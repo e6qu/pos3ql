@@ -96,8 +96,7 @@ fn spooled_column_witness(
 ) -> Datum<'static> {
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        if super::setops::describe_set_body(storage, tree, txid, &mut columns, arena).is_ok()
-        {
+        if super::setops::describe_set_body(storage, tree, txid, &mut columns, arena).is_ok() {
             return type_witness(
                 crate::sql::exec::coltype_of_oid(columns[0].type_oid).unwrap_or(ColType::Text),
             );

@@ -27,7 +27,10 @@ pub const SERVER_SESSION_BYTES: usize = 128 * 1024;
 
 /// Builds the server TLS configuration from a certificate chain and a private
 /// key, both PEM files. Startup only (allocation is still free).
-pub fn build_server_config(cert_file: &str, key_file: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+pub fn build_server_config(
+    cert_file: &str,
+    key_file: &str,
+) -> Result<Arc<rustls::ServerConfig>, String> {
     let cert_pem = std::fs::read_to_string(cert_file)
         .map_err(|e| format!("tls_cert_file {cert_file}: {e}"))?;
     let certs: Vec<CertificateDer<'static>> = crate::pem::certificates(&cert_pem)?
@@ -37,8 +40,8 @@ pub fn build_server_config(cert_file: &str, key_file: &str) -> Result<Arc<rustls
     if certs.is_empty() {
         return Err(format!("tls_cert_file {cert_file}: no certificates found"));
     }
-    let key_pem = std::fs::read_to_string(key_file)
-        .map_err(|e| format!("tls_key_file {key_file}: {e}"))?;
+    let key_pem =
+        std::fs::read_to_string(key_file).map_err(|e| format!("tls_key_file {key_file}: {e}"))?;
     let key = private_key(&key_pem)
         .ok_or_else(|| format!("tls_key_file {key_file}: no private key found"))?;
     let config = rustls::ServerConfig::builder()
@@ -72,10 +75,9 @@ pub struct ServerSession {
 
 impl ServerSession {
     pub fn new(config: &Arc<rustls::ServerConfig>) -> std::io::Result<Self> {
-        let inner = guard::tls_scope(|| {
-            rustls::ServerConnection::new(config.clone()).map(Box::new)
-        })
-        .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
+        let inner =
+            guard::tls_scope(|| rustls::ServerConnection::new(config.clone()).map(Box::new))
+                .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
         Ok(Self { inner: Some(inner) })
     }
 
@@ -85,7 +87,10 @@ impl ServerSession {
 
     /// True while the handshake is still in progress.
     pub fn is_handshaking(&self) -> bool {
-        self.inner.as_ref().expect("live tls session").is_handshaking()
+        self.inner
+            .as_ref()
+            .expect("live tls session")
+            .is_handshaking()
     }
 
     /// True when rustls has ciphertext queued to send (handshake or records);

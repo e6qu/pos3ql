@@ -56,7 +56,10 @@ impl<T> Pool<T> {
         what: &'static str,
         capacity: usize,
     ) -> Result<Self, BudgetError> {
-        assert!(capacity <= u32::MAX as usize, "pool '{what}' capacity overflows u32");
+        assert!(
+            capacity <= u32::MAX as usize,
+            "pool '{what}' capacity overflows u32"
+        );
         budget.draw_array(capacity, size_of::<T>() + size_of::<u32>() + 1, what)?;
         let mut free = FixedVec::new(budget, what, capacity)?;
         for index in (0..capacity as u32).rev() {
@@ -91,7 +94,9 @@ impl<T> Pool<T> {
         let i = self.check(handle);
         self.occupied[i] = false;
         self.generations[i] = self.generations[i].wrapping_add(1);
-        self.free.push(handle.index).expect("free list sized to capacity");
+        self.free
+            .push(handle.index)
+            .expect("free list sized to capacity");
         unsafe { self.values[i].assume_init_read() }
     }
 
@@ -121,9 +126,7 @@ impl<T> Pool<T> {
     fn check(&self, handle: Handle) -> usize {
         let i = handle.index as usize;
         assert!(
-            i < self.values.len()
-                && self.occupied[i]
-                && self.generations[i] == handle.generation,
+            i < self.values.len() && self.occupied[i] && self.generations[i] == handle.generation,
             "pool '{}': stale or invalid handle {:?}",
             self.what,
             handle

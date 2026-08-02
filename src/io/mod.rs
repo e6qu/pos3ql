@@ -7,15 +7,15 @@
 
 // The reactor backend is selected at compile time behind one interface:
 // kqueue on macOS/BSD, epoll on Linux.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub mod reactor;
 #[cfg(target_os = "linux")]
 pub mod epoll;
-
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub use reactor::{Event, Reactor, ReactorSetupError};
+pub mod reactor;
+
 #[cfg(target_os = "linux")]
 pub use epoll::{Event, Reactor, ReactorSetupError};
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub use reactor::{Event, Reactor, ReactorSetupError};
 
 // Keep the `reactor` path importable on Linux too, so `crate::io::reactor`
 // references resolve regardless of platform.

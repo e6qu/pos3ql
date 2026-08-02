@@ -14,9 +14,8 @@ use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    text_view,
-    arena_full, arity_err, cast_to, compare_datums, eval_full, load_array, sqlstate, text_arg,
-    type_mismatch, unify_arr_elem, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
+    load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
 };
 
 /// Handles the array scalar family. Returns `None` if `name` is not one of
@@ -145,8 +144,9 @@ pub(crate) fn dispatch<'a>(
                         count += 1;
                     }
                 }
-                let positions: &mut [Datum] =
-                    arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
+                let positions: &mut [Datum] = arena
+                    .alloc_slice_with(count, |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0usize;
                 for i in 0..len {
                     if matches(&array::get(raw, element, i).unwrap_or(Datum::Null))? {
@@ -163,7 +163,11 @@ pub(crate) fn dispatch<'a>(
             // is treated as empty (its element type taken from `elem`).
             "array_append" | "array_prepend" => {
                 arity(2)?;
-                let (array_index, elem_index) = if name == "array_append" { (0, 1) } else { (1, 0) };
+                let (array_index, elem_index) = if name == "array_append" {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
                 let arr = eval_full(args[array_index], arena, params, row, hooks)?;
                 let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
                 let (source, raw) = match arr {
@@ -172,7 +176,12 @@ pub(crate) fn dispatch<'a>(
                         ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text),
                         &[0u8, 0u8][..],
                     ),
-                    _ => return Err(type_mismatch("array_append/prepend requires an array", &arr)),
+                    _ => {
+                        return Err(type_mismatch(
+                            "array_append/prepend requires an array",
+                            &arr,
+                        ));
+                    }
                 };
                 // The result element type promotes to hold both the array's elements
                 // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
@@ -194,12 +203,18 @@ pub(crate) fn dispatch<'a>(
                 n = load_array(raw, source, element, &mut items, n, arena)?;
                 if name == "array_append" {
                     if n == items.len() {
-                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large"));
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "array value too large"
+                        ));
                     }
                     items[n] = coerced;
                     n += 1;
                 }
-                Ok(Datum::Array { element, raw: array::build(&items[..n], arena)? })
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build(&items[..n], arena)?,
+                })
             }
             // `array_cat(a, b)`: concatenate two arrays of the same element type.
             "array_cat" => {
@@ -207,9 +222,16 @@ pub(crate) fn dispatch<'a>(
                 let a = eval_full(args[0], arena, params, row, hooks)?;
                 let b = eval_full(args[1], arena, params, row, hooks)?;
                 let (a_elem, a_raw, b_elem, b_raw) = match (a, b) {
-                    (Datum::Array { element: ae, raw: ar }, Datum::Array { element: be, raw: br }) => {
-                        (ae, ar, be, br)
-                    }
+                    (
+                        Datum::Array {
+                            element: ae,
+                            raw: ar,
+                        },
+                        Datum::Array {
+                            element: be,
+                            raw: br,
+                        },
+                    ) => (ae, ar, be, br),
                     (Datum::Array { element, raw }, Datum::Null)
                     | (Datum::Null, Datum::Array { element, raw }) => {
                         return Ok(Datum::Array { element, raw });
@@ -221,7 +243,10 @@ pub(crate) fn dispatch<'a>(
                 let mut items = [Datum::Null; 1024];
                 let mut n = load_array(a_raw, a_elem, element, &mut items, 0, arena)?;
                 n = load_array(b_raw, b_elem, element, &mut items, n, arena)?;
-                Ok(Datum::Array { element, raw: array::build(&items[..n], arena)? })
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build(&items[..n], arena)?,
+                })
             }
             // `array_remove(arr, elem)`: drop every element equal to `elem`
             // (NULL-safe). `array_replace(arr, from, to)`: replace every match.
@@ -277,7 +302,10 @@ pub(crate) fn dispatch<'a>(
                         n += 1;
                     }
                 }
-                Ok(Datum::Array { element, raw: array::build(&items[..n], arena)? })
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build(&items[..n], arena)?,
+                })
             }
             // `trim_array(arr, n)`: drop the last `n` elements; `n` must be in range.
             "trim_array" => {
@@ -309,7 +337,10 @@ pub(crate) fn dispatch<'a>(
                 let keep = total - trim as usize;
                 let mut items = [Datum::Null; 1024];
                 let n = load_array(raw, element, element, &mut items, 0, arena)?;
-                Ok(Datum::Array { element, raw: array::build(&items[..keep.min(n)], arena)? })
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build(&items[..keep.min(n)], arena)?,
+                })
             }
             // `array_ndims`: 1 for a non-empty array, NULL for an empty one (we only
             // have one-dimensional arrays). `array_dims`: the `[1:n]` bound text.
@@ -328,7 +359,11 @@ pub(crate) fn dispatch<'a>(
                 if name == "array_ndims" {
                     Ok(Datum::Int4(1))
                 } else {
-                    Ok(Datum::Text(arena.alloc_str_display(format_args!("[1:{total}]")).map_err(|_| arena_full())?))
+                    Ok(Datum::Text(
+                        arena
+                            .alloc_str_display(format_args!("[1:{total}]"))
+                            .map_err(|_| arena_full())?,
+                    ))
                 }
             }
             "array_to_string" => {
@@ -386,7 +421,9 @@ pub(crate) fn dispatch<'a>(
                         first = false;
                     }
                 }
-                let out = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(total, |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let mut first = true;
                 for i in 0..count {
@@ -407,7 +444,10 @@ pub(crate) fn dispatch<'a>(
                 let value = eval_full(args[0], arena, params, row, hooks)?;
                 let dims = eval_full(args[1], arena, params, row, hooks)?;
                 if dims.is_null() {
-                    return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "dimension array or low bound array cannot be null"));
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "dimension array or low bound array cannot be null"
+                    ));
                 }
                 let Datum::Array { element, raw } = dims else {
                     return Err(type_mismatch(name, &dims));
@@ -420,17 +460,27 @@ pub(crate) fn dispatch<'a>(
                 }
                 let count = match array::get(raw, element, 0) {
                     Some(Datum::Int4(n)) => n,
-                    _ => return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "dimension values cannot be null")),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "dimension values cannot be null"
+                        ));
+                    }
                 };
                 if count < 0 {
-                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "array size exceeds the maximum allowed"));
+                    return Err(sql_err!(
+                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                        "array size exceeds the maximum allowed"
+                    ));
                 }
-                let elem = ArrElem::from_datum(&value)
-                    .unwrap_or(ArrElem::Int4);
+                let elem = ArrElem::from_datum(&value).unwrap_or(ArrElem::Int4);
                 let filled = arena
                     .alloc_slice_with(count as usize, |_| value)
                     .map_err(|_| arena_full())?;
-                Ok(Datum::Array { element: elem, raw: array::build(filled, arena)? })
+                Ok(Datum::Array {
+                    element: elem,
+                    raw: array::build(filled, arena)?,
+                })
             }
             "string_to_array" => {
                 // (string, delimiter [, null_string]) -> text[]. A NULL delimiter

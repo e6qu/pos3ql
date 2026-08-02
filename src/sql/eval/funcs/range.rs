@@ -13,8 +13,8 @@ use crate::sql::types::{Datum, RangeKind};
 use crate::sql_err;
 
 use super::super::{
-    arity_err, eval_full, range_mismatch, sqlstate, text_arg, type_mismatch, ColumnLookup,
-    EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, range_mismatch, sqlstate, text_arg,
+    type_mismatch,
 };
 
 /// Handles the range/multirange family. Returns `None` if `name` is not one of
@@ -78,17 +78,20 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     None
                 };
-                Ok(Datum::Range { text: range::construct(lo, hi, flags, kind, arena)?, kind })
+                Ok(Datum::Range {
+                    text: range::construct(lo, hi, flags, kind, arena)?,
+                    kind,
+                })
             }
             "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
             | "tsmultirange" | "tstzmultirange" => {
-                let kind = RangeKind::from_multirange_name(name).expect("matched a multirange name");
+                let kind =
+                    RangeKind::from_multirange_name(name).expect("matched a multirange name");
                 // Each argument is a range of the matching subtype; non-empty
                 // component texts are collected then canonicalized. A NULL argument
                 // makes the whole result NULL, matching PostgreSQL's strict
                 // multirange constructors.
-                let mut comps: [&str; range::MAX_MULTIRANGE] =
-                    [""; range::MAX_MULTIRANGE];
+                let mut comps: [&str; range::MAX_MULTIRANGE] = [""; range::MAX_MULTIRANGE];
                 let mut n = 0usize;
                 for arg in args.iter() {
                     match eval_full(arg, arena, params, row, hooks)? {
@@ -96,7 +99,10 @@ pub(crate) fn dispatch<'a>(
                         Datum::Range { text, kind: k } if k == kind => {
                             if !range::is_empty(text) {
                                 if n == range::MAX_MULTIRANGE {
-                                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
+                                    return Err(sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "multirange has too many component ranges"
+                                    ));
                                 }
                                 comps[n] = text;
                                 n += 1;
@@ -146,14 +152,18 @@ pub(crate) fn dispatch<'a>(
                 if a.is_null() || b.is_null() {
                     return Ok(Datum::Null);
                 }
-                let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) = (a, b)
+                let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) =
+                    (a, b)
                 else {
                     return Err(type_mismatch(name, &a));
                 };
                 if ak != bk {
                     return Err(range_mismatch());
                 }
-                Ok(Datum::Range { text: range::merge(at, bt, ak, arena)?, kind: ak })
+                Ok(Datum::Range {
+                    text: range::merge(at, bt, ak, arena)?,
+                    kind: ak,
+                })
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }

@@ -10,7 +10,7 @@
 
 use core::fmt::Write;
 
-use super::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
+use super::datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
 use crate::util::StackStr;
 
 const DAY_US: i64 = 86_400_000_000;
@@ -158,15 +158,31 @@ fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst
     let _ = write!(s, "{std_ab}");
     let mut d = StackStr::new();
     let _ = write!(d, "{dst_ab}");
-    Timezone::Posix(PosixZone { std_off, dst_off, std_abbrev: s, dst_abbrev: d, dst })
+    Timezone::Posix(PosixZone {
+        std_off,
+        dst_off,
+        std_abbrev: s,
+        dst_abbrev: d,
+        dst,
+    })
 }
 
 /// US rule (2007+): spring 2nd Sunday March 02:00 std, fall 1st Sunday
 /// November 02:00 dst.
 fn us() -> Dst {
     Dst {
-        start: Trans { month: 3, week: 2, dow: 0, seconds: 2 * 3600 },
-        end: Trans { month: 11, week: 1, dow: 0, seconds: 2 * 3600 },
+        start: Trans {
+            month: 3,
+            week: 2,
+            dow: 0,
+            seconds: 2 * 3600,
+        },
+        end: Trans {
+            month: 11,
+            week: 1,
+            dow: 0,
+            seconds: 2 * 3600,
+        },
     }
 }
 
@@ -176,8 +192,18 @@ fn eu(std_off_hours: i32) -> Dst {
     let start_local = (1 + std_off_hours) * 3600; // 01:00 UTC in std local time
     let end_local = (1 + std_off_hours + 1) * 3600; // 01:00 UTC in dst local time
     Dst {
-        start: Trans { month: 3, week: 5, dow: 0, seconds: start_local as i64 },
-        end: Trans { month: 10, week: 5, dow: 0, seconds: end_local as i64 },
+        start: Trans {
+            month: 3,
+            week: 5,
+            dow: 0,
+            seconds: start_local as i64,
+        },
+        end: Trans {
+            month: 10,
+            week: 5,
+            dow: 0,
+            seconds: end_local as i64,
+        },
     }
 }
 
@@ -185,16 +211,36 @@ fn eu(std_off_hours: i32) -> Dst {
 /// April 03:00 dst (southern hemisphere — DST spans the new year).
 fn au() -> Dst {
     Dst {
-        start: Trans { month: 10, week: 1, dow: 0, seconds: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
+        start: Trans {
+            month: 10,
+            week: 1,
+            dow: 0,
+            seconds: 2 * 3600,
+        },
+        end: Trans {
+            month: 4,
+            week: 1,
+            dow: 0,
+            seconds: 3 * 3600,
+        },
     }
 }
 
 /// New Zealand rule: last Sunday September 02:00 std, 1st Sunday April 03:00 dst.
 fn nz() -> Dst {
     Dst {
-        start: Trans { month: 9, week: 5, dow: 0, seconds: 2 * 3600 },
-        end: Trans { month: 4, week: 1, dow: 0, seconds: 3 * 3600 },
+        start: Trans {
+            month: 9,
+            week: 5,
+            dow: 0,
+            seconds: 2 * 3600,
+        },
+        end: Trans {
+            month: 4,
+            week: 1,
+            dow: 0,
+            seconds: 3 * 3600,
+        },
     }
 }
 
@@ -332,7 +378,11 @@ pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
                 *at += 1;
             }
         }
-        if out.as_str().is_empty() { None } else { Some(out) }
+        if out.as_str().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     };
     // `[+-]h[h][:mm[:ss]]`, seconds west of UTC as written.
     let offset = |at: &mut usize| -> Option<i64> {
@@ -396,7 +446,12 @@ pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
         if !(1..=12).contains(&month) || !(1..=5).contains(&week) || dow > 6 {
             return None;
         }
-        Some(Trans { month, week, dow, seconds })
+        Some(Trans {
+            month,
+            week,
+            dow,
+            seconds,
+        })
     };
 
     let std_abbrev = name(&mut at)?;

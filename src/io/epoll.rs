@@ -76,12 +76,7 @@ impl Reactor {
     }
 
     /// Level-triggered read plus optional write interest.
-    pub fn set_write_interest(
-        &self,
-        fd: RawFd,
-        token: u64,
-        enabled: bool,
-    ) -> std::io::Result<()> {
+    pub fn set_write_interest(&self, fd: RawFd, token: u64, enabled: bool) -> std::io::Result<()> {
         let mut mask = libc::EPOLLIN as u32;
         if enabled {
             mask |= libc::EPOLLOUT as u32;

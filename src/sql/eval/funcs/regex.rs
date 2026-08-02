@@ -16,9 +16,9 @@ use crate::sql_err;
 use crate::util::StackStr;
 
 use super::super::{
-    arena_full, arity_err, byte_to_char_1based, char_index_to_byte, expand_replacement, int_arg,
-    eval_full, regex_split, regexp_flags, similar_to_posix, sqlstate, text_arg, ColumnLookup, EvalHooks,
-    SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, byte_to_char_1based,
+    char_index_to_byte, eval_full, expand_replacement, int_arg, regex_split, regexp_flags,
+    similar_to_posix, sqlstate, text_arg,
 };
 
 /// Handles the scalar regex family. Returns `None` if `name` is not one of
@@ -89,7 +89,7 @@ pub(crate) fn dispatch<'a>(
                                     sqlstate::INVALID_PARAMETER_VALUE,
                                     "invalid regular expression option: \"{}\"",
                                     f
-                                ))
+                                ));
                             }
                         }
                     }
@@ -101,7 +101,10 @@ pub(crate) fn dispatch<'a>(
                     regex::find_captures(pat, src, pos, case_insensitive, &mut spans)?
                 {
                     if out.write_str(&src[pos..s]).is_err() {
-                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regexp_replace result too large"));
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "regexp_replace result too large"
+                        ));
                     }
                     expand_replacement(&mut out, rep, src, s, e, &spans[..ng])?;
                     if e == s {
@@ -125,9 +128,14 @@ pub(crate) fn dispatch<'a>(
                     }
                 }
                 if out.write_str(&src[pos..]).is_err() {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regexp_replace result too large"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "regexp_replace result too large"
+                    ));
                 }
-                Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(
+                    arena.alloc_str(out.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "regexp_count" | "regexp_instr" | "regexp_substr" => {
                 // (source, pattern [, start [, flags]]). `start` is a 1-based
@@ -179,9 +187,9 @@ pub(crate) fn dispatch<'a>(
                     Some((s, _)) if name == "regexp_instr" => {
                         Ok(Datum::Int4(byte_to_char_1based(src, s)))
                     }
-                    Some((s, e)) => {
-                        Ok(Datum::Text(arena.alloc_str(&src[s..e]).map_err(|_| arena_full())?))
-                    }
+                    Some((s, e)) => Ok(Datum::Text(
+                        arena.alloc_str(&src[s..e]).map_err(|_| arena_full())?,
+                    )),
                 }
             }
             // `regexp_like(source, pattern [, flags])`: whether the pattern matches.
@@ -203,7 +211,9 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     false
                 };
-                Ok(Datum::Bool(regex::find(pat, src, 0, case_insensitive)?.is_some()))
+                Ok(Datum::Bool(
+                    regex::find(pat, src, 0, case_insensitive)?.is_some(),
+                ))
             }
             // `regexp_split_to_array(source, pattern [, flags])`: split on matches.
             "regexp_split_to_array" => {
@@ -259,7 +269,11 @@ pub(crate) fn dispatch<'a>(
                 };
                 let mut posix = StackStr::<256>::new();
                 similar_to_posix(pattern, &mut posix, escape)?;
-                Ok(Datum::Bool(regex::regex_search(posix.as_str(), text, false)?))
+                Ok(Datum::Bool(regex::regex_search(
+                    posix.as_str(),
+                    text,
+                    false,
+                )?))
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }

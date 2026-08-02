@@ -35,7 +35,11 @@ pub(crate) struct ClusterNode {
 impl ClusterNode {
     /// Binds `addrs[id]` and prepares links to the other replicas. Peer
     /// dialing happens lazily in [`Self::poll`].
-    pub(crate) fn bind(id: ReplicaId, addrs: &[String], view_change_timeout: u32) -> std::io::Result<Self> {
+    pub(crate) fn bind(
+        id: ReplicaId,
+        addrs: &[String],
+        view_change_timeout: u32,
+    ) -> std::io::Result<Self> {
         let n = addrs.len();
         let listener = TcpListener::bind(&addrs[id as usize])?;
         listener.set_nonblocking(true)?;
@@ -43,7 +47,11 @@ impl ClusterNode {
             .iter()
             .enumerate()
             .map(|(i, a)| Peer {
-                addr: if i == id as usize { String::new() } else { a.clone() },
+                addr: if i == id as usize {
+                    String::new()
+                } else {
+                    a.clone()
+                },
                 stream: None,
                 rx: Vec::new(),
             })
@@ -234,7 +242,11 @@ mod tests {
     }
 
     /// Pumps all nodes until `done` holds or the deadline passes.
-    fn pump_until(nodes: &mut [ClusterNode], deadline: Duration, done: impl Fn(&[ClusterNode]) -> bool) {
+    fn pump_until(
+        nodes: &mut [ClusterNode],
+        deadline: Duration,
+        done: impl Fn(&[ClusterNode]) -> bool,
+    ) {
         let start = Instant::now();
         while start.elapsed() < deadline {
             for node in nodes.iter_mut() {
@@ -273,7 +285,10 @@ mod tests {
 
         // Submit three writes at replica 0 (the initial primary of view 0).
         for req in 1..=3u32 {
-            assert!(nodes[0].submit(1, req, u64::from(req) * 10), "primary rejected write");
+            assert!(
+                nodes[0].submit(1, req, u64::from(req) * 10),
+                "primary rejected write"
+            );
         }
         pump_until(&mut nodes, Duration::from_secs(3), |n| {
             n.iter().all(|node| node.applied.len() >= 3)
@@ -292,7 +307,9 @@ mod tests {
             .map(|i| ClusterNode::bind(i as u8, &addrs, 20).unwrap())
             .collect();
 
-        pump_until(&mut nodes, Duration::from_secs(2), |n| primary_index(n) == Some(0));
+        pump_until(&mut nodes, Duration::from_secs(2), |n| {
+            primary_index(n) == Some(0)
+        });
         assert!(nodes[0].submit(1, 1, 100));
         pump_until(&mut nodes, Duration::from_secs(2), |n| {
             n.iter().all(|node| !node.applied.is_empty())
@@ -319,10 +336,9 @@ mod tests {
             for node in nodes.iter_mut().skip(1) {
                 node.peers[0].stream = None;
             }
-            if let Some(p) = nodes[1..]
-                .iter()
-                .position(|node| node.replica.is_primary() && node.replica.status == super::super::Status::Normal)
-            {
+            if let Some(p) = nodes[1..].iter().position(|node| {
+                node.replica.is_primary() && node.replica.status == super::super::Status::Normal
+            }) {
                 new_primary = Some(p + 1);
                 break;
             }
@@ -342,7 +358,10 @@ mod tests {
             for node in nodes.iter_mut().skip(1) {
                 node.peers[0].stream = None;
             }
-            if nodes[1..].iter().all(|node| node.applied.iter().any(|c| c.value == 200)) {
+            if nodes[1..]
+                .iter()
+                .all(|node| node.applied.iter().any(|c| c.value == 200))
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));

@@ -6,8 +6,8 @@
 //! `,`, numbers canonicalized through the NUMERIC type, and strings minimally
 //! escaped. The same tree drives the `->` / `->>` accessors.
 
-use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
+use crate::sql::eval::sqlstate;
 use crate::sql_err;
 
 use super::eval::SqlError;
@@ -39,12 +39,19 @@ struct P<'a> {
 }
 
 fn bad() -> SqlError {
-    sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input syntax for type json")
+    sql_err!(
+        sqlstate::INVALID_TEXT_REPRESENTATION,
+        "invalid input syntax for type json"
+    )
 }
 
 /// Parses `input` into an arena tree (jsonb semantics: objects sorted/deduped).
 pub fn parse<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
-    let mut p = P { b: input.as_bytes(), at: 0, arena };
+    let mut p = P {
+        b: input.as_bytes(),
+        at: 0,
+        arena,
+    };
     p.ws();
     let v = p.value(0)?;
     p.ws();
@@ -89,7 +96,12 @@ pub fn object_keys_error(name: &str, kind: Kind) -> SqlError {
         Kind::Array => "an array",
         Kind::Object => "an object",
     };
-    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call {} on {}", name, what)
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "cannot call {} on {}",
+        name,
+        what
+    )
 }
 
 /// PostgreSQL's error for calling `*_array_elements` on a non-array. The `json`
@@ -102,13 +114,22 @@ pub fn array_elements_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
             Kind::Object => "an object",
             Kind::Array => "an array",
         };
-        sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot extract elements from {}", what)
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot extract elements from {}",
+            what
+        )
     } else {
         let what = match kind {
             Kind::Scalar => "a scalar",
             Kind::Object | Kind::Array => "a non-array",
         };
-        sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call {} on {}", name, what)
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot call {} on {}",
+            name,
+            what
+        )
     }
 }
 
@@ -120,10 +141,17 @@ pub fn object_members_source<'a>(
     input: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a str)], SqlError> {
-    let mut p = P { b: input.as_bytes(), at: 0, arena };
+    let mut p = P {
+        b: input.as_bytes(),
+        at: 0,
+        arena,
+    };
     p.ws();
     if p.b.get(p.at) != Some(&b'{') {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot call json_object_keys on a non-object"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot call json_object_keys on a non-object"
+        ));
     }
     p.at += 1;
     let mut members: [(&str, &str); MAX_ELEMS] = [("", ""); MAX_ELEMS];
@@ -134,7 +162,10 @@ pub fn object_members_source<'a>(
     }
     loop {
         if n == MAX_ELEMS {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON object too large"
+            ));
         }
         p.ws();
         if p.b.get(p.at) != Some(&b'"') {
@@ -176,10 +207,17 @@ pub fn array_elements_source<'a>(
     input: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [&'a str], SqlError> {
-    let mut p = P { b: input.as_bytes(), at: 0, arena };
+    let mut p = P {
+        b: input.as_bytes(),
+        at: 0,
+        arena,
+    };
     p.ws();
     if p.b.get(p.at) != Some(&b'[') {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot extract elements from a non-array"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot extract elements from a non-array"
+        ));
     }
     p.at += 1;
     let mut items: [&str; MAX_ELEMS] = [""; MAX_ELEMS];
@@ -190,7 +228,10 @@ pub fn array_elements_source<'a>(
     }
     loop {
         if n == MAX_ELEMS {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON array too large"
+            ));
         }
         p.ws();
         let start = p.at;
@@ -223,7 +264,10 @@ impl<'a> P<'a> {
 
     fn value(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
         if depth > MAX_DEPTH {
-            return Err(sql_err!(sqlstate::STATEMENT_TOO_COMPLEX, "JSON nested too deeply"));
+            return Err(sql_err!(
+                sqlstate::STATEMENT_TOO_COMPLEX,
+                "JSON nested too deeply"
+            ));
         }
         self.ws();
         match self.b.get(self.at) {
@@ -271,7 +315,9 @@ impl<'a> P<'a> {
         // Canonicalize through NUMERIC (so 1e2 -> 100, 1.0 -> 1.0).
         let n = Numeric::parse(raw, self.arena).map_err(|_| bad())?;
         let canon = crate::stack_format!(80, "{}", n);
-        Ok(Json::Number(self.arena.alloc_str(canon.as_str()).map_err(|_| bad())?))
+        Ok(Json::Number(
+            self.arena.alloc_str(canon.as_str()).map_err(|_| bad())?,
+        ))
     }
 
     /// Parses a JSON string literal, returning the raw source contents between
@@ -322,7 +368,10 @@ impl<'a> P<'a> {
         }
         loop {
             if n == MAX_ELEMS {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON array too large"
+                ));
             }
             items[n] = self.value(depth + 1)?;
             n += 1;
@@ -338,7 +387,11 @@ impl<'a> P<'a> {
                 _ => return Err(bad()),
             }
         }
-        Ok(Json::Array(self.arena.alloc_slice_copy(&items[..n]).map_err(|_| bad())?))
+        Ok(Json::Array(
+            self.arena
+                .alloc_slice_copy(&items[..n])
+                .map_err(|_| bad())?,
+        ))
     }
 
     fn object(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
@@ -352,7 +405,10 @@ impl<'a> P<'a> {
         }
         loop {
             if n == MAX_ELEMS {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON object too large"
+                ));
             }
             self.ws();
             if self.b.get(self.at) != Some(&b'"') {
@@ -384,10 +440,15 @@ impl<'a> P<'a> {
         // order PostgreSQL stores and prints them in.
         let ms = &mut members[..n];
         crate::mem::arena::stable_sort_via(self.arena, ms, |a, b| {
-            a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            a.0.len()
+                .cmp(&b.0.len())
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
         })
         .map_err(|_| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object exceeds the statement arena")
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON object exceeds the statement arena"
+            )
         })?;
         let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
         let mut m = 0;
@@ -400,7 +461,9 @@ impl<'a> P<'a> {
             out[m] = ms[i];
             m += 1;
         }
-        Ok(Json::Object(self.arena.alloc_slice_copy(&out[..m]).map_err(|_| bad())?))
+        Ok(Json::Object(
+            self.arena.alloc_slice_copy(&out[..m]).map_err(|_| bad())?,
+        ))
     }
 }
 
@@ -480,7 +543,11 @@ impl<'a> Json<'a> {
     pub fn get_index(&self, index: i64) -> Option<Json<'a>> {
         match self {
             Json::Array(items) => {
-                let i = if index < 0 { items.len() as i64 + index } else { index };
+                let i = if index < 0 {
+                    items.len() as i64 + index
+                } else {
+                    index
+                };
                 if i >= 0 && (i as usize) < items.len() {
                     Some(items[i as usize])
                 } else {
@@ -492,7 +559,10 @@ impl<'a> Json<'a> {
     }
 
     fn is_primitive(&self) -> bool {
-        matches!(self, Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_))
+        matches!(
+            self,
+            Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_)
+        )
     }
 }
 
@@ -531,8 +601,7 @@ fn scalar_eq(a: &Json, b: &Json) -> bool {
         (Json::Bool(x), Json::Bool(y)) => x == y,
         (Json::Str(x), Json::Str(y)) => x == y,
         (Json::Number(x), Json::Number(y)) => {
-            x == y
-                || crate::sql::numeric::cmp_decimal_str(x, y) == Some(core::cmp::Ordering::Equal)
+            x == y || crate::sql::numeric::cmp_decimal_str(x, y) == Some(core::cmp::Ordering::Equal)
         }
         _ => false,
     }
@@ -545,16 +614,24 @@ fn build_object<'a>(
     arena: &'a Arena,
 ) -> Result<Json<'a>, SqlError> {
     if members.len() > MAX_ELEMS {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "JSON object too large"
+        ));
     }
     let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
     buffer[..members.len()].copy_from_slice(members);
     let ms = &mut buffer[..members.len()];
     crate::mem::arena::stable_sort_via(arena, ms, |a, b| {
-        a.0.len().cmp(&b.0.len()).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        a.0.len()
+            .cmp(&b.0.len())
+            .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
     })
     .map_err(|_| {
-        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object exceeds the statement arena")
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "JSON object exceeds the statement arena"
+        )
     })?;
     let mut out: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
     let mut m = 0;
@@ -565,7 +642,9 @@ fn build_object<'a>(
         out[m] = ms[i];
         m += 1;
     }
-    Ok(Json::Object(arena.alloc_slice_copy(&out[..m]).map_err(|_| bad())?))
+    Ok(Json::Object(
+        arena.alloc_slice_copy(&out[..m]).map_err(|_| bad())?,
+    ))
 }
 
 /// Resolves a signed array index (negative counts from the end) into a bound.
@@ -596,7 +675,10 @@ pub fn set<'a>(
                 buffer[i].1 = set(members[i].1, rest, value, create, arena)?;
             } else if rest.is_empty() && create {
                 if n == MAX_ELEMS {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "JSON object too large"
+                    ));
                 }
                 buffer[n] = (*head, value);
                 return build_object(&buffer[..n + 1], arena);
@@ -612,7 +694,11 @@ pub fn set<'a>(
             let mut buffer = [Json::Null; MAX_ELEMS];
             buffer[..items.len()].copy_from_slice(items);
             buffer[i] = set(items[i], rest, value, create, arena)?;
-            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+            Ok(Json::Array(
+                arena
+                    .alloc_slice_copy(&buffer[..items.len()])
+                    .map_err(|_| bad())?,
+            ))
         }
         // Cannot descend into a scalar; leave it unchanged.
         _ => Ok(root),
@@ -638,13 +724,19 @@ pub fn insert<'a>(
             buffer[..n].copy_from_slice(members);
             if let Some(i) = members.iter().position(|(k, _)| k == head) {
                 if rest.is_empty() {
-                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot replace existing key"));
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "cannot replace existing key"
+                    ));
                 }
                 buffer[i].1 = insert(members[i].1, rest, value, after, arena)?;
                 build_object(&buffer[..n], arena)
             } else if rest.is_empty() {
                 if n == MAX_ELEMS {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON object too large"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "JSON object too large"
+                    ));
                 }
                 buffer[n] = (*head, value);
                 build_object(&buffer[..n + 1], arena)
@@ -664,13 +756,20 @@ pub fn insert<'a>(
                 }
                 let at = at as usize;
                 if items.len() + 1 > MAX_ELEMS {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON array too large"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "JSON array too large"
+                    ));
                 }
                 let mut buffer = [Json::Null; MAX_ELEMS];
                 buffer[..at].copy_from_slice(&items[..at]);
                 buffer[at] = value;
                 buffer[at + 1..items.len() + 1].copy_from_slice(&items[at..]);
-                Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len() + 1]).map_err(|_| bad())?))
+                Ok(Json::Array(
+                    arena
+                        .alloc_slice_copy(&buffer[..items.len() + 1])
+                        .map_err(|_| bad())?,
+                ))
             } else {
                 let Some(i) = array_index(head, items.len()) else {
                     return Ok(root);
@@ -678,7 +777,11 @@ pub fn insert<'a>(
                 let mut buffer = [Json::Null; MAX_ELEMS];
                 buffer[..items.len()].copy_from_slice(items);
                 buffer[i] = insert(items[i], rest, value, after, arena)?;
-                Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+                Ok(Json::Array(
+                    arena
+                        .alloc_slice_copy(&buffer[..items.len()])
+                        .map_err(|_| bad())?,
+                ))
             }
         }
         _ => Ok(root),
@@ -699,14 +802,20 @@ pub fn strip_nulls<'a>(root: Json<'a>, arena: &'a Arena) -> Result<Json<'a>, Sql
                 buffer[n] = (*k, strip_nulls(*v, arena)?);
                 n += 1;
             }
-            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+            Ok(Json::Object(
+                arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?,
+            ))
         }
         Json::Array(items) => {
             let mut buffer = [Json::Null; MAX_ELEMS];
             for (i, v) in items.iter().enumerate() {
                 buffer[i] = strip_nulls(*v, arena)?;
             }
-            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+            Ok(Json::Array(
+                arena
+                    .alloc_slice_copy(&buffer[..items.len()])
+                    .map_err(|_| bad())?,
+            ))
         }
         other => Ok(other),
     }
@@ -725,7 +834,9 @@ pub fn delete_key<'a>(root: Json<'a>, key: &str, arena: &'a Arena) -> Result<Jso
                 buffer[n] = (*k, *v);
                 n += 1;
             }
-            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+            Ok(Json::Object(
+                arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?,
+            ))
         }
         // `jsonb - text` on an array removes matching string elements.
         Json::Array(items) => {
@@ -738,18 +849,34 @@ pub fn delete_key<'a>(root: Json<'a>, key: &str, arena: &'a Arena) -> Result<Jso
                 buffer[n] = *v;
                 n += 1;
             }
-            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+            Ok(Json::Array(
+                arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?,
+            ))
         }
-        _ => Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot delete from scalar")),
+        _ => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot delete from scalar"
+        )),
     }
 }
 
 /// `jsonb - integer`: removes the element at a signed array index.
-pub fn delete_index<'a>(root: Json<'a>, index: i64, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+pub fn delete_index<'a>(
+    root: Json<'a>,
+    index: i64,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
     let Json::Array(items) = root else {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot delete from object using integer index"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot delete from object using integer index"
+        ));
     };
-    let resolved = if index < 0 { items.len() as i64 + index } else { index };
+    let resolved = if index < 0 {
+        items.len() as i64 + index
+    } else {
+        index
+    };
     if resolved < 0 || resolved as usize >= items.len() {
         return Ok(root);
     }
@@ -763,7 +890,9 @@ pub fn delete_index<'a>(root: Json<'a>, index: i64, arena: &'a Arena) -> Result<
         buffer[n] = *v;
         n += 1;
     }
-    Ok(Json::Array(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+    Ok(Json::Array(
+        arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?,
+    ))
 }
 
 /// `jsonb #- path`: removes the value at a path.
@@ -795,7 +924,9 @@ pub fn delete_path<'a>(
             } else {
                 return Ok(root);
             }
-            Ok(Json::Object(arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?))
+            Ok(Json::Object(
+                arena.alloc_slice_copy(&buffer[..n]).map_err(|_| bad())?,
+            ))
         }
         Json::Array(items) => {
             let Some(i) = array_index(head, items.len()) else {
@@ -804,7 +935,11 @@ pub fn delete_path<'a>(
             let mut buffer = [Json::Null; MAX_ELEMS];
             buffer[..items.len()].copy_from_slice(items);
             buffer[i] = delete_path(items[i], rest, arena)?;
-            Ok(Json::Array(arena.alloc_slice_copy(&buffer[..items.len()]).map_err(|_| bad())?))
+            Ok(Json::Array(
+                arena
+                    .alloc_slice_copy(&buffer[..items.len()])
+                    .map_err(|_| bad())?,
+            ))
         }
         _ => Ok(root),
     }
@@ -865,7 +1000,9 @@ pub fn pretty_to_arena<'a>(root: &Json, arena: &'a Arena) -> Result<&'a str, Sql
     }
     let mut counter = Counter(0);
     let _ = pretty(root, 0, &mut counter);
-    let bytes = arena.alloc_slice_with(counter.0, |_| 0u8).map_err(|_| bad())?;
+    let bytes = arena
+        .alloc_slice_with(counter.0, |_| 0u8)
+        .map_err(|_| bad())?;
     struct SliceWriter<'b> {
         buffer: &'b mut [u8],
         at: usize,
@@ -878,7 +1015,10 @@ pub fn pretty_to_arena<'a>(root: &Json, arena: &'a Arena) -> Result<&'a str, Sql
             Ok(())
         }
     }
-    let mut writer = SliceWriter { buffer: bytes, at: 0 };
+    let mut writer = SliceWriter {
+        buffer: bytes,
+        at: 0,
+    };
     let _ = pretty(root, 0, &mut writer);
     Ok(unsafe { core::str::from_utf8_unchecked(writer.buffer) })
 }
@@ -1102,12 +1242,14 @@ pub fn write_datum_json_styled(
         // Date-time types render in ISO 8601 (a `T` separator, `+HH:MM` offset
         // for timestamptz), which is how PostgreSQL's to_json / row_to_json
         // spell them — distinct from the space-separated `::text` form.
-        Datum::Timestamp(t) => {
-            write_json_raw_string(crate::sql::datetime::format_timestamp_json(*t, false).as_str(), out)
-        }
-        Datum::Timestamptz(t) => {
-            write_json_raw_string(crate::sql::datetime::format_timestamp_json(*t, true).as_str(), out)
-        }
+        Datum::Timestamp(t) => write_json_raw_string(
+            crate::sql::datetime::format_timestamp_json(*t, false).as_str(),
+            out,
+        ),
+        Datum::Timestamptz(t) => write_json_raw_string(
+            crate::sql::datetime::format_timestamp_json(*t, true).as_str(),
+            out,
+        ),
         Datum::Array { element, raw } => {
             out.write_char('[')?;
             let count = crate::sql::array::len(raw);

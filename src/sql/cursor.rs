@@ -11,7 +11,7 @@ use crate::mem::buffer::FixedBuf;
 use crate::sql_err;
 use crate::storage::SqlName;
 
-use super::eval::{sqlstate, SqlError};
+use super::eval::{SqlError, sqlstate};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -56,9 +56,7 @@ const MAX_CURSOR_ROWS: usize = 65536;
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         config.max_cursors
-            * (config.cursor_bytes
-                + 1024
-                + MAX_CURSOR_ROWS * core::mem::size_of::<(u32, u32)>())
+            * (config.cursor_bytes + 1024 + MAX_CURSOR_ROWS * core::mem::size_of::<(u32, u32)>())
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -76,7 +74,10 @@ impl CursorPool {
                 position: 0,
             });
         }
-        Ok(Self { slots, emit: Vec::with_capacity(MAX_CURSOR_ROWS) })
+        Ok(Self {
+            slots,
+            emit: Vec::with_capacity(MAX_CURSOR_ROWS),
+        })
     }
 
     /// Closes every cursor — used when a connection slot is recycled for a new
@@ -96,12 +97,7 @@ impl CursorPool {
 
     /// Reserves a slot for a fresh cursor, handing back its index; the caller
     /// fills the buffers and then calls [`Self::seal`].
-    pub fn open(
-        &mut self,
-        name: &str,
-        scroll: bool,
-        hold: bool,
-    ) -> Result<usize, SqlError> {
+    pub fn open(&mut self, name: &str, scroll: bool, hold: bool) -> Result<usize, SqlError> {
         if self.find(name).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_CURSOR,

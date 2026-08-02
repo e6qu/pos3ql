@@ -2,10 +2,10 @@
 //! A separate namespace from protocol-level prepared statements, as in
 //! PostgreSQL. Fixed pool per connection.
 
-use crate::sql::eval::sqlstate;
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
+use crate::sql::eval::sqlstate;
 use crate::sql_err;
 use crate::storage::SqlName;
 
@@ -49,7 +49,12 @@ impl SqlPreparedPool {
         Ok(Self { slots })
     }
 
-    pub fn store(&mut self, name: &str, sql: &str, param_types: &[ColType]) -> Result<(), SqlError> {
+    pub fn store(
+        &mut self,
+        name: &str,
+        sql: &str,
+        param_types: &[ColType],
+    ) -> Result<(), SqlError> {
         if self.get(name).is_some() {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::DUPLICATE_PREPARED_STATEMENT,

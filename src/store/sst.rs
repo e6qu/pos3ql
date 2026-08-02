@@ -1481,6 +1481,42 @@ pub(crate) fn block_keys_at(
     ))
 }
 
+/// Copies the entry beginning at `at` out of a resident data block.  A merged
+/// table walk has already paid to fetch this block; copying its selected row
+/// here keeps the scan from issuing a second point read for that same row.
+/// The returned key and tombstone flag let the caller retain the ordinary
+/// merged-version checks at its visibility boundary.
+pub(crate) fn copy_block_entry_at(
+    store: &mut dyn BlockStore,
+    block: &[u8],
+    at: usize,
+    versioned: bool,
+    out: &mut [u8],
+) -> Result<(SstKey, bool, usize), SstError> {
+    let remaining = block.get(at..).ok_or(SstError::Store(StoreError::Corrupt(
+        super::BlockError::Truncated,
+    )))?;
+    let mut entries = DataBlock {
+        bytes: remaining,
+        versioned,
+    };
+    let entry = entries.next().ok_or(SstError::Store(StoreError::Corrupt(
+        super::BlockError::Truncated,
+    )))?;
+    if entry.tombstone {
+        return Ok((entry.key, true, 0));
+    }
+    if out.len() != entry.total_len {
+        return Err(SstError::Store(StoreError::BufferTooSmall));
+    }
+    if entry.is_chained() {
+        assemble_chain(store, &entry, out)?;
+    } else {
+        out.copy_from_slice(entry.head);
+    }
+    Ok((entry.key, false, entry.total_len))
+}
+
 /// Copies a chained entry's row into `into`: the inline head chunk, then each
 /// overflow block in order. `into` must hold `total_len` bytes.
 fn assemble_chain(

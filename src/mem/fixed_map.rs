@@ -25,7 +25,11 @@ pub struct MapFull {
 
 impl fmt::Display for MapFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "map '{}' is full (capacity {})", self.what, self.capacity)
+        write!(
+            f,
+            "map '{}' is full (capacity {})",
+            self.what, self.capacity
+        )
     }
 }
 

@@ -22,9 +22,9 @@
 mod storage;
 
 use crate::prng::Pcg32;
-use crate::vsr::message::Message;
-use crate::vsr::replica::{Committed, Replica, MAX_REPLICAS};
 use crate::vsr::Status;
+use crate::vsr::message::Message;
+use crate::vsr::replica::{Committed, MAX_REPLICAS, Replica};
 
 /// Bounds in-flight messages so a message storm cannot grow memory without
 /// limit; overflow drops sends, which VSR treats as ordinary loss.
@@ -226,17 +226,18 @@ impl Sim {
 
             // Submit a client request to the current primary.
             if self.next_request <= self.cfg.requests
-                && let Some(p) = self.primary() {
-                    let client = 1 + (self.next_request % 4);
-                    let req = self.next_request;
-                    let value = u64::from(req) * 1000 + u64::from(client);
-                    if self.replicas[p].on_request(client, req, value) {
-                        self.issued.push((client, req, value));
-                        self.collect_commits(p);
-                        self.send_all(p);
-                        self.next_request += 1;
-                    }
+                && let Some(p) = self.primary()
+            {
+                let client = 1 + (self.next_request % 4);
+                let req = self.next_request;
+                let value = u64::from(req) * 1000 + u64::from(client);
+                if self.replicas[p].on_request(client, req, value) {
+                    self.issued.push((client, req, value));
+                    self.collect_commits(p);
+                    self.send_all(p);
+                    self.next_request += 1;
                 }
+            }
 
             // Fault injection.
             self.maybe_crash();
@@ -342,19 +343,20 @@ impl Sim {
             }
             // Keep re-submitting the current request so it eventually lands.
             if self.next_request <= self.cfg.requests
-                && let Some(p) = self.primary() {
-                    let client = 1 + (self.next_request % 4);
-                    let req = self.next_request;
-                    let value = u64::from(req) * 1000 + u64::from(client);
-                    if self.replicas[p].on_request(client, req, value) {
-                        if !self.issued.iter().any(|(_, r, _)| *r == req) {
-                            self.issued.push((client, req, value));
-                        }
-                        self.collect_commits(p);
-                        self.send_all(p);
-                        self.next_request += 1;
+                && let Some(p) = self.primary()
+            {
+                let client = 1 + (self.next_request % 4);
+                let req = self.next_request;
+                let value = u64::from(req) * 1000 + u64::from(client);
+                if self.replicas[p].on_request(client, req, value) {
+                    if !self.issued.iter().any(|(_, r, _)| *r == req) {
+                        self.issued.push((client, req, value));
                     }
+                    self.collect_commits(p);
+                    self.send_all(p);
+                    self.next_request += 1;
                 }
+            }
         }
     }
 

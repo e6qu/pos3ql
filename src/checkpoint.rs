@@ -1303,18 +1303,16 @@ impl Checkpointer {
                     } else {
                         storage
                             .find_schema(&schema)
-                            .ok_or(CheckpointSetupError::Corrupt(
-                                "dacl schema does not exist",
-                            ))? as u16
+                            .ok_or(CheckpointSetupError::Corrupt("dacl schema does not exist"))?
+                            as u16
                     };
                     let grantee = if grantee == "PUBLIC" {
                         crate::storage::PUBLIC_ROLE
                     } else {
                         storage
                             .find_role(&grantee)
-                            .ok_or(CheckpointSetupError::Corrupt(
-                                "dacl grantee does not exist",
-                            ))? as u16
+                            .ok_or(CheckpointSetupError::Corrupt("dacl grantee does not exist"))?
+                            as u16
                     };
                     storage
                         .change_default_acl(
@@ -3727,7 +3725,10 @@ fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {
     match e {
         crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
-            sql_err!(crate::sql::eval::sqlstate::INTERNAL_IO_WAIT, "block fetch in progress")
+            sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_IO_WAIT,
+                "block fetch in progress"
+            )
         }
         other => sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", other),
     }

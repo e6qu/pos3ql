@@ -1,7 +1,7 @@
 //! The VSR replica state machine.
 
-use super::message::{LogEntry, Message, MessageBody, MAX_LOG};
-use super::{primary_of, quorum, ReplicaId};
+use super::message::{LogEntry, MAX_LOG, Message, MessageBody};
+use super::{ReplicaId, primary_of, quorum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
@@ -248,14 +248,20 @@ impl Replica {
             // Rate-limited so recovery traffic never outruns delivery.
             self.ticks_since_resend += 1;
             let resend_period = (self.view_change_timeout / 4).max(1);
-            let (lo, hi) = if self.ticks_since_resend >= resend_period && self.operation > self.commit {
-                self.ticks_since_resend = 0;
-                (self.commit + 1, self.operation)
-            } else {
-                (1, 0) // empty range
-            };
+            let (lo, hi) =
+                if self.ticks_since_resend >= resend_period && self.operation > self.commit {
+                    self.ticks_since_resend = 0;
+                    (self.commit + 1, self.operation)
+                } else {
+                    (1, 0) // empty range
+                };
             for target_op in lo..=hi {
-                if let Some(entry) = self.log_slice().iter().find(|e| e.operation == target_op).copied() {
+                if let Some(entry) = self
+                    .log_slice()
+                    .iter()
+                    .find(|e| e.operation == target_op)
+                    .copied()
+                {
                     let (view, commit) = (self.view, self.commit);
                     self.for_each_peer(|this, peer| {
                         this.outbox.push(Message {
@@ -285,7 +291,9 @@ impl Replica {
                 commit,
                 entry,
             } => self.on_prepare(m.from, view, operation, commit, entry),
-            MessageBody::PrepareOk { view, operation } => self.on_prepare_ok(m.from, view, operation),
+            MessageBody::PrepareOk { view, operation } => {
+                self.on_prepare_ok(m.from, view, operation)
+            }
             MessageBody::Commit { view, commit } => self.on_commit_msg(view, commit),
             MessageBody::StartViewChange { view } => self.on_start_view_change(m.from, view),
             MessageBody::DoViewChange {
@@ -308,7 +316,14 @@ impl Replica {
 
     // ---- normal operation ----
 
-    fn on_prepare(&mut self, from: ReplicaId, view: u64, operation: u64, commit: u64, entry: LogEntry) {
+    fn on_prepare(
+        &mut self,
+        from: ReplicaId,
+        view: u64,
+        operation: u64,
+        commit: u64,
+        entry: LogEntry,
+    ) {
         if view < self.view {
             return;
         }
@@ -355,7 +370,10 @@ impl Replica {
     }
 
     fn maybe_commit_primary(&mut self) {
-        let votes = self.prepare_ok_from[..self.n].iter().filter(|v| **v).count();
+        let votes = self.prepare_ok_from[..self.n]
+            .iter()
+            .filter(|v| **v)
+            .count();
         if votes >= quorum(self.n) && self.prepare_ok_op > self.commit {
             self.advance_commit(self.prepare_ok_op);
             // Tell backups to commit.
@@ -702,7 +720,10 @@ mod tests {
         settle(&mut c);
         let before = c[0].operation;
         c[0].on_request(7, 1, 10); // same client+request
-        assert_eq!(c[0].operation, before, "duplicate must not advance operation");
+        assert_eq!(
+            c[0].operation, before,
+            "duplicate must not advance operation"
+        );
     }
 
     #[test]
@@ -731,14 +752,21 @@ mod tests {
                 continue; // primary 0 is down
             }
             c[m.to as usize].on_message(m);
-            let out: Vec<_> = c[m.to as usize].outbox().drain().filter(|m| m.to != 0).collect();
+            let out: Vec<_> = c[m.to as usize]
+                .outbox()
+                .drain()
+                .filter(|m| m.to != 0)
+                .collect();
             queue.extend(out);
         }
         // New view is 1, primary is replica 1, and the committed operation survives.
         assert_eq!(c[1].view, 1);
         assert!(c[1].is_primary());
         assert_eq!(c[1].status, Status::Normal);
-        assert!(c[1].commit >= 1, "committed operation lost across view change");
+        assert!(
+            c[1].commit >= 1,
+            "committed operation lost across view change"
+        );
         assert!(c[2].commit >= 1);
 
         // The new primary can accept and commit a fresh operation with only 1 and 2.
@@ -752,9 +780,16 @@ mod tests {
                 continue;
             }
             c[m.to as usize].on_message(m);
-            let out: Vec<_> = c[m.to as usize].outbox().drain().filter(|m| m.to != 0).collect();
+            let out: Vec<_> = c[m.to as usize]
+                .outbox()
+                .drain()
+                .filter(|m| m.to != 0)
+                .collect();
             queue.extend(out);
         }
-        assert_eq!(c[1].commit, 2, "new primary failed to commit after view change");
+        assert_eq!(
+            c[1].commit, 2,
+            "new primary failed to commit after view change"
+        );
     }
 }

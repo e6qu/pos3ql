@@ -640,17 +640,38 @@ fn run_storage_vopr() {
     let seed0 = env_or("POS3QL_STORAGE_VOPR_SEED0", 0x705e3);
     let seeds = env_or("POS3QL_STORAGE_VOPR_SEEDS", 4);
     let steps = env_or("POS3QL_STORAGE_VOPR_STEPS", 120);
-    for seed in seed0..seed0 + seeds {
-        let mut world = World::new(seed);
-        for _ in 0..steps {
-            world.step();
-        }
-        world.cold_start();
-        println!(
-            "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket",
-            world.steps_taken,
-            world.model.len(),
-            world.bucket.borrow().object_count(),
+    const MAX_WORKERS: usize = 4;
+    let workers = usize::try_from(seeds)
+        .unwrap_or(usize::MAX)
+        .min(MAX_WORKERS);
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let worker = worker as u64;
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("storage-vopr-worker-{worker}"))
+                .stack_size(2_097_152)
+                .spawn(move || {
+                    for seed in (seed0 + worker..seed0 + seeds).step_by(workers) {
+                        let mut world = World::new(seed);
+                        for _ in 0..steps {
+                            world.step();
+                        }
+                        world.cold_start();
+                        println!(
+                            "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket",
+                            world.steps_taken,
+                            world.model.len(),
+                            world.bucket.borrow().object_count(),
+                        );
+                    }
+                })
+                .expect("spawn storage VOPR worker"),
         );
+    }
+    for handle in handles {
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

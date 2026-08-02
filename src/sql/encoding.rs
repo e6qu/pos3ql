@@ -2,26 +2,34 @@
 //! base64, hex, and PostgreSQL's `escape` format. All allocate their result in
 //! the statement arena so arbitrarily large values never truncate.
 
-use crate::sql::eval::sqlstate;
 use crate::mem::arena::Arena;
+use crate::sql::eval::sqlstate;
 use crate::sql_err;
 
-use super::eval::{arena_full, SqlError};
+use super::eval::{SqlError, arena_full};
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn bad_base64() -> SqlError {
-    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid symbol found while decoding base64 sequence")
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "invalid symbol found while decoding base64 sequence"
+    )
 }
 
 fn bad_hex() -> SqlError {
-    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal digit")
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "invalid hexadecimal digit"
+    )
 }
 
 /// Standard base64 with padding, into the arena.
 pub fn base64_encode<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a str, SqlError> {
     let out_len = bytes.len().div_ceil(3) * 4;
-    let out = arena.alloc_slice_with(out_len, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(out_len, |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut at = 0usize;
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -30,8 +38,16 @@ pub fn base64_encode<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a str, SqlE
         let n = (b0 << 16) | (b1 << 8) | b2;
         out[at] = BASE64[(n >> 18) as usize & 0x3f];
         out[at + 1] = BASE64[(n >> 12) as usize & 0x3f];
-        out[at + 2] = if chunk.len() > 1 { BASE64[(n >> 6) as usize & 0x3f] } else { b'=' };
-        out[at + 3] = if chunk.len() > 2 { BASE64[n as usize & 0x3f] } else { b'=' };
+        out[at + 2] = if chunk.len() > 1 {
+            BASE64[(n >> 6) as usize & 0x3f]
+        } else {
+            b'='
+        };
+        out[at + 3] = if chunk.len() > 2 {
+            BASE64[n as usize & 0x3f]
+        } else {
+            b'='
+        };
         at += 4;
     }
     Ok(unsafe { core::str::from_utf8_unchecked(out) })
@@ -55,7 +71,9 @@ pub fn base64_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlEr
     let mut bits = 0u32;
     // A base64 string decodes to at most 3/4 of its length.
     let cap = text.len() / 4 * 3 + 3;
-    let out = arena.alloc_slice_with(cap, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(cap, |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut n = 0usize;
     for &c in text.as_bytes() {
         match c {
@@ -78,7 +96,9 @@ pub fn base64_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlEr
 /// Lowercase hex, into the arena.
 pub fn hex_encode<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a str, SqlError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let out = arena.alloc_slice_with(bytes.len() * 2, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(bytes.len() * 2, |_| 0u8)
+        .map_err(|_| arena_full())?;
     for (i, b) in bytes.iter().enumerate() {
         out[i * 2] = HEX[(b >> 4) as usize];
         out[i * 2 + 1] = HEX[(b & 0xf) as usize];
@@ -97,7 +117,9 @@ fn hex_value(c: u8) -> Option<u8> {
 
 /// Decodes hex (whitespace between bytes ignored, per PostgreSQL) into the arena.
 pub fn hex_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let out = arena.alloc_slice_with(text.len() / 2 + 1, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(text.len() / 2 + 1, |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut n = 0usize;
     let mut high: Option<u8> = None;
     for &c in text.as_bytes() {
@@ -115,7 +137,10 @@ pub fn hex_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError
         }
     }
     if high.is_some() {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal data: odd number of digits"));
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid hexadecimal data: odd number of digits"
+        ));
     }
     Ok(&out[..n])
 }
@@ -131,7 +156,9 @@ pub fn escape_encode<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a str, SqlE
             _ => 4,
         })
         .sum();
-    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(len, |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut at = 0usize;
     for &b in bytes {
         match b {
@@ -159,7 +186,9 @@ pub fn escape_encode<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a str, SqlE
 /// Parses PostgreSQL's `escape` bytea text (backslash escapes) into bytes.
 pub fn escape_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
     let bytes = text.as_bytes();
-    let out = arena.alloc_slice_with(bytes.len(), |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(bytes.len(), |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut n = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
@@ -180,13 +209,21 @@ pub fn escape_decode<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlEr
                 let (Some(d1 @ b'0'..=b'7'), Some(d2 @ b'0'..=b'7')) =
                     (bytes.get(i + 2), bytes.get(i + 3))
                 else {
-                    return Err(sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid input syntax for type bytea"));
+                    return Err(sql_err!(
+                        sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                        "invalid input syntax for type bytea"
+                    ));
                 };
                 out[n] = ((d0 - b'0') << 6) | ((d1 - b'0') << 3) | (d2 - b'0');
                 n += 1;
                 i += 4;
             }
-            _ => return Err(sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid input syntax for type bytea")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                    "invalid input syntax for type bytea"
+                ));
+            }
         }
     }
     Ok(&out[..n])

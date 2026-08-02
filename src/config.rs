@@ -211,7 +211,10 @@ impl Config {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
-                return Err(ConfigError::at(line_no, format!("expected key = value, got '{line}'")));
+                return Err(ConfigError::at(
+                    line_no,
+                    format!("expected key = value, got '{line}'"),
+                ));
             };
             let key = key.trim();
             let value = value.trim();
@@ -244,7 +247,10 @@ impl Config {
             match canonical_key {
                 "listen_addr" => config.listen_addr = value.to_string(),
                 "data_dir" => config.data_dir = value.to_string(),
-                "max_connections" => config.max_connections = parse_count(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "max_connections" => {
+                    config.max_connections =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "auth" => {
                     if !matches!(value, "trust" | "password" | "scram-sha-256") {
                         return Err(ConfigError::at(
@@ -255,7 +261,10 @@ impl Config {
                     config.auth = value.to_string();
                 }
                 "password" => config.password = value.to_string(),
-                "replica_id" => config.replica_id = parse_count(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "replica_id" => {
+                    config.replica_id =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "cluster" => {
                     config.cluster = value
                         .split(',')
@@ -263,27 +272,89 @@ impl Config {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
-                "conn_recv_buffer_bytes" => config.conn_recv_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "conn_send_buffer_bytes" => config.conn_send_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "sql_arena_bytes" => config.sql_arena_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "work_arena_bytes" => config.work_arena_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "max_prepared" => config.max_prepared = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "prepared_bytes" => config.prepared_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "max_portals" => config.max_portals = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "portal_bytes" => config.portal_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "portal_result_bytes" => config.portal_result_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "txn_rows" => config.txn_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "memtable_bytes" => config.memtable_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "wal_bytes" => config.wal_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "wal_buffer_bytes" => config.wal_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "max_tables" => config.max_tables = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "max_cursors" => config.max_cursors = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "cursor_bytes" => config.cursor_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "table_rows" => config.table_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "value_index_rows" => config.value_index_rows = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "max_value_indexes" => config.max_value_indexes = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "block_cache_bytes" => config.block_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "disk_cache_bytes" => config.disk_cache_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "conn_recv_buffer_bytes" => {
+                    config.conn_recv_buffer_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "conn_send_buffer_bytes" => {
+                    config.conn_send_buffer_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "sql_arena_bytes" => {
+                    config.sql_arena_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "work_arena_bytes" => {
+                    config.work_arena_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "max_prepared" => {
+                    config.max_prepared =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "prepared_bytes" => {
+                    config.prepared_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "max_portals" => {
+                    config.max_portals =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "portal_bytes" => {
+                    config.portal_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "portal_result_bytes" => {
+                    config.portal_result_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "txn_rows" => {
+                    config.txn_rows =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "memtable_bytes" => {
+                    config.memtable_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "wal_bytes" => {
+                    config.wal_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "wal_buffer_bytes" => {
+                    config.wal_buffer_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "max_tables" => {
+                    config.max_tables =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_cursors" => {
+                    config.max_cursors =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "cursor_bytes" => {
+                    config.cursor_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "table_rows" => {
+                    config.table_rows =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "value_index_rows" => {
+                    config.value_index_rows =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_value_indexes" => {
+                    config.max_value_indexes =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "block_cache_bytes" => {
+                    config.block_cache_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "disk_cache_bytes" => {
+                    config.disk_cache_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "wal_upload" => {
                     config.wal_upload = match value {
                         "on" | "true" => true,
@@ -292,7 +363,7 @@ impl Config {
                             return Err(ConfigError::at(
                                 line_no,
                                 format!("wal_upload must be on or off, got '{other}'"),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -304,11 +375,14 @@ impl Config {
                             return Err(ConfigError::at(
                                 line_no,
                                 format!("wal_upload_sync must be on or off, got '{other}'"),
-                            ))
+                            ));
                         }
                     }
                 }
-                "wal_upload_buffer_bytes" => config.wal_upload_buffer_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "wal_upload_buffer_bytes" => {
+                    config.wal_upload_buffer_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "object_store" => match value {
                     "on" | "true" => config.object_store_on = true,
                     "off" | "false" => config.object_store_on = false,
@@ -320,7 +394,7 @@ impl Config {
                         return Err(ConfigError::at(
                             line_no,
                             format!("object_store must be on, off or sim, got '{other}'"),
-                        ))
+                        ));
                     }
                 },
                 "object_store_endpoint" => config.object_store_endpoint = value.to_string(),
@@ -329,10 +403,22 @@ impl Config {
                 "object_store_region" => config.object_store_region = value.to_string(),
                 "object_store_access_key" => config.object_store_access_key = value.to_string(),
                 "object_store_secret_key" => config.object_store_secret_key = value.to_string(),
-                "object_store_head_bytes" => config.object_store_head_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "object_store_response_bytes" => config.object_store_response_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
-                "object_store_get_slots" => config.object_store_get_slots = parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize,
-                "object_store_hedge_after_ms" => config.object_store_hedge_after_ms = u64::from(parse_count(value).map_err(|m| ConfigError::at(line_no, m))?),
+                "object_store_head_bytes" => {
+                    config.object_store_head_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "object_store_response_bytes" => {
+                    config.object_store_response_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "object_store_get_slots" => {
+                    config.object_store_get_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "object_store_hedge_after_ms" => {
+                    config.object_store_hedge_after_ms =
+                        u64::from(parse_count(value).map_err(|m| ConfigError::at(line_no, m))?)
+                }
                 "object_store_tls" => {
                     config.object_store_tls = match value {
                         "on" | "true" => true,
@@ -341,12 +427,15 @@ impl Config {
                             return Err(ConfigError::at(
                                 line_no,
                                 format!("object_store_tls must be on or off, got '{other}'"),
-                            ))
+                            ));
                         }
                     }
                 }
                 "object_store_tls_ca_file" => config.object_store_tls_ca_file = value.to_string(),
-                "tls_pool_bytes" => config.tls_pool_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "tls_pool_bytes" => {
+                    config.tls_pool_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "tls_on" => {
                     config.tls_on = match value {
                         "on" | "true" => true,
@@ -355,13 +444,16 @@ impl Config {
                             return Err(ConfigError::at(
                                 line_no,
                                 format!("tls_on must be on or off, got '{other}'"),
-                            ))
+                            ));
                         }
                     }
                 }
                 "tls_cert_file" => config.tls_cert_file = value.to_string(),
                 "tls_key_file" => config.tls_key_file = value.to_string(),
-                "copy_line_bytes" => config.copy_line_bytes = parse_size(value).map_err(|m| ConfigError::at(line_no, m))?,
+                "copy_line_bytes" => {
+                    config.copy_line_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
@@ -393,10 +485,16 @@ impl Config {
         // toggle rather than silently accept plaintext.
         if config.tls_on {
             if config.tls_cert_file.is_empty() {
-                return Err(ConfigError::at(0, "tls_on requires tls_cert_file".to_string()));
+                return Err(ConfigError::at(
+                    0,
+                    "tls_on requires tls_cert_file".to_string(),
+                ));
             }
             if config.tls_key_file.is_empty() {
-                return Err(ConfigError::at(0, "tls_on requires tls_key_file".to_string()));
+                return Err(ConfigError::at(
+                    0,
+                    "tls_on requires tls_key_file".to_string(),
+                ));
             }
         }
         Ok(config)
@@ -557,7 +655,10 @@ sql_arena_bytes = 4096
     fn unknown_key_is_an_error_with_line_number() {
         let err = Config::parse("listen_addr = x\nmax_conections = 4\n").unwrap_err();
         assert_eq!(err.line, 2);
-        assert!(err.message.contains("unknown key 'max_conections'"), "{err}");
+        assert!(
+            err.message.contains("unknown key 'max_conections'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -570,7 +671,10 @@ sql_arena_bytes = 4096
     #[test]
     fn object_store_defaults_to_commit_durable_on_bucket() {
         let c = Config::parse("object_store = on\n").unwrap();
-        assert!(c.wal_upload && c.wal_upload_sync, "the plan-of-record default");
+        assert!(
+            c.wal_upload && c.wal_upload_sync,
+            "the plan-of-record default"
+        );
         assert!(Config::parse("object_store = on\nwal_upload = off\n").is_err());
         assert!(Config::parse("object_store = on\nwal_upload_sync = off\n").is_err());
         // Without object storage nothing is implied.
@@ -614,7 +718,10 @@ sql_arena_bytes = 4096
 
     #[test]
     fn malformed_values_are_errors() {
-        assert!(Config::parse("memtable_bytes = 16MB\n").is_err(), "MB is not MiB");
+        assert!(
+            Config::parse("memtable_bytes = 16MB\n").is_err(),
+            "MB is not MiB"
+        );
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
         assert!(Config::parse("just some words\n").is_err());
@@ -642,7 +749,10 @@ sql_arena_bytes = 4096
         // 50+100+200+300 + 2*30 + 2*(20+40) + cursor pool per connection.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
         assert_eq!(plan.connections, (950 + cursor_pool) * 10);
-        assert_eq!(plan.total(), (950 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250);
+        assert_eq!(
+            plan.total(),
+            (950 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250
+        );
     }
 
     #[test]

@@ -769,18 +769,28 @@ fn external_recursive_tree(
         })
     };
     external_set_body_into(
-        storage, txid, tree, &[], None, None, false, arena, params, &mut |values| {
-        storage
-            .with_block_store(|blocks| {
-                sorter.push_projected_by(
-                    blocks,
-                    values.len(),
-                    |column| values[column],
-                    &mut compare,
-                )
-            })
-            .expect("recursive work table has a block store")
-    })?;
+        storage,
+        txid,
+        tree,
+        &[],
+        None,
+        None,
+        false,
+        arena,
+        params,
+        &mut |values| {
+            storage
+                .with_block_store(|blocks| {
+                    sorter.push_projected_by(
+                        blocks,
+                        values.len(),
+                        |column| values[column],
+                        &mut compare,
+                    )
+                })
+                .expect("recursive work table has a block store")
+        },
+    )?;
     storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("recursive work table has a block store")
@@ -972,14 +982,7 @@ fn materialize_recursive<'a>(
     };
 
     if storage.spill_attached() {
-        let base = external_recursive_tree(
-            base_tree,
-            storage,
-            txid,
-            arena,
-            params,
-            !union_all,
-        )?;
+        let base = external_recursive_tree(base_tree, storage, txid, arena, params, !union_all)?;
         let mut all = if union_all {
             base
         } else {
@@ -1030,14 +1033,8 @@ fn materialize_recursive<'a>(
                     ));
                 }
             }
-            let candidates = external_recursive_tree(
-                step_tree,
-                storage,
-                txid,
-                arena,
-                params,
-                !union_all,
-            )?;
+            let candidates =
+                external_recursive_tree(step_tree, storage, txid, arena, params, !union_all)?;
             let fresh = if union_all {
                 candidates
             } else {

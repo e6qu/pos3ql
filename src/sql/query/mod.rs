@@ -1337,7 +1337,14 @@ pub(super) fn collect_windows<'a>(
     out: &mut [&'a Expr<'a>; MAX_WINDOWS],
     n: &mut usize,
 ) -> Result<(), SqlError> {
-    if let Expr::Call { over: Some(_), distinct, order_by, filter, .. } = expression {
+    if let Expr::Call {
+        over: Some(_),
+        distinct,
+        order_by,
+        filter,
+        ..
+    } = expression
+    {
         // PostgreSQL rejects these call decorations on window functions in
         // parse analysis; accepting them would silently compute a different
         // query.
@@ -2851,9 +2858,16 @@ fn select_into_rows_mode<'a>(
     if let Some(tree) = statement.set_body {
         if storage.spill_attached() {
             return setops::external_set_body_into(
-                storage, txid, tree,
-                statement.order_by, statement.limit, statement.offset, statement.with_ties,
-                arena, params, emit,
+                storage,
+                txid,
+                tree,
+                statement.order_by,
+                statement.limit,
+                statement.offset,
+                statement.with_ties,
+                arena,
+                params,
+                emit,
             );
         }
         let (mut rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
@@ -2874,9 +2888,7 @@ fn select_into_rows_mode<'a>(
             rows = rows_mut;
         }
         let start = (offset as usize).min(rows.len());
-        let mut end = offset
-            .saturating_add(limit)
-            .min(rows.len() as u64) as usize;
+        let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
         if let Some(ref cols) = columns_owned
             && statement.with_ties
             && limit > 0

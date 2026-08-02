@@ -2917,9 +2917,8 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("schemas")? {
             DefaultPrivilegeObjectKind::Schemas
         } else {
-            return Err(self.unexpected(
-                "expected TABLES, SEQUENCES, FUNCTIONS, ROUTINES, TYPES, or SCHEMAS",
-            ));
+            return Err(self
+                .unexpected("expected TABLES, SEQUENCES, FUNCTIONS, ROUTINES, TYPES, or SCHEMAS"));
         };
         if !schemas.is_empty() && kind == DefaultPrivilegeObjectKind::Schemas {
             return Err(ParseError {

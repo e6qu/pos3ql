@@ -423,7 +423,10 @@ fn scan_node(
             .saturating_add(generations.saturating_mul(2))
     };
     let index = index_name(storage, scope, table, predicate, txid);
-    let blocks = if index.is_some() && generations != 0 {
+    let use_index = index.is_some()
+        && generations != 0
+        && !storage.sequential_spill_scan_is_cheaper(slot, output_rows, txid);
+    let blocks = if use_index {
         // One bounded key-generation descent per immutable generation, then
         // only the row blocks expected to survive the predicate.
         generations.saturating_mul(3).saturating_add(
@@ -443,11 +446,11 @@ fn scan_node(
     let io_cost = object_requests as f64 * 4.0
         + (blocks.saturating_sub(object_requests) as f64)
             * (ram_probability * 0.01 + disk_probability * 0.1);
-    let cpu_rows = if index.is_some() { output_rows } else { rows };
+    let cpu_rows = if use_index { output_rows } else { rows };
     let cpu_cost = cpu_rows as f64 * 0.01;
     let mut relation = StackStr::new();
     let _ = write!(relation, "{}", scope.names[table]);
-    let name = if let Some(index) = index {
+    let name = if let Some(index) = index.filter(|_| use_index) {
         let mut name = StackStr::new();
         let _ = write!(name, "Index Scan using {}", index.as_str());
         name

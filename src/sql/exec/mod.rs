@@ -1366,13 +1366,9 @@ pub fn drop_table(
                     {
                         *target = Some(child_definition.columns()[column].name);
                     }
-                    if let Err(error) = storage.write_table_def(
-                        child,
-                        txn.txid,
-                        updated,
-                        &identity_mapping,
-                        false,
-                    ) {
+                    if let Err(error) =
+                        storage.write_table_def(child, txn.txid, updated, &identity_mapping, false)
+                    {
                         return sql_fail(error);
                     }
                     if let Err(error) =
@@ -1815,8 +1811,7 @@ pub fn alter_owner(
         storage.restore_object_owner(object, prior);
         return sql_fail(error);
     }
-    if let Err(error) =
-        rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
+    if let Err(error) = rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
     {
         return sql_fail(error);
     }
@@ -2786,9 +2781,7 @@ pub fn alter_default_privileges(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{DefaultPrivilegeAction, DefaultPrivilegeObjectKind};
-    use crate::storage::{
-        DefaultPrivilegeClass, DEFAULT_ACL_ALL_SCHEMAS, MAX_ROLES, PUBLIC_ROLE,
-    };
+    use crate::storage::{DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_ROLES, PUBLIC_ROLE};
 
     let (privileges, kind, grantees, grant, grant_option_only, grant_option) = match action {
         DefaultPrivilegeAction::Grant {
@@ -2803,14 +2796,7 @@ pub fn alter_default_privileges(
             kind,
             grantees,
             cascade: _,
-        } => (
-            privileges,
-            kind,
-            grantees,
-            false,
-            grant_option_only,
-            false,
-        ),
+        } => (privileges, kind, grantees, false, grant_option_only, false),
     };
     let class = match kind {
         DefaultPrivilegeObjectKind::Tables => DefaultPrivilegeClass::Table,
@@ -2938,12 +2924,10 @@ pub fn alter_default_privileges(
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
                 };
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
-                        slot: slot as u32,
-                        prior,
-                    })
-                {
+                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
+                    slot: slot as u32,
+                    prior,
+                }) {
                     storage.restore_default_acl_pending(slot, prior);
                     return sql_fail(error);
                 }
@@ -2960,8 +2944,8 @@ fn apply_default_privileges_to_new_object(
     object: crate::storage::AccessObject,
 ) -> Result<(), SqlError> {
     use crate::storage::{
-        AccessClass, DefaultPrivilegeClass, PrivilegeSet, DEFAULT_ACL_ALL_SCHEMAS, MAX_ROLES,
-        PUBLIC_ROLE,
+        AccessClass, DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_ROLES, PUBLIC_ROLE,
+        PrivilegeSet,
     };
     let class = match object.class {
         AccessClass::Table | AccessClass::View | AccessClass::MaterializedView => {
@@ -3005,20 +2989,10 @@ fn apply_default_privileges_to_new_object(
             }
             role_index as u16
         };
-        let (global_defined, _, _) = storage.default_acl_state(
-            owner,
-            DEFAULT_ACL_ALL_SCHEMAS,
-            class,
-            grantee,
-            txn.txid,
-        );
-        let (global_privileges, global_options) = storage.default_acl_effective(
-            owner,
-            DEFAULT_ACL_ALL_SCHEMAS,
-            class,
-            grantee,
-            txn.txid,
-        );
+        let (global_defined, _, _) =
+            storage.default_acl_state(owner, DEFAULT_ACL_ALL_SCHEMAS, class, grantee, txn.txid);
+        let (global_privileges, global_options) =
+            storage.default_acl_effective(owner, DEFAULT_ACL_ALL_SCHEMAS, class, grantee, txn.txid);
         let (schema_defined, schema_privileges, schema_options) =
             if schema == DEFAULT_ACL_ALL_SCHEMAS {
                 (false, PrivilegeSet::NONE, PrivilegeSet::NONE)
@@ -3036,14 +3010,8 @@ fn apply_default_privileges_to_new_object(
         {
             continue;
         }
-        let (slot, prior) = storage.change_acl(
-            object,
-            grantee,
-            owner,
-            privileges,
-            grant_options,
-            txn.txid,
-        )?;
+        let (slot, prior) =
+            storage.change_acl(object, grantee, owner, privileges, grant_options, txn.txid)?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
@@ -3234,14 +3202,11 @@ fn drop_owned_privileges(
     txn: &mut TxnState,
     roles: &[u16],
 ) -> Result<(), SqlError> {
-    use crate::storage::{PrivilegeSet, MAX_ACL_ENTRIES, PUBLIC_ROLE};
-    let mut queue_objects = [
-        crate::storage::AccessObject {
-            class: crate::storage::AccessClass::Table,
-            slot: 0,
-        };
-        MAX_ACL_ENTRIES
-    ];
+    use crate::storage::{MAX_ACL_ENTRIES, PUBLIC_ROLE, PrivilegeSet};
+    let mut queue_objects = [crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Table,
+        slot: 0,
+    }; MAX_ACL_ENTRIES];
     let mut queue_roles = [0u16; MAX_ACL_ENTRIES];
     let mut queue_privileges = [PrivilegeSet::NONE; MAX_ACL_ENTRIES];
     let mut queue_count = 0usize;
@@ -3353,15 +3318,14 @@ pub fn drop_owned(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{
-        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS, MAX_ROLES,
-        MAX_SCHEMAS, MAX_SEQUENCES,
+        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS, MAX_ROLES, MAX_SCHEMAS,
+        MAX_SEQUENCES,
     };
     let mut owned_roles = [0u16; MAX_ROLES];
-    let owned_role_count =
-        match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
-            Ok(count) => count,
-            Err(error) => return sql_fail(error),
-        };
+    let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
     let owned_roles = &owned_roles[..owned_role_count];
     if let Err(error) = drop_owned_privileges(storage, txn, owned_roles) {
         return sql_fail(error);
@@ -3482,13 +3446,16 @@ pub fn drop_owned(
                 continue;
             }
             let schema = storage.schema_def(slot).name;
-            let owner = storage.role_name(storage.object_owner(
-                AccessObject {
-                    class: AccessClass::Schema,
-                    slot: slot as u16,
-                },
+            let owner = storage.role_name(
+                storage.object_owner(
+                    AccessObject {
+                        class: AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                ),
                 txn.txid,
-            ), txn.txid);
+            );
             let outcome = run_as_role(owner, || {
                 responder.without_command_complete(|responder| {
                     drop_schema(
@@ -3516,7 +3483,12 @@ pub fn drop_owned(
     let mut table_schemas = [SqlName::EMPTY; MAX_DEPENDENT_STORED_QUERIES];
     let mut table_names = [SqlName::EMPTY; MAX_DEPENDENT_STORED_QUERIES];
     let mut table_name_count = 0usize;
-    for (slot, selected) in tables.iter().copied().enumerate().take(storage.table_count()) {
+    for (slot, selected) in tables
+        .iter()
+        .copied()
+        .enumerate()
+        .take(storage.table_count())
+    {
         if !selected || !storage.table(slot).visible_to(txn.txid) {
             continue;
         }
@@ -5134,12 +5106,10 @@ pub fn create_view(
                         Ok(change) => change,
                         Err(error) => return sql_fail(error),
                     };
-                    if let Err(error) =
-                        txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-                            slot: changed as u32,
-                            prior,
-                        })
-                    {
+                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+                        slot: changed as u32,
+                        prior,
+                    }) {
                         storage.restore_acl_pending(changed, prior);
                         return sql_fail(error);
                     }

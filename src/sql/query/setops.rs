@@ -10,7 +10,7 @@ use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql::ast::{Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{compare_datums, sqlstate, SqlError};
+use crate::sql::eval::{SqlError, compare_datums, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, Datum};
@@ -18,8 +18,8 @@ use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
 use super::{
-    arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type, select_into_rows,
-    select_into_rows_recycling, sql_fail, sql_ok, Outcome, QueryScope,
+    Outcome, QueryScope, arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type,
+    select_into_rows, select_into_rows_recycling, sql_fail, sql_ok,
 };
 
 const MAX_SET_LEAVES: usize = 32;
@@ -103,7 +103,8 @@ pub fn set_query<'a>(
     // output column, so ties compare those columns directly).
     if q.with_ties && limit > 0 && end < rows.len() && end > start {
         let boundary = rows[end - 1];
-        while end < rows.len() && set_rows_tie(boundary, rows[end], q.order_by, &columns[..n_cols]) {
+        while end < rows.len() && set_rows_tie(boundary, rows[end], q.order_by, &columns[..n_cols])
+        {
             end += 1;
         }
     }
@@ -145,13 +146,16 @@ fn resolve_set_order(
             Expr::Column {
                 name,
                 qualifier: None,
-            } => columns.iter().position(|column| column.name == *name).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "ORDER BY column \"{}\" does not exist in the set-operation result",
-                    name
-                )
-            })?,
+            } => columns
+                .iter()
+                .position(|column| column.name == *name)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "ORDER BY column \"{}\" does not exist in the set-operation result",
+                        name
+                    )
+                })?,
             _ => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -232,28 +236,37 @@ fn external_set_leaf<'a>(
     } else {
         insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
     };
-    select_into_rows_recycling(storage, txid, select, arena, params, None, None, &mut |values| {
-        if values.len() != target.len() {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "each UNION query must have the same number of columns"
-            ));
-        }
-        let mut coerced = [Datum::Null; MAX_PROJ];
-        for column in 0..target.len() {
-            coerced[column] = crate::sql::eval::cast_to(values[column], target[column], arena)?;
-        }
-        storage
-            .with_block_store(|blocks| {
-                sorter.push_projected_by(
-                    blocks,
-                    target.len(),
-                    |column| coerced[column],
-                    &mut compare,
-                )
-            })
-            .expect("spill-attached block store")
-    })?;
+    select_into_rows_recycling(
+        storage,
+        txid,
+        select,
+        arena,
+        params,
+        None,
+        None,
+        &mut |values| {
+            if values.len() != target.len() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "each UNION query must have the same number of columns"
+                ));
+            }
+            let mut coerced = [Datum::Null; MAX_PROJ];
+            for column in 0..target.len() {
+                coerced[column] = crate::sql::eval::cast_to(values[column], target[column], arena)?;
+            }
+            storage
+                .with_block_store(|blocks| {
+                    sorter.push_projected_by(
+                        blocks,
+                        target.len(),
+                        |column| coerced[column],
+                        &mut compare,
+                    )
+                })
+                .expect("spill-attached block store")
+        },
+    )?;
     storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("spill-attached block store")
@@ -430,7 +443,10 @@ fn external_set_tree<'a>(
 /// Streams a set-operation body from immutable provider-neutral runs. This is
 /// the retention-free row-source seam used by INSERT/CTAS and derived
 /// consumers; decoded values borrow only the reader's current row.
-#[expect(clippy::too_many_arguments, reason = "set-operation execution plumbing")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set-operation execution plumbing"
+)]
 pub(crate) fn external_set_body_into<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -447,8 +463,7 @@ pub(crate) fn external_set_body_into<'a>(
     let column_count = describe_set_body(storage, tree, txid, &mut columns, arena)?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
-        target[column] =
-            exec::coltype_of_oid(columns[column].type_oid).unwrap_or(ColType::Text);
+        target[column] = exec::coltype_of_oid(columns[column].type_oid).unwrap_or(ColType::Text);
     }
     let Some(run) = external_set_tree(
         tree,
@@ -458,7 +473,8 @@ pub(crate) fn external_set_body_into<'a>(
         params,
         &target[..column_count],
         false,
-    )? else {
+    )?
+    else {
         return Ok(());
     };
     let limit = exec::eval_limit_pub(limit, arena, params)?;
@@ -653,7 +669,10 @@ fn collect_set_leaves<'a>(
     match tree {
         SetTree::Select(s) => {
             if *n == MAX_SET_LEAVES {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many set-operation branches"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many set-operation branches"
+                ));
             }
             out[*n] = Some(s);
             *n += 1;
@@ -698,7 +717,7 @@ fn leaf_col_unknown<'a>(
                 idx += 1;
             }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
-                return false
+                return false;
             }
         }
     }
@@ -733,7 +752,12 @@ fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     let numeric = |t| {
         matches!(
             t,
-            ColType::Int2 | ColType::Int4 | ColType::Int8 | ColType::Float4 | ColType::Float8 | ColType::Numeric
+            ColType::Int2
+                | ColType::Int4
+                | ColType::Int8
+                | ColType::Float4
+                | ColType::Float8
+                | ColType::Numeric
         )
     };
     if numeric(a) && numeric(b) {
@@ -755,7 +779,12 @@ fn eval_set_tree<'a>(
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
         SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, target),
-        SetTree::Op { operator, all, left, right } => {
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => {
             let l = eval_set_tree(left, storage, txid, arena, params, target)?;
             let r = eval_set_tree(right, storage, txid, arena, params, target)?;
             combine_sets(*operator, *all, l, r, arena)
@@ -814,7 +843,7 @@ pub(crate) fn describe_set_body<'a>(
                             "UNION types {} and {} cannot be matched",
                             existing.name(),
                             lt.name()
-                        ))
+                        ));
                     }
                 },
             }
@@ -865,7 +894,9 @@ fn materialize_set_body_tied<'a>(
     for c in 0..n {
         tgt[c] = exec::coltype_of_oid(columns[c].type_oid).unwrap_or(ColType::Text);
     }
-    let target = arena.alloc_slice_copy(&tgt[..n]).map_err(|_| arena_full())?;
+    let target = arena
+        .alloc_slice_copy(&tgt[..n])
+        .map_err(|_| arena_full())?;
     let rows = eval_set_tree(tree, storage, txid, arena, params, target)?;
     Ok((rows, target, n))
 }
@@ -885,7 +916,9 @@ fn eval_set_leaf<'a>(
         Ok(())
     })?;
     let empty: &[u8] = &[];
-    let rows = arena.alloc_slice_with(count, |_| empty).map_err(|_| arena_full())?;
+    let rows = arena
+        .alloc_slice_with(count, |_| empty)
+        .map_err(|_| arena_full())?;
     let n = target.len();
     let mut at = 0usize;
     select_into_rows(storage, txid, s, arena, params, None, None, &mut |vals| {
@@ -996,21 +1029,17 @@ fn combine_sets<'a>(
 /// Whether two set-operation output rows tie on every ORDER BY column (the
 /// `WITH TIES` peer test). The ORDER BY has already been validated by
 /// [`sort_set_rows`], so an unresolvable key conservatively counts as no tie.
-pub(crate) fn set_rows_tie(
-    a: &[u8],
-    b: &[u8],
-    order_by: &[OrderBy],
-    columns: &[ColDesc],
-) -> bool {
+pub(crate) fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[ColDesc]) -> bool {
     for ob in order_by {
         let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
-            Expr::Column { name, qualifier: None } => {
-                match columns.iter().position(|c| c.name == *name) {
-                    Some(i) => i,
-                    None => return false,
-                }
-            }
+            Expr::Column {
+                name,
+                qualifier: None,
+            } => match columns.iter().position(|c| c.name == *name) {
+                Some(i) => i,
+                None => return false,
+            },
             _ => return false,
         };
         let va = exec::decode_projected_pub(a, index);
@@ -1042,23 +1071,24 @@ pub(crate) fn sort_set_rows(
     for ob in order_by {
         let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
-            Expr::Column { name, qualifier: None } => {
-                match columns.iter().position(|c| c.name == *name) {
-                    Some(i) => i,
-                    None => {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "ORDER BY column \"{}\" does not exist in the set-operation result",
-                            name
-                        ))
-                    }
+            Expr::Column {
+                name,
+                qualifier: None,
+            } => match columns.iter().position(|c| c.name == *name) {
+                Some(i) => i,
+                None => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "ORDER BY column \"{}\" does not exist in the set-operation result",
+                        name
+                    ));
                 }
-            }
+            },
             _ => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "ORDER BY on a set operation must name an output column or its position"
-                ))
+                ));
             }
         };
         keys[nk] = (index, ob.descending, ob.nulls_first);
@@ -1075,10 +1105,28 @@ pub(crate) fn sort_set_rows(
             let vb = exec::decode_projected_pub(b, index);
             let ord = match (va.is_null(), vb.is_null()) {
                 (true, true) => core::cmp::Ordering::Equal,
-                (true, false) => if nulls_first { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater },
-                (false, true) => if nulls_first { core::cmp::Ordering::Greater } else { core::cmp::Ordering::Less },
+                (true, false) => {
+                    if nulls_first {
+                        core::cmp::Ordering::Less
+                    } else {
+                        core::cmp::Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if nulls_first {
+                        core::cmp::Ordering::Greater
+                    } else {
+                        core::cmp::Ordering::Less
+                    }
+                }
                 (false, false) => match compare_datums(&va, &vb) {
-                    Ok(o) => if descending { o.reverse() } else { o },
+                    Ok(o) => {
+                        if descending {
+                            o.reverse()
+                        } else {
+                            o
+                        }
+                    }
                     Err(e) => {
                         err = Some(e);
                         core::cmp::Ordering::Equal

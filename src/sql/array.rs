@@ -10,7 +10,7 @@ use crate::mem::arena::Arena;
 use crate::sql_err;
 use crate::storage::rowenc;
 
-use super::eval::{sqlstate, SqlError};
+use super::eval::{SqlError, sqlstate};
 use super::types::{ArrElem, Datum};
 
 /// Maximum number of elements in any one array value. Bounds the fixed
@@ -18,7 +18,10 @@ use super::types::{ArrElem, Datum};
 pub const MAX_ELEMENTS: usize = 1024;
 
 fn arena_full() -> SqlError {
-    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value exceeds the statement arena")
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "array value exceeds the statement arena"
+    )
 }
 
 /// Serializes `items` into the array blob form.
@@ -27,7 +30,9 @@ pub fn build<'a>(items: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError
     for it in items {
         total += 4 + rowenc::encoded_len(core::slice::from_ref(it));
     }
-    let out = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+    let out = arena
+        .alloc_slice_with(total, |_| 0u8)
+        .map_err(|_| arena_full())?;
     out[0..2].copy_from_slice(&(items.len() as u16).to_le_bytes());
     let mut at = 2;
     for it in items {
@@ -75,7 +80,13 @@ pub fn parse_literal<'a>(
     element: ArrElem,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    let bad = || sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed array literal: \"{}\"", text);
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "malformed array literal: \"{}\"",
+            text
+        )
+    };
     let t = text.trim();
     let inner = t
         .strip_prefix('{')
@@ -89,7 +100,10 @@ pub fn parse_literal<'a>(
         let mut i = 0;
         loop {
             if n == items.len() {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array literal too large"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "array literal too large"
+                ));
             }
             // Skip leading whitespace.
             while i < b.len() && b[i].is_ascii_whitespace() {
@@ -133,9 +147,7 @@ fn read_field<'a>(
         while j < b.len() {
             match b[j] {
                 b'"' => {
-                    let s = arena
-                        .alloc_str(buffer.as_str())
-                        .map_err(|_| arena_full())?;
+                    let s = arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?;
                     return Ok((s, true, j + 1));
                 }
                 b'\\' if j + 1 < b.len() => {
@@ -148,7 +160,10 @@ fn read_field<'a>(
                 }
             }
         }
-        Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "unterminated array element"))
+        Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "unterminated array element"
+        ))
     } else {
         // Unquoted: up to the next comma or closing brace.
         let start = i;

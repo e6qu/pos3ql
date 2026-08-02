@@ -40,7 +40,11 @@ fn int_overflow(target: &str) -> SqlError {
 /// the wrong number of comma-separated parts. PostgreSQL names neither the range
 /// type nor the element here, only that the literal is malformed.
 fn bad_literal(input: &str) -> SqlError {
-    sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed range literal: \"{}\"", input)
+    sql_err!(
+        sqlstate::INVALID_TEXT_REPRESENTATION,
+        "malformed range literal: \"{}\"",
+        input
+    )
 }
 
 /// A bound that is well-placed but is not a value of the element type. This is
@@ -61,7 +65,13 @@ fn bad_element(kind: RangeKind, value: &str) -> SqlError {
 pub fn parse<'a>(input: &'a str) -> Result<Parsed<'a>, SqlError> {
     let t = input.trim();
     if t.eq_ignore_ascii_case("empty") {
-        return Ok(Parsed { empty: true, lower: None, upper: None, lower_inc: false, upper_inc: false });
+        return Ok(Parsed {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+        });
     }
     let b = t.as_bytes();
     if b.len() < 2 {
@@ -91,8 +101,16 @@ pub fn parse<'a>(input: &'a str) -> Result<Parsed<'a>, SqlError> {
     let upper_text = unquote_bound(upper_raw.trim());
     Ok(Parsed {
         empty: false,
-        lower: if lower_text.is_empty() { None } else { Some(lower_text) },
-        upper: if upper_text.is_empty() { None } else { Some(upper_text) },
+        lower: if lower_text.is_empty() {
+            None
+        } else {
+            Some(lower_text)
+        },
+        upper: if upper_text.is_empty() {
+            None
+        } else {
+            Some(upper_text)
+        },
         lower_inc,
         upper_inc,
     })
@@ -145,9 +163,9 @@ fn element_text<'a>(raw: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a 
 /// the quotes, and nothing else.
 fn bound_needs_quote(text: &str) -> bool {
     text.is_empty()
-        || text
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b',' | b'(' | b')' | b'[' | b']'))
+        || text.bytes().any(|b| {
+            b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b',' | b'(' | b')' | b'[' | b']')
+        })
 }
 
 /// Renders a bound for output: its canonical element text, quoted (with any
@@ -168,7 +186,6 @@ fn bound_out<'a>(raw: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str
     let _ = quoted.write_char('"');
     alloc(arena, quoted.as_str())
 }
-
 
 /// Canonicalizes parsed bounds and renders the canonical range text into the
 /// arena. Discrete kinds become half-open `[lower, upper)`; an empty or
@@ -238,8 +255,16 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     // rendered as its element type prints it and quoted when that text needs it
     // — which is where a timestamp bound gains both its time-of-day and its
     // surrounding quotes, matching what PostgreSQL stores and shows.
-    let lb = if p.lower.is_some() && p.lower_inc { '[' } else { '(' };
-    let rb = if p.upper.is_some() && p.upper_inc { ']' } else { ')' };
+    let lb = if p.lower.is_some() && p.lower_inc {
+        '['
+    } else {
+        '('
+    };
+    let rb = if p.upper.is_some() && p.upper_inc {
+        ']'
+    } else {
+        ')'
+    };
     let lower_out = match p.lower {
         Some(v) => bound_out(v, kind, arena)?,
         None => "",
@@ -263,14 +288,24 @@ pub fn construct<'a>(
     let f = flags.unwrap_or("[)");
     let fb = f.as_bytes();
     if fb.len() != 2 {
-        return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid range bound flags: \"{}\"", f));
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid range bound flags: \"{}\"",
+            f
+        ));
     }
     let lower_inc = fb[0] == b'[';
     let upper_inc = fb[1] == b']';
     // Bound datums render to canonical text in the arena (validated).
     let lower_text = elem_text(lower, kind, arena)?;
     let upper_text = elem_text(upper, kind, arena)?;
-    let p = Parsed { empty: false, lower: lower_text, upper: upper_text, lower_inc, upper_inc };
+    let p = Parsed {
+        empty: false,
+        lower: lower_text,
+        upper: upper_text,
+        lower_inc,
+        upper_inc,
+    };
     canonical(&p, kind, arena)
 }
 
@@ -286,7 +321,9 @@ fn elem_text<'a>(d: Datum, kind: RangeKind, arena: &'a Arena) -> Result<Option<&
 }
 
 fn alloc<'a>(arena: &'a Arena, s: &str) -> Result<&'a str, SqlError> {
-    arena.alloc_str(s).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(s)
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// Increments a discrete bound value by one (int/date) into `buffer`.
@@ -331,8 +368,9 @@ fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
             let y = super::eval::parse_int_bounded(b, i64::MIN, i64::MAX, "bigint")?;
             x.cmp(&y)
         }
-        RangeKind::Date => super::datetime::parse_date(a.trim())?
-            .cmp(&super::datetime::parse_date(b.trim())?),
+        RangeKind::Date => {
+            super::datetime::parse_date(a.trim())?.cmp(&super::datetime::parse_date(b.trim())?)
+        }
         RangeKind::Ts => super::datetime::parse_timestamp(a.trim(), false)?
             .cmp(&super::datetime::parse_timestamp(b.trim(), false)?),
         RangeKind::Tstz => super::datetime::parse_timestamp(a.trim(), true)?
@@ -351,10 +389,18 @@ fn cmp_elem(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
     })
 }
 
-pub fn lower_datum<'a>(text: &str, kind: RangeKind, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+pub fn lower_datum<'a>(
+    text: &str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     bound_datum(text, kind, true, arena)
 }
-pub fn upper_datum<'a>(text: &str, kind: RangeKind, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+pub fn upper_datum<'a>(
+    text: &str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     bound_datum(text, kind, false, arena)
 }
 
@@ -374,12 +420,18 @@ fn bound_datum<'a>(
 
 fn elem_datum<'a>(s: &str, kind: RangeKind, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(match kind {
-        RangeKind::Int4 => {
-            Datum::Int4(super::eval::parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32)
-        }
-        RangeKind::Int8 => {
-            Datum::Int8(super::eval::parse_int_bounded(s, i64::MIN, i64::MAX, "bigint")?)
-        }
+        RangeKind::Int4 => Datum::Int4(super::eval::parse_int_bounded(
+            s,
+            i32::MIN as i64,
+            i32::MAX as i64,
+            "integer",
+        )? as i32),
+        RangeKind::Int8 => Datum::Int8(super::eval::parse_int_bounded(
+            s,
+            i64::MIN,
+            i64::MAX,
+            "bigint",
+        )?),
         RangeKind::Date => Datum::Date(super::datetime::parse_date(s.trim())?),
         RangeKind::Ts => Datum::Timestamp(super::datetime::parse_timestamp(s.trim(), false)?),
         RangeKind::Tstz => Datum::Timestamptz(super::datetime::parse_timestamp(s.trim(), true)?),
@@ -396,7 +448,11 @@ pub fn bound_inc(text: &str, lower: bool) -> Result<bool, SqlError> {
     if p.empty {
         return Ok(false);
     }
-    Ok(if lower { p.lower.is_some() && p.lower_inc } else { p.upper.is_some() && p.upper_inc })
+    Ok(if lower {
+        p.lower.is_some() && p.lower_inc
+    } else {
+        p.upper.is_some() && p.upper_inc
+    })
 }
 
 /// `range @> element`.
@@ -431,7 +487,8 @@ pub fn contains_range(outer: &str, inner: &str, kind: RangeKind) -> Result<bool,
     if parsed_outer.empty {
         return Ok(false);
     }
-    Ok(lower_le(&parsed_outer, &parsed_inner, kind)? && upper_ge(&parsed_outer, &parsed_inner, kind)?)
+    Ok(lower_le(&parsed_outer, &parsed_inner, kind)?
+        && upper_ge(&parsed_outer, &parsed_inner, kind)?)
 }
 
 /// `a && b` (ranges overlap).
@@ -455,8 +512,12 @@ fn strictly_left(a: &Parsed, b: &Parsed, kind: RangeKind) -> Result<bool, SqlErr
 }
 
 fn lower_le(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
-    let Some(ol) = outer.lower else { return Ok(true) };
-    let Some(il) = inner.lower else { return Ok(false) };
+    let Some(ol) = outer.lower else {
+        return Ok(true);
+    };
+    let Some(il) = inner.lower else {
+        return Ok(false);
+    };
     Ok(match cmp_elem(ol, il, kind)? {
         Ordering::Less => true,
         Ordering::Equal => outer.lower_inc || !inner.lower_inc,
@@ -465,8 +526,12 @@ fn lower_le(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, Sql
 }
 
 fn upper_ge(outer: &Parsed, inner: &Parsed, kind: RangeKind) -> Result<bool, SqlError> {
-    let Some(ou) = outer.upper else { return Ok(true) };
-    let Some(iu) = inner.upper else { return Ok(false) };
+    let Some(ou) = outer.upper else {
+        return Ok(true);
+    };
+    let Some(iu) = inner.upper else {
+        return Ok(false);
+    };
     Ok(match cmp_elem(ou, iu, kind)? {
         Ordering::Greater => true,
         Ordering::Equal => outer.upper_inc || !inner.upper_inc,
@@ -487,11 +552,25 @@ pub fn cmp_ranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlErro
         (false, true) => return Ok(Ordering::Greater),
         (false, false) => {}
     }
-    let lower_text = cmp_bound(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, parsed_b.lower_inc, true, kind)?;
+    let lower_text = cmp_bound(
+        parsed_a.lower,
+        parsed_a.lower_inc,
+        parsed_b.lower,
+        parsed_b.lower_inc,
+        true,
+        kind,
+    )?;
     if lower_text != Ordering::Equal {
         return Ok(lower_text);
     }
-    cmp_bound(parsed_a.upper, parsed_a.upper_inc, parsed_b.upper, parsed_b.upper_inc, false, kind)
+    cmp_bound(
+        parsed_a.upper,
+        parsed_a.upper_inc,
+        parsed_b.upper,
+        parsed_b.upper_inc,
+        false,
+        kind,
+    )
 }
 
 /// Compares one bound of two ranges. `None` value denotes an infinite bound;
@@ -507,8 +586,16 @@ fn cmp_bound(
 ) -> Result<Ordering, SqlError> {
     match (a_value, b_value) {
         (None, None) => Ok(Ordering::Equal),
-        (None, Some(_)) => Ok(if lower { Ordering::Less } else { Ordering::Greater }),
-        (Some(_), None) => Ok(if lower { Ordering::Greater } else { Ordering::Less }),
+        (None, Some(_)) => Ok(if lower {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
+        (Some(_), None) => Ok(if lower {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
         (Some(x), Some(y)) => Ok(match cmp_elem(x, y, kind)? {
             Ordering::Equal => match (a_inclusive, b_inclusive) {
                 (true, false) => {
@@ -565,7 +652,14 @@ pub fn not_right_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError>
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(cmp_bound(parsed_a.upper, parsed_a.upper_inc, parsed_b.upper, parsed_b.upper_inc, false, kind)? != Ordering::Greater)
+    Ok(cmp_bound(
+        parsed_a.upper,
+        parsed_a.upper_inc,
+        parsed_b.upper,
+        parsed_b.upper_inc,
+        false,
+        kind,
+    )? != Ordering::Greater)
 }
 
 /// `a &> b`: `a` does not extend to the left of `b` (`lower(a) >= lower(b)`).
@@ -574,7 +668,14 @@ pub fn not_left_of(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> 
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(cmp_bound(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, parsed_b.lower_inc, true, kind)? != Ordering::Less)
+    Ok(cmp_bound(
+        parsed_a.lower,
+        parsed_a.lower_inc,
+        parsed_b.lower,
+        parsed_b.lower_inc,
+        true,
+        kind,
+    )? != Ordering::Less)
 }
 
 /// `a -|- b`: the ranges are adjacent (disjoint with no gap between them).
@@ -583,8 +684,19 @@ pub fn adjacent(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
     if parsed_a.empty || parsed_b.empty {
         return Ok(false);
     }
-    Ok(bound_adjacent(parsed_a.upper, parsed_a.upper_inc, parsed_b.lower, parsed_b.lower_inc, kind)?
-        || bound_adjacent(parsed_b.upper, parsed_b.upper_inc, parsed_a.lower, parsed_a.lower_inc, kind)?)
+    Ok(bound_adjacent(
+        parsed_a.upper,
+        parsed_a.upper_inc,
+        parsed_b.lower,
+        parsed_b.lower_inc,
+        kind,
+    )? || bound_adjacent(
+        parsed_b.upper,
+        parsed_b.upper_inc,
+        parsed_a.lower,
+        parsed_a.lower_inc,
+        kind,
+    )?)
 }
 
 /// An upper bound and a lower bound touch (same value, exactly one inclusive),
@@ -603,7 +715,12 @@ fn bound_adjacent(
 }
 
 /// `a * b`: the intersection of two ranges (empty when they do not overlap).
-pub fn intersect<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub fn intersect<'a>(
+    a: &str,
+    b: &str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
         return alloc(arena, "empty");
@@ -625,7 +742,10 @@ pub fn union<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<
         return canonical(&parsed_a, kind, arena);
     }
     if !overlaps(a, b, kind)? && !adjacent(a, b, kind)? {
-        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "result of range union would not be contiguous"));
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "result of range union would not be contiguous"
+        ));
     }
     let (lower_text, lo_inc) = pick_lower(&parsed_a, &parsed_b, kind, false)?;
     let (upper_text, hi_inc) = pick_upper(&parsed_a, &parsed_b, kind, false)?;
@@ -649,29 +769,78 @@ pub fn merge<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<
 
 /// `a - b`: `a` with the portion overlapping `b` removed. Errors when the
 /// result would not be contiguous (`b` strictly inside `a`).
-pub fn difference<'a>(a: &str, b: &str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub fn difference<'a>(
+    a: &str,
+    b: &str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
     if parsed_a.empty || parsed_b.empty || !overlaps(a, b, kind)? {
         return canonical(&parsed_a, kind, arena);
     }
     // Does `b` cover `a`'s left end / right end?
-    let left = cmp_bound(parsed_b.lower, parsed_b.lower_inc, parsed_a.lower, parsed_a.lower_inc, true, kind)? != Ordering::Greater;
-    let right = cmp_bound(parsed_b.upper, parsed_b.upper_inc, parsed_a.upper, parsed_a.upper_inc, false, kind)? != Ordering::Less;
+    let left = cmp_bound(
+        parsed_b.lower,
+        parsed_b.lower_inc,
+        parsed_a.lower,
+        parsed_a.lower_inc,
+        true,
+        kind,
+    )? != Ordering::Greater;
+    let right = cmp_bound(
+        parsed_b.upper,
+        parsed_b.upper_inc,
+        parsed_a.upper,
+        parsed_a.upper_inc,
+        false,
+        kind,
+    )? != Ordering::Less;
     match (left, right) {
         (true, true) => alloc(arena, "empty"),
         // `b` trims the left: keep `[b.upper, a.upper)` (inclusivity flipped).
-        (true, false) => canonical(&mk(parsed_b.upper, !parsed_b.upper_inc, parsed_a.upper, parsed_a.upper_inc), kind, arena),
+        (true, false) => canonical(
+            &mk(
+                parsed_b.upper,
+                !parsed_b.upper_inc,
+                parsed_a.upper,
+                parsed_a.upper_inc,
+            ),
+            kind,
+            arena,
+        ),
         // `b` trims the right: keep `[a.lower, b.lower)` (inclusivity flipped).
-        (false, true) => canonical(&mk(parsed_a.lower, parsed_a.lower_inc, parsed_b.lower, !parsed_b.lower_inc), kind, arena),
-        (false, false) => {
-            Err(sql_err!(sqlstate::DATA_EXCEPTION, "result of range difference would not be contiguous"))
-        }
+        (false, true) => canonical(
+            &mk(
+                parsed_a.lower,
+                parsed_a.lower_inc,
+                parsed_b.lower,
+                !parsed_b.lower_inc,
+            ),
+            kind,
+            arena,
+        ),
+        (false, false) => Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "result of range difference would not be contiguous"
+        )),
     }
 }
 
 /// Builds a non-empty `Parsed` from chosen bounds.
-fn mk<'a>(lower_text: Option<&'a str>, lo_inc: bool, upper_text: Option<&'a str>, hi_inc: bool) -> Parsed<'a> {
-    Parsed { empty: false, lower: lower_text, upper: upper_text, lower_inc: lo_inc, upper_inc: hi_inc }
+fn mk<'a>(
+    lower_text: Option<&'a str>,
+    lo_inc: bool,
+    upper_text: Option<&'a str>,
+    hi_inc: bool,
+) -> Parsed<'a> {
+    Parsed {
+        empty: false,
+        lower: lower_text,
+        upper: upper_text,
+        lower_inc: lo_inc,
+        upper_inc: hi_inc,
+    }
 }
 
 /// Chooses one range's lower bound: the greater (more restrictive) when
@@ -683,8 +852,16 @@ fn pick_lower<'a>(
     restrictive: bool,
 ) -> Result<(Option<&'a str>, bool), SqlError> {
     let c = cmp_bound(a.lower, a.lower_inc, b.lower, b.lower_inc, true, kind)?;
-    let take_a = if restrictive { c == Ordering::Greater } else { c != Ordering::Greater };
-    Ok(if take_a { (a.lower, a.lower_inc) } else { (b.lower, b.lower_inc) })
+    let take_a = if restrictive {
+        c == Ordering::Greater
+    } else {
+        c != Ordering::Greater
+    };
+    Ok(if take_a {
+        (a.lower, a.lower_inc)
+    } else {
+        (b.lower, b.lower_inc)
+    })
 }
 
 /// Chooses one range's upper bound: the lesser (more restrictive) when
@@ -696,8 +873,16 @@ fn pick_upper<'a>(
     restrictive: bool,
 ) -> Result<(Option<&'a str>, bool), SqlError> {
     let c = cmp_bound(a.upper, a.upper_inc, b.upper, b.upper_inc, false, kind)?;
-    let take_a = if restrictive { c == Ordering::Less } else { c != Ordering::Less };
-    Ok(if take_a { (a.upper, a.upper_inc) } else { (b.upper, b.upper_inc) })
+    let take_a = if restrictive {
+        c == Ordering::Less
+    } else {
+        c != Ordering::Less
+    };
+    Ok(if take_a {
+        (a.upper, a.upper_inc)
+    } else {
+        (b.upper, b.upper_inc)
+    })
 }
 
 // ── Multirange support ──────────────────────────────────────────────────────
@@ -709,8 +894,17 @@ pub const MAX_MULTIRANGE: usize = 64;
 /// Splits a canonical multirange text `{r1,r2,...}` into its component range
 /// texts (no canonicalization; input is assumed already canonical). Commas
 /// inside a component's brackets are not separators. Returns the count.
-pub fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) -> Result<usize, SqlError> {
-    let bad = || sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "malformed multirange literal: \"{}\"", text);
+pub fn split_components<'a>(
+    text: &'a str,
+    out: &mut [&'a str; MAX_MULTIRANGE],
+) -> Result<usize, SqlError> {
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "malformed multirange literal: \"{}\"",
+            text
+        )
+    };
     let inner = text
         .trim()
         .strip_prefix('{')
@@ -726,7 +920,10 @@ pub fn split_components<'a>(text: &'a str, out: &mut [&'a str; MAX_MULTIRANGE]) 
     let mut n = 0usize;
     let mut push = |seg: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n == MAX_MULTIRANGE {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "multirange has too many component ranges"
+            ));
         }
         out[*n] = seg.trim();
         *n += 1;
@@ -795,7 +992,10 @@ fn render_multirange<'a>(ranges: &[&str], arena: &'a Arena) -> Result<&'a str, S
     }
     let _ = buf.write_char('}');
     if buf.is_truncated() {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange value too large"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange value too large"
+        ));
     }
     alloc(arena, buf.as_str())
 }
@@ -858,14 +1058,22 @@ pub fn multirange_bound<'a>(
 }
 
 /// `A + B`: the union of two multiranges (all components merged).
-pub fn multirange_union<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub fn multirange_union<'a>(
+    a: &'a str,
+    b: &'a str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let mut comps: [&str; MAX_MULTIRANGE * 2] = [""; MAX_MULTIRANGE * 2];
     let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let na = split_components(a, &mut ca)?;
     let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let nb = split_components(b, &mut cb)?;
     if na + nb > MAX_MULTIRANGE * 2 {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange has too many component ranges"
+        ));
     }
     comps[..na].copy_from_slice(&ca[..na]);
     comps[na..na + nb].copy_from_slice(&cb[..nb]);
@@ -873,7 +1081,12 @@ pub fn multirange_union<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a 
 }
 
 /// `A * B`: the intersection of two multiranges (pairwise component overlaps).
-pub fn multirange_intersect<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub fn multirange_intersect<'a>(
+    a: &'a str,
+    b: &'a str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let na = split_components(a, &mut ca)?;
     let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
@@ -885,7 +1098,10 @@ pub fn multirange_intersect<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: 
             let x = intersect(ai, bj, kind, arena)?;
             if x != "empty" {
                 if n == MAX_MULTIRANGE {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "multirange has too many component ranges"
+                    ));
                 }
                 out[n] = x;
                 n += 1;
@@ -906,7 +1122,11 @@ fn range_minus<'a>(
     let mut n = 0usize;
     // Left remnant: [a.lower, b.lower). Present only if b is bounded below.
     if b.lower.is_some() {
-        let left = canonical(&mk(a.lower, a.lower_inc, b.lower, !b.lower_inc), kind, arena)?;
+        let left = canonical(
+            &mk(a.lower, a.lower_inc, b.lower, !b.lower_inc),
+            kind,
+            arena,
+        )?;
         if left != "empty" {
             out[n] = left;
             n += 1;
@@ -914,7 +1134,11 @@ fn range_minus<'a>(
     }
     // Right remnant: [b.upper, a.upper). Present only if b is bounded above.
     if b.upper.is_some() {
-        let right = canonical(&mk(b.upper, !b.upper_inc, a.upper, a.upper_inc), kind, arena)?;
+        let right = canonical(
+            &mk(b.upper, !b.upper_inc, a.upper, a.upper_inc),
+            kind,
+            arena,
+        )?;
         if right != "empty" {
             out[n] = right;
             n += 1;
@@ -924,7 +1148,12 @@ fn range_minus<'a>(
 }
 
 /// `A - B`: `A` with every point of `B` removed.
-pub fn multirange_difference<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub fn multirange_difference<'a>(
+    a: &'a str,
+    b: &'a str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
     let na = split_components(a, &mut ca)?;
     let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
@@ -939,7 +1168,10 @@ pub fn multirange_difference<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena:
         let mut nn = 0usize;
         let mut push = |s: &'a str, nn: &mut usize| -> Result<(), SqlError> {
             if *nn == MAX_MULTIRANGE * 2 {
-                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "multirange has too many component ranges"));
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "multirange has too many component ranges"
+                ));
             }
             next[*nn] = s;
             *nn += 1;
@@ -980,7 +1212,12 @@ pub fn multirange_overlaps(a: &str, b: &str, kind: RangeKind) -> Result<bool, Sq
 
 /// `A @> B` for two multiranges: every point of `B` lies in `A` (i.e. `A ∩ B`
 /// equals `B`).
-pub fn multirange_contains_multirange<'a>(a: &'a str, b: &'a str, kind: RangeKind, arena: &'a Arena) -> Result<bool, SqlError> {
+pub fn multirange_contains_multirange<'a>(
+    a: &'a str,
+    b: &'a str,
+    kind: RangeKind,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
     // Reuse the arena for the intermediate; compare canonical texts.
     let inter = multirange_intersect(a, b, kind, arena)?;
     // Canonicalize `b` for a like-for-like comparison.
@@ -1039,11 +1276,17 @@ mod tests {
     fn a_malformed_literal_names_neither_type_nor_element() {
         // Structural errors carry only "malformed range literal", as PostgreSQL
         // does — not the range type name it once wrongly included.
-        assert_eq!(error_of("garbage", Int4), "malformed range literal: \"garbage\"");
+        assert_eq!(
+            error_of("garbage", Int4),
+            "malformed range literal: \"garbage\""
+        );
         assert_eq!(error_of("1,5)", Int4), "malformed range literal: \"1,5)\"");
         assert_eq!(error_of("[1,5", Int4), "malformed range literal: \"[1,5\"");
         // A third comma-separated part is structural, not a bad second bound.
-        assert_eq!(error_of("[1,2,3]", Int4), "malformed range literal: \"[1,2,3]\"");
+        assert_eq!(
+            error_of("[1,2,3]", Int4),
+            "malformed range literal: \"[1,2,3]\""
+        );
     }
 
     #[test]
@@ -1051,12 +1294,27 @@ mod tests {
         // A well-placed but invalid bound raises the element type's error,
         // naming the type and the offending value — the way `\'a\'::integer`
         // does — rather than a range error.
-        assert_eq!(error_of("[a,5)", Int4), "invalid input syntax for type integer: \"a\"");
-        assert_eq!(error_of("[5,z)", RangeKind::Int8), "invalid input syntax for type bigint: \"z\"");
-        assert_eq!(error_of("[1.5,x)", Num), "invalid input syntax for type numeric: \"x\"");
+        assert_eq!(
+            error_of("[a,5)", Int4),
+            "invalid input syntax for type integer: \"a\""
+        );
+        assert_eq!(
+            error_of("[5,z)", RangeKind::Int8),
+            "invalid input syntax for type bigint: \"z\""
+        );
+        assert_eq!(
+            error_of("[1.5,x)", Num),
+            "invalid input syntax for type numeric: \"x\""
+        );
         // Whichever side is bad is the one named.
-        assert_eq!(error_of("[x,5)", Num), "invalid input syntax for type numeric: \"x\"");
-        assert_eq!(error_of("[1,bad)", Int4), "invalid input syntax for type integer: \"bad\"");
+        assert_eq!(
+            error_of("[x,5)", Num),
+            "invalid input syntax for type numeric: \"x\""
+        );
+        assert_eq!(
+            error_of("[1,bad)", Int4),
+            "invalid input syntax for type integer: \"bad\""
+        );
     }
 
     #[test]
@@ -1064,7 +1322,10 @@ mod tests {
         // Lower bound decides first, then upper bound.
         assert_eq!(cmp_ranges("[1,5)", "[1,6)", Int4).unwrap(), Ordering::Less);
         assert_eq!(cmp_ranges("[1,5)", "[2,3)", Int4).unwrap(), Ordering::Less);
-        assert_eq!(cmp_ranges("[1,10)", "[1,5)", Int4).unwrap(), Ordering::Greater);
+        assert_eq!(
+            cmp_ranges("[1,10)", "[1,5)", Int4).unwrap(),
+            Ordering::Greater
+        );
         assert_eq!(cmp_ranges("[1,5)", "[1,5)", Int4).unwrap(), Ordering::Equal);
     }
 
@@ -1072,9 +1333,18 @@ mod tests {
     fn multirange_canonicalizes() {
         let arena = mini_arena();
         // Sorted, overlapping and adjacent components merged, empties dropped.
-        assert_eq!(parse_multirange("{[5,7),[1,3)}", Int4, &arena).unwrap(), "{[1,3),[5,7)}");
-        assert_eq!(parse_multirange("{[1,3),[2,5)}", Int4, &arena).unwrap(), "{[1,5)}");
-        assert_eq!(parse_multirange("{[1,3),[3,5)}", Int4, &arena).unwrap(), "{[1,5)}");
+        assert_eq!(
+            parse_multirange("{[5,7),[1,3)}", Int4, &arena).unwrap(),
+            "{[1,3),[5,7)}"
+        );
+        assert_eq!(
+            parse_multirange("{[1,3),[2,5)}", Int4, &arena).unwrap(),
+            "{[1,5)}"
+        );
+        assert_eq!(
+            parse_multirange("{[1,3),[3,5)}", Int4, &arena).unwrap(),
+            "{[1,5)}"
+        );
         assert_eq!(parse_multirange("{[1,1)}", Int4, &arena).unwrap(), "{}");
         assert_eq!(parse_multirange("{}", Int4, &arena).unwrap(), "{}");
     }
@@ -1082,10 +1352,19 @@ mod tests {
     #[test]
     fn multirange_set_operations() {
         let arena = mini_arena();
-        assert_eq!(multirange_union("{[1,5)}", "{[10,15)}", Int4, &arena).unwrap(), "{[1,5),[10,15)}");
-        assert_eq!(multirange_intersect("{[1,10)}", "{[5,15)}", Int4, &arena).unwrap(), "{[5,10)}");
+        assert_eq!(
+            multirange_union("{[1,5)}", "{[10,15)}", Int4, &arena).unwrap(),
+            "{[1,5),[10,15)}"
+        );
+        assert_eq!(
+            multirange_intersect("{[1,10)}", "{[5,15)}", Int4, &arena).unwrap(),
+            "{[5,10)}"
+        );
         // Removing a middle chunk splits into two components.
-        assert_eq!(multirange_difference("{[1,10)}", "{[3,5)}", Int4, &arena).unwrap(), "{[1,3),[5,10)}");
+        assert_eq!(
+            multirange_difference("{[1,10)}", "{[3,5)}", Int4, &arena).unwrap(),
+            "{[1,3),[5,10)}"
+        );
         assert!(multirange_overlaps("{[1,5)}", "{[4,8)}", Int4).unwrap());
         assert!(!multirange_overlaps("{[1,5)}", "{[6,8)}", Int4).unwrap());
         assert!(multirange_contains_multirange("{[1,10)}", "{[2,4)}", Int4, &arena).unwrap());
@@ -1095,7 +1374,10 @@ mod tests {
     #[test]
     fn cmp_ranges_empty_sorts_first() {
         assert_eq!(cmp_ranges("empty", "[1,2)", Int4).unwrap(), Ordering::Less);
-        assert_eq!(cmp_ranges("[1,2)", "empty", Int4).unwrap(), Ordering::Greater);
+        assert_eq!(
+            cmp_ranges("[1,2)", "empty", Int4).unwrap(),
+            Ordering::Greater
+        );
         assert_eq!(cmp_ranges("empty", "empty", Int4).unwrap(), Ordering::Equal);
     }
 
@@ -1103,15 +1385,27 @@ mod tests {
     fn cmp_ranges_infinite_bounds() {
         // Unbounded lower is smallest; unbounded upper is largest.
         assert_eq!(cmp_ranges("(,5)", "[1,5)", Int4).unwrap(), Ordering::Less);
-        assert_eq!(cmp_ranges("[1,)", "[1,10)", Int4).unwrap(), Ordering::Greater);
+        assert_eq!(
+            cmp_ranges("[1,)", "[1,10)", Int4).unwrap(),
+            Ordering::Greater
+        );
     }
 
     #[test]
     fn cmp_ranges_numrange_is_value_based() {
         // 1.0 and 1.00 are equal by value, so equal ranges compare equal.
-        assert_eq!(cmp_ranges("[1.0,5.0)", "[1.00,5.0)", Num).unwrap(), Ordering::Equal);
-        assert_eq!(cmp_ranges("[1.0,5.0)", "[1.0,5.1)", Num).unwrap(), Ordering::Less);
-        assert_eq!(cmp_ranges("[-5.0,-1.0)", "[-5.0,-0.5)", Num).unwrap(), Ordering::Less);
+        assert_eq!(
+            cmp_ranges("[1.0,5.0)", "[1.00,5.0)", Num).unwrap(),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp_ranges("[1.0,5.0)", "[1.0,5.1)", Num).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_ranges("[-5.0,-1.0)", "[-5.0,-0.5)", Num).unwrap(),
+            Ordering::Less
+        );
     }
 
     #[test]

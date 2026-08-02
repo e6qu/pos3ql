@@ -119,7 +119,8 @@ fn fault() {
     if std::thread::panicking() {
         return;
     }
-    let msg: &[u8] = b"pos3ql: heap allocation after freeze or inside forbid_alloc scope; aborting\n";
+    let msg: &[u8] =
+        b"pos3ql: heap allocation after freeze or inside forbid_alloc scope; aborting\n";
     unsafe {
         libc::write(2, msg.as_ptr().cast(), msg.len());
         // An alloc-free backtrace: `backtrace_symbols_fd` writes straight to

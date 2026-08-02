@@ -15,7 +15,7 @@
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
 
-use super::{decode, encode, BlockId, BlockStore, BlockType, StoreError};
+use super::{BlockId, BlockStore, BlockType, StoreError, decode, encode};
 
 /// Where one block's bytes sit in the slab.
 #[derive(Clone, Copy)]
@@ -44,7 +44,12 @@ impl MemoryBlockStore {
         budget.draw_array(bytes, 1, what)?;
         let index = FixedMap::new(budget, what, max_blocks)?;
         let slab = vec![0u8; bytes];
-        Ok(Self { slab: slab.into_boxed_slice(), reads: 0, used: 0, index })
+        Ok(Self {
+            slab: slab.into_boxed_slice(),
+            reads: 0,
+            used: 0,
+            index,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -86,7 +91,9 @@ impl BlockStore for MemoryBlockStore {
         if self.index.get(&id).is_some() {
             return Ok(id);
         }
-        self.index.insert(id, Extent { at, len: n }).map_err(|_| StoreError::Unavailable)?;
+        self.index
+            .insert(id, Extent { at, len: n })
+            .map_err(|_| StoreError::Unavailable)?;
         self.used += n;
         Ok(id)
     }

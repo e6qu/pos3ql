@@ -542,7 +542,7 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
     -o "-p $TORTURE_PG_PORT -k $TORTURE_SOCK -c listen_addresses=127.0.0.1 -c timezone=UTC" \
     -l "$WORK/torture-pg.log" start >/dev/null
   if P3_BIN="${POS3QL_BIN:-./target/release/pos3ql}" P3_CONF="$WORK/server.conf" \
-     P3_PORT=$PG_PORT P3_DATADIR="$WORK/data" P3_LOG="$WORK/server.log" \
+     P3_PORT=$PG_PORT P3_DATADIR="$WORK/data" P3_LOG="$WORK/server.log" P3_INITIAL_PID=$SERVER_PID \
      PGHOST=127.0.0.1 PGPORT=$TORTURE_PG_PORT PGUSER=postgres PGDATABASE=postgres \
      "$POS3QL_VENV/bin/python" tests/external/torture_diff.py \
        --rounds "${POS3QL_TORTURE_ROUNDS:-12}" --seed "${POS3QL_TORTURE_SEED:-20260723}" \

@@ -823,6 +823,32 @@ body wins and releases its sibling. The remaining Pillars 2–4 work is
 coalescing, the block-at-a-time executor, and PAX
 late materialization described above.
 
+**Pillar 3 scan slice (2026-08-02).** An unshadowed cold table scan carries
+each selected row out of the resident merged-SST data block before the cursor
+advances, rather than re-probing that row through the same SST. The copied row
+lives only for the recycling callback (or in the ordinary statement arena for
+a retaining caller); the block context is released before nested execution can
+issue reads. The planner uses the same metadata-only request estimate for
+sequential and single-column index paths, so a fragmented point probe is not
+selected when the block cursor is cheaper. Repository formatting is now part
+of CI (`cargo fmt --check`), and the object-store regression bounds cold
+full-scan GETs while checking the selected plan is no more expensive.
+
+The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
+but distributes independent seeds over four bounded workers. The merge gate
+therefore targets five minutes rather than serially multiplying every
+checkpoint/restart/verification cost, with a 15-minute hard ceiling for
+runner variance.
+
+Crash recovery binds its TCP listener with `SO_REUSEADDR` before the address
+is claimed, and its pre-restart harness probe uses the identical bind
+contract. A killed predecessor can therefore be replaced after active
+connections close without weakening exclusive listener ownership.
+
+The async object-read regression fixtures now use explicit socket and response
+ownership handshakes, so their fixed-slot assertions are scheduler-independent
+on every CI runner.
+
 **External-execution slice (2026-07-30).** Physical scans now have a recycling
 mode: every join depth retains its bound outer rows while reusing row-local
 decode/evaluation space after the recursive callback returns. This separates

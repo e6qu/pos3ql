@@ -24,7 +24,10 @@ pub(crate) fn blocks(pem: &str) -> Result<Vec<Block>, String> {
             let name = rest.trim_end_matches('-').trim();
             match label.take() {
                 Some(open) if open == name => {
-                    out.push(Block { label: open, der: base64_decode(&b64)? });
+                    out.push(Block {
+                        label: open,
+                        der: base64_decode(&b64)?,
+                    });
                 }
                 _ => return Err(format!("mismatched PEM END for {name}")),
             }

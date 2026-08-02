@@ -79,10 +79,15 @@ impl<S: BlockStore> BlockCache<S> {
             inner,
             slots: vec![0u8; frame_count * MAX_PAYLOAD].into_boxed_slice(),
             frames: vec![
-                Frame { id: None, len: 0, block_type: BlockType::SstData, referenced: false };
+                Frame {
+                    id: None,
+                    len: 0,
+                    block_type: BlockType::SstData,
+                    referenced: false
+                };
                 frame_count
             ]
-                .into_boxed_slice(),
+            .into_boxed_slice(),
             index,
             hand: 0,
             stats: CacheStats::default(),

@@ -53,6 +53,7 @@ struct IndexedCandidates<'a> {
 fn indexed_candidates<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
+    txid: u32,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -136,6 +137,16 @@ fn indexed_candidates<'a>(
         .expect("physical table has definition")
         .columns()[column]
         .ctype;
+    let statistics = storage.table_statistics(slot, txid);
+    let expected_rows = if statistics.valid && statistics.columns[column].valid {
+        let distinct = statistics.columns[column].distinct_values.max(1);
+        statistics.rows.div_ceil(distinct).max(1)
+    } else {
+        1
+    };
+    if storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid) {
+        return Ok(None);
+    }
     let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
     let raw_type = ColType::from_oid(raw.type_oid());
     let integer =
@@ -803,7 +814,6 @@ pub(crate) fn scan_source_recycling<'a>(
     )
 }
 
-
 /// One build-side entry: the join-key hash, the row's MVCC identity, and its
 /// encoded bytes (kept to assemble matches and re-decode the key on a hash
 /// hit, so any key width works without growing the entry).
@@ -865,13 +875,26 @@ fn hash_join_keys<'a>(
     let mut pairs = [(0usize, 0usize); 8];
     let mut npairs = 0usize;
     for &c in &conjuncts[..nc] {
-        let Expr::Binary { operator: BinaryOp::Eq, left, right } = c else {
+        let Expr::Binary {
+            operator: BinaryOp::Eq,
+            left,
+            right,
+        } = c
+        else {
             continue;
         };
-        let Expr::Column { qualifier: lq, name: ln } = **left else {
+        let Expr::Column {
+            qualifier: lq,
+            name: ln,
+        } = **left
+        else {
             continue;
         };
-        let Expr::Column { qualifier: rq, name: rn } = **right else {
+        let Expr::Column {
+            qualifier: rq,
+            name: rn,
+        } = **right
+        else {
             continue;
         };
         let (Ok(ResolvedColumn::Table(lt, lc)), Ok(ResolvedColumn::Table(rt, rc))) =
@@ -893,7 +916,11 @@ fn hash_join_keys<'a>(
             npairs += 1;
         }
     }
-    if npairs == 0 { Ok(None) } else { Ok(Some((pairs, npairs))) }
+    if npairs == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((pairs, npairs)))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1050,7 +1077,10 @@ fn scan_source_mode<'a>(
             return Ok(false);
         }
         let join = &from.joins[0];
-        if !matches!(join.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) {
+        if !matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+        ) {
             return Ok(false);
         }
         let probe_t = order[0];
@@ -1063,8 +1093,7 @@ fn scan_source_mode<'a>(
             return Ok(false);
         }
         let on = join.on.or(scope.join_on[0]);
-        let Some((keys, nkeys)) = hash_join_keys(scope, on, where_clause, probe_t, build_t)?
-        else {
+        let Some((keys, nkeys)) = hash_join_keys(scope, on, where_clause, probe_t, build_t)? else {
             return Ok(false);
         };
 
@@ -1141,7 +1170,10 @@ fn scan_source_mode<'a>(
             let probe_count = storage.visible_row_count(probe_slot, txid)?;
             let probe_ordered = arena
                 .alloc_slice_with(probe_count.max(1), |_| {
-                    (0u64, crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }))
+                    (
+                        0u64,
+                        crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
+                    )
                 })
                 .map_err(|_| arena_full())?;
             let mut probe_fill = 0usize;
@@ -1181,7 +1213,8 @@ fn scan_source_mode<'a>(
                                 rowenc::decode(entry.bytes, build_schema, &mut build_buf)?;
                                 let mut matched = true;
                                 for i in 0..nkeys {
-                                    if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq() {
+                                    if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq()
+                                    {
                                         matched = false;
                                         break;
                                     }
@@ -1194,7 +1227,13 @@ fn scan_source_mode<'a>(
                                     bound[build_t] = Some(entry.bytes);
                                     bound_rowids[build_t] = Some(entry.rowid);
                                     let row = assemble(
-                                        scope, bound, bound_rowids, order, 2, decode_buffers, arena,
+                                        scope,
+                                        bound,
+                                        bound_rowids,
+                                        order,
+                                        2,
+                                        decode_buffers,
+                                        arena,
                                     )?;
                                     if let Some(on) = on {
                                         let chained = Chained { inner: &row, outer };
@@ -1235,9 +1274,8 @@ fn scan_source_mode<'a>(
                         let bound_rowids = &mut [None, None];
                         bound[probe_t] = Some(bytes);
                         bound_rowids[probe_t] = Some(rowid);
-                        let row = assemble(
-                            scope, bound, bound_rowids, order, 2, decode_buffers, arena,
-                        )?;
+                        let row =
+                            assemble(scope, bound, bound_rowids, order, 2, decode_buffers, arena)?;
                         if let Some(w) = where_clause {
                             let chained = Chained { inner: &row, outer };
                             if !where_passes(w, arena, params, &chained, hooks)? {
@@ -1581,6 +1619,34 @@ fn scan_source_mode<'a>(
             let candidates = indexed
                 .filter(|access| access.table == order[depth])
                 .map(|access| access.rowids);
+            // A cold, overlay-free table is already being merged in SST data
+            // blocks. Carry the selected entry bytes out of that cursor rather
+            // than point-reading every row a second time. Any resident overlay
+            // stays on the general row-state path below, which owns its MVCC
+            // shadowing and mixed heap/SST physical order.
+            if candidates.is_none() && storage.spill_rows_are_unshadowed(slot) {
+                let mut index = 0usize;
+                let mut aborted = false;
+                storage.for_each_spilled_row_bytes(
+                    slot,
+                    arena,
+                    recycle_rows,
+                    &mut |rowid, bytes| {
+                        check_timeout()?;
+                        let this = index;
+                        index += 1;
+                        if !visit_candidate!(this, bytes, Some(rowid))? {
+                            aborted = true;
+                            return Ok(core::ops::ControlFlow::Break(()));
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+                if aborted {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
             let count = candidates
                 .map(<[u64]>::len)
                 .unwrap_or(storage.visible_row_count(slot, txid)?);
@@ -1809,7 +1875,7 @@ fn scan_source_mode<'a>(
         })
         .map_err(|_| arena_full())?;
 
-    let indexed = indexed_candidates(storage, scope, where_clause, arena, params, hooks)?;
+    let indexed = indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?;
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;

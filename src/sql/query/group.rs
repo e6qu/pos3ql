@@ -9,9 +9,7 @@
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Expr, FromClause, Select, SelectItem};
-use crate::sql::eval::{
-    compare_datums, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError,
-};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, compare_datums, eval_full, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::stack_format;
@@ -22,8 +20,8 @@ use super::aggregate::AggState;
 use super::plan::where_passes;
 use super::subquery::merge_correlated;
 use super::{
-    arena_full, expr_contains_node, resolve_order_target, scan_source, scan_source_recycling,
-    sql_fail, sql_ok, JoinRow, Outcome, QueryScope, ScopeSchema, MAX_AGGS, MAX_SUBQUERIES,
+    JoinRow, MAX_AGGS, MAX_SUBQUERIES, Outcome, QueryScope, ScopeSchema, arena_full,
+    expr_contains_node, resolve_order_target, scan_source, scan_source_recycling, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -52,9 +50,13 @@ pub(super) fn row_passes_correlated_where<'a>(
         [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
     let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
     let base = hooks.subs.expect("outer subqueries prepared");
-    let row_subs =
-        merge_correlated(correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls)?;
-    let h = EvalHooks { subs: Some(&row_subs), ..*hooks };
+    let row_subs = merge_correlated(
+        correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
+    )?;
+    let h = EvalHooks {
+        subs: Some(&row_subs),
+        ..*hooks
+    };
     where_passes(w, arena, params, row, &h)
 }
 
@@ -70,7 +72,10 @@ struct GroupRow<'g, 'a> {
 impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         for (g, v) in self.group_by.iter().zip(self.keys) {
-            if let Expr::Column { qualifier: gq, name: gn } = g
+            if let Expr::Column {
+                qualifier: gq,
+                name: gn,
+            } = g
                 && *gn == name
                 && (qualifier.is_none() || gq.is_none() || *gq == qualifier)
             {
@@ -114,7 +119,11 @@ pub(super) fn groups_for_mask<'a>(
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     // WHERE with correlated subqueries is applied per row in the callbacks.
-    let scan_where = if correlated.is_empty() { statement.where_clause } else { None };
+    let scan_where = if correlated.is_empty() {
+        statement.where_clause
+    } else {
+        None
+    };
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -127,16 +136,29 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        let mut compare = |a: &[u8], b: &[u8]| {
-            Ok(crate::sql::exec::compare_projected_prefix(a, b, n_keys))
-        };
+        let mut compare =
+            |a: &[u8], b: &[u8]| Ok(crate::sql::exec::compare_projected_prefix(a, b, n_keys));
         let mut at = 0u32;
         scan_source_recycling(
-            storage, scope, from, txid, scan_where, arena, params, hooks,
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
             outer,
             &mut |row| {
                 if !row_passes_correlated_where(
-                    correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                    correlated,
+                    statement.where_clause,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    hooks,
+                    row,
                 )? {
                     return Ok(true);
                 }
@@ -152,9 +174,17 @@ pub(super) fn groups_for_mask<'a>(
                         correlated,
                         hooks.subs.expect("outer subqueries prepared"),
                         row,
-                        storage, txid, arena, params, &mut sc, &mut ls,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        &mut sc,
+                        &mut ls,
                     )?;
-                    row_hooks_store = EvalHooks { subs: Some(&row_subs), ..*hooks };
+                    row_hooks_store = EvalHooks {
+                        subs: Some(&row_subs),
+                        ..*hooks
+                    };
                     &row_hooks_store
                 };
                 let mut key_vals = [Datum::Null; MAX_PROJ];
@@ -169,9 +199,18 @@ pub(super) fn groups_for_mask<'a>(
                 let row_idx = at;
                 storage
                     .with_block_store(|blocks| {
-                        sorter.push_projected_by(blocks, n_keys + 1, |i| {
-                            if i < n_keys { key_vals[i] } else { Datum::Int4(row_idx as i32) }
-                        }, &mut compare)
+                        sorter.push_projected_by(
+                            blocks,
+                            n_keys + 1,
+                            |i| {
+                                if i < n_keys {
+                                    key_vals[i]
+                                } else {
+                                    Datum::Int4(row_idx as i32)
+                                }
+                            },
+                            &mut compare,
+                        )
                     })
                     .expect("spill-attached block store")?;
                 at += 1;
@@ -192,9 +231,7 @@ pub(super) fn groups_for_mask<'a>(
                 .with_block_store(|blocks| reader.start(blocks, run))
                 .expect("spill-attached block store")?;
             while let Some(context) = reader.context() {
-                let row_index = match crate::sql::exec::decode_projected_pub(
-                    context.row, n_keys,
-                ) {
+                let row_index = match crate::sql::exec::decode_projected_pub(context.row, n_keys) {
                     Datum::Int4(i) => i as u32 as usize,
                     _ => 0,
                 };
@@ -206,8 +243,7 @@ pub(super) fn groups_for_mask<'a>(
                     }
                 };
                 if is_new {
-                    let key_len =
-                        crate::sql::exec::projected_prefix_len(context.row, n_keys);
+                    let key_len = crate::sql::exec::projected_prefix_len(context.row, n_keys);
                     rep_keys_buf[ng] = arena
                         .alloc_slice_copy(&context.row[..2 + key_len])
                         .map_err(|_| arena_full())?;
@@ -228,11 +264,25 @@ pub(super) fn groups_for_mask<'a>(
         if n_keys > 0 {
             let mut at = 0usize;
             scan_source(
-                storage, scope, from, txid, scan_where, arena, params, hooks,
+                storage,
+                scope,
+                from,
+                txid,
+                scan_where,
+                arena,
+                params,
+                hooks,
                 outer,
                 &mut |row| {
                     if !row_passes_correlated_where(
-                        correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                        correlated,
+                        statement.where_clause,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        hooks,
+                        row,
                     )? {
                         return Ok(true);
                     }
@@ -248,9 +298,17 @@ pub(super) fn groups_for_mask<'a>(
                             correlated,
                             hooks.subs.expect("outer subqueries prepared"),
                             row,
-                            storage, txid, arena, params, &mut sc, &mut ls,
+                            storage,
+                            txid,
+                            arena,
+                            params,
+                            &mut sc,
+                            &mut ls,
                         )?;
-                        row_hooks_store = EvalHooks { subs: Some(&row_subs), ..*hooks };
+                        row_hooks_store = EvalHooks {
+                            subs: Some(&row_subs),
+                            ..*hooks
+                        };
                         &row_hooks_store
                     };
                     let mut key_vals = [Datum::Null; MAX_PROJ];
@@ -262,7 +320,8 @@ pub(super) fn groups_for_mask<'a>(
                     for v in key_vals[..n_keys].iter_mut() {
                         *v = crate::sql::eval::text_view(*v);
                     }
-                    keys[at].0 = crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
+                    keys[at].0 =
+                        crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
                     keys[at].1 = at as u32;
                     at += 1;
                     Ok(true)
@@ -304,10 +363,13 @@ pub(super) fn groups_for_mask<'a>(
         let in_group_clauses = statement.items.iter().any(|item| {
             matches!(item, SelectItem::Expr { expression, .. }
                 if expr_contains_node(expression, node as *const Expr))
-        }) || statement.having.is_some_and(|h| expr_contains_node(h, node as *const Expr))
-            || order_exprs.iter().take(n_order).any(|oe| {
-                oe.is_some_and(|o| expr_contains_node(o, node as *const Expr))
-            });
+        }) || statement
+            .having
+            .is_some_and(|h| expr_contains_node(h, node as *const Expr))
+            || order_exprs
+                .iter()
+                .take(n_order)
+                .any(|oe| oe.is_some_and(|o| expr_contains_node(o, node as *const Expr)));
         if in_group_clauses && n_group_correlated < MAX_SUBQUERIES {
             group_correlated_buffer[n_group_correlated] = node;
             n_group_correlated += 1;
@@ -330,53 +392,59 @@ pub(super) fn groups_for_mask<'a>(
             .iter()
             .all(AggState::recycling_safe);
         let mut visit = |row: &JoinRow<'_, 'a, '_>| {
-                if !row_passes_correlated_where(
-                    correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
-                )? {
-                    return Ok(true);
-                }
-                // Correlated subqueries inside aggregate arguments re-evaluate
-                // against each input row.
-                let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-                let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
-                let row_subs;
-                let row_hooks_store;
-                let row_hooks: &EvalHooks = if correlated.is_empty() {
-                    hooks
-                } else {
-                    row_subs = merge_correlated(
-                        correlated,
-                        hooks.subs.expect("outer subqueries prepared"),
-                        row,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        &mut sc,
-                        &mut ls,
-                    )?;
-                    row_hooks_store = EvalHooks { subs: Some(&row_subs), ..*hooks };
-                    &row_hooks_store
+            if !row_passes_correlated_where(
+                correlated,
+                statement.where_clause,
+                storage,
+                txid,
+                arena,
+                params,
+                hooks,
+                row,
+            )? {
+                return Ok(true);
+            }
+            // Correlated subqueries inside aggregate arguments re-evaluate
+            // against each input row.
+            let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
+                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
+            let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
+            let row_subs;
+            let row_hooks_store;
+            let row_hooks: &EvalHooks = if correlated.is_empty() {
+                hooks
+            } else {
+                row_subs = merge_correlated(
+                    correlated,
+                    hooks.subs.expect("outer subqueries prepared"),
+                    row,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    &mut sc,
+                    &mut ls,
+                )?;
+                row_hooks_store = EvalHooks {
+                    subs: Some(&row_subs),
+                    ..*hooks
                 };
-                let g = group_of.get(at).copied().unwrap_or(0) as usize;
-                for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                    states[g * n_aggs + i].update(node, arena, params, row, row_hooks)?;
-                }
-                at += 1;
-                Ok(true)
+                &row_hooks_store
             };
+            let g = group_of.get(at).copied().unwrap_or(0) as usize;
+            for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                states[g * n_aggs + i].update(node, arena, params, row, row_hooks)?;
+            }
+            at += 1;
+            Ok(true)
+        };
         if recycling_safe {
             scan_source_recycling(
-                storage, scope, from, txid, scan_where, arena, params, hooks,
-                outer,
-                &mut visit,
+                storage, scope, from, txid, scan_where, arena, params, hooks, outer, &mut visit,
             )?;
         } else {
             scan_source(
-                storage, scope, from, txid, scan_where, arena, params, hooks,
-                outer,
-                &mut visit,
+                storage, scope, from, txid, scan_where, arena, params, hooks, outer, &mut visit,
             )?;
         }
     }
@@ -401,7 +469,10 @@ pub(super) fn groups_for_mask<'a>(
         let group_subs = if group_correlated.is_empty() {
             hooks.subs
         } else {
-            let group_row = GroupRow { group_by: statement.group_by, keys: &key_vals[..n_keys] };
+            let group_row = GroupRow {
+                group_by: statement.group_by,
+                keys: &key_vals[..n_keys],
+            };
             merged_subs = merge_correlated(
                 group_correlated,
                 hooks.subs.expect("outer subqueries prepared"),
@@ -419,9 +490,13 @@ pub(super) fn groups_for_mask<'a>(
             group: Some((statement.group_by, &key_vals[..n_keys], mask)),
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: group_subs,
-        // Carry the catalog so a grouped projection resolves catalog-backed
-        // output (e.g. `pg_typeof` of an enum group key names the enum type).
-        windows: None, catalog: hooks.catalog, srf_index: None, sequences: hooks.sequences };
+            // Carry the catalog so a grouped projection resolves catalog-backed
+            // output (e.g. `pg_typeof` of an enum group key names the enum type).
+            windows: None,
+            catalog: hooks.catalog,
+            srf_index: None,
+            sequences: hooks.sequences,
+        };
         let schema = ScopeSchema(scope);
         if let Some(h) = statement.having {
             match eval_full(h, arena, params, &schema, &group_hooks)? {
@@ -431,23 +506,20 @@ pub(super) fn groups_for_mask<'a>(
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
                         "argument of HAVING must be type boolean"
-                    ))
+                    ));
                 }
             }
         }
         let mut full = [Datum::Null; MAX_PROJ];
         for (n, item) in statement.items.iter().enumerate() {
-            let SelectItem::Expr { expression, .. } = item else { unreachable!() };
+            let SelectItem::Expr { expression, .. } = item else {
+                unreachable!()
+            };
             full[n] = eval_full(expression, arena, params, &schema, &group_hooks)?;
         }
         for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
-            full[width + k] = eval_full(
-                oe.expect("resolved"),
-                arena,
-                params,
-                &schema,
-                &group_hooks,
-            )?;
+            full[width + k] =
+                eval_full(oe.expect("resolved"), arena, params, &schema, &group_hooks)?;
         }
         out_rows[survivors] =
             crate::sql::exec::encode_projected_pub(&full[..width + n_order], arena)?;
@@ -503,14 +575,32 @@ pub(super) fn grouped_rows<'a>(
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
     // with correlated subqueries is applied per row here too, so every pass
     // sees the same filtered sequence.
-    let scan_where = if correlated.is_empty() { statement.where_clause } else { None };
+    let scan_where = if correlated.is_empty() {
+        statement.where_clause
+    } else {
+        None
+    };
     let mut row_count = 0usize;
     scan_source_recycling(
-        storage, scope, from, txid, scan_where, arena, params, hooks,
+        storage,
+        scope,
+        from,
+        txid,
+        scan_where,
+        arena,
+        params,
+        hooks,
         outer,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated, statement.where_clause, storage, txid, arena, params, hooks, row,
+                correlated,
+                statement.where_clause,
+                storage,
+                txid,
+                arena,
+                params,
+                hooks,
+                row,
             )? {
                 return Ok(true);
             }
@@ -543,7 +633,11 @@ pub(super) fn grouped_rows<'a>(
 
     // Grouping sets: the explicit mask list, or a single implicit set of all
     // grouping columns for a plain GROUP BY / plain aggregate.
-    let all_mask = if n_keys >= 64 { u64::MAX } else { (1u64 << n_keys) - 1 };
+    let all_mask = if n_keys >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << n_keys) - 1
+    };
     let single = [all_mask];
     let masks: &[u64] = if statement.grouping_sets.is_empty() {
         &single[..]
@@ -551,7 +645,10 @@ pub(super) fn grouped_rows<'a>(
         statement.grouping_sets
     };
     if masks.len() > crate::sql::parser::MAX_GROUPING_SETS {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many grouping sets"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many grouping sets"
+        ));
     }
 
     // Aggregate each set independently, then concatenate (a single set is a
@@ -563,8 +660,23 @@ pub(super) fn grouped_rows<'a>(
     let mut total = 0usize;
     for (si, &mask) in masks.iter().enumerate() {
         let rows = groups_for_mask(
-            storage, scope, from, txid, statement, agg_nodes, arena, params, hooks, correlated,
-            outer, mask, row_count, agg_ptrs, order_exprs, width, n_order,
+            storage,
+            scope,
+            from,
+            txid,
+            statement,
+            agg_nodes,
+            arena,
+            params,
+            hooks,
+            correlated,
+            outer,
+            mask,
+            row_count,
+            agg_ptrs,
+            order_exprs,
+            width,
+            n_order,
         )?;
         per_set[si] = rows;
         total += rows.len();
@@ -613,10 +725,18 @@ pub(super) fn grouped_rows<'a>(
                 let ord = match (ka.is_null(), kb.is_null()) {
                     (true, true) => core::cmp::Ordering::Equal,
                     (true, false) => {
-                        if ob.nulls_first { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater }
+                        if ob.nulls_first {
+                            core::cmp::Ordering::Less
+                        } else {
+                            core::cmp::Ordering::Greater
+                        }
                     }
                     (false, true) => {
-                        if ob.nulls_first { core::cmp::Ordering::Greater } else { core::cmp::Ordering::Less }
+                        if ob.nulls_first {
+                            core::cmp::Ordering::Greater
+                        } else {
+                            core::cmp::Ordering::Less
+                        }
                     }
                     (false, false) => {
                         let c = compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal);
@@ -663,12 +783,8 @@ pub(super) fn grouped_select<'a>(
     // FETCH FIRST ... WITH TIES: extend past the limit while rows tie with the
     // last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
-        end = match super::materialize::extend_ties(
-            out_rows,
-            width,
-            statement.order_by.len(),
-            end,
-        ) {
+        end = match super::materialize::extend_ties(out_rows, width, statement.order_by.len(), end)
+        {
             Ok(end) => end,
             Err(error) => return sql_fail(error),
         };
@@ -693,8 +809,16 @@ pub(super) fn grouped_select<'a>(
 /// column — PostgreSQL's semantic key match, where `a` and `t.a` are one
 /// grouping key.
 fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
-    let (Expr::Column { qualifier: qa, name: na }, Expr::Column { qualifier: qb, name: nb }) =
-        (a, b)
+    let (
+        Expr::Column {
+            qualifier: qa,
+            name: na,
+        },
+        Expr::Column {
+            qualifier: qb,
+            name: nb,
+        },
+    ) = (a, b)
     else {
         return false;
     };
@@ -725,7 +849,10 @@ fn expand_grouped_stars<'a>(
     let mut n = 0usize;
     let mut push = |item: SelectItem<'a>, n: &mut usize| -> Result<(), SqlError> {
         if *n == MAX_PROJ {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many select columns"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many select columns"
+            ));
         }
         expanded[*n] = item;
         *n += 1;
@@ -736,24 +863,41 @@ fn expand_grouped_stars<'a>(
             SelectItem::Wildcard => {
                 for i in 0..scope.star_columns() {
                     let expression = scope.star_expression(scope.star_entry(i), arena)?;
-                    push(SelectItem::Expr { expression, alias: None }, &mut n)?;
+                    push(
+                        SelectItem::Expr {
+                            expression,
+                            alias: None,
+                        },
+                        &mut n,
+                    )?;
                 }
             }
             SelectItem::TableWildcard(q) => {
                 let t = scope.table_index(q)?;
                 let def = scope.defs[t].expect("resolved");
                 for c in 0..def.n_columns {
-                    let expression = scope
-                        .star_expression(super::scope::ResolvedColumn::Table(t, c), arena)?;
-                    push(SelectItem::Expr { expression, alias: None }, &mut n)?;
+                    let expression =
+                        scope.star_expression(super::scope::ResolvedColumn::Table(t, c), arena)?;
+                    push(
+                        SelectItem::Expr {
+                            expression,
+                            alias: None,
+                        },
+                        &mut n,
+                    )?;
                 }
             }
             other => push(*other, &mut n)?,
         }
     }
-    let items = arena.alloc_slice_copy(&expanded[..n]).map_err(|_| arena_full())?;
+    let items = arena
+        .alloc_slice_copy(&expanded[..n])
+        .map_err(|_| arena_full())?;
     let out = arena
-        .alloc(Select { items, ..*statement })
+        .alloc(Select {
+            items,
+            ..*statement
+        })
         .map_err(|_| arena_full())?;
     Ok(&*out)
 }
@@ -794,37 +938,67 @@ fn ungrouped_column<'e, 'a>(
     group_by: &[&Expr<'a>],
     scope: &QueryScope<'a>,
 ) -> Option<&'e Expr<'a>> {
-    if group_by.iter().any(|g| **g == *expression || same_scope_column(scope, g, expression))
+    if group_by
+        .iter()
+        .any(|g| **g == *expression || same_scope_column(scope, g, expression))
         || expression.is_aggregate()
     {
         return None;
     }
-    let first =
-        |parts: &[&'e Expr<'a>]| parts.iter().find_map(|e| ungrouped_column(e, group_by, scope));
+    let first = |parts: &[&'e Expr<'a>]| {
+        parts
+            .iter()
+            .find_map(|e| ungrouped_column(e, group_by, scope))
+    };
     match expression {
         Expr::Column { .. } | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => Some(expression),
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Str(_)
-        | Expr::BitLit(_) | Expr::Param(_) | Expr::DefaultMarker | Expr::Subquery(_) | Expr::Exists(_)
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_)
+        | Expr::Param(_)
+        | Expr::DefaultMarker
+        | Expr::Subquery(_)
+        | Expr::Exists(_)
         | Expr::ArraySubquery(_) => None,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::InSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
         Expr::Binary { left, right, .. } => first(&[left, right]),
-        Expr::Call { args, .. } => args.iter().find_map(|a| ungrouped_column(a, group_by, scope)),
-        Expr::InList { operand, list, .. } => ungrouped_column(operand, group_by, scope)
-            .or_else(|| list.iter().find_map(|e| ungrouped_column(e, group_by, scope))),
-        Expr::Between { operand, low, high, .. } => first(&[operand, low, high]),
-        Expr::Like { operand, pattern, .. } | Expr::Match { operand, pattern, .. } => {
-            first(&[operand, pattern])
-        }
-        Expr::Case { operand, whens, otherwise, .. } => operand
-            .and_then(|o| ungrouped_column(o, group_by, scope))
-            .or_else(|| {
-                whens.iter().find_map(|(c, r)| first(&[c, r]))
+        Expr::Call { args, .. } => args
+            .iter()
+            .find_map(|a| ungrouped_column(a, group_by, scope)),
+        Expr::InList { operand, list, .. } => {
+            ungrouped_column(operand, group_by, scope).or_else(|| {
+                list.iter()
+                    .find_map(|e| ungrouped_column(e, group_by, scope))
             })
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => first(&[operand, low, high]),
+        Expr::Like {
+            operand, pattern, ..
+        }
+        | Expr::Match {
+            operand, pattern, ..
+        } => first(&[operand, pattern]),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => operand
+            .and_then(|o| ungrouped_column(o, group_by, scope))
+            .or_else(|| whens.iter().find_map(|(c, r)| first(&[c, r])))
             .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by, scope))),
-        Expr::Array(items) => items.iter().find_map(|e| ungrouped_column(e, group_by, scope)),
+        Expr::Array(items) => items
+            .iter()
+            .find_map(|e| ungrouped_column(e, group_by, scope)),
         Expr::Subscript { base, index } => first(&[base, index]),
         Expr::Slice { base, lower, upper } => ungrouped_column(base, group_by, scope)
             .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope)))

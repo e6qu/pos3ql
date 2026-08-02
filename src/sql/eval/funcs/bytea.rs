@@ -11,8 +11,8 @@ use crate::sql::types::Datum;
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    arena_full, bytea_arg, eval_full, int_arg, sqlstate, text_arg, type_mismatch, ColumnLookup,
-    EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, bytea_arg, eval_full, int_arg, sqlstate,
+    text_arg, type_mismatch,
 };
 
 /// Handles the binary-string/encoding/hashing family. Returns `None` if `name`
@@ -70,13 +70,15 @@ pub(crate) fn dispatch<'a>(
                         return Err(sql_err!(
                             sqlstate::AMBIGUOUS_FUNCTION,
                             "function to_hex(smallint) is not unique"
-                        ))
+                        ));
                     }
                     Datum::Int4(v) => stack_format!(16, "{:x}", v as u32),
                     Datum::Int8(v) => stack_format!(16, "{:x}", v as u64),
                     other => return Err(type_mismatch(name, &other)),
                 };
-                Ok(Datum::Text(arena.alloc_str(s.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(
+                    arena.alloc_str(s.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "md5" => {
                 arity(1)?;
@@ -86,7 +88,9 @@ pub(crate) fn dispatch<'a>(
                 let d = crate::sql::md5::digest(s.as_bytes());
                 let mut hexbuf = [0u8; 32];
                 crate::sql::md5::hex(&d, &mut hexbuf);
-                let out = arena.alloc_slice_with(32, |i| hexbuf[i]).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(32, |i| hexbuf[i])
+                    .map_err(|_| arena_full())?;
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
             }
             // Cryptographic hashes of a bytea, each returning bytea.
@@ -96,16 +100,18 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 let digest: &[u8] = match name {
-                    "sha224" => {
-                        arena.alloc_slice_copy(&crate::crypto::sha256::sha224(bytes)).map_err(|_| arena_full())?
-                    }
-                    "sha256" => {
-                        arena.alloc_slice_copy(&crate::crypto::sha256::sha256(bytes)).map_err(|_| arena_full())?
-                    }
-                    "sha384" => {
-                        arena.alloc_slice_copy(&crate::sql::sha512::sha384(bytes)).map_err(|_| arena_full())?
-                    }
-                    _ => arena.alloc_slice_copy(&crate::sql::sha512::sha512(bytes)).map_err(|_| arena_full())?,
+                    "sha224" => arena
+                        .alloc_slice_copy(&crate::crypto::sha256::sha224(bytes))
+                        .map_err(|_| arena_full())?,
+                    "sha256" => arena
+                        .alloc_slice_copy(&crate::crypto::sha256::sha256(bytes))
+                        .map_err(|_| arena_full())?,
+                    "sha384" => arena
+                        .alloc_slice_copy(&crate::sql::sha512::sha384(bytes))
+                        .map_err(|_| arena_full())?,
+                    _ => arena
+                        .alloc_slice_copy(&crate::sql::sha512::sha512(bytes))
+                        .map_err(|_| arena_full())?,
                 };
                 Ok(Datum::Bytea(digest))
             }
@@ -123,7 +129,13 @@ pub(crate) fn dispatch<'a>(
                         "base64" => crate::sql::encoding::base64_encode(bytes, arena)?,
                         "hex" => crate::sql::encoding::hex_encode(bytes, arena)?,
                         "escape" => crate::sql::encoding::escape_encode(bytes, arena)?,
-                        _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unrecognized encoding: \"{}\"", format)),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "unrecognized encoding: \"{}\"",
+                                format
+                            ));
+                        }
                     };
                     Ok(Datum::Text(text))
                 } else {
@@ -134,7 +146,13 @@ pub(crate) fn dispatch<'a>(
                         "base64" => crate::sql::encoding::base64_decode(text, arena)?,
                         "hex" => crate::sql::encoding::hex_decode(text, arena)?,
                         "escape" => crate::sql::encoding::escape_decode(text, arena)?,
-                        _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unrecognized encoding: \"{}\"", format)),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "unrecognized encoding: \"{}\"",
+                                format
+                            ));
+                        }
                     };
                     Ok(Datum::Bytea(bytes))
                 }
@@ -147,7 +165,8 @@ pub(crate) fn dispatch<'a>(
                 let Some(encoding) = text_arg(name, args, 1, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
+                if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8")
+                {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "encoding \"{}\" is not supported (only UTF8)",
@@ -163,8 +182,12 @@ pub(crate) fn dispatch<'a>(
                     let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
                         return Ok(Datum::Null);
                     };
-                    let s = core::str::from_utf8(bytes)
-                        .map_err(|_| sql_err!(sqlstate::CHARACTER_NOT_IN_REPERTOIRE, "invalid byte sequence for encoding UTF8"))?;
+                    let s = core::str::from_utf8(bytes).map_err(|_| {
+                        sql_err!(
+                            sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                            "invalid byte sequence for encoding UTF8"
+                        )
+                    })?;
                     Ok(Datum::Text(s))
                 }
             }
@@ -178,7 +201,12 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if index < 0 || index as usize >= bytes.len() {
-                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "index {} out of valid range, 0..{}", index, bytes.len()));
+                    return Err(sql_err!(
+                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                        "index {} out of valid range, 0..{}",
+                        index,
+                        bytes.len()
+                    ));
                 }
                 if name == "get_byte" {
                     return Ok(Datum::Int4(bytes[index as usize] as i32));
@@ -201,7 +229,12 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if bit < 0 || (bit as usize) >= bytes.len() * 8 {
-                    return Err(sql_err!(sqlstate::ARRAY_SUBSCRIPT_ERROR, "index {} out of valid range, 0..{}", bit, bytes.len() * 8 - 1));
+                    return Err(sql_err!(
+                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                        "index {} out of valid range, 0..{}",
+                        bit,
+                        bytes.len() * 8 - 1
+                    ));
                 }
                 let byte_index = bit as usize / 8;
                 let bit_index = bit as usize % 8;
@@ -224,12 +257,12 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
-                    Datum::Bytea(b) => {
-                        Ok(Datum::Int8(b.iter().map(|byte| byte.count_ones() as i64).sum()))
-                    }
-                    Datum::Bit { bits, .. } => {
-                        Ok(Datum::Int8(bits.bytes().filter(|c| *c == b'1').count() as i64))
-                    }
+                    Datum::Bytea(b) => Ok(Datum::Int8(
+                        b.iter().map(|byte| byte.count_ones() as i64).sum(),
+                    )),
+                    Datum::Bit { bits, .. } => Ok(Datum::Int8(
+                        bits.bytes().filter(|c| *c == b'1').count() as i64,
+                    )),
                     other => Err(type_mismatch("bit_count requires bytea or bit", &other)),
                 }
             }

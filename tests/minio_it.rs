@@ -70,7 +70,16 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
     let mut guc = pos3ql::sql::guc::GucState::new();
     let mut resp = Responder::new(&mut buf);
     engine
-        .execute_simple(sql_text, &arena, &mut txn, &mut pool, &mut cursors, &mut guc, &mut resp, 1)
+        .execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut resp,
+            1,
+        )
         .unwrap();
     String::from_utf8_lossy(buf.readable()).to_string()
 }
@@ -88,12 +97,20 @@ fn rpo_zero_disk_loss_recovery() {
     {
         let mut budget = Budget::new(64 << 20);
         let mut e = Engine::new(&cfg, &mut budget).unwrap();
-        run_sql(&mut e, &mut budget, "CREATE TABLE ledger (id int, amount int)");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "CREATE TABLE ledger (id int, amount int)",
+        );
         run_sql(&mut e, &mut budget, "INSERT INTO ledger VALUES (1, 100)");
         run_sql(&mut e, &mut budget, "CHECKPOINT");
         // These commits land only in uploaded WAL segments, not any SST.
         run_sql(&mut e, &mut budget, "INSERT INTO ledger VALUES (2, 200)");
-        run_sql(&mut e, &mut budget, "UPDATE ledger SET amount = 150 WHERE id = 1");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "UPDATE ledger SET amount = 150 WHERE id = 1",
+        );
         run_sql(&mut e, &mut budget, "INSERT INTO ledger VALUES (3, 300)");
     }
     // Total disk loss: brand-new empty data dir, same bucket+prefix.
@@ -104,10 +121,17 @@ fn rpo_zero_disk_loss_recovery() {
     {
         let mut budget = Budget::new(64 << 20);
         let mut e = Engine::new(&cfg2, &mut budget).unwrap();
-        let out = run_sql(&mut e, &mut budget, "SELECT id, amount FROM ledger ORDER BY id");
+        let out = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT id, amount FROM ledger ORDER BY id",
+        );
         // The post-checkpoint tail must be present despite the wipe.
         assert!(out.contains("150"), "updated row lost: {out}");
-        assert!(out.contains("200") && out.contains("300"), "inserts lost: {out}");
+        assert!(
+            out.contains("200") && out.contains("300"),
+            "inserts lost: {out}"
+        );
     }
 }
 
@@ -121,13 +145,21 @@ fn delta_checkpoint_carries_clean_tables() {
     let mut e = Engine::new(&cfg, &mut budget).unwrap();
     run_sql(&mut e, &mut budget, "CREATE TABLE stable (id int, v text)");
     run_sql(&mut e, &mut budget, "CREATE TABLE churn (id int, v text)");
-    run_sql(&mut e, &mut budget, "INSERT INTO stable VALUES (1, 'permanent')");
+    run_sql(
+        &mut e,
+        &mut budget,
+        "INSERT INTO stable VALUES (1, 'permanent')",
+    );
     run_sql(&mut e, &mut budget, "INSERT INTO churn VALUES (1, 'a')");
     run_sql(&mut e, &mut budget, "CHECKPOINT");
     // Only `churn` changes; the next checkpoint must carry `stable`'s SST
     // forward and still cold-start correctly.
     for i in 2..10 {
-        run_sql(&mut e, &mut budget, &format!("INSERT INTO churn VALUES ({i}, 'x')"));
+        run_sql(
+            &mut e,
+            &mut budget,
+            &format!("INSERT INTO churn VALUES ({i}, 'x')"),
+        );
     }
     run_sql(&mut e, &mut budget, "CHECKPOINT");
 
@@ -139,7 +171,10 @@ fn delta_checkpoint_carries_clean_tables() {
     let mut budget2 = Budget::new(64 << 20);
     let mut e2 = Engine::new(&cfg2, &mut budget2).unwrap();
     let out = run_sql(&mut e2, &mut budget2, "SELECT v FROM stable");
-    assert!(out.contains("permanent"), "carried-forward table lost: {out}");
+    assert!(
+        out.contains("permanent"),
+        "carried-forward table lost: {out}"
+    );
     let out = run_sql(&mut e2, &mut budget2, "SELECT count(*) FROM churn");
     assert!(out.contains('9'), "churned table wrong: {out}");
 }
@@ -155,15 +190,35 @@ fn checkpoint_and_cold_start_from_bucket() {
     {
         let mut budget = Budget::new(64 << 20);
         let mut e = Engine::new(&config_a, &mut budget).unwrap();
-        run_sql(&mut e, &mut budget, "CREATE TABLE inventory (id int NOT NULL, name text, qty int)");
-        run_sql(&mut e, &mut budget, "INSERT INTO inventory VALUES (1,'bolt',100),(2,'nut',200),(3,'washer',300)");
-        run_sql(&mut e, &mut budget, "UPDATE inventory SET qty = 150 WHERE id = 1");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "CREATE TABLE inventory (id int NOT NULL, name text, qty int)",
+        );
+        run_sql(
+            &mut e,
+            &mut budget,
+            "INSERT INTO inventory VALUES (1,'bolt',100),(2,'nut',200),(3,'washer',300)",
+        );
+        run_sql(
+            &mut e,
+            &mut budget,
+            "UPDATE inventory SET qty = 150 WHERE id = 1",
+        );
         // A view created before the checkpoint must persist via the manifest.
-        run_sql(&mut e, &mut budget, "CREATE VIEW cheap AS SELECT name FROM inventory WHERE qty < 250");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "CREATE VIEW cheap AS SELECT name FROM inventory WHERE qty < 250",
+        );
         let out = run_sql(&mut e, &mut budget, "CHECKPOINT");
         assert!(out.contains("CHECKPOINT"), "{out}");
         // Tail after the checkpoint, covered only by the local WAL.
-        run_sql(&mut e, &mut budget, "INSERT INTO inventory VALUES (4,'screw',400)");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "INSERT INTO inventory VALUES (4,'screw',400)",
+        );
         run_sql(&mut e, &mut budget, "DELETE FROM inventory WHERE id = 2");
     }
 
@@ -171,7 +226,11 @@ fn checkpoint_and_cold_start_from_bucket() {
     {
         let mut budget = Budget::new(64 << 20);
         let mut e = Engine::new(&config_a, &mut budget).unwrap();
-        let out = run_sql(&mut e, &mut budget, "SELECT id, name, qty FROM inventory ORDER BY id");
+        let out = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT id, name, qty FROM inventory ORDER BY id",
+        );
         assert!(out.contains("bolt") && out.contains("150"), "{out}");
         assert!(out.contains("screw"), "tail insert lost: {out}");
         assert!(!out.contains("nut"), "tail delete lost: {out}");
@@ -187,7 +246,11 @@ fn checkpoint_and_cold_start_from_bucket() {
     {
         let mut budget = Budget::new(64 << 20);
         let mut e = Engine::new(&config_b, &mut budget).unwrap();
-        let out = run_sql(&mut e, &mut budget, "SELECT id, name, qty FROM inventory ORDER BY id");
+        let out = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT id, name, qty FROM inventory ORDER BY id",
+        );
         assert!(out.contains("bolt") && out.contains("150"), "{out}");
         assert!(out.contains("washer") && out.contains("screw"), "{out}");
         assert!(!out.contains("nut"), "{out}");
@@ -195,11 +258,22 @@ fn checkpoint_and_cold_start_from_bucket() {
         // over the current rows: only bolt has qty < 250).
         let vout = run_sql(&mut e, &mut budget, "SELECT name FROM cheap ORDER BY name");
         assert!(vout.contains("bolt"), "view lost on cold start: {vout}");
-        assert!(!vout.contains("washer") && !vout.contains("screw"), "view filter wrong: {vout}");
+        assert!(
+            !vout.contains("washer") && !vout.contains("screw"),
+            "view filter wrong: {vout}"
+        );
         // New writes on the cold-started node keep working, and rowids
         // continue past the replayed ones.
-        run_sql(&mut e, &mut budget, "INSERT INTO inventory VALUES (5,'rivet',500)");
-        let out = run_sql(&mut e, &mut budget, "SELECT name FROM inventory ORDER BY id");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "INSERT INTO inventory VALUES (5,'rivet',500)",
+        );
+        let out = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT name FROM inventory ORDER BY id",
+        );
         assert!(out.contains("rivet"), "{out}");
     }
 }
@@ -214,7 +288,9 @@ fn put_get_range_list_cas_delete() {
 
     // PUT + GET roundtrip.
     let key = format!("it/{run}/hello.txt");
-    let etag = c.put(&key, b"hello object storage", Precondition::None).unwrap();
+    let etag = c
+        .put(&key, b"hello object storage", Precondition::None)
+        .unwrap();
     assert!(!etag.as_str().is_empty());
     let got = c.get(&key, None).unwrap();
     assert_eq!(got.len, 20);
@@ -227,7 +303,8 @@ fn put_get_range_list_cas_delete() {
 
     // Create-only precondition: second PUT must fail.
     let cas_key = format!("it/{run}/create-once");
-    c.put(&cas_key, b"first", Precondition::IfNoneMatchAny).unwrap();
+    c.put(&cas_key, b"first", Precondition::IfNoneMatchAny)
+        .unwrap();
     let err = c
         .put(&cas_key, b"second", Precondition::IfNoneMatchAny)
         .unwrap_err();

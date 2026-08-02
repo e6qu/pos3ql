@@ -421,10 +421,7 @@ pub fn check_all_unique(
 /// Rejects an indexed tuple before its row or CREATE INDEX WAL can commit if
 /// the immutable object generation cannot represent the key. Checkpoint is
 /// never the first observer of this physical limit.
-pub(crate) fn check_index_tuple_size(
-    columns: &[u16],
-    values: &[Datum],
-) -> Result<(), SqlError> {
+pub(crate) fn check_index_tuple_size(columns: &[u16], values: &[Datum]) -> Result<(), SqlError> {
     let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
     for (at, column) in columns.iter().enumerate() {
         key[at] = values[*column as usize];

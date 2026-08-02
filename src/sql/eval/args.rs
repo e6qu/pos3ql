@@ -19,7 +19,7 @@ use crate::util::StackStr;
 use crate::sql::ast::Expr;
 
 use super::{
-    arena_full, eval_full, parse_bytea, sqlstate, type_mismatch, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, parse_bytea, sqlstate, type_mismatch,
 };
 
 pub(crate) fn arity_err(name: &str, got: usize) -> SqlError {
@@ -179,14 +179,23 @@ pub(crate) fn width_bucket_numeric(
     use crate::sql::numeric::{compare, mul, sub, trunc_div};
     use core::cmp::Ordering;
     if compare(lo, hi) == Ordering::Equal {
-        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "lower and upper bounds cannot be equal"));
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "lower and upper bounds cannot be equal"
+        ));
     }
     let cnt = Numeric::from_i64(count, arena)?;
     let ascending = compare(lo, hi) == Ordering::Less;
     let (below, at_or_above) = if ascending {
-        (compare(operator, lo) == Ordering::Less, compare(operator, hi) != Ordering::Less)
+        (
+            compare(operator, lo) == Ordering::Less,
+            compare(operator, hi) != Ordering::Less,
+        )
     } else {
-        (compare(operator, lo) == Ordering::Greater, compare(operator, hi) != Ordering::Greater)
+        (
+            compare(operator, lo) == Ordering::Greater,
+            compare(operator, hi) != Ordering::Greater,
+        )
     };
     if below {
         return Ok(0);
@@ -220,16 +229,19 @@ pub(crate) fn format_append_str<'a>(
 /// lowercase identifier.
 pub(crate) fn format_append_ident(out: &mut StackStr<4096>, v: Datum<'_>) -> Result<(), SqlError> {
     if v.is_null() {
-        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "null value cannot be formatted as SQL identifier"));
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "null value cannot be formatted as SQL identifier"
+        ));
     }
     let s = match v {
         Datum::Text(s) => s,
         other => return Err(type_mismatch("format", &other)),
     };
     let bare = !s.is_empty()
-        && s.bytes().enumerate().all(|(i, c)| {
-            c == b'_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit())
-        });
+        && s.bytes()
+            .enumerate()
+            .all(|(i, c)| c == b'_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()));
     if bare {
         let _ = out.write_str(s);
     } else {
@@ -341,16 +353,26 @@ pub(crate) fn expand_replacement(
 /// Rejects a non-positive logarithm argument the way PostgreSQL does.
 pub(crate) fn log_domain_check(n: &Numeric) -> Result<(), SqlError> {
     if n.is_zero() {
-        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
+        return Err(sql_err!(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of zero"
+        ));
     }
     if n.sign == crate::sql::numeric::Sign::Neg {
-        return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
+        return Err(sql_err!(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a negative number"
+        ));
     }
     Ok(())
 }
 
 /// Numeric view of an already-evaluated integer/numeric datum.
-pub(crate) fn datum_numeric<'a>(name: &str, d: Datum<'a>, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+pub(crate) fn datum_numeric<'a>(
+    name: &str,
+    d: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
     match d {
         Datum::Numeric(n) => Ok(n),
         Datum::Int2(v) => Numeric::from_i64(v as i64, arena),
@@ -413,7 +435,10 @@ pub(crate) fn quote_ident_str<'a>(s: &str, arena: &'a Arena) -> Result<&'a str, 
     }
     let _ = out.write_char('"');
     if out.is_truncated() {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "identifier too long to quote"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "identifier too long to quote"
+        ));
     }
     arena.alloc_str(out.as_str()).map_err(|_| arena_full())
 }
@@ -442,7 +467,10 @@ pub(crate) fn quote_literal_str<'a>(text: &str, arena: &'a Arena) -> Result<&'a 
     }
     let _ = out.write_char('\'');
     if out.is_truncated() {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "literal too long to quote"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "literal too long to quote"
+        ));
     }
     arena.alloc_str(out.as_str()).map_err(|_| arena_full())
 }
@@ -455,7 +483,13 @@ pub(crate) fn parse_qualified_ident<'a>(
     out: &mut [Datum<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
-    let bad = || sql_err!(sqlstate::SYNTAX_ERROR, "string is not a valid identifier: \"{}\"", input);
+    let bad = || {
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "string is not a valid identifier: \"{}\"",
+            input
+        )
+    };
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut n = 0usize;
@@ -467,7 +501,10 @@ pub(crate) fn parse_qualified_ident<'a>(
             return Err(bad());
         }
         if n == out.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "identifier has too many parts"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "identifier has too many parts"
+            ));
         }
         let part = if bytes[i] == b'"' {
             // Quoted part: read to the closing quote, collapsing `""` to `"`.
@@ -504,7 +541,8 @@ pub(crate) fn parse_qualified_ident<'a>(
                 return Err(bad());
             }
             let raw = &input[start..i];
-            let lower = arena.alloc_slice_with(raw.len(), |k| raw.as_bytes()[k].to_ascii_lowercase())
+            let lower = arena
+                .alloc_slice_with(raw.len(), |k| raw.as_bytes()[k].to_ascii_lowercase())
                 .map_err(|_| arena_full())?;
             unsafe { core::str::from_utf8_unchecked(lower) }
         };
@@ -530,8 +568,14 @@ pub(crate) fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a st
 }
 
 /// Concatenates text pieces into a fresh arena string of total length `total`.
-pub(crate) fn alloc_text<'a>(arena: &'a Arena, parts: &[&str], total: usize) -> Result<Datum<'a>, SqlError> {
-    let out = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+pub(crate) fn alloc_text<'a>(
+    arena: &'a Arena,
+    parts: &[&str],
+    total: usize,
+) -> Result<Datum<'a>, SqlError> {
+    let out = arena
+        .alloc_slice_with(total, |_| 0u8)
+        .map_err(|_| arena_full())?;
     let mut at = 0;
     for p in parts {
         out[at..at + p.len()].copy_from_slice(p.as_bytes());
@@ -554,7 +598,10 @@ pub(crate) fn split_pieces<'a>(
     let mut n = 0usize;
     let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n >= out.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many pieces in a split string"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many pieces in a split string"
+            ));
         }
         out[*n] = piece;
         *n += 1;

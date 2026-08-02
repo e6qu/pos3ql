@@ -72,12 +72,7 @@ impl Reactor {
     /// Turns write-readiness reporting for `fd` on or offset. Disabling when
     /// not enabled is a no-op so callers can treat this as setting the
     /// desired state rather than tracking transitions.
-    pub fn set_write_interest(
-        &self,
-        fd: RawFd,
-        token: u64,
-        enabled: bool,
-    ) -> std::io::Result<()> {
+    pub fn set_write_interest(&self, fd: RawFd, token: u64, enabled: bool) -> std::io::Result<()> {
         let result = if enabled {
             self.change(fd, libc::EVFILT_WRITE, libc::EV_ADD, token)
         } else {
@@ -236,7 +231,12 @@ mod tests {
         let (mut a, b) = pair();
 
         reactor.register_read(b.as_raw_fd(), 7).unwrap();
-        assert!(reactor.wait(Some(Duration::from_millis(1))).unwrap().is_empty());
+        assert!(
+            reactor
+                .wait(Some(Duration::from_millis(1)))
+                .unwrap()
+                .is_empty()
+        );
 
         a.write_all(b"hi").unwrap();
         let events = reactor.wait(Some(Duration::from_millis(1000))).unwrap();
@@ -272,7 +272,12 @@ mod tests {
         assert!(events.iter().any(|e| e.token == 3 && e.writable));
 
         reactor.set_write_interest(a.as_raw_fd(), 3, false).unwrap();
-        assert!(reactor.wait(Some(Duration::from_millis(1))).unwrap().is_empty());
+        assert!(
+            reactor
+                .wait(Some(Duration::from_millis(1)))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -282,9 +287,20 @@ mod tests {
         let (mut a, b) = pair();
         reactor.register_read(b.as_raw_fd(), 1).unwrap();
         a.write_all(b"x").unwrap();
-        assert_eq!(reactor.wait(Some(Duration::from_millis(1000))).unwrap().len(), 1);
+        assert_eq!(
+            reactor
+                .wait(Some(Duration::from_millis(1000)))
+                .unwrap()
+                .len(),
+            1
+        );
         reactor.deregister(b.as_raw_fd()).unwrap();
-        assert!(reactor.wait(Some(Duration::from_millis(1))).unwrap().is_empty());
+        assert!(
+            reactor
+                .wait(Some(Duration::from_millis(1)))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

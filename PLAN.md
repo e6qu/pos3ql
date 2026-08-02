@@ -777,16 +777,18 @@ interface, while RAM and local disk only accelerate reads.
 
 Pillar 1 still needs richer multi-column and distribution statistics, more
 access paths, and cost calibration against real provider traces. The first new
-access path landed (2026-08-01): a **hash join** for two-table inner/cross
-equi-joins over base tables — the inner side is built into an arena hash table
-keyed by the join column, the outer side probes it, so both tables are scanned
-once (O(N+M) reads, the right shape for cold object storage) instead of the
-nested loop's O(N·M). The equi-condition only generates candidates; the full
-ON and WHERE still run at the leaf, so a declined or arena-overflowing build
-falls back to the nested loop with identical results (verified against
-PostgreSQL 18: duplicates, NULL keys, unmatched keys, cross joins, residual
-conjuncts, aggregates, LIMIT early-stop, and int-width-mixed keys). Pillars 2–4
-remain the async fixed-pool I/O scheduler, block-at-a-time executor, and PAX
+access path landed: a **hash join** for two-table inner/cross equi-joins over
+base tables — single-column and multi-column keys (composite FKs, natural
+keys) — the inner side is built into an arena hash table keyed by the join
+column(s), the outer side probes it, so both tables are scanned once (O(N+M)
+reads, the right shape for cold object storage) instead of the nested loop's
+O(N·M). The equi-condition only generates candidates; the full ON and WHERE
+still run at the leaf, so a declined or arena-overflowing build falls back to
+the nested loop with identical results (verified against PostgreSQL 18:
+duplicates, NULL keys, unmatched keys, cross joins, residual conjuncts,
+aggregates, LIMIT early-stop, int-width-mixed keys, and multi-column keys).
+Pillars 2–4 remain the async fixed-pool I/O scheduler, block-at-a-time
+executor, and PAX
 late materialization described above.
 
 **External-execution slice (2026-07-30).** Physical scans now have a recycling

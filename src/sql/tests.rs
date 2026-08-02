@@ -5655,6 +5655,58 @@ fn hash_join_matches_nested_loop() {
         ["ada|one", "bob|two", "cyd|one"],
         "int4=int8 hash join: {r:?}"
     );
+
+    // Multi-column equi-join: ON a.x = b.y AND a.z = b.w. Only rows where both
+    // columns match are joined; a row matching on one column but not the other
+    // is excluded.
+    run_with(&mut e, &mut b, "CREATE TABLE mc1 (k int, sub int, v text)");
+    run_with(&mut e, &mut b, "CREATE TABLE mc2 (k int, sub int, w text)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO mc1 VALUES (1,1,'a'),(1,2,'b'),(2,1,'c'),(NULL,1,'d')",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO mc2 VALUES (1,1,'x'),(1,2,'y'),(2,1,'z'),(1,NULL,'w')",
+    );
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT mc1.v, mc2.w FROM mc1 JOIN mc2 ON mc1.k = mc2.k AND mc1.sub = mc2.sub ORDER BY 1, 2",
+    ));
+    assert_eq!(
+        r,
+        ["a|x", "b|y", "c|z"],
+        "multi-column hash join: {r:?}"
+    );
+
+    // LEFT JOIN via hash join: unmatched outer rows are null-padded.
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT mc1.v, mc2.w FROM mc1 LEFT JOIN mc2 ON mc1.k = mc2.k AND mc1.sub = mc2.sub ORDER BY 1, 2",
+    ));
+    assert_eq!(
+        r,
+        ["a|x", "b|y", "c|z", "d|NULL"],
+        "LEFT JOIN hash join: {r:?}"
+    );
+
+    // LEFT JOIN with WHERE on the inner side: a null-padded row survives a
+    // WHERE that only references the outer side, but one that references the
+    // inner (NULL) side is filtered.
+    let r = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "SELECT mc1.v FROM mc1 LEFT JOIN mc2 ON mc1.k = mc2.k AND mc1.sub = mc2.sub WHERE mc2.w IS NULL ORDER BY 1",
+    ));
+    assert_eq!(
+        r,
+        ["d"],
+        "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}"
+    );
 }
 
 #[test]

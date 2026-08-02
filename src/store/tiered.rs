@@ -169,7 +169,7 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
-    fn prefetch(&mut self, id: &super::BlockId) -> Result<(), super::StoreError> {
+    fn prefetch(&mut self, id: &super::BlockId) -> Result<super::PrefetchState, super::StoreError> {
         match self {
             Layer::Base(store) => store.prefetch(id),
             Layer::Disk(cache) => cache.prefetch(id),
@@ -297,7 +297,7 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
-    fn prefetch(&mut self, id: &super::BlockId) -> Result<(), super::StoreError> {
+    fn prefetch(&mut self, id: &super::BlockId) -> Result<super::PrefetchState, super::StoreError> {
         match self {
             TieredStore::WithRam(cache) => cache.prefetch(id),
             TieredStore::WithoutRam(layer) => layer.prefetch(id),

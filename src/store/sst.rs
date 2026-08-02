@@ -664,7 +664,7 @@ impl SstCursor {
                 self.prefetched_data = Some((ordinal, id));
             }
             Some(DataBlockLookahead::Leaf(id)) => {
-                store.prefetch(&id)?;
+                prefetch_index_block(store, id)?;
                 self.prefetched_leaf = Some((ordinal, id));
             }
             None => {}
@@ -739,7 +739,58 @@ pub(crate) fn prefetch_data_block(
     if !store.async_gets_enabled() {
         return Ok(());
     }
-    store.prefetch(&id).map_err(SstError::Store)
+    match store.prefetch(&id).map_err(SstError::Store)? {
+        super::PrefetchState::Scheduled
+        | super::PrefetchState::Reused
+        | super::PrefetchState::Saturated => Ok(()),
+        super::PrefetchState::Unavailable => Err(SstError::Store(StoreError::Unavailable)),
+    }
+}
+
+fn prefetch_index_block(store: &mut dyn BlockStore, id: BlockId) -> Result<(), SstError> {
+    if !store.async_gets_enabled() {
+        return Ok(());
+    }
+    match store.prefetch(&id).map_err(SstError::Store)? {
+        super::PrefetchState::Scheduled
+        | super::PrefetchState::Reused
+        | super::PrefetchState::Saturated => Ok(()),
+        super::PrefetchState::Unavailable => Err(SstError::Store(StoreError::Unavailable)),
+    }
+}
+
+/// Schedules consecutive entries from an already resident SST index leaf.
+/// The current block is deliberately excluded: it remains the demand read,
+/// leaving one fixed slot available for it. A saturated scheduler stops this
+/// optional window immediately; the saturation counter records that decision.
+fn prefetch_data_window(
+    store: &mut dyn BlockStore,
+    index: &[u8],
+    first: usize,
+    count: usize,
+    versioned: bool,
+) -> Result<(), SstError> {
+    if !store.async_gets_enabled() {
+        return Ok(());
+    }
+    let slots = store.async_read_slots();
+    if slots <= 1 {
+        return Ok(());
+    }
+    let end = first.saturating_add(slots - 1).min(count);
+    for entry in first..end {
+        match store
+            .prefetch(&block_id_at(index, entry, versioned))
+            .map_err(SstError::Store)?
+        {
+            super::PrefetchState::Scheduled | super::PrefetchState::Reused => {}
+            super::PrefetchState::Saturated => break,
+            super::PrefetchState::Unavailable => {
+                return Err(SstError::Store(StoreError::Unavailable));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one completed prefetched index leaf and returns its first data
@@ -953,9 +1004,13 @@ impl<'a> SstReader<'a> {
             };
             for entry_index in start..count {
                 let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
-                let next = (entry_index + 1 < count)
-                    .then(|| block_id_at(self.index_scratch, entry_index + 1, handle.versioned));
-                prefetch_data_block(store, next)?;
+                prefetch_data_window(
+                    store,
+                    self.index_scratch,
+                    entry_index + 1,
+                    count,
+                    handle.versioned,
+                )?;
                 let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
                 let mut ran_past = false;
                 // A chained entry owns its whole block, so at most one assembly
@@ -1023,9 +1078,13 @@ impl<'a> SstReader<'a> {
             let end = (start + budget).min(count);
             for entry_index in start..end {
                 let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
-                let next = (entry_index + 1 < end)
-                    .then(|| block_id_at(self.index_scratch, entry_index + 1, handle.versioned));
-                prefetch_data_block(store, next)?;
+                prefetch_data_window(
+                    store,
+                    self.index_scratch,
+                    entry_index + 1,
+                    end,
+                    handle.versioned,
+                )?;
                 let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
                 for entry in (DataBlock {
                     bytes: &self.data_scratch[..data_len],
@@ -1929,10 +1988,14 @@ mod tests {
             true
         }
 
-        fn prefetch(&mut self, id: &BlockId) -> Result<(), StoreError> {
+        fn async_read_slots(&self) -> usize {
+            4
+        }
+
+        fn prefetch(&mut self, id: &BlockId) -> Result<crate::store::PrefetchState, StoreError> {
             self.requested.push(*id);
             self.prefetched.push(*id);
-            Ok(())
+            Ok(crate::store::PrefetchState::Scheduled)
         }
 
         fn take_prefetch(
@@ -1984,6 +2047,47 @@ mod tests {
             .filter(|id| *id == first || *id == second)
             .collect();
         assert_eq!(requests[..2], [second, first]);
+    }
+
+    #[test]
+    fn scan_fills_the_bounded_lookahead_window_from_one_index_leaf() {
+        let (_budget, mut inner) = store();
+        let row = vec![7u8; MAX_PAYLOAD / 2];
+        let handle = build(
+            &mut inner,
+            &[
+                (1, row.clone()),
+                (2, row.clone()),
+                (3, row.clone()),
+                (4, row.clone()),
+                (5, row.clone()),
+            ],
+        )
+        .unwrap();
+        let mut index = [0u8; MAX_PAYLOAD];
+        let mut ids = [BlockId([0; 32]); 4];
+        for (ordinal, id) in ids.iter_mut().enumerate() {
+            *id = locate_data_block(&mut inner, &handle, &mut index, ordinal)
+                .unwrap()
+                .unwrap();
+        }
+        let mut store = LookaheadStore {
+            inner,
+            requested: Vec::new(),
+            prefetched: Vec::new(),
+        };
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        reader
+            .scan(&mut store, &handle, 1, 5, &mut |_, _| {})
+            .unwrap();
+        let requests: Vec<_> = store
+            .requested
+            .iter()
+            .copied()
+            .filter(|id| ids.contains(id))
+            .collect();
+        assert_eq!(requests[..4], [ids[1], ids[2], ids[3], ids[0]]);
     }
 
     #[test]

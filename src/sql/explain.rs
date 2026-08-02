@@ -167,6 +167,21 @@ fn cache_probabilities(stats: BlockIoStats) -> (f64, f64) {
     (ram, disk)
 }
 
+/// Estimated cost of one cold durable-block request in the plan's arbitrary
+/// cost units. Until one response has completed, keep the documented bootstrap
+/// calibration; afterwards use the provider-neutral observed mean latency.
+/// A plan never performs I/O to obtain this value.
+fn object_request_cost(stats: BlockIoStats) -> f64 {
+    if stats.object_read_completions == 0 {
+        return 4.0;
+    }
+    let mean_micros = stats.object_read_micros as f64 / stats.object_read_completions as f64;
+    // Cost units are milliseconds. A sub-millisecond local object store must
+    // still retain a non-zero request cost so it cannot erase CPU work or make
+    // an unbounded number of requests look free.
+    (mean_micros / 1_000.0).max(0.01)
+}
+
 fn predicate_column(
     expression: &Expr<'_>,
     scope: &QueryScope<'_>,
@@ -236,6 +251,88 @@ fn column_selectivity(
     (non_null / column_statistics.distinct_values.max(1) as f64).clamp(0.0, 1.0)
 }
 
+/// Returns a joint equality estimate when an AND-conjunction supplies every
+/// column of a collected composite key. This deliberately recognizes only
+/// constant equality arms: joins, parameters, calls, and range predicates
+/// retain the conservative general estimator below.
+fn multi_column_selectivity(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
+    table: usize,
+    expression: &Expr<'_>,
+    txid: u32,
+) -> Option<f64> {
+    fn collect(
+        expression: &Expr<'_>,
+        scope: &QueryScope<'_>,
+        table: usize,
+        columns: &mut [usize; crate::storage::MAX_INDEX_COLS],
+        count: &mut usize,
+    ) -> bool {
+        match expression {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+            } => {
+                collect(left, scope, table, columns, count)
+                    && collect(right, scope, table, columns, count)
+            }
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let column = |candidate: &Expr<'_>, other: &Expr<'_>| {
+                    let Expr::Column { qualifier, name } = candidate else {
+                        return None;
+                    };
+                    if !other.is_constant() || other.contains_call() {
+                        return None;
+                    }
+                    match scope.find_column(*qualifier, name).ok()? {
+                        query::ResolvedColumn::Table(owner, column) if owner == table => {
+                            Some(column)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(column) = column(left, right).or_else(|| column(right, left)) else {
+                    return false;
+                };
+                if *count == columns.len() || columns[..*count].contains(&column) {
+                    return false;
+                }
+                columns[*count] = column;
+                *count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    if scope.derived[table].is_some() || scope.slots[table] == usize::MAX {
+        return None;
+    }
+    let mut columns = [0usize; crate::storage::MAX_INDEX_COLS];
+    let mut count = 0usize;
+    if !collect(expression, scope, table, &mut columns, &mut count) || count < 2 {
+        return None;
+    }
+    let statistics = storage.table_statistics(scope.slots[table], txid);
+    if !statistics.valid || statistics.rows == 0 {
+        return None;
+    }
+    let multi = statistics
+        .multi_columns
+        .iter()
+        .find(|statistics| statistics.covers(&columns[..count]))?;
+    Some(
+        (multi.non_null_rows as f64 / statistics.rows as f64 / multi.distinct_values.max(1) as f64)
+            .clamp(0.0, 1.0),
+    )
+}
+
 fn predicate_selectivity(
     storage: &Storage,
     scope: &QueryScope<'_>,
@@ -249,6 +346,11 @@ fn predicate_selectivity(
             left,
             right,
         } => {
+            if let Some(selectivity) =
+                multi_column_selectivity(storage, scope, table, expression, txid)
+            {
+                return selectivity;
+            }
             let left = predicate_selectivity(storage, scope, table, left, txid);
             let right = predicate_selectivity(storage, scope, table, right, txid);
             (left * right).clamp(0.0, 1.0)
@@ -443,7 +545,7 @@ fn scan_node(
     let object_requests = blocks.saturating_sub(cache_blocks);
     // Object misses dominate; disk and RAM hits retain smaller but non-zero
     // costs so two equally selective plans prefer the warmer access path.
-    let io_cost = object_requests as f64 * 4.0
+    let io_cost = object_requests as f64 * object_request_cost(storage.block_io_stats())
         + (blocks.saturating_sub(object_requests) as f64)
             * (ram_probability * 0.01 + disk_probability * 0.1);
     let cpu_rows = if use_index { output_rows } else { rows };
@@ -713,7 +815,7 @@ fn physical_scan_node(
     let cache_probability = (ram_probability + disk_probability).min(1.0);
     let cache_blocks = (blocks as f64 * cache_probability).round() as u64;
     let object_requests = blocks.saturating_sub(cache_blocks);
-    let total_cost = object_requests as f64 * 4.0
+    let total_cost = object_requests as f64 * object_request_cost(storage.block_io_stats())
         + cache_blocks as f64 * (ram_probability * 0.01 + disk_probability * 0.1)
         + rows as f64 * 0.01;
     PlanNode {
@@ -1466,4 +1568,35 @@ pub(super) fn emit_plan(
     responder.data_row(&[Datum::Text(document.as_str())])?;
     responder.command_complete("EXPLAIN")?;
     Ok(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::object_request_cost;
+    use crate::store::BlockIoStats;
+
+    #[test]
+    fn object_cost_bootstraps_then_uses_completed_read_latency() {
+        assert_eq!(object_request_cost(BlockIoStats::default()), 4.0);
+        assert_eq!(
+            object_request_cost(BlockIoStats {
+                object_read_completions: 4,
+                object_read_micros: 12_000,
+                ..BlockIoStats::default()
+            }),
+            3.0
+        );
+    }
+
+    #[test]
+    fn object_cost_never_makes_a_completed_request_free() {
+        assert_eq!(
+            object_request_cost(BlockIoStats {
+                object_read_completions: 1,
+                object_read_micros: 0,
+                ..BlockIoStats::default()
+            }),
+            0.01
+        );
+    }
 }

@@ -5153,6 +5153,35 @@ fn vacuum_and_analyze() {
     assert_eq!(statistics.columns[1].distinct_values, 2);
     assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
     assert!(statistics.average_row_width > 0);
+    run_with(&mut e, &mut b, "CREATE INDEX vt_ab ON vt (a, b)");
+    run_with(&mut e, &mut b, "ANALYZE vt");
+    let statistics = e.storage.table_statistics(slot, 0);
+    let composite = statistics
+        .multi_columns
+        .iter()
+        .find(|statistics| statistics.covers(&[0, 1]))
+        .expect("ANALYZE records the composite value-index key");
+    assert_eq!(composite.non_null_rows, 2);
+    assert_eq!(composite.distinct_values, 2);
+    // Targeted analysis which does not cover every key column preserves the
+    // current joint statistic instead of manufacturing a partial key image.
+    run_with(&mut e, &mut b, "ANALYZE vt (a)");
+    assert!(
+        e.storage
+            .table_statistics(slot, 0)
+            .multi_columns
+            .iter()
+            .any(|statistics| statistics.covers(&[0, 1]))
+    );
+    run_with(&mut e, &mut b, "DROP INDEX vt_ab");
+    assert!(
+        !e.storage
+            .table_statistics(slot, 0)
+            .multi_columns
+            .iter()
+            .any(|statistics| statistics.valid),
+        "dropping a composite access path invalidates its joint statistic"
+    );
     let catalog = run_with(
         &mut e,
         &mut b,
@@ -5310,6 +5339,14 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
              DELETE FROM targeted_stale_statistics WHERE a = 2; \
              ANALYZE targeted_stale_statistics(a)",
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_composite_statistics (a int, b int); \
+             CREATE INDEX durable_composite_statistics_ab ON durable_composite_statistics (a, b); \
+             INSERT INTO durable_composite_statistics VALUES (1, 10), (1, 20), (NULL, 30); \
+             ANALYZE durable_composite_statistics",
+        );
     }
 
     let mut budget = Budget::new(1 << 26);
@@ -5337,6 +5374,18 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
         ["1|-1"],
         "targeted ANALYZE preserves an untouched estimate even when it exceeds the new row estimate"
     );
+    let composite_slot = engine
+        .storage
+        .find_table("public", "durable_composite_statistics")
+        .unwrap();
+    let composite_statistics = engine.storage.table_statistics(composite_slot, 0);
+    let composite = composite_statistics
+        .multi_columns
+        .iter()
+        .find(|statistics| statistics.covers(&[0, 1]))
+        .expect("WAL recovery retains composite statistics");
+    assert_eq!(composite.non_null_rows, 2);
+    assert_eq!(composite.distinct_values, 2);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -5568,6 +5617,37 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     ));
     assert!(yaml[0].starts_with("- Plan:\n"), "{yaml:?}");
     assert!(yaml[0].contains("Node Type: \"Result\""), "{yaml:?}");
+}
+
+#[test]
+fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
+    let mut config = test_config("correlated-composite-explain");
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE correlated_statistics (a int, b int); \
+         INSERT INTO correlated_statistics \
+           SELECT g % 10, g % 10 FROM generate_series(1, 1000) AS g; \
+         CREATE INDEX correlated_statistics_ab ON correlated_statistics (a, b); \
+         ANALYZE correlated_statistics",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
+    ));
+    assert!(
+        rows.iter().any(|row| row.contains("rows=100 ")),
+        "joint NDV=10 must estimate the 100 correlated matches instead of multiplying two 0.1 estimates: {rows:?}"
+    );
 }
 
 #[test]
@@ -10040,6 +10120,12 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         &mut writer,
         "INSERT INTO snapshot_rows VALUES (1, 'before'), (2, 'remove-me'), (3, 'keep-me')",
     );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE INDEX snapshot_rows_id_value ON snapshot_rows (id, value)",
+    );
     assert!(engine.checkpoint().unwrap());
     run_txn(
         &mut engine,
@@ -10134,6 +10220,13 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
     assert_eq!(restarted_statistics.columns[0].distinct_values, 2);
+    let composite = restarted_statistics
+        .multi_columns
+        .iter()
+        .find(|statistics| statistics.covers(&[0, 1]))
+        .expect("manifest recovery retains composite statistics");
+    assert_eq!(composite.non_null_rows, 2);
+    assert_eq!(composite.distinct_values, 2);
     assert!(
         !restarted.storage.value_cache_complete(restarted_slot, &[0])
             && restarted.storage.value_probe_complete(restarted_slot, &[0]),
@@ -10190,6 +10283,10 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     config.value_index_rows = 1;
     config.work_arena_bytes = 16 << 20;
+    assert!(
+        600 > crate::storage::SPILL_SCAN_BATCH_ROWS,
+        "the fixture must cross the durable scan batch boundary"
+    );
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);

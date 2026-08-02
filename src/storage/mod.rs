@@ -23,6 +23,22 @@ use crate::util::StackStr;
 
 pub(crate) use rowenc::MAX_COLUMNS;
 
+/// Rows handed from the durable merge cursor to the executor. The fixed batch
+/// boundary lets one resident SST block feed a bounded scan step rather than
+/// crossing the storage/executor seam once per row.
+#[derive(Clone, Copy)]
+pub(crate) struct SpilledRow<'a> {
+    pub(crate) rowid: u64,
+    pub(crate) bytes: &'a [u8],
+}
+
+/// A scan batch is deliberately small enough to leave statement-arena space
+/// for joins and expression results, while amortizing the cold cursor seam.
+pub(crate) const SPILL_SCAN_BATCH_ROWS: usize = 128;
+
+type SpilledRowBatchVisitor<'a, 'callback> =
+    dyn FnMut(&[SpilledRow<'a>]) -> Result<core::ops::ControlFlow<()>, SqlError> + 'callback;
+
 fn spill_read_error(error: crate::store::SstError) -> SqlError {
     match error {
         crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
@@ -948,6 +964,35 @@ impl ColumnStatistics {
     };
 }
 
+/// Distinctness information for one composite value-index key. NULL-bearing
+/// rows are counted separately because SQL equality cannot match them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MultiColumnStatistics {
+    pub(crate) valid: bool,
+    pub(crate) columns: [u16; MAX_INDEX_COLS],
+    pub(crate) n_columns: u8,
+    pub(crate) non_null_rows: u64,
+    pub(crate) distinct_values: u64,
+}
+
+impl MultiColumnStatistics {
+    pub(crate) const EMPTY: Self = Self {
+        valid: false,
+        columns: [0; MAX_INDEX_COLS],
+        n_columns: 0,
+        non_null_rows: 0,
+        distinct_values: 0,
+    };
+
+    pub(crate) fn covers(&self, columns: &[usize]) -> bool {
+        self.valid
+            && self.n_columns as usize == columns.len()
+            && self.columns[..columns.len()]
+                .iter()
+                .all(|column| columns.contains(&usize::from(*column)))
+    }
+}
+
 /// Table cardinality and width statistics used by the storage-aware planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableStatistics {
@@ -956,6 +1001,7 @@ pub(crate) struct TableStatistics {
     pub(crate) average_row_width: u32,
     pub(crate) analyzed_generation: u64,
     pub(crate) columns: [ColumnStatistics; MAX_COLUMNS],
+    pub(crate) multi_columns: [MultiColumnStatistics; MAX_MULTICOLUMN_STATISTICS],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -971,6 +1017,7 @@ impl TableStatistics {
         average_row_width: 0,
         analyzed_generation: 0,
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
+        multi_columns: [MultiColumnStatistics::EMPTY; MAX_MULTICOLUMN_STATISTICS],
     };
 }
 
@@ -986,6 +1033,10 @@ pub(crate) const MAX_TOMBSTONES: usize = 1024;
 /// column tuple, whether introduced by a constraint or a named index.
 /// Exceeding it at DDL is a loud error.
 pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
+
+/// Composite statistics are collected only for the bounded composite keys the
+/// planner can actually seek through the provider-neutral value-index path.
+pub(crate) const MAX_MULTICOLUMN_STATISTICS: usize = MAX_VALUE_ENFORCERS;
 
 /// A table's binding of one indexed tuple to its value cache: the key columns
 /// it covers and the pool slot holding the `value_hash → rowid` map. Constraint
@@ -5598,19 +5649,63 @@ impl Storage {
         }
     }
 
-    /// Streams every spill-only row with the bytes already carried by the
-    /// merged data-block cursor. Overlay rows are intentionally excluded:
-    /// they remain in the row-state seam, where transaction visibility is
-    /// resolved. The outer physical scan combines these rows with that seam
-    /// in its established physical order.
-    pub(crate) fn for_each_spilled_row_bytes<'a>(
+    /// Streams every spill-only row in bounded batches with bytes already
+    /// carried by the merged data-block cursor. Overlay rows are intentionally
+    /// excluded: they remain in the row-state seam, where transaction
+    /// visibility is resolved. The outer physical scan combines these rows
+    /// with that seam in its established physical order.
+    pub(crate) fn for_each_spilled_row_batch<'a, 'callback>(
         &self,
         table_slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
-        each: &mut dyn FnMut(u64, &'a [u8]) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut SpilledRowBatchVisitor<'a, 'callback>,
     ) -> Result<(), SqlError> {
-        self.spill_merged_walk_bytes(table_slot, arena, recycle_rows, each)
+        let rows = arena
+            .alloc_slice_with(SPILL_SCAN_BATCH_ROWS, |_| SpilledRow {
+                rowid: 0,
+                bytes: &[],
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "spilled scan batch exceeds the statement arena; raise work_arena_bytes"
+                )
+            })?;
+        let rows = &mut *rows;
+        let batch_mark = recycle_rows.then(|| arena.mark());
+        let mut len = 0usize;
+        let mut stopped = false;
+        let mut result =
+            self.spill_merged_walk_bytes(table_slot, arena, false, &mut |rowid, bytes| {
+                rows[len] = SpilledRow { rowid, bytes };
+                len += 1;
+                if len != rows.len() {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                }
+                match each(&rows[..len])? {
+                    core::ops::ControlFlow::Continue(()) => {
+                        if let Some(mark) = batch_mark {
+                            // SAFETY: `each` consumed this batch synchronously.
+                            unsafe { arena.rewind_to(mark) };
+                        }
+                        len = 0;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    }
+                    core::ops::ControlFlow::Break(()) => {
+                        stopped = true;
+                        Ok(core::ops::ControlFlow::Break(()))
+                    }
+                }
+            });
+        if result.is_ok() && !stopped && len != 0 {
+            result = each(&rows[..len]).map(|_| ());
+        }
+        if let Some(mark) = batch_mark {
+            // SAFETY: the batch callback consumes every row synchronously.
+            unsafe { arena.rewind_to(mark) };
+        }
+        result
     }
 
     /// Whether the spill list has no resident row-state overlay. In that
@@ -5990,6 +6085,28 @@ impl Storage {
         let mut widths = [0u64; MAX_COLUMNS];
         let mut non_nulls = [0u64; MAX_COLUMNS];
         let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
+        let mut multi_columns = [[0u16; MAX_INDEX_COLS]; MAX_MULTICOLUMN_STATISTICS];
+        let mut multi_widths = [0usize; MAX_MULTICOLUMN_STATISTICS];
+        let mut multi_refresh = [false; MAX_MULTICOLUMN_STATISTICS];
+        let mut multi_non_nulls = [0u64; MAX_MULTICOLUMN_STATISTICS];
+        let mut multi_registers = [[0u8; REGISTERS]; MAX_MULTICOLUMN_STATISTICS];
+        let mut n_multi = 0usize;
+        for binding in 0..self.tables[table_slot].n_enforcers {
+            let enforcer = self.tables[table_slot].enforcers[binding].expect("enforcer exists");
+            if enforcer.n_cols < 2 {
+                continue;
+            }
+            let refresh = selected_columns.is_empty()
+                || enforcer
+                    .columns()
+                    .iter()
+                    .all(|column| selected[*column as usize]);
+            let slot = n_multi;
+            multi_columns[slot][..enforcer.n_cols].copy_from_slice(enforcer.columns());
+            multi_widths[slot] = enforcer.n_cols;
+            multi_refresh[slot] = refresh;
+            n_multi += 1;
+        }
         self.for_each_row_state(table_slot, &mut |rowid, state| {
             let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
@@ -6017,6 +6134,20 @@ impl Storage {
                     widths[column] = widths[column].saturating_add(width as u64);
                     let index = [column as u16];
                     add_distinct(&mut registers[column], hash_key(&values, &index));
+                }
+                for multi in 0..n_multi {
+                    if !multi_refresh[multi]
+                        || multi_columns[multi][..multi_widths[multi]]
+                            .iter()
+                            .any(|column| values[*column as usize].is_null())
+                    {
+                        continue;
+                    }
+                    multi_non_nulls[multi] = multi_non_nulls[multi].saturating_add(1);
+                    add_distinct(
+                        &mut multi_registers[multi],
+                        hash_key(&values, &multi_columns[multi][..multi_widths[multi]]),
+                    );
                 }
                 Ok(())
             })?;
@@ -6058,6 +6189,23 @@ impl Storage {
                     .unwrap_or(0)
                     .min(u64::from(u32::MAX)) as u32,
             };
+        }
+        for multi in 0..n_multi {
+            if !multi_refresh[multi] {
+                continue;
+            }
+            let distinct_values =
+                distinct_estimate(&multi_registers[multi]).min(multi_non_nulls[multi]);
+            statistics.multi_columns[multi] = MultiColumnStatistics {
+                valid: rows != 0,
+                columns: multi_columns[multi],
+                n_columns: multi_widths[multi] as u8,
+                non_null_rows: multi_non_nulls[multi],
+                distinct_values,
+            };
+        }
+        for multi in n_multi..statistics.multi_columns.len() {
+            statistics.multi_columns[multi] = MultiColumnStatistics::EMPTY;
         }
         self.write_table_statistics(table_slot, txid, statistics)?;
         // PostgreSQL updates pg_class's relation statistics in place:
@@ -7569,7 +7717,30 @@ impl Storage {
             // taken by this rebuild.
             self.tables[table_index].n_enforcers = w + 1;
         }
-        self.populate_enforcers(table_index)
+        self.populate_enforcers(table_index)?;
+        // A dropped or reshaped composite key must not leave a planner-visible
+        // joint statistic behind. Pending CREATE INDEX ownership is private,
+        // so only reconcile committed/startup cache shapes here.
+        if txid.is_none() {
+            let mut changed = false;
+            for statistics in &mut self.tables[table_index].statistics.multi_columns {
+                if statistics.valid
+                    && !want[..n_want].iter().any(|(columns, n_columns)| {
+                        *n_columns == statistics.n_columns as usize
+                            && columns[..*n_columns]
+                                == statistics.columns[..statistics.n_columns as usize]
+                    })
+                {
+                    *statistics = MultiColumnStatistics::EMPTY;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.tables[table_index].statistics_dirty = true;
+                self.tables[table_index].statistics_wal_dirty = true;
+            }
+        }
+        Ok(())
     }
 
     /// Populates a table's enforcer indexes from its committed rows. Takes the

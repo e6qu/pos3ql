@@ -775,8 +775,14 @@ durable objects than a full scan. The durable authority is unchanged: rows,
 indexes, statistics, and WAL publication remain behind the common object-store
 interface, while RAM and local disk only accelerate reads.
 
-Pillar 1 still needs richer multi-column and distribution statistics, more
-access paths, and cost calibration against real provider traces. The first new
+Pillar 1 still needs richer distribution statistics, more access paths, and
+cost calibration against real provider traces. `ANALYZE` now records a joint
+non-NULL population and bounded HyperLogLog distinct estimate for every
+composite value-index key; the image survives WAL and manifest recovery,
+disappears with that access path, and prevents the planner from multiplying
+correlated constant-equality predicates. Durable GET telemetry also records
+completed response count, bytes, and elapsed time, so the object-request cost
+calibrates from observed provider latency after its documented bootstrap. The first new
 access path landed: a **hash join** for two-table inner/cross equi-joins over
 base tables — single-column and multi-column keys (composite FKs, natural
 keys) — the inner side is built into an arena hash table keyed by the join
@@ -810,29 +816,35 @@ schedule it before consuming the current block. Prefetch is an explicit
 `BlockStore` operation: only reactor-owned GET stacks schedule it, a completed
 body remains owned by its request slot until the demand read consumes it, and
 RAM/disk tiers pass the request through without inventing a buffer or a second
-GET. The one-block lookahead is bounded by the configured GET-slot pool; a
-full pool simply cannot schedule another optional lookahead, while provider
+GET. The lookahead window fills every spare configured GET slot with
+consecutive data blocks already named by the loaded index leaf while retaining
+one slot for the demand read. Each request reports scheduled, reused, or
+saturated; a full pool is observable scheduler telemetry, while provider
 errors surface through the normal demand read. Cross-leaf lookahead now keeps
 the same ownership contract: a cursor schedules the next index leaf, takes
 only that completed speculative body, then schedules the leaf's first data
-block before crossing the boundary. Ranged-GET coalescing and p95 hedging
-remain separate scheduler work. A configured hedge is now available too:
+block before crossing the boundary. Byte-range coalescing requires a packed
+immutable-container format: one content-addressed object per block cannot
+truthfully merge unrelated object keys into one HTTP range request. A
+configured hedge is now available too:
 `object_store_hedge_after_ms` starts one duplicate of a still-pending GET on a
 spare fixed slot after that deadline (zero disables it); the first verified
-body wins and releases its sibling. The remaining Pillars 2–4 work is
-coalescing, the block-at-a-time executor, and PAX
+body wins and releases its sibling. The remaining Pillars 2–4 work is the
+packed ranged-read container, the block-at-a-time executor, and PAX
 late materialization described above.
 
-**Pillar 3 scan slice (2026-08-02).** An unshadowed cold table scan carries
-each selected row out of the resident merged-SST data block before the cursor
-advances, rather than re-probing that row through the same SST. The copied row
-lives only for the recycling callback (or in the ordinary statement arena for
-a retaining caller); the block context is released before nested execution can
-issue reads. The planner uses the same metadata-only request estimate for
+**Pillar 3 scan slice (2026-08-03).** An unshadowed cold table scan carries
+selected rows out of the resident merged-SST data block before the cursor
+advances, rather than re-probing those rows through the same SST. It hands the
+executor fixed 128-row batches, recycling every completed batch before the
+cursor collects another one; a retaining caller keeps the ordinary
+statement-arena lifetime. The block context is released before nested execution
+can issue reads. The planner uses the same metadata-only request estimate for
 sequential and single-column index paths, so a fragmented point probe is not
 selected when the block cursor is cheaper. Repository formatting is now part
-of CI (`cargo fmt --check`), and the object-store regression bounds cold
-full-scan GETs while checking the selected plan is no more expensive.
+of CI (`cargo fmt --check`), and the forced-cold regression crosses the batch
+boundary, bounds full-scan GETs, and checks the selected plan is no more
+expensive.
 
 The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
 but distributes independent seeds over four bounded workers. The merge gate

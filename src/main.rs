@@ -26,7 +26,10 @@ fn run() -> Result<(), String> {
         + 128 // canned refusal message scratch
         + (config.max_connections as usize) * 8
         + block_read_slots * core::mem::size_of::<Option<i32>>();
-    let plan = config.memory_plan(server_bytes, pos3ql::sql::Engine::extra_budget_bytes(&config));
+    let plan = config.memory_plan(
+        server_bytes,
+        pos3ql::sql::Engine::extra_budget_bytes(&config),
+    );
 
     println!("pos3ql starting");
     println!("  listen_addr  {}", config.listen_addr);

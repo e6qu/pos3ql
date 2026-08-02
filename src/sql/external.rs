@@ -167,7 +167,10 @@ impl ExternalRunReader {
     /// Copies the current immutable row into reader-owned staging so a merge
     /// may advance this cursor while retaining the run key.
     pub(crate) fn stage_current(&mut self) -> Option<usize> {
-        let row = self.reader.row().map(|prefixed| &prefixed[ORDINAL_BYTES..])?;
+        let row = self
+            .reader
+            .row()
+            .map(|prefixed| &prefixed[ORDINAL_BYTES..])?;
         self.output[..row.len()].copy_from_slice(row);
         Some(row.len())
     }
@@ -242,7 +245,9 @@ impl ExternalSorter {
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
         let projected_len = projected_row_len_by(columns, &mut value_at)?;
-        let total = ORDINAL_BYTES.checked_add(projected_len).ok_or_else(row_too_large)?;
+        let total = ORDINAL_BYTES
+            .checked_add(projected_len)
+            .ok_or_else(row_too_large)?;
         if total > MAX_INLINE_ROW {
             return Err(row_too_large());
         }
@@ -269,7 +274,9 @@ impl ExternalSorter {
         row: &[u8],
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
-        let total = ORDINAL_BYTES.checked_add(row.len()).ok_or_else(row_too_large)?;
+        let total = ORDINAL_BYTES
+            .checked_add(row.len())
+            .ok_or_else(row_too_large)?;
         if total > MAX_INLINE_ROW {
             return Err(row_too_large());
         }

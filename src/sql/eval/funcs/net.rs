@@ -9,7 +9,7 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::util::StackStr;
 
-use super::super::{arena_full, arity_err, eval_full, sqlstate, ColumnLookup, EvalHooks, SqlError};
+use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, sqlstate};
 
 /// Handles the network-address family. Returns `None` if `name` is not one of
 /// these functions, leaving the router to keep matching.
@@ -177,12 +177,14 @@ pub(crate) fn dispatch<'a>(
                 if a.is_null() || b.is_null() {
                     return Ok(Datum::Null);
                 }
-                net::inet_merge(&net_arg(a)?, &net_arg(b)?).map(Datum::Cidr).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "cannot merge addresses from different families"
-                    )
-                })
+                net::inet_merge(&net_arg(a)?, &net_arg(b)?)
+                    .map(Datum::Cidr)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "cannot merge addresses from different families"
+                        )
+                    })
             }
             "macaddr8_set7bit" => {
                 want(1)?;

@@ -44,10 +44,9 @@ impl Transport {
         config: &Arc<rustls::ClientConfig>,
         server_name: &rustls::pki_types::ServerName<'static>,
     ) -> std::io::Result<Self> {
-        let session = guard::tls_scope(|| {
-            rustls::ClientConnection::new(config.clone(), server_name.clone())
-        })
-        .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
+        let session =
+            guard::tls_scope(|| rustls::ClientConnection::new(config.clone(), server_name.clone()))
+                .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
         Ok(Transport::Tls(Some(guard::tls_scope(|| {
             Box::new(rustls::StreamOwned::new(session, stream))
         }))))
@@ -58,9 +57,7 @@ impl Read for Transport {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Transport::Plain(s) => s.read(buf),
-            Transport::Tls(t) => {
-                guard::tls_scope(|| t.as_mut().expect("live session").read(buf))
-            }
+            Transport::Tls(t) => guard::tls_scope(|| t.as_mut().expect("live session").read(buf)),
         }
     }
 }
@@ -69,18 +66,14 @@ impl Write for Transport {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Transport::Plain(s) => s.write(buf),
-            Transport::Tls(t) => {
-                guard::tls_scope(|| t.as_mut().expect("live session").write(buf))
-            }
+            Transport::Tls(t) => guard::tls_scope(|| t.as_mut().expect("live session").write(buf)),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Transport::Plain(s) => s.flush(),
-            Transport::Tls(t) => {
-                guard::tls_scope(|| t.as_mut().expect("live session").flush())
-            }
+            Transport::Tls(t) => guard::tls_scope(|| t.as_mut().expect("live session").flush()),
         }
     }
 }
@@ -106,10 +99,7 @@ pub(super) struct TlsContext {
 /// then): Mozilla's compiled-in roots plus, when `ca_file` names a PEM, the
 /// certificates it holds — the door for self-signed test endpoints, decided
 /// explicitly in configuration rather than by an insecure-skip flag.
-pub(super) fn build_context(
-    host: &str,
-    ca_file: &str,
-) -> Result<TlsContext, String> {
+pub(super) fn build_context(host: &str, ca_file: &str) -> Result<TlsContext, String> {
     let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -120,9 +110,7 @@ pub(super) fn build_context(
         for der in crate::pem::certificates(&pem)? {
             roots
                 .add(rustls::pki_types::CertificateDer::from(der))
-                .map_err(|e| {
-                    format!("object_store_tls_ca_file {ca_file}: bad certificate: {e}")
-                })?;
+                .map_err(|e| format!("object_store_tls_ca_file {ca_file}: bad certificate: {e}"))?;
             added += 1;
         }
         if added == 0 {
@@ -136,5 +124,8 @@ pub(super) fn build_context(
         .with_no_client_auth();
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| format!("object_store_endpoint host {host}: {e}"))?;
-    Ok(TlsContext { config: Arc::new(config), server_name })
+    Ok(TlsContext {
+        config: Arc::new(config),
+        server_name,
+    })
 }

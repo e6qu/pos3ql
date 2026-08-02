@@ -66,9 +66,13 @@ pub fn find(
         let best = Cell::new(None::<usize>);
         let accept = |rest: &str| {
             let consumed = sub.len() - rest.len();
-            let better = best
-                .get()
-                .is_none_or(|b| if prefer_longest { consumed > b } else { consumed < b });
+            let better = best.get().is_none_or(|b| {
+                if prefer_longest {
+                    consumed > b
+                } else {
+                    consumed < b
+                }
+            });
             if better {
                 best.set(Some(consumed));
             }
@@ -121,7 +125,10 @@ impl Recorder<'_> {
     /// The 1-based group number of the group whose `(` begins `pat`.
     fn group_of(&self, pat: &str) -> Option<usize> {
         let offset = pat.as_ptr() as usize - self.pat_base;
-        self.group_starts.iter().position(|&s| s == offset).map(|i| i + 1)
+        self.group_starts
+            .iter()
+            .position(|&s| s == offset)
+            .map(|i| i + 1)
     }
     /// Byte offset consumed so far, given the remaining suffix length.
     fn consumed(&self, remaining_len: usize) -> i64 {
@@ -179,7 +186,10 @@ pub fn find_captures(
     let mut starts = [0usize; MAX_GROUPS];
     let ng = group_starts(pat, &mut starts);
     if ng > MAX_GROUPS {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many capture groups in regular expression"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many capture groups in regular expression"
+        ));
     }
     // Locate the leftmost-longest whole match first (POSIX semantics).
     let Some((mstart, mend)) = find(pattern, text, from, case_insensitive)? else {
@@ -198,10 +208,21 @@ pub fn find_captures(
         spans: &spans[..ng],
     };
     let accept = |rest: &str| Ok(sub.len() - rest.len() == target);
-    m(pat, sub, case_insensitive, &budget, Some(&recorder), &accept)?;
+    m(
+        pat,
+        sub,
+        case_insensitive,
+        &budget,
+        Some(&recorder),
+        &accept,
+    )?;
     for (i, span) in spans[..ng].iter().enumerate() {
         let (a, b) = span.get();
-        spans_out[i] = if a < 0 { (-1, -1) } else { (a + mstart as i64, b + mstart as i64) };
+        spans_out[i] = if a < 0 {
+            (-1, -1)
+        } else {
+            (a + mstart as i64, b + mstart as i64)
+        };
     }
     Ok(Some(((mstart, mend), ng)))
 }
@@ -226,14 +247,20 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
                     i += 1;
                 }
                 if i >= bytes.len() {
-                    return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ["));
+                    return Err(sql_err!(
+                        sqlstate::INVALID_REGULAR_EXPRESSION,
+                        "invalid regular expression: unbalanced ["
+                    ));
                 }
             }
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ("));
+                    return Err(sql_err!(
+                        sqlstate::INVALID_REGULAR_EXPRESSION,
+                        "invalid regular expression: unbalanced ("
+                    ));
                 }
             }
             b'{' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
@@ -248,7 +275,10 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
         i += 1;
     }
     if depth != 0 {
-        return Err(sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: unbalanced ("));
+        return Err(sql_err!(
+            sqlstate::INVALID_REGULAR_EXPRESSION,
+            "invalid regular expression: unbalanced ("
+        ));
     }
     Ok(())
 }
@@ -256,7 +286,10 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
 fn step(budget: &Cell<u32>) -> Result<(), SqlError> {
     let b = budget.get();
     if b == 0 {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "regular expression is too complex"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "regular expression is too complex"
+        ));
     }
     budget.set(b - 1);
     Ok(())
@@ -309,7 +342,16 @@ fn m(
                 // The repetition records each iteration (last wins); the
                 // downstream continuation does not re-record the whole span.
                 let after_reps = move |t: &str| m(rest, t, case_insensitive, budget, rec, k);
-                rep_group(body, text, case_insensitive, budget, q, rec, group, &after_reps)
+                rep_group(
+                    body,
+                    text,
+                    case_insensitive,
+                    budget,
+                    q,
+                    rec,
+                    group,
+                    &after_reps,
+                )
             }
         };
     }
@@ -349,7 +391,14 @@ fn rep_atom(
         if let Some(c) = text.chars().next()
             && atom_matches(atom, c, case_insensitive)
         {
-            rep_atom(atom, &text[c.len_utf8()..], case_insensitive, budget, q.step_down(), cont)
+            rep_atom(
+                atom,
+                &text[c.len_utf8()..],
+                case_insensitive,
+                budget,
+                q.step_down(),
+                cont,
+            )
         } else {
             Ok(false)
         }
@@ -370,7 +419,10 @@ fn rep_atom(
 /// Repetition of a group `body` within `[q.min, q.max]` occurrences, then
 /// `cont`. Each iteration records the group's span (the last iteration wins,
 /// matching PostgreSQL/POSIX capture semantics for a repeated group).
-#[expect(clippy::too_many_arguments, reason = "capture recording threads context")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "capture recording threads context"
+)]
 fn rep_group(
     body: &str,
     text: &str,
@@ -395,7 +447,16 @@ fn rep_group(
             if let (Some(r), Some(g)) = (rec, group) {
                 r.record(g, r.consumed(start_len), r.consumed(t.len()));
             }
-            rep_group(body, t, case_insensitive, budget, q.step_down(), rec, group, cont)
+            rep_group(
+                body,
+                t,
+                case_insensitive,
+                budget,
+                q.step_down(),
+                rec,
+                group,
+                cont,
+            )
         };
         m(body, text, case_insensitive, budget, rec, &more)
     };
@@ -478,7 +539,11 @@ impl Quant {
     fn step_down(self) -> Quant {
         Quant {
             min: self.min.saturating_sub(1),
-            max: if self.max == u32::MAX { u32::MAX } else { self.max - 1 },
+            max: if self.max == u32::MAX {
+                u32::MAX
+            } else {
+                self.max - 1
+            },
             greedy: self.greedy,
         }
     }
@@ -493,14 +558,42 @@ const MAX_REPEAT: u32 = 255;
 fn parse_quant(pat: &str) -> Result<(Option<Quant>, &str), SqlError> {
     let b = pat.as_bytes();
     let (mut q, mut used) = match b.first() {
-        Some(b'*') => (Quant { min: 0, max: u32::MAX, greedy: true }, 1),
-        Some(b'+') => (Quant { min: 1, max: u32::MAX, greedy: true }, 1),
-        Some(b'?') => (Quant { min: 0, max: 1, greedy: true }, 1),
+        Some(b'*') => (
+            Quant {
+                min: 0,
+                max: u32::MAX,
+                greedy: true,
+            },
+            1,
+        ),
+        Some(b'+') => (
+            Quant {
+                min: 1,
+                max: u32::MAX,
+                greedy: true,
+            },
+            1,
+        ),
+        Some(b'?') => (
+            Quant {
+                min: 0,
+                max: 1,
+                greedy: true,
+            },
+            1,
+        ),
         // `{` opens a bound only when followed by a digit (PostgreSQL treats a
         // bare `{` as a literal character).
         Some(b'{') if b.get(1).is_some_and(u8::is_ascii_digit) => {
             let (min, max, after) = parse_bound(pat)?;
-            (Quant { min, max, greedy: true }, after)
+            (
+                Quant {
+                    min,
+                    max,
+                    greedy: true,
+                },
+                after,
+            )
         }
         _ => return Ok((None, pat)),
     };
@@ -515,7 +608,12 @@ fn parse_quant(pat: &str) -> Result<(Option<Quant>, &str), SqlError> {
 /// `(min, max, bytes_used)`. Bounds are validated exactly as PostgreSQL does:
 /// integers, `m <= n`, both at most 255.
 fn parse_bound(pat: &str) -> Result<(u32, u32, usize), SqlError> {
-    let bad = || sql_err!(sqlstate::INVALID_REGULAR_EXPRESSION, "invalid regular expression: invalid repetition count(s)");
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_REGULAR_EXPRESSION,
+            "invalid regular expression: invalid repetition count(s)"
+        )
+    };
     let b = pat.as_bytes();
     let mut i = 1;
     let read_int = |i: &mut usize| -> Option<u32> {
@@ -638,7 +736,11 @@ fn atom_matches(atom: &str, ch: char, case_insensitive: bool) -> bool {
             None => false,
         },
         Some(b'[') => class_matches(atom, ch, case_insensitive),
-        Some(_) => atom.chars().next().map(|c| eq_ci(c, ch, case_insensitive)).unwrap_or(false),
+        Some(_) => atom
+            .chars()
+            .next()
+            .map(|c| eq_ci(c, ch, case_insensitive))
+            .unwrap_or(false),
         None => false,
     }
 }
@@ -684,8 +786,7 @@ fn in_range(lo: char, hi: char, ch: char, case_insensitive: bool) -> bool {
         return true;
     }
     if case_insensitive {
-        (lo..=hi).contains(&ch.to_ascii_lowercase())
-            || (lo..=hi).contains(&ch.to_ascii_uppercase())
+        (lo..=hi).contains(&ch.to_ascii_lowercase()) || (lo..=hi).contains(&ch.to_ascii_uppercase())
     } else {
         false
     }
@@ -771,7 +872,7 @@ mod tests {
 
     #[test]
     fn captures_record_group_spans() {
-        use super::{find_captures, MAX_GROUPS};
+        use super::{MAX_GROUPS, find_captures};
         let mut spans = [(-1i64, -1i64); MAX_GROUPS];
         // Two groups: substrings "abc" (0..3) and "123" (4..7).
         let r = find_captures("([a-z]+)-([0-9]+)", "abc-123", 0, false, &mut spans).unwrap();

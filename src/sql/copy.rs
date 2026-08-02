@@ -9,7 +9,7 @@
 //! `\.` ends the data (kept for `pg_dump` scripts, whose data is inline).
 
 use crate::mem::arena::Arena;
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 /// Splits one row into fields, decoding escapes into the arena. Returns the
@@ -127,7 +127,9 @@ pub fn decode_row<'a>(
             let bytes: &[u8] = match decoded {
                 Some(buf) => &buf[..out_len],
                 None => {
-                    let copy = arena.alloc_slice_copy(raw).map_err(|_| copy_row_too_large())?;
+                    let copy = arena
+                        .alloc_slice_copy(raw)
+                        .map_err(|_| copy_row_too_large())?;
                     &*copy
                 }
             };
@@ -207,7 +209,12 @@ pub fn binary_header(buf: &[u8]) -> BinaryHeader {
         return BinaryHeader::Bad;
     }
     let ext_at = BINARY_SIGNATURE.len() + 4;
-    let ext_len = i32::from_be_bytes([buf[ext_at], buf[ext_at + 1], buf[ext_at + 2], buf[ext_at + 3]]);
+    let ext_len = i32::from_be_bytes([
+        buf[ext_at],
+        buf[ext_at + 1],
+        buf[ext_at + 2],
+        buf[ext_at + 3],
+    ]);
     if ext_len < 0 {
         return BinaryHeader::Bad;
     }
@@ -289,7 +296,9 @@ pub fn encode_field_csv(
     let bytes = text.as_bytes();
     let needs_quote = force_quote
         || text == null_str
-        || bytes.iter().any(|&b| b == delimiter || b == quote || b == b'\n' || b == b'\r');
+        || bytes
+            .iter()
+            .any(|&b| b == delimiter || b == quote || b == b'\n' || b == b'\r');
     if !needs_quote {
         out(bytes);
         return;
@@ -375,9 +384,15 @@ fn parse_unquoted_csv<'a>(
         }
         end += 1;
     }
-    let copy = arena.alloc_slice_copy(&line[at..end]).map_err(|_| copy_row_too_large())?;
+    let copy = arena
+        .alloc_slice_copy(&line[at..end])
+        .map_err(|_| copy_row_too_large())?;
     let text = core::str::from_utf8(&*copy).map_err(|_| invalid_utf8())?;
-    let next = if end < line.len() { Some(end + 1) } else { None };
+    let next = if end < line.len() {
+        Some(end + 1)
+    } else {
+        None
+    };
     Ok((text, next))
 }
 
@@ -389,8 +404,12 @@ fn parse_quoted_csv<'a>(
     escape: u8,
     delimiter: u8,
 ) -> Result<(&'a str, Option<usize>), SqlError> {
-    let unterminated =
-        || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "unterminated CSV quoted field");
+    let unterminated = || {
+        sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "unterminated CSV quoted field"
+        )
+    };
     let buf = arena
         .alloc_slice_with(line.len().saturating_sub(at), |_| 0u8)
         .map_err(|_| copy_row_too_large())?;
@@ -497,7 +516,10 @@ mod tests {
         let a = arena();
         let mut fields = [None; 16];
         let n = decode_row(line, &a, &mut fields).expect("decodes");
-        fields[..n].iter().map(|f| f.map(|s| s.to_string())).collect()
+        fields[..n]
+            .iter()
+            .map(|f| f.map(|s| s.to_string()))
+            .collect()
     }
 
     fn encode(value: Option<&str>) -> String {
@@ -541,7 +563,15 @@ mod tests {
 
     #[test]
     fn encoding_round_trips_the_awkward_bytes() {
-        for text in ["plain", "tab\there", "line\nbreak", "back\\slash", "cr\rlf", "\u{8}\u{b}\u{c}", "héllo"] {
+        for text in [
+            "plain",
+            "tab\there",
+            "line\nbreak",
+            "back\\slash",
+            "cr\rlf",
+            "\u{8}\u{b}\u{c}",
+            "héllo",
+        ] {
             let encoded = encode(Some(text));
             let decoded = decode(encoded.as_bytes());
             assert_eq!(decoded, vec![Some(text.to_string())], "via {encoded:?}");
@@ -563,37 +593,70 @@ mod tests {
     fn decode_csv(line: &[u8], null: &str) -> Vec<Option<String>> {
         let a = arena();
         let mut fields = [None; 16];
-        let n = decode_row_csv(line, &a, &mut fields, b',', b'"', b'"', null, &no_force, &no_force)
-            .expect("decodes");
-        fields[..n].iter().map(|f| f.map(|s| s.to_string())).collect()
+        let n = decode_row_csv(
+            line,
+            &a,
+            &mut fields,
+            b',',
+            b'"',
+            b'"',
+            null,
+            &no_force,
+            &no_force,
+        )
+        .expect("decodes");
+        fields[..n]
+            .iter()
+            .map(|f| f.map(|s| s.to_string()))
+            .collect()
     }
 
     fn encode_csv(value: Option<&str>, null: &str, force: bool) -> String {
         let mut out = Vec::new();
-        encode_field_csv(&mut |b| out.extend_from_slice(b), value, null, b',', b'"', b'"', force);
+        encode_field_csv(
+            &mut |b| out.extend_from_slice(b),
+            value,
+            null,
+            b',',
+            b'"',
+            b'"',
+            force,
+        );
         String::from_utf8(out).unwrap()
     }
 
     #[test]
     fn csv_decodes_quoting_and_nulls() {
         // Unquoted empty is NULL; quoted empty is the empty string.
-        assert_eq!(decode_csv(b"a,,\"\"", ""), vec![Some("a".into()), None, Some("".into())]);
+        assert_eq!(
+            decode_csv(b"a,,\"\"", ""),
+            vec![Some("a".into()), None, Some("".into())]
+        );
         // A quoted field carries the delimiter and doubled quotes.
         assert_eq!(
             decode_csv(b"\"a,b\",\"say \"\"hi\"\"\"", ""),
             vec![Some("a,b".into()), Some("say \"hi\"".into())]
         );
         // The NULL string only nulls an unquoted field.
-        assert_eq!(decode_csv(b"NA,\"NA\"", "NA"), vec![None, Some("NA".into())]);
+        assert_eq!(
+            decode_csv(b"NA,\"NA\"", "NA"),
+            vec![None, Some("NA".into())]
+        );
         // A trailing CR (CRLF line ending) is ignored.
-        assert_eq!(decode_csv(b"x,y\r", ""), vec![Some("x".into()), Some("y".into())]);
+        assert_eq!(
+            decode_csv(b"x,y\r", ""),
+            vec![Some("x".into()), Some("y".into())]
+        );
     }
 
     #[test]
     fn csv_encodes_only_when_needed() {
         assert_eq!(encode_csv(Some("plain"), "", false), "plain");
         assert_eq!(encode_csv(Some("a,b"), "", false), "\"a,b\"");
-        assert_eq!(encode_csv(Some("say \"hi\""), "", false), "\"say \"\"hi\"\"\"");
+        assert_eq!(
+            encode_csv(Some("say \"hi\""), "", false),
+            "\"say \"\"hi\"\"\""
+        );
         assert_eq!(encode_csv(Some("a\nb"), "", false), "\"a\nb\"");
         assert_eq!(encode_csv(None, "", false), "");
         assert_eq!(encode_csv(None, "NA", false), "NA");
@@ -631,9 +694,15 @@ mod tests {
         row.extend_from_slice(&(-1i32).to_be_bytes());
         assert!(matches!(binary_frame(&row), BinaryFrame::Row(14)));
         // Truncated by one byte is incomplete.
-        assert!(matches!(binary_frame(&row[..row.len() - 1]), BinaryFrame::Incomplete));
+        assert!(matches!(
+            binary_frame(&row[..row.len() - 1]),
+            BinaryFrame::Incomplete
+        ));
         // The -1 field count is the trailer.
-        assert!(matches!(binary_frame(&(-1i16).to_be_bytes()), BinaryFrame::Trailer));
+        assert!(matches!(
+            binary_frame(&(-1i16).to_be_bytes()),
+            BinaryFrame::Trailer
+        ));
         // A negative field length is malformed.
         let mut bad = 1i16.to_be_bytes().to_vec();
         bad.extend_from_slice(&(-2i32).to_be_bytes());

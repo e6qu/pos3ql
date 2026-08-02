@@ -12,8 +12,8 @@ use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    arena_full, arity_err, eval_full, format_append_ident, format_append_literal,
-    format_append_str, sqlstate, text_arg, type_mismatch, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, format_append_ident,
+    format_append_literal, format_append_str, sqlstate, text_arg, type_mismatch,
 };
 
 /// Handles the miscellaneous scalar family. Returns `None` if `name` is not one
@@ -49,7 +49,10 @@ pub(crate) fn dispatch<'a>(
             // f1, f2, ... as PostgreSQL does for an anonymous record.
             "row" => {
                 if args.len() > parser::MAX_LIST {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many fields in ROW()"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many fields in ROW()"
+                    ));
                 }
                 let mut fields = [RecordField {
                     name: "",
@@ -65,7 +68,9 @@ pub(crate) fn dispatch<'a>(
                         value: v,
                     };
                 }
-                let out = arena.alloc_slice_copy(&fields[..args.len()]).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_copy(&fields[..args.len()])
+                    .map_err(|_| arena_full())?;
                 Ok(Datum::Record(&*out))
             }
             "pg_size_pretty" => {
@@ -100,7 +105,9 @@ pub(crate) fn dispatch<'a>(
                     }
                     stack_format!(64, "{} {}", half_rounded(scaled), UNITS[index])
                 };
-                Ok(Datum::Text(arena.alloc_str(text.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(
+                    arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "format" => {
                 if args.is_empty() {
@@ -121,7 +128,10 @@ pub(crate) fn dispatch<'a>(
                     }
                     i += 1;
                     let Some(&spec) = bytes.get(i) else {
-                        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unterminated format specifier"));
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unterminated format specifier"
+                        ));
                     };
                     i += 1;
                     if spec == b'%' {
@@ -129,7 +139,10 @@ pub(crate) fn dispatch<'a>(
                         continue;
                     }
                     if argi >= args.len() {
-                        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()"));
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "too few arguments for format()"
+                        ));
                     }
                     let v = eval_full(args[argi], arena, params, row, hooks)?;
                     argi += 1;
@@ -142,11 +155,13 @@ pub(crate) fn dispatch<'a>(
                                 sqlstate::INVALID_PARAMETER_VALUE,
                                 "unrecognized format() type specifier \"{}\"",
                                 other as char
-                            ))
+                            ));
                         }
                     }
                 }
-                Ok(Datum::Text(arena.alloc_str(out.as_str()).map_err(|_| arena_full())?))
+                Ok(Datum::Text(
+                    arena.alloc_str(out.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "to_number" => {
                 arity(2)?;

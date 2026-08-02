@@ -234,7 +234,11 @@ impl SimClient {
             }
             Err(at) => bucket.objects.insert(
                 at,
-                StoredObject { key: full, bytes: body.to_vec(), etag },
+                StoredObject {
+                    key: full,
+                    bytes: body.to_vec(),
+                    etag,
+                },
             ),
         }
         let ambiguous_per_mille = bucket.faults.ambiguous_put_per_mille;
@@ -280,7 +284,10 @@ impl SimClient {
             let bit = bucket.rng.next_bounded((len * 8) as u32) as usize;
             self.body.filled_mut()[bit / 8] ^= 1 << (bit % 8);
         }
-        Ok(GetResult { len, etag: etag_text(bucket.objects[at].etag) })
+        Ok(GetResult {
+            len,
+            etag: etag_text(bucket.objects[at].etag),
+        })
     }
 
     pub(crate) fn body_bytes(&self) -> &[u8] {
@@ -321,7 +328,10 @@ impl SimClient {
 }
 
 fn status(code: u16, message: &str) -> Error {
-    Error::Status { code, message: stack_format!(256, "{message}") }
+    Error::Status {
+        code,
+        message: stack_format!(256, "{message}"),
+    }
 }
 
 #[cfg(test)]
@@ -369,21 +379,27 @@ mod tests {
     fn compare_and_swap_semantics() {
         let (mut c, _) = client("sim-cas");
         let first = c.put("m", b"v1", Precondition::IfNoneMatchAny).unwrap();
-        assert!(c
-            .put("m", b"v2", Precondition::IfNoneMatchAny)
-            .unwrap_err()
-            .is_precondition_failed());
-        let second = c.put("m", b"v2", Precondition::IfMatch(first.as_str())).unwrap();
+        assert!(
+            c.put("m", b"v2", Precondition::IfNoneMatchAny)
+                .unwrap_err()
+                .is_precondition_failed()
+        );
+        let second = c
+            .put("m", b"v2", Precondition::IfMatch(first.as_str()))
+            .unwrap();
         // The stale tag loses.
-        assert!(c
-            .put("m", b"v3", Precondition::IfMatch(first.as_str()))
-            .unwrap_err()
-            .is_precondition_failed());
-        c.put("m", b"v3", Precondition::IfMatch(second.as_str())).unwrap();
-        assert!(c
-            .put("absent", b"x", Precondition::IfMatch(second.as_str()))
-            .unwrap_err()
-            .is_precondition_failed());
+        assert!(
+            c.put("m", b"v3", Precondition::IfMatch(first.as_str()))
+                .unwrap_err()
+                .is_precondition_failed()
+        );
+        c.put("m", b"v3", Precondition::IfMatch(second.as_str()))
+            .unwrap();
+        assert!(
+            c.put("absent", b"x", Precondition::IfMatch(second.as_str()))
+                .unwrap_err()
+                .is_precondition_failed()
+        );
     }
 
     #[test]

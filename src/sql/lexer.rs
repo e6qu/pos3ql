@@ -56,7 +56,10 @@ pub struct LexerMark {
 
 impl<'a> Lexer<'a> {
     pub fn mark(&self) -> LexerMark {
-        LexerMark { at: self.at, token_start: self.token_start }
+        LexerMark {
+            at: self.at,
+            token_start: self.token_start,
+        }
     }
 
     pub fn reset(&mut self, mark: LexerMark) {
@@ -137,9 +140,9 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
         // Longer operators first: the POSIX regex match family before `~`.
         for operator in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "=>", "||/", "||", "|/", "<<=", ">>=", "<<", ">>", "@>",
-            "<@", "&<", "&>", "&&", "#>>", "#>", "#-", "?|", "?&", "<", ">", "=", "~", "|", "&",
-            "#", "^", "?", "@",
+            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "=>", "||/", "||", "|/", "<<=", ">>=", "<<",
+            ">>", "@>", "<@", "&<", "&>", "&&", "#>>", "#>", "#-", "?|", "?&", "<", ">", "=", "~",
+            "|", "&", "#", "^", "?", "@",
         ] {
             if rest.starts_with(operator) {
                 self.at += operator.len();
@@ -154,9 +157,7 @@ impl<'a> Lexer<'a> {
         let rest = self.rest();
 
         // E'...' escape-string syntax.
-        if (rest.starts_with('e') || rest.starts_with('E'))
-            && rest[1..].starts_with('\'')
-        {
+        if (rest.starts_with('e') || rest.starts_with('E')) && rest[1..].starts_with('\'') {
             self.at += 1;
             return self.escape_string();
         }
@@ -180,10 +181,8 @@ impl<'a> Lexer<'a> {
         if word.bytes().any(|b| b.is_ascii_uppercase()) {
             let mut folded = StackStr::<128>::new();
             for c in word.chars() {
-                let _ = core::fmt::Write::write_fmt(
-                    &mut folded,
-                    format_args!("{}", c.to_lowercase()),
-                );
+                let _ =
+                    core::fmt::Write::write_fmt(&mut folded, format_args!("{}", c.to_lowercase()));
             }
             if folded.is_truncated() {
                 return Err(LexError {
@@ -218,8 +217,7 @@ impl<'a> Lexer<'a> {
         while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
             i += 1;
         }
-        if i < bytes.len() && bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
-        {
+        if i < bytes.len() && bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
             i += 1;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
@@ -249,7 +247,12 @@ impl<'a> Lexer<'a> {
         let mut i = self.at;
         loop {
             match bytes.get(i) {
-                None => return Err(LexError { at: start, message: "unterminated string" }),
+                None => {
+                    return Err(LexError {
+                        at: start,
+                        message: "unterminated string",
+                    });
+                }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
                     has_escape = true;
                     i += 2;
@@ -296,7 +299,12 @@ impl<'a> Lexer<'a> {
         let mut i = self.at;
         loop {
             match bytes.get(i) {
-                None => return Err(LexError { at: start, message: "unterminated string" }),
+                None => {
+                    return Err(LexError {
+                        at: start,
+                        message: "unterminated string",
+                    });
+                }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
                     scratch[w] = b'\'';
                     w += 1;
@@ -333,7 +341,10 @@ impl<'a> Lexer<'a> {
         let out = &scratch[..w];
         core::str::from_utf8(out)
             .map(Tok::Str)
-            .map_err(|_| LexError { at: start, message: "invalid UTF-8 after unescaping" })
+            .map_err(|_| LexError {
+                at: start,
+                message: "invalid UTF-8 after unescaping",
+            })
     }
 
     /// Lexes a `B'…'` (binary) or `X'…'` (hexadecimal) bit-string literal into
@@ -346,7 +357,12 @@ impl<'a> Lexer<'a> {
         let mut i = self.at;
         loop {
             match bytes.get(i) {
-                None => return Err(LexError { at: start, message: "unterminated bit string" }),
+                None => {
+                    return Err(LexError {
+                        at: start,
+                        message: "unterminated bit string",
+                    });
+                }
                 Some(b'\'') => break,
                 Some(_) => i += 1,
             }
@@ -379,7 +395,7 @@ impl<'a> Lexer<'a> {
                     return Err(LexError {
                         at: start,
                         message: "invalid hexadecimal digit in \"X\" bit-string literal",
-                    })
+                    });
                 }
             };
             for bit in (0..4).rev() {
@@ -387,7 +403,9 @@ impl<'a> Lexer<'a> {
                 w += 1;
             }
         }
-        Ok(Tok::Bit(unsafe { core::str::from_utf8_unchecked(&out[..w]) }))
+        Ok(Tok::Bit(unsafe {
+            core::str::from_utf8_unchecked(&out[..w])
+        }))
     }
 
     fn quoted_ident(&mut self) -> Result<Tok<'a>, LexError> {
@@ -399,7 +417,10 @@ impl<'a> Lexer<'a> {
         loop {
             match bytes.get(i) {
                 None => {
-                    return Err(LexError { at: start, message: "unterminated quoted identifier" })
+                    return Err(LexError {
+                        at: start,
+                        message: "unterminated quoted identifier",
+                    });
                 }
                 Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
                     has_escape = true;
@@ -412,7 +433,10 @@ impl<'a> Lexer<'a> {
         let raw = &self.text[self.at..i];
         self.at = i + 1;
         if raw.is_empty() {
-            return Err(LexError { at: start, message: "zero-length quoted identifier" });
+            return Err(LexError {
+                at: start,
+                message: "zero-length quoted identifier",
+            });
         }
         if !has_escape {
             return Ok(Tok::QuotedIdent(raw));
@@ -441,16 +465,17 @@ impl<'a> Lexer<'a> {
         let start = self.at;
         let rest = self.rest();
         // $n parameter
-        let digits = rest[1..]
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
+        let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
         if digits > 0 {
-            let n: u32 = rest[1..1 + digits]
-                .parse()
-                .map_err(|_| LexError { at: start, message: "parameter number too large" })?;
+            let n: u32 = rest[1..1 + digits].parse().map_err(|_| LexError {
+                at: start,
+                message: "parameter number too large",
+            })?;
             if n == 0 {
-                return Err(LexError { at: start, message: "there is no parameter $0" });
+                return Err(LexError {
+                    at: start,
+                    message: "there is no parameter $0",
+                });
             }
             self.at += 1 + digits;
             return Ok(Tok::Param(n));
@@ -467,7 +492,10 @@ impl<'a> Lexer<'a> {
         let open = &rest[..after_tag + 1]; // e.g. "$tag$"
         let body_start = self.at + open.len();
         let Some(close_rel) = self.text[body_start..].find(open) else {
-            return Err(LexError { at: start, message: "unterminated dollar-quoted string" });
+            return Err(LexError {
+                at: start,
+                message: "unterminated dollar-quoted string",
+            });
         };
         let body = &self.text[body_start..body_start + close_rel];
         self.at = body_start + close_rel + open.len();
@@ -516,15 +544,23 @@ impl<'a> Lexer<'a> {
     }
 
     fn error(&self, message: &'static str) -> LexError {
-        LexError { at: self.at, message }
+        LexError {
+            at: self.at,
+            message,
+        }
     }
 
     fn arena_full(&self, at: usize) -> LexError {
-        LexError { at, message: "statement too large for SQL arena" }
+        LexError {
+            at,
+            message: "statement too large for SQL arena",
+        }
     }
 
     fn arena_str(&self, s: &str, at: usize) -> Result<&'a str, LexError> {
-        self.arena.alloc_str(s).map_err(|_: ArenaFull| self.arena_full(at))
+        self.arena
+            .alloc_str(s)
+            .map_err(|_: ArenaFull| self.arena_full(at))
     }
 }
 
@@ -551,7 +587,12 @@ mod tests {
     fn folds_unquoted_identifiers() {
         assert_eq!(
             lex_all("SELECT Foo, \"Bar\""),
-            ["Ident(\"select\")", "Ident(\"foo\")", "Op(\",\")", "QuotedIdent(\"Bar\")"]
+            [
+                "Ident(\"select\")",
+                "Ident(\"foo\")",
+                "Op(\",\")",
+                "QuotedIdent(\"Bar\")"
+            ]
         );
     }
 
@@ -576,7 +617,15 @@ mod tests {
 
     #[test]
     fn numbers() {
-        assert_eq!(lex_all("1 2.5 1e3 1.5e-2"), ["Num(\"1\")", "Num(\"2.5\")", "Num(\"1e3\")", "Num(\"1.5e-2\")"]);
+        assert_eq!(
+            lex_all("1 2.5 1e3 1.5e-2"),
+            [
+                "Num(\"1\")",
+                "Num(\"2.5\")",
+                "Num(\"1e3\")",
+                "Num(\"1.5e-2\")"
+            ]
+        );
         // A trailing dot is not part of the number (it's projection syntax).
         assert_eq!(lex_all("1.x"), ["Num(\"1\")", "Op(\".\")", "Ident(\"x\")"]);
     }
@@ -585,7 +634,16 @@ mod tests {
     fn comments_and_operators() {
         assert_eq!(
             lex_all("1 -- line\n + /* multi /* nested */ */ 2 <> 3 :: || <="),
-            ["Num(\"1\")", "Op(\"+\")", "Num(\"2\")", "Op(\"<>\")", "Num(\"3\")", "Op(\"::\")", "Op(\"||\")", "Op(\"<=\")"]
+            [
+                "Num(\"1\")",
+                "Op(\"+\")",
+                "Num(\"2\")",
+                "Op(\"<>\")",
+                "Num(\"3\")",
+                "Op(\"::\")",
+                "Op(\"||\")",
+                "Op(\"<=\")"
+            ]
         );
     }
 

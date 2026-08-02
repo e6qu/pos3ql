@@ -10,7 +10,7 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    arity_err, compare_datums, eval_full, sqlstate, static_type, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arity_err, compare_datums, eval_full, sqlstate, static_type,
 };
 
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
@@ -112,7 +112,11 @@ pub(crate) fn dispatch<'a>(
                         None => v,
                         Some(cur) => {
                             let ord = compare_datums(&cur, &v)?;
-                            let take_v = if name == "greatest" { ord.is_lt() } else { ord.is_gt() };
+                            let take_v = if name == "greatest" {
+                                ord.is_lt()
+                            } else {
+                                ord.is_gt()
+                            };
                             if take_v { v } else { cur }
                         }
                     });

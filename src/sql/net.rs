@@ -24,20 +24,12 @@ pub struct NetAddr {
 impl NetAddr {
     /// The number of address bytes this family uses (4 or 16).
     pub fn addr_len(&self) -> usize {
-        if self.family == 4 {
-            4
-        } else {
-            16
-        }
+        if self.family == 4 { 4 } else { 16 }
     }
 
     /// The maximum mask length for this family (32 or 128).
     pub fn max_bits(&self) -> u8 {
-        if self.family == 4 {
-            32
-        } else {
-            128
-        }
+        if self.family == 4 { 32 } else { 128 }
     }
 
     /// A copy with every host bit (right of the mask) cleared — the network
@@ -73,7 +65,11 @@ impl NetAddr {
     pub fn netmask(self) -> NetAddr {
         let mut addr = [0u8; 16];
         set_prefix_ones(&mut addr, self.bits, self.addr_len());
-        NetAddr { family: self.family, bits: self.max_bits(), addr }
+        NetAddr {
+            family: self.family,
+            bits: self.max_bits(),
+            addr,
+        }
     }
 
     /// The hostmask (`0.0.0.255`) — the bitwise inverse of the netmask over the
@@ -85,7 +81,11 @@ impl NetAddr {
         for byte in addr[..len].iter_mut() {
             *byte = !*byte;
         }
-        NetAddr { family: self.family, bits: self.max_bits(), addr }
+        NetAddr {
+            family: self.family,
+            bits: self.max_bits(),
+            addr,
+        }
     }
 
     /// A copy with a new mask length; for a `cidr` the host bits beyond the new
@@ -528,7 +528,11 @@ pub fn inet_merge(a: &NetAddr, b: &NetAddr) -> Option<NetAddr> {
         return None;
     }
     let bits = common_prefix_bits(&a.addr, &b.addr, a.addr_len());
-    let mut out = NetAddr { family: a.family, bits, addr: a.addr };
+    let mut out = NetAddr {
+        family: a.family,
+        bits,
+        addr: a.addr,
+    };
     clear_host_bits(&mut out.addr, bits);
     Some(out)
 }
@@ -579,7 +583,10 @@ mod tests {
         assert_eq!(inet("10.0.0.1/8"), "10.0.0.1/8"); // host bits kept
         assert_eq!(inet("192.168.1.5/24"), "192.168.1.5/24");
         assert_eq!(inet("2001:db8::1"), "2001:db8::1"); // default /128 omitted
-        assert_eq!(inet("2001:0db8:0000:0000:0000:0000:0000:0001"), "2001:db8::1");
+        assert_eq!(
+            inet("2001:0db8:0000:0000:0000:0000:0000:0001"),
+            "2001:db8::1"
+        );
         assert_eq!(inet("::1"), "::1");
         assert_eq!(inet("::"), "::");
         assert_eq!(inet("fe80::1/64"), "fe80::1/64");

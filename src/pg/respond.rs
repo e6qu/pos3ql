@@ -2,8 +2,8 @@
 //! the raw send buffer.
 
 use crate::mem::buffer::FixedBuf;
-use crate::sql::types::{ColDesc, Datum};
 use crate::sql::ast::ExplainSerialize;
+use crate::sql::types::{ColDesc, Datum};
 use crate::stack_format;
 
 use super::wire::{self, MsgOut, WireFull};
@@ -117,11 +117,9 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
             .sum(),
         Datum::Bytea(bytes) => 2usize.saturating_add(bytes.len().saturating_mul(2)),
         Datum::Numeric(number) => display_len(number),
-        Datum::Date(date) => {
-            crate::sql::datetime::format_date_styled(*date, render.datestyle)
-                .as_str()
-                .len()
-        }
+        Datum::Date(date) => crate::sql::datetime::format_date_styled(*date, render.datestyle)
+            .as_str()
+            .len(),
         Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => {
             crate::sql::datetime::format_timestamp_styled(
                 *timestamp,
@@ -156,9 +154,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
         Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
         Datum::Bit { bits, .. } => 4usize.saturating_add(bits.len().div_ceil(8)),
-        Datum::Inet(network) | Datum::Cidr(network) => {
-            4usize.saturating_add(network.addr_len())
-        }
+        Datum::Inet(network) | Datum::Cidr(network) => 4usize.saturating_add(network.addr_len()),
         Datum::Enum { label, .. } => label.len(),
         Datum::Numeric(number) => 8usize.saturating_add(number.ndigits().saturating_mul(2)),
         Datum::Record(_) => display_len(value),
@@ -170,11 +166,9 @@ fn binary_value_len(value: &Datum) -> usize {
         }
         Datum::Array { element, raw } => {
             let count = crate::sql::array::len(raw);
-            let mut bytes =
-                12usize.saturating_add(usize::from(count != 0).saturating_mul(8));
+            let mut bytes = 12usize.saturating_add(usize::from(count != 0).saturating_mul(8));
             for index in 0..count {
-                let item =
-                    crate::sql::array::get(raw, *element, index).unwrap_or(Datum::Null);
+                let item = crate::sql::array::get(raw, *element, index).unwrap_or(Datum::Null);
                 bytes = bytes
                     .saturating_add(4)
                     .saturating_add(binary_value_len(&item));
@@ -190,13 +184,11 @@ fn serialized_row_len(
     render: crate::sql::guc::RenderContext,
 ) -> usize {
     values.iter().fold(2usize, |bytes, value| {
-        bytes
-            .saturating_add(4)
-            .saturating_add(if binary {
-                binary_value_len(value)
-            } else {
-                text_value_len(value, render)
-            })
+        bytes.saturating_add(4).saturating_add(if binary {
+            binary_value_len(value)
+        } else {
+            text_value_len(value, render)
+        })
     })
 }
 
@@ -562,9 +554,9 @@ impl<'b> Responder<'b> {
                 let binary = self.discard_serialize == ExplainSerialize::Binary;
                 let bytes = serialized_row_len(values, binary, self.render_context());
                 self.serialized_bytes = self.serialized_bytes.saturating_add(bytes as u64);
-                self.serialization_micros = self.serialization_micros.saturating_add(
-                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                );
+                self.serialization_micros = self
+                    .serialization_micros
+                    .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
             }
             return Ok(());
         }
@@ -1012,10 +1004,7 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
-    pub fn without_command_complete<T>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> T,
-    ) -> T {
+    pub fn without_command_complete<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
         let prior = self.suppress_command_complete;
         self.suppress_command_complete = true;
         let result = operation(self);

@@ -80,7 +80,9 @@ mod tests {
     fn a_key_that_was_inserted_is_never_reported_absent() {
         // The one invariant everything rests on: no false negatives.
         let mut bits = vec![0u8; FILTER_BYTES];
-        let keys: Vec<u64> = (0..50_000u64).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let keys: Vec<u64> = (0..50_000u64)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
         for &k in &keys {
             insert(&mut bits, k);
         }
@@ -110,7 +112,10 @@ mod tests {
             }
         }
         let rate = false_positives as f64 / trials as f64;
-        assert!(rate < 0.05, "false-positive rate {rate} is too high — check the hashing");
+        assert!(
+            rate < 0.05,
+            "false-positive rate {rate} is too high — check the hashing"
+        );
     }
 
     #[test]
@@ -124,7 +129,10 @@ mod tests {
     #[test]
     fn a_fresh_filter_rejects_before_anything_is_inserted() {
         let bits = vec![0u8; 1024];
-        assert!(!maybe_contains(&bits, 42), "an all-zero filter should reject");
+        assert!(
+            !maybe_contains(&bits, 42),
+            "an all-zero filter should reject"
+        );
     }
 
     #[test]

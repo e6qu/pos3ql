@@ -209,8 +209,7 @@ impl ScramFlow {
                 without_proof_len = client_final.len() - field.len() - 1;
             }
         }
-        let (Some(channel), Some(nonce), Some(proof_b64)) = (channel, nonce, proof_b64)
-        else {
+        let (Some(channel), Some(nonce), Some(proof_b64)) = (channel, nonce, proof_b64) else {
             return Err("malformed client-final-message");
         };
         if channel != "biws" && channel != "eSws" {
@@ -236,8 +235,7 @@ impl ScramFlow {
             ),
         );
 
-        let client_signature =
-            hmac_sha256(&server.stored_key, auth_message.as_str().as_bytes());
+        let client_signature = hmac_sha256(&server.stored_key, auth_message.as_str().as_bytes());
         let mut client_key = [0u8; 32];
         for i in 0..32 {
             client_key[i] = proof[i] ^ client_signature[i];
@@ -252,15 +250,11 @@ impl ScramFlow {
             return Err("password authentication failed");
         }
 
-        let server_signature =
-            hmac_sha256(&server.server_key, auth_message.as_str().as_bytes());
+        let server_signature = hmac_sha256(&server.server_key, auth_message.as_str().as_bytes());
         let mut sig_b64 = StackStr::<512>::new();
         b64_encode(&server_signature, &mut sig_b64);
         let mut out = StackStr::<256>::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("v={}", sig_b64.as_str()),
-        );
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("v={}", sig_b64.as_str()));
         Ok(ScramStep::Final(out))
     }
 }
@@ -277,7 +271,15 @@ mod tests {
 
     #[test]
     fn base64_roundtrip() {
-        for input in [b"".as_slice(), b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+        for input in [
+            b"".as_slice(),
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+        ] {
             let mut enc = StackStr::<512>::new();
             b64_encode(input, &mut enc);
             let mut dec = [0u8; 16];
@@ -296,10 +298,7 @@ mod tests {
     #[test]
     fn rfc7677_example_exchange() {
         let mut salt = [0u8; 16];
-        assert_eq!(
-            b64_decode("W22ZaJ0SNY7soEsUEjb6gQ==", &mut salt),
-            Some(16)
-        );
+        assert_eq!(b64_decode("W22ZaJ0SNY7soEsUEjb6gQ==", &mut salt), Some(16));
         let server = ScramServer::derive("pencil", salt, 4096);
 
         // Server nonce raw bytes chosen so the base64 matches the RFC's
@@ -310,11 +309,8 @@ mod tests {
         // constructing the states directly instead.
         let mut flow = ScramFlow::new();
         flow.client_first_bare.clear();
-        core::fmt::Write::write_str(
-            &mut flow.client_first_bare,
-            "n=user,r=rOprNGfwEbeRWgbNEkqO",
-        )
-        .unwrap();
+        core::fmt::Write::write_str(&mut flow.client_first_bare, "n=user,r=rOprNGfwEbeRWgbNEkqO")
+            .unwrap();
         flow.nonce.clear();
         core::fmt::Write::write_str(
             &mut flow.nonce,
@@ -333,10 +329,7 @@ mod tests {
         let client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
         match flow.finish(&server, client_final).unwrap() {
             ScramStep::Final(v) => {
-                assert_eq!(
-                    v.as_str(),
-                    "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
-                );
+                assert_eq!(v.as_str(), "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
             }
             ScramStep::Continue(_) => panic!("expected Final"),
         }
@@ -348,8 +341,12 @@ mod tests {
         let wrong = ScramServer::derive("wrong", [7u8; 16], 4096);
         let mut flow = ScramFlow::new();
         let nonce_raw = [1u8; NONCE_RAW];
-        let step = flow.first(&server, "n,,n=user,r=clientnonce123", &nonce_raw).unwrap();
-        let ScramStep::Continue(server_first) = step else { panic!() };
+        let step = flow
+            .first(&server, "n,,n=user,r=clientnonce123", &nonce_raw)
+            .unwrap();
+        let ScramStep::Continue(server_first) = step else {
+            panic!()
+        };
         // Forge a client-final using the WRONG password's keys.
         let mut auth_message = StackStr::<768>::new();
         core::fmt::Write::write_fmt(

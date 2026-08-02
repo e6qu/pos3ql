@@ -113,18 +113,20 @@ impl LockManager {
         } else {
             let mut modes = [0; 4];
             modes[requested_index] = sequence;
-            self.locks.push(RowLock {
-                table: table as u32,
-                rowid,
-                owner,
-                modes,
-            }).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "row-lock registry is full ({} locks)",
-                    self.locks.capacity()
-                )
-            })?;
+            self.locks
+                .push(RowLock {
+                    table: table as u32,
+                    rowid,
+                    owner,
+                    modes,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "row-lock registry is full ({} locks)",
+                        self.locks.capacity()
+                    )
+                })?;
         }
         Ok(LockDecision::Acquired)
     }
@@ -230,10 +232,7 @@ impl LockManager {
         for _ in 0..=self.waits.len() {
             if cursor == waiter {
                 self.clear_wait(waiter);
-                return Err(sql_err!(
-                    sqlstate::DEADLOCK_DETECTED,
-                    "deadlock detected"
-                ));
+                return Err(sql_err!(sqlstate::DEADLOCK_DETECTED, "deadlock detected"));
             }
             let Some(edge) = self.waits.iter().find(|edge| edge.waiter == cursor) else {
                 return Ok(());
@@ -283,9 +282,7 @@ fn conflicts(left: u8, right: u8) -> bool {
 }
 
 fn pair_conflicts(left: u8, right: u8) -> bool {
-    left == 1
-        || right == 1
-        || matches!((left, right), (2, 2) | (2, 4) | (4, 2))
+    left == 1 || right == 1 || matches!((left, right), (2, 2) | (2, 4) | (4, 2))
 }
 
 #[cfg(test)]

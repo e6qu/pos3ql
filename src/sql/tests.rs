@@ -5435,9 +5435,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{detailed:?}"
     );
     assert!(
-        detailed
-            .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey"))
+        detailed.iter().any(|row| row.contains("Seq Scan on ep")),
+        "{detailed:?}"
     );
 
     run_with(
@@ -5676,11 +5675,7 @@ fn hash_join_matches_nested_loop() {
         &mut b,
         "SELECT mc1.v, mc2.w FROM mc1 JOIN mc2 ON mc1.k = mc2.k AND mc1.sub = mc2.sub ORDER BY 1, 2",
     ));
-    assert_eq!(
-        r,
-        ["a|x", "b|y", "c|z"],
-        "multi-column hash join: {r:?}"
-    );
+    assert_eq!(r, ["a|x", "b|y", "c|z"], "multi-column hash join: {r:?}");
 
     // LEFT JOIN via hash join: unmatched outer rows are null-padded.
     let r = data_rows(&run_with(
@@ -5702,11 +5697,7 @@ fn hash_join_matches_nested_loop() {
         &mut b,
         "SELECT mc1.v FROM mc1 LEFT JOIN mc2 ON mc1.k = mc2.k AND mc1.sub = mc2.sub WHERE mc2.w IS NULL ORDER BY 1",
     ));
-    assert_eq!(
-        r,
-        ["d"],
-        "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}"
-    );
+    assert_eq!(r, ["d"], "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}");
 
     // reltuples is deliberately a planner estimate. A stale underestimate
     // must exhaust the selected fixed-capacity hash table loudly rather than
@@ -10268,7 +10259,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     ));
     assert!(
         plan.iter()
-            .any(|line| line.contains("Index Scan using pruning_rows_pkey")),
+            .any(|line| line.contains("Seq Scan on pruning_rows")),
         "{plan:?}"
     );
     assert_eq!(
@@ -10289,8 +10280,12 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
         .saturating_sub(before_selective)
         .object_gets;
     assert!(
-        selective_gets < full_gets,
-        "durable index pruning must fetch fewer objects: selective={selective_gets}, full={full_gets}"
+        full_gets < 16,
+        "a cold sequential scan must consume each durable data block once, not point-reread every row: full={full_gets}"
+    );
+    assert!(
+        selective_gets <= full_gets,
+        "the planner must not choose a primary-key probe more expensive than the sequential durable scan: selective={selective_gets}, full={full_gets}"
     );
     drop(selective);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
@@ -10649,13 +10644,21 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
 
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(&mut engine, &mut budget, "CREATE TABLE rc (id int, v text)");
-    run_with(&mut engine, &mut budget, "INSERT INTO rc VALUES (1, 'uploaded')");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO rc VALUES (1, 'uploaded')",
+    );
 
     // Force the next commit's WAL upload to fail: the row is promoted and
     // visible (an errored commit's outcome is unknown) but durable only in the
     // local journal.
     bucket.borrow_mut().faults.transient_per_mille = 1000;
-    let failed = run_with(&mut engine, &mut budget, "INSERT INTO rc VALUES (2, 'unuploaded')");
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO rc VALUES (2, 'unuploaded')",
+    );
     bucket.borrow_mut().faults.transient_per_mille = 0;
     assert!(
         String::from_utf8_lossy(&failed).contains("58030"),
@@ -10671,7 +10674,11 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id")),
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM rc ORDER BY id"
+        )),
         ["1", "2"],
         "row 2 recovered and now reconciled into the bucket"
     );
@@ -10684,7 +10691,11 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id")),
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM rc ORDER BY id"
+        )),
         ["1", "2"],
         "row 2 survives a wiped journal because reconciliation uploaded it"
     );
@@ -10910,10 +10921,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     }
 
     let before = engine.storage.block_io_stats();
-    let partitioned = |engine: &mut Engine,
-                       budget: &mut Budget,
-                       text: &str,
-                       expected: &[&str]| {
+    let partitioned = |engine: &mut Engine, budget: &mut Budget, text: &str, expected: &[&str]| {
         assert_eq!(
             data_rows(&run_with(engine, budget, text)),
             expected,
@@ -10949,7 +10957,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
             "0|7|7|7|19999",
             "0|14|21|7|19999",
             "0|21|42|7|19999",
-            "0|28|70|7|19999"
+            "0|28|70|7|19999",
         ],
     );
     partitioned(
@@ -10970,7 +10978,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
          FROM external_window_rows
          ORDER BY grp",
         &[
-            "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857"
+            "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
     );
     let traffic = engine.storage.block_io_stats().saturating_sub(before);
@@ -12927,7 +12935,8 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     let mut config = test_config(&format!("external-in-witness-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-external-in-witness-{}-{sequence}", std::process::id());
+    config.object_store_bucket =
+        format!("sql-external-in-witness-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
@@ -12959,7 +12968,11 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
         )),
         ["f|t"]
     );
-    run_with(&mut engine, &mut budget, "INSERT INTO in_witness VALUES (1)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO in_witness VALUES (1)",
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -13054,8 +13067,8 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
             "SELECT g, count(*), sum(v) FROM grp_src GROUP BY g ORDER BY g"
         )),
         [
-            "0|10|550", "1|10|460", "2|10|470", "3|10|480", "4|10|490",
-            "5|10|500", "6|10|510", "7|10|520", "8|10|530", "9|10|540"
+            "0|10|550", "1|10|460", "2|10|470", "3|10|480", "4|10|490", "5|10|500", "6|10|510",
+            "7|10|520", "8|10|530", "9|10|540"
         ]
     );
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);

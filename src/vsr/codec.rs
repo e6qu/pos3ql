@@ -5,8 +5,8 @@
 //! Encoding is allocation-free into a caller buffer; decoding validates
 //! lengths and rejects anything malformed rather than trusting the peer.
 
-use super::message::{LogEntry, Message, MessageBody, MAX_LOG};
 use super::ReplicaId;
+use super::message::{LogEntry, MAX_LOG, Message, MessageBody};
 
 const TAG_PREPARE: u8 = 1;
 const TAG_PREPARE_OK: u8 = 2;
@@ -69,7 +69,12 @@ pub(crate) fn encode(msg: &Message, buffer: &mut [u8]) -> Option<usize> {
     w.u8(msg.from);
     w.u8(msg.to);
     match &msg.body {
-        MessageBody::Prepare { view, operation, commit, entry } => {
+        MessageBody::Prepare {
+            view,
+            operation,
+            commit,
+            entry,
+        } => {
             w.u8(TAG_PREPARE);
             w.u64(*view);
             w.u64(*operation);
@@ -288,12 +293,20 @@ mod tests {
         roundtrip(Message {
             from: 1,
             to: 2,
-            body: MessageBody::Prepare { view: 3, operation: 9, commit: 8, entry },
+            body: MessageBody::Prepare {
+                view: 3,
+                operation: 9,
+                commit: 8,
+                entry,
+            },
         });
         roundtrip(Message {
             from: 2,
             to: 0,
-            body: MessageBody::PrepareOk { view: 3, operation: 9 },
+            body: MessageBody::PrepareOk {
+                view: 3,
+                operation: 9,
+            },
         });
         roundtrip(Message {
             from: 0,
@@ -364,7 +377,10 @@ mod tests {
         let b = Message {
             from: 0,
             to: 2,
-            body: MessageBody::PrepareOk { view: 1, operation: 3 },
+            body: MessageBody::PrepareOk {
+                view: 1,
+                operation: 3,
+            },
         };
         let mut buffer = [0u8; MAX_ENCODED * 2];
         let n1 = encode(&a, &mut buffer).unwrap();

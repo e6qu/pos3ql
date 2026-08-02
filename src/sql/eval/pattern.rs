@@ -9,7 +9,7 @@ use crate::mem::arena::Arena;
 use crate::sql::types::Datum;
 use crate::sql_err;
 
-use super::{arena_full, sqlstate, SqlError};
+use super::{SqlError, arena_full, sqlstate};
 
 /// Translates a SQL `SIMILAR TO` pattern into a POSIX regular expression
 /// anchored to the whole string. `%`/`_` become `.*`/`.`; the SIMILAR TO
@@ -64,7 +64,10 @@ pub(crate) fn similar_to_posix(
     }
     let _ = buffer.write_char('$');
     if buffer.is_truncated() {
-        return Err(sql_err!(sqlstate::STRING_DATA_LENGTH_MISMATCH, "SIMILAR TO pattern is too long"));
+        return Err(sql_err!(
+            sqlstate::STRING_DATA_LENGTH_MISMATCH,
+            "SIMILAR TO pattern is too long"
+        ));
     }
     Ok(())
 }
@@ -72,12 +75,7 @@ pub(crate) fn similar_to_posix(
 /// SQL LIKE: `%` matches any run (including empty), `_` exactly one
 /// character, `\` escapes the next pattern character. Iterative
 /// two-pointer match with backtracking to the last `%`; allocation-free.
-pub fn like_match(
-    text: &str,
-    pattern: &str,
-    case_insensitive: bool,
-    escape: Option<char>,
-) -> bool {
+pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
     fn next_char(s: &str, at: usize) -> Option<(char, usize)> {
         s[at..].chars().next().map(|c| (c, at + c.len_utf8()))
     }
@@ -114,19 +112,21 @@ pub fn like_match(
                         None => (c, p_next), // a trailing escape stands for itself
                     };
                     if let Some((tc, t_next)) = next_char(text, t)
-                        && eq(tc, want) {
-                            t = t_next;
-                            p = after;
-                            continue;
-                        }
+                        && eq(tc, want)
+                    {
+                        t = t_next;
+                        p = after;
+                        continue;
+                    }
                 }
                 _ => {
                     if let Some((tc, t_next)) = next_char(text, t)
-                        && eq(tc, pc) {
-                            t = t_next;
-                            p = p_next;
-                            continue;
-                        }
+                        && eq(tc, pc)
+                    {
+                        t = t_next;
+                        p = p_next;
+                        continue;
+                    }
                 }
             }
         } else if t >= text.len() {
@@ -210,7 +210,12 @@ pub(crate) fn sql_regex_substring<'a>(
                     }
                     let _ = posix.write_char(other);
                 }
-                None => return Err(sql_err!(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string")),
+                None => {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_ESCAPE_SEQUENCE,
+                        "invalid escape string"
+                    ));
+                }
             }
             continue;
         }
@@ -246,7 +251,10 @@ pub(crate) fn sql_regex_substring<'a>(
     }
     let _ = posix.write_char('$');
     if posix.is_truncated() {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "substring pattern too long"));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "substring pattern too long"
+        ));
     }
     let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
     match crate::sql::regex::find_captures(posix.as_str(), s, 0, false, &mut spans)? {
@@ -257,7 +265,9 @@ pub(crate) fn sql_regex_substring<'a>(
             } else {
                 (mstart, mend)
             };
-            Ok(Datum::Text(arena.alloc_str(&s[from..to]).map_err(|_| arena_full())?))
+            Ok(Datum::Text(
+                arena.alloc_str(&s[from..to]).map_err(|_| arena_full())?,
+            ))
         }
     }
 }
@@ -272,7 +282,9 @@ pub fn regex_split_pub<'a>(
 ) -> Result<&'a [Datum<'a>], SqlError> {
     let mut pieces = [Datum::Null; 1024];
     let n = regex_split(src, pattern, case_insensitive, &mut pieces)?;
-    Ok(&*arena.alloc_slice_copy(&pieces[..n]).map_err(|_| arena_full())?)
+    Ok(&*arena
+        .alloc_slice_copy(&pieces[..n])
+        .map_err(|_| arena_full())?)
 }
 
 /// Splits `src` on every match of `pattern`, writing the pieces into `out` and
@@ -286,7 +298,10 @@ pub(crate) fn regex_split<'a>(
     let mut n = 0usize;
     let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
         if *n == out.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many split pieces"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many split pieces"
+            ));
         }
         out[*n] = Datum::Text(piece);
         *n += 1;
@@ -301,7 +316,8 @@ pub(crate) fn regex_split<'a>(
     let mut last = 0usize;
     let mut pos = 0usize;
     while pos <= src.len() {
-        let Some((start, end)) = crate::sql::regex::find(pattern, src, pos, case_insensitive)? else {
+        let Some((start, end)) = crate::sql::regex::find(pattern, src, pos, case_insensitive)?
+        else {
             break;
         };
         if end == start {
@@ -331,7 +347,13 @@ pub fn regexp_flags(flags: &str) -> Result<(bool, bool), SqlError> {
             'g' => global = true,
             'i' => case_insensitive = true,
             'c' => case_insensitive = false,
-            _ => return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid regular expression option: \"{}\"", f)),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid regular expression option: \"{}\"",
+                    f
+                ));
+            }
         }
     }
     Ok((global, case_insensitive))

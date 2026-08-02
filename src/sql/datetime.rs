@@ -27,7 +27,11 @@ pub fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_index = (5 * day_of_year + 2) / 153;
     let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 } as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
@@ -77,9 +81,18 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     let trimmed = s.trim();
     let mut parts = trimmed.splitn(3, '-');
     let (year, month, day) = (
-        parts.next().and_then(|p| p.parse::<i64>().ok()).ok_or_else(bad)?,
-        parts.next().and_then(|p| p.parse::<u32>().ok()).ok_or_else(bad)?,
-        parts.next().and_then(|p| p.parse::<u32>().ok()).ok_or_else(bad)?,
+        parts
+            .next()
+            .and_then(|p| p.parse::<i64>().ok())
+            .ok_or_else(bad)?,
+        parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .ok_or_else(bad)?,
+        parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .ok_or_else(bad)?,
     );
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return Err(out_of_range());
@@ -92,8 +105,18 @@ const MONTH_ABBR: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
 const MONTH_FULL: [&str; 12] = [
-    "january", "february", "march", "april", "may", "june", "july", "august", "september",
-    "october", "november", "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 ];
 
 /// Parses `input` guided by a `to_date`/`to_timestamp` format string into
@@ -102,8 +125,14 @@ const MONTH_FULL: [&str; 12] = [
 /// `MON`/`MONTH`) with any non-code characters treated as skippable separators;
 /// unrecognized letter codes are rejected loudly.
 pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
-    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid value for input string");
-    let (mut y, mut month, mut d, mut h, mut minute, mut s) = (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "invalid value for input string"
+        )
+    };
+    let (mut y, mut month, mut d, mut h, mut minute, mut s) =
+        (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
     let input_bytes = input.as_bytes();
     let format_bytes = fmt.as_bytes();
     let mut input_position = 0usize;
@@ -115,20 +144,28 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
         }
         let start = *input_position;
         let mut v: i64 = 0;
-        while *input_position < input_bytes.len() && *input_position - start < width && input_bytes[*input_position].is_ascii_digit() {
+        while *input_position < input_bytes.len()
+            && *input_position - start < width
+            && input_bytes[*input_position].is_ascii_digit()
+        {
             v = v * 10 + (input_bytes[*input_position] - b'0') as i64;
             *input_position += 1;
         }
-        if *input_position == start { None } else { Some(v) }
+        if *input_position == start {
+            None
+        } else {
+            Some(v)
+        }
     };
     let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
-        at + word.len() <= bytes.len()
-            && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
+        at + word.len() <= bytes.len() && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
     };
     while format_index < format_bytes.len() {
         let up = format_bytes[format_index].to_ascii_uppercase();
         // Longest field codes first.
-        if starts_with_ci(format_bytes, format_index, b"HH24") || starts_with_ci(format_bytes, format_index, b"HH12") {
+        if starts_with_ci(format_bytes, format_index, b"HH24")
+            || starts_with_ci(format_bytes, format_index, b"HH12")
+        {
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
             format_index += 4;
         } else if starts_with_ci(format_bytes, format_index, b"YYYY") {
@@ -166,17 +203,25 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
             y = read_num(&mut input_position, 1).ok_or_else(bad)?;
             format_index += 1;
         } else if up.is_ascii_alphabetic() {
-            return Err(sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "unsupported to_date/to_timestamp code"));
+            return Err(sql_err!(
+                sqlstate::INVALID_DATETIME_FORMAT,
+                "unsupported to_date/to_timestamp code"
+            ));
         } else {
             // Separator: skip one non-alphanumeric input character if present.
-            if input_position < input_bytes.len() && !input_bytes[input_position].is_ascii_alphanumeric() {
+            if input_position < input_bytes.len()
+                && !input_bytes[input_position].is_ascii_alphanumeric()
+            {
                 input_position += 1;
             }
             format_index += 1;
         }
     }
     if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
-        return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date/time field value out of range"));
+        return Err(sql_err!(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "date/time field value out of range"
+        ));
     }
     Ok((y, month, d, h, minute, s))
 }
@@ -191,7 +236,10 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
     let table: &[&str] = if abbr { &MONTH_ABBR } else { &MONTH_FULL };
     for (i, name) in table.iter().enumerate() {
         let name_bytes = name.as_bytes();
-        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+        if *input_position + name_bytes.len() <= bytes.len()
+            && bytes[*input_position..*input_position + name_bytes.len()]
+                .eq_ignore_ascii_case(name_bytes)
+        {
             *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
@@ -200,7 +248,10 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
     let other: &[&str] = if abbr { &MONTH_FULL } else { &MONTH_ABBR };
     for (i, name) in other.iter().enumerate() {
         let name_bytes = name.as_bytes();
-        if *input_position + name_bytes.len() <= bytes.len() && bytes[*input_position..*input_position + name_bytes.len()].eq_ignore_ascii_case(name_bytes) {
+        if *input_position + name_bytes.len() <= bytes.len()
+            && bytes[*input_position..*input_position + name_bytes.len()]
+                .eq_ignore_ascii_case(name_bytes)
+        {
             *input_position += name_bytes.len();
             return Some(i as u32 + 1);
         }
@@ -224,7 +275,12 @@ pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
 /// the fields as PostgreSQL `make_date` does.
 pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32, SqlError> {
-    let range = || sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date field value out of range");
+    let range = || {
+        sql_err!(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "date field value out of range"
+        )
+    };
     if !(1..=12).contains(&month) {
         return Err(range());
     }
@@ -239,7 +295,12 @@ pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32, SqlError> {
 /// Constructs a time-of-day (microseconds since midnight) from hour/minute and
 /// a fractional second, validating fields as PostgreSQL `make_time` does.
 pub fn make_time(hour: i64, minute: i64, sec: f64) -> Result<i64, SqlError> {
-    let range = || sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "time field value out of range");
+    let range = || {
+        sql_err!(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "time field value out of range"
+        )
+    };
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&sec) {
         return Err(range());
     }
@@ -271,7 +332,14 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     } else {
         "timestamp"
     };
-    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type {}: \"{}\"", type_name, s);
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "invalid input syntax for type {}: \"{}\"",
+            type_name,
+            s
+        )
+    };
     let t = s.trim();
     // Split date and time parts.
     let (date_part, rest) = match t.find([' ', 'T']) {
@@ -282,13 +350,8 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     // `date` error surfaced verbatim — so a 22007 from `parse_date` is remapped
     // to the timestamp type, while its 22008 out-of-range error is kept, since
     // an impossible date is an impossible timestamp too.
-    let date_days = parse_date(date_part).map_err(|e| {
-        if e.sqlstate == "22007" {
-            bad()
-        } else {
-            e
-        }
-    })? as i64;
+    let date_days =
+        parse_date(date_part).map_err(|e| if e.sqlstate == "22007" { bad() } else { e })? as i64;
 
     if rest.is_empty() {
         return Ok(date_days * 86_400 * 1_000_000);
@@ -302,7 +365,9 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     let rest = if let Some((head, name)) = rest.rsplit_once(' ') {
         let name = name.trim();
         let name_like = !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphabetic() || c == '/' || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '_')
             && name.chars().any(|c| c.is_ascii_alphabetic());
         if name_like {
             if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
@@ -332,29 +397,28 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM. Whether an offset was
     // written matters: a bare timestamptz literal is interpreted in the
     // *session* zone, as PostgreSQL reads it.
-    let (time_part, timezone_seconds, explicit_offset) = if let Some(stripped) =
-        rest.strip_suffix('Z')
-    {
-        (stripped, 0i64, true)
-    } else if let Some(pos) = rest.rfind(['+', '-']) {
-        if pos > 0 {
-            let (tp, zone) = rest.split_at(pos);
-            let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
-            let z = &zone[1..];
-            let (h, m) = match z.split_once(':') {
-                Some((h, m)) => (
-                    h.parse::<i64>().map_err(|_| bad())?,
-                    m.parse::<i64>().map_err(|_| bad())?,
-                ),
-                None => (z.parse::<i64>().map_err(|_| bad())?, 0),
-            };
-            (tp, sign * (h * 3600 + m * 60), true)
+    let (time_part, timezone_seconds, explicit_offset) =
+        if let Some(stripped) = rest.strip_suffix('Z') {
+            (stripped, 0i64, true)
+        } else if let Some(pos) = rest.rfind(['+', '-']) {
+            if pos > 0 {
+                let (tp, zone) = rest.split_at(pos);
+                let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
+                let z = &zone[1..];
+                let (h, m) = match z.split_once(':') {
+                    Some((h, m)) => (
+                        h.parse::<i64>().map_err(|_| bad())?,
+                        m.parse::<i64>().map_err(|_| bad())?,
+                    ),
+                    None => (z.parse::<i64>().map_err(|_| bad())?, 0),
+                };
+                (tp, sign * (h * 3600 + m * 60), true)
+            } else {
+                (rest, 0, false)
+            }
         } else {
             (rest, 0, false)
-        }
-    } else {
-        (rest, 0, false)
-    };
+        };
 
     let mut it = time_part.splitn(3, ':');
     let h: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
@@ -383,8 +447,7 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
             s
         ));
     }
-    let mut total =
-        date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
+    let mut total = date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
     if apply_timezone {
         if let Some(zone) = named_zone {
             // The offset in effect at the given wall time (resolved with the
@@ -417,8 +480,14 @@ pub fn parse_time(s: &str) -> Result<i64, SqlError> {
 }
 
 fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlError> {
-    let bad =
-        || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type {}: \"{}\"", type_name, s);
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "invalid input syntax for type {}: \"{}\"",
+            type_name,
+            s
+        )
+    };
     let t = s.trim();
     // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
     // sign has to be past the start so a lone offset is not read as a time.
@@ -447,7 +516,10 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
     };
     let t = t.trim();
     let mut it = t.splitn(3, ':');
-    let h: i64 = it.next().and_then(|p| p.trim().parse().ok()).ok_or_else(bad)?;
+    let h: i64 = it
+        .next()
+        .and_then(|p| p.trim().parse().ok())
+        .ok_or_else(bad)?;
     let m: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let (sec, micros) = match it.next() {
         None => (0i64, 0i64),
@@ -468,7 +540,11 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
     // 24:00:00 is the one hour-24 time PostgreSQL accepts.
     let hour_ok = (0..24).contains(&h) || (h == 24 && m == 0 && sec == 0 && micros == 0);
     if !hour_ok || !(0..60).contains(&m) || !(0..61).contains(&sec) {
-        return Err(sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date/time field value out of range: \"{}\"", s));
+        return Err(sql_err!(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "date/time field value out of range: \"{}\"",
+            s
+        ));
     }
     Ok(((h * 3600 + m * 60 + sec) * 1_000_000 + micros, zone))
 }
@@ -490,7 +566,11 @@ fn parse_zone_offset(zone: &str) -> Option<i32> {
         Some(p) => p.parse().ok()?,
         None => 0,
     };
-    if parts.next().is_some() || !(0..=15).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+    if parts.next().is_some()
+        || !(0..=15).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..60).contains(&sec)
+    {
         return None;
     }
     Some(sign * (h * 3600 + m * 60 + sec))
@@ -528,7 +608,13 @@ pub fn format_time(micros: i64) -> StackStr<24> {
 /// `90 minutes`, `-5 days`, `1 day 03:04:05`). Returns (months, days, micros).
 pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     use super::types::Interval;
-    let bad = || sql_err!(sqlstate::INVALID_DATETIME_FORMAT, "invalid input syntax for type interval: \"{}\"", s);
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "invalid input syntax for type interval: \"{}\"",
+            s
+        )
+    };
     let mut months = 0i64;
     let mut days = 0i64;
     let mut micros = 0i64;
@@ -597,19 +683,20 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         }
         *first = false;
     };
-    let unit = |out: &mut StackStr<48>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
-        if n != 0 {
-            sep(out, first);
-            if n > 0 && *prev_neg {
-                let _ = write!(out, "+");
+    let unit =
+        |out: &mut StackStr<48>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
+            if n != 0 {
+                sep(out, first);
+                if n > 0 && *prev_neg {
+                    let _ = write!(out, "+");
+                }
+                let _ = write!(out, "{n} {singular}");
+                if n != 1 {
+                    let _ = write!(out, "s");
+                }
+                *prev_neg = n < 0;
             }
-            let _ = write!(out, "{n} {singular}");
-            if n != 1 {
-                let _ = write!(out, "s");
-            }
-            *prev_neg = n < 0;
-        }
-    };
+        };
     unit(&mut out, &mut first, &mut prev_neg, years, "year");
     unit(&mut out, &mut first, &mut prev_neg, mons, "mon");
     unit(&mut out, &mut first, &mut prev_neg, interval.days, "day");
@@ -673,7 +760,11 @@ pub fn add_interval(micros_epoch: i64, interval: super::types::Interval) -> i64 
 /// PostgreSQL's `interval_mul`/`interval_div`: a fractional number of months
 /// spills into days (30-day months) and a fractional number of days spills into
 /// the time field.
-pub fn interval_scale(interval: super::types::Interval, factor: f64, div: bool) -> super::types::Interval {
+pub fn interval_scale(
+    interval: super::types::Interval,
+    factor: f64,
+    div: bool,
+) -> super::types::Interval {
     let f = if div { 1.0 / factor } else { factor };
     const DAYS_PER_MONTH: f64 = 30.0;
     let month_double = interval.months as f64 * f;
@@ -688,7 +779,11 @@ pub fn interval_scale(interval: super::types::Interval, factor: f64, div: bool) 
     let sec_remainder = (sec_remainder * 1_000_000.0).round() / 1_000_000.0;
     let days = days_whole + month_remainder_days as i64 as i32;
     let micros = (interval.micros as f64 * f + sec_remainder * 1_000_000.0).round() as i64;
-    super::types::Interval { months, days, micros }
+    super::types::Interval {
+        months,
+        days,
+        micros,
+    }
 }
 
 /// `justify_hours`: carry whole days out of the time field.
@@ -754,7 +849,11 @@ pub fn age_between(timestamp1: i64, timestamp2: i64) -> super::types::Interval {
     // `timestamp_age` normalizes the borrow to non-negative fields and recovers
     // the sign at the end.
     let neg = timestamp1 < timestamp2;
-    let (hi, lo) = if neg { (timestamp2, timestamp1) } else { (timestamp1, timestamp2) };
+    let (hi, lo) = if neg {
+        (timestamp2, timestamp1)
+    } else {
+        (timestamp1, timestamp2)
+    };
     let (yh, moh, dh, ush) = decompose(hi);
     let (yl, mol, dl, usl) = decompose(lo);
     let mut microseconds = ush - usl;
@@ -780,7 +879,11 @@ pub fn age_between(timestamp1: i64, timestamp2: i64) -> super::types::Interval {
         micros: microseconds,
     };
     if neg {
-        super::types::Interval { months: -interval.months, days: -interval.days, micros: -interval.micros }
+        super::types::Interval {
+            months: -interval.months,
+            days: -interval.days,
+            micros: -interval.micros,
+        }
     } else {
         interval
     }
@@ -826,7 +929,10 @@ pub struct DateStyle {
 
 impl Default for DateStyle {
     fn default() -> Self {
-        DateStyle { format: DateFormat::Iso, order: FieldOrder::Mdy }
+        DateStyle {
+            format: DateFormat::Iso,
+            order: FieldOrder::Mdy,
+        }
     }
 }
 
@@ -843,7 +949,12 @@ pub fn format_date(days: i32) -> StackStr<16> {
 
 /// `with_timezone` renders a timestamptz (UTC) as PostgreSQL does.
 pub fn format_timestamp(micros: i64, with_timezone: bool) -> StackStr<48> {
-    format_timestamp_styled(micros, with_timezone, DateStyle::default(), crate::sql::timezone::Timezone::utc())
+    format_timestamp_styled(
+        micros,
+        with_timezone,
+        DateStyle::default(),
+        crate::sql::timezone::Timezone::utc(),
+    )
 }
 
 /// Date output honoring DateStyle. Matches PostgreSQL: ISO `YYYY-MM-DD`,
@@ -890,7 +1001,11 @@ pub fn format_timestamp_styled(
 ) -> StackStr<48> {
     // The offset and abbreviation are resolved for this specific instant, so
     // DST is honored; a plain timestamp (no timezone) always renders at wall clock.
-    let (timezone_offset_seconds, abbrev) = if with_timezone { timezone.resolve(micros) } else { (0, StackStr::<8>::new()) };
+    let (timezone_offset_seconds, abbrev) = if with_timezone {
+        timezone.resolve(micros)
+    } else {
+        (0, StackStr::<8>::new())
+    };
     let timezone_abbreviation = abbrev.as_str();
     let local = micros + timezone_offset_seconds as i64 * 1_000_000;
     let days = local.div_euclid(DAY_US);
@@ -1049,41 +1164,75 @@ mod tests {
     use crate::sql::types::Interval;
 
     fn interval(months: i32, days: i32, micros: i64) -> Interval {
-        Interval { months, days, micros }
+        Interval {
+            months,
+            days,
+            micros,
+        }
     }
 
     // Reference values captured from PostgreSQL 18.4.
     #[test]
     fn interval_scale_matches_pg() {
         // interval '1 month' * 1.5 = 1 month 15 days (fractional month -> days).
-        assert_eq!(interval_scale(interval(1, 0, 0), 1.5, false), interval(1, 15, 0));
+        assert_eq!(
+            interval_scale(interval(1, 0, 0), 1.5, false),
+            interval(1, 15, 0)
+        );
         // interval '1 day' / 2 = 12:00:00 (fractional day -> time).
-        assert_eq!(interval_scale(interval(0, 1, 0), 2.0, true), interval(0, 0, 43_200_000_000));
+        assert_eq!(
+            interval_scale(interval(0, 1, 0), 2.0, true),
+            interval(0, 0, 43_200_000_000)
+        );
         // interval '10 days' / 3 = 3 days 08:00:00.
-        assert_eq!(interval_scale(interval(0, 10, 0), 3.0, true), interval(0, 3, 28_800_000_000));
+        assert_eq!(
+            interval_scale(interval(0, 10, 0), 3.0, true),
+            interval(0, 3, 28_800_000_000)
+        );
         // interval '2 hours' * 2.5 = 05:00:00.
-        assert_eq!(interval_scale(interval(0, 0, 7_200_000_000), 2.5, false), interval(0, 0, 18_000_000_000));
+        assert_eq!(
+            interval_scale(interval(0, 0, 7_200_000_000), 2.5, false),
+            interval(0, 0, 18_000_000_000)
+        );
     }
 
     #[test]
     fn justify_matches_pg() {
         // 36 hours -> 1 day 12:00:00.
-        assert_eq!(justify_hours(interval(0, 0, 129_600_000_000)), interval(0, 1, 43_200_000_000));
+        assert_eq!(
+            justify_hours(interval(0, 0, 129_600_000_000)),
+            interval(0, 1, 43_200_000_000)
+        );
         // 35 days -> 1 month 5 days.
         assert_eq!(justify_days(interval(0, 35, 0)), interval(1, 5, 0));
         // 1 month -1 hour -> 29 days 23:00:00.
-        assert_eq!(justify_interval(interval(1, 0, -3_600_000_000)), interval(0, 29, 82_800_000_000));
+        assert_eq!(
+            justify_interval(interval(1, 0, -3_600_000_000)),
+            interval(0, 29, 82_800_000_000)
+        );
     }
 
     #[test]
     fn age_matches_pg() {
         let timestamp = |s: &str| parse_timestamp(s, false).unwrap();
-        assert_eq!(age_between(timestamp("2024-06-15"), timestamp("2020-01-10")), interval(53, 5, 0));
+        assert_eq!(
+            age_between(timestamp("2024-06-15"), timestamp("2020-01-10")),
+            interval(53, 5, 0)
+        );
         // Reversed arguments negate every field.
-        assert_eq!(age_between(timestamp("2020-01-10"), timestamp("2024-06-15")), interval(-53, -5, 0));
+        assert_eq!(
+            age_between(timestamp("2020-01-10"), timestamp("2024-06-15")),
+            interval(-53, -5, 0)
+        );
         // Day borrow uses the earlier date's own month length.
-        assert_eq!(age_between(timestamp("2024-03-01"), timestamp("2024-01-31")), interval(1, 1, 0));
-        assert_eq!(age_between(timestamp("2000-01-01"), timestamp("1999-02-05")), interval(10, 24, 0));
+        assert_eq!(
+            age_between(timestamp("2024-03-01"), timestamp("2024-01-31")),
+            interval(1, 1, 0)
+        );
+        assert_eq!(
+            age_between(timestamp("2000-01-01"), timestamp("1999-02-05")),
+            interval(10, 24, 0)
+        );
         // Time-of-day borrow into days.
         assert_eq!(
             age_between(timestamp("2024-01-01 10:00"), timestamp("2023-12-15 14:30")),
@@ -1099,27 +1248,92 @@ mod tests {
         let days = parse_date("2024-01-15").unwrap();
         let timestamp = parse_timestamp("2024-01-15 14:30:00", false).unwrap();
         let tsf = parse_timestamp("2024-01-15 14:30:00.5", false).unwrap();
-        let mdy = |f| DateStyle { format: f, order: FieldOrder::Mdy };
-        let dmy = |f| DateStyle { format: f, order: FieldOrder::Dmy };
+        let mdy = |f| DateStyle {
+            format: f,
+            order: FieldOrder::Mdy,
+        };
+        let dmy = |f| DateStyle {
+            format: f,
+            order: FieldOrder::Dmy,
+        };
         let cases = [
-            (mdy(DateFormat::Iso), "2024-01-15", "2024-01-15 14:30:00",
-             "2024-01-15 14:30:00.5", "2024-01-15 14:30:00+00"),
-            (mdy(DateFormat::Postgres), "01-15-2024", "Mon Jan 15 14:30:00 2024",
-             "Mon Jan 15 14:30:00.5 2024", "Mon Jan 15 14:30:00 2024 UTC"),
-            (dmy(DateFormat::Postgres), "15-01-2024", "Mon 15 Jan 14:30:00 2024",
-             "Mon 15 Jan 14:30:00.5 2024", "Mon 15 Jan 14:30:00 2024 UTC"),
-            (mdy(DateFormat::Sql), "01/15/2024", "01/15/2024 14:30:00",
-             "01/15/2024 14:30:00.5", "01/15/2024 14:30:00 UTC"),
-            (dmy(DateFormat::Sql), "15/01/2024", "15/01/2024 14:30:00",
-             "15/01/2024 14:30:00.5", "15/01/2024 14:30:00 UTC"),
-            (mdy(DateFormat::German), "15.01.2024", "15.01.2024 14:30:00",
-             "15.01.2024 14:30:00.5", "15.01.2024 14:30:00 UTC"),
+            (
+                mdy(DateFormat::Iso),
+                "2024-01-15",
+                "2024-01-15 14:30:00",
+                "2024-01-15 14:30:00.5",
+                "2024-01-15 14:30:00+00",
+            ),
+            (
+                mdy(DateFormat::Postgres),
+                "01-15-2024",
+                "Mon Jan 15 14:30:00 2024",
+                "Mon Jan 15 14:30:00.5 2024",
+                "Mon Jan 15 14:30:00 2024 UTC",
+            ),
+            (
+                dmy(DateFormat::Postgres),
+                "15-01-2024",
+                "Mon 15 Jan 14:30:00 2024",
+                "Mon 15 Jan 14:30:00.5 2024",
+                "Mon 15 Jan 14:30:00 2024 UTC",
+            ),
+            (
+                mdy(DateFormat::Sql),
+                "01/15/2024",
+                "01/15/2024 14:30:00",
+                "01/15/2024 14:30:00.5",
+                "01/15/2024 14:30:00 UTC",
+            ),
+            (
+                dmy(DateFormat::Sql),
+                "15/01/2024",
+                "15/01/2024 14:30:00",
+                "15/01/2024 14:30:00.5",
+                "15/01/2024 14:30:00 UTC",
+            ),
+            (
+                mdy(DateFormat::German),
+                "15.01.2024",
+                "15.01.2024 14:30:00",
+                "15.01.2024 14:30:00.5",
+                "15.01.2024 14:30:00 UTC",
+            ),
         ];
         for (style, d_exp, ts_exp, tsf_exp, tstz_exp) in cases {
-            assert_eq!(format_date_styled(days, style).as_str(), d_exp, "{style:?} date");
-            assert_eq!(format_timestamp_styled(timestamp, false, style, crate::sql::timezone::Timezone::utc()).as_str(), ts_exp, "{style:?} timestamp");
-            assert_eq!(format_timestamp_styled(tsf, false, style, crate::sql::timezone::Timezone::utc()).as_str(), tsf_exp, "{style:?} tsf");
-            assert_eq!(format_timestamp_styled(timestamp, true, style, crate::sql::timezone::Timezone::utc()).as_str(), tstz_exp, "{style:?} tstz");
+            assert_eq!(
+                format_date_styled(days, style).as_str(),
+                d_exp,
+                "{style:?} date"
+            );
+            assert_eq!(
+                format_timestamp_styled(
+                    timestamp,
+                    false,
+                    style,
+                    crate::sql::timezone::Timezone::utc()
+                )
+                .as_str(),
+                ts_exp,
+                "{style:?} timestamp"
+            );
+            assert_eq!(
+                format_timestamp_styled(tsf, false, style, crate::sql::timezone::Timezone::utc())
+                    .as_str(),
+                tsf_exp,
+                "{style:?} tsf"
+            );
+            assert_eq!(
+                format_timestamp_styled(
+                    timestamp,
+                    true,
+                    style,
+                    crate::sql::timezone::Timezone::utc()
+                )
+                .as_str(),
+                tstz_exp,
+                "{style:?} tstz"
+            );
         }
     }
 
@@ -1158,19 +1372,26 @@ mod tests {
     #[test]
     fn make_constructors_match_parsing() {
         // make_date agrees with parse_date, and validates its fields.
-        assert_eq!(make_date(2024, 6, 15).unwrap(), parse_date("2024-06-15").unwrap());
+        assert_eq!(
+            make_date(2024, 6, 15).unwrap(),
+            parse_date("2024-06-15").unwrap()
+        );
         assert_eq!(make_date(2000, 1, 1).unwrap(), 0);
         assert!(make_date(2024, 13, 1).is_err());
         assert!(make_date(2024, 2, 30).is_err());
         // make_time counts microseconds since midnight.
-        assert_eq!(make_time(12, 30, 0.0).unwrap(), ((12 * 60 + 30) * 60) * 1_000_000);
+        assert_eq!(
+            make_time(12, 30, 0.0).unwrap(),
+            ((12 * 60 + 30) * 60) * 1_000_000
+        );
         assert_eq!(make_time(0, 0, 45.5).unwrap(), 45_500_000);
         assert!(make_time(24, 0, 0.0).is_err());
         assert!(make_time(0, 0, 60.0).is_err());
         // make_timestamp combines the two.
         assert_eq!(
             make_timestamp(2024, 6, 15, 12, 30, 0.0).unwrap(),
-            make_date(2024, 6, 15).unwrap() as i64 * 86_400_000_000 + make_time(12, 30, 0.0).unwrap()
+            make_date(2024, 6, 15).unwrap() as i64 * 86_400_000_000
+                + make_time(12, 30, 0.0).unwrap()
         );
     }
 
@@ -1181,7 +1402,10 @@ mod tests {
         assert_eq!(to_date("15/06/2024", "DD/MM/YYYY").unwrap(), d);
         assert_eq!(to_date("06-15-2024", "MM-DD-YYYY").unwrap(), d);
         assert_eq!(to_date("240615", "YYMMDD").unwrap(), d);
-        assert_eq!(to_date("2024-6-5", "YYYY-MM-DD").unwrap(), parse_date("2024-06-05").unwrap());
+        assert_eq!(
+            to_date("2024-6-5", "YYYY-MM-DD").unwrap(),
+            parse_date("2024-06-05").unwrap()
+        );
         assert_eq!(to_date("Jun 15 2024", "Mon DD YYYY").unwrap(), d);
         assert_eq!(
             to_timestamp("2024-06-15 12:30:45", "YYYY-MM-DD HH24:MI:SS").unwrap(),
@@ -1197,8 +1421,14 @@ mod tests {
         assert_eq!(format_timestamp(t, false).as_str(), "2000-01-01 00:00:00");
 
         let t = parse_timestamp("2024-06-15 12:34:56.789", false).unwrap();
-        assert_eq!(format_timestamp(t, false).as_str(), "2024-06-15 12:34:56.789");
-        assert_eq!(format_timestamp(t, true).as_str(), "2024-06-15 12:34:56.789+00");
+        assert_eq!(
+            format_timestamp(t, false).as_str(),
+            "2024-06-15 12:34:56.789"
+        );
+        assert_eq!(
+            format_timestamp(t, true).as_str(),
+            "2024-06-15 12:34:56.789+00"
+        );
 
         // Zone shifting for timestamptz.
         let utc = parse_timestamp("2024-01-01 12:00:00+00", true).unwrap();

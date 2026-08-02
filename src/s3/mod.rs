@@ -23,7 +23,7 @@ pub use crate::object_store::{Error as S3Error, GetResult, Precondition};
 use crate::stack_format;
 use crate::util::StackStr;
 
-use sigv4::{sign, uri_encode, SigningInput};
+use sigv4::{SigningInput, sign, uri_encode};
 
 pub const EMPTY_SHA256_HEX: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -143,11 +143,7 @@ impl S3Client {
             } else {
                 None
             },
-            head: FixedBuf::new(
-                budget,
-                "object_store_head",
-                config.object_store_head_bytes,
-            )?,
+            head: FixedBuf::new(budget, "object_store_head", config.object_store_head_bytes)?,
             body: FixedBuf::new(
                 budget,
                 "object_store_response",
@@ -172,7 +168,15 @@ impl S3Client {
         precondition: Precondition,
     ) -> Result<StackStr<80>, S3Error> {
         let payload_hash = HexDigest::of(&sha256(body));
-        let result = self.request("PUT", key, "", body, payload_hash.as_str(), precondition, None)?;
+        let result = self.request(
+            "PUT",
+            key,
+            "",
+            body,
+            payload_hash.as_str(),
+            precondition,
+            None,
+        )?;
         Ok(result.etag)
     }
 
@@ -207,7 +211,11 @@ impl S3Client {
                 let stream = self.stream.as_mut().expect("connected");
                 write_body(stream)
                     .and_then(|()| stream.flush())
-                    .map_err(|e| S3Error::Io { context: "send body", kind: e.kind(), detail: stack_format!(160, "{e}") })?;
+                    .map_err(|e| S3Error::Io {
+                        context: "send body",
+                        kind: e.kind(),
+                        detail: stack_format!(160, "{e}"),
+                    })?;
                 self.head.clear();
                 self.body.clear();
                 read_response(stream, &mut self.head, &mut self.body)
@@ -296,7 +304,10 @@ impl S3Client {
     }
 
     pub fn disable_async_gets(&mut self) {
-        assert!(self.pending.is_none(), "cannot switch a pending GET to blocking");
+        assert!(
+            self.pending.is_none(),
+            "cannot switch a pending GET to blocking"
+        );
         self.async_gets = false;
     }
 
@@ -387,7 +398,8 @@ impl S3Client {
             let take = already.min(content_length);
             if take > 0 {
                 assert!(
-                    self.body.append(&self.head.readable()[head_end..head_end + take]),
+                    self.body
+                        .append(&self.head.readable()[head_end..head_end + take]),
                     "checked against capacity"
                 );
                 pending.body_read = take;
@@ -431,7 +443,9 @@ impl S3Client {
         if chunked {
             // The scheduler admits only fixed-length object responses.
             self.clear_pending();
-            return Err(S3Error::Protocol("chunked encoding not supported in non-blocking GET"));
+            return Err(S3Error::Protocol(
+                "chunked encoding not supported in non-blocking GET",
+            ));
         }
         if !(200..300).contains(&status) {
             let text = core::str::from_utf8(self.body.readable()).unwrap_or("");
@@ -475,11 +489,7 @@ impl S3Client {
     /// Lists keys under `prefix` (ListObjectsV2, following continuation
     /// tokens). Keys are yielded in S3's lexicographic order, with the
     /// client's key prefix stripped.
-    pub fn list(
-        &mut self,
-        prefix: &str,
-        mut each: impl FnMut(&str),
-    ) -> Result<usize, S3Error> {
+    pub fn list(&mut self, prefix: &str, mut each: impl FnMut(&str)) -> Result<usize, S3Error> {
         let mut token: Option<StackStr<1024>> = None;
         let mut count = 0usize;
         loop {
@@ -536,7 +546,10 @@ impl S3Client {
         }
     }
 
-    #[expect(clippy::too_many_arguments, reason = "internal seam shared by all verbs")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal seam shared by all verbs"
+    )]
     fn request(
         &mut self,
         method: &str,
@@ -564,7 +577,10 @@ impl S3Client {
         Err(last.expect("at least one attempt ran"))
     }
 
-    #[expect(clippy::too_many_arguments, reason = "internal seam shared by all verbs")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal seam shared by all verbs"
+    )]
     fn attempt(
         &mut self,
         method: &str,
@@ -588,7 +604,11 @@ impl S3Client {
         let send = stream.write_all(body).and_then(|()| stream.flush());
         if let Err(e) = send {
             self.stream = None;
-            return Err(S3Error::Io { context: "send body", kind: e.kind(), detail: stack_format!(160, "{e}") });
+            return Err(S3Error::Io {
+                context: "send body",
+                kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
+            });
         }
 
         // Receive: reuse `head` for the response head.
@@ -605,7 +625,10 @@ impl S3Client {
     }
 
     /// Builds, signs, and sends the request head (connecting if needed).
-    #[expect(clippy::too_many_arguments, reason = "internal seam shared by all verbs")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal seam shared by all verbs"
+    )]
     fn send_head_and_connect(
         &mut self,
         method: &str,
@@ -702,21 +725,27 @@ impl S3Client {
         };
         if self.stream.is_none() {
             let stream = TcpStream::connect(self.connect_addr).map_err(io("connect"))?;
-            stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(io("timeout"))?;
-            stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(io("timeout"))?;
+            stream
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .map_err(io("timeout"))?;
+            stream
+                .set_write_timeout(Some(IO_TIMEOUT))
+                .map_err(io("timeout"))?;
             stream.set_nodelay(true).map_err(io("nodelay"))?;
             self.stream = Some(match &self.tls_context {
-                Some(context) => {
-                    tls::Transport::tls(stream, &context.config, &context.server_name)
-                        .map_err(io("tls"))?
-                }
+                Some(context) => tls::Transport::tls(stream, &context.config, &context.server_name)
+                    .map_err(io("tls"))?,
                 None => tls::Transport::plain(stream),
             });
         }
         let stream = self.stream.as_mut().expect("connected above");
         if let Err(e) = stream.write_all(self.head.readable()) {
             self.stream = None;
-            return Err(S3Error::Io { context: "send head", kind: e.kind(), detail: stack_format!(160, "{e}") });
+            return Err(S3Error::Io {
+                context: "send head",
+                kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
+            });
         }
         Ok(())
     }
@@ -826,9 +855,11 @@ fn read_chunked_body(
                 self.leftover = &self.leftover[n..];
                 return Ok(n);
             }
-            self.stream
-                .read(out)
-                .map_err(|e| S3Error::Io { context: "read chunk", kind: e.kind(), detail: stack_format!(160, "{e}") })
+            self.stream.read(out).map_err(|e| S3Error::Io {
+                context: "read chunk",
+                kind: e.kind(),
+                detail: stack_format!(160, "{e}"),
+            })
         }
     }
     fn fill(feed: &mut Feed, carry: &mut [u8; 512], carry_len: &mut usize) -> Result<(), S3Error> {
@@ -862,8 +893,8 @@ fn read_chunked_body(
         let line = core::str::from_utf8(&carry[..line_end])
             .map_err(|_| S3Error::Protocol("non-UTF-8 chunk size"))?;
         let hex = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(hex, 16)
-            .map_err(|_| S3Error::Protocol("bad chunk size"))?;
+        let size =
+            usize::from_str_radix(hex, 16).map_err(|_| S3Error::Protocol("bad chunk size"))?;
         // Drop the size line from the carry.
         carry.copy_within(line_end + 2..carry_len, 0);
         carry_len -= line_end + 2;
@@ -883,9 +914,10 @@ fn read_chunked_body(
                 match fill(&mut feed, &mut carry, &mut carry_len) {
                     Ok(()) => {}
                     // Connection close after the last chunk is a valid end.
-                    Err(S3Error::Io { kind: std::io::ErrorKind::UnexpectedEof, .. })
-                        if carry_len == 0 =>
-                    {
+                    Err(S3Error::Io {
+                        kind: std::io::ErrorKind::UnexpectedEof,
+                        ..
+                    }) if carry_len == 0 => {
                         return Ok(());
                     }
                     Err(e) => return Err(e),
@@ -938,7 +970,9 @@ fn read_chunked_body(
 }
 
 fn find_head_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    data.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
 }
 
 fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>, bool), S3Error> {
@@ -999,8 +1033,7 @@ mod tests {
         c.object_store_endpoint = format!("127.0.0.1:{port}");
         c.object_store_bucket = "testbucket".to_string();
         c.object_store_access_key = "AKIDEXAMPLE".to_string();
-        c.object_store_secret_key =
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string();
+        c.object_store_secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string();
         c.object_store_head_bytes = 8192;
         c.object_store_response_bytes = 65536;
         c
@@ -1182,7 +1215,8 @@ mod tests {
         // A chunk stream larger than the response buffer must refuse, not
         // truncate: the declared capacity below is 64 KiB and the single
         // chunk claims 128 KiB.
-        let mut big = String::from("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n20000\r\n");
+        let mut big =
+            String::from("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n20000\r\n");
         big.push_str(&"y".repeat(0x20000));
         big.push_str("\r\n0\r\n\r\n");
         let leaked: &'static str = Box::leak(big.into_boxed_str());
@@ -1213,7 +1247,11 @@ mod tests {
         let mut client = S3Client::new(&config, &mut budget).unwrap();
         client.with_clock(|| 1_440_938_160);
         let etag = client
-            .put("sst/000001.sst", b"hello world", Precondition::IfNoneMatchAny)
+            .put(
+                "sst/000001.sst",
+                b"hello world",
+                Precondition::IfNoneMatchAny,
+            )
             .unwrap();
         assert_eq!(etag.as_str(), "abc123");
         server.join().unwrap();

@@ -16,10 +16,10 @@ use crate::sql::types::{ArrElem, Datum};
 use crate::sql_err;
 
 use super::super::{
-    text_view,
-    alloc_text, arena_full, arity_err, datum_to_text, eval_full, ident_needs_quotes, int_arg,
-    overflow, parse_qualified_ident, quote_ident_str, quote_literal_str, regex_substring,
-    sql_regex_substring, sqlstate, text_arg, type_mismatch, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, alloc_text, arena_full, arity_err, datum_to_text, eval_full,
+    ident_needs_quotes, int_arg, overflow, parse_qualified_ident, quote_ident_str,
+    quote_literal_str, regex_substring, sql_regex_substring, sqlstate, text_arg, text_view,
+    type_mismatch,
 };
 
 /// Handles the scalar text family. Returns `None` if `name` is not one of these
@@ -146,9 +146,7 @@ pub(crate) fn dispatch<'a>(
                                 }
                             }
                         }
-                        Ok(Datum::Text(unsafe {
-                            core::str::from_utf8_unchecked(out)
-                        }))
+                        Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
                     }
                     other => Err(type_mismatch(name, &other)),
                 }
@@ -203,7 +201,10 @@ pub(crate) fn dispatch<'a>(
                 // Prefix = first (n-1) chars of s; suffix = s from char (n-1+l).
                 let prefix_chars = (n - 1).max(0) as usize;
                 let skip_to = (n - 1 + l).max(0) as usize;
-                let prefix_end = s.char_indices().nth(prefix_chars).map_or(s.len(), |(b, _)| b);
+                let prefix_end = s
+                    .char_indices()
+                    .nth(prefix_chars)
+                    .map_or(s.len(), |(b, _)| b);
                 let suffix_start = s.char_indices().nth(skip_to).map_or(s.len(), |(b, _)| b);
                 let suffix_start = suffix_start.max(prefix_end);
                 let total = prefix_end + r.len() + (s.len() - suffix_start);
@@ -227,7 +228,9 @@ pub(crate) fn dispatch<'a>(
                     let escape = match text_view(eval_full(args[2], arena, params, row, hooks)?) {
                         Datum::Text(e) => e,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch("substring escape must be text", &other)),
+                        other => {
+                            return Err(type_mismatch("substring escape must be text", &other));
+                        }
                     };
                     return sql_regex_substring(s, pattern, escape, arena);
                 }
@@ -242,7 +245,10 @@ pub(crate) fn dispatch<'a>(
                     match int_arg(name, args, 2, arena, params, row, hooks)? {
                         Some(c) => {
                             if c < 0 {
-                                return Err(sql_err!(sqlstate::SUBSTRING_ERROR, "negative substring length not allowed"));
+                                return Err(sql_err!(
+                                    sqlstate::SUBSTRING_ERROR,
+                                    "negative substring length not allowed"
+                                ));
                             }
                             Some(c)
                         }
@@ -284,7 +290,9 @@ pub(crate) fn dispatch<'a>(
                 let n = s.matches(from).count();
                 let out_len = s.len() + n * to.len().saturating_sub(from.len())
                     - n * from.len().saturating_sub(to.len());
-                let out = arena.alloc_slice_with(out_len, |_| 0u8).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(out_len, |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let mut rest = s;
                 while let Some(pos) = rest.find(from) {
@@ -307,7 +315,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let n = n.max(0) as usize;
                 let out_len = s.len().checked_mul(n).ok_or_else(|| overflow("text"))?;
-                let out = arena.alloc_slice_with(out_len, |_| 0u8).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(out_len, |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 for i in 0..n {
                     out[i * s.len()..(i + 1) * s.len()].copy_from_slice(s.as_bytes());
                 }
@@ -318,7 +328,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let out = arena.alloc_slice_with(s.len(), |_| 0u8).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(s.len(), |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = s.len();
                 for c in s.chars() {
                     at -= c.len_utf8();
@@ -337,7 +349,11 @@ pub(crate) fn dispatch<'a>(
                 let total = s.chars().count() as i64;
                 // Negative n means "all but the last/first |n| characters".
                 let take = if name == "left" {
-                    if n < 0 { (total + n).max(0) } else { n.min(total) }
+                    if n < 0 {
+                        (total + n).max(0)
+                    } else {
+                        n.min(total)
+                    }
                 } else if n < 0 {
                     (total + n).max(0)
                 } else {
@@ -431,24 +447,34 @@ pub(crate) fn dispatch<'a>(
                 // lower-casing the rest — PostgreSQL's rule.
                 let out_len: usize = s
                     .chars()
-                    .map(|c| c.to_uppercase().map(char::len_utf8).sum::<usize>().max(c.len_utf8()))
+                    .map(|c| {
+                        c.to_uppercase()
+                            .map(char::len_utf8)
+                            .sum::<usize>()
+                            .max(c.len_utf8())
+                    })
                     .sum::<usize>()
                     .max(s.len());
-                let out = arena.alloc_slice_with(out_len, |_| 0u8).map_err(|_| arena_full())?;
+                let out = arena
+                    .alloc_slice_with(out_len, |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let mut prev_alnum = false;
                 for c in s.chars() {
-                    let mapped: &mut dyn Iterator<Item = char> = if c.is_alphanumeric() && !prev_alnum {
-                        &mut c.to_uppercase()
-                    } else {
-                        &mut c.to_lowercase()
-                    };
+                    let mapped: &mut dyn Iterator<Item = char> =
+                        if c.is_alphanumeric() && !prev_alnum {
+                            &mut c.to_uppercase()
+                        } else {
+                            &mut c.to_lowercase()
+                        };
                     for m in mapped {
                         at += m.encode_utf8(&mut out[at..]).len();
                     }
                     prev_alnum = c.is_alphanumeric();
                 }
-                Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&out[..at]) }))
+                Ok(Datum::Text(unsafe {
+                    core::str::from_utf8_unchecked(&out[..at])
+                }))
             }
             "ascii" => {
                 arity(1)?;
@@ -466,13 +492,23 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if n == 0 {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "null character not permitted"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "null character not permitted"
+                    ));
                 }
                 let c = u32::try_from(n)
                     .ok()
                     .and_then(char::from_u32)
-                    .ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "requested character not valid for encoding"))?;
-                let out = arena.alloc_slice_with(c.len_utf8(), |_| 0u8).map_err(|_| arena_full())?;
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "requested character not valid for encoding"
+                        )
+                    })?;
+                let out = arena
+                    .alloc_slice_with(c.len_utf8(), |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 c.encode_utf8(out);
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
             }
@@ -520,9 +556,16 @@ pub(crate) fn dispatch<'a>(
                 }
                 let pad_count = len - s_len;
                 // Padding is `fill` repeated, cut to `pad_count` characters.
-                let pad_len: usize = fill.chars().cycle().take(pad_count).map(char::len_utf8).sum();
+                let pad_len: usize = fill
+                    .chars()
+                    .cycle()
+                    .take(pad_count)
+                    .map(char::len_utf8)
+                    .sum();
                 let total = pad_len + s.len();
-                let buffer = arena.alloc_slice_with(total, |_| 0u8).map_err(|_| arena_full())?;
+                let buffer = arena
+                    .alloc_slice_with(total, |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let write_pad = |buffer: &mut [u8], at: &mut usize| {
                     for c in fill.chars().cycle().take(pad_count) {
@@ -537,7 +580,9 @@ pub(crate) fn dispatch<'a>(
                     at += s.len();
                     write_pad(buffer, &mut at);
                 }
-                Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(buffer) }))
+                Ok(Datum::Text(unsafe {
+                    core::str::from_utf8_unchecked(buffer)
+                }))
             }
             "split_part" => {
                 arity(3)?;
@@ -551,7 +596,10 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 if n == 0 {
-                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "field position must not be zero"));
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "field position must not be zero"
+                    ));
                 }
                 if delim.is_empty() {
                     return Ok(Datum::Text(if n == 1 || n == -1 { s } else { "" }));
@@ -581,7 +629,9 @@ pub(crate) fn dispatch<'a>(
                 // Each character of `s` that appears in `from` is replaced by the
                 // char at the same index in `to`, or removed if `to` is shorter.
                 let out_cap: usize = s.chars().map(|c| c.len_utf8()).sum();
-                let buffer = arena.alloc_slice_with(out_cap.max(1), |_| 0u8).map_err(|_| arena_full())?;
+                let buffer = arena
+                    .alloc_slice_with(out_cap.max(1), |_| 0u8)
+                    .map_err(|_| arena_full())?;
                 let mut at = 0;
                 for c in s.chars() {
                     match from.chars().position(|f| f == c) {
@@ -596,7 +646,9 @@ pub(crate) fn dispatch<'a>(
                         }
                     }
                 }
-                Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(&buffer[..at]) }))
+                Ok(Datum::Text(unsafe {
+                    core::str::from_utf8_unchecked(&buffer[..at])
+                }))
             }
             "bit_length" => {
                 arity(1)?;
@@ -605,9 +657,9 @@ pub(crate) fn dispatch<'a>(
                     // A bit string's bit_length is its bit count.
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
                     Datum::Text(s) => Ok(Datum::Int4((s.len() as i64 * 8) as i32)),
-                    Datum::Bpchar(s) => {
-                        Ok(Datum::Int4((s.trim_end_matches(' ').len() as i64 * 8) as i32))
-                    }
+                    Datum::Bpchar(s) => Ok(Datum::Int4(
+                        (s.trim_end_matches(' ').len() as i64 * 8) as i32,
+                    )),
                     Datum::Bytea(b) => Ok(Datum::Int4((b.len() as i64 * 8) as i32)),
                     other => Err(type_mismatch("bit_length", &other)),
                 }

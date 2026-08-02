@@ -12,9 +12,9 @@
 //! well as the CRC — the one case a checksum cannot cover is being handed a
 //! *different* block that is itself intact.
 
-use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 use crate::mem::budget::Budget;
 use crate::mem::fixed_vec::FixedVec;
+use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
 use std::time::{Duration, Instant};
 
 use super::{BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, StoreError, decode, encode};
@@ -149,8 +149,12 @@ impl OwnedObjectStore {
         budget: &mut Budget,
         prefix: &'static str,
     ) -> Result<Self, crate::object_store::SetupError> {
-        let mut slots = FixedVec::new(budget, "object_store_get_slots", config.object_store_get_slots)
-            .map_err(crate::object_store::SetupError::Budget)?;
+        let mut slots = FixedVec::new(
+            budget,
+            "object_store_get_slots",
+            config.object_store_get_slots,
+        )
+        .map_err(crate::object_store::SetupError::Budget)?;
         for _ in 0..config.object_store_get_slots {
             slots
                 .push(ObjectReadSlot {
@@ -245,7 +249,10 @@ impl OwnedObjectStore {
         self.slots
             .iter()
             .filter(|slot| slot.pending_id.is_some() && !slot.hedge_issued)
-            .filter_map(|slot| slot.started_at.and_then(|started| started.checked_add(hedge_after)))
+            .filter_map(|slot| {
+                slot.started_at
+                    .and_then(|started| started.checked_add(hedge_after))
+            })
             .min()
     }
 
@@ -261,7 +268,10 @@ impl OwnedObjectStore {
                 && !slot.hedge_issued
                 && slot
                     .started_at
-                    .and_then(|started| self.hedge_after.and_then(|after| started.checked_add(after)))
+                    .and_then(|started| {
+                        self.hedge_after
+                            .and_then(|after| started.checked_add(after))
+                    })
                     .is_some_and(|due| due <= now)
         }) else {
             return;
@@ -316,7 +326,11 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(winner) = self.slots.iter().position(|slot| slot.ready_id == Some(*id)) {
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.ready_id == Some(*id))
+        {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
@@ -326,7 +340,11 @@ impl BlockStore for OwnedObjectStore {
         if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
             return Err(StoreError::NotReady);
         }
-        if let Some(winner) = self.slots.iter().position(|slot| slot.error_id == Some(*id)) {
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.error_id == Some(*id))
+        {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.error_id = None;
@@ -376,7 +394,11 @@ impl BlockStore for OwnedObjectStore {
         id: &BlockId,
         into: &mut [u8],
     ) -> Result<Option<(usize, BlockType)>, StoreError> {
-        if let Some(winner) = self.slots.iter().position(|slot| slot.ready_id == Some(*id)) {
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.ready_id == Some(*id))
+        {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
@@ -386,7 +408,11 @@ impl BlockStore for OwnedObjectStore {
         if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
             return Ok(None);
         }
-        if let Some(winner) = self.slots.iter().position(|slot| slot.error_id == Some(*id)) {
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.error_id == Some(*id))
+        {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.error_id = None;
@@ -400,7 +426,10 @@ impl BlockStore for OwnedObjectStore {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         self.stats.object_contains = self.stats.object_contains.saturating_add(1);
-        match self.slots[0].client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
+        match self.slots[0]
+            .client
+            .get(key, Some((0, HEADER_LEN as u64 - 1)))
+        {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -635,9 +664,14 @@ mod tests {
 
         let mut output = [0u8; 64];
         assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));
-        let deadline = store.next_hedge_deadline().expect("pending read has a deadline");
+        let deadline = store
+            .next_hedge_deadline()
+            .expect("pending read has a deadline");
         store.issue_due_hedges(deadline);
-        assert!(store.pending_read_fd(1).is_some(), "hedge owns the spare slot");
+        assert!(
+            store.pending_read_fd(1).is_some(),
+            "hedge owns the spare slot"
+        );
         assert_eq!(store.io_stats().object_gets, 2);
         let mut complete = false;
         for _ in 0..10_000 {
@@ -653,7 +687,10 @@ mod tests {
             (payload.len(), BlockType::SstData)
         );
         assert_eq!(&output[..payload.len()], payload);
-        assert!(store.pending_read_fd(0).is_none(), "winner released the stalled sibling");
+        assert!(
+            store.pending_read_fd(0).is_none(),
+            "winner released the stalled sibling"
+        );
         drop(store);
         server.join().unwrap();
     }

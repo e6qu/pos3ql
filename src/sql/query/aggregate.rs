@@ -30,12 +30,7 @@ impl core::fmt::Display for JsonAggregateDisplay<'_> {
             if index > 0 {
                 formatter.write_str(", ")?;
             }
-            crate::sql::json::write_datum_json_styled(
-                value,
-                colon,
-                ", ",
-                formatter,
-            )?;
+            crate::sql::json::write_datum_json_styled(value, colon, ", ", formatter)?;
         }
         formatter.write_char(']')
     }
@@ -59,12 +54,7 @@ impl core::fmt::Display for JsonObjectAggregateDisplay<'_> {
             let value = crate::sql::exec::decode_projected_pub(encoded, 1);
             crate::sql::json::write_json_display_string(&key, formatter)?;
             formatter.write_str(colon)?;
-            crate::sql::json::write_datum_json_styled(
-                &value,
-                colon,
-                ", ",
-                formatter,
-            )?;
+            crate::sql::json::write_datum_json_styled(&value, colon, ", ", formatter)?;
         }
         formatter.write_str(close)
     }
@@ -93,15 +83,15 @@ pub(crate) fn fold_aggregates<'a>(
         .iter()
         .all(AggState::recycling_safe);
     let mut visit = |row: &super::JoinRow<'_, 'a, '_>| {
-            let chained_row = Chained {
-                inner: row,
-                outer: outer_arg,
-            };
-            for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                states[i].update(node, arena, params, &chained_row, hooks)?;
-            }
-            Ok(true)
+        let chained_row = Chained {
+            inner: row,
+            outer: outer_arg,
         };
+        for (i, (_, node)) in agg_nodes.iter().enumerate() {
+            states[i].update(node, arena, params, &chained_row, hooks)?;
+        }
+        Ok(true)
+    };
     if recycling_safe {
         scan_source_recycling(
             storage,

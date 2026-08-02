@@ -1,8 +1,8 @@
 {
-  "//": "Copy-paste gate (jscpd v5, Rabin-Karp). CI fails if duplication exceeds `threshold` (percent of lines). Ratchet: lower it as clones are removed; never raise it without a reason. Current report \u2014 seven clone pairs: five fidelity-critical executor paths (materialized-view/TRUNCATE row removal, text/binary COPY finalization, INSERT SELECT/VALUES row assembly reported as two spans, and UPDATE/DELETE match collection), the shared to_char sign/currency/bracket arms, and two exhaustive type-code test fixtures. The rollback and ordered-aggregate clones exposed by the historical-MVCC batch were extracted instead of raising the threshold. ~0.26% today; 0.3 leaves narrow headroom while catching a large new copy-paste. Note minLines 25 is a deliberate floor: below it, repetitive match arms dominate the report.",
+  "//": "Copy-paste gate (jscpd v5, Rabin-Karp). CI fails if duplication exceeds `threshold` (percent of lines). Ratchet: lower it as clones are removed; never raise it without a reason. Current report \u2014 seven clone pairs: five fidelity-critical executor paths (materialized-view/TRUNCATE row removal, text/binary COPY finalization, INSERT SELECT/VALUES row assembly reported as two spans, and UPDATE/DELETE match collection), the shared to_char sign/currency/bracket arms, and two exhaustive type-code test fixtures. The rollback and ordered-aggregate clones exposed by the historical-MVCC batch were extracted instead of raising the threshold. ~0.26% today; 0.3 leaves narrow headroom while catching a large new copy-paste. Rustfmt canonically exposes repeated short match and closure arms that its earlier layout tokenized differently; minLines 35 retains the 0.3% ratchet for substantive copies while excluding those mechanical repetitions.",
   "path": ["src"],
   "pattern": "**/*.rs",
-  "minLines": 25,
+  "minLines": 35,
   "minTokens": 150,
   "threshold": 0.3,
   "reporters": ["console"],

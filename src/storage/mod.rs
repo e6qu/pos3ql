@@ -25,10 +25,9 @@ pub(crate) use rowenc::MAX_COLUMNS;
 
 fn spill_read_error(error: crate::store::SstError) -> SqlError {
     match error {
-        crate::store::SstError::Store(crate::store::StoreError::NotReady) => sql_err!(
-            sqlstate::INTERNAL_IO_WAIT,
-            "durable block read in progress"
-        ),
+        crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
+            sql_err!(sqlstate::INTERNAL_IO_WAIT, "durable block read in progress")
+        }
         other => sql_err!(sqlstate::IO_ERROR, "spill read: {:?}", other),
     }
 }
@@ -2402,8 +2401,7 @@ pub(crate) struct SpillReader {
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
-    external_readers:
-        std::rc::Rc<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
+    external_readers: std::rc::Rc<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
 }
 
 /// Copyable access to immutable external runs.
@@ -2416,8 +2414,7 @@ pub(crate) struct SpillReader {
 /// were reserved during startup.
 #[derive(Clone, Copy)]
 pub(crate) struct ExternalRunAccess {
-    blocks:
-        *const std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+    blocks: *const std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
     readers: *const [std::cell::RefCell<crate::sql::external::ExternalRunReader>],
 }
 
@@ -2475,6 +2472,8 @@ struct MemberCursor {
     ordinal: usize,
     /// Byte offset of the next entry inside that block.
     offset: usize,
+    /// Byte offset of `head` inside the currently resident data block.
+    head_offset: usize,
     /// Which ordinal the context's resident buffer currently holds, if any,
     /// and how many bytes of it are the block (the buffer is oversized).
     loaded: Option<usize>,
@@ -3359,10 +3358,7 @@ impl Storage {
         self.ownership_mut(object).pending = prior;
     }
 
-    fn acl_visible(
-        entry: &AclEntry,
-        txid: u32,
-    ) -> (bool, u16, u16, PrivilegeSet, PrivilegeSet) {
+    fn acl_visible(entry: &AclEntry, txid: u32) -> (bool, u16, u16, PrivilegeSet, PrivilegeSet) {
         match entry.pending {
             Some(pending) if pending.txid == txid => (
                 pending.privileges.0 != 0,
@@ -3394,8 +3390,7 @@ impl Storage {
             .acl_entries
             .iter()
             .position(|entry| {
-                let (_, visible_grantee, visible_grantor, _, _) =
-                    Self::acl_visible(entry, txid);
+                let (_, visible_grantee, visible_grantor, _, _) = Self::acl_visible(entry, txid);
                 entry.object == object
                     && visible_grantee == grantee
                     && visible_grantor == grantor
@@ -3490,8 +3485,7 @@ impl Storage {
         self.acl_entries
             .iter()
             .filter(|entry| {
-                let (_, visible_grantee, visible_grantor, _, _) =
-                    Self::acl_visible(entry, txid);
+                let (_, visible_grantee, visible_grantor, _, _) = Self::acl_visible(entry, txid);
                 entry.object == object
                     && visible_grantee == grantee
                     && visible_grantor == grantor
@@ -3547,23 +3541,29 @@ impl Storage {
         let object = self.acl_entries[slot].object;
         let grantee = self.acl_entries[slot].grantee;
         let grantor = self.acl_entries[slot].grantor;
-        let Some(canonical) = self.acl_entries.iter().enumerate().find_map(|(candidate, entry)| {
-            (candidate != slot
-                && entry.object == object
-                && entry.grantee == grantee
-                && entry.grantor == grantor
-                && entry.object.slot != u16::MAX
-                && entry.pending.is_none())
-            .then_some(candidate)
-        }) else {
+        let Some(canonical) = self
+            .acl_entries
+            .iter()
+            .enumerate()
+            .find_map(|(candidate, entry)| {
+                (candidate != slot
+                    && entry.object == object
+                    && entry.grantee == grantee
+                    && entry.grantor == grantor
+                    && entry.object.slot != u16::MAX
+                    && entry.pending.is_none())
+                .then_some(candidate)
+            })
+        else {
             return;
         };
         let privileges = self.acl_entries[slot].privileges;
         let grant_options = self.acl_entries[slot].grant_options;
         self.acl_entries[canonical].privileges =
             self.acl_entries[canonical].privileges.union(privileges);
-        self.acl_entries[canonical].grant_options =
-            self.acl_entries[canonical].grant_options.union(grant_options);
+        self.acl_entries[canonical].grant_options = self.acl_entries[canonical]
+            .grant_options
+            .union(grant_options);
         self.acl_entries[canonical].live = self.acl_entries[canonical].privileges.0 != 0;
         self.acl_entries[slot].object.slot = u16::MAX;
         self.acl_entries[slot].privileges = PrivilegeSet::NONE;
@@ -3614,11 +3614,9 @@ impl Storage {
         txid: u32,
     ) -> (bool, PrivilegeSet, PrivilegeSet) {
         match entry.pending {
-            Some(pending) if pending.txid == txid => (
-                pending.defined,
-                pending.privileges,
-                pending.grant_options,
-            ),
+            Some(pending) if pending.txid == txid => {
+                (pending.defined, pending.privileges, pending.grant_options)
+            }
             _ => (entry.defined, entry.privileges, entry.grant_options),
         }
     }
@@ -3659,11 +3657,7 @@ impl Storage {
                     && entry.grantee == grantee
             })
             .map(|entry| Self::default_acl_visible(entry, txid))
-            .unwrap_or((
-                false,
-                PrivilegeSet::NONE,
-                PrivilegeSet::NONE,
-            ))
+            .unwrap_or((false, PrivilegeSet::NONE, PrivilegeSet::NONE))
     }
 
     pub(crate) fn default_acl_effective(
@@ -3766,9 +3760,7 @@ impl Storage {
         &self.default_acl_entries[slot]
     }
 
-    pub(crate) fn default_acl_entries(
-        &self,
-    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
+    pub(crate) fn default_acl_entries(&self) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
         self.default_acl_entries.iter().enumerate()
     }
 
@@ -3799,9 +3791,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn live_default_acls(
-        &self,
-    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
+    pub(crate) fn live_default_acls(&self) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
         self.default_acl_entries
             .iter()
             .enumerate()
@@ -3842,8 +3832,7 @@ impl Storage {
     ) -> usize {
         let mut count = 0usize;
         for (slot, entry) in self.acl_entries.iter().enumerate() {
-            let (visible, _, entry_grantor, entry_privileges, _) =
-                Self::acl_visible(entry, txid);
+            let (visible, _, entry_grantor, entry_privileges, _) = Self::acl_visible(entry, txid);
             if visible
                 && entry.object == object
                 && entry_grantor == grantor
@@ -5296,7 +5285,9 @@ impl Storage {
 
     /// Returns an owned capability for consuming immutable external runs
     /// without retaining an immutable borrow of the mutable database state.
-    pub(crate) fn external_run_access(&self) -> Result<ExternalRunAccess, crate::sql::eval::SqlError> {
+    pub(crate) fn external_run_access(
+        &self,
+    ) -> Result<ExternalRunAccess, crate::sql::eval::SqlError> {
         let Some(spill) = self.spill.as_ref() else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5358,6 +5349,7 @@ impl Storage {
         let mut cursors = [MemberCursor {
             ordinal: 0,
             offset: 0,
+            head_offset: 0,
             loaded: None,
             loaded_len: 0,
             prefetched_leaf: None,
@@ -5447,6 +5439,224 @@ impl Storage {
         }
     }
 
+    /// The payload-carrying form of [`Self::spill_merged_walk`]. A sequential
+    /// scan already has the winning entry's data block resident while it
+    /// merges versions. Copying that entry into statement storage before the
+    /// cursor advances avoids turning every row in the block into a second
+    /// SST point lookup. The context is released before `emit`, so nested
+    /// execution still uses the normal bounded reader pool.
+    fn spill_merged_walk_bytes<'a>(
+        &self,
+        slot: usize,
+        arena: &'a crate::mem::arena::Arena,
+        recycle_rows: bool,
+        emit: &mut dyn FnMut(u64, &'a [u8]) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<(), SqlError> {
+        let table = &self.tables[slot];
+        let n = table.n_spill_ssts;
+        if n == 0 {
+            return Ok(());
+        }
+        let Some(spill) = &self.spill else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "table has spill SSTs but no spill reader is attached"
+            ));
+        };
+        let walk_id = spill.next_walk_id.get();
+        spill.next_walk_id.set(walk_id.wrapping_add(1).max(1));
+        let mut cursors = [MemberCursor {
+            ordinal: 0,
+            offset: 0,
+            head_offset: 0,
+            loaded: None,
+            loaded_len: 0,
+            prefetched_leaf: None,
+            prefetched_data: None,
+            head: None,
+            done: false,
+        }; MAX_SPILL_SSTS];
+        {
+            let Some(mut context) = spill
+                .scan_contexts
+                .iter()
+                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row-state block context is already in use"
+                ));
+            };
+            context.owner = walk_id;
+            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+            }
+        }
+        loop {
+            let mark = recycle_rows.then(|| arena.mark());
+            let mut min: Option<u64> = None;
+            for cursor in cursors[..n].iter() {
+                if let Some((key, ..)) = cursor.head {
+                    min = Some(min.map_or(key.rowid, |rowid: u64| rowid.min(key.rowid)));
+                }
+            }
+            let Some(rowid) = min else { return Ok(()) };
+            let Some(mut context) = spill
+                .scan_contexts
+                .iter()
+                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row-state block context is already in use"
+                ));
+            };
+            if context.owner != walk_id {
+                for cursor in &mut cursors[..n] {
+                    cursor.loaded = None;
+                    cursor.loaded_len = 0;
+                }
+                context.owner = walk_id;
+            }
+            let mut verdict: Option<SpillVersion> = None;
+            for (member, cursor) in cursors[..n].iter().enumerate() {
+                if let Some((key, tombstone, len)) = cursor.head
+                    && key.rowid == rowid
+                    && key.commit_lsn <= self.commit_snapshot
+                    && verdict.is_none_or(|current| {
+                        key.commit_lsn > current.commit_lsn
+                            || (key.commit_lsn == current.commit_lsn
+                                && member as u8 > current.member)
+                    })
+                {
+                    verdict = Some(SpillVersion {
+                        len: (!tombstone).then_some(len),
+                        member: member as u8,
+                        commit_lsn: key.commit_lsn,
+                    });
+                }
+            }
+            let bytes = if let Some(SpillVersion {
+                len: Some(len),
+                member,
+                commit_lsn,
+            }) = verdict
+                && self.tables[slot].rows.get(&rowid).is_none()
+            {
+                let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "spilled scan rows exceed the statement arena; raise work_arena_bytes"
+                    )
+                })?;
+                let cursor = &cursors[member as usize];
+                let handle = table.spill_ssts[member as usize].expect("cursor member exists");
+                let (key, tombstone, copied) = {
+                    let mut blocks = spill.blocks.borrow_mut();
+                    crate::store::copy_block_entry_at(
+                        &mut *blocks,
+                        &context.member_blocks[member as usize][..cursor.loaded_len],
+                        cursor.head_offset,
+                        handle.versioned,
+                        output,
+                    )
+                    .map_err(spill_read_error)?
+                };
+                if tombstone
+                    || key.rowid != rowid
+                    || key.commit_lsn != commit_lsn
+                    || copied != len as usize
+                {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "merged spill cursor payload does not match its selected version"
+                    ));
+                }
+                Some(&*output)
+            } else {
+                None
+            };
+            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                while cursor.head.is_some_and(|(key, ..)| key.rowid == rowid) {
+                    Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+                }
+            }
+            drop(context);
+            let emitted = if let Some(bytes) = bytes {
+                emit(rowid, bytes)
+            } else {
+                Ok(core::ops::ControlFlow::Continue(()))
+            };
+            if let Some(mark) = mark {
+                // SAFETY: recycling callers consume the copied row and all
+                // values derived from it synchronously in `emit`.
+                unsafe { arena.rewind_to(mark) };
+            }
+            if emitted?.is_break() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Streams every spill-only row with the bytes already carried by the
+    /// merged data-block cursor. Overlay rows are intentionally excluded:
+    /// they remain in the row-state seam, where transaction visibility is
+    /// resolved. The outer physical scan combines these rows with that seam
+    /// in its established physical order.
+    pub(crate) fn for_each_spilled_row_bytes<'a>(
+        &self,
+        table_slot: usize,
+        arena: &'a crate::mem::arena::Arena,
+        recycle_rows: bool,
+        each: &mut dyn FnMut(u64, &'a [u8]) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<(), SqlError> {
+        self.spill_merged_walk_bytes(table_slot, arena, recycle_rows, each)
+    }
+
+    /// Whether the spill list has no resident row-state overlay. In that
+    /// state a physical scan can stream its already-merged rows directly;
+    /// any overlay requires the ordinary row-state seam to preserve MVCC
+    /// shadowing and mixed physical ordering.
+    pub(crate) fn spill_rows_are_unshadowed(&self, table_slot: usize) -> bool {
+        self.tables[table_slot].rows.is_empty()
+    }
+
+    /// Whether an unshadowed sequential spill walk costs no more durable block
+    /// traffic than a single-column index probe. Both estimates use only
+    /// manifest and ANALYZE metadata, so choosing the access path cannot warm
+    /// the cache or perform a speculative read.
+    pub(crate) fn sequential_spill_scan_is_cheaper(
+        &self,
+        table_slot: usize,
+        expected_rows: u64,
+        txid: u32,
+    ) -> bool {
+        if !self.spill_rows_are_unshadowed(table_slot) {
+            return false;
+        }
+        let generations = self.spill_generation_count(table_slot) as u64;
+        if generations == 0 {
+            return false;
+        }
+        let statistics = self.table_statistics(table_slot, txid);
+        let rows = self.planning_row_estimate(table_slot);
+        let width = if statistics.valid {
+            statistics.average_row_width.max(1)
+        } else {
+            32
+        };
+        let full_scan_blocks = rows
+            .saturating_mul(u64::from(width))
+            .div_ceil(crate::store::MAX_PAYLOAD as u64)
+            .saturating_add(generations.saturating_mul(2));
+        let index_blocks = generations.saturating_mul(3).saturating_add(
+            expected_rows
+                .saturating_mul(u64::from(width))
+                .div_ceil(crate::store::MAX_PAYLOAD as u64),
+        );
+        full_scan_blocks <= index_blocks
+    }
+
     /// Steps one member cursor to its next entry, loading blocks (through
     /// the cache tiers) as it crosses block boundaries.
     fn cursor_advance(
@@ -5526,13 +5736,15 @@ impl Storage {
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
+            let head_offset = cursor.offset;
             match crate::store::block_keys_at(
                 &context.member_blocks[member][..cursor.loaded_len],
-                cursor.offset,
+                head_offset,
                 handle.versioned,
             ) {
                 Some((key, tombstone, len, next)) => {
                     cursor.offset = next;
+                    cursor.head_offset = head_offset;
                     cursor.head = Some((key, tombstone, len));
                     return Ok(());
                 }

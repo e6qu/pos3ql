@@ -103,12 +103,20 @@ impl<S: BlockStore> DiskCache<S> {
         // and re-warming from the store is what a cache is for. Sizing to the
         // full extent up front makes every later write an overwrite.
         let capacity = (slot_count * SLOT_SIZE) as u64;
-        file.set_len(capacity).map_err(|e| DiskError::Io("size cache file", e))?;
+        file.set_len(capacity)
+            .map_err(|e| DiskError::Io("size cache file", e))?;
         Ok(Self {
             inner,
             file,
-            slots: vec![Slot { id: None, len: 0, referenced: false }; slot_count]
-                .into_boxed_slice(),
+            slots: vec![
+                Slot {
+                    id: None,
+                    len: 0,
+                    referenced: false
+                };
+                slot_count
+            ]
+            .into_boxed_slice(),
             index,
             scratch: vec![0u8; SLOT_SIZE].into_boxed_slice(),
             hand: 0,

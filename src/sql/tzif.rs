@@ -61,7 +61,10 @@ struct ZoneData {
     footer: Option<super::timezone::PosixZone>,
 }
 
-const EMPTY_TYPE: TypeInfo = TypeInfo { utoff: 0, abbrev: StackStr::new() };
+const EMPTY_TYPE: TypeInfo = TypeInfo {
+    utoff: 0,
+    abbrev: StackStr::new(),
+};
 
 const EMPTY_ZONE: ZoneData = ZoneData {
     times: [0; MAX_TRANSITIONS],
@@ -108,8 +111,10 @@ pub fn init_catalog() {
         if c.is_some() {
             return;
         }
-        let mut catalog =
-            Box::new(Catalog { names: [StackStr::new(); MAX_CATALOG], n: 0 });
+        let mut catalog = Box::new(Catalog {
+            names: [StackStr::new(); MAX_CATALOG],
+            n: 0,
+        });
         let mut prefix = String::new();
         walk(&mut catalog, root, &mut prefix);
         *c = Some(catalog);
@@ -147,7 +152,9 @@ fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
         {
             continue;
         }
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let saved = prefix.len();
         if !prefix.is_empty() {
             prefix.push('/');
@@ -214,7 +221,9 @@ pub fn load(name: &str) -> Option<u16> {
             total
         };
         let slot = cache.n;
-        let Cache { zones, file_buf, .. } = &mut **cache;
+        let Cache {
+            zones, file_buf, ..
+        } = &mut **cache;
         if !parse_tzif(&file_buf[..n_read], &mut zones[slot]) {
             return None;
         }
@@ -304,8 +313,7 @@ impl TzifHeader {
         if d.len() < 44 || &d[0..4] != b"TZif" {
             return None;
         }
-        let u32_at =
-            |at: usize| u32::from_be_bytes(d[at..at + 4].try_into().expect("4 bytes"));
+        let u32_at = |at: usize| u32::from_be_bytes(d[at..at + 4].try_into().expect("4 bytes"));
         Some(TzifHeader {
             version: d[4],
             isutcnt: u32_at(20),
@@ -343,7 +351,9 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         out.times[i] = if time_size == 8 {
             i64::from_be_bytes(d[at..at + 8].try_into().expect("8 bytes"))
         } else {
-            i64::from(i32::from_be_bytes(d[at..at + 4].try_into().expect("4 bytes")))
+            i64::from(i32::from_be_bytes(
+                d[at..at + 4].try_into().expect("4 bytes"),
+            ))
         };
         at += time_size;
     }
@@ -396,7 +406,7 @@ fn parse_footer(d: &[u8]) -> Option<super::timezone::PosixZone> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::datetime::{days_from_civil, PG_EPOCH_DAYS};
+    use crate::sql::datetime::{PG_EPOCH_DAYS, days_from_civil};
 
     fn ts(y: i64, month: u32, d: u32, h: i64) -> i64 {
         (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * 86_400_000_000 + h * 3_600_000_000
@@ -411,7 +421,9 @@ mod tests {
     fn new_york_matches_history_and_present() {
         // Hermetic skip when the host has no zoneinfo (the embedded rules
         // then serve lookups, tested in `timezone`).
-        let Some(slot) = load_or_skip("America/New_York") else { return };
+        let Some(slot) = load_or_skip("America/New_York") else {
+            return;
+        };
         // Present rule.
         assert_eq!(resolve(slot, ts(2021, 1, 15, 12)).0, -5 * 3600);
         assert_eq!(resolve(slot, ts(2021, 7, 15, 12)).0, -4 * 3600);
@@ -436,7 +448,10 @@ mod tests {
             return;
         }
         init_catalog();
-        assert!(load("America/New_York").is_some(), "zoneinfo present but load failed");
+        assert!(
+            load("America/New_York").is_some(),
+            "zoneinfo present but load failed"
+        );
     }
 
     #[test]
@@ -454,7 +469,9 @@ mod tests {
     fn moscow_history_needs_the_database() {
         // Moscow observed +04 year-round 2011..2014, then returned to +03 —
         // rule changes no single POSIX rule can express.
-        let Some(slot) = load_or_skip("Europe/Moscow") else { return };
+        let Some(slot) = load_or_skip("Europe/Moscow") else {
+            return;
+        };
         assert_eq!(resolve(slot, ts(2012, 7, 1, 12)).0, 4 * 3600);
         assert_eq!(resolve(slot, ts(2021, 7, 1, 12)).0, 3 * 3600);
     }
@@ -463,7 +480,9 @@ mod tests {
     fn lord_howe_half_hour_dst() {
         // Lord Howe Island: +10:30 standard, +11:00 daylight — a half-hour
         // DST step the embedded rules never modeled.
-        let Some(slot) = load_or_skip("Australia/Lord_Howe") else { return };
+        let Some(slot) = load_or_skip("Australia/Lord_Howe") else {
+            return;
+        };
         assert_eq!(resolve(slot, ts(2021, 7, 1, 12)).0, 10 * 3600 + 1800);
         assert_eq!(resolve(slot, ts(2021, 1, 15, 12)).0, 11 * 3600);
     }

@@ -8,8 +8,10 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 use crate::stack_format;
 
-use super::{ParseError, Parser, MAX_LIST, MAX_WINDOW_DEFS};
-use crate::sql::ast::{Expr, FrameBound, FrameExclusion, FrameUnits, OrderBy, WindowFrame, WindowSpec};
+use super::{MAX_LIST, MAX_WINDOW_DEFS, ParseError, Parser};
+use crate::sql::ast::{
+    Expr, FrameBound, FrameExclusion, FrameUnits, OrderBy, WindowFrame, WindowSpec,
+};
 
 impl<'a> Parser<'a> {
     /// Parses an optional aggregate `FILTER (WHERE cond)` clause.
@@ -29,7 +31,11 @@ impl<'a> Parser<'a> {
     /// already consumed).
     pub(super) fn order_by_items(&mut self) -> Result<&'a [OrderBy<'a>], ParseError> {
         let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut ord = [OrderBy { expression: null_expr, descending: false, nulls_first: false }; MAX_LIST];
+        let mut ord = [OrderBy {
+            expression: null_expr,
+            descending: false,
+            nulls_first: false,
+        }; MAX_LIST];
         let mut m = 0;
         loop {
             if m == MAX_LIST {
@@ -52,7 +58,11 @@ impl<'a> Parser<'a> {
             } else {
                 descending
             };
-            ord[m] = OrderBy { expression, descending, nulls_first };
+            ord[m] = OrderBy {
+                expression,
+                descending,
+                nulls_first,
+            };
             m += 1;
             if !self.eat_op(",")? {
                 break;
@@ -115,8 +125,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn arena_window(&self, spec: WindowSpec<'a>) -> Result<&'a WindowSpec<'a>, ParseError> {
-        let spec = self.arena.alloc(spec).map_err(|_| self.err_here("window spec too large for arena"))?;
+    pub(super) fn arena_window(
+        &self,
+        spec: WindowSpec<'a>,
+    ) -> Result<&'a WindowSpec<'a>, ParseError> {
+        let spec = self
+            .arena
+            .alloc(spec)
+            .map_err(|_| self.err_here("window spec too large for arena"))?;
         Ok(&*spec)
     }
 
@@ -216,22 +232,30 @@ impl<'a> Parser<'a> {
             };
             // PostgreSQL's frame-shape validation (42P20).
             if matches!(start, FrameBound::UnboundedFollowing) {
-                return Err(ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame start cannot be UNBOUNDED FOLLOWING") });
+                return Err(ParseError {
+                    sqlstate: sqlstate::WINDOWING_ERROR,
+                    ..self.err_here("frame start cannot be UNBOUNDED FOLLOWING")
+                });
             }
             if matches!(end, FrameBound::UnboundedPreceding) {
-                return Err(ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame end cannot be UNBOUNDED PRECEDING") });
+                return Err(ParseError {
+                    sqlstate: sqlstate::WINDOWING_ERROR,
+                    ..self.err_here("frame end cannot be UNBOUNDED PRECEDING")
+                });
             }
             if matches!(start, FrameBound::CurrentRow) && matches!(end, FrameBound::Preceding(_)) {
-                return Err(
-                    ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame starting from current row cannot have preceding rows") }
-                );
+                return Err(ParseError {
+                    sqlstate: sqlstate::WINDOWING_ERROR,
+                    ..self.err_here("frame starting from current row cannot have preceding rows")
+                });
             }
             if matches!(start, FrameBound::Following(_))
                 && matches!(end, FrameBound::Preceding(_) | FrameBound::CurrentRow)
             {
-                return Err(
-                    ParseError { sqlstate: sqlstate::WINDOWING_ERROR, ..self.err_here("frame starting from following row cannot have preceding rows") }
-                );
+                return Err(ParseError {
+                    sqlstate: sqlstate::WINDOWING_ERROR,
+                    ..self.err_here("frame starting from following row cannot have preceding rows")
+                });
             }
             let exclusion = if self.eat_ident("exclude")? {
                 if self.eat_ident("no")? {
@@ -252,40 +276,65 @@ impl<'a> Parser<'a> {
             } else {
                 FrameExclusion::NoOthers
             };
-            Some(WindowFrame { units, start, end, exclusion })
+            Some(WindowFrame {
+                units,
+                start,
+                end,
+                exclusion,
+            })
         } else {
             None
         };
         self.expect_op(")")?;
         let Some((name, base)) = copied else {
-            return Ok(WindowSpec { partition_by, order_by, frame });
+            return Ok(WindowSpec {
+                partition_by,
+                order_by,
+                frame,
+            });
         };
         // A copy inherits the partitioning, may add an ORDER BY only where the
         // copied window has none, and may not copy a window that has a frame.
         if !partition_by.is_empty() {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "cannot override PARTITION BY clause of window \"{}\"", name),
+                message: stack_format!(
+                    96,
+                    "cannot override PARTITION BY clause of window \"{}\"",
+                    name
+                ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "cannot override ORDER BY clause of window \"{}\"", name),
+                message: stack_format!(
+                    96,
+                    "cannot override ORDER BY clause of window \"{}\"",
+                    name
+                ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         if base.frame.is_some() {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "cannot copy window \"{}\" because it has a frame clause", name),
+                message: stack_format!(
+                    96,
+                    "cannot copy window \"{}\" because it has a frame clause",
+                    name
+                ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
             });
         }
         Ok(WindowSpec {
             partition_by: base.partition_by,
-            order_by: if order_by.is_empty() { base.order_by } else { order_by },
+            order_by: if order_by.is_empty() {
+                base.order_by
+            } else {
+                order_by
+            },
             frame,
         })
     }

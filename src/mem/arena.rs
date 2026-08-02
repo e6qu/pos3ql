@@ -133,7 +133,10 @@ impl Arena {
                 Ok(())
             }
         }
-        let mut writer = SliceWriter { buffer: bytes, at: 0 };
+        let mut writer = SliceWriter {
+            buffer: bytes,
+            at: 0,
+        };
         let _ = write!(writer, "{value}");
         Ok(unsafe { core::str::from_utf8_unchecked(writer.buffer) })
     }
@@ -180,8 +183,14 @@ impl Arena {
     /// per-row value before rewinding; long-lived AST/scope state is allocated
     /// below the mark.
     pub(crate) unsafe fn rewind_to(&self, mark: ArenaMark) {
-        assert!(core::ptr::eq(mark.arena, self), "arena mark belongs to another arena");
-        assert!(mark.offset <= self.offset.get(), "arena mark is ahead of the frontier");
+        assert!(
+            core::ptr::eq(mark.arena, self),
+            "arena mark belongs to another arena"
+        );
+        assert!(
+            mark.offset <= self.offset.get(),
+            "arena mark is ahead of the frontier"
+        );
         self.offset.set(mark.offset);
     }
 
@@ -207,7 +216,9 @@ impl Arena {
             ARENA_ALIGN
         );
         let start = self.offset.get().next_multiple_of(layout.align());
-        let end = start.checked_add(layout.size()).ok_or_else(|| self.full(layout.size()))?;
+        let end = start
+            .checked_add(layout.size())
+            .ok_or_else(|| self.full(layout.size()))?;
         if end > self.capacity {
             return Err(self.full(layout.size()));
         }
@@ -230,8 +241,8 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity, ARENA_ALIGN)
-            .expect("validated at construction");
+        let layout =
+            Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("validated at construction");
         unsafe { std::alloc::dealloc(self.base, layout) };
     }
 }
@@ -290,8 +301,9 @@ mod tests {
         let mut budget = crate::mem::budget::Budget::new(64 << 20);
         let mut arena = super::Arena::new(&mut budget, "sort", 16 << 20).unwrap();
         for n in [0usize, 1, 2, 7, 33, 1000, 30_000] {
-            let mut a: Vec<(u32, u32)> =
-                (0..n as u32).map(|i| (i.wrapping_mul(2_654_435_761) % 17, i)).collect();
+            let mut a: Vec<(u32, u32)> = (0..n as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) % 17, i))
+                .collect();
             let mut b = a.clone();
             a.sort_by_key(|x| x.0);
             super::stable_sort_via(&arena, &mut b, |x, y| x.0.cmp(&y.0)).unwrap();

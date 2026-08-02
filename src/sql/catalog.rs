@@ -1095,15 +1095,13 @@ fn acl<'a>(
             .take(slot)
             .any(|(earlier_slot, earlier)| {
                 earlier.object == object
-                    && storage.acl_identity(earlier_slot, txid)
-                        != (owner as u16, owner as u16)
+                    && storage.acl_identity(earlier_slot, txid) != (owner as u16, owner as u16)
                     && storage.acl_identity(earlier_slot, txid) == (grantee, grantor)
             })
         {
             continue;
         }
-        let (privileges, grant_options) =
-            storage.acl_from(object, grantee, grantor, txid);
+        let (privileges, grant_options) = storage.acl_from(object, grantee, grantor, txid);
         if privileges.0 == 0 {
             continue;
         }
@@ -1137,11 +1135,11 @@ fn pg_default_acl<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    use core::fmt::Write;
     use crate::storage::{
-        DefaultPrivilegeClass, PrivilegeSet, DEFAULT_ACL_ALL_SCHEMAS,
-        MAX_DEFAULT_ACL_ENTRIES, MAX_ROLES, PUBLIC_ROLE,
+        DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_DEFAULT_ACL_ENTRIES, MAX_ROLES,
+        PUBLIC_ROLE, PrivilegeSet,
     };
+    use core::fmt::Write;
 
     let def = def_of(
         "pg_default_acl",
@@ -1158,27 +1156,25 @@ fn pg_default_acl<'a>(
     let mut row_count = 0usize;
 
     for (entry_slot, entry) in storage.default_acl_entries() {
-        let (defined, _, _) = storage.default_acl_state(
-            entry.owner,
-            entry.schema,
-            entry.class,
-            entry.grantee,
-            txid,
-        );
+        let (defined, _, _) =
+            storage.default_acl_state(entry.owner, entry.schema, entry.class, entry.grantee, txid);
         if !defined
-            || storage.default_acl_entries().take(entry_slot).any(|(_, earlier)| {
-                let (earlier_defined, _, _) = storage.default_acl_state(
-                    earlier.owner,
-                    earlier.schema,
-                    earlier.class,
-                    earlier.grantee,
-                    txid,
-                );
-                earlier_defined
-                    && earlier.owner == entry.owner
-                    && earlier.schema == entry.schema
-                    && earlier.class == entry.class
-            })
+            || storage
+                .default_acl_entries()
+                .take(entry_slot)
+                .any(|(_, earlier)| {
+                    let (earlier_defined, _, _) = storage.default_acl_state(
+                        earlier.owner,
+                        earlier.schema,
+                        earlier.class,
+                        earlier.grantee,
+                        txid,
+                    );
+                    earlier_defined
+                        && earlier.owner == entry.owner
+                        && earlier.schema == entry.schema
+                        && earlier.class == entry.class
+                })
         {
             continue;
         }
@@ -1193,13 +1189,8 @@ fn pg_default_acl<'a>(
                 }
                 role_index as u16
             };
-            let (explicit, privileges, grant_options) = storage.default_acl_state(
-                entry.owner,
-                entry.schema,
-                entry.class,
-                grantee,
-                txid,
-            );
+            let (explicit, privileges, grant_options) =
+                storage.default_acl_state(entry.owner, entry.schema, entry.class, grantee, txid);
             let (privileges, grant_options) = if explicit {
                 (privileges, grant_options)
             } else if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
@@ -1210,16 +1201,15 @@ fn pg_default_acl<'a>(
             let include = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
                 grantee == entry.owner
                     || explicit
-                    || (grantee == PUBLIC_ROLE
-                        && entry.class.default_public_privileges().0 != 0)
+                    || (grantee == PUBLIC_ROLE && entry.class.default_public_privileges().0 != 0)
             } else {
                 explicit
             };
             if !include {
                 continue;
             }
-            let named_grantee = (grantee != PUBLIC_ROLE)
-                .then(|| storage.role_name(grantee as usize, txid));
+            let named_grantee =
+                (grantee != PUBLIC_ROLE).then(|| storage.role_name(grantee as usize, txid));
             let grantee_name = named_grantee.as_ref().map_or("", SqlName::as_str);
             let owner_name = storage.role_name(entry.owner as usize, txid);
             let mut rendered = StackStr::<256>::new();

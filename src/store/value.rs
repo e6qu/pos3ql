@@ -114,10 +114,7 @@ impl ValueIndexWriter {
     /// Publishes one immutable roster node pointing at the previously written
     /// node. Only one node's identities stay resident, so generation size is
     /// not bounded by a single roster block.
-    fn flush_roster(
-        &mut self,
-        store: &mut dyn BlockStore,
-    ) -> Result<(), ValueIndexError> {
+    fn flush_roster(&mut self, store: &mut dyn BlockStore) -> Result<(), ValueIndexError> {
         let count = u32::try_from(self.block_count).map_err(|_| ValueIndexError::Corrupt)?;
         self.pending[..4].copy_from_slice(&(count | ROSTER_CHAINED).to_le_bytes());
         self.pending[4..36].fill(0);
@@ -135,11 +132,8 @@ impl ValueIndexWriter {
         // break write-idempotency for an identical rebuilt index. The lsn is
         // vestigial in the block (never read back); `published_lsn` rides the
         // handle into the manifest instead.
-        self.roster_tail = Some(store.put(
-            &self.pending[..bytes],
-            BlockType::ValueIndexRoster,
-            0,
-        )?);
+        self.roster_tail =
+            Some(store.put(&self.pending[..bytes], BlockType::ValueIndexRoster, 0)?);
         self.block_count = 0;
         Ok(())
     }
@@ -342,9 +336,7 @@ mod tests {
         let mut chained = [0u8; ROSTER_HEADER];
         chained[..4].copy_from_slice(&ROSTER_CHAINED.to_le_bytes());
         chained[4..36].copy_from_slice(&base.roster.0);
-        let root = store
-            .put(&chained, BlockType::ValueIndexRoster, 3)
-            .unwrap();
+        let root = store.put(&chained, BlockType::ValueIndexRoster, 3).unwrap();
         let handle = ValueIndexHandle {
             roster: root,
             ..base

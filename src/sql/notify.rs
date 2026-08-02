@@ -23,7 +23,7 @@
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
-use crate::sql::eval::{sqlstate, SqlError};
+use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::util::StackStr;
 
@@ -88,9 +88,12 @@ impl Notification {
     pub fn from_bytes(pid: i32, channel: Channel, payload_bytes: &[u8]) -> Self {
         let mut payload = Payload::new();
         // The bytes came from a validated payload, so they fit.
-        let _ = core::str::from_utf8(payload_bytes)
-            .map(|text| payload.write_str(text));
-        Self { pid, channel, payload }
+        let _ = core::str::from_utf8(payload_bytes).map(|text| payload.write_str(text));
+        Self {
+            pid,
+            channel,
+            payload,
+        }
     }
 }
 
@@ -236,17 +239,45 @@ mod tests {
     #[test]
     fn registry_listen_unlisten_and_drop() {
         let mut s = state();
-        assert!(s.apply(ListenOp::Listen { conn_id: 7, channel: channel("a") }).is_ok());
-        assert!(s.apply(ListenOp::Listen { conn_id: 7, channel: channel("b") }).is_ok());
-        assert!(s.apply(ListenOp::Listen { conn_id: 9, channel: channel("a") }).is_ok());
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 7,
+                channel: channel("a")
+            })
+            .is_ok()
+        );
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 7,
+                channel: channel("b")
+            })
+            .is_ok()
+        );
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 9,
+                channel: channel("a")
+            })
+            .is_ok()
+        );
         // A duplicate LISTEN is a no-op, not a second entry.
-        assert!(s.apply(ListenOp::Listen { conn_id: 7, channel: channel("a") }).is_ok());
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 7,
+                channel: channel("a")
+            })
+            .is_ok()
+        );
         assert!(s.is_listening(7, "a"));
         assert!(s.is_listening(9, "a"));
         assert!(!s.is_listening(9, "b"));
 
         // UNLISTEN drops only the named channel for that connection.
-        s.apply(ListenOp::Unlisten { conn_id: 7, channel: channel("a") }).unwrap();
+        s.apply(ListenOp::Unlisten {
+            conn_id: 7,
+            channel: channel("a"),
+        })
+        .unwrap();
         assert!(!s.is_listening(7, "a"));
         assert!(s.is_listening(7, "b"));
         assert!(s.is_listening(9, "a")); // a different connection is untouched
@@ -265,8 +296,12 @@ mod tests {
     fn outbox_enqueue_and_clear() {
         let mut s = state();
         assert!(!s.has_pending());
-        s.enqueue(Notification { pid: 3, channel: channel("a"), payload: payload("hi").unwrap() })
-            .unwrap();
+        s.enqueue(Notification {
+            pid: 3,
+            channel: channel("a"),
+            payload: payload("hi").unwrap(),
+        })
+        .unwrap();
         assert!(s.has_pending());
         assert_eq!(s.outbox().len(), 1);
         assert_eq!(s.outbox()[0].pid, 3);
@@ -286,9 +321,27 @@ mod tests {
     fn listener_pool_is_bounded() {
         let mut budget = Budget::new(1 << 20);
         let mut s = NotifyState::new(&mut budget, 2, 2).unwrap();
-        assert!(s.apply(ListenOp::Listen { conn_id: 1, channel: channel("a") }).is_ok());
-        assert!(s.apply(ListenOp::Listen { conn_id: 1, channel: channel("b") }).is_ok());
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 1,
+                channel: channel("a")
+            })
+            .is_ok()
+        );
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 1,
+                channel: channel("b")
+            })
+            .is_ok()
+        );
         // The third distinct registration exhausts the pool: a loud error.
-        assert!(s.apply(ListenOp::Listen { conn_id: 1, channel: channel("c") }).is_err());
+        assert!(
+            s.apply(ListenOp::Listen {
+                conn_id: 1,
+                channel: channel("c")
+            })
+            .is_err()
+        );
     }
 }

@@ -496,12 +496,11 @@ impl Engine {
             .map_err(EngineSetupError::Checkpoint)?;
         }
         for (lsn, record) in &recovered {
-            let operator = crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(
-                SqlError {
+            let operator =
+                crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(SqlError {
                     sqlstate: sqlstate::INTERNAL_ERROR,
                     message: stack_format!(192, "corrupt uploaded WAL record"),
-                },
-            ))?;
+                }))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
         }
         // Startup reconciliation: the newest committed records are
@@ -856,8 +855,7 @@ impl Engine {
             let (grantee, grantor) = self.storage.acl_identity(slot as usize, txn.txid);
             if txn.ddl()[..position].iter().any(|earlier| {
                 let DdlUndo::ObjectAclChanged {
-                    slot: earlier_slot,
-                    ..
+                    slot: earlier_slot, ..
                 } = *earlier
                 else {
                     return false;
@@ -867,16 +865,13 @@ impl Engine {
                 }
                 let earlier_entry = self.storage.acl_entry(earlier_slot as usize);
                 earlier_entry.object == object
-                    && self
-                        .storage
-                        .acl_identity(earlier_slot as usize, txn.txid)
+                    && self.storage.acl_identity(earlier_slot as usize, txn.txid)
                         == (grantee, grantor)
             }) {
                 continue;
             }
             let (privileges, grant_options) =
-                self.storage
-                    .acl_from(object, grantee, grantor, txn.txid);
+                self.storage.acl_from(object, grantee, grantor, txn.txid);
             let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
             let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(grantee as usize, txn.txid));
@@ -1559,7 +1554,8 @@ impl Engine {
     /// both wake parked statements; the retry then consumes the cached block
     /// or returns the real storage error.
     pub(crate) fn advance_pending_block_read(
-        &mut self, slot: usize,
+        &mut self,
+        slot: usize,
     ) -> Result<bool, crate::store::StoreError> {
         let Some(checkpointer) = self.ckpt.as_mut() else {
             return Ok(false);
@@ -3706,19 +3702,17 @@ impl Engine {
             Stmt::SetRole { role, local, reset } => {
                 exec::set_role(&self.storage, txn, guc, *role, *local, *reset, responder)
             }
-            Stmt::SetSessionAuthorization {
-                role,
-                local,
-                reset,
-            } => exec::set_session_authorization(
-                &self.storage,
-                txn,
-                guc,
-                *role,
-                *local,
-                *reset,
-                responder,
-            ),
+            Stmt::SetSessionAuthorization { role, local, reset } => {
+                exec::set_session_authorization(
+                    &self.storage,
+                    txn,
+                    guc,
+                    *role,
+                    *local,
+                    *reset,
+                    responder,
+                )
+            }
             Stmt::GrantRole {
                 roles,
                 members,
@@ -5175,14 +5169,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             privileges,
             grant_options,
         } => {
-            let class =
-                crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "corrupt WAL default privilege class {}",
-                        class
-                    )
-                })?;
+            let class = crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL default privilege class {}",
+                    class
+                )
+            })?;
             let Some(owner_slot) = storage.find_role(owner) else {
                 if !defined {
                     storage.set_lsn(lsn);

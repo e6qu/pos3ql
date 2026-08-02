@@ -9,10 +9,10 @@
 //! `src/backend/utils/adt/formatting.c`), and every rendering rule here was
 //! pinned empirically against PostgreSQL 18.4.
 
-use crate::sql::eval::sqlstate;
 use super::eval::SqlError;
 use super::numeric::{Numeric, RoundMode};
 use crate::mem::arena::Arena;
+use crate::sql::eval::sqlstate;
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 use core::fmt::Write as _;
@@ -101,7 +101,10 @@ pub fn number<'a>(
     let mut i = 0usize;
     let push = |toks: &mut [Tok; MAX_TOKS], ntok: &mut usize, t: Tok| -> Result<(), SqlError> {
         if *ntok >= MAX_TOKS {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char format too long"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "to_char format too long"
+            ));
         }
         toks[*ntok] = t;
         *ntok += 1;
@@ -118,10 +121,18 @@ pub fn number<'a>(
         };
         // Anything but a plain literal after EEEE is an error, as in
         // PostgreSQL (literal characters may still follow).
-        let is_action = matches!(up, b'9' | b'0' | b'.' | b'D' | b',' | b'G' | b'L' | b'$' | b'S' | b'V')
-            || matches!(&two, b"MI" | b"PL" | b"SG" | b"PR" | b"TH" | b"RN" | b"FM" | b"EE");
+        let is_action = matches!(
+            up,
+            b'9' | b'0' | b'.' | b'D' | b',' | b'G' | b'L' | b'$' | b'S' | b'V'
+        ) || matches!(
+            &two,
+            b"MI" | b"PL" | b"SG" | b"PR" | b"TH" | b"RN" | b"FM" | b"EE"
+        );
         if eeee && is_action {
-            return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"EEEE\" must be the last pattern used"));
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"EEEE\" must be the last pattern used"
+            ));
         }
         match &two {
             b"FM" => {
@@ -131,7 +142,10 @@ pub fn number<'a>(
             }
             b"MI" => {
                 if sign_seen {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"MI\" together"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "cannot use \"S\" and \"MI\" together"
+                    ));
                 }
                 minus = true;
                 push(&mut toks, &mut ntok, Tok::SignMinus)?;
@@ -140,7 +154,10 @@ pub fn number<'a>(
             }
             b"PL" => {
                 if sign_seen {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"PL\" together"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "cannot use \"S\" and \"PL\" together"
+                    ));
                 }
                 plus = true;
                 push(&mut toks, &mut ntok, Tok::SignPlus)?;
@@ -149,7 +166,10 @@ pub fn number<'a>(
             }
             b"SG" => {
                 if sign_seen {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" and \"SG\" together"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "cannot use \"S\" and \"SG\" together"
+                    ));
                 }
                 minus = true;
                 plus = true;
@@ -170,7 +190,13 @@ pub fn number<'a>(
                 continue;
             }
             b"TH" => {
-                push(&mut toks, &mut ntok, Tok::Ordinal { upper: bytes[i] == b'T' })?;
+                push(
+                    &mut toks,
+                    &mut ntok,
+                    Tok::Ordinal {
+                        upper: bytes[i] == b'T',
+                    },
+                )?;
                 i += 2;
                 continue;
             }
@@ -194,10 +220,16 @@ pub fn number<'a>(
                     ));
                 }
                 if eeee {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"EEEE\" twice"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "cannot use \"EEEE\" twice"
+                    ));
                 }
                 if fm || sign_seen || bracket || minus || plus || roman || multi > 0 || in_multi {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"EEEE\" is incompatible with other formats"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "\"EEEE\" is incompatible with other formats"
+                    ));
                 }
                 eeee = true;
                 i += 4;
@@ -208,7 +240,10 @@ pub fn number<'a>(
         match up {
             b'9' => {
                 if bracket {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"9\" must be ahead of \"PR\""));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "\"9\" must be ahead of \"PR\""
+                    ));
                 }
                 push(&mut toks, &mut ntok, Tok::Nine)?;
                 if in_multi {
@@ -223,7 +258,10 @@ pub fn number<'a>(
             }
             b'0' => {
                 if bracket {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"0\" must be ahead of \"PR\""));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "\"0\" must be ahead of \"PR\""
+                    ));
                 }
                 push(&mut toks, &mut ntok, Tok::Zero)?;
                 if has_point && !in_multi {
@@ -293,7 +331,10 @@ pub fn number<'a>(
     // RN combines only with FM (plain digit positions carry no flag and are
     // ignored); anything else is an error, as in PostgreSQL.
     if roman && (sign_seen || plus || minus || bracket || multi > 0 || in_multi || eeee) {
-        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "\"RN\" is incompatible with other formats"));
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "\"RN\" is incompatible with other formats"
+        ));
     }
     if roman {
         return render_roman(value, float_source, roman_upper, fm, arena);
@@ -375,7 +416,9 @@ fn render_roman<'a>(
     let mut olen = 0usize;
     if !(1..=3999).contains(&n) {
         let filled = "###############";
-        return arena.alloc_str(filled).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
+        return arena
+            .alloc_str(filled)
+            .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     const ONES: [&str; 10] = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"];
     const TENS: [&str; 10] = ["", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"];
@@ -394,14 +437,22 @@ fn render_roman<'a>(
     emit(ONES[(n % 10) as usize], &mut out, &mut olen);
     let mut body = [0u8; 16];
     for k in 0..olen {
-        body[k] = if upper { out[k] } else { out[k].to_ascii_lowercase() };
+        body[k] = if upper {
+            out[k]
+        } else {
+            out[k].to_ascii_lowercase()
+        };
     }
     let roman = core::str::from_utf8(&body[..olen]).expect("ascii");
     if fm {
-        return arena.alloc_str(roman).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
+        return arena
+            .alloc_str(roman)
+            .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     let padded = stack_format!(24, "{:>15}", roman);
-    arena.alloc_str(padded.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(padded.as_str())
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// `EEEE`: scientific notation `[sign]d.<frac>e±XX`. A float8 source rounds
@@ -429,7 +480,9 @@ fn render_eeee<'a>(
             out[dot] = b'.';
         }
         let text = core::str::from_utf8(&out[..n]).expect("ascii");
-        return arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
+        return arena
+            .alloc_str(text)
+            .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"));
     }
     // Mantissa digits (1 + frac) and a base-10 exponent.
     let (neg, mantissa, exponent) = match float_source {
@@ -446,7 +499,11 @@ fn render_eeee<'a>(
                 }
             }
             let exponent: i32 = e.parse().expect("float exponent");
-            ((x < 0.0 && x != 0.0) || negative_sign_override, (digits, nd), exponent)
+            (
+                (x < 0.0 && x != 0.0) || negative_sign_override,
+                (digits, nd),
+                exponent,
+            )
         }
         _ => {
             let t = stack_format!(512, "{}", value);
@@ -533,7 +590,9 @@ fn render_eeee<'a>(
         let _ = write!(out, "0");
     }
     let _ = write!(out, "{}", e);
-    arena.alloc_str(out.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(out.as_str())
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -560,8 +619,8 @@ fn render<'a>(
     // Non-finite values (pinned against PostgreSQL 18.4): NaN lays the text
     // "NaN" into the digit positions with no fractional part; Infinity
     // overflows every position (keeping its sign).
-    let nan = matches!(float_source, Some(x) if x.is_nan())
-        || (float_source.is_none() && value.is_nan());
+    let nan =
+        matches!(float_source, Some(x) if x.is_nan()) || (float_source.is_none() && value.is_nan());
     let infinite = matches!(float_source, Some(x) if x.is_infinite());
     if nan || infinite {
         return render_nonfinite(
@@ -727,29 +786,38 @@ fn render<'a>(
     let fill_start = int_digits.saturating_sub(intstr.len());
     // On overflow every integer position is `#` (non-blank), so the sign sits
     // at the very front.
-    let sig_start = if overflow { 0 } else { fill_start.min(zero_start) };
+    let sig_start = if overflow {
+        0
+    } else {
+        fill_start.min(zero_start)
+    };
 
     let mut out = [0u8; MAX_OUT];
     let mut olen = 0usize;
     let emit = |out: &mut [u8; MAX_OUT], olen: &mut usize, ch: u8| -> Result<(), SqlError> {
         if *olen >= MAX_OUT {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "to_char output too long"
+            ));
         }
         out[*olen] = ch;
         *olen += 1;
         Ok(())
     };
-    let emit_str =
-        |out: &mut [u8; MAX_OUT], olen: &mut usize, s: &str| -> Result<(), SqlError> {
-            for &b in s.as_bytes() {
-                if *olen >= MAX_OUT {
-                    return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
-                }
-                out[*olen] = b;
-                *olen += 1;
+    let emit_str = |out: &mut [u8; MAX_OUT], olen: &mut usize, s: &str| -> Result<(), SqlError> {
+        for &b in s.as_bytes() {
+            if *olen >= MAX_OUT {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "to_char output too long"
+                ));
             }
-            Ok(())
-        };
+            out[*olen] = b;
+            *olen += 1;
+        }
+        Ok(())
+    };
 
     let mut int_idx = 0usize; // integer digit tokens seen
     let mut frac_idx = 0usize; // fractional digit tokens seen
@@ -769,7 +837,10 @@ fn render<'a>(
                 } else {
                     // Integer digit position. The floating sign lands just
                     // before the first non-blank position.
-                    if sign_leading && !sign_emitted && int_idx == sig_start && sig_start < int_digits
+                    if sign_leading
+                        && !sign_emitted
+                        && int_idx == sig_start
+                        && sig_start < int_digits
                     {
                         if let Some(sc) = sign_char {
                             emit(&mut out, &mut olen, sc)?;
@@ -875,12 +946,16 @@ fn render<'a>(
     }
 
     let text = core::str::from_utf8(&out[..olen]).expect("ascii output");
-    arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(text)
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// Position (token index) of the decimal point, or `usize::MAX` if none.
 fn point_index(toks: &[Tok]) -> usize {
-    toks.iter().position(|t| *t == Tok::Point).unwrap_or(usize::MAX)
+    toks.iter()
+        .position(|t| *t == Tok::Point)
+        .unwrap_or(usize::MAX)
 }
 
 /// NaN / Infinity through a plain digit format: NaN lays "NaN" into the
@@ -928,7 +1003,10 @@ fn render_nonfinite<'a>(
     let mut olen = 0usize;
     let emit = |out: &mut [u8; MAX_OUT], olen: &mut usize, ch: u8| -> Result<(), SqlError> {
         if *olen >= MAX_OUT {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "to_char output too long"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "to_char output too long"
+            ));
         }
         out[*olen] = ch;
         *olen += 1;
@@ -999,7 +1077,9 @@ fn render_nonfinite<'a>(
         emit(&mut out, &mut olen, sc)?;
     }
     let text = core::str::from_utf8(&out[..olen]).expect("ascii output");
-    arena.alloc_str(text).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(text)
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 /// `to_number(text, fmt)`: parse a formatted number. The format determines the
@@ -1018,7 +1098,10 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         if i + 1 < fb.len() {
             let two = [up, fb[i + 1].to_ascii_uppercase()];
             if &two == b"EE" {
-                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"EEEE\" not supported for input"));
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "\"EEEE\" not supported for input"
+                ));
             }
             if matches!(&two, b"FM" | b"MI" | b"PL" | b"SG" | b"PR" | b"TH") {
                 i += 2;
@@ -1032,8 +1115,18 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
                 }
             }
             b'.' | b'D' => seen_point = true,
-            b'V' => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"V\" not supported for input")),
-            b'R' => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "\"RN\" not supported for input")),
+            b'V' => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "\"V\" not supported for input"
+                ));
+            }
+            b'R' => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "\"RN\" not supported for input"
+                ));
+            }
             _ => {}
         }
         i += 1;
@@ -1051,7 +1144,10 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         match c {
             b'0'..=b'9' => {
                 if k >= buffer.len() {
-                    return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "value too long for to_number"));
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TEXT_REPRESENTATION,
+                        "value too long for to_number"
+                    ));
                 }
                 buffer[k] = c;
                 k += 1;
@@ -1067,7 +1163,11 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
         }
     }
     if !digits {
-        return Err(sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "invalid input syntax for type numeric: \"{}\"", input));
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type numeric: \"{}\"",
+            input
+        ));
     }
     if neg {
         buffer[0] = b'-';
@@ -1078,14 +1178,30 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
 }
 
 const MONTH_FULL: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 const MONTH_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 const DAY_FULL: [&str; 7] = [
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
 ];
 const DAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -1119,7 +1235,7 @@ fn name_case(code: &[u8]) -> Case {
 /// (microseconds since 2000-01-01) per the format string. Supports the common
 /// field codes; unrecognized letter codes are rejected loudly.
 pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    use crate::sql::datetime::{civil_from_days, day_of_week, days_from_civil, PG_EPOCH_DAYS};
+    use crate::sql::datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
     let days = micros.div_euclid(86_400_000_000);
     let time_of_day = micros.rem_euclid(86_400_000_000);
     let adays = days + PG_EPOCH_DAYS;
@@ -1130,7 +1246,11 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
     let us = (time_of_day % 1_000_000) as u32;
     let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
     let doy = (adays - days_from_civil(y, 1, 1) + 1) as u32;
-    let hh12 = if hh24.is_multiple_of(12) { 12 } else { hh24 % 12 };
+    let hh12 = if hh24.is_multiple_of(12) {
+        12
+    } else {
+        hh24 % 12
+    };
 
     let mut out = StackStr::<512>::new();
     let name = |out: &mut StackStr<512>, s: &str, case: Case, pad: usize, fm: bool| {
@@ -1164,7 +1284,10 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
     let mut i = 0usize;
     while i < fb.len() {
         let mut fm = false;
-        if i + 1 < fb.len() && fb[i].eq_ignore_ascii_case(&b'F') && fb[i + 1].eq_ignore_ascii_case(&b'M') {
+        if i + 1 < fb.len()
+            && fb[i].eq_ignore_ascii_case(&b'F')
+            && fb[i + 1].eq_ignore_ascii_case(&b'M')
+        {
             fm = true;
             i += 2;
         }
@@ -1180,10 +1303,22 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y, 4, fm);
             i += 4;
         } else if m(b"MONTH") {
-            name(&mut out, MONTH_FULL[(month - 1) as usize], name_case(&rest[..5]), 9, fm);
+            name(
+                &mut out,
+                MONTH_FULL[(month - 1) as usize],
+                name_case(&rest[..5]),
+                9,
+                fm,
+            );
             i += 5;
         } else if m(b"MON") {
-            name(&mut out, MONTH_ABBR[(month - 1) as usize], name_case(&rest[..3]), 3, fm);
+            name(
+                &mut out,
+                MONTH_ABBR[(month - 1) as usize],
+                name_case(&rest[..3]),
+                3,
+                fm,
+            );
             i += 3;
         } else if m(b"DAY") {
             name(&mut out, DAY_FULL[dow], name_case(&rest[..3]), 9, fm);
@@ -1238,13 +1373,19 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
             num(&mut out, y % 10, 1, fm);
             i += 1;
         } else if rest[0].is_ascii_alphabetic() {
-            return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "to_char timestamp code not supported: \"{}\"", rest[0] as char));
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "to_char timestamp code not supported: \"{}\"",
+                rest[0] as char
+            ));
         } else {
             let _ = out.write_char(rest[0] as char);
             i += 1;
         }
     }
-    arena.alloc_str(out.as_str()).map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
+    arena
+        .alloc_str(out.as_str())
+        .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
 #[cfg(test)]
@@ -1258,7 +1399,9 @@ mod tests {
     }
 
     fn tc(v: &str, f: &str, a: &Arena) -> String {
-        number(&Numeric::parse(v, a).unwrap(), f, false, None, a).unwrap().to_string()
+        number(&Numeric::parse(v, a).unwrap(), f, false, None, a)
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -1302,8 +1445,8 @@ mod tests {
     fn timestamp_formats_match_postgres() {
         let a = arena();
         // 2024-06-15 14:07:09.123456 (a Saturday) in micros since 2000-01-01.
-        let micros = crate::sql::datetime::parse_timestamp("2024-06-15 14:07:09.123456", false)
-            .unwrap();
+        let micros =
+            crate::sql::datetime::parse_timestamp("2024-06-15 14:07:09.123456", false).unwrap();
         let tc = |f: &str| timestamp(micros, f, &a).unwrap().to_string();
         assert_eq!(tc("YYYY-MM-DD HH24:MI:SS"), "2024-06-15 14:07:09");
         assert_eq!(tc("HH12:MI:SS AM"), "02:07:09 PM");
@@ -1321,9 +1464,18 @@ mod tests {
         // Formerly-rejected codes now format (verified against PostgreSQL
         // 18.4); invalid combinations still error loudly.
         let a = arena();
-        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "999MI", false, None, &a).unwrap(), "  5 ");
-        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "RN", false, None, &a).unwrap(), "              V");
-        assert_eq!(number(&Numeric::parse("5", &a).unwrap(), "9EEEE", false, None, &a).unwrap(), " 5e+00");
+        assert_eq!(
+            number(&Numeric::parse("5", &a).unwrap(), "999MI", false, None, &a).unwrap(),
+            "  5 "
+        );
+        assert_eq!(
+            number(&Numeric::parse("5", &a).unwrap(), "RN", false, None, &a).unwrap(),
+            "              V"
+        );
+        assert_eq!(
+            number(&Numeric::parse("5", &a).unwrap(), "9EEEE", false, None, &a).unwrap(),
+            " 5e+00"
+        );
         assert!(number(&Numeric::parse("5", &a).unwrap(), "S999MI", false, None, &a).is_err());
         assert!(number(&Numeric::parse("5", &a).unwrap(), "9.9V9", false, None, &a).is_err());
         assert!(number(&Numeric::parse("5", &a).unwrap(), "EEEE9", false, None, &a).is_err());

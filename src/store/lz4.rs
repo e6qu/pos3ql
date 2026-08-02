@@ -112,13 +112,7 @@ pub(crate) fn compress(input: &[u8], output: &mut [u8]) -> Option<usize> {
                 while at + len < end && input[candidate + len] == input[at + len] {
                     len += 1;
                 }
-                emit(
-                    output,
-                    &mut out,
-                    &input[anchor..at],
-                    len,
-                    at - candidate,
-                )?;
+                emit(output, &mut out, &input[anchor..at], len, at - candidate)?;
                 at += len;
                 anchor = at;
             } else {
@@ -257,7 +251,10 @@ mod tests {
         let data = vec![b'x'; 64 * 1024];
         let mut out = vec![0u8; data.len()];
         let n = compress(&data, &mut out).expect("fits");
-        assert!(n < data.len() / 100, "64K of one byte compresses hard, got {n}");
+        assert!(
+            n < data.len() / 100,
+            "64K of one byte compresses hard, got {n}"
+        );
     }
 
     #[test]
@@ -290,7 +287,10 @@ mod tests {
         // Output too small for the declared match.
         let mut tiny = [0u8; 4];
         assert_eq!(
-            decompress(&[0x4F, b'a', b'b', b'c', b'd', 4, 0, 200, 0x10, b'e'], &mut tiny),
+            decompress(
+                &[0x4F, b'a', b'b', b'c', b'd', 4, 0, 200, 0x10, b'e'],
+                &mut tiny
+            ),
             None
         );
     }

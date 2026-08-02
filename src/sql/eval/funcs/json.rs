@@ -15,9 +15,8 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 
 use super::super::{
-    text_view,
-    arena_full, arity_err, eval_full, json_path_parts, json_to_text, json_tree_arg, sqlstate,
-    type_mismatch, ColumnLookup, EvalHooks, SqlError,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, json_path_parts,
+    json_to_text, json_tree_arg, sqlstate, text_view, type_mismatch,
 };
 
 /// Handles the JSON/JSONB scalar family. Returns `None` if `name` is not one of
@@ -87,9 +86,15 @@ pub(crate) fn dispatch<'a>(
                 let mut buffer = crate::util::StackStr::<16384>::new();
                 let _ = json::write_datum_json(&array, false, &mut buffer);
                 if buffer.is_truncated() {
-                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array_to_json value exceeds the supported size"));
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "array_to_json value exceeds the supported size"
+                    ));
                 }
-                Ok(Datum::Json { text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?, jsonb: false })
+                Ok(Datum::Json {
+                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    jsonb: false,
+                })
             }
             "jsonb_array_length" | "json_array_length" => {
                 arity(1)?;
@@ -101,7 +106,10 @@ pub(crate) fn dispatch<'a>(
                 };
                 match json::parse(s, arena)? {
                     json::Json::Array(items) => Ok(Datum::Int4(items.len() as i32)),
-                    _ => Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "cannot get array length of a scalar")),
+                    _ => Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "cannot get array length of a scalar"
+                    )),
                 }
             }
             // The JSON type name of the value, as PostgreSQL's json_typeof.
@@ -123,12 +131,19 @@ pub(crate) fn dispatch<'a>(
                 }))
             }
             // `json_extract_path(json, VARIADIC keys)` / `_text`: navigate by keys.
-            "json_extract_path" | "jsonb_extract_path" | "json_extract_path_text"
+            "json_extract_path"
+            | "jsonb_extract_path"
+            | "json_extract_path_text"
             | "jsonb_extract_path_text" => {
                 if star || args.is_empty() {
-                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}(...) does not exist", name));
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) does not exist",
+                        name
+                    ));
                 }
-                let (text, jsonb) = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
+                let (text, jsonb) = match text_view(eval_full(args[0], arena, params, row, hooks)?)
+                {
                     Datum::Json { text, jsonb } => (text, jsonb),
                     Datum::Text(s) => (s, name.starts_with("jsonb")),
                     Datum::Null => return Ok(Datum::Null),
@@ -162,7 +177,10 @@ pub(crate) fn dispatch<'a>(
                     }
                     return Ok(Datum::Text(json_to_text(&node, arena)?));
                 }
-                Ok(Datum::Json { text: json_to_text(&node, arena)?, jsonb })
+                Ok(Datum::Json {
+                    text: json_to_text(&node, arena)?,
+                    jsonb,
+                })
             }
             "row_to_json" | "to_json" | "to_jsonb" => {
                 if star || args.is_empty() || args.len() > 2 {
@@ -198,7 +216,9 @@ pub(crate) fn dispatch<'a>(
                     match eval_full(args[3], arena, params, row, hooks)? {
                         Datum::Bool(b) => b,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch("create_if_missing must be boolean", &other)),
+                        other => {
+                            return Err(type_mismatch("create_if_missing must be boolean", &other));
+                        }
                     }
                 } else {
                     true
@@ -211,7 +231,10 @@ pub(crate) fn dispatch<'a>(
                             Datum::Text(t) => t,
                             Datum::Null => return Ok(Datum::Null),
                             other => {
-                                return Err(type_mismatch("null_value_treatment must be text", &other))
+                                return Err(type_mismatch(
+                                    "null_value_treatment must be text",
+                                    &other,
+                                ));
                             }
                         }
                     } else {
@@ -225,20 +248,26 @@ pub(crate) fn dispatch<'a>(
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                                 "JSON value must not be null"
-                            ))
+                            ));
                         }
                         _ => {
                             return Err(sql_err!(
                                 sqlstate::INVALID_PARAMETER_VALUE,
                                 "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\""
-                            ))
+                            ));
                         }
                     };
-                    return Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true });
+                    return Ok(Datum::Json {
+                        text: json_to_text(&result, arena)?,
+                        jsonb: true,
+                    });
                 }
                 let value = json_tree_arg(raw_value, arena)?;
                 let result = json::set(root, path, value, create, arena)?;
-                Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+                Ok(Datum::Json {
+                    text: json_to_text(&result, arena)?,
+                    jsonb: true,
+                })
             }
             // `jsonb_insert(target, path, new_value [, insert_after])`.
             "jsonb_insert" => {
@@ -262,7 +291,10 @@ pub(crate) fn dispatch<'a>(
                     false
                 };
                 let result = json::insert(root, path, value, after, arena)?;
-                Ok(Datum::Json { text: json_to_text(&result, arena)?, jsonb: true })
+                Ok(Datum::Json {
+                    text: json_to_text(&result, arena)?,
+                    jsonb: true,
+                })
             }
             // `jsonb_strip_nulls` / `json_strip_nulls`: drop null-valued members.
             "jsonb_strip_nulls" | "json_strip_nulls" => {
@@ -271,7 +303,8 @@ pub(crate) fn dispatch<'a>(
                 if d.is_null() {
                     return Ok(Datum::Null);
                 }
-                let jsonb = matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
+                let jsonb =
+                    matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
                 let result = json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
                 // A json result re-serializes compactly, a jsonb one in the
                 // canonical spaced form — PostgreSQL's split exactly.
@@ -297,7 +330,11 @@ pub(crate) fn dispatch<'a>(
             // spacing, jsonb the canonical `": "`; both separate with `, `.
             "json_build_object" | "jsonb_build_object" => {
                 if star {
-                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}() does not exist", name));
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}() does not exist",
+                        name
+                    ));
                 }
                 if !args.len().is_multiple_of(2) {
                     return Err(sql_err!(
@@ -312,7 +349,11 @@ pub(crate) fn dispatch<'a>(
                 for pair in args.chunks(2) {
                     let key = eval_full(pair[0], arena, params, row, hooks)?;
                     if key.is_null() {
-                        return Err(sql_err!(sqlstate::NULL_VALUE_NOT_ALLOWED, "argument {}: key must not be null", 1));
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "argument {}: key must not be null",
+                            1
+                        ));
                     }
                     let value = eval_full(pair[1], arena, params, row, hooks)?;
                     if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {
@@ -332,7 +373,11 @@ pub(crate) fn dispatch<'a>(
             // `json_build_array(v1, v2, ...)` / `jsonb_build_array(...)`.
             "json_build_array" | "jsonb_build_array" => {
                 if star {
-                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function {}() does not exist", name));
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}() does not exist",
+                        name
+                    ));
                 }
                 let jsonb = name == "jsonb_build_array";
                 let colon = if jsonb { ": " } else { " : " };

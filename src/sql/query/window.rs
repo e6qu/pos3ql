@@ -1338,7 +1338,12 @@ pub(crate) fn project_window_rows<'a>(
 
 /// Compares two encoded rows' first `n` columns under SQL equality and order,
 /// NULLs first — the same semantics `keys_equal` uses to partition rows.
-fn compare_encoded_keys(a: &[u8], b: &[u8], at: usize, n: usize) -> Result<core::cmp::Ordering, SqlError> {
+fn compare_encoded_keys(
+    a: &[u8],
+    b: &[u8],
+    at: usize,
+    n: usize,
+) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for k in 0..n {
         let va = crate::sql::exec::decode_projected_pub(a, at + k);
@@ -1402,7 +1407,9 @@ fn grow_slots<'a, T: Copy>(
     fill: T,
 ) -> Result<&'a mut [T], SqlError> {
     let new_len = slots.len().saturating_mul(2).max(2);
-    let bigger = arena.alloc_slice_with(new_len, |_| fill).map_err(|_| arena_full())?;
+    let bigger = arena
+        .alloc_slice_with(new_len, |_| fill)
+        .map_err(|_| arena_full())?;
     bigger[..slots.len()].copy_from_slice(slots);
     Ok(bigger)
 }
@@ -1491,13 +1498,14 @@ pub(crate) fn external_window_into<'a>(
         // partition streams back as one contiguous run segment.
         let mut spec_sorter = storage.external_sorter()?;
         spec_sorter.reset();
-        let mut spec_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
-            let by_partition = compare_encoded_keys(left, right, 0, n_partition)?;
-            if !by_partition.is_eq() {
-                return Ok(by_partition);
-            }
-            compare_encoded_order(left, right, n_partition, spec.order_by)
-        };
+        let mut spec_compare =
+            |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
+                let by_partition = compare_encoded_keys(left, right, 0, n_partition)?;
+                if !by_partition.is_eq() {
+                    return Ok(by_partition);
+                }
+                compare_encoded_order(left, right, n_partition, spec.order_by)
+            };
         let mut position = 0i64;
         scan_source_recycling(
             storage,
@@ -1658,18 +1666,16 @@ pub(crate) fn external_window_into<'a>(
                         )?;
                     }
                     rows[count] = &flat[..total];
-                    pos_of[count] = match crate::sql::exec::decode_projected_pub(
-                        copied,
-                        n_keys + total,
-                    ) {
-                        Datum::Int8(v) => v,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "window partition position is corrupt"
-                            ));
-                        }
-                    };
+                    pos_of[count] =
+                        match crate::sql::exec::decode_projected_pub(copied, n_keys + total) {
+                            Datum::Int8(v) => v,
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "window partition position is corrupt"
+                                ));
+                            }
+                        };
                     count += 1;
                     true
                 };
@@ -1701,7 +1707,9 @@ pub(crate) fn external_window_into<'a>(
     let mut out_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
         let by_order = compare_encoded_order(left, right, width, statement.order_by)?;
         if statement.distinct && by_order.is_eq() {
-            Ok(crate::sql::exec::compare_projected_prefix(left, right, width))
+            Ok(crate::sql::exec::compare_projected_prefix(
+                left, right, width,
+            ))
         } else {
             Ok(by_order)
         }
@@ -1748,9 +1756,9 @@ pub(crate) fn external_window_into<'a>(
                 let reader = win_reader.as_mut().ok_or_else(|| {
                     sql_err!(sqlstate::INTERNAL_ERROR, "window run is missing rows")
                 })?;
-                let entry = reader.row().ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "window run ended early")
-                })?;
+                let entry = reader
+                    .row()
+                    .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "window run ended early"))?;
                 debug_assert_eq!(
                     crate::sql::exec::decode_projected_pub(entry, 0),
                     Datum::Int8(position)
@@ -1780,15 +1788,7 @@ pub(crate) fn external_window_into<'a>(
                 hooks.subs
             } else {
                 row_subs = merge_correlated(
-                    correlated,
-                    base,
-                    row,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut sc,
-                    &mut ls,
+                    correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
                 )?;
                 Some(&row_subs)
             };

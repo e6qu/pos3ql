@@ -243,10 +243,16 @@ mod tests {
     #[test]
     fn timestamp_formatting() {
         // 2015-08-30T12:36:00Z — the suite's own timestamp.
-        assert_eq!(format_amz_timestamp(1_440_938_160).as_str(), "20150830T123600Z");
+        assert_eq!(
+            format_amz_timestamp(1_440_938_160).as_str(),
+            "20150830T123600Z"
+        );
         assert_eq!(format_amz_timestamp(0).as_str(), "19700101T000000Z");
         // Leap-day check: 2024-02-29T23:59:59Z.
-        assert_eq!(format_amz_timestamp(1_709_251_199).as_str(), "20240229T235959Z");
+        assert_eq!(
+            format_amz_timestamp(1_709_251_199).as_str(),
+            "20240229T235959Z"
+        );
     }
 
     #[test]

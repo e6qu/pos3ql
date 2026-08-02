@@ -110,12 +110,13 @@ impl Server {
         } else {
             0
         };
-        let reactor = Reactor::new(budget, max_conns + 1 + block_read_slots).map_err(|e| match e {
-            crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
-            crate::io::reactor::ReactorSetupError::Os(io) => {
-                ServerSetupError::Io("create kqueue", io)
-            }
-        })?;
+        let reactor =
+            Reactor::new(budget, max_conns + 1 + block_read_slots).map_err(|e| match e {
+                crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
+                crate::io::reactor::ReactorSetupError::Os(io) => {
+                    ServerSetupError::Io("create kqueue", io)
+                }
+            })?;
         reactor
             .register_read(listener.as_raw_fd(), LISTENER_TOKEN)
             .map_err(|e| ServerSetupError::Io("register listener", e))?;
@@ -124,7 +125,9 @@ impl Server {
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
         for _ in 0..block_read_slots {
-            block_read_fds.push(None).expect("sized from object_store_get_slots");
+            block_read_fds
+                .push(None)
+                .expect("sized from object_store_get_slots");
         }
         for i in (0..max_conns as u32).rev() {
             slots
@@ -287,10 +290,14 @@ impl Server {
                 .engine
                 .next_block_read_hedge_deadline()
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
-            let timeout = [checkpoint_timeout, self.next_lock_wait_timeout(), hedge_timeout]
-                .into_iter()
-                .flatten()
-                .min();
+            let timeout = [
+                checkpoint_timeout,
+                self.next_lock_wait_timeout(),
+                hedge_timeout,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let n = self.reactor.poll(timeout)?;
             for i in 0..n {
                 let event = self.reactor.event(i);
@@ -506,7 +513,8 @@ impl Server {
                 self.reactor.deregister(fd)?;
             }
             if let Some(fd) = wanted {
-                self.reactor.register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
+                self.reactor
+                    .register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
                 self.block_read_fds[slot] = Some(fd);
             }
         }

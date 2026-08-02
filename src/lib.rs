@@ -23,9 +23,9 @@ pub(crate) mod sim;
 pub mod sql;
 pub(crate) mod storage;
 pub(crate) mod store;
-pub(crate) mod wal;
 pub(crate) mod util;
 pub(crate) mod vsr;
+pub(crate) mod wal;
 
 /// All heap memory flows through the guard so that "no allocation after
 /// startup" is enforced at runtime, not just by convention.

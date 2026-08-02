@@ -31,7 +31,10 @@ impl FixedBuf {
 
     /// Marks `n` readable bytes as consumed.
     pub fn consume(&mut self, n: usize) {
-        assert!(n <= self.end - self.start, "consuming more than is readable");
+        assert!(
+            n <= self.end - self.start,
+            "consuming more than is readable"
+        );
         self.start += n;
         if self.start == self.end {
             self.start = 0;
@@ -95,7 +98,10 @@ impl FixedBuf {
     }
 
     pub fn truncate_to(&mut self, mark: usize) {
-        assert!(mark >= self.start && mark <= self.end, "invalid truncate mark");
+        assert!(
+            mark >= self.start && mark <= self.end,
+            "invalid truncate mark"
+        );
         self.end = mark;
     }
 }

@@ -19,7 +19,7 @@ use core::fmt;
 use crate::mem::arena::Arena;
 use crate::sql_err;
 
-use super::eval::{sqlstate, SqlError};
+use super::eval::{SqlError, sqlstate};
 
 /// Base-10000: each digit holds four decimal places.
 pub const NBASE: i32 = 10_000;
@@ -129,7 +129,9 @@ impl<'a> Numeric<'a> {
             digits[int_len + i] = *frac_b.get(i).unwrap_or(&b'0');
         }
         let first_dropped = frac_b.get(scale).copied().unwrap_or(b'0');
-        let has_dropped_nonzero = frac_b.get(scale..).is_some_and(|d| d.iter().any(|&c| c != b'0'));
+        let has_dropped_nonzero = frac_b
+            .get(scale..)
+            .is_some_and(|d| d.iter().any(|&c| c != b'0'));
         let round_up = match mode {
             RoundMode::HalfAwayZero => first_dropped >= b'5',
             RoundMode::Trunc => false,
@@ -364,11 +366,7 @@ impl<'a> Numeric<'a> {
         }
         let neg = v < 0;
         // Work in magnitude; i128::MIN handled via unsigned.
-        let mut mag: u128 = if neg {
-            v.unsigned_abs()
-        } else {
-            v as u128
-        };
+        let mut mag: u128 = if neg { v.unsigned_abs() } else { v as u128 };
         let _ = &mut v;
         let mut rev: [i16; MAX_NDIGITS] = [0; MAX_NDIGITS];
         let mut n = 0;
@@ -405,7 +403,12 @@ impl<'a> Numeric<'a> {
     /// most 5 base-10000 digits (10 bytes).
     pub fn from_i64_stack(v: i64, buffer: &'a mut [u8; 20]) -> Numeric<'a> {
         if v == 0 {
-            return Numeric { sign: Sign::Pos, weight: 0, dscale: 0, digits: &[] };
+            return Numeric {
+                sign: Sign::Pos,
+                weight: 0,
+                dscale: 0,
+                digits: &[],
+            };
         }
         let neg = v < 0;
         let mut mag = (v as i128).unsigned_abs();
@@ -496,7 +499,10 @@ impl<'a> Numeric<'a> {
 }
 
 fn overflow() -> SqlError {
-    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "value overflows numeric format")
+    sql_err!(
+        sqlstate::NUMERIC_OUT_OF_RANGE,
+        "value overflows numeric format"
+    )
 }
 
 /// Serializes base-10000 digits (as i16) into LE byte pairs in the arena.
@@ -594,8 +600,16 @@ impl Numeric<'_> {
 
 fn write_digit(f: &mut fmt::Formatter<'_>, d: u8) -> fmt::Result {
     f.write_str(match d {
-        0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4",
-        5 => "5", 6 => "6", 7 => "7", 8 => "8", _ => "9",
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        _ => "9",
     })
 }
 
@@ -612,10 +626,18 @@ pub fn compare(a: &Numeric, b: &Numeric) -> Ordering {
         return Ordering::Equal;
     }
     if a.is_zero() {
-        return if b.sign == Sign::Neg { Ordering::Greater } else { Ordering::Less };
+        return if b.sign == Sign::Neg {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
     }
     if b.is_zero() {
-        return if a.sign == Sign::Neg { Ordering::Less } else { Ordering::Greater };
+        return if a.sign == Sign::Neg {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
     }
     match (a.sign, b.sign) {
         (Sign::Pos, Sign::Neg) => return Ordering::Greater,
@@ -880,7 +902,11 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         carry = *slot / NBASE;
         *slot %= NBASE;
     }
-    let sign = if a.sign == b.sign { Sign::Pos } else { Sign::Neg };
+    let sign = if a.sign == b.sign {
+        Sign::Pos
+    } else {
+        Sign::Neg
+    };
     let dscale = a.dscale + b.dscale;
     finish_from_lsf(sign, lo, &buffer[..n + 1], dscale, arena)
 }
@@ -948,7 +974,12 @@ fn div_with_scale<'a>(
     arena: &'a Arena,
 ) -> Result<Numeric<'a>, SqlError> {
     if a.is_zero() {
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: rscale,
+            digits: &[],
+        });
     }
     // Significant decimal digits (no leading/trailing zeros) and the weight
     // of the least-significant digit, so each operand is `int * 10^lsw`.
@@ -985,7 +1016,12 @@ fn div_with_scale<'a>(
     let mut q = [0i8; MAX_NDIGITS * DEC_DIGITS + 8];
     let qlen = long_divide(&dividend[..dlen], &divisor[..blen], &mut q);
     if qlen == 0 {
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: rscale,
+            digits: &[],
+        });
     }
 
     // Round: the guard digit (q[qlen-1], weight -(rscale+1)) rounds the digit
@@ -1019,13 +1055,24 @@ fn div_with_scale<'a>(
             for (k, &d) in q[..out_len].iter().enumerate() {
                 dec[k] = d as u8;
             }
-            let mut r = Numeric::from_decimal_digits(&dec[..out_len], msd_w as i64 + 1, rscale, neg, arena)?;
+            let mut r = Numeric::from_decimal_digits(
+                &dec[..out_len],
+                msd_w as i64 + 1,
+                rscale,
+                neg,
+                arena,
+            )?;
             r.dscale = rscale;
             return Ok(r);
         }
     }
     if out_len == 0 {
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: rscale,
+            digits: &[],
+        });
     }
     // q[0..out_len]: MSD at weight (out_len-1) - rscale.
     let neg = a.sign != b.sign;
@@ -1034,7 +1081,8 @@ fn div_with_scale<'a>(
     for (k, &d) in q[..out_len].iter().enumerate() {
         dec[k] = d as u8;
     }
-    let mut r = Numeric::from_decimal_digits(&dec[..out_len], msd_w as i64 + 1, rscale, neg, arena)?;
+    let mut r =
+        Numeric::from_decimal_digits(&dec[..out_len], msd_w as i64 + 1, rscale, neg, arena)?;
     r.dscale = rscale;
     Ok(r)
 }
@@ -1159,7 +1207,12 @@ fn finish<'a>(
     // Zero is always positive in PostgreSQL (no negative zero).
     let sign = if digits.is_empty() { Sign::Pos } else { sign };
     let d = arena.alloc_slice_copy(digits).map_err(|_| overflow())?;
-    Ok(Numeric { sign, weight, dscale, digits: &*d })
+    Ok(Numeric {
+        sign,
+        weight,
+        dscale,
+        digits: &*d,
+    })
 }
 
 /// Builds a canonical Numeric from an LSF base-10000 buffer where `buffer[i]`
@@ -1198,7 +1251,12 @@ fn finish_from_lsf<'a>(
         out[k] = buffer[hi - 1 - k] as i16;
     }
     let weight = (lo + hi as i32 - 1) as i16;
-    Ok(Numeric { sign, weight, dscale, digits: pack(&out[..ndigits], arena)? })
+    Ok(Numeric {
+        sign,
+        weight,
+        dscale,
+        digits: pack(&out[..ndigits], arena)?,
+    })
 }
 
 // --- Transcendental functions (sqrt, ln, exp, pow) --------------------------
@@ -1268,12 +1326,20 @@ pub fn sqrt<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError
         .max(arg.dscale as i32)
         .clamp(0, MAX_DISPLAY_SCALE) as u16;
     if arg.is_zero() {
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: rscale,
+            digits: &[],
+        });
     }
     let wscale = rscale + 8;
     let half = Numeric::parse("0.5", arena)?;
     // Initial guess from the f64 square root (accurate to ~15 digits).
-    let mut x = Numeric::parse(crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(), arena)?;
+    let mut x = Numeric::parse(
+        crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(),
+        arena,
+    )?;
     newton_sqrt(arg, &mut x, &half, wscale, arena)?;
     x.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
 }
@@ -1304,7 +1370,12 @@ pub fn var_stddev<'a>(
     // Roundoff on real inputs can push Sxx slightly negative; clamp to zero
     // exactly as PostgreSQL does before dividing.
     if compare(&sxx, &Numeric::ZERO) != Ordering::Greater {
-        return Ok(Some(Numeric { sign: Sign::Pos, weight: 0, dscale: 0, digits: &[] }));
+        return Ok(Some(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: 0,
+            digits: &[],
+        }));
     }
     // divisor = N·(N−1) for the sample estimator, N² for the population one.
     let divisor = if sample {
@@ -1321,7 +1392,11 @@ pub fn var_stddev<'a>(
     // Standard deviation is the square root of the variance taken at the
     // variance's own result scale (PostgreSQL's sqrt_var(&var, &var, rscale)).
     let root = sqrt_to_scale(&variance, rscale + 8, arena)?;
-    Ok(Some(root.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)?))
+    Ok(Some(root.round_scale(
+        rscale as usize,
+        RoundMode::HalfAwayZero,
+        arena,
+    )?))
 }
 
 /// `ln(arg)` in the numeric domain (arg must be > 0; caller checks).
@@ -1343,7 +1418,11 @@ fn ln_rscale(arg: &Numeric) -> u16 {
         if (0.9..=1.1).contains(&v) {
             // Near 1: ln(x) ~ (x-1); take the decimal weight of |x-1|.
             let d = (v - 1.0).abs();
-            if d == 0.0 { 0 } else { d.log10().floor() as i32 }
+            if d == 0.0 {
+                0
+            } else {
+                d.log10().floor() as i32
+            }
         } else {
             let dweight = arg.dec_weight();
             if dweight == 0 {
@@ -1471,7 +1550,11 @@ pub fn log10<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlErro
 
 /// `log(base, value)` = `ln(value)/ln(base)` in the numeric domain (both must
 /// be > 0; caller checks). The result scale follows `value`, as PostgreSQL.
-pub fn logb<'a>(base: &Numeric, value: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
+pub fn logb<'a>(
+    base: &Numeric,
+    value: &Numeric,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
     if base.is_nan() || value.is_nan() {
         return Ok(Numeric::NAN);
     }
@@ -1482,8 +1565,11 @@ pub fn logb<'a>(base: &Numeric, value: &Numeric, arena: &'a Arena) -> Result<Num
     if lnb.is_zero() {
         return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
     }
-    div_with_scale(&lnv, &lnb, rscale + 2, true, arena)?
-        .round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
+    div_with_scale(&lnv, &lnb, rscale + 2, true, arena)?.round_scale(
+        rscale as usize,
+        RoundMode::HalfAwayZero,
+        arena,
+    )
 }
 
 /// `trunc(a / b)` toward zero (the `div` function): an exact integer quotient
@@ -1524,15 +1610,25 @@ pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeri
     // Domain rules matching PostgreSQL numeric_power.
     if base.is_zero() {
         if exp.sign == Sign::Neg {
-            return Err(sql_err!(sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION, "zero raised to a negative power is undefined"));
+            return Err(sql_err!(
+                sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                "zero raised to a negative power is undefined"
+            ));
         }
         // The logarithm is undefined at zero, so the result weight is 0: both
         // `0^0 = 1` and `0^positive = 0` carry MIN_SIG_DIGITS fractional places.
-        let rscale = MIN_SIG_DIGITS.max(base.dscale as i32).clamp(0, MAX_DISPLAY_SCALE) as u16;
+        let rscale = MIN_SIG_DIGITS
+            .max(base.dscale as i32)
+            .clamp(0, MAX_DISPLAY_SCALE) as u16;
         if exp.is_zero() {
             return one(arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena);
         }
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: rscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: rscale,
+            digits: &[],
+        });
     }
     if base.sign == Sign::Neg && !exp.is_integer() {
         return Err(sql_err!(
@@ -1603,10 +1699,18 @@ fn sqrt_to_scale<'a>(
     arena: &'a Arena,
 ) -> Result<Numeric<'a>, SqlError> {
     if arg.is_zero() {
-        return Ok(Numeric { sign: Sign::Pos, weight: 0, dscale: wscale, digits: &[] });
+        return Ok(Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: wscale,
+            digits: &[],
+        });
     }
     let half = Numeric::parse("0.5", arena)?;
-    let mut x = Numeric::parse(crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(), arena)?;
+    let mut x = Numeric::parse(
+        crate::stack_format!(64, "{}", arg.to_f64().sqrt()).as_str(),
+        arena,
+    )?;
     newton_sqrt(arg, &mut x, &half, wscale, arena)?;
     Ok(x)
 }
@@ -1673,9 +1777,25 @@ mod tests {
     #[test]
     fn parse_and_display_roundtrip() {
         let a = arena();
-        for s in ["0", "1", "10", "100", "1000", "10000", "12345", "-7",
-                  "0.1", "0.30", "10.0", "2.5", "-2.25", "3.14159",
-                  "0.001", "1234567890123456789", "0.30000000000000000"] {
+        for s in [
+            "0",
+            "1",
+            "10",
+            "100",
+            "1000",
+            "10000",
+            "12345",
+            "-7",
+            "0.1",
+            "0.30",
+            "10.0",
+            "2.5",
+            "-2.25",
+            "3.14159",
+            "0.001",
+            "1234567890123456789",
+            "0.30000000000000000",
+        ] {
             assert_eq!(disp(&p(s, &a)), s, "roundtrip {s}");
         }
     }
@@ -1693,19 +1813,37 @@ mod tests {
         // A dividend with more fractional digits than the divisor must still
         // divide its integer part (regression: the quotient dropped to zero).
         let a = arena();
-        assert_eq!(disp(&rem(&p("223.1273", &a), &p("8.45", &a), &a).unwrap()), "3.4273");
+        assert_eq!(
+            disp(&rem(&p("223.1273", &a), &p("8.45", &a), &a).unwrap()),
+            "3.4273"
+        );
         assert_eq!(disp(&rem(&p("10.5", &a), &p("3", &a), &a).unwrap()), "1.5");
-        assert_eq!(disp(&rem(&p("-10.5", &a), &p("3.2", &a), &a).unwrap()), "-0.9");
-        assert_eq!(disp(&rem(&p("100.0", &a), &p("7.5", &a), &a).unwrap()), "2.5");
+        assert_eq!(
+            disp(&rem(&p("-10.5", &a), &p("3.2", &a), &a).unwrap()),
+            "-0.9"
+        );
+        assert_eq!(
+            disp(&rem(&p("100.0", &a), &p("7.5", &a), &a).unwrap()),
+            "2.5"
+        );
     }
 
     #[test]
     fn sqrt_matches_postgres_scale() {
         let a = arena();
         assert_eq!(disp(&sqrt(&p("2.0", &a), &a).unwrap()), "1.414213562373095");
-        assert_eq!(disp(&sqrt(&p("0.04", &a), &a).unwrap()), "0.20000000000000000");
-        assert_eq!(disp(&sqrt(&p("100.0", &a), &a).unwrap()), "10.000000000000000");
-        assert_eq!(disp(&sqrt(&p("12345.0", &a), &a).unwrap()), "111.1080555135405");
+        assert_eq!(
+            disp(&sqrt(&p("0.04", &a), &a).unwrap()),
+            "0.20000000000000000"
+        );
+        assert_eq!(
+            disp(&sqrt(&p("100.0", &a), &a).unwrap()),
+            "10.000000000000000"
+        );
+        assert_eq!(
+            disp(&sqrt(&p("12345.0", &a), &a).unwrap()),
+            "111.1080555135405"
+        );
         assert_eq!(disp(&sqrt(&p("0.0", &a), &a).unwrap()), "0.000000000000000");
     }
 
@@ -1713,20 +1851,41 @@ mod tests {
     fn ln_exp_match_postgres() {
         let a = arena();
         assert_eq!(disp(&ln(&p("2.0", &a), &a).unwrap()), "0.6931471805599453");
-        assert_eq!(disp(&ln(&p("1000000.0", &a), &a).unwrap()), "13.815510557964274");
+        assert_eq!(
+            disp(&ln(&p("1000000.0", &a), &a).unwrap()),
+            "13.815510557964274"
+        );
         assert_eq!(disp(&exp(&p("1.0", &a), &a).unwrap()), "2.7182818284590452");
-        assert_eq!(disp(&exp(&p("-5.0", &a), &a).unwrap()), "0.006737946999085467");
+        assert_eq!(
+            disp(&exp(&p("-5.0", &a), &a).unwrap()),
+            "0.006737946999085467"
+        );
     }
 
     #[test]
     fn log_div_scale_match_postgres() {
         let a = arena();
-        assert_eq!(disp(&log10(&p("100.0", &a), &a).unwrap()), "2.0000000000000000");
-        assert_eq!(disp(&log10(&p("1000000.0", &a), &a).unwrap()), "6.000000000000000");
-        assert_eq!(disp(&logb(&p("2.0", &a), &p("8.0", &a), &a).unwrap()), "3.0000000000000000");
+        assert_eq!(
+            disp(&log10(&p("100.0", &a), &a).unwrap()),
+            "2.0000000000000000"
+        );
+        assert_eq!(
+            disp(&log10(&p("1000000.0", &a), &a).unwrap()),
+            "6.000000000000000"
+        );
+        assert_eq!(
+            disp(&logb(&p("2.0", &a), &p("8.0", &a), &a).unwrap()),
+            "3.0000000000000000"
+        );
         // div truncates toward zero at scale 0.
-        assert_eq!(disp(&trunc_div(&p("7.0", &a), &p("2.0", &a), &a).unwrap()), "3");
-        assert_eq!(disp(&trunc_div(&p("-7", &a), &p("2", &a), &a).unwrap()), "-3");
+        assert_eq!(
+            disp(&trunc_div(&p("7.0", &a), &p("2.0", &a), &a).unwrap()),
+            "3"
+        );
+        assert_eq!(
+            disp(&trunc_div(&p("-7", &a), &p("2", &a), &a).unwrap()),
+            "-3"
+        );
         // min_scale strips trailing zeros.
         assert_eq!(p("2.500", &a).min_scale(), 1);
         assert_eq!(p("120.0", &a).min_scale(), 0);
@@ -1737,13 +1896,28 @@ mod tests {
     fn pow_matches_postgres() {
         let a = arena();
         // Integer exponent: exact repeated squaring, then padded to rscale.
-        assert_eq!(disp(&pow(&p("2.0", &a), &p("10", &a), &a).unwrap()), "1024.0000000000000");
-        assert_eq!(disp(&pow(&p("10.0", &a), &p("5", &a), &a).unwrap()), "100000.00000000000");
+        assert_eq!(
+            disp(&pow(&p("2.0", &a), &p("10", &a), &a).unwrap()),
+            "1024.0000000000000"
+        );
+        assert_eq!(
+            disp(&pow(&p("10.0", &a), &p("5", &a), &a).unwrap()),
+            "100000.00000000000"
+        );
         // Fractional exponent via exp(exp*ln(base)).
-        assert_eq!(disp(&pow(&p("2.5", &a), &p("0.5", &a), &a).unwrap()), "1.5811388300841897");
+        assert_eq!(
+            disp(&pow(&p("2.5", &a), &p("0.5", &a), &a).unwrap()),
+            "1.5811388300841897"
+        );
         // Zero exponent / zero base carry MIN_SIG_DIGITS fractional places.
-        assert_eq!(disp(&pow(&p("1.5", &a), &p("0", &a), &a).unwrap()), "1.0000000000000000");
-        assert_eq!(disp(&pow(&p("0.0", &a), &p("5", &a), &a).unwrap()), "0.0000000000000000");
+        assert_eq!(
+            disp(&pow(&p("1.5", &a), &p("0", &a), &a).unwrap()),
+            "1.0000000000000000"
+        );
+        assert_eq!(
+            disp(&pow(&p("0.0", &a), &p("5", &a), &a).unwrap()),
+            "0.0000000000000000"
+        );
         // Domain errors.
         assert!(pow(&p("-2.0", &a), &p("0.5", &a), &a).is_err());
         assert!(pow(&p("0.0", &a), &p("-1", &a), &a).is_err());
@@ -1753,10 +1927,16 @@ mod tests {
     fn addition_matches_decimal() {
         let a = arena();
         assert_eq!(disp(&add(&p("0.1", &a), &p("0.2", &a), &a).unwrap()), "0.3");
-        assert_eq!(disp(&add(&p("10.0", &a), &p("0.5", &a), &a).unwrap()), "10.5");
+        assert_eq!(
+            disp(&add(&p("10.0", &a), &p("0.5", &a), &a).unwrap()),
+            "10.5"
+        );
         assert_eq!(disp(&add(&p("-7", &a), &p("7", &a), &a).unwrap()), "0");
         assert_eq!(disp(&add(&p("999", &a), &p("1", &a), &a).unwrap()), "1000");
-        assert_eq!(disp(&add(&p("9999", &a), &p("1", &a), &a).unwrap()), "10000");
+        assert_eq!(
+            disp(&add(&p("9999", &a), &p("1", &a), &a).unwrap()),
+            "10000"
+        );
     }
 
     #[test]
@@ -1764,7 +1944,10 @@ mod tests {
         let a = arena();
         assert_eq!(disp(&sub(&p("10", &a), &p("3", &a), &a).unwrap()), "7");
         assert_eq!(disp(&sub(&p("0.3", &a), &p("0.1", &a), &a).unwrap()), "0.2");
-        assert_eq!(disp(&sub(&p("1", &a), &p("0.001", &a), &a).unwrap()), "0.999");
+        assert_eq!(
+            disp(&sub(&p("1", &a), &p("0.001", &a), &a).unwrap()),
+            "0.999"
+        );
         assert_eq!(disp(&sub(&p("3", &a), &p("10", &a), &a).unwrap()), "-7");
     }
 
@@ -1772,21 +1955,33 @@ mod tests {
     fn multiplication() {
         let a = arena();
         assert_eq!(disp(&mul(&p("2.5", &a), &p("4", &a), &a).unwrap()), "10.0");
-        assert_eq!(disp(&mul(&p("1.1", &a), &p("1.1", &a), &a).unwrap()), "1.21");
+        assert_eq!(
+            disp(&mul(&p("1.1", &a), &p("1.1", &a), &a).unwrap()),
+            "1.21"
+        );
         assert_eq!(disp(&mul(&p("-3", &a), &p("7", &a), &a).unwrap()), "-21");
-        assert_eq!(disp(&mul(&p("12345", &a), &p("67890", &a), &a).unwrap()), "838102050");
+        assert_eq!(
+            disp(&mul(&p("12345", &a), &p("67890", &a), &a).unwrap()),
+            "838102050"
+        );
     }
 
     #[test]
     fn division_matches_postgres_scale() {
         let a = arena();
         // PostgreSQL: 1/3 -> 0.33333333333333333333 (20 digits)
-        assert_eq!(disp(&div(&p("1", &a), &p("3", &a), &a).unwrap()),
-                   "0.33333333333333333333");
-        assert_eq!(disp(&div(&p("10", &a), &p("2", &a), &a).unwrap()),
-                   "5.0000000000000000");
-        assert_eq!(disp(&div(&p("7", &a), &p("2", &a), &a).unwrap()),
-                   "3.5000000000000000");
+        assert_eq!(
+            disp(&div(&p("1", &a), &p("3", &a), &a).unwrap()),
+            "0.33333333333333333333"
+        );
+        assert_eq!(
+            disp(&div(&p("10", &a), &p("2", &a), &a).unwrap()),
+            "5.0000000000000000"
+        );
+        assert_eq!(
+            disp(&div(&p("7", &a), &p("2", &a), &a).unwrap()),
+            "3.5000000000000000"
+        );
     }
 
     #[test]
@@ -1814,17 +2009,34 @@ mod tests {
         let a = arena();
         let n = |v: i64| Numeric::from_i64(v, &a).unwrap();
         // Sample variance/stddev over {2,4,6,7}: Σx=19, Σx²=105, count=4.
-        let var = var_stddev(4, &n(19), &n(105), true, false, &a).unwrap().unwrap();
+        let var = var_stddev(4, &n(19), &n(105), true, false, &a)
+            .unwrap()
+            .unwrap();
         assert_eq!(disp(&var), "4.9166666666666667");
-        let stddev = var_stddev(4, &n(19), &n(105), true, true, &a).unwrap().unwrap();
+        let stddev = var_stddev(4, &n(19), &n(105), true, true, &a)
+            .unwrap()
+            .unwrap();
         assert_eq!(disp(&stddev), "2.2173557826083451");
         // Population variance over {2,4,6}: Σx=12, Σx²=56, count=3.
-        let var_pop = var_stddev(3, &n(12), &n(56), false, false, &a).unwrap().unwrap();
+        let var_pop = var_stddev(3, &n(12), &n(56), false, false, &a)
+            .unwrap()
+            .unwrap();
         assert_eq!(disp(&var_pop), "2.6666666666666667");
         // The sample estimator is undefined for a single row.
-        assert!(var_stddev(1, &n(5), &n(25), true, false, &a).unwrap().is_none());
+        assert!(
+            var_stddev(1, &n(5), &n(25), true, false, &a)
+                .unwrap()
+                .is_none()
+        );
         // Population variance of a single (or all-equal) value is exactly zero.
-        assert_eq!(disp(&var_stddev(1, &n(5), &n(25), false, false, &a).unwrap().unwrap()), "0");
+        assert_eq!(
+            disp(
+                &var_stddev(1, &n(5), &n(25), false, false, &a)
+                    .unwrap()
+                    .unwrap()
+            ),
+            "0"
+        );
     }
 
     #[test]

@@ -864,9 +864,13 @@ and cold scans. This makes the physical table layout column-aware without
 forking MVCC semantics or leaving a compatibility path that can drift. The
 merged cold scan now consumes the validated key stream and column spans directly,
 rebuilding only its selected winning row rather than every row in the fetched
-group. The remaining late-materialization work is to expose those spans to the
-batched scan/filter/project pipeline and to the packed range container, so
-surviving rows alone require their projected payloads.
+group. The batch seam now carries a tagged row representation too: a legacy
+row-packed group carries its canonical bytes, while a PAX winner decodes its
+validated physical spans straight into statement-owned values and never makes a
+canonical row only for the executor to decode it again. The remaining
+late-materialization work is to select the exact filter/project columns before
+that decode, and to feed those selected spans into the packed range container,
+so a survivor need not carry every payload.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

@@ -29,7 +29,16 @@ pub(crate) use rowenc::MAX_COLUMNS;
 #[derive(Clone, Copy)]
 pub(crate) struct SpilledRow<'a> {
     pub(crate) rowid: u64,
-    pub(crate) bytes: &'a [u8],
+    pub(crate) representation: SpilledRowRepresentation<'a>,
+}
+
+/// The physical representation a merged spill cursor hands to the executor.
+/// Canonical entries retain the historical path; PAX entries arrive as
+/// statement-owned decoded values after the resident block has been released.
+#[derive(Clone, Copy)]
+pub(crate) enum SpilledRowRepresentation<'a> {
+    Encoded(&'a [u8]),
+    Values(&'a [Datum<'a>]),
 }
 
 /// A scan batch is deliberately small enough to leave statement-arena space
@@ -5520,7 +5529,10 @@ impl Storage {
         slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
-        emit: &mut dyn FnMut(u64, &'a [u8]) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        emit: &mut dyn FnMut(
+            u64,
+            SpilledRowRepresentation<'a>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
@@ -5619,19 +5631,13 @@ impl Storage {
                     });
                 }
             }
-            let bytes = if let Some(SpillVersion {
+            let representation = if let Some(SpillVersion {
                 len: Some(len),
                 member,
                 commit_lsn,
             }) = verdict
                 && self.tables[slot].rows.get(&rowid).is_none()
             {
-                let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "spilled scan rows exceed the statement arena; raise work_arena_bytes"
-                    )
-                })?;
                 let cursor = &cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
                     sql_err!(
@@ -5639,22 +5645,53 @@ impl Storage {
                         "selected spill version has no resident cursor head"
                     )
                 })?;
-                let copied = if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+                let representation = if cursor.loaded_type
+                    == Some(crate::store::BlockType::SstDataPaxV1)
+                {
                     let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "PAX block has no validated layout"
                         )
                     })?;
-                    layout
-                        .copy_row(
-                            &context.member_raw_blocks[member as usize][..cursor.raw_len],
-                            cursor.head_raw_row,
-                            &cursor.head_pax_values,
-                            output,
-                        )
-                        .map_err(spill_read_error)?
+                    let mut schema = [ColType::Bool; MAX_COLUMNS];
+                    table.def.schema(&mut schema);
+                    let values = arena
+                        .alloc_slice_with(layout.columns(), |_| Datum::Null)
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "spilled PAX values exceed the statement arena; raise work_arena_bytes"
+                            )
+                        })?;
+                    let mut copied = 2 + layout.columns().div_ceil(8);
+                    for column in 0..layout.columns() {
+                        let Some((start, end)) = cursor.head_pax_values[column] else {
+                            continue;
+                        };
+                        copied = copied.checked_add(end - start).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
+                        })?;
+                        values[column] = rowenc::decode_payload(
+                            &context.member_raw_blocks[member as usize][start..end],
+                            schema[column],
+                            arena,
+                        )?;
+                    }
+                    if copied != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX selected row length does not match its cursor header"
+                        ));
+                    }
+                    SpilledRowRepresentation::Values(&*values)
                 } else {
+                    let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled scan rows exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })?;
                     let handle = table.spill_ssts[member as usize].expect("cursor member exists");
                     let (copied_key, copied_tombstone, copied) = {
                         let mut blocks = spill.blocks.borrow_mut();
@@ -5673,19 +5710,21 @@ impl Storage {
                             "merged spill cursor payload does not match its selected version"
                         ));
                     }
-                    copied
+                    if copied != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "merged spill cursor payload length does not match its selected version"
+                        ));
+                    }
+                    SpilledRowRepresentation::Encoded(&*output)
                 };
-                if tombstone
-                    || key.rowid != rowid
-                    || key.commit_lsn != commit_lsn
-                    || copied != len as usize
-                {
+                if tombstone || key.rowid != rowid || key.commit_lsn != commit_lsn {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "merged spill cursor payload does not match its selected version"
                     ));
                 }
-                Some(&*output)
+                Some(representation)
             } else {
                 None
             };
@@ -5695,8 +5734,8 @@ impl Storage {
                 }
             }
             drop(context);
-            let emitted = if let Some(bytes) = bytes {
-                emit(rowid, bytes)
+            let emitted = if let Some(representation) = representation {
+                emit(rowid, representation)
             } else {
                 Ok(core::ops::ControlFlow::Continue(()))
             };
@@ -5726,7 +5765,7 @@ impl Storage {
         let rows = arena
             .alloc_slice_with(SPILL_SCAN_BATCH_ROWS, |_| SpilledRow {
                 rowid: 0,
-                bytes: &[],
+                representation: SpilledRowRepresentation::Encoded(&[]),
             })
             .map_err(|_| {
                 sql_err!(
@@ -5739,8 +5778,11 @@ impl Storage {
         let mut len = 0usize;
         let mut stopped = false;
         let mut result =
-            self.spill_merged_walk_bytes(table_slot, arena, false, &mut |rowid, bytes| {
-                rows[len] = SpilledRow { rowid, bytes };
+            self.spill_merged_walk_bytes(table_slot, arena, false, &mut |rowid, representation| {
+                rows[len] = SpilledRow {
+                    rowid,
+                    representation,
+                };
                 len += 1;
                 if len != rows.len() {
                     return Ok(core::ops::ControlFlow::Continue(()));

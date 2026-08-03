@@ -46,6 +46,15 @@ struct IndexedCandidates<'a> {
     rowids: &'a [u64],
 }
 
+/// A bound base-table row. Storage sources normally carry the canonical row
+/// encoding; a columnar source can instead hand the executor its already
+/// decoded selected values without reconstituting unneeded payloads.
+#[derive(Clone, Copy)]
+enum BoundRow<'a> {
+    Encoded(&'a [u8]),
+    Values(&'a [Datum<'a>]),
+}
+
 /// Finds one single-column `indexed_column = constant` conjunct. This is
 /// intentionally conservative: joins, derived rows, parameters and
 /// multi-column keys stay on the ordinary scan until their access path can
@@ -1073,7 +1082,7 @@ fn scan_source_mode<'a>(
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
         scope: &'s QueryScope<'d>,
-        bound: &[Option<&'v [u8]>],
+        bound: &[Option<BoundRow<'v>>],
         bound_rowids: &'s [Option<u64>],
         order: &[usize],
         count: usize,
@@ -1090,7 +1099,7 @@ fn scan_source_mode<'a>(
             rest = tail;
             let def = scope.defs[t].expect("resolved");
             match bound[t] {
-                Some(bytes) => {
+                Some(BoundRow::Encoded(bytes)) => {
                     if scope.derived[t].is_some() {
                         for (c, slot) in buffer.iter_mut().enumerate().take(def.n_columns) {
                             // Structural decode: a record column comes back
@@ -1105,6 +1114,7 @@ fn scan_source_mode<'a>(
                     }
                     values[t] = Some(&buffer[..def.n_columns]);
                 }
+                Some(BoundRow::Values(row_values)) => values[t] = Some(row_values),
                 None => values[t] = Some(&[]), // outer-join null row
             }
         }
@@ -1255,11 +1265,11 @@ fn scan_source_mode<'a>(
                                     }
                                 }
                                 if matched {
-                                    let bound = &mut [None, None];
+                                    let bound = &mut [None::<BoundRow>, None];
                                     let bound_rowids = &mut [None, None];
-                                    bound[probe_t] = Some(bytes);
+                                    bound[probe_t] = Some(BoundRow::Encoded(bytes));
                                     bound_rowids[probe_t] = Some(rowid);
-                                    bound[build_t] = Some(entry.bytes);
+                                    bound[build_t] = Some(BoundRow::Encoded(entry.bytes));
                                     bound_rowids[build_t] = Some(entry.rowid);
                                     let row = assemble(
                                         scope,
@@ -1305,9 +1315,9 @@ fn scan_source_mode<'a>(
                     // LEFT JOIN: no ON-passing match (NULL key, or all candidates
                     // rejected) → preserve the outer row with NULLs for the inner.
                     if !matched_any && plan.preserves_probe_rows {
-                        let bound = &mut [None, None];
+                        let bound = &mut [None::<BoundRow>, None];
                         let bound_rowids = &mut [None, None];
-                        bound[probe_t] = Some(bytes);
+                        bound[probe_t] = Some(BoundRow::Encoded(bytes));
                         bound_rowids[probe_t] = Some(rowid);
                         let row =
                             assemble(scope, bound, bound_rowids, order, 2, decode_buffers, arena)?;
@@ -1336,7 +1346,7 @@ fn scan_source_mode<'a>(
     #[allow(clippy::too_many_arguments)]
     fn candidate_passes<'a>(
         scope: &QueryScope<'a>,
-        bound: &[Option<&'a [u8]>],
+        bound: &[Option<BoundRow<'a>>],
         bound_rowids: &[Option<u64>],
         order: &[usize],
         count: usize,
@@ -1405,9 +1415,9 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         depth: usize,
         index: usize,
-        bytes: &'a [u8],
+        candidate: BoundRow<'a>,
         rowid: Option<u64>,
-        bound: &mut [Option<&'a [u8]>],
+        bound: &mut [Option<BoundRow<'a>>],
         bound_rowids: &mut [Option<u64>],
         matched: &[Option<&[core::cell::Cell<bool>]>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
@@ -1416,7 +1426,7 @@ fn scan_source_mode<'a>(
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         on: Option<&'a Expr<'a>>,
     ) -> Result<bool, SqlError> {
-        bound[order[depth]] = Some(bytes);
+        bound[order[depth]] = Some(candidate);
         bound_rowids[order[depth]] = rowid;
         if !candidate_passes(
             scope,
@@ -1455,7 +1465,7 @@ fn scan_source_mode<'a>(
         hooks: &EvalHooks<'_, 'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
         depth: usize,
-        bound: &mut [Option<&'a [u8]>],
+        bound: &mut [Option<BoundRow<'a>>],
         bound_rowids: &mut [Option<u64>],
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
@@ -1502,7 +1512,7 @@ fn scan_source_mode<'a>(
         // `candidate_matches` returns before that descent, keeping the
         // wide-range-table recursion to one live frame per join edge.
         macro_rules! visit_candidate {
-            ($index:expr, $bytes:expr, $rowid:expr) => {{
+            ($index:expr, $candidate:expr, $rowid:expr) => {{
                 if !candidate_matches(
                     storage,
                     scope,
@@ -1512,7 +1522,7 @@ fn scan_source_mode<'a>(
                     outer,
                     depth,
                     $index,
-                    $bytes,
+                    $candidate,
                     $rowid,
                     bound,
                     bound_rowids,
@@ -1590,7 +1600,9 @@ fn scan_source_mode<'a>(
                             run,
                             arena,
                             recycle_rows,
-                            &mut |index, bytes| visit_candidate!(index, bytes, None),
+                            &mut |index, bytes| {
+                                visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                            },
                         )?
                     {
                         return Ok(false);
@@ -1599,8 +1611,9 @@ fn scan_source_mode<'a>(
                 LateralRows::Local(rows) => {
                     for (index, bytes) in rows.iter().enumerate() {
                         check_timeout()?;
-                        let keep_scanning =
-                            recycled(arena, recycle_rows, || visit_candidate!(index, bytes, None))?;
+                        let keep_scanning = recycled(arena, recycle_rows, || {
+                            visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                        })?;
                         if !keep_scanning {
                             return Ok(false);
                         }
@@ -1624,7 +1637,7 @@ fn scan_source_mode<'a>(
                         // deeper join levels retain this row in recycling
                         // statement storage only for the callback's lifetime.
                         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                        visit_candidate!(this, owned, None)
+                        visit_candidate!(this, BoundRow::Encoded(owned), None)
                     })
                 }?;
                 if !keep_scanning {
@@ -1637,8 +1650,9 @@ fn scan_source_mode<'a>(
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
-                let keep_scanning =
-                    recycled(arena, recycle_rows, || visit_candidate!(index, bytes, None))?;
+                let keep_scanning = recycled(arena, recycle_rows, || {
+                    visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                })?;
                 if !keep_scanning {
                     return Ok(false);
                 }
@@ -1669,7 +1683,18 @@ fn scan_source_mode<'a>(
                         let this = index;
                         index += 1;
                         let keep_scanning = recycled(arena, recycle_rows, || {
-                            visit_candidate!(this, spilled.bytes, Some(spilled.rowid))
+                            visit_candidate!(
+                                this,
+                                match spilled.representation {
+                                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                        BoundRow::Encoded(bytes)
+                                    }
+                                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                                        BoundRow::Values(values)
+                                    }
+                                },
+                                Some(spilled.rowid)
+                            )
                         })?;
                         if !keep_scanning {
                             aborted = true;
@@ -1726,7 +1751,7 @@ fn scan_source_mode<'a>(
                 check_timeout()?;
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
-                    visit_candidate!(this, bytes, Some(rowid))
+                    visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                 })?;
                 if !keep_scanning {
                     return Ok(false);
@@ -1746,7 +1771,7 @@ fn scan_source_mode<'a>(
                 index += 1;
                 let keep_scanning = recycled(arena, recycle_rows, || {
                     let bytes = storage.row_bytes(slot, rowid, home, arena)?;
-                    visit_candidate!(this, bytes, Some(rowid))
+                    visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                 })?;
                 if !keep_scanning {
                     aborted = true;
@@ -2018,7 +2043,7 @@ fn scan_source_mode<'a>(
                  -> Result<bool, SqlError> {
                     bound.fill(None);
                     bound_rowids.fill(None);
-                    bound[d] = Some(bytes);
+                    bound[d] = Some(BoundRow::Encoded(bytes));
                     bound_rowids[d] = rowid;
                     if d + 1 == scope.n {
                         // Last level: the row is complete once the left side nulls.

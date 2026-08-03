@@ -8,6 +8,7 @@
 //! text is `u32 len` + UTF-8 bytes. The same encoding will be written
 //! into SSTs, so it is versioned by the column count against the schema.
 
+use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -547,6 +548,35 @@ pub(crate) fn decode<'a>(
     Ok(())
 }
 
+/// Decodes one physical stored-value payload after copying only that payload
+/// into statement-owned memory. A PAX reader can therefore release its
+/// resident block before the resulting datum reaches the executor.
+pub(crate) fn decode_payload<'a>(
+    payload: &[u8],
+    column_type: ColType,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let length = encoded_value_len(payload, column_type)?;
+    if length != payload.len() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "corrupt row encoding"
+        ));
+    }
+    let encoded = arena.alloc_slice_with(3 + length, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statement arena exhausted decoding PAX value"
+        )
+    })?;
+    encoded[..2].copy_from_slice(&1u16.to_le_bytes());
+    encoded[2] = 0;
+    encoded[3..].copy_from_slice(payload);
+    let mut value = [Datum::Null];
+    decode(encoded, &[column_type], &mut value)?;
+    Ok(value[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +628,22 @@ mod tests {
         encode(&values, &mut buffer);
         let mut out = [Datum::Null; 2];
         assert!(decode(&buffer, &[ColType::Int4, ColType::Int4], &mut out).is_err());
+    }
+
+    #[test]
+    fn payload_decode_keeps_only_the_selected_value() {
+        let values = [Datum::Int4(7), Datum::Text("selected")];
+        let schema = [ColType::Int4, ColType::Text];
+        let mut row = vec![0; encoded_len(&values)];
+        encode(&values, &mut row);
+        let mut payloads = [&[][..]; MAX_COLUMNS];
+        let mut nulls = [false; MAX_COLUMNS];
+        encoded_columns(&row, &schema, &mut payloads, &mut nulls).unwrap();
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "row payload", 1 << 12).unwrap();
+        assert_eq!(
+            decode_payload(payloads[1], schema[1], &arena).unwrap(),
+            values[1]
+        );
     }
 }

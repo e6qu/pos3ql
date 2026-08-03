@@ -5,7 +5,7 @@
 # instruments that binary too, which is what takes the figure to ~80%.
 #
 # The external suite is sharded across parallel jobs so that no job runs past
-# 20 minutes: each coverage shard measures its slice strictly, exports an lcov
+# 15 minutes: each coverage shard measures its slice strictly, exports an lcov
 # tracefile, and the merge job unions the tracefiles and holds the floor over
 # the whole. Shard percentages alone are meaningless and never compared. The
 # crash-torture shards are correctness-only (runtest:*): they kill -9 every
@@ -26,10 +26,10 @@ jobs:
   shard:
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # Forced-spill differential currently needs about 14 minutes to build,
-    # execute both 84-corpus passes, and render LCOV. Leave enough room for
-    # runner variance and artifact upload after the measurement succeeds.
-    timeout-minutes: 20
+    # Each differential storage mode has its own shard. This keeps its build,
+    # corpus replay, profile rendering, and artifact upload within the same
+    # hard ceiling as every other PR job.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +49,7 @@ jobs:
           # independent seeds rather than one 12-round run.
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
+          - { name: diff, shard: "run:diff" }
           - { name: spilldiff, shard: "run:spilldiff" }
           - { name: spill-correctness, shard: "runtest:overlay,ingest,tls" }
           - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }

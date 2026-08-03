@@ -41,6 +41,9 @@ jobs:
       - name: BUGS.md discipline guard
         run: zsh tools/check-bugs.sh
 
+      - name: CI timeout guard
+        run: zsh tools/check-ci-timeouts.sh
+
       - name: Set up Node (for the duplicate-code guard)
         uses: actions/setup-node@v6
         with:

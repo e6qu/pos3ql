@@ -881,7 +881,7 @@ The cold external-run regression builds its fixed 3,000-row input in thirty
 arena-bounded set transactions and publishes it with its explicit checkpoint:
 its purpose is the 1.5 MiB object-resident sort, DISTINCT, and membership path,
 not synchronous WAL uploads whose behavior has independent coverage. That keeps
-the aggregate gate focused on its ordinary checks. Three configured bounded CI
+the aggregate gate focused on its ordinary checks. Four configured bounded CI
 phases are the authoritative execution of the cold materialization assertions:
 cold read/sort/membership, recursive execution, lateral/outer execution, and
 set/nested/retaining execution.
@@ -891,6 +891,11 @@ but distributes independent seeds over four bounded workers. The merge gate
 therefore targets five minutes rather than serially multiplying every
 checkpoint/restart/verification cost, with a 15-minute hard ceiling for
 runner variance.
+
+Coverage likewise runs the plain and forced-spill differential suites in
+separate authoritative shards. Each produces one LCOV trace and the merge gate
+unions both, retaining the complete measurement while keeping every PR job
+inside the same 15-minute ceiling.
 
 Crash recovery binds its TCP listener with `SO_REUSEADDR` before the address
 is claimed, and its pre-restart harness probe uses the identical bind

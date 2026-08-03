@@ -21,7 +21,8 @@ use super::plan::where_passes;
 use super::subquery::merge_correlated;
 use super::{
     JoinRow, MAX_AGGS, MAX_SUBQUERIES, Outcome, QueryScope, ScopeSchema, arena_full,
-    expr_contains_node, resolve_order_target, scan_source, scan_source_recycling, sql_fail, sql_ok,
+    expr_contains_node, resolve_order_target, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, single_table_pax_columns, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -116,6 +117,7 @@ pub(super) fn groups_for_mask<'a>(
     order_exprs: &[Option<&'a Expr<'a>>],
     width: usize,
     n_order: usize,
+    pax_columns: Option<&[bool; crate::storage::MAX_COLUMNS]>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     // WHERE with correlated subqueries is applied per row in the callbacks.
@@ -139,7 +141,7 @@ pub(super) fn groups_for_mask<'a>(
         let mut compare =
             |a: &[u8], b: &[u8]| Ok(crate::sql::exec::compare_projected_prefix(a, b, n_keys));
         let mut at = 0u32;
-        scan_source_recycling(
+        scan_source_recycling_with_pax_columns(
             storage,
             scope,
             from,
@@ -149,6 +151,7 @@ pub(super) fn groups_for_mask<'a>(
             params,
             hooks,
             outer,
+            pax_columns,
             &mut |row| {
                 if !row_passes_correlated_where(
                     correlated,
@@ -263,7 +266,7 @@ pub(super) fn groups_for_mask<'a>(
             .map_err(|_| arena_full())?;
         if n_keys > 0 {
             let mut at = 0usize;
-            scan_source(
+            scan_source_with_pax_columns(
                 storage,
                 scope,
                 from,
@@ -273,6 +276,7 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 hooks,
                 outer,
+                pax_columns,
                 &mut |row| {
                     if !row_passes_correlated_where(
                         correlated,
@@ -439,12 +443,32 @@ pub(super) fn groups_for_mask<'a>(
             Ok(true)
         };
         if recycling_safe {
-            scan_source_recycling(
-                storage, scope, from, txid, scan_where, arena, params, hooks, outer, &mut visit,
+            scan_source_recycling_with_pax_columns(
+                storage,
+                scope,
+                from,
+                txid,
+                scan_where,
+                arena,
+                params,
+                hooks,
+                outer,
+                pax_columns,
+                &mut visit,
             )?;
         } else {
-            scan_source(
-                storage, scope, from, txid, scan_where, arena, params, hooks, outer, &mut visit,
+            scan_source_with_pax_columns(
+                storage,
+                scope,
+                from,
+                txid,
+                scan_where,
+                arena,
+                params,
+                hooks,
+                outer,
+                pax_columns,
+                &mut visit,
             )?;
         }
     }
@@ -572,6 +596,41 @@ pub(super) fn grouped_rows<'a>(
         return Err(ungrouped_error(column, scope));
     }
 
+    let pax_columns = if correlated.is_empty() {
+        let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_AGGS + 2];
+        let mut count = 0usize;
+        for item in statement.items {
+            let SelectItem::Expr { expression, .. } = item else {
+                unreachable!("grouped stars were expanded and validated")
+            };
+            expressions[count] = expression;
+            count += 1;
+        }
+        for expression in statement.group_by {
+            expressions[count] = expression;
+            count += 1;
+        }
+        for (_, expression) in agg_nodes {
+            expressions[count] = expression;
+            count += 1;
+        }
+        if let Some(predicate) = statement.where_clause {
+            expressions[count] = predicate;
+            count += 1;
+        }
+        if let Some(predicate) = statement.having {
+            expressions[count] = predicate;
+            count += 1;
+        }
+        for order in statement.order_by {
+            expressions[count] = order.expression;
+            count += 1;
+        }
+        single_table_pax_columns(scope, &expressions[..count])
+    } else {
+        None
+    };
+
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
     // with correlated subqueries is applied per row here too, so every pass
     // sees the same filtered sequence.
@@ -581,7 +640,7 @@ pub(super) fn grouped_rows<'a>(
         None
     };
     let mut row_count = 0usize;
-    scan_source_recycling(
+    scan_source_recycling_with_pax_columns(
         storage,
         scope,
         from,
@@ -591,6 +650,7 @@ pub(super) fn grouped_rows<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -677,6 +737,7 @@ pub(super) fn grouped_rows<'a>(
             order_exprs,
             width,
             n_order,
+            pax_columns.as_ref(),
         )?;
         per_set[si] = rows;
         total += rows.len();

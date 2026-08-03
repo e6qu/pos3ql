@@ -873,6 +873,11 @@ dedicated four-worker job is its sole authoritative execution. Running that
 same endurance sweep twice made the aggregate job exceed its 15-minute limit
 after its ordinary unit suite had completed; the dedicated job preserves the
 coverage while the aggregate job remains a fast correctness gate.
+The cold external-run regression builds its fixed 3,000-row input in thirty
+arena-bounded set transactions: its purpose is the 1.5 MiB object-resident
+sort, DISTINCT, and membership path, not 60 repeated synchronous WAL uploads
+whose behavior has independent coverage. That keeps the aggregate gate focused
+on its asserted read-path invariant.
 
 The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
 but distributes independent seeds over four bounded workers. The merge gate

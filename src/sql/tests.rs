@@ -10456,8 +10456,12 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         "CREATE TABLE external_rows (id int PRIMARY KEY, payload text)",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
-    for start in (1..=3000).step_by(50) {
-        let end = start + 49;
+    // Thirty arena-bounded set inserts establish the complete external-run
+    // input. Splitting it into 60 synchronous WAL commits only tests the
+    // already-covered upload loop and makes this cold-sort regression depend
+    // on that latency.
+    for start in (1..=3000).step_by(100) {
+        let end = start + 99;
         let inserted = run_with(
             &mut engine,
             &mut budget,
@@ -10469,7 +10473,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         );
         assert!(
             !String::from_utf8_lossy(&inserted).contains("ERROR"),
-            "rows {start}..={end}: {}",
+            "external-run input {start}..={end}: {}",
             String::from_utf8_lossy(&inserted)
         );
     }

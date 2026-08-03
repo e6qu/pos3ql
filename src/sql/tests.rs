@@ -10477,274 +10477,291 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget = Budget::new((1 << 28) + (96 << 20));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
-    let before = restarted.storage.block_io_stats();
-    let ordered = run_with(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT id FROM external_rows ORDER BY payload DESC LIMIT 10",
-    );
-    assert_eq!(
-        data_rows(&ordered),
-        [
-            "3000", "2999", "2998", "2997", "2996", "2995", "2994", "2993", "2992", "2991"
-        ],
-        "{}",
-        String::from_utf8_lossy(&ordered),
-    );
-    let traffic = restarted.storage.block_io_stats().saturating_sub(before);
-    assert!(
-        traffic.object_gets > 0 && traffic.object_puts > 0,
-        "cold input and external runs must cross the durable block boundary: {traffic:?}"
-    );
+    let phase = match std::env::var("POS3QL_EXTERNAL_RUN_PHASE").as_deref() {
+        Ok("cold") => "cold",
+        Ok("recursive") => "recursive",
+        Ok("set") => "set",
+        Err(std::env::VarError::NotPresent) => "all",
+        Ok(other) => panic!("unknown external-run phase: {other}"),
+        Err(error) => panic!("cannot read external-run phase: {error}"),
+    };
 
-    assert_eq!(
-        data_rows(&run_with(
+    if phase == "all" || phase == "cold" {
+        let before = restarted.storage.block_io_stats();
+        let ordered = run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT DISTINCT ON (id % 10) id % 10, id \
+            "SELECT id FROM external_rows ORDER BY payload DESC LIMIT 10",
+        );
+        assert_eq!(
+            data_rows(&ordered),
+            [
+                "3000", "2999", "2998", "2997", "2996", "2995", "2994", "2993", "2992", "2991"
+            ],
+            "{}",
+            String::from_utf8_lossy(&ordered),
+        );
+        let traffic = restarted.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            traffic.object_gets > 0 && traffic.object_puts > 0,
+            "cold input and external runs must cross the durable block boundary: {traffic:?}"
+        );
+
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT DISTINCT ON (id % 10) id % 10, id \
              FROM external_rows ORDER BY id % 10, id DESC",
-        )),
-        [
-            "0|3000", "1|2991", "2|2992", "3|2993", "4|2994", "5|2995", "6|2996", "7|2997",
-            "8|2998", "9|2999"
-        ]
-    );
-    assert_eq!(
-        data_rows(&run_with(
+            )),
+            [
+                "0|3000", "1|2991", "2|2992", "3|2993", "4|2994", "5|2995", "6|2996", "7|2997",
+                "8|2998", "9|2999"
+            ]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT DISTINCT id % 17 FROM external_rows",
+            )),
+            [
+                "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
+                "15", "16"
+            ]
+        );
+        let before_membership = restarted.storage.block_io_stats();
+        let membership = run_with_arena_bytes(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT DISTINCT id % 17 FROM external_rows",
-        )),
-        [
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
-            "16"
-        ]
-    );
-    let before_membership = restarted.storage.block_io_stats();
-    let membership = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT 1 WHERE lpad('1', 512, '0') IN \
+            "SELECT 1 WHERE lpad('1', 512, '0') IN \
          (SELECT payload FROM external_rows)",
-        256 << 10,
-    );
-    assert_eq!(
-        data_rows(&membership),
-        ["1"],
-        "a subquery list larger than the arena must remain probeable: {}",
-        String::from_utf8_lossy(&membership)
-    );
-    let membership_traffic = restarted
-        .storage
-        .block_io_stats()
-        .saturating_sub(before_membership);
-    assert!(
-        membership_traffic.object_puts > 0 && membership_traffic.object_gets > 0,
-        "subquery membership must spool and probe the provider-neutral run: {membership_traffic:?}"
-    );
-    assert_eq!(
-        data_rows(&run_with_arena_bytes(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT 1
+            256 << 10,
+        );
+        assert_eq!(
+            data_rows(&membership),
+            ["1"],
+            "a subquery list larger than the arena must remain probeable: {}",
+            String::from_utf8_lossy(&membership)
+        );
+        let membership_traffic = restarted
+            .storage
+            .block_io_stats()
+            .saturating_sub(before_membership);
+        assert!(
+            membership_traffic.object_puts > 0 && membership_traffic.object_gets > 0,
+            "subquery membership must spool and probe the provider-neutral run: {membership_traffic:?}"
+        );
+        assert_eq!(
+            data_rows(&run_with_arena_bytes(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT 1
              WHERE ROW(1, lpad('1', 512, '0')) IN
                    (SELECT id, payload FROM external_rows WHERE id <= 2)",
-            256 << 10,
-        )),
-        ["1"],
-        "a rewritten row-valued subquery must remain a single record in its external run"
-    );
-    assert_eq!(
-        data_rows(&run_with_arena_bytes(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT 1 WHERE 3001 IN (
+                256 << 10,
+            )),
+            ["1"],
+            "a rewritten row-valued subquery must remain a single record in its external run"
+        );
+        assert_eq!(
+            data_rows(&run_with_arena_bytes(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT 1 WHERE 3001 IN (
                  SELECT id FROM external_rows
                  UNION ALL
                  VALUES (3001)
              )",
+                256 << 10,
+            )),
+            ["1"],
+            "set-operation membership must probe the external run"
+        );
+        let scalar = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT length((SELECT payload FROM external_rows WHERE id > 0 LIMIT 1))",
             256 << 10,
-        )),
-        ["1"],
-        "set-operation membership must probe the external run"
-    );
-    let scalar = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT length((SELECT payload FROM external_rows WHERE id > 0 LIMIT 1))",
-        256 << 10,
-    );
-    assert_eq!(
-        data_rows(&scalar),
-        ["512"],
-        "LIMIT must stop an externally spooled scalar subquery before its cardinality check"
-    );
-    let updated = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "UPDATE external_rows SET payload = payload \
+        );
+        assert_eq!(
+            data_rows(&scalar),
+            ["512"],
+            "LIMIT must stop an externally spooled scalar subquery before its cardinality check"
+        );
+    }
+
+    if phase == "all" || phase == "recursive" {
+        let updated = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "UPDATE external_rows SET payload = payload \
          WHERE id = 1 AND id IN (SELECT id FROM external_rows)",
-        256 << 10,
-    );
-    assert!(
-        !String::from_utf8_lossy(&updated).contains("ERROR"),
-        "DML must keep its object-run probe after releasing the immutable Storage borrow: {}",
-        String::from_utf8_lossy(&updated)
-    );
-    let before_recursive = restarted.storage.block_io_stats();
-    let recursive = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "WITH RECURSIVE r(id, payload) AS (
+            256 << 10,
+        );
+        assert!(
+            !String::from_utf8_lossy(&updated).contains("ERROR"),
+            "DML must keep its object-run probe after releasing the immutable Storage borrow: {}",
+            String::from_utf8_lossy(&updated)
+        );
+        let before_recursive = restarted.storage.block_io_stats();
+        let recursive = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "WITH RECURSIVE r(id, payload) AS (
              SELECT id, payload FROM external_rows
              UNION ALL
              SELECT id, payload FROM r WHERE false
          )
          SELECT count(*) FROM r",
-        256 << 10,
-    );
-    assert_eq!(
-        data_rows(&recursive),
-        ["3000"],
-        "the recursive all/work tables must outgrow the arena: {}",
-        String::from_utf8_lossy(&recursive)
-    );
-    assert!(
-        restarted
-            .storage
-            .block_io_stats()
-            .saturating_sub(before_recursive)
-            .object_puts
-            > 0,
-        "recursive work tables must be immutable object-backed runs"
-    );
-    let lateral = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT 1
+            256 << 10,
+        );
+        assert_eq!(
+            data_rows(&recursive),
+            ["3000"],
+            "the recursive all/work tables must outgrow the arena: {}",
+            String::from_utf8_lossy(&recursive)
+        );
+        assert!(
+            restarted
+                .storage
+                .block_io_stats()
+                .saturating_sub(before_recursive)
+                .object_puts
+                > 0,
+            "recursive work tables must be immutable object-backed runs"
+        );
+        let lateral = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT 1
          FROM (VALUES (1)) AS seed(n)
          CROSS JOIN LATERAL (
              SELECT payload FROM external_rows
          ) AS expanded
          WHERE expanded.payload IS NULL",
-        256 << 10,
-    );
-    assert!(
-        data_rows(&lateral).is_empty(),
-        "lateral spooling changed the empty result: {}",
-        String::from_utf8_lossy(&lateral)
-    );
-    let lateral_function = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT generated.n
+            256 << 10,
+        );
+        assert!(
+            data_rows(&lateral).is_empty(),
+            "lateral spooling changed the empty result: {}",
+            String::from_utf8_lossy(&lateral)
+        );
+        let lateral_function = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT generated.n
          FROM (VALUES (5000)) AS seed(stop)
          CROSS JOIN LATERAL generate_series(1, seed.stop) AS generated(n)
          WHERE generated.n < 0",
-        256 << 10,
-    );
-    assert!(
-        data_rows(&lateral_function).is_empty(),
-        "lateral SRF spooling changed the empty result: {}",
-        String::from_utf8_lossy(&lateral_function)
-    );
-    let outer_join = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT right_side.id
+            256 << 10,
+        );
+        assert!(
+            data_rows(&lateral_function).is_empty(),
+            "lateral SRF spooling changed the empty result: {}",
+            String::from_utf8_lossy(&lateral_function)
+        );
+        let outer_join = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT right_side.id
          FROM (
              SELECT id FROM external_rows WHERE id = 1
          ) AS left_side
          RIGHT JOIN external_rows AS right_side
            ON left_side.id = right_side.id
          WHERE left_side.id IS NULL AND right_side.id < 0",
-        256 << 10,
-    );
-    assert!(
-        data_rows(&outer_join).is_empty(),
-        "the external RIGHT JOIN match map lost matches: {}",
-        String::from_utf8_lossy(&outer_join)
-    );
-    let union_output = run_with(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT id FROM external_rows WHERE id <= 4
+            256 << 10,
+        );
+        assert!(
+            data_rows(&outer_join).is_empty(),
+            "the external RIGHT JOIN match map lost matches: {}",
+            String::from_utf8_lossy(&outer_join)
+        );
+    }
+
+    if phase == "all" || phase == "set" {
+        let union_output = run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM external_rows WHERE id <= 4
              UNION
              SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
              ORDER BY id DESC",
-    );
-    assert_eq!(
-        data_rows(&union_output),
-        ["6", "5", "4", "3", "2", "1"],
-        "UNION must merge and deduplicate provider-neutral runs: {}",
-        String::from_utf8_lossy(&union_output)
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT id FROM external_rows WHERE id <= 4
+        );
+        assert_eq!(
+            data_rows(&union_output),
+            ["6", "5", "4", "3", "2", "1"],
+            "UNION must merge and deduplicate provider-neutral runs: {}",
+            String::from_utf8_lossy(&union_output)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT id FROM external_rows WHERE id <= 4
              INTERSECT ALL
              SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
              ORDER BY id",
-        )),
-        ["3", "4"],
-        "INTERSECT ALL must merge external multisets"
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT id FROM external_rows WHERE id <= 4
+            )),
+            ["3", "4"],
+            "INTERSECT ALL must merge external multisets"
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT id FROM external_rows WHERE id <= 4
              EXCEPT
              SELECT id FROM external_rows WHERE id BETWEEN 3 AND 6
              ORDER BY id",
-        )),
-        ["1", "2"],
-        "EXCEPT must merge external multisets"
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut restarted,
-            &mut restarted_budget,
-            "SELECT id FROM \
+            )),
+            ["1", "2"],
+            "EXCEPT must merge external multisets"
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT id FROM \
              (SELECT id, payload FROM external_rows ORDER BY payload DESC) AS materialized \
              ORDER BY id LIMIT 10",
-        )),
-        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
-        "a nested consumer must stream its immutable child run while building its own"
-    );
-    let created = run_with_arena_bytes(
-        &mut restarted,
-        &mut restarted_budget,
-        "CREATE TABLE external_copy AS \
+            )),
+            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+            "a nested consumer must stream its immutable child run while building its own"
+        );
+        let created = run_with_arena_bytes(
+            &mut restarted,
+            &mut restarted_budget,
+            "CREATE TABLE external_copy AS \
          SELECT id, payload FROM \
          (SELECT id, payload FROM external_rows ORDER BY payload DESC) AS materialized \
          ORDER BY id LIMIT 10",
-        1 << 20,
-    );
-    assert!(
-        !String::from_utf8_lossy(&created).contains("ERROR"),
-        "{}",
-        String::from_utf8_lossy(&created)
-    );
-    assert_eq!(
-        data_rows(&run_with(
+            1 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT id FROM external_copy ORDER BY id",
+            )),
+            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+            "a retaining consumer must outlive recycled evaluator scratch"
+        );
+        let ties = data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT id FROM external_copy ORDER BY id",
-        )),
-        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
-        "a retaining consumer must outlive recycled evaluator scratch"
-    );
-    let ties = data_rows(&run_with(
-        &mut restarted,
-        &mut restarted_budget,
-        "SELECT id / 1000 FROM external_rows \
+            "SELECT id / 1000 FROM external_rows \
          ORDER BY id / 1000 FETCH FIRST 1 ROW WITH TIES",
-    ));
-    assert_eq!(ties.len(), 999);
-    assert!(ties.iter().all(|value| value == "0"));
+        ));
+        assert_eq!(ties.len(), 999);
+        assert!(ties.iter().all(|value| value == "0"));
+    }
 
     drop(restarted);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);

@@ -881,8 +881,10 @@ The cold external-run regression builds its fixed 3,000-row input in thirty
 arena-bounded set transactions and publishes it with its explicit checkpoint:
 its purpose is the 1.5 MiB object-resident sort, DISTINCT, and membership path,
 not synchronous WAL uploads whose behavior has independent coverage. That keeps
-the aggregate gate focused on its ordinary checks; its own bounded CI job is
-the authoritative execution of the cold materialization assertion.
+the aggregate gate focused on its ordinary checks. Three configured bounded CI
+phases are the authoritative execution of the cold materialization assertions:
+cold read/sort/membership, recursive/lateral/outer execution, and
+set/nested/retaining execution.
 
 The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
 but distributes independent seeds over four bounded workers. The merge gate

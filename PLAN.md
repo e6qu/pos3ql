@@ -763,6 +763,12 @@ provider-neutral telemetry vector counts RAM hits/misses, disk hits/misses,
 and object GET/PUT/contains operations at the `BlockStore` boundary; no
 planner code knows an S3, MinIO, Google Cloud Storage, or Azure implementation.
 
+Two-table equi-joins now select one explicit physical plan before execution:
+an arena-bounded hash plan when compatible keys and the `reltuples` build
+estimate fit its fixed capacity, otherwise the ordinary nested-loop plan. A
+selected hash plan never changes strategy while running; a stale estimate that
+overfills its table raises 54000 loudly.
+
 `EXPLAIN` now prints the real bounded plan for SELECT, set operations, and
 data modification in text, JSON, XML, or YAML. `ANALYZE`, `VERBOSE`, `COSTS`,
 `BUFFERS`, `WAL`, `TIMING`, `SUMMARY`, `MEMORY`, `SERIALIZE`, `SETTINGS`, and

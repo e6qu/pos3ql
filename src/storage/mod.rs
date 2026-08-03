@@ -2513,6 +2513,7 @@ const EXTERNAL_RUN_CONTEXTS: usize = 8;
 struct ScanContext {
     owner: u64,
     member_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
+    member_raw_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
     index_buf: Box<[u8]>,
 }
 
@@ -2529,6 +2530,13 @@ struct MemberCursor {
     /// and how many bytes of it are the block (the buffer is oversized).
     loaded: Option<usize>,
     loaded_len: usize,
+    raw_len: usize,
+    raw_row: usize,
+    head_raw_row: usize,
+    pax_layout: Option<crate::store::PaxLayout>,
+    pax_value_cursors: [usize; MAX_COLUMNS],
+    head_pax_values: [Option<(usize, usize)>; MAX_COLUMNS],
+    loaded_type: Option<crate::store::BlockType>,
     prefetched_leaf: Option<(usize, crate::store::BlockId)>,
     prefetched_data: Option<(usize, crate::store::BlockId)>,
     /// The head entry, parsed as one immutable row-version key.
@@ -2571,7 +2579,7 @@ impl SpillReader {
         )?;
         budget.draw(
             SCAN_CONTEXTS
-                * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                * ((2 * MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>()),
             "row-state walk contexts",
         )?;
@@ -2613,6 +2621,9 @@ impl SpillReader {
                 member_blocks: core::array::from_fn(|_| {
                     vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice()
                 }),
+                member_raw_blocks: core::array::from_fn(|_| {
+                    vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice()
+                }),
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
         };
@@ -2641,7 +2652,7 @@ impl SpillReader {
     pub(crate) fn budget_bytes() -> usize {
         2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS
-                * ((MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                * ((2 * MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
             + 4 * crate::store::MAX_PAYLOAD
             + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
@@ -5403,6 +5414,13 @@ impl Storage {
             head_offset: 0,
             loaded: None,
             loaded_len: 0,
+            raw_len: 0,
+            raw_row: 0,
+            head_raw_row: 0,
+            pax_layout: None,
+            pax_value_cursors: [0; MAX_COLUMNS],
+            head_pax_values: [None; MAX_COLUMNS],
+            loaded_type: None,
             prefetched_leaf: None,
             prefetched_data: None,
             head: None,
@@ -5449,6 +5467,7 @@ impl Storage {
                 for cursor in &mut cursors[..n] {
                     cursor.loaded = None;
                     cursor.loaded_len = 0;
+                    cursor.loaded_type = None;
                 }
                 context.owner = walk_id;
             }
@@ -5522,6 +5541,13 @@ impl Storage {
             head_offset: 0,
             loaded: None,
             loaded_len: 0,
+            raw_len: 0,
+            raw_row: 0,
+            head_raw_row: 0,
+            pax_layout: None,
+            pax_value_cursors: [0; MAX_COLUMNS],
+            head_pax_values: [None; MAX_COLUMNS],
+            loaded_type: None,
             prefetched_leaf: None,
             prefetched_data: None,
             head: None,
@@ -5566,6 +5592,12 @@ impl Storage {
                 for cursor in &mut cursors[..n] {
                     cursor.loaded = None;
                     cursor.loaded_len = 0;
+                    cursor.raw_len = 0;
+                    cursor.raw_row = 0;
+                    cursor.head_raw_row = 0;
+                    cursor.pax_layout = None;
+                    cursor.pax_value_cursors = [0; MAX_COLUMNS];
+                    cursor.head_pax_values = [None; MAX_COLUMNS];
                 }
                 context.owner = walk_id;
             }
@@ -5821,23 +5853,75 @@ impl Storage {
                     }
                     id
                 };
-                cursor.loaded_len = crate::store::read_data_block(
+                let (loaded_len, loaded_type, raw_len) = crate::store::read_data_block_with_type(
                     &mut *blocks,
                     &id,
                     &mut context.member_blocks[member],
                     &mut context.index_buf,
+                    Some(&mut context.member_raw_blocks[member]),
                 )
                 .map_err(spill_read_error)?;
+                cursor.loaded_len = loaded_len;
+                cursor.raw_len = raw_len;
+                cursor.raw_row = 0;
+                cursor.pax_layout = (loaded_type == crate::store::BlockType::SstDataPaxV1)
+                    .then(|| {
+                        crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len])
+                    })
+                    .transpose()
+                    .map_err(spill_read_error)?;
+                cursor.pax_value_cursors = cursor
+                    .pax_layout
+                    .as_ref()
+                    .map_or([0; MAX_COLUMNS], crate::store::PaxLayout::column_starts);
+                cursor.head_pax_values = [None; MAX_COLUMNS];
+                cursor.loaded_type = Some(loaded_type);
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
             let head_offset = cursor.offset;
+            if cursor.loaded_type.is_none() || cursor.raw_len == 0 {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "spill cursor advanced without a complete loaded block state"
+                ));
+            }
             match crate::store::block_keys_at(
                 &context.member_blocks[member][..cursor.loaded_len],
                 head_offset,
                 handle.versioned,
             ) {
                 Some((key, tombstone, len, next)) => {
+                    if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+                        let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "PAX block has no validated layout"
+                            )
+                        })?;
+                        let (raw_key, raw_tombstone) = layout
+                            .row_key(
+                                &context.member_raw_blocks[member][..cursor.raw_len],
+                                cursor.raw_row,
+                            )
+                            .map_err(spill_read_error)?;
+                        if raw_key != key || raw_tombstone != tombstone {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "PAX cursor metadata diverges from canonical SST entry"
+                            ));
+                        }
+                        layout
+                            .advance_row_values(
+                                &context.member_raw_blocks[member][..cursor.raw_len],
+                                cursor.raw_row,
+                                &mut cursor.pax_value_cursors,
+                                &mut cursor.head_pax_values,
+                            )
+                            .map_err(spill_read_error)?;
+                        cursor.head_raw_row = cursor.raw_row;
+                        cursor.raw_row += 1;
+                    }
                     cursor.offset = next;
                     cursor.head_offset = head_offset;
                     cursor.head = Some((key, tombstone, len));

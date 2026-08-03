@@ -14,7 +14,10 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
 
-use super::{Chained, MAX_AGGS, QueryScope, arena_full, scan_source, scan_source_recycling};
+use super::{
+    Chained, MAX_AGGS, QueryScope, arena_full, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, single_table_pax_columns,
+};
 
 struct JsonAggregateDisplay<'a> {
     values: &'a [Datum<'a>],
@@ -82,6 +85,16 @@ pub(crate) fn fold_aggregates<'a>(
     let recycling_safe = states[..agg_nodes.len()]
         .iter()
         .all(AggState::recycling_safe);
+    let mut expressions = [&Expr::Null; MAX_AGGS + 1];
+    for (index, (_, expression)) in agg_nodes.iter().enumerate() {
+        expressions[index] = expression;
+    }
+    let mut expression_count = agg_nodes.len();
+    if let Some(predicate) = where_clause {
+        expressions[expression_count] = predicate;
+        expression_count += 1;
+    }
+    let pax_columns = single_table_pax_columns(scope, &expressions[..expression_count]);
     let mut visit = |row: &super::JoinRow<'_, 'a, '_>| {
         let chained_row = Chained {
             inner: row,
@@ -93,7 +106,7 @@ pub(crate) fn fold_aggregates<'a>(
         Ok(true)
     };
     if recycling_safe {
-        scan_source_recycling(
+        scan_source_recycling_with_pax_columns(
             storage,
             scope,
             from,
@@ -103,10 +116,11 @@ pub(crate) fn fold_aggregates<'a>(
             params,
             hooks,
             outer_arg,
+            pax_columns.as_ref(),
             &mut visit,
         )?;
     } else {
-        scan_source(
+        scan_source_with_pax_columns(
             storage,
             scope,
             from,
@@ -116,6 +130,7 @@ pub(crate) fn fold_aggregates<'a>(
             params,
             hooks,
             outer_arg,
+            pax_columns.as_ref(),
             &mut visit,
         )?;
     }

@@ -881,6 +881,10 @@ projections, and order keys determine the physical PAX spans. Correlated
 grouping still retains full rows until it has an equally complete proof.
 Derived row sources now share the direct stream's demand derivation, so nesting
 or a set-operation leaf cannot silently widen a proven one-table PAX scan.
+Plain aggregate folding likewise reads only aggregate arguments and predicate
+columns, including no payload columns at all for `count(*)`.
+Predicate-only EXISTS probes follow the same contract and short-circuit without
+decoding unrelated physical values.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

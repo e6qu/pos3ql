@@ -14,7 +14,7 @@
 # Ways to run it (COVERAGE_SHARD):
 #   - unset — whole suite in one process, the floor enforced at the end. This
 #     is the local command.
-#   - sql / run:<groups> — a coverage shard: its slice runs strictly (a failure
+#   - lib / sql / run:<groups> — a coverage shard: its slice runs strictly (a failure
 #     fails the shard) against an instrumented binary, and the profile is
 #     written as an lcov tracefile to COVERAGE_LCOV instead of being compared to
 #     the floor (one shard's number is meaningless alone). tools/coverage-
@@ -88,7 +88,7 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
 }
 # Coverage-producing shards need a tracefile to merge.
 case "$SHARD" in
-sql | run:*)
+lib | sql | run:*)
     if [ -z "$LCOV_OUT" ]; then
         echo "FAIL: COVERAGE_SHARD=$SHARD is set but COVERAGE_LCOV is not; a"
         echo "      shard's floor-less percentage would vanish without a"
@@ -106,10 +106,10 @@ find target -name '*.profraw' -delete 2>/dev/null || true
 # Everything is measured in the release profile so that the unit tests and the
 # server binary the external suites drive produce profiles against the same
 # objects; mixing profiles makes llvm-cov fail to find one of them.
-# The in-process tests belong to the sql shard; the run:* shards measure only
-# the server binary their external steps drive.
+# The in-process tests have their own trace shard so their growing runtime
+# cannot consume the differential shard's server-build budget.
 case "$SHARD" in
-"" | sql)
+"" | lib)
     echo "=== in-process tests ==="
     cargo test --lib --release 2>&1 | grep -E '^test result' | tail -1
     ;;
@@ -117,6 +117,13 @@ esac
 # The in-process tests' profiles are the baseline; the external suites must
 # add server profiles on top.
 LIB_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "$SHARD" = "lib" ]; then
+    echo "=== lcov tracefile ==="
+    cargo llvm-cov report --release --lcov --output-path "$LCOV_OUT"
+    echo "wrote $LCOV_OUT"
+    exit 0
+fi
 
 echo "=== building the instrumented server ==="
 # Cargo does not always re-fingerprint on RUSTC_WRAPPER alone, so an existing
@@ -210,7 +217,7 @@ run:*)
     write_lcov
     ;;
 *)
-    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected sql, run:<groups> or runtest:<groups>)"
+    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected lib, sql, run:<groups> or runtest:<groups>)"
     exit 1
     ;;
 esac

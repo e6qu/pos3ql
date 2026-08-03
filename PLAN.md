@@ -867,10 +867,11 @@ rebuilding only its selected winning row rather than every row in the fetched
 group. The batch seam now carries a tagged row representation too: a legacy
 row-packed group carries its canonical bytes, while a PAX winner packs its
 validated physical spans once into statement-owned row storage before decoding
-them into values. A plain one-table streaming SELECT now derives its complete
-physical demand from projection expressions plus its in-scan WHERE predicate:
-only those PAX spans are copied and decoded, while stars, joins, derived rows,
-outer references, correlated predicates, and materializing paths retain full
+them into values. A one-table SELECT now derives its complete physical demand
+from projection expressions, its in-scan WHERE predicate, and materialized
+ORDER BY/DISTINCT keys: direct scans and materialization without deferred
+projection copy and decode only those PAX spans. Stars, joins, derived rows,
+outer references, correlated predicates, and deferred projections retain full
 rows until they carry an equally complete demand proof. The remaining
 late-materialization work is to feed those selected spans into the packed range
 container, so a survivor need not fetch every payload.
@@ -884,6 +885,10 @@ dedicated four-worker job is its sole authoritative execution. Running that
 same endurance sweep twice made the aggregate job exceed its 15-minute limit
 after its ordinary unit suite had completed; the dedicated job preserves the
 coverage while the aggregate job remains a fast correctness gate.
+The instrumented library suite and the server-side SQL differential corpus now
+produce separate `lib` and `sql` coverage tracefiles: neither can consume the
+other's bounded runtime, and the existing merge gate unions both before holding
+the coverage floor.
 The cold external-run regression builds its fixed 3,000-row input in thirty
 arena-bounded set transactions and publishes it with its explicit checkpoint:
 its purpose is the 1.5 MiB object-resident sort, DISTINCT, and membership path,

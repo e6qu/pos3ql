@@ -42,7 +42,7 @@ pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, scan_source, scan_source_recycling, scan_source_recycling_with_pax_columns,
-    single_table_pax_columns,
+    scan_source_with_pax_columns, single_table_pax_columns,
 };
 
 mod scope;

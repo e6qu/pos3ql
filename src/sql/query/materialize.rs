@@ -22,8 +22,9 @@ use crate::{sql_err, stack_format};
 use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
     correlated_in_expression, correlated_where_passes, find_srf, merge_correlated, postpone_cost,
-    project_row_skipping, record_star_width, resolve_order_target, scan_source,
-    scan_source_recycling, sql_fail, sql_ok, srf_max_count,
+    project_row_skipping, record_star_width, resolve_order_target,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, single_table_pax_columns,
+    sql_fail, sql_ok, srf_max_count,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -427,6 +428,42 @@ fn prepare_materialization<'a>(
     })
 }
 
+/// The physical PAX columns that a non-deferred materialization can observe.
+///
+/// A deferred projection serializes the complete source row to evaluate after
+/// sorting, and a correlated predicate evaluates outside the scan. Neither
+/// shape has a complete demand set at the scan boundary.
+fn materialization_pax_columns<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    plan: &MaterializationPlan<'a>,
+) -> Option<[bool; crate::storage::MAX_COLUMNS]> {
+    if plan.any_postponed || plan.n_where_correlated != 0 {
+        return None;
+    }
+
+    let mut expressions = [&Expr::Null; MAX_PROJ * 2 + 1];
+    let mut count = 0usize;
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expressions[count] = expression;
+                count += 1;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
+        }
+    }
+    if let Some(predicate) = plan.where_in_scan {
+        expressions[count] = predicate;
+        count += 1;
+    }
+    for expression in plan.order_exprs.iter().take(plan.n_keys) {
+        expressions[count] = expression.expect("resolved");
+        count += 1;
+    }
+    single_table_pax_columns(scope, &expressions[..count])
+}
+
 /// The row-producing half of DISTINCT / ORDER BY execution: materialize
 /// projected rows (with hidden ORDER BY key columns), dedupe on the visible
 /// prefix for DISTINCT, and sort by the hidden keys. Returns `(rows, width)`;
@@ -447,6 +484,7 @@ pub(crate) fn materialized_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let pax_columns = materialization_pax_columns(statement, scope, &plan);
     let MaterializationPlan {
         n_order,
         n_on,
@@ -473,7 +511,7 @@ pub(crate) fn materialized_rows<'a>(
     // items are exactly the ones PostgreSQL does not evaluate below the Sort,
     // so they are skipped here too.
     let mut count = 0usize;
-    scan_source(
+    scan_source_with_pax_columns(
         storage,
         scope,
         from,
@@ -483,6 +521,7 @@ pub(crate) fn materialized_rows<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             for_each_materialized_projection(
                 storage,
@@ -520,7 +559,7 @@ pub(crate) fn materialized_rows<'a>(
     // Pass 2: project + keys, encode.
     {
         let mut at = 0usize;
-        scan_source(
+        scan_source_with_pax_columns(
             storage,
             scope,
             from,
@@ -530,6 +569,7 @@ pub(crate) fn materialized_rows<'a>(
             params,
             hooks,
             outer,
+            pax_columns.as_ref(),
             &mut |row| {
                 for_each_materialized_projection(
                     storage,
@@ -924,12 +964,13 @@ pub(crate) fn external_materialized_into<'a>(
     emit: &mut ExternalRowEmitter<'_>,
 ) -> Result<u64, SqlError> {
     let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let pax_columns = materialization_pax_columns(statement, scope, &plan);
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         compare_materialized_rows(statement, plan.width, plan.n_order, plan.n_on, left, right)
     };
-    let scan = scan_source_recycling(
+    let scan = scan_source_recycling_with_pax_columns(
         storage,
         scope,
         from,
@@ -939,6 +980,7 @@ pub(crate) fn external_materialized_into<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             let mark = arena.mark();
             let result = for_each_materialized_projection(

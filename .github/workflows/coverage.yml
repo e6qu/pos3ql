@@ -34,9 +34,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The coverage shards (run:* / sql) are the ones whose work lands on a
-          # server that shuts down gracefully and flushes a profile — sql's
-          # in-process tests + differential corpora, wire-durability on the
+          # The coverage shards (lib / run:* / sql) are the ones whose work
+          # lands on a process that exits gracefully and flushes a profile —
+          # lib measures the in-process tests, sql measures the differential
+          # corpus, and wire-durability runs on the
           # base-port server run.sh stops at cleanup, and diff/spilldiff on
           # the differential harness's own server. Everything else runs
           # uninstrumented for correctness only (runtest:*, several times
@@ -47,6 +48,7 @@ jobs:
           # everything. Their line coverage is carried by the coverage shards;
           # what they add here is that they *run and pass*. Torture depth is two
           # independent seeds rather than one 12-round run.
+          - { name: lib, shard: "lib" }
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
           - { name: diff, shard: "run:diff" }

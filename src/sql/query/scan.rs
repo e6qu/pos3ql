@@ -816,6 +816,38 @@ pub(crate) fn scan_source<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    scan_source_with_pax_columns(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        None,
+        f,
+    )
+}
+
+/// Source scan with an optional complete single-table PAX demand mask.
+/// Omitted columns are represented as NULL and therefore this is valid only
+/// when the caller has proved they cannot be observed downstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_source_with_pax_columns<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_columns: Option<&[bool; MAX_COLUMNS]>,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
     scan_source_mode(
         storage,
         scope,
@@ -827,7 +859,7 @@ pub(crate) fn scan_source<'a>(
         hooks,
         outer,
         false,
-        None,
+        pax_columns,
         f,
     )
 }

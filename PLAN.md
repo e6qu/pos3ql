@@ -868,6 +868,10 @@ group. The remaining late-materialization work is to expose those spans to the
 batched scan/filter/project pipeline and to the packed range container, so
 surviving rows alone require their projected payloads.
 
+An immediately completed asynchronous object GET is retained as a completed
+slot for its eventual consumer, so reactor progress cannot re-advance an
+already finished request.
+
 The aggregate CI test job excludes the extended storage-VOPR test because the
 dedicated four-worker job is its sole authoritative execution. Running that
 same endurance sweep twice made the aggregate job exceed its 15-minute limit

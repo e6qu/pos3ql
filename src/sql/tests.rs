@@ -10526,6 +10526,23 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
         String::from_utf8_lossy(&grouped_result)
     );
     drop(grouped);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut derived_budget = Budget::new(1 << 30);
+    let mut derived = Engine::new(&config, &mut derived_budget).unwrap();
+    let derived_result = run_with_arena_bytes(
+        &mut derived,
+        &mut derived_budget,
+        "SELECT id FROM (SELECT id FROM wide_pax) AS projected WHERE id = 287",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&derived_result),
+        ["287"],
+        "{}",
+        String::from_utf8_lossy(&derived_result)
+    );
+    drop(derived);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

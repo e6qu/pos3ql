@@ -2241,26 +2241,8 @@ pub fn select_query<'a>(
         // from the scan callback. Its complete row demand is therefore known
         // here: projection expressions plus the in-scan WHERE. Every other
         // scan path retains full rows until it proves an equivalent contract.
-        let pax_columns = (n_where_correlated == 0)
-            .then(|| {
-                let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
-                let mut count = 0usize;
-                for item in statement.items {
-                    let expression = match item {
-                        SelectItem::Expr { expression, .. }
-                        | SelectItem::RecordStar(expression) => expression,
-                        SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
-                    };
-                    expressions[count] = expression;
-                    count += 1;
-                }
-                if let Some(where_clause) = where_in_scan {
-                    expressions[count] = where_clause;
-                    count += 1;
-                }
-                single_table_pax_columns(&scope, &expressions[..count])
-            })
-            .flatten();
+        let pax_columns =
+            streaming_pax_columns(&scope, statement.items, where_in_scan, n_where_correlated);
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -3522,8 +3504,10 @@ fn select_into_rows_mode<'a>(
         }
         Ok(produced < stop_after)
     };
+    let pax_columns =
+        streaming_pax_columns(&scope, statement.items, where_in_scan, n_where_correlated);
     if recycle_rows {
-        scan_source_recycling(
+        scan_source_recycling_with_pax_columns(
             storage,
             &scope,
             from,
@@ -3533,10 +3517,11 @@ fn select_into_rows_mode<'a>(
             params,
             &hooks,
             outer,
+            pax_columns.as_ref(),
             &mut visit,
         )
     } else {
-        scan_source(
+        scan_source_with_pax_columns(
             storage,
             &scope,
             from,
@@ -3546,9 +3531,36 @@ fn select_into_rows_mode<'a>(
             params,
             &hooks,
             outer,
+            pax_columns.as_ref(),
             &mut visit,
         )
     }
+}
+
+fn streaming_pax_columns<'a>(
+    scope: &QueryScope<'a>,
+    items: &'a [SelectItem<'a>],
+    where_in_scan: Option<&'a Expr<'a>>,
+    n_where_correlated: usize,
+) -> Option<[bool; crate::storage::MAX_COLUMNS]> {
+    if n_where_correlated != 0 {
+        return None;
+    }
+    let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
+    let mut count = 0usize;
+    for item in items {
+        let expression = match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
+        };
+        expressions[count] = expression;
+        count += 1;
+    }
+    if let Some(where_clause) = where_in_scan {
+        expressions[count] = where_clause;
+        count += 1;
+    }
+    single_table_pax_columns(scope, &expressions[..count])
 }
 
 /// Projects one source row through the select items.

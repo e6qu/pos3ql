@@ -37,8 +37,8 @@ jobs:
           # The coverage shards (run:* / sql) are the ones whose work lands on a
           # server that shuts down gracefully and flushes a profile — sql's
           # in-process tests + differential corpora, wire-durability on the
-          # base-port server run.sh stops at cleanup, and spilldiff on the
-          # differential harness's own server. Everything else runs
+          # base-port server run.sh stops at cleanup, and diff/spilldiff on
+          # the differential harness's own server. Everything else runs
           # uninstrumented for correctness only (runtest:*, several times
           # faster) and stays out of the merge: the spill group kill -9's a side
           # server (overlay) or just iterates the same spill/merge/cold-start

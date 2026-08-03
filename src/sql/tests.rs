@@ -10431,9 +10431,6 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-external-runs-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
-    config.wal_upload = true;
-    config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 16 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
@@ -10454,9 +10451,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
     // Thirty arena-bounded set inserts establish the complete external-run
-    // input. Splitting it into 60 synchronous WAL commits only tests the
-    // already-covered upload loop and makes this cold-sort regression depend
-    // on that latency.
+    // input. The explicit checkpoint below publishes its durable object state.
     for start in (1..=3000).step_by(100) {
         let end = start + 99;
         let inserted = run_with(

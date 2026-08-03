@@ -5673,6 +5673,28 @@ fn hash_join_matches_nested_loop() {
         "INSERT INTO emp VALUES (1,1,'ada'),(2,2,'bob'),(3,1,'cyd'),(4,8,'dee'),(5,NULL,'eve')",
     );
 
+    // EXPLAIN must report the same physical decision as execution. A bare
+    // two-table product has no equi-key and remains the explicit nested-loop
+    // plan instead.
+    let hash_plan = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "EXPLAIN SELECT e.name, d.dep FROM emp e JOIN d ON e.did = d.id",
+    ));
+    assert!(
+        hash_plan.iter().any(|line| line.contains("Hash Join")),
+        "EXPLAIN must expose the selected hash plan: {hash_plan:?}"
+    );
+    let nested_plan = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "EXPLAIN SELECT e.name, d.dep FROM emp e CROSS JOIN d",
+    ));
+    assert!(
+        nested_plan.iter().any(|line| line.contains("Nested Loop")),
+        "EXPLAIN must expose the selected nested-loop plan: {nested_plan:?}"
+    );
+
     // Inner equi-join: duplicates produce every pairing, NULLs and unmatched
     // keys drop out. Every row here was checked against real PostgreSQL.
     let r = data_rows(&run_with(

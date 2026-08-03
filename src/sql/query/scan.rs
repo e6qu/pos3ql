@@ -923,6 +923,69 @@ fn hash_join_keys<'a>(
     }
 }
 
+/// A selected two-table hash implementation. Planning is shared with EXPLAIN
+/// so reported and executed physical join choices remain one decision.
+pub(crate) struct HashJoinPlan<'a> {
+    probe_table: usize,
+    build_table: usize,
+    keys: [(usize, usize); 8],
+    key_count: usize,
+    on: Option<&'a Expr<'a>>,
+    preserves_probe_rows: bool,
+    build_capacity: usize,
+}
+
+/// Selects the hash implementation only when its fixed build table and
+/// equi-key representation can execute this join exactly. Every other shape
+/// selects the ordinary nested-loop implementation before execution.
+pub(crate) fn select_hash_join_plan<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    order: &[usize],
+) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
+    if scope.n != 2 || from.joins.len() != 1 {
+        return Ok(None);
+    }
+    let join = &from.joins[0];
+    if !matches!(
+        join.kind,
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+    ) {
+        return Ok(None);
+    }
+    let probe_table = order[0];
+    let build_table = order[1];
+    if scope.lateral[probe_table]
+        || scope.lateral[build_table]
+        || scope.derived[probe_table].is_some()
+        || scope.derived[build_table].is_some()
+    {
+        return Ok(None);
+    }
+    let on = join.on.or(scope.join_on[0]);
+    let Some((keys, key_count)) =
+        hash_join_keys(scope, on, where_clause, probe_table, build_table)?
+    else {
+        return Ok(None);
+    };
+    const MAX_HASH_ENTRIES: usize = 1 << 15;
+    let build_capacity = storage.planning_row_estimate(scope.slots[build_table]) as usize;
+    if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
+        return Ok(None);
+    }
+    Ok(Some(HashJoinPlan {
+        probe_table,
+        build_table,
+        keys,
+        key_count,
+        on,
+        preserves_probe_rows: matches!(join.kind, JoinKind::Left),
+        build_capacity,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -1046,67 +1109,6 @@ fn scan_source_mode<'a>(
             values,
             rowids: &bound_rowids[..scope.n],
         })
-    }
-
-    struct HashJoinPlan<'a> {
-        probe_table: usize,
-        build_table: usize,
-        keys: [(usize, usize); 8],
-        key_count: usize,
-        on: Option<&'a Expr<'a>>,
-        preserves_probe_rows: bool,
-        build_capacity: usize,
-    }
-
-    /// Selects the hash implementation only when its fixed build table and
-    /// equi-key representation can execute this join exactly. Every other
-    /// shape selects the ordinary nested-loop implementation before execution.
-    fn select_hash_join_plan<'a>(
-        storage: &Storage,
-        scope: &QueryScope<'a>,
-        from: &'a FromClause<'a>,
-        where_clause: Option<&'a Expr<'a>>,
-        order: &[usize],
-    ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
-        if scope.n != 2 || from.joins.len() != 1 {
-            return Ok(None);
-        }
-        let join = &from.joins[0];
-        if !matches!(
-            join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-        ) {
-            return Ok(None);
-        }
-        let probe_table = order[0];
-        let build_table = order[1];
-        if scope.lateral[probe_table]
-            || scope.lateral[build_table]
-            || scope.derived[probe_table].is_some()
-            || scope.derived[build_table].is_some()
-        {
-            return Ok(None);
-        }
-        let on = join.on.or(scope.join_on[0]);
-        let Some((keys, key_count)) =
-            hash_join_keys(scope, on, where_clause, probe_table, build_table)?
-        else {
-            return Ok(None);
-        };
-        const MAX_HASH_ENTRIES: usize = 1 << 15;
-        let build_capacity = storage.planning_row_estimate(scope.slots[build_table]) as usize;
-        if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
-            return Ok(None);
-        }
-        Ok(Some(HashJoinPlan {
-            probe_table,
-            build_table,
-            keys,
-            key_count,
-            on,
-            preserves_probe_rows: matches!(join.kind, JoinKind::Left),
-            build_capacity,
-        }))
     }
 
     /// Executes a previously selected two-table hash plan. Its fixed capacity

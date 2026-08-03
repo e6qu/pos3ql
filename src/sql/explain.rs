@@ -591,6 +591,7 @@ pub(super) fn plan_select(
     let mut total_cost = 0.01f64;
     let mut object_requests = 0u64;
     let mut cache_blocks = 0u64;
+    let mut hash_join = false;
     let mut table_order: [usize; query::MAX_JOIN_TABLES] = core::array::from_fn(|index| index);
     if let Some(scope) = &scope {
         let reorderable = statement.from.as_ref().is_some_and(|from| {
@@ -610,6 +611,16 @@ pub(super) fn plan_select(
             total_cost += scan.total_cost;
             object_requests = object_requests.saturating_add(scan.object_requests);
             cache_blocks = cache_blocks.saturating_add(scan.cache_blocks);
+        }
+        if let Some(from) = statement.from.as_ref() {
+            hash_join = query::select_hash_join_plan(
+                storage,
+                scope,
+                from,
+                statement.where_clause,
+                &table_order[..scope.n],
+            )?
+            .is_some();
         }
     }
 
@@ -638,7 +649,11 @@ pub(super) fn plan_select(
             &mut stages,
             &mut stage_count,
             PlanNode {
-                name: StackStr::from_str("Nested Loop"),
+                name: StackStr::from_str(if hash_join {
+                    "Hash Join"
+                } else {
+                    "Nested Loop"
+                }),
                 total_cost,
                 rows: estimated_rows,
                 width,

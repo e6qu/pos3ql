@@ -10543,6 +10543,40 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
         String::from_utf8_lossy(&derived_result)
     );
     drop(derived);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut aggregate_budget = Budget::new(1 << 30);
+    let mut aggregate = Engine::new(&config, &mut aggregate_budget).unwrap();
+    let aggregate_result = run_with_arena_bytes(
+        &mut aggregate,
+        &mut aggregate_budget,
+        "SELECT (SELECT count(*) FROM wide_pax)",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&aggregate_result),
+        ["300"],
+        "{}",
+        String::from_utf8_lossy(&aggregate_result)
+    );
+    drop(aggregate);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut exists_budget = Budget::new(1 << 30);
+    let mut exists = Engine::new(&config, &mut exists_budget).unwrap();
+    let exists_result = run_with_arena_bytes(
+        &mut exists,
+        &mut exists_budget,
+        "SELECT EXISTS (SELECT 1 FROM wide_pax)",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&exists_result),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&exists_result)
+    );
+    drop(exists);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

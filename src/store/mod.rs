@@ -83,9 +83,9 @@ pub(crate) use object::OwnedObjectStore;
 pub(crate) use sst::{DataBlockLookahead, PaxLayout, SstCursor, SstHandle, SstKey, SstReader};
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{
-    block_keys_at, copy_block_entry_at, data_block_total, locate_data_block,
+    block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block,
     locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block,
-    read_data_block_with_type, take_prefetched_index_first_data,
+    read_data_block_raw, take_prefetched_index_first_data,
 };
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};

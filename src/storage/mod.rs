@@ -5633,17 +5633,47 @@ impl Storage {
                     )
                 })?;
                 let cursor = &cursors[member as usize];
-                let handle = table.spill_ssts[member as usize].expect("cursor member exists");
-                let (key, tombstone, copied) = {
-                    let mut blocks = spill.blocks.borrow_mut();
-                    crate::store::copy_block_entry_at(
-                        &mut *blocks,
-                        &context.member_blocks[member as usize][..cursor.loaded_len],
-                        cursor.head_offset,
-                        handle.versioned,
-                        output,
+                let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "selected spill version has no resident cursor head"
                     )
-                    .map_err(spill_read_error)?
+                })?;
+                let copied = if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+                    let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX block has no validated layout"
+                        )
+                    })?;
+                    layout
+                        .copy_row(
+                            &context.member_raw_blocks[member as usize][..cursor.raw_len],
+                            cursor.head_raw_row,
+                            &cursor.head_pax_values,
+                            output,
+                        )
+                        .map_err(spill_read_error)?
+                } else {
+                    let handle = table.spill_ssts[member as usize].expect("cursor member exists");
+                    let (copied_key, copied_tombstone, copied) = {
+                        let mut blocks = spill.blocks.borrow_mut();
+                        crate::store::copy_block_entry_at(
+                            &mut *blocks,
+                            &context.member_blocks[member as usize][..cursor.loaded_len],
+                            cursor.head_offset,
+                            handle.versioned,
+                            output,
+                        )
+                        .map_err(spill_read_error)?
+                    };
+                    if copied_key != key || copied_tombstone != tombstone {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "merged spill cursor payload does not match its selected version"
+                        ));
+                    }
+                    copied
                 };
                 if tombstone
                     || key.rowid != rowid
@@ -5853,14 +5883,22 @@ impl Storage {
                     }
                     id
                 };
-                let (loaded_len, loaded_type, raw_len) = crate::store::read_data_block_with_type(
+                let (raw_len, loaded_type) = crate::store::read_data_block_raw(
                     &mut *blocks,
                     &id,
-                    &mut context.member_blocks[member],
-                    &mut context.index_buf,
-                    Some(&mut context.member_raw_blocks[member]),
+                    &mut context.member_raw_blocks[member],
                 )
                 .map_err(spill_read_error)?;
+                let loaded_len = if loaded_type == crate::store::BlockType::SstDataPaxV1 {
+                    0
+                } else {
+                    crate::store::decode_data_block(
+                        &context.member_raw_blocks[member][..raw_len],
+                        loaded_type,
+                        &mut context.member_blocks[member],
+                    )
+                    .map_err(spill_read_error)?
+                };
                 cursor.loaded_len = loaded_len;
                 cursor.raw_len = raw_len;
                 cursor.raw_row = 0;
@@ -5879,6 +5917,54 @@ impl Storage {
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
+            if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+                let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "PAX block has no validated layout"
+                    )
+                })?;
+                if cursor.raw_row == layout.rows() {
+                    cursor.ordinal += 1;
+                    continue;
+                }
+                let row = cursor.raw_row;
+                let (key, tombstone) = layout
+                    .row_key(&context.member_raw_blocks[member][..cursor.raw_len], row)
+                    .map_err(spill_read_error)?;
+                layout
+                    .advance_row_values(
+                        &context.member_raw_blocks[member][..cursor.raw_len],
+                        row,
+                        &mut cursor.pax_value_cursors,
+                        &mut cursor.head_pax_values,
+                    )
+                    .map_err(spill_read_error)?;
+                let len = if tombstone {
+                    0
+                } else {
+                    let column_count = layout.columns();
+                    let row_len = cursor
+                        .head_pax_values
+                        .iter()
+                        .filter_map(|value| *value)
+                        .take(column_count)
+                        .try_fold(2 + column_count.div_ceil(8), |total, (start, end)| {
+                            total.checked_add(end - start)
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
+                        })?;
+                    u32::try_from(row_len).map_err(|_| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "PAX row exceeds SST entry size")
+                    })?
+                };
+                cursor.head_raw_row = row;
+                cursor.raw_row += 1;
+                cursor.head_offset = 0;
+                cursor.head = Some((key, tombstone, len));
+                return Ok(());
+            }
             let head_offset = cursor.offset;
             if cursor.loaded_type.is_none() || cursor.raw_len == 0 {
                 return Err(sql_err!(
@@ -5892,36 +5978,6 @@ impl Storage {
                 handle.versioned,
             ) {
                 Some((key, tombstone, len, next)) => {
-                    if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
-                        let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX block has no validated layout"
-                            )
-                        })?;
-                        let (raw_key, raw_tombstone) = layout
-                            .row_key(
-                                &context.member_raw_blocks[member][..cursor.raw_len],
-                                cursor.raw_row,
-                            )
-                            .map_err(spill_read_error)?;
-                        if raw_key != key || raw_tombstone != tombstone {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX cursor metadata diverges from canonical SST entry"
-                            ));
-                        }
-                        layout
-                            .advance_row_values(
-                                &context.member_raw_blocks[member][..cursor.raw_len],
-                                cursor.raw_row,
-                                &mut cursor.pax_value_cursors,
-                                &mut cursor.head_pax_values,
-                            )
-                            .map_err(spill_read_error)?;
-                        cursor.head_raw_row = cursor.raw_row;
-                        cursor.raw_row += 1;
-                    }
                     cursor.offset = next;
                     cursor.head_offset = head_offset;
                     cursor.head = Some((key, tombstone, len));

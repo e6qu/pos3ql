@@ -883,20 +883,38 @@ pub(crate) fn read_data_block_with_type(
         }
         raw[..n].copy_from_slice(&buf[..n]);
     }
+    if bounce.len() < n {
+        return Err(SstError::Store(StoreError::Corrupt(
+            super::BlockError::Payload,
+        )));
+    }
+    bounce[..n].copy_from_slice(&buf[..n]);
+    decode_data_block(&bounce[..n], block_type, buf).map(|length| (length, block_type, n))
+}
+
+/// Canonicalizes already-fetched physical data-block bytes. Keeping this
+/// separate from the demand read lets a PAX-aware merge cursor retain PAX in
+/// its column layout while ordinary block formats still use the same decoder.
+pub(crate) fn decode_data_block(
+    input: &[u8],
+    block_type: BlockType,
+    output: &mut [u8],
+) -> Result<usize, SstError> {
     match block_type {
-        BlockType::SstData | BlockType::SstDataV2 => Ok((n, block_type, n)),
-        BlockType::SstDataLz4 | BlockType::SstDataV2Lz4 => {
-            bounce[..n].copy_from_slice(&buf[..n]);
-            super::lz4::decompress(&bounce[..n], buf)
-                .ok_or(SstError::Store(StoreError::Corrupt(
+        BlockType::SstData | BlockType::SstDataV2 => {
+            if output.len() < input.len() {
+                return Err(SstError::Store(StoreError::Corrupt(
                     super::BlockError::Payload,
-                )))
-                .map(|length| (length, block_type, n))
+                )));
+            }
+            output[..input.len()].copy_from_slice(input);
+            Ok(input.len())
         }
-        BlockType::SstDataPaxV1 => {
-            bounce[..n].copy_from_slice(&buf[..n]);
-            decode_pax(&bounce[..n], buf).map(|length| (length, block_type, n))
-        }
+        BlockType::SstDataLz4 | BlockType::SstDataV2Lz4 => super::lz4::decompress(input, output)
+            .ok_or(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            ))),
+        BlockType::SstDataPaxV1 => decode_pax(input, output),
         _ => Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         ))),
@@ -937,6 +955,14 @@ pub(crate) struct PaxLayout {
 }
 
 impl PaxLayout {
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn columns(&self) -> usize {
+        self.columns
+    }
+
     pub(crate) fn row_key(&self, input: &[u8], row: usize) -> Result<(SstKey, bool), SstError> {
         let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
         if row >= self.rows {
@@ -992,6 +1018,47 @@ impl PaxLayout {
             cursors[column] = end;
         }
         Ok(())
+    }
+
+    /// Rebuilds one canonical row from the already-validated PAX value spans.
+    /// The caller supplies the exact spans yielded by [`Self::advance_row_values`]
+    /// for this row, so a merge cursor need not reassemble every row in a block.
+    pub(crate) fn copy_row(
+        &self,
+        input: &[u8],
+        row: usize,
+        values: &[Option<(usize, usize)>; MAX_COLUMNS],
+        output: &mut [u8],
+    ) -> Result<usize, SstError> {
+        let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+        let (_, tombstone) = self.row_key(input, row)?;
+        if tombstone {
+            return Err(corrupt());
+        }
+        let bitmap_bytes = self.columns.div_ceil(8);
+        let mut written = 2usize.checked_add(bitmap_bytes).ok_or_else(corrupt)?;
+        if output.len() < written {
+            return Err(corrupt());
+        }
+        output[..2].copy_from_slice(&(self.columns as u16).to_le_bytes());
+        output[2..written].fill(0);
+        for column in 0..self.columns {
+            if self.column_is_null(input, row, column)? {
+                output[2 + column / 8] |= 1 << (column % 8);
+                continue;
+            }
+            let Some((start, end)) = values[column] else {
+                return Err(corrupt());
+            };
+            let bytes = input.get(start..end).ok_or_else(corrupt)?;
+            let next = written.checked_add(bytes.len()).ok_or_else(corrupt)?;
+            if next > output.len() {
+                return Err(corrupt());
+            }
+            output[written..next].copy_from_slice(bytes);
+            written = next;
+        }
+        Ok(written)
     }
 
     fn column_is_null(&self, input: &[u8], row: usize, column: usize) -> Result<bool, SstError> {
@@ -2089,6 +2156,59 @@ mod tests {
         assert_eq!(get(&mut reader, &mut store, &handle, 1), Some(first_bytes));
         assert_eq!(get(&mut reader, &mut store, &handle, 2), None);
         assert_eq!(get(&mut reader, &mut store, &handle, 3), Some(second_bytes));
+    }
+
+    #[test]
+    fn pax_row_spans_rebuild_only_the_selected_row() {
+        let (_budget, mut store) = store();
+        let schema = [ColType::Int4, ColType::Text, ColType::Bool];
+        let first = [Datum::Int4(7), Datum::Text("wide value"), Datum::Null];
+        let second = [Datum::Int4(-4), Datum::Text("second"), Datum::Bool(true)];
+        let mut first_bytes = vec![0; rowenc::encoded_len(&first)];
+        let mut second_bytes = vec![0; rowenc::encoded_len(&second)];
+        rowenc::encode(&first, &mut first_bytes);
+        rowenc::encode(&second, &mut second_bytes);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 20), &first_bytes)
+            .unwrap();
+        writer
+            .append_tombstone_version(&mut store, SstKey::at(2, 20))
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(3, 20), &second_bytes)
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = [0; MAX_PAYLOAD];
+        let id = locate_data_block(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap();
+        let mut raw = [0; MAX_PAYLOAD];
+        let (length, kind) = read_data_block_raw(&mut store, &id, &mut raw).unwrap();
+        assert_eq!(kind, BlockType::SstDataPaxV1);
+        let layout = pax_layout(&raw[..length]).unwrap();
+        let mut cursors = layout.column_starts();
+        let mut values = [None; MAX_COLUMNS];
+        let mut output = [0; MAX_PAYLOAD];
+        layout
+            .advance_row_values(&raw[..length], 0, &mut cursors, &mut values)
+            .unwrap();
+        let copied = layout
+            .copy_row(&raw[..length], 0, &values, &mut output)
+            .unwrap();
+        assert_eq!(&output[..copied], first_bytes);
+        layout
+            .advance_row_values(&raw[..length], 1, &mut cursors, &mut values)
+            .unwrap();
+        assert!(values.iter().all(Option::is_none));
+        layout
+            .advance_row_values(&raw[..length], 2, &mut cursors, &mut values)
+            .unwrap();
+        let copied = layout
+            .copy_row(&raw[..length], 2, &values, &mut output)
+            .unwrap();
+        assert_eq!(&output[..copied], second_bytes);
     }
 
     #[test]

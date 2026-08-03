@@ -853,8 +853,10 @@ and the canonical physical value bytes; readers validate the complete group and
 reassemble the one canonical row stream used by point lookup, recovery, merge,
 and cold scans. This makes the physical table layout column-aware without
 forking MVCC semantics or leaving a compatibility path that can drift. The
-remaining late-materialization work is to expose those validated column spans to
-the batched scan/filter/project pipeline and to the packed range container, so
+merged cold scan now consumes the validated key stream and column spans directly,
+rebuilding only its selected winning row rather than every row in the fetched
+group. The remaining late-materialization work is to expose those spans to the
+batched scan/filter/project pipeline and to the packed range container, so
 surviving rows alone require their projected payloads.
 
 The aggregate CI test job excludes the extended storage-VOPR test because the

@@ -5685,6 +5685,19 @@ fn hash_join_matches_nested_loop() {
         hash_plan.iter().any(|line| line.contains("Hash Join")),
         "EXPLAIN must expose the selected hash plan: {hash_plan:?}"
     );
+    // Predicate simplification may make this query return no rows, but it
+    // cannot retroactively change the physical plan EXPLAIN reports.
+    let simplified_hash_plan = data_rows(&run_with(
+        &mut e,
+        &mut b,
+        "EXPLAIN SELECT e.name, d.dep FROM emp e, d WHERE e.did = d.id AND FALSE",
+    ));
+    assert!(
+        simplified_hash_plan
+            .iter()
+            .any(|line| line.contains("Hash Join")),
+        "EXPLAIN must retain the parsed hash plan through simplification: {simplified_hash_plan:?}"
+    );
     let nested_plan = data_rows(&run_with(
         &mut e,
         &mut b,

@@ -1054,6 +1054,10 @@ fn scan_source_mode<'a>(
     // NOT-NULL columns, then order the WHERE conjuncts by PostgreSQL's clause
     // cost once, up front, so the per-row leaf evaluates them cheapest-first
     // without re-sorting.
+    // Physical-plan choice is made from the parsed predicate, exactly as
+    // EXPLAIN sees it. Simplification below is an evaluation detail and must
+    // not change the reported implementation.
+    let planning_where_clause = where_clause;
     let where_clause = match where_clause {
         Some(w) => {
             let simplified = simplify_qual(w, arena)?;
@@ -1857,7 +1861,7 @@ fn scan_source_mode<'a>(
         .alloc_slice_with(scope.n, |index| index)
         .map_err(|_| arena_full())?;
     if all_cross && !any_lateral {
-        fill_join_order(storage, scope, where_clause, order);
+        fill_join_order(storage, scope, planning_where_clause, order);
     }
     let inv_order = arena
         .alloc_slice_with(scope.n, |_| 0usize)
@@ -1917,7 +1921,7 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    let hash_plan = select_hash_join_plan(storage, scope, from, where_clause, order)?;
+    let hash_plan = select_hash_join_plan(storage, scope, from, planning_where_clause, order)?;
     if let Some(hash_plan) = hash_plan {
         execute_hash_join_plan(
             storage,

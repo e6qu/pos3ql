@@ -769,7 +769,8 @@ estimate fit its fixed capacity, otherwise the ordinary nested-loop plan. A
 selected hash plan never changes strategy while running; a stale estimate that
 overfills its table raises 54000 loudly. `EXPLAIN` calls that same selector, so
 it reports `Hash Join` exactly when execution will use the bounded hash plan
-rather than presenting a stale nested-loop description.
+rather than presenting a stale nested-loop description. Both choose from the
+parsed predicate before evaluation-only simplification.
 
 `EXPLAIN` now prints the real bounded plan for SELECT, set operations, and
 data modification in text, JSON, XML, or YAML. `ANALYZE`, `VERBOSE`, `COSTS`,

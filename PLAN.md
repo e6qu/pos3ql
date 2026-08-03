@@ -34,7 +34,7 @@ acknowledged data in durable mode.
 | P3 | SQL front + in-memory engine | Lexer/parser/eval with PG semantics; CREATE/INSERT/SELECT/UPDATE/DELETE, ORDER BY w/ PG null ordering, LIMIT | **done** |
 | P4 | WAL / journal + recovery | Single preallocated journal, CRC-32C + monotonic LSNs, F_FULLFSYNC, kill -9 survives | **done** |
 | P5 | Object-storage client | Hand-rolled SHA-256/HMAC/SigV4 (official AWS test-suite vectors) + HTTP/1.1; verified against MinIO | **done** |
-| P6 | Driver compatibility | Extended query protocol incl. binary parameters, named statements/portals; functions & aggregates; psycopg 3 suite passes | **done** (`pg_catalog` tables themselves still absent) |
+| P6 | Driver compatibility | Extended query protocol incl. binary parameters, named statements/portals; functions & aggregates; psycopg 3 suite passes | **done** |
 | P7 | Object storage is the database | CHECKPOINT + auto-checkpoint snapshot SSTs + CAS'd manifest; cold start from a wiped disk; WAL truncation; heap compaction; object GC | **done** (snapshot model — see "Deviations") |
 | P8 | External conformance suite | psql 18 golden tests (dialect, SQLSTATEs, extended), raw wire probes, psycopg, durability + cold-start scenarios; 12/12 pass | **done** |
 | P9 | Transactions | BEGIN/COMMIT/ROLLBACK, READ COMMITTED, REPEATABLE READ, and SERIALIZABLE snapshots, READ ONLY enforcement, commit-LSN-keyed row versions in resident staging and object SSTs, waitable writer/catalog/row/table locks with deadlock detection, WAL-batch-at-commit, transactional DDL | **done** |
@@ -1171,16 +1171,37 @@ step-wise **server-side cursors**, a **persisted/portable compiled-plan cache** 
 fleet, or a **JIT** to native for CPU-bound execution — none of which the
 storage-aware-planner + async-scheduler + push-based-pipeline approach needs.
 
-## Maturity roadmap — what remains, in order (2026-07-29)
+## Maturity roadmap — current completion plan (2026-08-03)
 
 A full step-back audit against the founding goal — a mature,
 PostgreSQL-compatible engine whose *primary* storage is object storage, with
-local disk and memory as **mere caches** — found the SQL/wire-fidelity axis
-substantially complete (differential + sqllogictest + fuzzer green; the
-remaining open ledger entries document explicitly accepted or architectural
-concurrency differences) and the remaining work concentrated in one open
-structural storage gap, one compatibility wave, and the adaptive-execution
-capstone. This section is the plan of record for all of it.
+local disk and memory as **mere caches** — confirms that the durable-storage
+invariant is implemented and the SQL/wire axis has a strong regression floor.
+The 10,911-block PostgreSQL replay, differential suite, and fuzzer are not a
+claim of complete PostgreSQL compatibility: they are the floor that every
+remaining change must preserve. The bug ledger currently has no open entries;
+the work below is deliberate completion work, not deferred correctness bugs.
+
+### Completion definition and next sequence
+
+| Surface | Current state | Completion work |
+|---|---|---|
+| Durable object storage | Object SSTs, manifests, secondary-index generations, and synchronously uploaded WAL are authoritative; RAM and disk are rebuildable caches. | Qualify each deployment adapter or compatibility gateway against the common six-operation contract. Do not add provider branches above that boundary. |
+| PostgreSQL text SQL and catalogs | Broad SQL, DDL/DML, transactions, catalogs, dump/restore, and a zero-unsupported measured replay are implemented. | Continue strict differential expansion until the intended PostgreSQL language, catalog, locking, and tooling surface is covered; retain loud errors for every unsupported feature. |
+| PostgreSQL binary client format | COPY binary is byte-exact for implemented stored types, including composites; binary Bind is broadly supported. | Implement anonymous-record binary codecs and binary range/multirange Result encoding; then expand type coverage with the SQL surface. |
+| WAL compatibility | Pos3ql WAL is durable, checksummed, LSN-ordered, and cold-recoverable from object storage. | Implement logical replication publisher (`START_REPLICATION`, `pgoutput`, publications), then subscriber migration. PostgreSQL physical XLOG remains outside this design. |
+| Object-store execution | Costed scans/indexes, bounded hash joins, fixed-slot asynchronous GETs/prefetch/hedging, PAX groups, and proven column-demand decoding are implemented. | Build the packed ranged-read container, drive it through a block-at-a-time vector pipeline, and complete late materialization so survivors do not fetch unrelated payloads. |
+| Availability | VSR state machine and deterministic fault simulation exist. | Productionize live write routing, quorum ordering/failover, and group commit without changing bucket-durable acknowledgement. |
+
+**Execution order.** Finish the packed ranged-read/vector/late-materialization
+chain first: it builds directly on the current PAX and bounded-hash-join work
+and removes the remaining object-store read amplification. In parallel, define
+the logical-replication wire corpus against vanilla PostgreSQL. Then complete
+the binary exceptions and expand the strict SQL/catalog/tooling differential
+surface. VSR productionization follows with the same bucket-durability
+invariant. Adapter qualification is continuous for each supported deployment;
+it validates the shared contract rather than introducing a provider-specific
+database mode.
 
 ### Decisions of record (fixed with the project owner)
 

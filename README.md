@@ -45,6 +45,28 @@ engineering discipline.
   is single-node today and synchronously uploads WAL whenever object
   storage is enabled; live quorum write-routing remains roadmap work.
 
+## Compatibility boundary
+
+pos3ql targets PostgreSQL client compatibility, not a copy of PostgreSQL's
+storage engine. Text SQL and the v3 simple/extended wire protocol are the
+compatibility surface; COPY binary and binary Bind/Result encodings are exact
+for each implemented stored type. The remaining binary-wire exceptions are
+anonymous `record` (rejected loudly) and range/multirange extended results
+(currently rendered as canonical text).
+
+The durable journal is pos3ql WAL: it is checksummed, ordered by LSN, and
+recovered from the provider-neutral object store. PostgreSQL physical XLOG is
+not a compatible target because its heap-page format would make the object
+store stop being the database. The PostgreSQL-facing WAL target is logical
+replication: first a `pgoutput` publisher, then a subscriber for migration.
+
+Every durable backend supplies the same six operations: immutable or
+conditional PUT, full/ranged GET, LIST, DELETE, and ETag compare-and-swap.
+The current production adapter is S3-compatible (including MinIO); GCS, Azure,
+and other providers must use an adapter or compatibility gateway that provides
+those semantics. Neither the storage engine nor SQL/WAL/recovery code may gain
+provider-specific behavior.
+
 ## Dependency policy
 
 `std` + `libc` only (raw syscall bindings). No async runtime, no protocol or
@@ -149,11 +171,14 @@ Working single-node database:
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
   cold-start durability scenarios, differential vs PostgreSQL 18).
 
-Not yet: multi-replica VSR. See [PLAN.md](PLAN.md) for the roadmap and
-[BUGS.md](BUGS.md) for known divergences; the headline ones are summarized
-under **Limitations** below. [AGENTS.md](AGENTS.md) holds the standing
-directives, and [docs/terminology.md](docs/terminology.md) is the glossary and
-naming rules.
+Still to complete: the full PostgreSQL SQL/catalog/tooling surface, the two
+binary-wire exceptions above, logical replication, VSR productionization, and
+the object-storage execution capstone (packed range reads, vectorized
+execution, and end-to-end late materialization). See [PLAN.md](PLAN.md) for
+the ordered plan and [BUGS.md](BUGS.md) for known divergences; the headline
+ones are summarized under **Limitations** below. [AGENTS.md](AGENTS.md) holds
+the standing directives, and [docs/terminology.md](docs/terminology.md) is the
+glossary and naming rules.
 
 ## Durability and write safety
 

@@ -40,7 +40,10 @@ use materialize::{
 mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
-use scan::{Chained, scan_source, scan_source_recycling};
+use scan::{
+    Chained, scan_source, scan_source_recycling, scan_source_recycling_with_pax_columns,
+    single_table_pax_columns,
+};
 
 mod scope;
 pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
@@ -2234,7 +2237,31 @@ pub fn select_query<'a>(
         // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(statement.items);
-        let scan = scan_source_recycling(
+        // This stream is the only path whose projection is consumed directly
+        // from the scan callback. Its complete row demand is therefore known
+        // here: projection expressions plus the in-scan WHERE. Every other
+        // scan path retains full rows until it proves an equivalent contract.
+        let pax_columns = (n_where_correlated == 0)
+            .then(|| {
+                let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
+                let mut count = 0usize;
+                for item in statement.items {
+                    let expression = match item {
+                        SelectItem::Expr { expression, .. }
+                        | SelectItem::RecordStar(expression) => expression,
+                        SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
+                    };
+                    expressions[count] = expression;
+                    count += 1;
+                }
+                if let Some(where_clause) = where_in_scan {
+                    expressions[count] = where_clause;
+                    count += 1;
+                }
+                single_table_pax_columns(&scope, &expressions[..count])
+            })
+            .flatten();
+        let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
             from,
@@ -2244,6 +2271,7 @@ pub fn select_query<'a>(
             params,
             &hooks,
             None,
+            pax_columns.as_ref(),
             &mut |row| {
                 if emitted >= limit {
                     return Ok(false);

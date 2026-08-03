@@ -599,4 +599,29 @@ mod tests {
         let mut out = [Datum::Null; 2];
         assert!(decode(&buffer, &[ColType::Int4, ColType::Int4], &mut out).is_err());
     }
+
+    #[test]
+    fn physical_columns_reassemble_into_one_decodable_row() {
+        let values = [Datum::Int4(7), Datum::Text("selected")];
+        let schema = [ColType::Int4, ColType::Text];
+        let mut row = vec![0; encoded_len(&values)];
+        encode(&values, &mut row);
+        let mut payloads = [&[][..]; MAX_COLUMNS];
+        let mut nulls = [false; MAX_COLUMNS];
+        encoded_columns(&row, &schema, &mut payloads, &mut nulls).unwrap();
+        let mut reassembled = vec![0; row.len()];
+        reassembled[..2].copy_from_slice(&(schema.len() as u16).to_le_bytes());
+        let mut at = 2 + schema.len().div_ceil(8);
+        for column in 0..schema.len() {
+            if nulls[column] {
+                reassembled[2 + column / 8] |= 1 << (column % 8);
+                continue;
+            }
+            reassembled[at..at + payloads[column].len()].copy_from_slice(payloads[column]);
+            at += payloads[column].len();
+        }
+        let mut decoded = [Datum::Null; 2];
+        decode(&reassembled, &schema, &mut decoded).unwrap();
+        assert_eq!(decoded, values);
+    }
 }

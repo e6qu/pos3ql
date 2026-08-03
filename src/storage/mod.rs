@@ -29,7 +29,16 @@ pub(crate) use rowenc::MAX_COLUMNS;
 #[derive(Clone, Copy)]
 pub(crate) struct SpilledRow<'a> {
     pub(crate) rowid: u64,
-    pub(crate) bytes: &'a [u8],
+    pub(crate) representation: SpilledRowRepresentation<'a>,
+}
+
+/// The physical representation a merged spill cursor hands to the executor.
+/// Canonical entries retain the historical path; PAX entries arrive as
+/// statement-owned decoded values after the resident block has been released.
+#[derive(Clone, Copy)]
+pub(crate) enum SpilledRowRepresentation<'a> {
+    Encoded(&'a [u8]),
+    Values(&'a [Datum<'a>]),
 }
 
 /// A scan batch is deliberately small enough to leave statement-arena space
@@ -5520,7 +5529,11 @@ impl Storage {
         slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
-        emit: &mut dyn FnMut(u64, &'a [u8]) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        emit: &mut dyn FnMut(
+            u64,
+            SpilledRowRepresentation<'a>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
@@ -5619,19 +5632,13 @@ impl Storage {
                     });
                 }
             }
-            let bytes = if let Some(SpillVersion {
+            let representation = if let Some(SpillVersion {
                 len: Some(len),
                 member,
                 commit_lsn,
             }) = verdict
                 && self.tables[slot].rows.get(&rowid).is_none()
             {
-                let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "spilled scan rows exceed the statement arena; raise work_arena_bytes"
-                    )
-                })?;
                 let cursor = &cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
                     sql_err!(
@@ -5639,22 +5646,97 @@ impl Storage {
                         "selected spill version has no resident cursor head"
                     )
                 })?;
-                let copied = if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+                let representation = if cursor.loaded_type
+                    == Some(crate::store::BlockType::SstDataPaxV1)
+                {
                     let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "PAX block has no validated layout"
                         )
                     })?;
-                    layout
-                        .copy_row(
-                            &context.member_raw_blocks[member as usize][..cursor.raw_len],
-                            cursor.head_raw_row,
-                            &cursor.head_pax_values,
-                            output,
+                    let mut schema = [ColType::Bool; MAX_COLUMNS];
+                    table.def.schema(&mut schema);
+                    // PAX payload slices borrow the resident block, while the
+                    // executor can retain a batch row after this cursor moves
+                    // on. Pack only demanded physical values into statement
+                    // storage, then decode that one stable row.
+                    let header_len = 2 + layout.columns().div_ceil(8);
+                    let mut full_len = header_len;
+                    let mut packed_len = header_len;
+                    for column in 0..layout.columns() {
+                        let Some((start, end)) = cursor.head_pax_values[column] else {
+                            continue;
+                        };
+                        let value_len = end.checked_sub(start).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX value span is inverted")
+                        })?;
+                        full_len = full_len.checked_add(value_len).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
+                        })?;
+                        if decoded_columns.is_none_or(|columns| columns[column]) {
+                            packed_len = packed_len.checked_add(value_len).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX packed row length overflows"
+                                )
+                            })?;
+                        }
+                    }
+                    if full_len != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX selected row length does not match its cursor header"
+                        ));
+                    }
+                    let encoded = arena.alloc_slice_with(packed_len, |_| 0u8).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
                         )
-                        .map_err(spill_read_error)?
+                    })?;
+                    encoded[..2].copy_from_slice(&(layout.columns() as u16).to_le_bytes());
+                    encoded[2..2 + layout.columns().div_ceil(8)].fill(0);
+                    let values = arena
+                        .alloc_slice_with(layout.columns(), |_| Datum::Null)
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "spilled PAX values exceed the statement arena; raise work_arena_bytes"
+                            )
+                        })?;
+                    let mut copied = header_len;
+                    for column in 0..layout.columns() {
+                        let Some((start, end)) = cursor.head_pax_values[column] else {
+                            encoded[2 + column / 8] |= 1 << (column % 8);
+                            continue;
+                        };
+                        if decoded_columns.is_some_and(|columns| !columns[column]) {
+                            encoded[2 + column / 8] |= 1 << (column % 8);
+                            continue;
+                        }
+                        copied = copied.checked_add(end - start).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX packed row length overflows")
+                        })?;
+                        encoded[copied - (end - start)..copied].copy_from_slice(
+                            &context.member_raw_blocks[member as usize][start..end],
+                        );
+                    }
+                    if copied != packed_len {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX packed row length does not match selected value spans"
+                        ));
+                    }
+                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
+                    SpilledRowRepresentation::Values(&*values)
                 } else {
+                    let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled scan rows exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })?;
                     let handle = table.spill_ssts[member as usize].expect("cursor member exists");
                     let (copied_key, copied_tombstone, copied) = {
                         let mut blocks = spill.blocks.borrow_mut();
@@ -5673,19 +5755,21 @@ impl Storage {
                             "merged spill cursor payload does not match its selected version"
                         ));
                     }
-                    copied
+                    if copied != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "merged spill cursor payload length does not match its selected version"
+                        ));
+                    }
+                    SpilledRowRepresentation::Encoded(&*output)
                 };
-                if tombstone
-                    || key.rowid != rowid
-                    || key.commit_lsn != commit_lsn
-                    || copied != len as usize
-                {
+                if tombstone || key.rowid != rowid || key.commit_lsn != commit_lsn {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "merged spill cursor payload does not match its selected version"
                     ));
                 }
-                Some(&*output)
+                Some(representation)
             } else {
                 None
             };
@@ -5695,8 +5779,8 @@ impl Storage {
                 }
             }
             drop(context);
-            let emitted = if let Some(bytes) = bytes {
-                emit(rowid, bytes)
+            let emitted = if let Some(representation) = representation {
+                emit(rowid, representation)
             } else {
                 Ok(core::ops::ControlFlow::Continue(()))
             };
@@ -5721,12 +5805,13 @@ impl Storage {
         table_slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         each: &mut SpilledRowBatchVisitor<'a, 'callback>,
     ) -> Result<(), SqlError> {
         let rows = arena
             .alloc_slice_with(SPILL_SCAN_BATCH_ROWS, |_| SpilledRow {
                 rowid: 0,
-                bytes: &[],
+                representation: SpilledRowRepresentation::Encoded(&[]),
             })
             .map_err(|_| {
                 sql_err!(
@@ -5738,9 +5823,16 @@ impl Storage {
         let batch_mark = recycle_rows.then(|| arena.mark());
         let mut len = 0usize;
         let mut stopped = false;
-        let mut result =
-            self.spill_merged_walk_bytes(table_slot, arena, false, &mut |rowid, bytes| {
-                rows[len] = SpilledRow { rowid, bytes };
+        let mut result = self.spill_merged_walk_bytes(
+            table_slot,
+            arena,
+            false,
+            decoded_columns,
+            &mut |rowid, representation| {
+                rows[len] = SpilledRow {
+                    rowid,
+                    representation,
+                };
                 len += 1;
                 if len != rows.len() {
                     return Ok(core::ops::ControlFlow::Continue(()));
@@ -5759,7 +5851,8 @@ impl Storage {
                         Ok(core::ops::ControlFlow::Break(()))
                     }
                 }
-            });
+            },
+        );
         if result.is_ok() && !stopped && len != 0 {
             result = each(&rows[..len]).map(|_| ());
         }

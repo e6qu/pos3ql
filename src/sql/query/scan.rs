@@ -832,8 +832,8 @@ const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
 
 /// Whether two join-key column types compare and hash identically to the `=`
 /// operator: the same type, or any mix of integer widths (an int is an int at
-/// any width to both `compare_datums` and `hash_key`). Cross-type joins fall
-/// back to the nested loop rather than risk a coercion mismatch.
+/// any width to both `compare_datums` and `hash_key`). Other type pairs select
+/// the nested-loop plan rather than assume a coercion-compatible hash key.
 fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     fn is_integer(t: ColType) -> bool {
         matches!(t, ColType::Int2 | ColType::Int4 | ColType::Int8)

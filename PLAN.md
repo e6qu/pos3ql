@@ -763,6 +763,15 @@ provider-neutral telemetry vector counts RAM hits/misses, disk hits/misses,
 and object GET/PUT/contains operations at the `BlockStore` boundary; no
 planner code knows an S3, MinIO, Google Cloud Storage, or Azure implementation.
 
+Two-table equi-joins now select one explicit physical plan before execution:
+an arena-bounded hash plan when compatible keys and the `reltuples` build
+estimate fit its fixed capacity, otherwise the ordinary nested-loop plan. A
+selected hash plan never changes strategy while running; a stale estimate that
+overfills its table raises 54000 loudly. `EXPLAIN` calls that same selector, so
+it reports `Hash Join` exactly when execution will use the bounded hash plan
+rather than presenting a stale nested-loop description. Both choose from the
+parsed predicate before evaluation-only simplification.
+
 `EXPLAIN` now prints the real bounded plan for SELECT, set operations, and
 data modification in text, JSON, XML, or YAML. `ANALYZE`, `VERBOSE`, `COSTS`,
 `BUFFERS`, `WAL`, `TIMING`, `SUMMARY`, `MEMORY`, `SERIALIZE`, `SETTINGS`, and
@@ -853,21 +862,40 @@ and the canonical physical value bytes; readers validate the complete group and
 reassemble the one canonical row stream used by point lookup, recovery, merge,
 and cold scans. This makes the physical table layout column-aware without
 forking MVCC semantics or leaving a compatibility path that can drift. The
-remaining late-materialization work is to expose those validated column spans to
-the batched scan/filter/project pipeline and to the packed range container, so
+merged cold scan now consumes the validated key stream and column spans directly,
+rebuilding only its selected winning row rather than every row in the fetched
+group. The remaining late-materialization work is to expose those spans to the
+batched scan/filter/project pipeline and to the packed range container, so
 surviving rows alone require their projected payloads.
+
+An immediately completed asynchronous object GET is retained as a completed
+slot for its eventual consumer, so reactor progress cannot re-advance an
+already finished request.
 
 The aggregate CI test job excludes the extended storage-VOPR test because the
 dedicated four-worker job is its sole authoritative execution. Running that
 same endurance sweep twice made the aggregate job exceed its 15-minute limit
 after its ordinary unit suite had completed; the dedicated job preserves the
 coverage while the aggregate job remains a fast correctness gate.
+The cold external-run regression builds its fixed 3,000-row input in thirty
+arena-bounded set transactions and publishes it with its explicit checkpoint:
+its purpose is the 1.5 MiB object-resident sort, DISTINCT, and membership path,
+not synchronous WAL uploads whose behavior has independent coverage. That keeps
+the aggregate gate focused on its ordinary checks. Four configured bounded CI
+phases are the authoritative execution of the cold materialization assertions:
+cold read/sort/membership, recursive execution, lateral/outer execution, and
+set/nested/retaining execution.
 
 The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,
 but distributes independent seeds over four bounded workers. The merge gate
 therefore targets five minutes rather than serially multiplying every
 checkpoint/restart/verification cost, with a 15-minute hard ceiling for
 runner variance.
+
+Coverage likewise runs the plain and forced-spill differential suites in
+separate authoritative shards. Each produces one LCOV trace and the merge gate
+unions both, retaining the complete measurement while keeping every PR job
+inside the same 15-minute ceiling.
 
 Crash recovery binds its TCP listener with `SO_REUSEADDR` before the address
 is claimed, and its pre-restart harness probe uses the identical bind

@@ -39,7 +39,8 @@ FAIL=0
 #              (POS3QL_TORTURE_ROUNDS / POS3QL_TORTURE_SEED size one run,
 #              so CI can split the depth across seeds)
 #   tls        the durability cycle over HTTPS
-#   spilldiff  the differential suites (plain and forced-spill)
+#   diff       the plain differential suite against PostgreSQL
+#   spilldiff  the forced-spill differential suite against PostgreSQL
 SELECTED_GROUPS=${POS3QL_RUN_GROUPS:-all}
 want() { [[ "$SELECTED_GROUPS" == all || ",$SELECTED_GROUPS," == *",$1,"* ]] }
 
@@ -668,7 +669,7 @@ fi
 
 fi # tls
 
-if want spilldiff; then
+if want diff; then
 
 step "differential vs real PostgreSQL 18 (when installed)"
 if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
@@ -680,6 +681,10 @@ if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; the
 else
   print -- "SKIP: real PostgreSQL 18 not installed"
 fi
+
+fi # diff
+
+if want spilldiff; then
 
 step "forced-spill differential: the whole suite with a 256KiB memtable over the bucket"
 # Every corpus and sqllogictest block runs against a pos3ql whose memtable is

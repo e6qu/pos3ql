@@ -212,6 +212,13 @@ impl OwnedObjectStore {
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
         let (result, completed) = {
             let slot = self.slots.get_mut(slot).expect("reactor slot is bounded");
+            if slot.pending_id.is_none() {
+                assert!(
+                    slot.ready_id.is_some() || slot.error_id.is_some(),
+                    "advance called on a free object-read slot"
+                );
+                return Ok(true);
+            }
             match slot.client.advance_get() {
                 Ok(()) => {
                     let started = slot
@@ -684,6 +691,20 @@ mod tests {
         assert_eq!(stats.object_read_completions, 1);
         assert_eq!(stats.object_read_bytes, framed_len as u64);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn advancing_an_inline_completed_prefetch_reports_completion() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let id = BlockId::of(b"inline completion");
+
+        store.slots[0].ready_id = Some(id);
+        assert!(store.advance_pending_read(0).unwrap());
     }
 
     #[test]

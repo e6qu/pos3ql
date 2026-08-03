@@ -80,12 +80,12 @@ pub(crate) mod lz4;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
-pub(crate) use sst::{DataBlockLookahead, SstCursor, SstHandle, SstKey, SstReader};
+pub(crate) use sst::{DataBlockLookahead, PaxLayout, SstCursor, SstHandle, SstKey, SstReader};
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{
-    block_keys_at, copy_block_entry_at, data_block_total, locate_data_block,
-    locate_data_block_with_next, prefetch_data_block, read_data_block,
-    take_prefetched_index_first_data,
+    block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block,
+    locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block,
+    read_data_block_raw, take_prefetched_index_first_data,
 };
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};

@@ -39,6 +39,7 @@ use materialize::{
 
 mod scan;
 pub use scan::JoinRow;
+pub(crate) use scan::select_hash_join_plan;
 use scan::{Chained, scan_source, scan_source_recycling};
 
 mod scope;

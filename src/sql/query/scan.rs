@@ -832,8 +832,8 @@ const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
 
 /// Whether two join-key column types compare and hash identically to the `=`
 /// operator: the same type, or any mix of integer widths (an int is an int at
-/// any width to both `compare_datums` and `hash_key`). Cross-type joins fall
-/// back to the nested loop rather than risk a coercion mismatch.
+/// any width to both `compare_datums` and `hash_key`). Other type pairs select
+/// the nested-loop plan rather than assume a coercion-compatible hash key.
 fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     fn is_integer(t: ColType) -> bool {
         matches!(t, ColType::Int2 | ColType::Int4 | ColType::Int8)
@@ -923,6 +923,69 @@ fn hash_join_keys<'a>(
     }
 }
 
+/// A selected two-table hash implementation. Planning is shared with EXPLAIN
+/// so reported and executed physical join choices remain one decision.
+pub(crate) struct HashJoinPlan<'a> {
+    probe_table: usize,
+    build_table: usize,
+    keys: [(usize, usize); 8],
+    key_count: usize,
+    on: Option<&'a Expr<'a>>,
+    preserves_probe_rows: bool,
+    build_capacity: usize,
+}
+
+/// Selects the hash implementation only when its fixed build table and
+/// equi-key representation can execute this join exactly. Every other shape
+/// selects the ordinary nested-loop implementation before execution.
+pub(crate) fn select_hash_join_plan<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    order: &[usize],
+) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
+    if scope.n != 2 || from.joins.len() != 1 {
+        return Ok(None);
+    }
+    let join = &from.joins[0];
+    if !matches!(
+        join.kind,
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+    ) {
+        return Ok(None);
+    }
+    let probe_table = order[0];
+    let build_table = order[1];
+    if scope.lateral[probe_table]
+        || scope.lateral[build_table]
+        || scope.derived[probe_table].is_some()
+        || scope.derived[build_table].is_some()
+    {
+        return Ok(None);
+    }
+    let on = join.on.or(scope.join_on[0]);
+    let Some((keys, key_count)) =
+        hash_join_keys(scope, on, where_clause, probe_table, build_table)?
+    else {
+        return Ok(None);
+    };
+    const MAX_HASH_ENTRIES: usize = 1 << 15;
+    let build_capacity = storage.planning_row_estimate(scope.slots[build_table]) as usize;
+    if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
+        return Ok(None);
+    }
+    Ok(Some(HashJoinPlan {
+        probe_table,
+        build_table,
+        keys,
+        key_count,
+        on,
+        preserves_probe_rows: matches!(join.kind, JoinKind::Left),
+        build_capacity,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -991,6 +1054,10 @@ fn scan_source_mode<'a>(
     // NOT-NULL columns, then order the WHERE conjuncts by PostgreSQL's clause
     // cost once, up front, so the per-row leaf evaluates them cheapest-first
     // without re-sorting.
+    // Physical-plan choice is made from the parsed predicate, exactly as
+    // EXPLAIN sees it. Simplification below is an evaluation detail and must
+    // not change the reported implementation.
+    let planning_where_clause = where_clause;
     let where_clause = match where_clause {
         Some(w) => {
             let simplified = simplify_qual(w, arena)?;
@@ -1048,19 +1115,13 @@ fn scan_source_mode<'a>(
         })
     }
 
-    /// Hash-join fast path for a two-table inner/cross equi-join over physical
-    /// base tables. Builds the inner (`order[1]`) side into an arena hash
-    /// table keyed by the join column, then probes it with the outer
-    /// (`order[0]`) side, so both tables are scanned once (O(N+M) reads) instead
-    /// of the nested loop's O(N·M). The equi-condition only generates
-    /// candidates; the full ON and WHERE run at the leaf, so a declined or
-    /// overflowing build simply falls back to the nested loop with identical
-    /// results. Returns whether it handled the join.
+    /// Executes a previously selected two-table hash plan. Its fixed capacity
+    /// is a plan invariant: stale statistics that exceed it raise 54000 rather
+    /// than changing the execution strategy after query execution begins.
     #[allow(clippy::too_many_arguments)]
-    fn try_hash_join<'a>(
+    fn execute_hash_join_plan<'a>(
         storage: &'a Storage,
         scope: &QueryScope<'a>,
-        from: &'a FromClause<'a>,
         txid: u32,
         where_clause: Option<&'a Expr<'a>>,
         arena: &'a Arena,
@@ -1068,47 +1129,21 @@ fn scan_source_mode<'a>(
         hooks: &EvalHooks<'_, 'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
         order: &[usize],
+        plan: HashJoinPlan<'a>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<(), SqlError> {
         use core::ops::ControlFlow;
-        if scope.n != 2 || from.joins.len() != 1 {
-            return Ok(false);
-        }
-        let join = &from.joins[0];
-        if !matches!(
-            join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-        ) {
-            return Ok(false);
-        }
-        let probe_t = order[0];
-        let build_t = order[1];
-        if scope.lateral[probe_t]
-            || scope.lateral[build_t]
-            || scope.derived[probe_t].is_some()
-            || scope.derived[build_t].is_some()
-        {
-            return Ok(false);
-        }
-        let on = join.on.or(scope.join_on[0]);
-        let Some((keys, nkeys)) = hash_join_keys(scope, on, where_clause, probe_t, build_t)? else {
-            return Ok(false);
-        };
-
-        // Cost-gate from ANALYZE's reltuples estimate, without a preliminary
-        // visibility scan that would fetch the build side twice. The selected
-        // fixed-capacity hash table fails loudly if a stale underestimate
-        // exceeds it; an overestimate merely leaves unused arena slots.
+        let probe_t = plan.probe_table;
+        let build_t = plan.build_table;
+        let keys = plan.keys;
+        let nkeys = plan.key_count;
+        let on = plan.on;
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs[build_t].expect("resolved");
-        let build_count = storage.planning_row_estimate(build_slot) as usize;
-        const MAX_HASH_ENTRIES: usize = 1 << 15;
-        if build_count == 0 || build_count > MAX_HASH_ENTRIES {
-            return Ok(false);
-        }
-        let handled = (|| -> Result<bool, SqlError> {
+        let build_count = plan.build_capacity;
+        let completed = (|| -> Result<bool, SqlError> {
             let buckets_len = (build_count * 2).next_power_of_two().max(16);
             let entries = arena
                 .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
@@ -1269,7 +1304,7 @@ fn scan_source_mode<'a>(
                     }
                     // LEFT JOIN: no ON-passing match (NULL key, or all candidates
                     // rejected) → preserve the outer row with NULLs for the inner.
-                    if !matched_any && matches!(join.kind, JoinKind::Left) {
+                    if !matched_any && plan.preserves_probe_rows {
                         let bound = &mut [None, None];
                         let bound_rowids = &mut [None, None];
                         bound[probe_t] = Some(bytes);
@@ -1294,7 +1329,8 @@ fn scan_source_mode<'a>(
             }
             Ok(true)
         })()?;
-        Ok(handled)
+        let _ = completed;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1825,7 +1861,7 @@ fn scan_source_mode<'a>(
         .alloc_slice_with(scope.n, |index| index)
         .map_err(|_| arena_full())?;
     if all_cross && !any_lateral {
-        fill_join_order(storage, scope, where_clause, order);
+        fill_join_order(storage, scope, planning_where_clause, order);
     }
     let inv_order = arena
         .alloc_slice_with(scope.n, |_| 0usize)
@@ -1885,24 +1921,23 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    // A two-table inner/cross equi-join over base tables is faster as a hash
-    // join (both sides scanned once) than as the nested loop below; it falls
-    // back to the nested loop whenever it does not apply.
-    if try_hash_join(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer,
-        order,
-        decode_buffers,
-        recycle_rows,
-        f,
-    )? {
+    let hash_plan = select_hash_join_plan(storage, scope, from, planning_where_clause, order)?;
+    if let Some(hash_plan) = hash_plan {
+        execute_hash_join_plan(
+            storage,
+            scope,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            outer,
+            order,
+            hash_plan,
+            decode_buffers,
+            recycle_rows,
+            f,
+        )?;
         return Ok(());
     }
     let mut match_run = None;

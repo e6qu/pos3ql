@@ -5,7 +5,7 @@
 # instruments that binary too, which is what takes the figure to ~80%.
 #
 # The external suite is sharded across parallel jobs so that no job runs past
-# 20 minutes: each coverage shard measures its slice strictly, exports an lcov
+# 15 minutes: each coverage shard measures its slice strictly, exports an lcov
 # tracefile, and the merge job unions the tracefiles and holds the floor over
 # the whole. Shard percentages alone are meaningless and never compared. The
 # crash-torture shards are correctness-only (runtest:*): they kill -9 every
@@ -26,10 +26,10 @@ jobs:
   shard:
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # Forced-spill differential currently needs about 14 minutes to build,
-    # execute both 84-corpus passes, and render LCOV. Leave enough room for
-    # runner variance and artifact upload after the measurement succeeds.
-    timeout-minutes: 20
+    # Each differential storage mode has its own shard. This keeps its build,
+    # corpus replay, profile rendering, and artifact upload within the same
+    # hard ceiling as every other PR job.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +37,8 @@ jobs:
           # The coverage shards (run:* / sql) are the ones whose work lands on a
           # server that shuts down gracefully and flushes a profile — sql's
           # in-process tests + differential corpora, wire-durability on the
-          # base-port server run.sh stops at cleanup, and spilldiff on the
-          # differential harness's own server. Everything else runs
+          # base-port server run.sh stops at cleanup, and diff/spilldiff on
+          # the differential harness's own server. Everything else runs
           # uninstrumented for correctness only (runtest:*, several times
           # faster) and stays out of the merge: the spill group kill -9's a side
           # server (overlay) or just iterates the same spill/merge/cold-start
@@ -49,6 +49,7 @@ jobs:
           # independent seeds rather than one 12-round run.
           - { name: sql, shard: "sql" }
           - { name: wire-durability, shard: "run:proto,dur" }
+          - { name: diff, shard: "run:diff" }
           - { name: spilldiff, shard: "run:spilldiff" }
           - { name: spill-correctness, shard: "runtest:overlay,ingest,tls" }
           - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
@@ -81,7 +82,7 @@ jobs:
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
         run: sh tools/coverage.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: lcov-${{ matrix.name }}
           path: coverage-*.lcov
@@ -95,7 +96,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: lcov-*
           merge-multiple: true

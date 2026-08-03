@@ -10283,10 +10283,9 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     config.value_index_rows = 1;
     config.work_arena_bytes = 16 << 20;
-    assert!(
-        600 > crate::storage::SPILL_SCAN_BATCH_ROWS,
-        "the fixture must cross the durable scan batch boundary"
-    );
+    const {
+        assert!(600 > crate::storage::SPILL_SCAN_BATCH_ROWS);
+    }
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);

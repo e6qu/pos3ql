@@ -141,6 +141,8 @@ pub(crate) enum BlockType {
     ValueIndexData = 11,
     /// Complete immutable-block roster for one secondary-index generation.
     ValueIndexRoster = 12,
+    /// Commit-LSN-versioned rows laid out as one self-describing PAX group.
+    SstDataPaxV1 = 13,
 }
 
 impl BlockType {
@@ -158,6 +160,7 @@ impl BlockType {
             10 => BlockType::SstIndexV2,
             11 => BlockType::ValueIndexData,
             12 => BlockType::ValueIndexRoster,
+            13 => BlockType::SstDataPaxV1,
             _ => return None,
         })
     }
@@ -504,6 +507,7 @@ mod tests {
             BlockType::SstDataLz4,
             BlockType::SstDataV2,
             BlockType::SstDataV2Lz4,
+            BlockType::SstDataPaxV1,
             BlockType::SstIndexV2,
             BlockType::ValueIndexData,
             BlockType::ValueIndexRoster,

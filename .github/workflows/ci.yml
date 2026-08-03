@@ -62,7 +62,7 @@ jobs:
         run: cargo clippy --lib --bins -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked -- --skip sim::storage::storage_vopr
 
   # Independent deterministic seeds run on four bounded workers. This retains
   # the endurance sweep while keeping the PR critical path near five minutes.

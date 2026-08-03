@@ -309,6 +309,11 @@ impl Checkpointer {
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
                 self.merge_writer.reset();
+                let mut schema = [ColType::Bool; MAX_COLUMNS];
+                let columns = storage.table(job.slot).def.schema(&mut schema);
+                self.merge_writer
+                    .set_pax_schema(&schema[..columns])
+                    .map_err(sst_to_sql)?;
                 self.merge_job = Some(job);
             }
             return Ok(());
@@ -3482,6 +3487,11 @@ impl Checkpointer {
             // images during a full rewrite.
             self.sst_arena.reset();
             self.slice_writer.reset();
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            let columns = storage.table(slot).def.schema(&mut schema);
+            self.slice_writer
+                .set_pax_schema(&schema[..columns])
+                .map_err(sst_to_sql)?;
             let writer = &mut self.slice_writer;
             let blocks = &self.blocks;
             let mut count = 0u64;

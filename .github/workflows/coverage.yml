@@ -81,7 +81,7 @@ jobs:
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
         run: sh tools/coverage.sh
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: lcov-${{ matrix.name }}
           path: coverage-*.lcov

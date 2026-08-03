@@ -879,6 +879,8 @@ queries now carry the same proof through their count, key-collection, and
 aggregate-folding scans: group keys, aggregate arguments, predicates,
 projections, and order keys determine the physical PAX spans. Correlated
 grouping still retains full rows until it has an equally complete proof.
+Derived row sources now share the direct stream's demand derivation, so nesting
+or a set-operation leaf cannot silently widen a proven one-table PAX scan.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

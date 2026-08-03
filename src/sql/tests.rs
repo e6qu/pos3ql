@@ -10421,6 +10421,82 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
 }
 
 #[test]
+fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("pax-column-demand-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-pax-column-demand-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 32 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    config.memtable_bytes = 16 << 20;
+    config.work_arena_bytes = 1 << 20;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::from("CREATE TABLE wide_pax (id int PRIMARY KEY");
+    let mut selected = String::from("i");
+    for column in 0..20 {
+        definition.push_str(&format!(", payload_{column} text"));
+        selected.push_str(", repeat('x', 2048)");
+    }
+    definition.push(')');
+    assert!(
+        !String::from_utf8_lossy(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &definition,
+            1 << 20,
+        ))
+        .contains("ERROR")
+    );
+    for start in 1..=300 {
+        let end = start;
+        let inserted = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO wide_pax SELECT {selected} FROM generate_series({start}, {end}) AS g(i)"
+            ),
+            1 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    let _ = engine.checkpoint().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let result = run_with_arena_bytes(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id FROM wide_pax WHERE id = 287",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&result),
+        ["287"],
+        "{}",
+        String::from_utf8_lossy(&result)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

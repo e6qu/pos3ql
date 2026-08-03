@@ -5529,6 +5529,7 @@ impl Storage {
         slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         emit: &mut dyn FnMut(
             u64,
             SpilledRowRepresentation<'a>,
@@ -5658,11 +5659,37 @@ impl Storage {
                     table.def.schema(&mut schema);
                     // PAX payload slices borrow the resident block, while the
                     // executor can retain a batch row after this cursor moves
-                    // on. Pack the selected physical values once into the
-                    // statement arena, then decode that one stable row. A
-                    // per-column synthetic row here turns one scan row into
-                    // dozens of arena allocations under instrumentation.
-                    let encoded = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                    // on. Pack only demanded physical values into statement
+                    // storage, then decode that one stable row.
+                    let header_len = 2 + layout.columns().div_ceil(8);
+                    let mut full_len = header_len;
+                    let mut packed_len = header_len;
+                    for column in 0..layout.columns() {
+                        let Some((start, end)) = cursor.head_pax_values[column] else {
+                            continue;
+                        };
+                        let value_len = end.checked_sub(start).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX value span is inverted")
+                        })?;
+                        full_len = full_len.checked_add(value_len).ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
+                        })?;
+                        if decoded_columns.is_none_or(|columns| columns[column]) {
+                            packed_len = packed_len.checked_add(value_len).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX packed row length overflows"
+                                )
+                            })?;
+                        }
+                    }
+                    if full_len != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX selected row length does not match its cursor header"
+                        ));
+                    }
+                    let encoded = arena.alloc_slice_with(packed_len, |_| 0u8).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
@@ -5678,23 +5705,27 @@ impl Storage {
                                 "spilled PAX values exceed the statement arena; raise work_arena_bytes"
                             )
                         })?;
-                    let mut copied = 2 + layout.columns().div_ceil(8);
+                    let mut copied = header_len;
                     for column in 0..layout.columns() {
                         let Some((start, end)) = cursor.head_pax_values[column] else {
                             encoded[2 + column / 8] |= 1 << (column % 8);
                             continue;
                         };
+                        if decoded_columns.is_some_and(|columns| !columns[column]) {
+                            encoded[2 + column / 8] |= 1 << (column % 8);
+                            continue;
+                        }
                         copied = copied.checked_add(end - start).ok_or_else(|| {
-                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
+                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX packed row length overflows")
                         })?;
                         encoded[copied - (end - start)..copied].copy_from_slice(
                             &context.member_raw_blocks[member as usize][start..end],
                         );
                     }
-                    if copied != len as usize {
+                    if copied != packed_len {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
-                            "PAX selected row length does not match its cursor header"
+                            "PAX packed row length does not match selected value spans"
                         ));
                     }
                     rowenc::decode(encoded, &schema[..layout.columns()], values)?;
@@ -5774,6 +5805,7 @@ impl Storage {
         table_slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         each: &mut SpilledRowBatchVisitor<'a, 'callback>,
     ) -> Result<(), SqlError> {
         let rows = arena
@@ -5791,8 +5823,12 @@ impl Storage {
         let batch_mark = recycle_rows.then(|| arena.mark());
         let mut len = 0usize;
         let mut stopped = false;
-        let mut result =
-            self.spill_merged_walk_bytes(table_slot, arena, false, &mut |rowid, representation| {
+        let mut result = self.spill_merged_walk_bytes(
+            table_slot,
+            arena,
+            false,
+            decoded_columns,
+            &mut |rowid, representation| {
                 rows[len] = SpilledRow {
                     rowid,
                     representation,
@@ -5815,7 +5851,8 @@ impl Storage {
                         Ok(core::ops::ControlFlow::Break(()))
                     }
                 }
-            });
+            },
+        );
         if result.is_ok() && !stopped && len != 0 {
             result = each(&rows[..len]).map(|_| ());
         }

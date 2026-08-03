@@ -55,6 +55,45 @@ enum BoundRow<'a> {
     Values(&'a [Datum<'a>]),
 }
 
+/// Builds the complete physical-column demand for a plain one-table scan.
+/// Returning `None` deliberately retains full decoding whenever an expression
+/// can observe a row shape this scan does not own (a join, derived row, outer
+/// reference, or whole-row value).
+pub(crate) fn single_table_pax_columns(
+    scope: &QueryScope,
+    expressions: &[&Expr],
+) -> Option<[bool; MAX_COLUMNS]> {
+    if scope.n != 1 || scope.derived[0].is_some() || scope.defs[0].is_none() {
+        return None;
+    }
+    let mut columns = [false; MAX_COLUMNS];
+    fn collect(expression: &Expr, scope: &QueryScope, columns: &mut [bool; MAX_COLUMNS]) -> bool {
+        match expression {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(ResolvedColumn::Table(0, column)) => columns[column] = true,
+                _ => return false,
+            },
+            Expr::WholeRow(_) | Expr::SchemaColumn { .. } => return false,
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) => return false,
+            _ => {}
+        }
+        let mut complete = true;
+        let _ = super::subquery::walk_children(expression, &mut |child| {
+            if !collect(child, scope, columns) {
+                complete = false;
+            }
+            Ok(())
+        });
+        complete
+    }
+    for expression in expressions {
+        if !collect(expression, scope, &mut columns) {
+            return None;
+        }
+    }
+    Some(columns)
+}
+
 /// Finds one single-column `indexed_column = constant` conjunct. This is
 /// intentionally conservative: joins, derived rows, parameters and
 /// multi-column keys stay on the ordinary scan until their access path can
@@ -788,6 +827,7 @@ pub(crate) fn scan_source<'a>(
         hooks,
         outer,
         false,
+        None,
         f,
     )
 }
@@ -808,6 +848,38 @@ pub(crate) fn scan_source_recycling<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
+    scan_source_recycling_with_pax_columns(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        None,
+        f,
+    )
+}
+
+/// Recycling scan with an optional complete single-table PAX demand mask.
+/// Omitted columns are represented as NULL and therefore this is valid only
+/// when the caller has proved they cannot be observed downstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_columns: Option<&[bool; MAX_COLUMNS]>,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
     scan_source_mode(
         storage,
         scope,
@@ -819,6 +891,7 @@ pub(crate) fn scan_source_recycling<'a>(
         hooks,
         outer,
         true,
+        pax_columns,
         f,
     )
 }
@@ -1007,6 +1080,7 @@ fn scan_source_mode<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     recycle_rows: bool,
+    pax_columns: Option<&[bool; MAX_COLUMNS]>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
@@ -1479,6 +1553,7 @@ fn scan_source_mode<'a>(
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
+        pax_columns: Option<&[bool; MAX_COLUMNS]>,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -1556,6 +1631,7 @@ fn scan_source_mode<'a>(
                         indexed,
                         decode_buffers,
                         recycle_rows,
+                        pax_columns,
                         f,
                     )
                 }
@@ -1677,32 +1753,42 @@ fn scan_source_mode<'a>(
             if candidates.is_none() && storage.spill_rows_are_unshadowed(slot) {
                 let mut index = 0usize;
                 let mut aborted = false;
-                storage.for_each_spilled_row_batch(slot, arena, recycle_rows, &mut |rows| {
-                    for spilled in rows {
-                        check_timeout()?;
-                        let this = index;
-                        index += 1;
-                        let keep_scanning = recycled(arena, recycle_rows, || {
-                            visit_candidate!(
-                                this,
-                                match spilled.representation {
-                                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                                        BoundRow::Encoded(bytes)
-                                    }
-                                    crate::storage::SpilledRowRepresentation::Values(values) => {
-                                        BoundRow::Values(values)
-                                    }
-                                },
-                                Some(spilled.rowid)
-                            )
-                        })?;
-                        if !keep_scanning {
-                            aborted = true;
-                            return Ok(core::ops::ControlFlow::Break(()));
+                storage.for_each_spilled_row_batch(
+                    slot,
+                    arena,
+                    recycle_rows,
+                    pax_columns,
+                    &mut |rows| {
+                        for spilled in rows {
+                            check_timeout()?;
+                            let this = index;
+                            index += 1;
+                            let keep_scanning = recycled(arena, recycle_rows, || {
+                                visit_candidate!(
+                                    this,
+                                    match spilled.representation {
+                                        crate::storage::SpilledRowRepresentation::Encoded(
+                                            bytes,
+                                        ) => {
+                                            BoundRow::Encoded(bytes)
+                                        }
+                                        crate::storage::SpilledRowRepresentation::Values(
+                                            values,
+                                        ) => {
+                                            BoundRow::Values(values)
+                                        }
+                                    },
+                                    Some(spilled.rowid)
+                                )
+                            })?;
+                            if !keep_scanning {
+                                aborted = true;
+                                return Ok(core::ops::ControlFlow::Break(()));
+                            }
                         }
-                    }
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })?;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
                 if aborted {
                     return Ok(false);
                 }
@@ -1808,6 +1894,7 @@ fn scan_source_mode<'a>(
                 indexed,
                 decode_buffers,
                 recycle_rows,
+                pax_columns,
                 f,
             )? {
                 return Ok(false);
@@ -1997,6 +2084,7 @@ fn scan_source_mode<'a>(
             indexed.as_ref(),
             decode_buffers,
             recycle_rows,
+            pax_columns,
             f,
         )?;
     }
@@ -2084,6 +2172,7 @@ fn scan_source_mode<'a>(
                         indexed.as_ref(),
                         decode_buffers,
                         recycle_rows,
+                        pax_columns,
                         f,
                     )
                 };

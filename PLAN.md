@@ -867,10 +867,13 @@ rebuilding only its selected winning row rather than every row in the fetched
 group. The batch seam now carries a tagged row representation too: a legacy
 row-packed group carries its canonical bytes, while a PAX winner packs its
 validated physical spans once into statement-owned row storage before decoding
-them into values. The remaining
-late-materialization work is to select the exact filter/project columns before
-that decode, and to feed those selected spans into the packed range container,
-so a survivor need not carry every payload.
+them into values. A plain one-table streaming SELECT now derives its complete
+physical demand from projection expressions plus its in-scan WHERE predicate:
+only those PAX spans are copied and decoded, while stars, joins, derived rows,
+outer references, correlated predicates, and materializing paths retain full
+rows until they carry an equally complete demand proof. The remaining
+late-materialization work is to feed those selected spans into the packed range
+container, so a survivor need not fetch every payload.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

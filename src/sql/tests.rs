@@ -10310,9 +10310,6 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-object-pruning-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
-    config.wal_upload = true;
-    config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;

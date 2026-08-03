@@ -62,7 +62,7 @@ jobs:
         run: cargo clippy --lib --bins -- -D warnings
 
       - name: Test
-        run: cargo test --locked -- --skip sim::storage::storage_vopr
+        run: cargo test --locked -- --skip sim::storage::storage_vopr --skip sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache
 
   # Independent deterministic seeds run on four bounded workers. This retains
   # the endurance sweep while keeping the PR critical path near five minutes.
@@ -87,3 +87,25 @@ jobs:
         env:
           POS3QL_STORAGE_VOPR_SEEDS: 16
           POS3QL_STORAGE_VOPR_STEPS: 300
+
+  # The cold external-run assertion has its own fixed object-store workload.
+  # Run it independently of the ordinary unit suite so it remains an
+  # authoritative regression rather than sharing that job's runtime budget.
+  external-runs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-external-runs-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-external-runs-
+
+      - name: Cold external-run regression
+        run: cargo test --locked --lib sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache

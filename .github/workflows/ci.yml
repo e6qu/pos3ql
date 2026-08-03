@@ -104,8 +104,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-external-runs-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-external-runs-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Cold external-run regression
         run: cargo test --locked --lib sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache

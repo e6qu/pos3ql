@@ -9,8 +9,10 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
-Last reviewed: 2026-08-03. Crash recovery owns the killed server PID and the
-server listener explicitly permits safe immediate reuse after a crash; the
+Last reviewed: 2026-08-03. The ledger has no open entries: current remaining
+work is tracked as planned compatibility, replication, and execution work in
+`PLAN.md`, not as deferred bugs. Crash recovery owns the killed server PID and
+the server listener explicitly permits safe immediate reuse after a crash; the
 cold merged-SST scan also has a fixed, recycling 128-row handoff to the
 executor, covered by the forced-cold query regression.
 

@@ -10509,6 +10509,23 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
         String::from_utf8_lossy(&ordered_result)
     );
     drop(ordered);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut grouped_budget = Budget::new(1 << 30);
+    let mut grouped = Engine::new(&config, &mut grouped_budget).unwrap();
+    let grouped_result = run_with_arena_bytes(
+        &mut grouped,
+        &mut grouped_budget,
+        "SELECT id, count(*) FROM wide_pax GROUP BY id ORDER BY id LIMIT 1",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&grouped_result),
+        ["1|1"],
+        "{}",
+        String::from_utf8_lossy(&grouped_result)
+    );
+    drop(grouped);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

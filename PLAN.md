@@ -874,7 +874,11 @@ projection copy and decode only those PAX spans. Stars, joins, derived rows,
 outer references, correlated predicates, and deferred projections retain full
 rows until they carry an equally complete demand proof. The remaining
 late-materialization work is to feed those selected spans into the packed range
-container, so a survivor need not fetch every payload.
+container, so a survivor need not fetch every payload. Non-correlated grouped
+queries now carry the same proof through their count, key-collection, and
+aggregate-folding scans: group keys, aggregate arguments, predicates,
+projections, and order keys determine the physical PAX spans. Correlated
+grouping still retains full rows until it has an equally complete proof.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

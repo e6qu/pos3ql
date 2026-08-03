@@ -193,6 +193,104 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
     }
 }
 
+/// Splits a canonical stored row into its physical column payloads.  The
+/// payloads exclude the row header and null bitmap, so a columnar SST can
+/// retain exactly the bytes decoded by [`decode`] without constructing Datum
+/// values.  `payloads` and `nulls` are caller-owned fixed scratch.
+pub(crate) fn encoded_columns<'a>(
+    bytes: &'a [u8],
+    schema: &[ColType],
+    payloads: &mut [&'a [u8]; MAX_COLUMNS],
+    nulls: &mut [bool; MAX_COLUMNS],
+) -> Result<(), SqlError> {
+    let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
+    if bytes.len() < 2 || schema.len() > MAX_COLUMNS {
+        return Err(corrupt());
+    }
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    if count != schema.len() {
+        return Err(corrupt());
+    }
+    let bitmap_len = count.div_ceil(8);
+    if bytes.len() < 2 + bitmap_len {
+        return Err(corrupt());
+    }
+    let bitmap = &bytes[2..2 + bitmap_len];
+    let mut at = 2 + bitmap_len;
+    for column in 0..count {
+        let is_null = bitmap[column / 8] & (1 << (column % 8)) != 0;
+        nulls[column] = is_null;
+        if is_null {
+            payloads[column] = &[];
+            continue;
+        }
+        let length = encoded_value_len(&bytes[at..], schema[column])?;
+        let end = at.checked_add(length).ok_or_else(corrupt)?;
+        payloads[column] = bytes.get(at..end).ok_or_else(corrupt)?;
+        at = end;
+    }
+    if at != bytes.len() {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// Length of one non-null physical column payload at the beginning of `bytes`.
+/// This is shared by row decoding and the PAX reassembler so both formats
+/// reject the same malformed variable-length values.
+pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, SqlError> {
+    let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
+    let fixed = match column {
+        ColType::Bool => Some(1),
+        ColType::Int2 | ColType::Int4 | ColType::Date => Some(4),
+        ColType::Int8
+        | ColType::Float4
+        | ColType::Float8
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Time => Some(8),
+        ColType::Timetz => Some(12),
+        ColType::Interval | ColType::Uuid => Some(16),
+        ColType::Inet | ColType::Cidr => Some(18),
+        ColType::Macaddr => Some(6),
+        ColType::Macaddr8 => Some(8),
+        ColType::Numeric => {
+            let header = bytes.get(..7).ok_or_else(corrupt)?;
+            Some(7 + u16::from_le_bytes([header[5], header[6]]) as usize * 2)
+        }
+        ColType::Text
+        | ColType::Name
+        | ColType::Varchar
+        | ColType::Bpchar
+        | ColType::Json
+        | ColType::Jsonb
+        | ColType::Range(_)
+        | ColType::Multirange(_)
+        | ColType::Bytea => {
+            let length = bytes.get(..4).ok_or_else(corrupt)?;
+            Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+        }
+        ColType::Array(_) | ColType::Bit { .. } => {
+            let length = bytes.get(..4).ok_or_else(corrupt)?;
+            let payload = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+            if payload == 0 {
+                return Err(corrupt());
+            }
+            Some(4 + payload)
+        }
+        ColType::Enum(_) => {
+            let length = bytes.get(8..12).ok_or_else(corrupt)?;
+            Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+        }
+        ColType::Int2Vector | ColType::Record => return Err(corrupt()),
+    };
+    let length = fixed.expect("all stored types have a length");
+    if bytes.len() < length {
+        return Err(corrupt());
+    }
+    Ok(length)
+}
+
 /// Decodes a row into `out` (at least as many slots as the schema has
 /// columns). Text values borrow from `bytes`.
 pub(crate) fn decode<'a>(

@@ -3,7 +3,8 @@
 //! An SST is a table's row versions written once, in key order, and never changed —
 //! which is what lets it be a run of immutable blocks rather than a file that
 //! is seeked within. Current rows are packed into [`BlockType::SstDataV2`]
-//! blocks in key order, and sparse [`BlockType::SstIndexV2`] leaves record,
+//! blocks in key order (row-packed or self-describing PAX), and sparse
+//! [`BlockType::SstIndexV2`] leaves record,
 //! for each data block, the first key it holds and the block's identity. A
 //! large SST adds one root over those leaves. Given the root identity a reader
 //! can find any key; nothing else about the SST needs naming.
@@ -21,6 +22,8 @@
 //! rowid-only block format; the next checkpoint rewrites those legacy SSTs.
 
 use crate::mem::arena::Arena;
+use crate::sql::types::ColType;
+use crate::storage::rowenc::{self, MAX_COLUMNS};
 
 use super::bloom::{self, FILTER_BYTES};
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
@@ -117,6 +120,8 @@ pub(crate) const MAX_ASSEMBLED: usize =
 /// this caps a single row at about 4 MiB — far above anything the engine's
 /// arenas admit — and exceeding it is a loud error, never truncation.
 const MAX_CHAIN: usize = 16;
+const PAX_MAGIC: u32 = 0x3158_4150;
+const PAX_ROW_HEADER: usize = 8 + 8 + 4;
 
 const LEGACY_INDEX_ENTRY: usize = 8 + 32;
 const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
@@ -141,6 +146,8 @@ pub(crate) enum SstError {
     TooManyBlocks,
     /// Rows were not handed to the writer in ascending key order.
     KeyOutOfOrder,
+    /// A PAX group could not represent a row supplied by its table writer.
+    PaxEncoding,
     /// The block store failed.
     Store(StoreError),
 }
@@ -185,6 +192,11 @@ pub(crate) struct SstWriter {
     /// LZ4 staging for data-block flushes: the smaller of raw/compressed is
     /// what gets stored.
     compress_buf: Box<[u8]>,
+    /// Columnar payload assembled from `pending` before compression.
+    pax_buf: Box<[u8]>,
+    pax_schema: [ColType; MAX_COLUMNS],
+    pax_columns: usize,
+    pax_enabled: bool,
     /// Flushed index leaves: `(first key, data_block_count, id)`. One leaf
     /// makes the classic single-block index; more make a two-level one, so
     /// an SST is no longer capped at one index block's worth of data.
@@ -230,6 +242,10 @@ impl SstWriter {
             roster: vec![BlockId([0u8; 32]); MAX_ROSTER].into_boxed_slice(),
             roster_len: 0,
             compress_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            pax_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            pax_schema: [ColType::Bool; MAX_COLUMNS],
+            pax_columns: 0,
+            pax_enabled: false,
             leaves: vec![(SstKey::MIN, 0u32, BlockId([0u8; 32])); MAX_LEAVES].into_boxed_slice(),
             leaves_len: 0,
         }
@@ -237,7 +253,7 @@ impl SstWriter {
 
     /// The fixed bytes one writer reserves, for budget estimates.
     pub(crate) fn budget_bytes() -> usize {
-        2 * MAX_PAYLOAD // pending + compress staging
+        3 * MAX_PAYLOAD // pending + PAX + compression staging
             + MAX_DATA_BLOCKS * core::mem::size_of::<(SstKey, BlockId)>()
             + FILTER_TIERS.iter().sum::<usize>()
             + MAX_ROSTER * 32
@@ -256,6 +272,22 @@ impl SstWriter {
         self.key_count = 0;
         self.roster_len = 0;
         self.leaves_len = 0;
+    }
+
+    /// Selects the table row layout for the next SST.  Callers must choose it
+    /// before appending; execution runs retain the ordinary row layout.
+    pub(crate) fn set_pax_schema(&mut self, schema: &[ColType]) -> Result<(), SstError> {
+        if self.pending_len != 0
+            || self.index_len != 0
+            || self.leaves_len != 0
+            || schema.len() > MAX_COLUMNS
+        {
+            return Err(SstError::PaxEncoding);
+        }
+        self.pax_schema[..schema.len()].copy_from_slice(schema);
+        self.pax_columns = schema.len();
+        self.pax_enabled = true;
+        Ok(())
     }
 
     /// The identities written so far — a garbage sweep running while a
@@ -289,10 +321,15 @@ impl SstWriter {
             return Err(SstError::KeyOutOfOrder);
         }
         let entry = VERSIONED_ENTRY_HEADER + row.len();
+        if self.pax_enabled && entry > MAX_PAYLOAD {
+            return Err(SstError::PaxEncoding);
+        }
         if entry > MAX_PAYLOAD {
             return self.append_chained(store, key, row);
         }
-        if self.pending_len + entry > MAX_PAYLOAD {
+        if self.pending_len + entry
+            > MAX_PAYLOAD.saturating_sub(if self.pax_enabled { 128 } else { 0 })
+        {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
@@ -380,7 +417,9 @@ impl SstWriter {
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        if self.pending_len + VERSIONED_ENTRY_HEADER > MAX_PAYLOAD {
+        if self.pending_len + VERSIONED_ENTRY_HEADER
+            > MAX_PAYLOAD.saturating_sub(if self.pax_enabled { 128 } else { 0 })
+        {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
@@ -426,12 +465,21 @@ impl SstWriter {
         // Store whichever of raw/LZ4 is smaller: on object storage the bytes
         // are latency, bandwidth and money, and an incompressible block
         // costs nothing but this attempt.
-        let raw = &self.pending[..self.pending_len];
-        let id = match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
-            Some(n) if n < raw.len() => {
-                store.put(&self.compress_buf[..n], BlockType::SstDataV2Lz4, 0)?
+        let (raw, block_type) = if !self.pax_enabled {
+            (&self.pending[..self.pending_len], BlockType::SstDataV2)
+        } else {
+            let length = self.encode_pax()?;
+            (&self.pax_buf[..length], BlockType::SstDataPaxV1)
+        };
+        let id = if self.pax_enabled {
+            store.put(raw, block_type, 0)?
+        } else {
+            match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
+                Some(n) if n < raw.len() => {
+                    store.put(&self.compress_buf[..n], BlockType::SstDataV2Lz4, 0)?
+                }
+                _ => store.put(raw, block_type, 0)?,
             }
-            _ => store.put(raw, BlockType::SstDataV2, 0)?,
         };
         self.record(id)?;
         self.index[self.index_len] = (first, id);
@@ -439,6 +487,105 @@ impl SstWriter {
         self.pending_len = 0;
         self.pending_first = None;
         Ok(())
+    }
+
+    fn encode_pax(&mut self) -> Result<usize, SstError> {
+        let mut rows = 0usize;
+        let mut payload_bytes = [0usize; MAX_COLUMNS];
+        let entries = DataBlock {
+            bytes: &self.pending[..self.pending_len],
+            versioned: true,
+        };
+        for entry in entries {
+            if entry.is_chained() || rows == u16::MAX as usize {
+                return Err(SstError::PaxEncoding);
+            }
+            rows += 1;
+            if entry.tombstone {
+                continue;
+            }
+            let mut payloads = [&[][..]; MAX_COLUMNS];
+            let mut nulls = [false; MAX_COLUMNS];
+            rowenc::encoded_columns(
+                entry.head,
+                &self.pax_schema[..self.pax_columns],
+                &mut payloads,
+                &mut nulls,
+            )
+            .map_err(|_| SstError::PaxEncoding)?;
+            for column in 0..self.pax_columns {
+                if !nulls[column] {
+                    payload_bytes[column] = payload_bytes[column]
+                        .checked_add(payloads[column].len())
+                        .ok_or(SstError::PaxEncoding)?;
+                }
+            }
+        }
+        let bitmap_bytes = rows.div_ceil(8);
+        let header = 8usize
+            .checked_add(self.pax_columns)
+            .and_then(|n| n.checked_add(rows * PAX_ROW_HEADER))
+            .and_then(|n| n.checked_add(self.pax_columns * bitmap_bytes))
+            .ok_or(SstError::PaxEncoding)?;
+        let total = payload_bytes
+            .iter()
+            .take(self.pax_columns)
+            .try_fold(header, |n, bytes| n.checked_add(*bytes))
+            .ok_or(SstError::PaxEncoding)?;
+        if total > MAX_PAYLOAD {
+            return Err(SstError::PaxEncoding);
+        }
+        let output = &mut self.pax_buf[..total];
+        output[..4].copy_from_slice(&PAX_MAGIC.to_le_bytes());
+        output[4..6].copy_from_slice(&(rows as u16).to_le_bytes());
+        output[6..8].copy_from_slice(&(self.pax_columns as u16).to_le_bytes());
+        for column in 0..self.pax_columns {
+            output[8 + column] = self.pax_schema[column].code();
+        }
+        let row_base = 8 + self.pax_columns;
+        let bitmap_base = row_base + rows * PAX_ROW_HEADER;
+        output[bitmap_base..bitmap_base + self.pax_columns * bitmap_bytes].fill(0);
+        let mut columns = [0usize; MAX_COLUMNS];
+        let mut at = bitmap_base + self.pax_columns * bitmap_bytes;
+        for column in 0..self.pax_columns {
+            columns[column] = at;
+            at += payload_bytes[column];
+        }
+        let mut entries = DataBlock {
+            bytes: &self.pending[..self.pending_len],
+            versioned: true,
+        };
+        for row in 0..rows {
+            let entry = entries.next().ok_or(SstError::PaxEncoding)?;
+            let row_at = row_base + row * PAX_ROW_HEADER;
+            output[row_at..row_at + 8].copy_from_slice(&entry.key.rowid.to_le_bytes());
+            output[row_at + 8..row_at + 16].copy_from_slice(&entry.key.commit_lsn.to_le_bytes());
+            output[row_at + 16..row_at + 20]
+                .copy_from_slice(&(if entry.tombstone { TOMB_FLAG } else { 0 }).to_le_bytes());
+            if entry.tombstone {
+                continue;
+            }
+            let mut payloads = [&[][..]; MAX_COLUMNS];
+            let mut nulls = [false; MAX_COLUMNS];
+            rowenc::encoded_columns(
+                entry.head,
+                &self.pax_schema[..self.pax_columns],
+                &mut payloads,
+                &mut nulls,
+            )
+            .map_err(|_| SstError::PaxEncoding)?;
+            for column in 0..self.pax_columns {
+                let bitmap_at = bitmap_base + column * bitmap_bytes + row / 8;
+                if nulls[column] {
+                    output[bitmap_at] |= 1 << (row % 8);
+                } else {
+                    let end = columns[column] + payloads[column].len();
+                    output[columns[column]..end].copy_from_slice(payloads[column]);
+                    columns[column] = end;
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Writes the accumulated index entries as one leaf block (the classic
@@ -723,10 +870,124 @@ pub(crate) fn read_data_block(
                 super::BlockError::Payload,
             )))
         }
+        BlockType::SstDataPaxV1 => {
+            bounce[..n].copy_from_slice(&buf[..n]);
+            decode_pax(&bounce[..n], buf)
+        }
         _ => Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         ))),
     }
+}
+
+fn decode_pax(input: &[u8], output: &mut [u8]) -> Result<usize, SstError> {
+    let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+    if input.len() < 8 || u32::from_le_bytes(input[..4].try_into().unwrap()) != PAX_MAGIC {
+        return Err(corrupt());
+    }
+    let rows = u16::from_le_bytes(input[4..6].try_into().unwrap()) as usize;
+    let columns = u16::from_le_bytes(input[6..8].try_into().unwrap()) as usize;
+    if columns > MAX_COLUMNS {
+        return Err(corrupt());
+    }
+    let bitmap_bytes = rows.div_ceil(8);
+    let row_base = 8usize.checked_add(columns).ok_or_else(corrupt)?;
+    let bitmap_base = row_base
+        .checked_add(rows.checked_mul(PAX_ROW_HEADER).ok_or_else(corrupt)?)
+        .ok_or_else(corrupt)?;
+    let values_base = bitmap_base
+        .checked_add(columns.checked_mul(bitmap_bytes).ok_or_else(corrupt)?)
+        .ok_or_else(corrupt)?;
+    if values_base > input.len() {
+        return Err(corrupt());
+    }
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    for column in 0..columns {
+        schema[column] = ColType::from_code(input[8 + column]).ok_or_else(corrupt)?;
+    }
+    let mut starts = [0usize; MAX_COLUMNS];
+    let mut ends = [0usize; MAX_COLUMNS];
+    let mut at = values_base;
+    for column in 0..columns {
+        starts[column] = at;
+        for row in 0..rows {
+            let flags_at = row_base + row * PAX_ROW_HEADER + 16;
+            let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
+            if flags & !TOMB_FLAG != 0 {
+                return Err(corrupt());
+            }
+            if flags & TOMB_FLAG != 0
+                || input[bitmap_base + column * bitmap_bytes + row / 8] & (1 << (row % 8)) != 0
+            {
+                continue;
+            }
+            let length =
+                rowenc::encoded_value_len(&input[at..], schema[column]).map_err(|_| corrupt())?;
+            at = at.checked_add(length).ok_or_else(corrupt)?;
+            if at > input.len() {
+                return Err(corrupt());
+            }
+        }
+        ends[column] = at;
+    }
+    if at != input.len() {
+        return Err(corrupt());
+    }
+    let mut cursors = starts;
+    let row_bitmap = columns.div_ceil(8);
+    let mut written = 0usize;
+    for row in 0..rows {
+        let row_at = row_base + row * PAX_ROW_HEADER;
+        let flags = u32::from_le_bytes(input[row_at + 16..row_at + 20].try_into().unwrap());
+        let header_end = written
+            .checked_add(VERSIONED_ENTRY_HEADER)
+            .ok_or_else(corrupt)?;
+        if header_end > output.len() {
+            return Err(corrupt());
+        }
+        output[written..written + 8].copy_from_slice(&input[row_at..row_at + 8]);
+        output[written + 8..header_end].copy_from_slice(&input[row_at + 8..row_at + 20]);
+        written = header_end;
+        if flags & TOMB_FLAG != 0 {
+            continue;
+        }
+        let row_start = written;
+        let row_header = written.checked_add(2 + row_bitmap).ok_or_else(corrupt)?;
+        if row_header > output.len() {
+            return Err(corrupt());
+        }
+        output[written..written + 2].copy_from_slice(&(columns as u16).to_le_bytes());
+        output[written + 2..row_header].fill(0);
+        written = row_header;
+        for column in 0..columns {
+            let is_null =
+                input[bitmap_base + column * bitmap_bytes + row / 8] & (1 << (row % 8)) != 0;
+            if is_null {
+                output[row_start + 2 + column / 8] |= 1 << (column % 8);
+                continue;
+            }
+            let length =
+                rowenc::encoded_value_len(&input[cursors[column]..ends[column]], schema[column])
+                    .map_err(|_| corrupt())?;
+            let end = written.checked_add(length).ok_or_else(corrupt)?;
+            if end > output.len() {
+                return Err(corrupt());
+            }
+            output[written..end].copy_from_slice(&input[cursors[column]..cursors[column] + length]);
+            cursors[column] += length;
+            written = end;
+        }
+        let length = written - row_start;
+        if length > u32::MAX as usize {
+            return Err(corrupt());
+        }
+        output[row_start - VERSIONED_ENTRY_HEADER + 16..row_start - VERSIONED_ENTRY_HEADER + 20]
+            .copy_from_slice(&(length as u32).to_le_bytes());
+    }
+    if cursors[..columns] != ends[..columns] {
+        return Err(corrupt());
+    }
+    Ok(written)
 }
 
 /// Starts a read whose bytes a sequential scan will need next. The store
@@ -1606,6 +1867,8 @@ fn assemble_chain(
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+    use crate::sql::types::Datum;
+    use crate::storage::rowenc;
     use crate::store::memory::MemoryBlockStore;
 
     fn store() -> (Budget, MemoryBlockStore) {
@@ -1656,6 +1919,35 @@ mod tests {
         );
         assert_eq!(get(&mut r, &mut s, &root, 2), None);
         assert_eq!(get(&mut r, &mut s, &root, 0), None);
+    }
+
+    #[test]
+    fn pax_rows_and_tombstones_reassemble_as_canonical_rows() {
+        let (_budget, mut store) = store();
+        let arena = arena();
+        let schema = [ColType::Int4, ColType::Text, ColType::Bool];
+        let first = [Datum::Int4(7), Datum::Text("wide value"), Datum::Null];
+        let second = [Datum::Int4(-4), Datum::Text("second"), Datum::Bool(true)];
+        let mut first_bytes = vec![0; rowenc::encoded_len(&first)];
+        let mut second_bytes = vec![0; rowenc::encoded_len(&second)];
+        rowenc::encode(&first, &mut first_bytes);
+        rowenc::encode(&second, &mut second_bytes);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 20), &first_bytes)
+            .unwrap();
+        writer
+            .append_tombstone_version(&mut store, SstKey::at(2, 20))
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(3, 20), &second_bytes)
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut reader = SstReader::new(&arena).unwrap();
+        assert_eq!(get(&mut reader, &mut store, &handle, 1), Some(first_bytes));
+        assert_eq!(get(&mut reader, &mut store, &handle, 2), None);
+        assert_eq!(get(&mut reader, &mut store, &handle, 3), Some(second_bytes));
     }
 
     #[test]

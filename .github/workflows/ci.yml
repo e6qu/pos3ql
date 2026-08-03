@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        phase: [cold, recursive, set]
+        phase: [cold, recursive, lateral, set]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

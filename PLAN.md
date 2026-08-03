@@ -883,7 +883,7 @@ its purpose is the 1.5 MiB object-resident sort, DISTINCT, and membership path,
 not synchronous WAL uploads whose behavior has independent coverage. That keeps
 the aggregate gate focused on its ordinary checks. Three configured bounded CI
 phases are the authoritative execution of the cold materialization assertions:
-cold read/sort/membership, recursive/lateral/outer execution, and
+cold read/sort/membership, recursive execution, lateral/outer execution, and
 set/nested/retaining execution.
 
 The deterministic storage-VOPR keeps its 16-seed, 300-step endurance sweep,

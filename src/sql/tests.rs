@@ -10480,6 +10480,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     let phase = match std::env::var("POS3QL_EXTERNAL_RUN_PHASE").as_deref() {
         Ok("cold") => "cold",
         Ok("recursive") => "recursive",
+        Ok("lateral") => "lateral",
         Ok("set") => "set",
         Err(std::env::VarError::NotPresent) => "all",
         Ok(other) => panic!("unknown external-run phase: {other}"),
@@ -10631,6 +10632,9 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
                 > 0,
             "recursive work tables must be immutable object-backed runs"
         );
+    }
+
+    if phase == "all" || phase == "lateral" {
         let lateral = run_with_arena_bytes(
             &mut restarted,
             &mut restarted_budget,

@@ -5656,6 +5656,20 @@ impl Storage {
                     })?;
                     let mut schema = [ColType::Bool; MAX_COLUMNS];
                     table.def.schema(&mut schema);
+                    // PAX payload slices borrow the resident block, while the
+                    // executor can retain a batch row after this cursor moves
+                    // on. Pack the selected physical values once into the
+                    // statement arena, then decode that one stable row. A
+                    // per-column synthetic row here turns one scan row into
+                    // dozens of arena allocations under instrumentation.
+                    let encoded = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })?;
+                    encoded[..2].copy_from_slice(&(layout.columns() as u16).to_le_bytes());
+                    encoded[2..2 + layout.columns().div_ceil(8)].fill(0);
                     let values = arena
                         .alloc_slice_with(layout.columns(), |_| Datum::Null)
                         .map_err(|_| {
@@ -5667,16 +5681,15 @@ impl Storage {
                     let mut copied = 2 + layout.columns().div_ceil(8);
                     for column in 0..layout.columns() {
                         let Some((start, end)) = cursor.head_pax_values[column] else {
+                            encoded[2 + column / 8] |= 1 << (column % 8);
                             continue;
                         };
                         copied = copied.checked_add(end - start).ok_or_else(|| {
                             sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
                         })?;
-                        values[column] = rowenc::decode_payload(
+                        encoded[copied - (end - start)..copied].copy_from_slice(
                             &context.member_raw_blocks[member as usize][start..end],
-                            schema[column],
-                            arena,
-                        )?;
+                        );
                     }
                     if copied != len as usize {
                         return Err(sql_err!(
@@ -5684,6 +5697,7 @@ impl Storage {
                             "PAX selected row length does not match its cursor header"
                         ));
                     }
+                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
                     SpilledRowRepresentation::Values(&*values)
                 } else {
                     let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {

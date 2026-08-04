@@ -9,7 +9,7 @@ See [docs/terminology.md](docs/terminology.md) for the glossary and naming
 rules; architecture is in [README.md](README.md), the roadmap in
 [PLAN.md](PLAN.md), and standing directives in [AGENTS.md](AGENTS.md).
 
-Last reviewed: 2026-08-03. The ledger has no open entries: current remaining
+Last reviewed: 2026-08-04. The ledger has no open entries: current remaining
 work is tracked as planned compatibility, replication, and execution work in
 `PLAN.md`, not as deferred bugs. Crash recovery owns the killed server PID and
 the server listener explicitly permits safe immediate reuse after a crash; the
@@ -18,6 +18,7 @@ executor, covered by the forced-cold query regression.
 
 | ID | Status | Found | Description | Repro | Fixed in |
 |----|--------|-------|-------------|-------|----------|
+| B-310 | fixed | 2026-08-04 | **The first packed-PAX sizing rule made each logical group only one quarter of its immutable container.** A cold sequential scan over an ordinary wide table then needed seventeen physical GETs, exceeding the established bounded-read regression despite the container protocol being correct. The fixed half-container target retains multiple independently verified groups per object while keeping the existing cold scan within its request bound. | `cargo test --locked sql::tests::selective_object_resident_query_prunes_durable_blocks_without_warming_during_planning` | this PR |
 | B-309 | fixed | 2026-08-03 | **A PAX-backed `EXISTS` subquery decoded every physical payload even though it observes only whether one predicate-matching row exists.** Wide cold predicate probes could therefore exhaust the statement arena before the first-match short circuit. EXISTS now carries its predicate-only demand into the scan. | `cargo test --locked sql::tests::cold_pax_scan_decodes_only_filter_and_projection_columns` | this PR |
 | B-308 | fixed | 2026-08-03 | **Plain aggregate folding decoded every PAX payload although aggregate arguments and the scan predicate completely determine its observable source columns.** A narrow `count(*)` over wide cold rows therefore exhausted the statement arena even though it observes no payload values. Aggregate scans now derive and carry their complete physical demand. | `cargo test --locked sql::tests::cold_pax_scan_decodes_only_filter_and_projection_columns` | this PR |
 | B-307 | fixed | 2026-08-03 | **A direct one-table PAX SELECT decoded its proved demand, but the same SELECT used as a derived row source discarded that proof and decoded every payload.** Set operations and nested query sources could therefore reintroduce statement-arena exhaustion for an otherwise narrow scan. Wire streaming and row-source streaming now share one demand derivation choke point. | `cargo test --locked sql::tests::cold_pax_scan_decodes_only_filter_and_projection_columns` | this PR |

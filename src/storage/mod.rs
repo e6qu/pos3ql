@@ -2547,7 +2547,7 @@ struct MemberCursor {
     head_pax_values: [Option<(usize, usize)>; MAX_COLUMNS],
     loaded_type: Option<crate::store::BlockType>,
     prefetched_leaf: Option<(usize, crate::store::BlockId)>,
-    prefetched_data: Option<(usize, crate::store::BlockId)>,
+    prefetched_data: Option<(usize, crate::store::DataBlockRef)>,
     /// The head entry, parsed as one immutable row-version key.
     head: Option<(crate::store::SstKey, bool, u32)>,
     done: bool,
@@ -5924,18 +5924,21 @@ impl Storage {
         loop {
             if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
                 let mut blocks = spill.blocks.borrow_mut();
-                if let Some(id) = crate::store::take_prefetched_index_first_data(
+                if let Some(reference) = crate::store::take_prefetched_index_first_data(
                     &mut *blocks,
                     &leaf,
                     &mut context.index_buf,
                     handle.versioned,
+                    handle.packed,
                 )
                 .map_err(spill_read_error)?
                 {
-                    crate::store::prefetch_data_block(&mut *blocks, Some(id))
-                        .map_err(spill_read_error)?;
                     cursor.prefetched_leaf = None;
-                    cursor.prefetched_data = Some((ordinal, id));
+                    if let crate::store::DataBlockRef::Direct(id) = reference {
+                        crate::store::prefetch_data_block(&mut *blocks, Some(id))
+                            .map_err(spill_read_error)?;
+                        cursor.prefetched_data = Some((ordinal, reference));
+                    }
                 }
             }
             if cursor.loaded != Some(cursor.ordinal) {
@@ -5962,8 +5965,10 @@ impl Storage {
                     };
                     match next {
                         Some(crate::store::DataBlockLookahead::Data(next)) => {
-                            crate::store::prefetch_data_block(&mut *blocks, Some(next))
-                                .map_err(spill_read_error)?;
+                            if let crate::store::DataBlockRef::Direct(next_id) = next {
+                                crate::store::prefetch_data_block(&mut *blocks, Some(next_id))
+                                    .map_err(spill_read_error)?;
+                            }
                             cursor.prefetched_data = Some((cursor.ordinal + 1, next));
                         }
                         Some(crate::store::DataBlockLookahead::Leaf(leaf)) => {
@@ -5976,10 +5981,11 @@ impl Storage {
                     }
                     id
                 };
-                let (raw_len, loaded_type) = crate::store::read_data_block_raw(
+                let (raw_len, loaded_type) = crate::store::read_data_block_raw_ref(
                     &mut *blocks,
-                    &id,
+                    id,
                     &mut context.member_raw_blocks[member],
+                    &mut context.member_blocks[member],
                 )
                 .map_err(spill_read_error)?;
                 let loaded_len = if loaded_type == crate::store::BlockType::SstDataPaxV1 {

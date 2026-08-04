@@ -838,9 +838,9 @@ truthfully merge unrelated object keys into one HTTP range request. A
 configured hedge is now available too:
 `object_store_hedge_after_ms` starts one duplicate of a still-pending GET on a
 spare fixed slot after that deadline (zero disables it); the first verified
-body wins and releases its sibling. The remaining Pillars 2–4 work is the
-packed ranged-read container, the block-at-a-time executor, and PAX
-late materialization described above.
+body wins and releases its sibling. The remaining Pillars 2–4 work is physical
+PAX-column late materialization and the vector operators that consume it; the
+immutable packed range container is described below.
 
 **Pillar 3 scan slice (2026-08-03).** An unshadowed cold table scan carries
 selected rows out of the resident merged-SST data block before the cursor
@@ -873,8 +873,8 @@ ORDER BY/DISTINCT keys: direct scans and materialization without deferred
 projection copy and decode only those PAX spans. Stars, joins, derived rows,
 outer references, correlated predicates, and deferred projections retain full
 rows until they carry an equally complete demand proof. The remaining
-late-materialization work is to feed those selected spans into the packed range
-container, so a survivor need not fetch every payload. Non-correlated grouped
+late-materialization work is to give selected PAX columns their own packed range
+extents, so a survivor need not fetch every payload. Non-correlated grouped
 queries now carry the same proof through their count, key-collection, and
 aggregate-folding scans: group keys, aggregate arguments, predicates,
 projections, and order keys determine the physical PAX spans. Correlated
@@ -885,6 +885,21 @@ Plain aggregate folding likewise reads only aggregate arguments and predicate
 columns, including no payload columns at all for `count(*)`.
 Predicate-only EXISTS probes follow the same contract and short-circuit without
 decoding unrelated physical values.
+
+**Packed PAX range-read slice (2026-08-04).** PAX data groups now enter an
+immutable `SstPackedContainerV1`: a bounded container holds several complete,
+independently framed logical groups. The version-three SST index names each
+logical group's container, byte extent, and content identity. A cold object
+reader therefore requests exactly the named HTTP byte range, verifies the
+returned logical frame before use, and caches that logical block rather than
+the unrelated container bytes. The same operation passes through RAM and disk
+cache tiers without a provider-specific branch; direct data blocks and older
+SST index forms remain readable. The PAX group target deliberately leaves room
+for more than one group per container while preserving the fixed writer budget.
+This removes whole-object amplification between adjacent groups, but not yet
+between columns of a selected group: the next slice will give each physical
+column its own verified extent and feed only proven predicate/projection
+columns to the fixed batch operators.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
@@ -1190,12 +1205,13 @@ the work below is deliberate completion work, not deferred correctness bugs.
 | PostgreSQL text SQL and catalogs | Broad SQL, DDL/DML, transactions, catalogs, dump/restore, and a zero-unsupported measured replay are implemented. | Continue strict differential expansion until the intended PostgreSQL language, catalog, locking, and tooling surface is covered; retain loud errors for every unsupported feature. |
 | PostgreSQL binary client format | COPY binary is byte-exact for implemented stored types, including composites; binary Bind is broadly supported. | Implement anonymous-record binary codecs and binary range/multirange Result encoding; then expand type coverage with the SQL surface. |
 | WAL compatibility | Pos3ql WAL is durable, checksummed, LSN-ordered, and cold-recoverable from object storage. | Implement logical replication publisher (`START_REPLICATION`, `pgoutput`, publications), then subscriber migration. PostgreSQL physical XLOG remains outside this design. |
-| Object-store execution | Costed scans/indexes, bounded hash joins, fixed-slot asynchronous GETs/prefetch/hedging, PAX groups, and proven column-demand decoding are implemented. | Build the packed ranged-read container, drive it through a block-at-a-time vector pipeline, and complete late materialization so survivors do not fetch unrelated payloads. |
+| Object-store execution | Costed scans/indexes, bounded hash joins, fixed-slot asynchronous GETs/prefetch/hedging, fixed batches, PAX groups, proven column-demand decoding, and verified packed-container range reads are implemented. | Give PAX columns independent verified extents, then drive their proven demand through vector operators so survivors do not fetch unrelated column payloads. |
 | Availability | VSR state machine and deterministic fault simulation exist. | Productionize live write routing, quorum ordering/failover, and group commit without changing bucket-durable acknowledgement. |
 
-**Execution order.** Finish the packed ranged-read/vector/late-materialization
-chain first: it builds directly on the current PAX and bounded-hash-join work
-and removes the remaining object-store read amplification. In parallel, define
+**Execution order.** Finish the PAX column-range/vector late-materialization
+chain first: it builds directly on the packed container, current PAX, and
+bounded-hash-join work and removes the remaining object-store read
+amplification. In parallel, define
 the logical-replication wire corpus against vanilla PostgreSQL. Then complete
 the binary exceptions and expand the strict SQL/catalog/tooling differential
 surface. VSR productionization follows with the same bucket-durability

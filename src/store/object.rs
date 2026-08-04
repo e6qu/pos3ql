@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, PrefetchState, StoreError, decode,
-    encode,
+    decode_packed_block, encode,
 };
 
 /// Blocks kept as objects under a key prefix.
@@ -102,6 +102,33 @@ fn get_block(
     let result = client.get(key, None).map_err(store_error)?;
     let body = &client.body_bytes()[..result.len];
     decode_block_body(body, id, into)
+}
+
+fn get_packed_block(
+    client: &mut ObjectStore,
+    prefix: &str,
+    container: &BlockId,
+    offset: usize,
+    length: usize,
+    expected: &BlockId,
+    into: &mut [u8],
+) -> Result<(usize, BlockType), StoreError> {
+    let start = HEADER_LEN
+        .checked_add(offset)
+        .ok_or(StoreError::Corrupt(super::BlockError::Truncated))?;
+    let end = start
+        .checked_add(length)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or(StoreError::Corrupt(super::BlockError::Truncated))?;
+    let mut key_buffer = [0u8; 128];
+    let key = key_of(prefix, container, &mut key_buffer);
+    let result = client
+        .get(key, Some((start as u64, end as u64)))
+        .map_err(store_error)?;
+    if result.len != length {
+        return Err(StoreError::Corrupt(super::BlockError::Truncated));
+    }
+    decode_packed_block(&client.body_bytes()[..result.len], expected, into)
 }
 
 fn decode_block_body(
@@ -407,6 +434,32 @@ impl BlockStore for OwnedObjectStore {
         result
     }
 
+    fn get_packed(
+        &mut self,
+        container: &BlockId,
+        offset: usize,
+        length: usize,
+        expected: &BlockId,
+        into: &mut [u8],
+        _scratch: &mut [u8],
+    ) -> Result<(usize, BlockType), StoreError> {
+        let started = Instant::now();
+        let result = get_packed_block(
+            &mut self.slots[0].client,
+            self.prefix,
+            container,
+            offset,
+            length,
+            expected,
+            into,
+        );
+        if result.is_ok() {
+            self.record_completed_read(started, length);
+        }
+        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
+        result
+    }
+
     fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
         for slot in self.slots.as_mut_slice() {
             if slot.pending_id == Some(*id)
@@ -560,6 +613,26 @@ impl BlockStore for ObjectBlockStore<'_> {
         get_block(self.client, self.prefix, id, into)
     }
 
+    fn get_packed(
+        &mut self,
+        container: &BlockId,
+        offset: usize,
+        length: usize,
+        expected: &BlockId,
+        into: &mut [u8],
+        _scratch: &mut [u8],
+    ) -> Result<(usize, BlockType), StoreError> {
+        get_packed_block(
+            self.client,
+            self.prefix,
+            container,
+            offset,
+            length,
+            expected,
+            into,
+        )
+    }
+
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
@@ -705,6 +778,64 @@ mod tests {
 
         store.slots[0].ready_id = Some(id);
         assert!(store.advance_pending_read(0).unwrap());
+    }
+
+    #[test]
+    fn packed_read_uses_only_the_requested_verified_extent() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+
+        let mut first = [0u8; super::super::BLOCK_SIZE];
+        let (first_id, first_len) =
+            encode(b"first", BlockType::SstDataPaxV1, 0, &mut first).unwrap();
+        let mut second = [0u8; super::super::BLOCK_SIZE];
+        let (second_id, second_len) =
+            encode(b"second", BlockType::SstDataPaxV1, 0, &mut second).unwrap();
+        let mut container = vec![0u8; first_len + second_len];
+        container[..first_len].copy_from_slice(&first[..first_len]);
+        container[first_len..].copy_from_slice(&second[..second_len]);
+        let container_id = store
+            .put(&container, BlockType::SstPackedContainerV1, 0)
+            .unwrap();
+
+        let before = store.io_stats();
+        let mut output = [0u8; 32];
+        let mut scratch = [0u8; 32];
+        assert_eq!(
+            store
+                .get_packed(
+                    &container_id,
+                    first_len,
+                    second_len,
+                    &second_id,
+                    &mut output,
+                    &mut scratch,
+                )
+                .unwrap(),
+            (6, BlockType::SstDataPaxV1)
+        );
+        assert_eq!(&output[..6], b"second");
+        let after = store.io_stats().saturating_sub(before);
+        assert_eq!(after.object_gets, 1);
+        assert_eq!(after.object_read_bytes, second_len as u64);
+
+        assert!(
+            store
+                .get_packed(
+                    &container_id,
+                    0,
+                    first_len,
+                    &second_id,
+                    &mut output,
+                    &mut scratch,
+                )
+                .is_err()
+        );
+        assert_ne!(first_id, second_id);
     }
 
     #[test]

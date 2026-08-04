@@ -141,6 +141,25 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn get_packed(
+        &mut self,
+        container: &super::BlockId,
+        offset: usize,
+        length: usize,
+        expected: &super::BlockId,
+        into: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<(usize, super::BlockType), super::StoreError> {
+        match self {
+            Layer::Base(store) => {
+                store.get_packed(container, offset, length, expected, into, scratch)
+            }
+            Layer::Disk(cache) => {
+                cache.get_packed(container, offset, length, expected, into, scratch)
+            }
+        }
+    }
+
     fn contains(&mut self, id: &super::BlockId) -> Result<bool, super::StoreError> {
         match self {
             Layer::Base(s) => s.contains(id),
@@ -266,6 +285,25 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(c) => c.get(id, into),
             TieredStore::WithoutRam(l) => l.get(id, into),
+        }
+    }
+
+    fn get_packed(
+        &mut self,
+        container: &super::BlockId,
+        offset: usize,
+        length: usize,
+        expected: &super::BlockId,
+        into: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<(usize, super::BlockType), super::StoreError> {
+        match self {
+            TieredStore::WithRam(cache) => {
+                cache.get_packed(container, offset, length, expected, into, scratch)
+            }
+            TieredStore::WithoutRam(layer) => {
+                layer.get_packed(container, offset, length, expected, into, scratch)
+            }
         }
     }
 

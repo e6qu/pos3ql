@@ -195,6 +195,26 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         Ok((len, block_type))
     }
 
+    fn get_packed(
+        &mut self,
+        container: &BlockId,
+        offset: usize,
+        length: usize,
+        expected: &BlockId,
+        into: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<(usize, BlockType), StoreError> {
+        if self.index.get(expected).is_some() {
+            return self.get(expected, into);
+        }
+        self.stats.misses += 1;
+        let (len, block_type) = self
+            .inner
+            .get_packed(container, offset, length, expected, into, scratch)?;
+        self.admit(*expected, block_type, &into[..len]);
+        Ok((len, block_type))
+    }
+
     fn prefetch(&mut self, id: &BlockId) -> Result<super::PrefetchState, StoreError> {
         if self.index.get(id).is_none() {
             return self.inner.prefetch(id);
@@ -277,6 +297,49 @@ mod tests {
             1,
             "the second read was served from the frame"
         );
+    }
+
+    #[test]
+    fn a_packed_extent_is_cached_by_its_logical_identity() {
+        let mut c = cache(4);
+        let mut framed = [0u8; super::super::BLOCK_SIZE];
+        let (logical, framed_len) =
+            super::super::encode(b"range payload", BlockType::SstDataPaxV1, 0, &mut framed)
+                .unwrap();
+        let container = c
+            .inner
+            .put(&framed[..framed_len], BlockType::SstPackedContainerV1, 0)
+            .unwrap();
+        let mut output = [0u8; 64];
+        let mut scratch = [0u8; super::super::BLOCK_SIZE];
+        let (len, kind) = c
+            .get_packed(
+                &container,
+                0,
+                framed_len,
+                &logical,
+                &mut output,
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(&output[..len], b"range payload");
+        assert_eq!(c.stats().misses, 1);
+
+        let (len, kind) = c
+            .get_packed(
+                &container,
+                0,
+                framed_len,
+                &logical,
+                &mut output,
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(&output[..len], b"range payload");
+        assert_eq!(c.stats().hits, 1);
+        assert_eq!(c.stats().misses, 1);
     }
 
     #[test]

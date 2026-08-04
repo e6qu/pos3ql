@@ -69,6 +69,20 @@ impl Reactor {
         self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)
     }
 
+    /// Sets read-readiness reporting without requiring callers to track
+    /// whether a filter is currently installed.
+    pub fn set_read_interest(&self, fd: RawFd, token: u64, enabled: bool) -> std::io::Result<()> {
+        let result = if enabled {
+            self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)
+        } else {
+            self.change(fd, libc::EVFILT_READ, libc::EV_DELETE, token)
+        };
+        match result {
+            Err(e) if !enabled && e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            other => other,
+        }
+    }
+
     /// Turns write-readiness reporting for `fd` on or offset. Disabling when
     /// not enabled is a no-op so callers can treat this as setting the
     /// desired state rather than tracking transitions.
@@ -272,6 +286,32 @@ mod tests {
         assert!(events.iter().any(|e| e.token == 3 && e.writable));
 
         reactor.set_write_interest(a.as_raw_fd(), 3, false).unwrap();
+        assert!(
+            reactor
+                .wait(Some(Duration::from_millis(1)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_interest_toggles() {
+        let mut budget = Budget::new(1 << 20);
+        let mut reactor = Reactor::new(&mut budget, 16).unwrap();
+        let (mut a, b) = pair();
+
+        reactor.set_read_interest(b.as_raw_fd(), 4, false).unwrap();
+        reactor.set_read_interest(b.as_raw_fd(), 4, true).unwrap();
+        a.write_all(b"x").unwrap();
+        assert!(
+            reactor
+                .wait(Some(Duration::from_millis(1000)))
+                .unwrap()
+                .iter()
+                .any(|event| event.token == 4 && event.readable)
+        );
+
+        reactor.set_read_interest(b.as_raw_fd(), 4, false).unwrap();
         assert!(
             reactor
                 .wait(Some(Duration::from_millis(1)))

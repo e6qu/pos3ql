@@ -264,6 +264,10 @@ impl Conn {
         !self.send.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
+    pub(crate) fn wants_read(&self) -> bool {
+        !self.parked
+    }
+
     /// The connection's id (the backend PID reported in BackendKeyData and in
     /// NotificationResponse).
     pub fn id(&self) -> i32 {
@@ -386,8 +390,14 @@ impl Conn {
         }
     }
 
-    pub fn retry_parked(&mut self, engine: &mut Engine, generation: u64) -> After {
+    pub fn retry_parked(
+        &mut self,
+        engine: &mut Engine,
+        generation: u64,
+        retry_io_waiters: bool,
+    ) -> After {
         if !self.parked
+            || (self.parked_for_io && !retry_io_waiters)
             || (!self.parked_for_io
                 && self.parked_generation == generation
                 && !self.lock_timeout_expired())

@@ -321,6 +321,10 @@ impl SstWriter {
         self.leaves_len = 0;
         self.packed_len = 0;
         self.packed_index_start = 0;
+        self.pax_schema.fill(ColType::Bool);
+        self.pax_refs.fill(DataBlockRef::Direct(BlockId([0u8; 32])));
+        self.pax_columns = 0;
+        self.pax_enabled = false;
     }
 
     /// Selects the table row layout for the next SST.  Callers must choose it
@@ -2962,6 +2966,31 @@ mod tests {
             2,
             "the filter and index are needed again, but the decoded PAX descriptor is reused"
         );
+    }
+
+    #[test]
+    fn reset_returns_a_pax_writer_to_canonical_rows() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&[ColType::Int4]).unwrap();
+        writer.reset();
+        writer
+            .append_version(&mut store, SstKey::at(1, 1), b"ordinary external row")
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = [0; MAX_PAYLOAD];
+        let reference = locate_data_block_with_next(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap()
+            .0;
+        let mut data = [0; MAX_PAYLOAD];
+        let mut scratch = [0; MAX_PAYLOAD];
+        let (_, block_type) =
+            read_data_block_raw_ref(&mut store, reference, &mut data, &mut scratch).unwrap();
+        assert!(matches!(
+            block_type,
+            BlockType::SstDataV2 | BlockType::SstDataV2Lz4
+        ));
     }
 
     #[test]

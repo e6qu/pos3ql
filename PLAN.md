@@ -354,6 +354,13 @@ construction. What remained of Stage C proper — the multi-block index and the 
 filter — closed with maturity-roadmap step 4's format follow-ups
 (2026-07-25), alongside LZ4 data-block compression.
 
+**Async object-read ownership (2026-08-04):** the synchronous block writer has
+its own startup-budgeted object client; every configured read slot exclusively
+owns one pending or completed response until its verified consumer releases it.
+The reactor wakes I/O-parked statements only on that read's completion and
+removes their client-read interest while parked, so cold reads neither corrupt
+their retained bytes nor spin on unrelated socket readiness.
+
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 
 Kill the "flush not implemented" wall: ingest becomes bounded by flush *rate*, not

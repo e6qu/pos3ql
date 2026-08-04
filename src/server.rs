@@ -62,6 +62,7 @@ pub struct Server {
 struct Slot {
     conn: Conn,
     generation: u32,
+    want_read: bool,
     want_write: bool,
 }
 
@@ -110,7 +111,11 @@ impl Server {
         } else {
             0
         };
-        let reactor =
+        #[allow(
+            unused_mut,
+            reason = "the Linux epoll backend records fixed read/write interest"
+        )]
+        let mut reactor =
             Reactor::new(budget, max_conns + 1 + block_read_slots).map_err(|e| match e {
                 crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
                 crate::io::reactor::ReactorSetupError::Os(io) => {
@@ -134,6 +139,7 @@ impl Server {
                 .push(Slot {
                     conn: Conn::new(config, budget)?,
                     generation: 0,
+                    want_read: false,
                     want_write: false,
                 })
                 .expect("sized to max_conns");
@@ -321,10 +327,13 @@ impl Server {
             self.wake_lock_waiters();
             self.engine
                 .issue_due_block_read_hedges(std::time::Instant::now());
-            self.sync_block_read_interest()?;
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }
+            // Enabling queued reads may open their non-blocking GET sockets.
+            // Reconcile after it does so every pending read has reactor
+            // interest before this loop can block again.
+            self.sync_block_read_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -413,6 +422,7 @@ impl Server {
         self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
         let fd = stream.as_raw_fd();
         slot.conn.open(stream, id);
+        slot.want_read = true;
         slot.want_write = false;
         let token = token_for(index, slot.generation);
         if let Err(e) = self.reactor.register_read(fd, token) {
@@ -455,6 +465,19 @@ impl Server {
             }
             After::Continue => {
                 let slot = &mut self.slots[index];
+                let read_desired = slot.conn.wants_read();
+                if read_desired != slot.want_read {
+                    let fd = slot.conn.stream().as_raw_fd();
+                    let token = token_for(index as u32, slot.generation);
+                    match self.reactor.set_read_interest(fd, token, read_desired) {
+                        Ok(()) => slot.want_read = read_desired,
+                        Err(e) => {
+                            log_io("set read interest", &e);
+                            self.release(index);
+                            return;
+                        }
+                    }
+                }
                 let desired = slot.conn.wants_write();
                 if desired != slot.want_write {
                     let fd = slot.conn.stream().as_raw_fd();
@@ -492,9 +515,10 @@ impl Server {
             .advance_pending_block_read(slot)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?
         {
-            // The GET completed and the block is cached. Wake parked
-            // statements — they'll retry and find the block in cache.
-            self.wake_lock_waiters();
+            // The GET completed and the block is cached. Wake only statements
+            // that are parked on object I/O; lock waiters have a separate
+            // generation-driven wakeup path.
+            self.wake_io_waiters();
         }
         Ok(())
     }
@@ -506,16 +530,25 @@ impl Server {
         assert_eq!(self.block_read_fds.len(), self.engine.block_read_slots());
         for slot in 0..self.block_read_fds.len() {
             let wanted = self.engine.pending_block_read_fd(slot);
-            if wanted == self.block_read_fds[slot] {
-                continue;
-            }
-            if let Some(fd) = self.block_read_fds[slot].take() {
-                self.reactor.deregister(fd)?;
-            }
-            if let Some(fd) = wanted {
-                self.reactor
-                    .register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
-                self.block_read_fds[slot] = Some(fd);
+            match (self.block_read_fds[slot], wanted) {
+                (Some(registered), Some(fd)) if registered == fd => {
+                    // A completed or cancelled GET can close `registered` and
+                    // the next connection may receive the same integer fd.
+                    // EV_ADD is idempotent for a live registration and
+                    // recreates the filter after that close.
+                    self.reactor
+                        .register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
+                }
+                (registered, wanted) => {
+                    if let Some(fd) = registered {
+                        self.reactor.deregister(fd)?;
+                    }
+                    if let Some(fd) = wanted {
+                        self.reactor
+                            .register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
+                    }
+                    self.block_read_fds[slot] = wanted;
+                }
             }
         }
         Ok(())
@@ -531,6 +564,17 @@ impl Server {
     /// statement index, so wakeup neither reparses client state nor replays
     /// completed commands.
     fn wake_lock_waiters(&mut self) {
+        self.wake_waiters(false);
+    }
+
+    /// Retries statements parked on an object read only after that read has
+    /// completed. Readable client sockets do not make a pending object GET
+    /// complete, so combining this with lock wakeups would spin the reactor.
+    fn wake_io_waiters(&mut self) {
+        self.wake_waiters(true);
+    }
+
+    fn wake_waiters(&mut self, retry_io_waiters: bool) {
         // A retry can itself abort a deadlock victim and release locks. Loop
         // until one complete pass observes a stable generation so every newly
         // unblocked connection is considered in the same reactor turn.
@@ -540,10 +584,11 @@ impl Server {
                 if !self.slots[index].conn.is_open() {
                     continue;
                 }
-                match self.slots[index]
-                    .conn
-                    .retry_parked(&mut self.engine, generation)
-                {
+                match self.slots[index].conn.retry_parked(
+                    &mut self.engine,
+                    generation,
+                    retry_io_waiters,
+                ) {
                     After::Continue => self.sync_write_interest(index),
                     After::Close => {
                         let slot = &mut self.slots[index];
@@ -601,6 +646,19 @@ impl Server {
         if !slot.conn.is_open() {
             return;
         }
+        let read_desired = slot.conn.wants_read();
+        if read_desired != slot.want_read {
+            let fd = slot.conn.stream().as_raw_fd();
+            let token = token_for(index as u32, slot.generation);
+            match self.reactor.set_read_interest(fd, token, read_desired) {
+                Ok(()) => slot.want_read = read_desired,
+                Err(e) => {
+                    log_io("set read interest", &e);
+                    self.release(index);
+                    return;
+                }
+            }
+        }
         let desired = slot.conn.wants_write();
         if desired != slot.want_write {
             let fd = slot.conn.stream().as_raw_fd();
@@ -631,6 +689,7 @@ impl Server {
             drop(stream);
         }
         slot.generation = slot.generation.wrapping_add(1);
+        slot.want_read = false;
         slot.want_write = false;
         self.free
             .push(index as u32)

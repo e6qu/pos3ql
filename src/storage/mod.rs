@@ -2523,6 +2523,11 @@ struct ScanContext {
     owner: u64,
     member_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
     member_raw_blocks: [Box<[u8]>; MAX_SPILL_SSTS],
+    pax_column_buf: Box<[u8]>,
+    pax_values_buf: Box<[u8]>,
+    pax_value_extents: [Option<(usize, usize)>; MAX_COLUMNS],
+    pax_values_owner: Option<(usize, usize)>,
+    pax_row_buf: Box<[u8]>,
     index_buf: Box<[u8]>,
 }
 
@@ -2560,13 +2565,16 @@ struct SpillVersion {
     commit_lsn: u64,
 }
 
-/// The reader's owned block buffers (index, data, chain assembly, and the
-/// staging bounce a compressed data block decompresses through).
+/// The reader's owned block buffers (index, data, physical column, chain
+/// assembly, and packed-range staging).
 struct SpillScratch {
     index_buf: Box<[u8]>,
     data_buf: Box<[u8]>,
+    decoded_buf: Box<[u8]>,
+    column_buf: Box<[u8]>,
     assembly_buf: Box<[u8]>,
     bounce_buf: Box<[u8]>,
+    decoded_data_ref: Option<(crate::store::SstHandle, crate::store::DataBlockRef, usize)>,
 }
 
 struct ValueIndexScratch {
@@ -2583,12 +2591,14 @@ impl SpillReader {
         >,
     ) -> Result<Self, BudgetError> {
         budget.draw(
-            2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
+            2 * (5 * crate::store::MAX_PAYLOAD
+                + crate::store::MAX_ASSEMBLED
+                + core::mem::size_of::<SpillScratch>()),
             "spill reader",
         )?;
         budget.draw(
             SCAN_CONTEXTS
-                * ((2 * MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                * ((2 * MAX_SPILL_SSTS + 4) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>()),
             "row-state walk contexts",
         )?;
@@ -2620,8 +2630,11 @@ impl SpillReader {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                column_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
                 bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                decoded_data_ref: None,
             })
         };
         let context = || {
@@ -2633,6 +2646,11 @@ impl SpillReader {
                 member_raw_blocks: core::array::from_fn(|_| {
                     vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice()
                 }),
+                pax_column_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                pax_values_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                pax_value_extents: [None; MAX_COLUMNS],
+                pax_values_owner: None,
+                pax_row_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
         };
@@ -2659,9 +2677,11 @@ impl SpillReader {
 
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes() -> usize {
-        2 * (3 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+        2 * (5 * crate::store::MAX_PAYLOAD
+            + crate::store::MAX_ASSEMBLED
+            + core::mem::size_of::<SpillScratch>())
             + SCAN_CONTEXTS
-                * ((2 * MAX_SPILL_SSTS + 1) * crate::store::MAX_PAYLOAD
+                * ((2 * MAX_SPILL_SSTS + 4) * crate::store::MAX_PAYLOAD
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
             + 4 * crate::store::MAX_PAYLOAD
             + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
@@ -5447,6 +5467,7 @@ impl Storage {
                 ));
             };
             context.owner = walk_id;
+            context.pax_values_owner = None;
             for (member, cursor) in cursors[..n].iter_mut().enumerate() {
                 Self::cursor_advance(spill, table, member, cursor, &mut context)?;
             }
@@ -5479,6 +5500,7 @@ impl Storage {
                     cursor.loaded_type = None;
                 }
                 context.owner = walk_id;
+                context.pax_values_owner = None;
             }
             // Consume every version of this row from every member. The
             // greatest commit LSN admitted by the statement snapshot wins;
@@ -5578,6 +5600,7 @@ impl Storage {
                 ));
             };
             context.owner = walk_id;
+            context.pax_values_owner = None;
             for (member, cursor) in cursors[..n].iter_mut().enumerate() {
                 Self::cursor_advance(spill, table, member, cursor, &mut context)?;
             }
@@ -5613,6 +5636,7 @@ impl Storage {
                     cursor.head_pax_values = [None; MAX_COLUMNS];
                 }
                 context.owner = walk_id;
+                context.pax_values_owner = None;
             }
             let mut verdict: Option<SpillVersion> = None;
             for (member, cursor) in cursors[..n].iter().enumerate() {
@@ -5728,6 +5752,117 @@ impl Storage {
                             "PAX packed row length does not match selected value spans"
                         ));
                     }
+                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
+                    SpilledRowRepresentation::Values(&*values)
+                } else if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
+                    let layout = cursor.pax_layout.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX descriptor has no validated layout"
+                        )
+                    })?;
+                    if !layout.external_columns() {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX descriptor does not name external columns"
+                        ));
+                    }
+                    let owner = (member as usize, cursor.ordinal);
+                    if context.pax_values_owner != Some(owner) {
+                        let ScanContext {
+                            member_blocks,
+                            member_raw_blocks,
+                            pax_column_buf,
+                            pax_values_buf,
+                            pax_value_extents,
+                            pax_values_owner,
+                            pax_row_buf,
+                            ..
+                        } = &mut *context;
+                        let mut blocks = spill.blocks.borrow_mut();
+                        let mut at = 0usize;
+                        pax_value_extents.fill(None);
+                        for column in 0..layout.columns() {
+                            if decoded_columns.is_some_and(|columns| !columns[column]) {
+                                continue;
+                            }
+                            let reference = layout
+                                .column_ref(
+                                    &member_raw_blocks[member as usize][..cursor.raw_len],
+                                    column,
+                                )
+                                .map_err(spill_read_error)?;
+                            let (len, block_type) = crate::store::read_data_block_raw_ref(
+                                &mut *blocks,
+                                reference,
+                                pax_column_buf,
+                                &mut member_blocks[member as usize],
+                            )
+                            .map_err(spill_read_error)?;
+                            if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX descriptor column reference has the wrong block type"
+                                ));
+                            }
+                            let end = at.checked_add(len).ok_or_else(|| {
+                                sql_err!(sqlstate::INTERNAL_ERROR, "PAX extent length overflows")
+                            })?;
+                            if end > pax_values_buf.len() {
+                                return Err(sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "PAX column extents exceed the fixed scan vector buffer"
+                                ));
+                            }
+                            pax_values_buf[at..end].copy_from_slice(&pax_column_buf[..len]);
+                            pax_value_extents[column] = Some((at, end));
+                            at = end;
+                        }
+                        *pax_values_owner = Some(owner);
+                        let _ = (member_raw_blocks, pax_row_buf);
+                    }
+                    let encoded_len = {
+                        let ScanContext {
+                            member_raw_blocks,
+                            pax_values_buf,
+                            pax_value_extents,
+                            pax_row_buf,
+                            ..
+                        } = &mut *context;
+                        crate::store::copy_pax_v2_row_from_extents(
+                            &layout,
+                            &member_raw_blocks[member as usize][..cursor.raw_len],
+                            cursor.head_raw_row,
+                            decoded_columns,
+                            pax_values_buf,
+                            pax_value_extents,
+                            pax_row_buf,
+                        )
+                        .map_err(spill_read_error)?
+                    };
+                    if decoded_columns.is_none() && encoded_len != len as usize {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX descriptor row length does not match its cursor header"
+                        ));
+                    }
+                    let mut schema = [ColType::Bool; MAX_COLUMNS];
+                    table.def.schema(&mut schema);
+                    let encoded = arena.alloc_slice_with(encoded_len, |_| 0u8).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })?;
+                    encoded.copy_from_slice(&context.pax_row_buf[..encoded_len]);
+                    let values = arena
+                        .alloc_slice_with(layout.columns(), |_| Datum::Null)
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "spilled PAX values exceed the statement arena; raise work_arena_bytes"
+                            )
+                        })?;
                     rowenc::decode(encoded, &schema[..layout.columns()], values)?;
                     SpilledRowRepresentation::Values(&*values)
                 } else {
@@ -5988,7 +6123,10 @@ impl Storage {
                     &mut context.member_blocks[member],
                 )
                 .map_err(spill_read_error)?;
-                let loaded_len = if loaded_type == crate::store::BlockType::SstDataPaxV1 {
+                let loaded_len = if matches!(
+                    loaded_type,
+                    crate::store::BlockType::SstDataPaxV1 | crate::store::BlockType::SstDataPaxV2
+                ) {
                     0
                 } else {
                     crate::store::decode_data_block(
@@ -6001,12 +6139,13 @@ impl Storage {
                 cursor.loaded_len = loaded_len;
                 cursor.raw_len = raw_len;
                 cursor.raw_row = 0;
-                cursor.pax_layout = (loaded_type == crate::store::BlockType::SstDataPaxV1)
-                    .then(|| {
-                        crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len])
-                    })
-                    .transpose()
-                    .map_err(spill_read_error)?;
+                cursor.pax_layout = matches!(
+                    loaded_type,
+                    crate::store::BlockType::SstDataPaxV1 | crate::store::BlockType::SstDataPaxV2
+                )
+                .then(|| crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len]))
+                .transpose()
+                .map_err(spill_read_error)?;
                 cursor.pax_value_cursors = cursor
                     .pax_layout
                     .as_ref()
@@ -6016,7 +6155,11 @@ impl Storage {
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
-            if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV1) {
+            if matches!(
+                cursor.loaded_type,
+                Some(crate::store::BlockType::SstDataPaxV1)
+                    | Some(crate::store::BlockType::SstDataPaxV2)
+            ) {
                 let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -6031,16 +6174,22 @@ impl Storage {
                 let (key, tombstone) = layout
                     .row_key(&context.member_raw_blocks[member][..cursor.raw_len], row)
                     .map_err(spill_read_error)?;
-                layout
-                    .advance_row_values(
-                        &context.member_raw_blocks[member][..cursor.raw_len],
-                        row,
-                        &mut cursor.pax_value_cursors,
-                        &mut cursor.head_pax_values,
-                    )
-                    .map_err(spill_read_error)?;
+                if !layout.external_columns() {
+                    layout
+                        .advance_row_values(
+                            &context.member_raw_blocks[member][..cursor.raw_len],
+                            row,
+                            &mut cursor.pax_value_cursors,
+                            &mut cursor.head_pax_values,
+                        )
+                        .map_err(spill_read_error)?;
+                }
                 let len = if tombstone {
                     0
+                } else if layout.external_columns() {
+                    layout
+                        .row_len(&context.member_raw_blocks[member][..cursor.raw_len], row)
+                        .map_err(spill_read_error)?
                 } else {
                     let column_count = layout.columns();
                     let row_len = cursor
@@ -6115,9 +6264,14 @@ impl Storage {
             ));
         };
         let scratch = &mut *scratch;
+        // This multi-SST probe reuses the decoded buffer without preserving a
+        // single row block, so it invalidates the point-reader cache.
+        scratch.decoded_data_ref = None;
         let mut reader = crate::store::SstReader::over(
             &mut scratch.index_buf,
             &mut scratch.data_buf,
+            &mut scratch.decoded_buf,
+            &mut scratch.column_buf,
             &mut scratch.assembly_buf,
         );
         let mut best: Option<SpillVersion> = None;
@@ -6681,13 +6835,30 @@ impl Storage {
                 let SpillScratch {
                     index_buf,
                     data_buf,
+                    decoded_buf,
+                    column_buf,
                     assembly_buf,
+                    decoded_data_ref,
                     ..
                 } = &mut *scratch;
-                let mut reader = crate::store::SstReader::over(index_buf, data_buf, assembly_buf);
+                let mut reader = crate::store::SstReader::over(
+                    index_buf,
+                    data_buf,
+                    decoded_buf,
+                    column_buf,
+                    assembly_buf,
+                );
+                reader.restore_cached_data_block((*decoded_data_ref).and_then(
+                    |(cached_handle, reference, cached_len)| {
+                        (cached_handle == handle).then_some((reference, cached_len))
+                    },
+                ));
                 let got = reader
                     .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
                     .map_err(spill_read_error)?;
+                *decoded_data_ref = reader
+                    .cached_data_block()
+                    .map(|(reference, cached_len)| (handle, reference, cached_len));
                 match got {
                     Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
                         Ok(&out[..len as usize])
@@ -6751,8 +6922,11 @@ impl Storage {
                 let SpillScratch {
                     index_buf,
                     data_buf,
+                    decoded_buf,
+                    column_buf,
                     assembly_buf,
                     bounce_buf,
+                    decoded_data_ref,
                 } = &mut *scratch;
                 // The assembly buffer doubles as the row destination: `get`
                 // assembles a chained row into the caller buffer directly, so
@@ -6762,10 +6936,25 @@ impl Storage {
                 let row_buf = &mut assembly_buf[..len as usize];
                 let got = {
                     let mut blocks = spill.blocks.borrow_mut();
-                    let mut reader = crate::store::SstReader::over(index_buf, data_buf, bounce_buf);
-                    reader
+                    let mut reader = crate::store::SstReader::over(
+                        index_buf,
+                        data_buf,
+                        decoded_buf,
+                        column_buf,
+                        bounce_buf,
+                    );
+                    reader.restore_cached_data_block((*decoded_data_ref).and_then(
+                        |(cached_handle, reference, cached_len)| {
+                            (cached_handle == handle).then_some((reference, cached_len))
+                        },
+                    ));
+                    let got = reader
                         .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
-                        .map_err(spill_read_error)?
+                        .map_err(spill_read_error)?;
+                    *decoded_data_ref = reader
+                        .cached_data_block()
+                        .map(|(reference, cached_len)| (handle, reference, cached_len));
+                    got
                 };
                 match got {
                     Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {

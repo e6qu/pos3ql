@@ -80,6 +80,7 @@ pub(crate) mod lz4;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
+pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
     DataBlockLookahead, DataBlockRef, PaxLayout, SstCursor, SstHandle, SstKey, SstReader,
 };
@@ -87,7 +88,7 @@ pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{
     block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block_ref,
     locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block_raw_ref,
-    read_data_block_ref, take_prefetched_index_first_data,
+    take_prefetched_index_first_data,
 };
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
@@ -148,6 +149,11 @@ pub(crate) enum BlockType {
     /// Immutable container holding several independently checksummed PAX data
     /// blocks. SST index entries name their byte extents inside this object.
     SstPackedContainerV1 = 14,
+    /// Commit-LSN-versioned PAX descriptor: row keys and null maps name
+    /// independently verified physical column extents.
+    SstDataPaxV2 = 15,
+    /// One physical PAX column extent named by an [`SstDataPaxV2`] descriptor.
+    SstDataPaxColumnV1 = 16,
 }
 
 impl BlockType {
@@ -167,6 +173,8 @@ impl BlockType {
             12 => BlockType::ValueIndexRoster,
             13 => BlockType::SstDataPaxV1,
             14 => BlockType::SstPackedContainerV1,
+            15 => BlockType::SstDataPaxV2,
+            16 => BlockType::SstDataPaxColumnV1,
             _ => return None,
         })
     }
@@ -565,6 +573,8 @@ mod tests {
             BlockType::SstDataV2Lz4,
             BlockType::SstDataPaxV1,
             BlockType::SstPackedContainerV1,
+            BlockType::SstDataPaxV2,
+            BlockType::SstDataPaxColumnV1,
             BlockType::SstIndexV2,
             BlockType::ValueIndexData,
             BlockType::ValueIndexRoster,

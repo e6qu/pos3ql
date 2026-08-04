@@ -111,7 +111,12 @@ find target -name '*.profraw' -delete 2>/dev/null || true
 case "$SHARD" in
 "" | lib)
     echo "=== in-process tests ==="
-    cargo test --lib --release 2>&1 | grep -E '^test result' | tail -1
+    if ! cargo test --lib --release > "$TMP/lib.log" 2>&1; then
+        tail -80 "$TMP/lib.log"
+        echo "FAIL: in-process tests did not pass; coverage cannot be reported"
+        exit 1
+    fi
+    grep -E '^test result' "$TMP/lib.log" | tail -1
     ;;
 esac
 # The in-process tests' profiles are the baseline; the external suites must

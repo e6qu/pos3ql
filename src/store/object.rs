@@ -153,6 +153,7 @@ fn decode_block_body(
 /// The bucket store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
+    write_client: ObjectStore,
     slots: FixedVec<ObjectReadSlot>,
     prefix: &'static str,
     scratch: Vec<u8>,
@@ -180,6 +181,10 @@ impl OwnedObjectStore {
         budget: &mut Budget,
         prefix: &'static str,
     ) -> Result<Self, crate::object_store::SetupError> {
+        // A completed async read retains its response until its consumer
+        // verifies it. Writes must never share that client: sending a PUT
+        // clears the response buffer while the read identity is still live.
+        let write_client = ObjectStore::new(config, budget)?;
         let mut slots = FixedVec::new(
             budget,
             "object_store_get_slots",
@@ -201,6 +206,7 @@ impl OwnedObjectStore {
                 .expect("object read slots sized from configuration");
         }
         Ok(Self {
+            write_client,
             slots,
             prefix,
             scratch: vec![0u8; super::BLOCK_SIZE],
@@ -387,7 +393,7 @@ impl BlockStore for OwnedObjectStore {
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
         let result = put_block(
-            &mut self.slots[0].client,
+            &mut self.write_client,
             self.prefix,
             &mut self.scratch,
             payload,
@@ -792,6 +798,30 @@ mod tests {
             )
             .unwrap();
             stream.write_all(&body).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            for _ in 0..1_000_000 {
+                match listener.accept() {
+                    Ok((mut writer, _)) => {
+                        read_request(&mut writer);
+                        writer
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("accept writer: {error}"),
+                }
+                let mut request = [0u8; 1];
+                match stream.read(&mut request) {
+                    Ok(count) if count > 0 => panic!("write reused a completed read client"),
+                    Ok(_) => panic!("read client closed before writer connected"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("read completed client: {error}"),
+                }
+                std::thread::yield_now();
+            }
+            panic!("writer did not use its dedicated object client");
         });
 
         let mut config = crate::config::Config::default_dev();
@@ -814,6 +844,9 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(complete, "mock object response did not complete");
+        store
+            .put(b"concurrent write", BlockType::SstIndex, 0)
+            .unwrap();
         let mut output = [0u8; 64];
         assert_eq!(
             store.take_prefetch(&id, &mut output).unwrap(),

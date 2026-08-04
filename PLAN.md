@@ -354,6 +354,13 @@ construction. What remained of Stage C proper — the multi-block index and the 
 filter — closed with maturity-roadmap step 4's format follow-ups
 (2026-07-25), alongside LZ4 data-block compression.
 
+**Async object-read ownership (2026-08-04):** the synchronous block writer has
+its own startup-budgeted object client; every configured read slot exclusively
+owns one pending or completed response until its verified consumer releases it.
+The reactor wakes I/O-parked statements only on that read's completion and
+removes their client-read interest while parked, so cold reads neither corrupt
+their retained bytes nor spin on unrelated socket readiness.
+
 ### Stage D — memtable flush + the manifest log (continuous ingest)
 
 Kill the "flush not implemented" wall: ingest becomes bounded by flush *rate*, not
@@ -873,8 +880,8 @@ ORDER BY/DISTINCT keys: direct scans and materialization without deferred
 projection copy and decode only those PAX spans. Stars, joins, derived rows,
 outer references, correlated predicates, and deferred projections retain full
 rows until they carry an equally complete demand proof. The remaining
-late-materialization work is to give selected PAX columns their own packed range
-extents, so a survivor need not fetch every payload. Non-correlated grouped
+late-materialization work is to carry the same physical proof through those
+multi-table and deferred operators. Non-correlated grouped
 queries now carry the same proof through their count, key-collection, and
 aggregate-folding scans: group keys, aggregate arguments, predicates,
 projections, and order keys determine the physical PAX spans. Correlated
@@ -896,10 +903,20 @@ the unrelated container bytes. The same operation passes through RAM and disk
 cache tiers without a provider-specific branch; direct data blocks and older
 SST index forms remain readable. The PAX group target deliberately leaves room
 for more than one group per container while preserving the fixed writer budget.
-This removes whole-object amplification between adjacent groups, but not yet
-between columns of a selected group: the next slice will give each physical
-column its own verified extent and feed only proven predicate/projection
-columns to the fixed batch operators.
+This removes whole-object amplification between adjacent groups.
+
+**PAX column-extent/vector slice (2026-08-04).** A PAX group now writes one
+verified descriptor containing its version keys, null maps, canonical row
+lengths, and exact references to independently framed physical column extents.
+Those extents share immutable packed containers where they fit, but every read
+names and verifies only its own byte range and logical identity. A cold scan
+loads each descriptor's proven predicate/projection extents once into a
+startup-bounded vector buffer, then materializes surviving rows from that
+buffer; it no longer refetches a column per row or transfers unrelated wide
+payloads. Point lookup, range scan, compaction, and recovery all consume the
+same descriptor format, while older PAX-v1 groups remain readable. The
+forced-cold wide-table regression caps an id-only scan below one MiB of object
+transfer, making a full-payload regression observable rather than inferred.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
@@ -1210,13 +1227,12 @@ the work below is deliberate completion work, not deferred correctness bugs.
 | PostgreSQL text SQL and catalogs | Broad SQL, DDL/DML, transactions, catalogs, dump/restore, and a zero-unsupported measured replay are implemented. | Continue strict differential expansion until the intended PostgreSQL language, catalog, locking, and tooling surface is covered; retain loud errors for every unsupported feature. |
 | PostgreSQL binary client format | COPY binary is byte-exact for implemented stored types, including composites; binary Bind is broadly supported. | Implement anonymous-record binary codecs and binary range/multirange Result encoding; then expand type coverage with the SQL surface. |
 | WAL compatibility | Pos3ql WAL is durable, checksummed, LSN-ordered, and cold-recoverable from object storage. | Implement logical replication publisher (`START_REPLICATION`, `pgoutput`, publications), then subscriber migration. PostgreSQL physical XLOG remains outside this design. |
-| Object-store execution | Costed scans/indexes, bounded hash joins, fixed-slot asynchronous GETs/prefetch/hedging, fixed batches, PAX groups, proven column-demand decoding, and verified packed-container range reads are implemented. | Give PAX columns independent verified extents, then drive their proven demand through vector operators so survivors do not fetch unrelated column payloads. |
+| Object-store execution | Costed scans/indexes, bounded hash joins, fixed-slot asynchronous GETs/prefetch/hedging, fixed batches, PAX descriptors with independent verified column extents, and vector-cached proven-demand reads are implemented. | Carry the complete physical-demand proof through remaining multi-table, correlated, and deferred operators so every late-materialization boundary stays narrow. |
 | Availability | VSR state machine and deterministic fault simulation exist. | Productionize live write routing, quorum ordering/failover, and group commit without changing bucket-durable acknowledgement. |
 
-**Execution order.** Finish the PAX column-range/vector late-materialization
-chain first: it builds directly on the packed container, current PAX, and
-bounded-hash-join work and removes the remaining object-store read
-amplification. In parallel, define
+**Execution order.** Carry the PAX physical-demand proof through the remaining
+late-materialization boundaries first: it builds directly on the packed
+container, current vector path, and bounded-hash-join work. In parallel, define
 the logical-replication wire corpus against vanilla PostgreSQL. Then complete
 the binary exceptions and expand the strict SQL/catalog/tooling differential
 surface. VSR productionization follows with the same bucket-durability

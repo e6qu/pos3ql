@@ -150,7 +150,11 @@ pub(crate) const MAX_ASSEMBLED: usize =
 /// arenas admit — and exceeding it is a loud error, never truncation.
 const MAX_CHAIN: usize = 16;
 const PAX_MAGIC: u32 = 0x3158_4150;
+const PAX_V2_MAGIC: u32 = 0x3258_4150;
+const PAX_COLUMN_MAGIC: u32 = 0x3143_4150;
 const PAX_ROW_HEADER: usize = 8 + 8 + 4;
+const PAX_V2_ROW_HEADER: usize = PAX_ROW_HEADER + 4;
+const PACKED_DATA_REF_BYTES: usize = 32 + 4 + 4 + 32;
 /// PAX data groups are deliberately smaller than their enclosing container so
 /// one ranged object can carry several independently cacheable groups.
 const PACKED_PAX_TARGET: usize = MAX_PAYLOAD / 2;
@@ -228,6 +232,7 @@ pub(crate) struct SstWriter {
     /// Columnar payload assembled from `pending` before compression.
     pax_buf: Box<[u8]>,
     pax_schema: [ColType; MAX_COLUMNS],
+    pax_refs: [DataBlockRef; MAX_COLUMNS],
     pax_columns: usize,
     pax_enabled: bool,
     /// Framed logical PAX blocks waiting to become one immutable container.
@@ -282,6 +287,7 @@ impl SstWriter {
             compress_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pax_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pax_schema: [ColType::Bool; MAX_COLUMNS],
+            pax_refs: [DataBlockRef::Direct(BlockId([0u8; 32])); MAX_COLUMNS],
             pax_columns: 0,
             pax_enabled: false,
             packed: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
@@ -315,6 +321,10 @@ impl SstWriter {
         self.leaves_len = 0;
         self.packed_len = 0;
         self.packed_index_start = 0;
+        self.pax_schema.fill(ColType::Bool);
+        self.pax_refs.fill(DataBlockRef::Direct(BlockId([0u8; 32])));
+        self.pax_columns = 0;
+        self.pax_enabled = false;
     }
 
     /// Selects the table row layout for the next SST.  Callers must choose it
@@ -518,8 +528,8 @@ impl SstWriter {
         let (raw, block_type) = if !self.pax_enabled {
             (&self.pending[..self.pending_len], BlockType::SstDataV2)
         } else {
-            let length = self.encode_pax()?;
-            (&self.pax_buf[..length], BlockType::SstDataPaxV1)
+            let length = self.encode_pax_v2(store)?;
+            (&self.pax_buf[..length], BlockType::SstDataPaxV2)
         };
         let reference = if self.pax_enabled {
             let (id, framed_len) = super::encode(raw, block_type, 0, &mut self.compress_buf)
@@ -586,7 +596,11 @@ impl SstWriter {
         Ok(())
     }
 
-    fn encode_pax(&mut self) -> Result<usize, SstError> {
+    fn encode_pax_v2(&mut self, store: &mut dyn BlockStore) -> Result<usize, SstError> {
+        // Descriptor frames already staged for earlier groups must receive an
+        // immutable identity before this group's physical extents reuse the
+        // same fixed packing buffer.
+        self.flush_packed(store)?;
         let mut rows = 0usize;
         let mut payload_bytes = [0usize; MAX_COLUMNS];
         let entries = DataBlock {
@@ -619,46 +633,116 @@ impl SstWriter {
             }
         }
         let bitmap_bytes = rows.div_ceil(8);
-        let header = 8usize
+        for column in 0..self.pax_columns {
+            let column_len = 8usize
+                .checked_add(payload_bytes[column])
+                .ok_or(SstError::PaxEncoding)?;
+            if column_len > MAX_PAYLOAD {
+                return Err(SstError::PaxEncoding);
+            }
+            let output = &mut self.pax_buf[..column_len];
+            output[..4].copy_from_slice(&PAX_COLUMN_MAGIC.to_le_bytes());
+            output[4..6].copy_from_slice(&(rows as u16).to_le_bytes());
+            output[6] = self.pax_schema[column].code();
+            output[7] = 0;
+            let mut at = 8usize;
+            for entry in (DataBlock {
+                bytes: &self.pending[..self.pending_len],
+                versioned: true,
+            }) {
+                if entry.tombstone {
+                    continue;
+                }
+                let mut payloads = [&[][..]; MAX_COLUMNS];
+                let mut nulls = [false; MAX_COLUMNS];
+                rowenc::encoded_columns(
+                    entry.head,
+                    &self.pax_schema[..self.pax_columns],
+                    &mut payloads,
+                    &mut nulls,
+                )
+                .map_err(|_| SstError::PaxEncoding)?;
+                if !nulls[column] {
+                    let end = at
+                        .checked_add(payloads[column].len())
+                        .ok_or(SstError::PaxEncoding)?;
+                    output[at..end].copy_from_slice(payloads[column]);
+                    at = end;
+                }
+            }
+            if at != column_len {
+                return Err(SstError::PaxEncoding);
+            }
+            let (id, framed_len) = super::encode(
+                &self.pax_buf[..column_len],
+                BlockType::SstDataPaxColumnV1,
+                0,
+                &mut self.compress_buf,
+            )
+            .map_err(|_| SstError::PaxEncoding)?;
+            if self.packed_len + framed_len > self.packed.len() {
+                self.flush_pax_columns(store)?;
+            }
+            let offset = self.packed_len;
+            self.packed[offset..offset + framed_len]
+                .copy_from_slice(&self.compress_buf[..framed_len]);
+            self.packed_len += framed_len;
+            self.pax_refs[column] = DataBlockRef::Packed {
+                container: BlockId([0; 32]),
+                offset: u32::try_from(offset).map_err(|_| SstError::PaxEncoding)?,
+                length: u32::try_from(framed_len).map_err(|_| SstError::PaxEncoding)?,
+                id,
+            };
+        }
+        self.flush_pax_columns(store)?;
+
+        let row_base = 8usize
             .checked_add(self.pax_columns)
-            .and_then(|n| n.checked_add(rows * PAX_ROW_HEADER))
-            .and_then(|n| n.checked_add(self.pax_columns * bitmap_bytes))
             .ok_or(SstError::PaxEncoding)?;
-        let total = payload_bytes
-            .iter()
-            .take(self.pax_columns)
-            .try_fold(header, |n, bytes| n.checked_add(*bytes))
+        let bitmap_base = row_base
+            .checked_add(
+                rows.checked_mul(PAX_V2_ROW_HEADER)
+                    .ok_or(SstError::PaxEncoding)?,
+            )
+            .ok_or(SstError::PaxEncoding)?;
+        let refs_base = bitmap_base
+            .checked_add(
+                self.pax_columns
+                    .checked_mul(bitmap_bytes)
+                    .ok_or(SstError::PaxEncoding)?,
+            )
+            .ok_or(SstError::PaxEncoding)?;
+        let total = refs_base
+            .checked_add(
+                self.pax_columns
+                    .checked_mul(PACKED_DATA_REF_BYTES)
+                    .ok_or(SstError::PaxEncoding)?,
+            )
             .ok_or(SstError::PaxEncoding)?;
         if total > MAX_PAYLOAD {
             return Err(SstError::PaxEncoding);
         }
         let output = &mut self.pax_buf[..total];
-        output[..4].copy_from_slice(&PAX_MAGIC.to_le_bytes());
+        output[..4].copy_from_slice(&PAX_V2_MAGIC.to_le_bytes());
         output[4..6].copy_from_slice(&(rows as u16).to_le_bytes());
         output[6..8].copy_from_slice(&(self.pax_columns as u16).to_le_bytes());
         for column in 0..self.pax_columns {
             output[8 + column] = self.pax_schema[column].code();
         }
-        let row_base = 8 + self.pax_columns;
-        let bitmap_base = row_base + rows * PAX_ROW_HEADER;
-        output[bitmap_base..bitmap_base + self.pax_columns * bitmap_bytes].fill(0);
-        let mut columns = [0usize; MAX_COLUMNS];
-        let mut at = bitmap_base + self.pax_columns * bitmap_bytes;
-        for column in 0..self.pax_columns {
-            columns[column] = at;
-            at += payload_bytes[column];
-        }
-        let mut entries = DataBlock {
+        output[bitmap_base..refs_base].fill(0);
+        for (row, entry) in (DataBlock {
             bytes: &self.pending[..self.pending_len],
             versioned: true,
-        };
-        for row in 0..rows {
-            let entry = entries.next().ok_or(SstError::PaxEncoding)?;
-            let row_at = row_base + row * PAX_ROW_HEADER;
+        })
+        .enumerate()
+        {
+            let row_at = row_base + row * PAX_V2_ROW_HEADER;
             output[row_at..row_at + 8].copy_from_slice(&entry.key.rowid.to_le_bytes());
             output[row_at + 8..row_at + 16].copy_from_slice(&entry.key.commit_lsn.to_le_bytes());
             output[row_at + 16..row_at + 20]
                 .copy_from_slice(&(if entry.tombstone { TOMB_FLAG } else { 0 }).to_le_bytes());
+            let row_len = if entry.tombstone { 0 } else { entry.total_len };
+            output[row_at + 20..row_at + 24].copy_from_slice(&(row_len as u32).to_le_bytes());
             if entry.tombstone {
                 continue;
             }
@@ -672,17 +756,45 @@ impl SstWriter {
             )
             .map_err(|_| SstError::PaxEncoding)?;
             for column in 0..self.pax_columns {
-                let bitmap_at = bitmap_base + column * bitmap_bytes + row / 8;
                 if nulls[column] {
-                    output[bitmap_at] |= 1 << (row % 8);
-                } else {
-                    let end = columns[column] + payloads[column].len();
-                    output[columns[column]..end].copy_from_slice(payloads[column]);
-                    columns[column] = end;
+                    output[bitmap_base + column * bitmap_bytes + row / 8] |= 1 << (row % 8);
                 }
             }
         }
+        for column in 0..self.pax_columns {
+            let at = refs_base + column * PACKED_DATA_REF_BYTES;
+            write_data_ref(
+                self.pax_refs[column],
+                &mut output[at..at + PACKED_DATA_REF_BYTES],
+                true,
+            );
+        }
         Ok(total)
+    }
+
+    fn flush_pax_columns(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+        if self.packed_len == 0 {
+            return Ok(());
+        }
+        let container = store.put(
+            &self.packed[..self.packed_len],
+            BlockType::SstPackedContainerV1,
+            0,
+        )?;
+        self.record(container)?;
+        for reference in &mut self.pax_refs[..self.pax_columns] {
+            if let DataBlockRef::Packed {
+                container: location,
+                ..
+            } = reference
+                && location.0 == [0; 32]
+            {
+                *location = container;
+            }
+        }
+        self.packed_len = 0;
+        self.packed_index_start = self.index_len;
+        Ok(())
     }
 
     /// Writes the accumulated index entries as one leaf block (the classic
@@ -805,6 +917,10 @@ impl SstWriter {
 pub(crate) struct SstReader<'a> {
     index_scratch: &'a mut [u8],
     data_scratch: &'a mut [u8],
+    decoded_scratch: &'a mut [u8],
+    column_scratch: &'a mut [u8],
+    loaded_ref: Option<DataBlockRef>,
+    decoded_len: usize,
     /// Scratch a range scan assembles a chained row into (a point lookup
     /// assembles straight into the caller's buffer instead).
     assembly: &'a mut [u8],
@@ -881,7 +997,7 @@ impl SstCursor {
                     self.schedule_lookahead(store, self.block_ordinal + 1, next)?;
                     id
                 };
-                self.data_len = read_data_block_ref(store, id, data, bounce)?;
+                self.data_len = read_external_run_data_block_ref(store, id, data, bounce)?;
                 self.block_ordinal += 1;
                 self.offset = 0;
                 self.loaded = true;
@@ -988,7 +1104,12 @@ pub(crate) fn read_data_block(
     read_data_block_with_type(store, id, buf, bounce, None).map(|(length, _, _)| length)
 }
 
-pub(crate) fn read_data_block_ref(
+/// Decodes a canonical row block belonging to an external execution run.
+///
+/// PAX descriptors require their column extents and are intentionally handled
+/// only by the PAX-aware reader paths below; an execution run cannot contain
+/// one.
+pub(crate) fn read_external_run_data_block_ref(
     store: &mut dyn BlockStore,
     reference: DataBlockRef,
     buf: &mut [u8],
@@ -1090,7 +1211,9 @@ pub(crate) fn read_data_block_raw(
         | BlockType::SstDataV2
         | BlockType::SstDataLz4
         | BlockType::SstDataV2Lz4
-        | BlockType::SstDataPaxV1 => Ok((n, block_type)),
+        | BlockType::SstDataPaxV1
+        | BlockType::SstDataPaxV2
+        | BlockType::SstDataPaxColumnV1 => Ok((n, block_type)),
         _ => Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         ))),
@@ -1128,11 +1251,14 @@ pub(crate) struct PaxLayout {
     rows: usize,
     columns: usize,
     row_base: usize,
+    row_header: usize,
     bitmap_base: usize,
     bitmap_bytes: usize,
     schema: [ColType; MAX_COLUMNS],
     starts: [usize; MAX_COLUMNS],
     ends: [usize; MAX_COLUMNS],
+    refs_base: usize,
+    external: bool,
 }
 
 impl PaxLayout {
@@ -1144,12 +1270,46 @@ impl PaxLayout {
         self.columns
     }
 
+    pub(crate) fn external_columns(&self) -> bool {
+        self.external
+    }
+
+    pub(crate) fn column_ref(&self, input: &[u8], column: usize) -> Result<DataBlockRef, SstError> {
+        if !self.external || column >= self.columns {
+            return Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )));
+        }
+        let at = self
+            .refs_base
+            .checked_add(column * PACKED_DATA_REF_BYTES)
+            .ok_or(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )))?;
+        let bytes = input
+            .get(at..at + PACKED_DATA_REF_BYTES)
+            .ok_or(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )))?;
+        Ok(read_data_ref(bytes, true))
+    }
+
+    pub(crate) fn row_len(&self, input: &[u8], row: usize) -> Result<u32, SstError> {
+        if !self.external || row >= self.rows {
+            return Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )));
+        }
+        let at = self.row_base + row * self.row_header + PAX_ROW_HEADER;
+        Ok(u32::from_le_bytes(input[at..at + 4].try_into().unwrap()))
+    }
+
     pub(crate) fn row_key(&self, input: &[u8], row: usize) -> Result<(SstKey, bool), SstError> {
         let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
         if row >= self.rows {
             return Err(corrupt());
         }
-        let at = self.row_base + row * PAX_ROW_HEADER;
+        let at = self.row_base + row * self.row_header;
         let rowid = u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
         let commit_lsn = u64::from_le_bytes(input[at + 8..at + 16].try_into().unwrap());
         let flags = u32::from_le_bytes(input[at + 16..at + 20].try_into().unwrap());
@@ -1170,6 +1330,11 @@ impl PaxLayout {
         cursors: &mut [usize; MAX_COLUMNS],
         out: &mut [Option<(usize, usize)>; MAX_COLUMNS],
     ) -> Result<(), SstError> {
+        if self.external {
+            return Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )));
+        }
         let (_, tombstone) = self.row_key(input, row)?;
         out.fill(None);
         if tombstone {
@@ -1212,6 +1377,9 @@ impl PaxLayout {
         output: &mut [u8],
     ) -> Result<usize, SstError> {
         let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+        if self.external {
+            return Err(corrupt());
+        }
         let (_, tombstone) = self.row_key(input, row)?;
         if tombstone {
             return Err(corrupt());
@@ -1242,7 +1410,12 @@ impl PaxLayout {
         Ok(written)
     }
 
-    fn column_is_null(&self, input: &[u8], row: usize, column: usize) -> Result<bool, SstError> {
+    pub(crate) fn column_is_null(
+        &self,
+        input: &[u8],
+        row: usize,
+        column: usize,
+    ) -> Result<bool, SstError> {
         let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
         if row >= self.rows || column >= self.columns {
             return Err(corrupt());
@@ -1253,18 +1426,28 @@ impl PaxLayout {
 
 pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
     let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
-    if input.len() < 8 || u32::from_le_bytes(input[..4].try_into().unwrap()) != PAX_MAGIC {
+    if input.len() < 8 {
         return Err(corrupt());
     }
+    let magic = u32::from_le_bytes(input[..4].try_into().unwrap());
+    if magic != PAX_MAGIC && magic != PAX_V2_MAGIC {
+        return Err(corrupt());
+    }
+    let external = magic == PAX_V2_MAGIC;
     let rows = u16::from_le_bytes(input[4..6].try_into().unwrap()) as usize;
     let columns = u16::from_le_bytes(input[6..8].try_into().unwrap()) as usize;
     if columns > MAX_COLUMNS {
         return Err(corrupt());
     }
+    let row_header = if external {
+        PAX_V2_ROW_HEADER
+    } else {
+        PAX_ROW_HEADER
+    };
     let bitmap_bytes = rows.div_ceil(8);
     let row_base = 8usize.checked_add(columns).ok_or_else(corrupt)?;
     let bitmap_base = row_base
-        .checked_add(rows.checked_mul(PAX_ROW_HEADER).ok_or_else(corrupt)?)
+        .checked_add(rows.checked_mul(row_header).ok_or_else(corrupt)?)
         .ok_or_else(corrupt)?;
     let values_base = bitmap_base
         .checked_add(columns.checked_mul(bitmap_bytes).ok_or_else(corrupt)?)
@@ -1278,11 +1461,52 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
     }
     let mut starts = [0usize; MAX_COLUMNS];
     let mut ends = [0usize; MAX_COLUMNS];
+    if external {
+        let refs_end = values_base
+            .checked_add(
+                columns
+                    .checked_mul(PACKED_DATA_REF_BYTES)
+                    .ok_or_else(corrupt)?,
+            )
+            .ok_or_else(corrupt)?;
+        if refs_end != input.len() {
+            return Err(corrupt());
+        }
+        for row in 0..rows {
+            let flags_at = row_base + row * row_header + 16;
+            let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
+            if flags & !TOMB_FLAG != 0 {
+                return Err(corrupt());
+            }
+            let len_at = flags_at + 4;
+            let len = u32::from_le_bytes(input[len_at..len_at + 4].try_into().unwrap());
+            if flags & TOMB_FLAG != 0 {
+                if len != 0 {
+                    return Err(corrupt());
+                }
+            } else if len < (2 + columns.div_ceil(8)) as u32 {
+                return Err(corrupt());
+            }
+        }
+        return Ok(PaxLayout {
+            rows,
+            columns,
+            row_base,
+            row_header,
+            bitmap_base,
+            bitmap_bytes,
+            schema,
+            starts,
+            ends,
+            refs_base: values_base,
+            external,
+        });
+    }
     let mut at = values_base;
     for column in 0..columns {
         starts[column] = at;
         for row in 0..rows {
-            let flags_at = row_base + row * PAX_ROW_HEADER + 16;
+            let flags_at = row_base + row * row_header + 16;
             let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
             if flags & !TOMB_FLAG != 0 {
                 return Err(corrupt());
@@ -1308,12 +1532,230 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
         rows,
         columns,
         row_base,
+        row_header,
         bitmap_base,
         bitmap_bytes,
         schema,
         starts,
         ends,
+        refs_base: 0,
+        external,
     })
+}
+
+fn decode_pax_v2(
+    store: &mut dyn BlockStore,
+    input: &[u8],
+    output: &mut [u8],
+    column_scratch: &mut [u8],
+    range_scratch: &mut [u8],
+) -> Result<usize, SstError> {
+    let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+    let layout = pax_layout(input)?;
+    if !layout.external_columns() {
+        return Err(corrupt());
+    }
+    let mut extents = [None; MAX_COLUMNS];
+    let mut extent_len = 0usize;
+    for (column, extent) in extents.iter_mut().enumerate().take(layout.columns()) {
+        let reference = layout.column_ref(input, column)?;
+        let (column_len, block_type) =
+            read_data_block_raw_ref(store, reference, column_scratch, output)?;
+        if block_type != BlockType::SstDataPaxColumnV1 || column_len < 8 {
+            return Err(corrupt());
+        }
+        let end = extent_len.checked_add(column_len).ok_or_else(corrupt)?;
+        if end > range_scratch.len() {
+            return Err(SstError::RowTooLarge);
+        }
+        range_scratch[extent_len..end].copy_from_slice(&column_scratch[..column_len]);
+        *extent = Some((extent_len, end));
+        extent_len = end;
+    }
+    let mut written = 0usize;
+    for row in 0..layout.rows() {
+        let (key, tombstone) = layout.row_key(input, row)?;
+        let row_len = layout.row_len(input, row)? as usize;
+        let header_end = written
+            .checked_add(VERSIONED_ENTRY_HEADER)
+            .ok_or_else(corrupt)?;
+        if header_end > output.len() {
+            return Err(corrupt());
+        }
+        output[written..written + 8].copy_from_slice(&key.rowid.to_le_bytes());
+        output[written + 8..written + 16].copy_from_slice(&key.commit_lsn.to_le_bytes());
+        output[written + 16..header_end]
+            .copy_from_slice(&(if tombstone { TOMB_FLAG } else { row_len as u32 }).to_le_bytes());
+        written = header_end;
+        if tombstone {
+            continue;
+        }
+        let row_end = written.checked_add(row_len).ok_or_else(corrupt)?;
+        if row_end > output.len() {
+            return Err(corrupt());
+        }
+        let copied = copy_pax_v2_row_from_extents(
+            &layout,
+            input,
+            row,
+            None,
+            &range_scratch[..extent_len],
+            &extents,
+            &mut output[written..row_end],
+        )?;
+        if copied != row_len {
+            return Err(corrupt());
+        }
+        written = row_end;
+    }
+    Ok(written)
+}
+
+pub(crate) struct PaxReadScratch<'a> {
+    pub(crate) column: &'a mut [u8],
+    pub(crate) range: &'a mut [u8],
+}
+
+pub(crate) fn copy_pax_v2_row_demand(
+    store: &mut dyn BlockStore,
+    layout: &PaxLayout,
+    input: &[u8],
+    row: usize,
+    demanded: Option<&[bool; MAX_COLUMNS]>,
+    scratch: &mut PaxReadScratch<'_>,
+    output: &mut [u8],
+) -> Result<usize, SstError> {
+    let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+    let (_, tombstone) = layout.row_key(input, row)?;
+    if !layout.external_columns() || tombstone {
+        return Err(corrupt());
+    }
+    let bitmap_bytes = layout.columns().div_ceil(8);
+    let mut written = 2usize.checked_add(bitmap_bytes).ok_or_else(corrupt)?;
+    if written > output.len() {
+        return Err(corrupt());
+    }
+    output[..2].copy_from_slice(&(layout.columns() as u16).to_le_bytes());
+    output[2..written].fill(0);
+    let all_columns = demanded.is_none();
+    for column in 0..layout.columns() {
+        if demanded.is_some_and(|columns| !columns[column])
+            || layout.column_is_null(input, row, column)?
+        {
+            output[2 + column / 8] |= 1 << (column % 8);
+            continue;
+        }
+        let reference = layout.column_ref(input, column)?;
+        let (column_len, block_type) =
+            read_data_block_raw_ref(store, reference, scratch.column, scratch.range)?;
+        if block_type != BlockType::SstDataPaxColumnV1 || column_len < 8 {
+            return Err(corrupt());
+        }
+        if u32::from_le_bytes(scratch.column[..4].try_into().unwrap()) != PAX_COLUMN_MAGIC
+            || u16::from_le_bytes(scratch.column[4..6].try_into().unwrap()) as usize
+                != layout.rows()
+            || ColType::from_code(scratch.column[6]) != Some(layout.schema[column])
+            || scratch.column[7] != 0
+        {
+            return Err(corrupt());
+        }
+        let mut at = 8usize;
+        for preceding in 0..row {
+            let (_, preceding_tombstone) = layout.row_key(input, preceding)?;
+            if preceding_tombstone || layout.column_is_null(input, preceding, column)? {
+                continue;
+            }
+            let length =
+                rowenc::encoded_value_len(&scratch.column[at..column_len], layout.schema[column])
+                    .map_err(|_| corrupt())?;
+            at = at.checked_add(length).ok_or_else(corrupt)?;
+            if at > column_len {
+                return Err(corrupt());
+            }
+        }
+        let length =
+            rowenc::encoded_value_len(&scratch.column[at..column_len], layout.schema[column])
+                .map_err(|_| corrupt())?;
+        let end = at.checked_add(length).ok_or_else(corrupt)?;
+        let next = written.checked_add(length).ok_or_else(corrupt)?;
+        if end > column_len || next > output.len() {
+            return Err(corrupt());
+        }
+        output[written..next].copy_from_slice(&scratch.column[at..end]);
+        written = next;
+    }
+    if all_columns && written != layout.row_len(input, row)? as usize {
+        return Err(corrupt());
+    }
+    Ok(written)
+}
+
+pub(crate) fn copy_pax_v2_row_from_extents(
+    layout: &PaxLayout,
+    input: &[u8],
+    row: usize,
+    demanded: Option<&[bool; MAX_COLUMNS]>,
+    extent_bytes: &[u8],
+    extents: &[Option<(usize, usize)>; MAX_COLUMNS],
+    output: &mut [u8],
+) -> Result<usize, SstError> {
+    let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
+    let (_, tombstone) = layout.row_key(input, row)?;
+    if !layout.external_columns() || tombstone {
+        return Err(corrupt());
+    }
+    let bitmap_bytes = layout.columns().div_ceil(8);
+    let mut written = 2usize.checked_add(bitmap_bytes).ok_or_else(corrupt)?;
+    if written > output.len() {
+        return Err(corrupt());
+    }
+    output[..2].copy_from_slice(&(layout.columns() as u16).to_le_bytes());
+    output[2..written].fill(0);
+    let all_columns = demanded.is_none();
+    for column in 0..layout.columns() {
+        if demanded.is_some_and(|columns| !columns[column])
+            || layout.column_is_null(input, row, column)?
+        {
+            output[2 + column / 8] |= 1 << (column % 8);
+            continue;
+        }
+        let (start, end) = extents[column].ok_or_else(corrupt)?;
+        let bytes = extent_bytes.get(start..end).ok_or_else(corrupt)?;
+        if bytes.len() < 8
+            || u32::from_le_bytes(bytes[..4].try_into().unwrap()) != PAX_COLUMN_MAGIC
+            || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize != layout.rows()
+            || ColType::from_code(bytes[6]) != Some(layout.schema[column])
+            || bytes[7] != 0
+        {
+            return Err(corrupt());
+        }
+        let mut at = 8usize;
+        for preceding in 0..row {
+            let (_, preceding_tombstone) = layout.row_key(input, preceding)?;
+            if preceding_tombstone || layout.column_is_null(input, preceding, column)? {
+                continue;
+            }
+            let length = rowenc::encoded_value_len(&bytes[at..], layout.schema[column])
+                .map_err(|_| corrupt())?;
+            at = at.checked_add(length).ok_or_else(corrupt)?;
+            if at > bytes.len() {
+                return Err(corrupt());
+            }
+        }
+        let length = rowenc::encoded_value_len(&bytes[at..], layout.schema[column])
+            .map_err(|_| corrupt())?;
+        let end = at.checked_add(length).ok_or_else(corrupt)?;
+        let next = written.checked_add(length).ok_or_else(corrupt)?;
+        if end > bytes.len() || next > output.len() {
+            return Err(corrupt());
+        }
+        output[written..next].copy_from_slice(&bytes[at..end]);
+        written = next;
+    }
+    if all_columns && written != layout.row_len(input, row)? as usize {
+        return Err(corrupt());
+    }
+    Ok(written)
 }
 
 fn decode_pax(input: &[u8], output: &mut [u8]) -> Result<usize, SstError> {
@@ -1461,11 +1903,32 @@ pub(crate) fn take_prefetched_index_first_data(
 }
 
 impl<'a> SstReader<'a> {
+    /// Restores a canonical block held by the caller-owned scratch. The
+    /// caller retains that scratch for its entire lifetime, so its decoded
+    /// bytes remain valid exactly while this identity does.
+    pub(crate) fn restore_cached_data_block(&mut self, cached: Option<(DataBlockRef, usize)>) {
+        if let Some((reference, len)) = cached {
+            self.loaded_ref = Some(reference);
+            self.decoded_len = len;
+        }
+    }
+
+    pub(crate) fn cached_data_block(&self) -> Option<(DataBlockRef, usize)> {
+        self.loaded_ref
+            .map(|reference| (reference, self.decoded_len))
+    }
+
     pub(crate) fn new(arena: &'a Arena) -> Result<Self, SstError> {
         let index_scratch = arena
             .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         let data_scratch = arena
+            .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let decoded_scratch = arena
+            .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let column_scratch = arena
             .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         let assembly = arena
@@ -1474,19 +1937,64 @@ impl<'a> SstReader<'a> {
         Ok(Self {
             index_scratch,
             data_scratch,
+            decoded_scratch,
+            column_scratch,
+            loaded_ref: None,
+            decoded_len: 0,
             assembly,
         })
     }
 
     /// A reader over caller-owned buffers — the long-lived spill path, whose
     /// scratch persists across statements instead of living in an arena.
-    /// `index`/`data` must each hold a block payload; `assembly` a chained row.
-    pub(crate) fn over(index: &'a mut [u8], data: &'a mut [u8], assembly: &'a mut [u8]) -> Self {
+    /// `index`, `data`, `decoded`, and `column` must each hold a block payload;
+    /// `assembly` holds a chained row or a packed-range scratch extent.
+    pub(crate) fn over(
+        index: &'a mut [u8],
+        data: &'a mut [u8],
+        decoded: &'a mut [u8],
+        column: &'a mut [u8],
+        assembly: &'a mut [u8],
+    ) -> Self {
         Self {
             index_scratch: index,
             data_scratch: data,
+            decoded_scratch: decoded,
+            column_scratch: column,
+            loaded_ref: None,
+            decoded_len: 0,
             assembly,
         }
+    }
+
+    fn load_data_block(
+        &mut self,
+        store: &mut dyn BlockStore,
+        reference: DataBlockRef,
+    ) -> Result<usize, SstError> {
+        if self.loaded_ref == Some(reference) {
+            return Ok(self.decoded_len);
+        }
+        let (raw_len, block_type) =
+            read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
+        let decoded_len = if block_type == BlockType::SstDataPaxV2 {
+            decode_pax_v2(
+                store,
+                &self.data_scratch[..raw_len],
+                self.decoded_scratch,
+                self.column_scratch,
+                self.assembly,
+            )?
+        } else {
+            decode_data_block(
+                &self.data_scratch[..raw_len],
+                block_type,
+                self.decoded_scratch,
+            )?
+        };
+        self.loaded_ref = Some(reference);
+        self.decoded_len = decoded_len;
+        Ok(decoded_len)
     }
 
     /// Finds `rowid`, copying its row into `into` and returning the length, or
@@ -1539,9 +2047,9 @@ impl<'a> SstReader<'a> {
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
-        let data_len = read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
+        let data_len = self.load_data_block(store, block_ref)?;
         for entry in (DataBlock {
-            bytes: &self.data_scratch[..data_len],
+            bytes: &self.decoded_scratch[..data_len],
             versioned: handle.versioned,
         }) {
             if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
@@ -1610,9 +2118,9 @@ impl<'a> SstReader<'a> {
             return Ok(None);
         };
         let block_ref = block_ref_at(self.index_scratch, entry, handle.versioned, handle.packed);
-        let data_len = read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
+        let data_len = self.load_data_block(store, block_ref)?;
         for entry in (DataBlock {
-            bytes: &self.data_scratch[..data_len],
+            bytes: &self.decoded_scratch[..data_len],
             versioned: handle.versioned,
         }) {
             if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
@@ -1685,15 +2193,14 @@ impl<'a> SstReader<'a> {
                     handle.versioned,
                     handle.packed,
                 )?;
-                let data_len =
-                    read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
+                let data_len = self.load_data_block(store, block_ref)?;
                 let mut ran_past = false;
                 // A chained entry owns its whole block, so at most one assembly
                 // happens per block and the borrow of `data_scratch` has ended by
                 // the time the chain's overflow blocks are read.
                 let mut chained: Option<(u64, usize)> = None;
                 for entry in (DataBlock {
-                    bytes: &self.data_scratch[..data_len],
+                    bytes: &self.decoded_scratch[..data_len],
                     versioned: handle.versioned,
                 }) {
                     if entry.key.rowid > hi {
@@ -1773,10 +2280,9 @@ impl<'a> SstReader<'a> {
                     handle.versioned,
                     handle.packed,
                 )?;
-                let data_len =
-                    read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
+                let data_len = self.load_data_block(store, block_ref)?;
                 for entry in (DataBlock {
-                    bytes: &self.data_scratch[..data_len],
+                    bytes: &self.decoded_scratch[..data_len],
                     versioned: handle.versioned,
                 }) {
                     if entry.key >= lo {
@@ -2453,11 +2959,42 @@ mod tests {
         let mut reader = SstReader::new(&arena).unwrap();
         assert_eq!(get(&mut reader, &mut store, &handle, 1), Some(first_bytes));
         assert_eq!(get(&mut reader, &mut store, &handle, 2), None);
+        let before_second_live_row = store.reads();
         assert_eq!(get(&mut reader, &mut store, &handle, 3), Some(second_bytes));
+        assert_eq!(
+            store.reads() - before_second_live_row,
+            2,
+            "the filter and index are needed again, but the decoded PAX descriptor is reused"
+        );
     }
 
     #[test]
-    fn pax_row_spans_rebuild_only_the_selected_row() {
+    fn reset_returns_a_pax_writer_to_canonical_rows() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&[ColType::Int4]).unwrap();
+        writer.reset();
+        writer
+            .append_version(&mut store, SstKey::at(1, 1), b"ordinary external row")
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = [0; MAX_PAYLOAD];
+        let reference = locate_data_block_with_next(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap()
+            .0;
+        let mut data = [0; MAX_PAYLOAD];
+        let mut scratch = [0; MAX_PAYLOAD];
+        let (_, block_type) =
+            read_data_block_raw_ref(&mut store, reference, &mut data, &mut scratch).unwrap();
+        assert!(matches!(
+            block_type,
+            BlockType::SstDataV2 | BlockType::SstDataV2Lz4
+        ));
+    }
+
+    #[test]
+    fn pax_column_extents_rebuild_only_the_selected_row() {
         let (_budget, mut store) = store();
         let schema = [ColType::Int4, ColType::Text, ColType::Bool];
         let first = [Datum::Int4(7), Datum::Text("wide value"), Datum::Null];
@@ -2487,33 +3024,52 @@ mod tests {
         let mut scratch = [0; MAX_PAYLOAD];
         let (length, kind) =
             read_data_block_raw_ref(&mut store, reference, &mut raw, &mut scratch).unwrap();
-        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(kind, BlockType::SstDataPaxV2);
         let layout = pax_layout(&raw[..length]).unwrap();
-        let mut cursors = layout.column_starts();
-        let mut values = [None; MAX_COLUMNS];
+        assert!(layout.external_columns());
+        assert_ne!(
+            layout.column_ref(&raw[..length], 0).unwrap(),
+            layout.column_ref(&raw[..length], 1).unwrap()
+        );
+        let spans = [None; MAX_COLUMNS];
         let mut output = [0; MAX_PAYLOAD];
-        layout
-            .advance_row_values(&raw[..length], 0, &mut cursors, &mut values)
-            .unwrap();
-        let copied = layout
-            .copy_row(&raw[..length], 0, &values, &mut output)
-            .unwrap();
+        assert!(
+            layout
+                .copy_row(&raw[..length], 0, &spans, &mut output)
+                .is_err()
+        );
+        let copied = copy_pax_v2_row_demand(
+            &mut store,
+            &layout,
+            &raw[..length],
+            0,
+            None,
+            &mut PaxReadScratch {
+                column: &mut scratch,
+                range: &mut index,
+            },
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(&output[..copied], first_bytes);
-        layout
-            .advance_row_values(&raw[..length], 1, &mut cursors, &mut values)
-            .unwrap();
-        assert!(values.iter().all(Option::is_none));
-        layout
-            .advance_row_values(&raw[..length], 2, &mut cursors, &mut values)
-            .unwrap();
-        let copied = layout
-            .copy_row(&raw[..length], 2, &values, &mut output)
-            .unwrap();
+        let copied = copy_pax_v2_row_demand(
+            &mut store,
+            &layout,
+            &raw[..length],
+            2,
+            None,
+            &mut PaxReadScratch {
+                column: &mut scratch,
+                range: &mut index,
+            },
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(&output[..copied], second_bytes);
     }
 
     #[test]
-    fn pax_data_blocks_share_one_verified_packed_container() {
+    fn pax_columns_share_one_verified_packed_container() {
         let (_budget, mut store) = store();
         let schema = [ColType::Int4, ColType::Text];
         let payload = "x".repeat(20_000);
@@ -2534,28 +3090,28 @@ mod tests {
         let first = locate_data_block_ref(&mut store, &handle, &mut index, 0)
             .unwrap()
             .unwrap();
-        let second = locate_data_block_ref(&mut store, &handle, &mut index, 1)
-            .unwrap()
-            .unwrap();
-        let (first_container, second_container) = match (first, second) {
-            (
-                DataBlockRef::Packed {
-                    container: first, ..
-                },
-                DataBlockRef::Packed {
-                    container: second, ..
-                },
-            ) => (first, second),
-            other => panic!("expected packed PAX references, got {other:?}"),
-        };
-        assert_eq!(first_container, second_container);
-
         let mut raw = [0; MAX_PAYLOAD];
         let mut scratch = [0; MAX_PAYLOAD];
         let (length, kind) =
             read_data_block_raw_ref(&mut store, first, &mut raw, &mut scratch).unwrap();
-        assert_eq!(kind, BlockType::SstDataPaxV1);
-        assert_eq!(pax_layout(&raw[..length]).unwrap().rows(), 6);
+        assert_eq!(kind, BlockType::SstDataPaxV2);
+        let layout = pax_layout(&raw[..length]).unwrap();
+        assert_eq!(layout.rows(), 6);
+        let (first_container, first_offset) = match layout.column_ref(&raw[..length], 0).unwrap() {
+            DataBlockRef::Packed {
+                container, offset, ..
+            } => (container, offset),
+            other => panic!("expected packed PAX column reference, got {other:?}"),
+        };
+        let (second_container, second_offset) = match layout.column_ref(&raw[..length], 1).unwrap()
+        {
+            DataBlockRef::Packed {
+                container, offset, ..
+            } => (container, offset),
+            other => panic!("expected packed PAX column reference, got {other:?}"),
+        };
+        assert_eq!(first_container, second_container);
+        assert_ne!(first_offset, second_offset);
     }
 
     #[test]

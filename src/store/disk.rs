@@ -251,6 +251,26 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         Ok((len, block_type))
     }
 
+    fn get_packed(
+        &mut self,
+        container: &BlockId,
+        offset: usize,
+        length: usize,
+        expected: &BlockId,
+        into: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<(usize, BlockType), StoreError> {
+        if self.index.get(expected).is_some() {
+            return self.get(expected, into);
+        }
+        self.stats.misses += 1;
+        let (len, block_type) = self
+            .inner
+            .get_packed(container, offset, length, expected, into, scratch)?;
+        self.admit(*expected, block_type, 0, &into[..len]);
+        Ok((len, block_type))
+    }
+
     fn prefetch(&mut self, id: &BlockId) -> Result<super::PrefetchState, StoreError> {
         if self.index.get(id).is_none() {
             return self.inner.prefetch(id);

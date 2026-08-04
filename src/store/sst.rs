@@ -41,6 +41,35 @@ pub(crate) struct SstHandle {
     pub(crate) roster: BlockId,
     /// False for manifests written before commit-LSN keys were introduced.
     pub(crate) versioned: bool,
+    /// Data entries name verified extents in immutable packed containers.
+    /// False retains the direct content-addressed data-block format.
+    pub(crate) packed: bool,
+}
+
+/// One physical data-block location. A packed reference names both the
+/// container extent used for the range read and the logical block identity
+/// used to verify the returned bytes before they enter a cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataBlockRef {
+    Direct(BlockId),
+    Packed {
+        container: BlockId,
+        offset: u32,
+        length: u32,
+        id: BlockId,
+    },
+}
+
+impl DataBlockRef {
+    fn direct(id: BlockId) -> Self {
+        Self::Direct(id)
+    }
+
+    pub(crate) fn id(self) -> BlockId {
+        match self {
+            Self::Direct(id) | Self::Packed { id, .. } => id,
+        }
+    }
 }
 
 /// A durable row-version key. Ordering is rowid ascending, then commit LSN
@@ -122,14 +151,18 @@ pub(crate) const MAX_ASSEMBLED: usize =
 const MAX_CHAIN: usize = 16;
 const PAX_MAGIC: u32 = 0x3158_4150;
 const PAX_ROW_HEADER: usize = 8 + 8 + 4;
+/// PAX data groups are deliberately smaller than their enclosing container so
+/// one ranged object can carry several independently cacheable groups.
+const PACKED_PAX_TARGET: usize = MAX_PAYLOAD / 2;
 
 const LEGACY_INDEX_ENTRY: usize = 8 + 32;
 const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
+const PACKED_VERSIONED_INDEX_ENTRY: usize = 16 + 32 + 4 + 4 + 32;
 
 /// The most data blocks a single-block index can point at. A larger SST needs a
 /// multi-block index, which is a later concern; this bound is checked and raised
 /// rather than silently overrun.
-const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / VERSIONED_INDEX_ENTRY;
+const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / PACKED_VERSIONED_INDEX_ENTRY;
 
 /// The most block identities one roster block can list — and so the most
 /// blocks one SST may comprise. Checked and raised, never overrun.
@@ -175,7 +208,7 @@ pub(crate) struct SstWriter {
     /// The first key in the current data block, set when its first row lands.
     pending_first: Option<SstKey>,
     /// The index as it grows: `(first key, block_id)` per flushed data block.
-    index: Box<[(SstKey, BlockId)]>,
+    index: Box<[(SstKey, DataBlockRef)]>,
     index_len: usize,
     /// The last key written, so out-of-order rows are caught rather than
     /// producing an SST whose binary search silently misses them.
@@ -197,6 +230,10 @@ pub(crate) struct SstWriter {
     pax_schema: [ColType; MAX_COLUMNS],
     pax_columns: usize,
     pax_enabled: bool,
+    /// Framed logical PAX blocks waiting to become one immutable container.
+    packed: Box<[u8]>,
+    packed_len: usize,
+    packed_index_start: usize,
     /// Flushed index leaves: `(first key, data_block_count, id)`. One leaf
     /// makes the classic single-block index; more make a two-level one, so
     /// an SST is no longer capped at one index block's worth of data.
@@ -230,7 +267,8 @@ impl SstWriter {
             pending: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pending_len: 0,
             pending_first: None,
-            index: vec![(SstKey::MIN, BlockId([0u8; 32])); MAX_DATA_BLOCKS].into_boxed_slice(),
+            index: vec![(SstKey::MIN, DataBlockRef::Direct(BlockId([0u8; 32]))); MAX_DATA_BLOCKS]
+                .into_boxed_slice(),
             index_len: 0,
             last_key: None,
             filters: [
@@ -246,6 +284,9 @@ impl SstWriter {
             pax_schema: [ColType::Bool; MAX_COLUMNS],
             pax_columns: 0,
             pax_enabled: false,
+            packed: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            packed_len: 0,
+            packed_index_start: 0,
             leaves: vec![(SstKey::MIN, 0u32, BlockId([0u8; 32])); MAX_LEAVES].into_boxed_slice(),
             leaves_len: 0,
         }
@@ -253,8 +294,8 @@ impl SstWriter {
 
     /// The fixed bytes one writer reserves, for budget estimates.
     pub(crate) fn budget_bytes() -> usize {
-        3 * MAX_PAYLOAD // pending + PAX + compression staging
-            + MAX_DATA_BLOCKS * core::mem::size_of::<(SstKey, BlockId)>()
+        4 * MAX_PAYLOAD // pending + PAX + compression + packed-container staging
+            + MAX_DATA_BLOCKS * core::mem::size_of::<(SstKey, DataBlockRef)>()
             + FILTER_TIERS.iter().sum::<usize>()
             + MAX_ROSTER * 32
             + MAX_LEAVES * core::mem::size_of::<(SstKey, u32, BlockId)>()
@@ -272,6 +313,8 @@ impl SstWriter {
         self.key_count = 0;
         self.roster_len = 0;
         self.leaves_len = 0;
+        self.packed_len = 0;
+        self.packed_index_start = 0;
     }
 
     /// Selects the table row layout for the next SST.  Callers must choose it
@@ -327,9 +370,12 @@ impl SstWriter {
         if entry > MAX_PAYLOAD {
             return self.append_chained(store, key, row);
         }
-        if self.pending_len + entry
-            > MAX_PAYLOAD.saturating_sub(if self.pax_enabled { 128 } else { 0 })
-        {
+        let limit = if self.pax_enabled {
+            PACKED_PAX_TARGET.saturating_sub(128)
+        } else {
+            MAX_PAYLOAD
+        };
+        if self.pending_len != 0 && self.pending_len + entry > limit {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
@@ -417,9 +463,12 @@ impl SstWriter {
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        if self.pending_len + VERSIONED_ENTRY_HEADER
-            > MAX_PAYLOAD.saturating_sub(if self.pax_enabled { 128 } else { 0 })
-        {
+        let limit = if self.pax_enabled {
+            PACKED_PAX_TARGET.saturating_sub(128)
+        } else {
+            MAX_PAYLOAD
+        };
+        if self.pending_len != 0 && self.pending_len + VERSIONED_ENTRY_HEADER > limit {
             self.flush_data(store)?;
         }
         let at = self.pending_len;
@@ -457,6 +506,7 @@ impl SstWriter {
         if self.index_len == MAX_DATA_BLOCKS {
             // One index leaf is full; start another. The finish decides
             // whether a root is needed over them.
+            self.flush_packed(store)?;
             self.flush_index_leaf(store)?;
         }
         let first = self
@@ -471,21 +521,68 @@ impl SstWriter {
             let length = self.encode_pax()?;
             (&self.pax_buf[..length], BlockType::SstDataPaxV1)
         };
-        let id = if self.pax_enabled {
-            store.put(raw, block_type, 0)?
+        let reference = if self.pax_enabled {
+            let (id, framed_len) = super::encode(raw, block_type, 0, &mut self.compress_buf)
+                .map_err(|_| SstError::PaxEncoding)?;
+            if framed_len > self.packed.len() {
+                DataBlockRef::direct(store.put(raw, block_type, 0)?)
+            } else {
+                if self.packed_len + framed_len > self.packed.len() {
+                    self.flush_packed(store)?;
+                }
+                let offset = self.packed_len;
+                self.packed[offset..offset + framed_len]
+                    .copy_from_slice(&self.compress_buf[..framed_len]);
+                self.packed_len += framed_len;
+                DataBlockRef::Packed {
+                    container: BlockId([0; 32]),
+                    offset: u32::try_from(offset).map_err(|_| SstError::PaxEncoding)?,
+                    length: u32::try_from(framed_len).map_err(|_| SstError::PaxEncoding)?,
+                    id,
+                }
+            }
         } else {
             match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
-                Some(n) if n < raw.len() => {
-                    store.put(&self.compress_buf[..n], BlockType::SstDataV2Lz4, 0)?
-                }
-                _ => store.put(raw, block_type, 0)?,
+                Some(n) if n < raw.len() => DataBlockRef::direct(store.put(
+                    &self.compress_buf[..n],
+                    BlockType::SstDataV2Lz4,
+                    0,
+                )?),
+                _ => DataBlockRef::direct(store.put(raw, block_type, 0)?),
             }
         };
-        self.record(id)?;
-        self.index[self.index_len] = (first, id);
+        if let DataBlockRef::Direct(id) = reference {
+            self.record(id)?;
+        }
+        self.index[self.index_len] = (first, reference);
         self.index_len += 1;
         self.pending_len = 0;
         self.pending_first = None;
+        Ok(())
+    }
+
+    fn flush_packed(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+        if self.packed_len == 0 {
+            return Ok(());
+        }
+        let container = store.put(
+            &self.packed[..self.packed_len],
+            BlockType::SstPackedContainerV1,
+            0,
+        )?;
+        self.record(container)?;
+        for (_, reference) in &mut self.index[self.packed_index_start..self.index_len] {
+            if let DataBlockRef::Packed {
+                container: location,
+                ..
+            } = reference
+                && location.0 == [0; 32]
+            {
+                *location = container;
+            }
+        }
+        self.packed_len = 0;
+        self.packed_index_start = self.index_len;
         Ok(())
     }
 
@@ -597,19 +694,25 @@ impl SstWriter {
         if self.leaves_len == MAX_LEAVES {
             return Err(SstError::TooManyBlocks);
         }
-        let bytes = 4 + self.index_len * VERSIONED_INDEX_ENTRY;
+        let entry_size = if self.pax_enabled {
+            PACKED_VERSIONED_INDEX_ENTRY
+        } else {
+            VERSIONED_INDEX_ENTRY
+        };
+        let bytes = 4 + self.index_len * entry_size;
         let buffer = &mut *self.compress_buf; // free between data flushes
         buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
         for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-            let at = 4 + i * VERSIONED_INDEX_ENTRY;
+            let at = 4 + i * entry_size;
             write_key(*first, &mut buffer[at..at + 16]);
-            buffer[at + 16..at + VERSIONED_INDEX_ENTRY].copy_from_slice(&id.0);
+            write_data_ref(*id, &mut buffer[at + 16..at + entry_size], self.pax_enabled);
         }
         let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
         self.record(id)?;
         self.leaves[self.leaves_len] = (self.index[0].0, self.index_len as u32, id);
         self.leaves_len += 1;
         self.index_len = 0;
+        self.packed_index_start = 0;
         Ok(())
     }
 
@@ -621,6 +724,7 @@ impl SstWriter {
         store: &mut dyn BlockStore,
     ) -> Result<Option<SstHandle>, SstError> {
         self.flush_data(store)?;
+        self.flush_packed(store)?;
         if self.index_len == 0 && self.leaves_len == 0 {
             return Ok(None);
         }
@@ -637,13 +741,23 @@ impl SstWriter {
         // block; more make leaves under a root, so SST size is no longer
         // bounded by one index block.
         let index = if self.leaves_len == 0 {
-            let bytes = 4 + self.index_len * VERSIONED_INDEX_ENTRY;
+            let bytes = 4 + self.index_len
+                * if self.pax_enabled {
+                    PACKED_VERSIONED_INDEX_ENTRY
+                } else {
+                    VERSIONED_INDEX_ENTRY
+                };
             let buffer = &mut *self.pending; // reuse the data scratch; it is done with
             buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
             for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-                let at = 4 + i * VERSIONED_INDEX_ENTRY;
+                let entry_size = if self.pax_enabled {
+                    PACKED_VERSIONED_INDEX_ENTRY
+                } else {
+                    VERSIONED_INDEX_ENTRY
+                };
+                let at = 4 + i * entry_size;
                 write_key(*first, &mut buffer[at..at + 16]);
-                buffer[at + 16..at + VERSIONED_INDEX_ENTRY].copy_from_slice(&id.0);
+                write_data_ref(*id, &mut buffer[at + 16..at + entry_size], self.pax_enabled);
             }
             store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         } else {
@@ -680,6 +794,7 @@ impl SstWriter {
             filter,
             roster,
             versioned: true,
+            packed: self.pax_enabled,
         }))
     }
 }
@@ -710,7 +825,7 @@ pub(crate) struct SstCursor {
     data_len: usize,
     loaded: bool,
     prefetched_leaf: Option<(usize, BlockId)>,
-    prefetched_data: Option<(usize, BlockId)>,
+    prefetched_data: Option<(usize, DataBlockRef)>,
     done: bool,
 }
 
@@ -766,7 +881,7 @@ impl SstCursor {
                     self.schedule_lookahead(store, self.block_ordinal + 1, next)?;
                     id
                 };
-                self.data_len = read_data_block(store, &id, data, bounce)?;
+                self.data_len = read_data_block_ref(store, id, data, bounce)?;
                 self.block_ordinal += 1;
                 self.offset = 0;
                 self.loaded = true;
@@ -806,9 +921,11 @@ impl SstCursor {
         next: Option<DataBlockLookahead>,
     ) -> Result<(), SstError> {
         match next {
-            Some(DataBlockLookahead::Data(id)) => {
-                prefetch_data_block(store, Some(id))?;
-                self.prefetched_data = Some((ordinal, id));
+            Some(DataBlockLookahead::Data(reference)) => {
+                if let DataBlockRef::Direct(id) = reference {
+                    prefetch_data_block(store, Some(id))?;
+                    self.prefetched_data = Some((ordinal, reference));
+                }
             }
             Some(DataBlockLookahead::Leaf(id)) => {
                 prefetch_index_block(store, id)?;
@@ -827,21 +944,28 @@ impl SstCursor {
         let Some((ordinal, leaf)) = self.prefetched_leaf else {
             return Ok(());
         };
-        let Some(id) =
-            take_prefetched_index_first_data(store, &leaf, index, self.handle.versioned)?
+        let Some(reference) = take_prefetched_index_first_data(
+            store,
+            &leaf,
+            index,
+            self.handle.versioned,
+            self.handle.packed,
+        )?
         else {
             return Ok(());
         };
         self.prefetched_leaf = None;
-        prefetch_data_block(store, Some(id))?;
-        self.prefetched_data = Some((ordinal, id));
+        if let DataBlockRef::Direct(id) = reference {
+            prefetch_data_block(store, Some(id))?;
+            self.prefetched_data = Some((ordinal, reference));
+        }
         Ok(())
     }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum DataBlockLookahead {
-    Data(BlockId),
+    Data(DataBlockRef),
     Leaf(BlockId),
 }
 
@@ -862,6 +986,37 @@ pub(crate) fn read_data_block(
     bounce: &mut [u8],
 ) -> Result<usize, SstError> {
     read_data_block_with_type(store, id, buf, bounce, None).map(|(length, _, _)| length)
+}
+
+pub(crate) fn read_data_block_ref(
+    store: &mut dyn BlockStore,
+    reference: DataBlockRef,
+    buf: &mut [u8],
+    bounce: &mut [u8],
+) -> Result<usize, SstError> {
+    match reference {
+        DataBlockRef::Direct(id) => read_data_block(store, &id, buf, bounce),
+        DataBlockRef::Packed {
+            container,
+            offset,
+            length,
+            id,
+        } => {
+            let (n, block_type) = store.get_packed(
+                &container,
+                offset as usize,
+                length as usize,
+                &id,
+                buf,
+                bounce,
+            )?;
+            if bounce.len() < n {
+                return Err(SstError::Store(StoreError::BufferTooSmall));
+            }
+            bounce[..n].copy_from_slice(&buf[..n]);
+            decode_data_block(&bounce[..n], block_type, buf)
+        }
+    }
 }
 
 /// Loads a data block into canonical row bytes and reports its durable physical
@@ -939,6 +1094,32 @@ pub(crate) fn read_data_block_raw(
         _ => Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         ))),
+    }
+}
+
+pub(crate) fn read_data_block_raw_ref(
+    store: &mut dyn BlockStore,
+    reference: DataBlockRef,
+    buf: &mut [u8],
+    scratch: &mut [u8],
+) -> Result<(usize, BlockType), SstError> {
+    match reference {
+        DataBlockRef::Direct(id) => read_data_block_raw(store, &id, buf),
+        DataBlockRef::Packed {
+            container,
+            offset,
+            length,
+            id,
+        } => store
+            .get_packed(
+                &container,
+                offset as usize,
+                length as usize,
+                &id,
+                buf,
+                scratch,
+            )
+            .map_err(SstError::Store),
     }
 }
 
@@ -1238,8 +1419,9 @@ fn prefetch_data_window(
     first: usize,
     count: usize,
     versioned: bool,
+    packed: bool,
 ) -> Result<(), SstError> {
-    if !store.async_gets_enabled() {
+    if packed || !store.async_gets_enabled() {
         return Ok(());
     }
     let slots = store.async_read_slots();
@@ -1249,7 +1431,7 @@ fn prefetch_data_window(
     let end = first.saturating_add(slots - 1).min(count);
     for entry in first..end {
         match store
-            .prefetch(&block_id_at(index, entry, versioned))
+            .prefetch(&block_ref_at(index, entry, versioned, false).id())
             .map_err(SstError::Store)?
         {
             super::PrefetchState::Scheduled | super::PrefetchState::Reused => {}
@@ -1269,12 +1451,13 @@ pub(crate) fn take_prefetched_index_first_data(
     id: &BlockId,
     into: &mut [u8],
     versioned: bool,
-) -> Result<Option<BlockId>, SstError> {
+    packed: bool,
+) -> Result<Option<DataBlockRef>, SstError> {
     let Some((_, block_type)) = store.take_prefetch(id, into)? else {
         return Ok(None);
     };
     validate_index_type(block_type, versioned)?;
-    Ok(Some(block_id_at(into, 0, versioned)))
+    Ok(Some(block_ref_at(into, 0, versioned, packed)))
 }
 
 impl<'a> SstReader<'a> {
@@ -1342,16 +1525,21 @@ impl<'a> SstReader<'a> {
         }
         let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(self.index_scratch, count, target, handle.versioned)
-        else {
+        let Some(entry) = block_containing(
+            self.index_scratch,
+            count,
+            target,
+            handle.versioned,
+            handle.packed,
+        ) else {
             return Ok(None);
         };
-        let block_id = block_id_at(self.index_scratch, entry, handle.versioned);
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.versioned, handle.packed);
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
-        let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+        let data_len = read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
         for entry in (DataBlock {
             bytes: &self.data_scratch[..data_len],
             versioned: handle.versioned,
@@ -1412,12 +1600,17 @@ impl<'a> SstReader<'a> {
         }
         let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(self.index_scratch, count, target, handle.versioned)
-        else {
+        let Some(entry) = block_containing(
+            self.index_scratch,
+            count,
+            target,
+            handle.versioned,
+            handle.packed,
+        ) else {
             return Ok(None);
         };
-        let block_id = block_id_at(self.index_scratch, entry, handle.versioned);
-        let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.versioned, handle.packed);
+        let data_len = read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
         for entry in (DataBlock {
             bytes: &self.data_scratch[..data_len],
             versioned: handle.versioned,
@@ -1466,21 +1659,34 @@ impl<'a> SstReader<'a> {
             // The block `lo` falls in, or — when `lo` precedes every key — the
             // first block, since the range may still cover it from the left.
             let start = if leaf_ordinal == start_leaf {
-                block_containing(self.index_scratch, count, start_key, handle.versioned)
-                    .unwrap_or(0)
+                block_containing(
+                    self.index_scratch,
+                    count,
+                    start_key,
+                    handle.versioned,
+                    handle.packed,
+                )
+                .unwrap_or(0)
             } else {
                 0
             };
             for entry_index in start..count {
-                let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let block_ref = block_ref_at(
+                    self.index_scratch,
+                    entry_index,
+                    handle.versioned,
+                    handle.packed,
+                );
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     count,
                     handle.versioned,
+                    handle.packed,
                 )?;
-                let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+                let data_len =
+                    read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
                 let mut ran_past = false;
                 // A chained entry owns its whole block, so at most one assembly
                 // happens per block and the borrow of `data_scratch` has ended by
@@ -1540,21 +1746,35 @@ impl<'a> SstReader<'a> {
                 return Ok(None); // the SST is exhausted
             };
             let start = if leaf_ordinal == start_leaf {
-                block_containing(self.index_scratch, count, lo, handle.versioned).unwrap_or(0)
+                block_containing(
+                    self.index_scratch,
+                    count,
+                    lo,
+                    handle.versioned,
+                    handle.packed,
+                )
+                .unwrap_or(0)
             } else {
                 0
             };
             let end = (start + budget).min(count);
             for entry_index in start..end {
-                let block_id = block_id_at(self.index_scratch, entry_index, handle.versioned);
+                let block_ref = block_ref_at(
+                    self.index_scratch,
+                    entry_index,
+                    handle.versioned,
+                    handle.packed,
+                );
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     end,
                     handle.versioned,
+                    handle.packed,
                 )?;
-                let data_len = read_data_block(store, &block_id, self.data_scratch, self.assembly)?;
+                let data_len =
+                    read_data_block_ref(store, block_ref, self.data_scratch, self.assembly)?;
                 for entry in (DataBlock {
                     bytes: &self.data_scratch[..data_len],
                     versioned: handle.versioned,
@@ -1698,7 +1918,17 @@ pub(crate) fn locate_data_block(
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<BlockId>, SstError> {
-    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(id, _)| id))
+    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?
+        .map(|(reference, _)| reference.id()))
+}
+
+pub(crate) fn locate_data_block_ref(
+    store: &mut dyn BlockStore,
+    handle: &SstHandle,
+    buf: &mut [u8],
+    ordinal: usize,
+) -> Result<Option<DataBlockRef>, SstError> {
+    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(reference, _)| reference))
 }
 
 /// Resolves one data-block ordinal and, when it shares an index leaf with a
@@ -1709,7 +1939,7 @@ pub(crate) fn locate_data_block_with_next(
     handle: &SstHandle,
     buf: &mut [u8],
     ordinal: usize,
-) -> Result<Option<(BlockId, Option<DataBlockLookahead>)>, SstError> {
+) -> Result<Option<(DataBlockRef, Option<DataBlockLookahead>)>, SstError> {
     load_index(store, &handle.index, buf, handle.versioned)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
@@ -1717,9 +1947,18 @@ pub(crate) fn locate_data_block_with_next(
         if ordinal >= count {
             return Ok(None);
         }
-        let next = (ordinal + 1 < count)
-            .then(|| DataBlockLookahead::Data(block_id_at(buf, ordinal + 1, handle.versioned)));
-        return Ok(Some((block_id_at(buf, ordinal, handle.versioned), next)));
+        let next = (ordinal + 1 < count).then(|| {
+            DataBlockLookahead::Data(block_ref_at(
+                buf,
+                ordinal + 1,
+                handle.versioned,
+                handle.packed,
+            ))
+        });
+        return Ok(Some((
+            block_ref_at(buf, ordinal, handle.versioned, handle.packed),
+            next,
+        )));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let entry_size = root_entry_size(handle.versioned);
@@ -1740,15 +1979,19 @@ pub(crate) fn locate_data_block_with_next(
             id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
             load_index(store, &BlockId(id), buf, handle.versioned)?;
             let next = if remaining + 1 < count {
-                Some(DataBlockLookahead::Data(block_id_at(
+                Some(DataBlockLookahead::Data(block_ref_at(
                     buf,
                     remaining + 1,
                     handle.versioned,
+                    handle.packed,
                 )))
             } else {
                 next_leaf.map(DataBlockLookahead::Leaf)
             };
-            return Ok(Some((block_id_at(buf, remaining, handle.versioned), next)));
+            return Ok(Some((
+                block_ref_at(buf, remaining, handle.versioned, handle.packed),
+                next,
+            )));
         }
         remaining -= count;
     }
@@ -1781,8 +2024,14 @@ pub(crate) fn data_block_total(
 /// Binary-searches the sparse index for the last block whose first key does not
 /// exceed `key` — the only data block `key` can be in. `None` when the index is
 /// empty or `key` precedes every block's first key.
-fn block_containing(index: &[u8], count: usize, key: SstKey, versioned: bool) -> Option<usize> {
-    let entry_size = index_entry_size(versioned);
+fn block_containing(
+    index: &[u8],
+    count: usize,
+    key: SstKey,
+    versioned: bool,
+    packed: bool,
+) -> Option<usize> {
+    let entry_size = index_entry_size(versioned, packed);
     let first_key = |i: usize| {
         let at = 4 + i * entry_size;
         read_key(&index[at..], versioned)
@@ -1816,24 +2065,73 @@ fn block_containing(index: &[u8], count: usize, key: SstKey, versioned: bool) ->
 }
 
 /// The block identity stored in index entry `i`.
-fn block_id_at(index: &[u8], i: usize, versioned: bool) -> BlockId {
-    let entry_size = index_entry_size(versioned);
+fn block_ref_at(index: &[u8], i: usize, versioned: bool, packed: bool) -> DataBlockRef {
+    let entry_size = index_entry_size(versioned, packed);
     let key_bytes = key_size(versioned);
     let at = 4 + i * entry_size;
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&index[at + key_bytes..at + entry_size]);
-    BlockId(id)
+    read_data_ref(&index[at + key_bytes..at + entry_size], packed)
 }
 
 fn key_size(versioned: bool) -> usize {
     if versioned { 16 } else { 8 }
 }
 
-fn index_entry_size(versioned: bool) -> usize {
+fn index_entry_size(versioned: bool, packed: bool) -> usize {
     if versioned {
-        VERSIONED_INDEX_ENTRY
+        if packed {
+            PACKED_VERSIONED_INDEX_ENTRY
+        } else {
+            VERSIONED_INDEX_ENTRY
+        }
     } else {
         LEGACY_INDEX_ENTRY
+    }
+}
+
+fn write_data_ref(reference: DataBlockRef, into: &mut [u8], packed: bool) {
+    if !packed {
+        into[..32].copy_from_slice(&reference.id().0);
+        return;
+    }
+    match reference {
+        DataBlockRef::Direct(id) => {
+            into[..32].fill(0);
+            into[32..40].fill(0);
+            into[40..72].copy_from_slice(&id.0);
+        }
+        DataBlockRef::Packed {
+            container,
+            offset,
+            length,
+            id,
+        } => {
+            into[..32].copy_from_slice(&container.0);
+            into[32..36].copy_from_slice(&offset.to_le_bytes());
+            into[36..40].copy_from_slice(&length.to_le_bytes());
+            into[40..72].copy_from_slice(&id.0);
+        }
+    }
+}
+
+fn read_data_ref(bytes: &[u8], packed: bool) -> DataBlockRef {
+    if !packed {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes[..32]);
+        return DataBlockRef::Direct(BlockId(id));
+    }
+    let mut container = [0u8; 32];
+    container.copy_from_slice(&bytes[..32]);
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes[40..72]);
+    if container == [0; 32] {
+        DataBlockRef::Direct(BlockId(id))
+    } else {
+        DataBlockRef::Packed {
+            container: BlockId(container),
+            offset: u32::from_le_bytes(bytes[32..36].try_into().expect("packed offset")),
+            length: u32::from_le_bytes(bytes[36..40].try_into().expect("packed length")),
+            id: BlockId(id),
+        }
     }
 }
 
@@ -2181,11 +2479,14 @@ mod tests {
             .unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let mut index = [0; MAX_PAYLOAD];
-        let id = locate_data_block(&mut store, &handle, &mut index, 0)
+        let reference = locate_data_block_with_next(&mut store, &handle, &mut index, 0)
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
         let mut raw = [0; MAX_PAYLOAD];
-        let (length, kind) = read_data_block_raw(&mut store, &id, &mut raw).unwrap();
+        let mut scratch = [0; MAX_PAYLOAD];
+        let (length, kind) =
+            read_data_block_raw_ref(&mut store, reference, &mut raw, &mut scratch).unwrap();
         assert_eq!(kind, BlockType::SstDataPaxV1);
         let layout = pax_layout(&raw[..length]).unwrap();
         let mut cursors = layout.column_starts();
@@ -2209,6 +2510,52 @@ mod tests {
             .copy_row(&raw[..length], 2, &values, &mut output)
             .unwrap();
         assert_eq!(&output[..copied], second_bytes);
+    }
+
+    #[test]
+    fn pax_data_blocks_share_one_verified_packed_container() {
+        let (_budget, mut store) = store();
+        let schema = [ColType::Int4, ColType::Text];
+        let payload = "x".repeat(20_000);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        for rowid in 1..=8 {
+            let row = [Datum::Int4(rowid), Datum::Text(&payload)];
+            let mut encoded = vec![0; rowenc::encoded_len(&row)];
+            rowenc::encode(&row, &mut encoded);
+            writer
+                .append_version(&mut store, SstKey::at(rowid as u64, 1), &encoded)
+                .unwrap();
+        }
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        assert!(handle.packed);
+
+        let mut index = [0; MAX_PAYLOAD];
+        let first = locate_data_block_ref(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap();
+        let second = locate_data_block_ref(&mut store, &handle, &mut index, 1)
+            .unwrap()
+            .unwrap();
+        let (first_container, second_container) = match (first, second) {
+            (
+                DataBlockRef::Packed {
+                    container: first, ..
+                },
+                DataBlockRef::Packed {
+                    container: second, ..
+                },
+            ) => (first, second),
+            other => panic!("expected packed PAX references, got {other:?}"),
+        };
+        assert_eq!(first_container, second_container);
+
+        let mut raw = [0; MAX_PAYLOAD];
+        let mut scratch = [0; MAX_PAYLOAD];
+        let (length, kind) =
+            read_data_block_raw_ref(&mut store, first, &mut raw, &mut scratch).unwrap();
+        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(pax_layout(&raw[..length]).unwrap().rows(), 6);
     }
 
     #[test]
@@ -2435,6 +2782,7 @@ mod tests {
             filter: filter_id,
             roster: roster_id,
             versioned: false,
+            packed: false,
         };
 
         let arena = arena();
@@ -2854,7 +3202,7 @@ mod tests {
         second_leaf.copy_from_slice(&buf[second_leaf_at + 20..second_leaf_at + 52]);
         let second_leaf = BlockId(second_leaf);
         s.get(&second_leaf, &mut buf).unwrap();
-        let second_leaf_first_data = block_id_at(&buf, 0, true);
+        let second_leaf_first_data = block_ref_at(&buf, 0, true, false).id();
         let mut lookahead = LookaheadStore {
             inner: s,
             requested: Vec::new(),

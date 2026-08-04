@@ -1677,6 +1677,12 @@ impl Engine {
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
         self.wal.commit();
+        if ckpt.block_reads_busy() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "durable block reads in progress"
+            ));
+        }
         // A checkpoint owns the block stack synchronously: its publication
         // state machine cannot be rewound as a client statement can.
         ckpt.disable_async_block_reads();
@@ -1844,6 +1850,9 @@ impl Engine {
             return true;
         }
         self.wal.commit();
+        if ckpt.block_reads_busy() {
+            return true;
+        }
         // A checkpoint beat advances publication state that cannot be replayed
         // after yielding. Its block reads therefore own the store
         // synchronously, just as an explicit CHECKPOINT does.

@@ -80,12 +80,14 @@ pub(crate) mod lz4;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
-pub(crate) use sst::{DataBlockLookahead, PaxLayout, SstCursor, SstHandle, SstKey, SstReader};
+pub(crate) use sst::{
+    DataBlockLookahead, DataBlockRef, PaxLayout, SstCursor, SstHandle, SstKey, SstReader,
+};
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{
-    block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block,
-    locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block,
-    read_data_block_raw, take_prefetched_index_first_data,
+    block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block_ref,
+    locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block_raw_ref,
+    read_data_block_ref, take_prefetched_index_first_data,
 };
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
@@ -143,6 +145,9 @@ pub(crate) enum BlockType {
     ValueIndexRoster = 12,
     /// Commit-LSN-versioned rows laid out as one self-describing PAX group.
     SstDataPaxV1 = 13,
+    /// Immutable container holding several independently checksummed PAX data
+    /// blocks. SST index entries name their byte extents inside this object.
+    SstPackedContainerV1 = 14,
 }
 
 impl BlockType {
@@ -161,6 +166,7 @@ impl BlockType {
             11 => BlockType::ValueIndexData,
             12 => BlockType::ValueIndexRoster,
             13 => BlockType::SstDataPaxV1,
+            14 => BlockType::SstPackedContainerV1,
             _ => return None,
         })
     }
@@ -305,6 +311,31 @@ pub(crate) trait BlockStore {
     /// mismatch is an error, never a shorter answer.
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError>;
 
+    /// Reads one independently framed logical block from an immutable packed
+    /// container. The default is correct for in-memory stores; object-backed
+    /// implementations override it with one ranged GET. `expected` is the
+    /// logical block identity, so a container extent is never trusted merely
+    /// because its enclosing object was found.
+    fn get_packed(
+        &mut self,
+        container: &BlockId,
+        offset: usize,
+        length: usize,
+        expected: &BlockId,
+        into: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<(usize, BlockType), StoreError> {
+        let (container_len, container_type) = self.get(container, scratch)?;
+        if container_type != BlockType::SstPackedContainerV1
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > container_len)
+        {
+            return Err(StoreError::Corrupt(BlockError::Truncated));
+        }
+        decode_packed_block(&scratch[offset..offset + length], expected, into)
+    }
+
     /// Whether the block is present without reading it.
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError>;
 
@@ -383,6 +414,24 @@ pub(crate) trait BlockStore {
     }
 }
 
+/// Validates a framed logical block carried by a packed-container extent and
+/// copies its payload into a caller-owned cache/read buffer.
+pub(crate) fn decode_packed_block(
+    bytes: &[u8],
+    expected: &BlockId,
+    into: &mut [u8],
+) -> Result<(usize, BlockType), StoreError> {
+    let block = decode(bytes, true)?;
+    if block.id != *expected {
+        return Err(StoreError::Corrupt(BlockError::IdentityMismatch));
+    }
+    if into.len() < block.payload.len() {
+        return Err(StoreError::BufferTooSmall);
+    }
+    into[..block.payload.len()].copy_from_slice(block.payload);
+    Ok((block.payload.len(), block.block_type))
+}
+
 /// Cumulative traffic through the tiered block stack.
 ///
 /// These are execution telemetry, not durable database state. Losing them on
@@ -403,6 +452,10 @@ pub(crate) struct BlockIoStats {
     /// Elapsed wall time awaiting completed durable-block GET responses.
     /// Telemetry calibrates future plans only; it is not durable state.
     pub(crate) object_read_micros: u64,
+    /// Readiness events observed after their fixed request slot was released.
+    /// Kernel readiness is level-triggered, so this is expected lifecycle
+    /// telemetry rather than a failed durable read.
+    pub(crate) object_read_stale_events: u64,
     /// Speculative reads accepted into an owned fixed GET slot.
     pub(crate) object_prefetch_scheduled: u64,
     /// Speculative reads that reused an already-owned request or cache body.
@@ -430,6 +483,9 @@ impl BlockIoStats {
             object_read_micros: self
                 .object_read_micros
                 .saturating_sub(earlier.object_read_micros),
+            object_read_stale_events: self
+                .object_read_stale_events
+                .saturating_sub(earlier.object_read_stale_events),
             object_prefetch_scheduled: self
                 .object_prefetch_scheduled
                 .saturating_sub(earlier.object_prefetch_scheduled),
@@ -508,6 +564,7 @@ mod tests {
             BlockType::SstDataV2,
             BlockType::SstDataV2Lz4,
             BlockType::SstDataPaxV1,
+            BlockType::SstPackedContainerV1,
             BlockType::SstIndexV2,
             BlockType::ValueIndexData,
             BlockType::ValueIndexRoster,

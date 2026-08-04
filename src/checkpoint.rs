@@ -1547,6 +1547,7 @@ impl Checkpointer {
                             filter: parse_block_id(filter)?,
                             roster: parse_block_id(roster)?,
                             versioned: false,
+                            packed: false,
                         })
                     };
                     bssts.push((mindex, 0, count, crc, handle));
@@ -1569,9 +1570,10 @@ impl Checkpointer {
                     let handle = if index == "-" {
                         None
                     } else {
-                        let versioned = match words.next() {
-                            None | Some("v1") => false,
-                            Some("v2") => true,
+                        let (versioned, packed) = match words.next() {
+                            None | Some("v1") => (false, false),
+                            Some("v2") => (true, false),
+                            Some("v3") => (true, true),
                             Some(_) => {
                                 return Err(CheckpointSetupError::Corrupt("unknown dsst format"));
                             }
@@ -1581,6 +1583,7 @@ impl Checkpointer {
                             filter: parse_block_id(filter)?,
                             roster: parse_block_id(roster)?,
                             versioned,
+                            packed,
                         })
                     };
                     bssts.push((mindex, idx, count, crc, handle));
@@ -2117,12 +2120,13 @@ impl Checkpointer {
         if block_count == 0 {
             return Err(CheckpointSetupError::Corrupt("sst index names no blocks"));
         }
-        let last_id =
-            crate::store::locate_data_block(&mut *blocks, handle, index_buf, block_count - 1)
+        let last_reference =
+            crate::store::locate_data_block_ref(&mut *blocks, handle, index_buf, block_count - 1)
                 .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
                 .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
-        let data_len = crate::store::read_data_block(&mut *blocks, &last_id, data_buf, index_buf)
-            .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+        let data_len =
+            crate::store::read_data_block_ref(&mut *blocks, last_reference, data_buf, index_buf)
+                .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
         let mut at = 0usize;
         let mut max_rowid: Option<u64> = None;
         while let Some((key, _, _, next)) =
@@ -2849,7 +2853,13 @@ impl Checkpointer {
                         core::str::from_utf8(&ih).expect("hex"),
                         core::str::from_utf8(&fh).expect("hex"),
                         core::str::from_utf8(&rh).expect("hex"),
-                        if h.versioned { "v2" } else { "v1" },
+                        if h.packed {
+                            "v3"
+                        } else if h.versioned {
+                            "v2"
+                        } else {
+                            "v1"
+                        },
                     ),
                 )?;
             }

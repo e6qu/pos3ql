@@ -906,6 +906,9 @@ slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a
 consumed response is recognized from its now-free slot state and counted as
 stale lifecycle telemetry rather than treated as a new request.
+Checkpoint publication checks the same fixed-slot state before taking
+synchronous ownership; an active cold GET remains reactor-owned until it
+finishes instead of changing transport mode mid-request.
 
 The aggregate CI test job excludes the extended storage-VOPR test because the
 dedicated four-worker job is its sole authoritative execution. Running that

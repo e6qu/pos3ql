@@ -166,6 +166,7 @@ struct ObjectReadSlot {
     pending_id: Option<BlockId>,
     ready_id: Option<BlockId>,
     error_id: Option<BlockId>,
+    packed: bool,
     pending_error: Option<StoreError>,
     started_at: Option<Instant>,
     hedge_issued: bool,
@@ -192,6 +193,7 @@ impl OwnedObjectStore {
                     pending_id: None,
                     ready_id: None,
                     error_id: None,
+                    packed: false,
                     pending_error: None,
                     started_at: None,
                     hedge_issued: false,
@@ -302,6 +304,7 @@ impl OwnedObjectStore {
             slot.pending_error = None;
             slot.started_at = None;
             slot.hedge_issued = false;
+            slot.packed = false;
         }
     }
 
@@ -309,7 +312,7 @@ impl OwnedObjectStore {
         let hedge_after = self.hedge_after?;
         self.slots
             .iter()
-            .filter(|slot| slot.pending_id.is_some() && !slot.hedge_issued)
+            .filter(|slot| slot.pending_id.is_some() && !slot.hedge_issued && !slot.packed)
             .filter_map(|slot| {
                 slot.started_at
                     .and_then(|started| started.checked_add(hedge_after))
@@ -327,6 +330,7 @@ impl OwnedObjectStore {
         let Some(source_index) = self.slots.iter().position(|slot| {
             slot.pending_id.is_some()
                 && !slot.hedge_issued
+                && !slot.packed
                 && slot
                     .started_at
                     .and_then(|started| {
@@ -398,26 +402,32 @@ impl BlockStore for OwnedObjectStore {
         if let Some(winner) = self
             .slots
             .iter()
-            .position(|slot| slot.ready_id == Some(*id))
+            .position(|slot| slot.ready_id == Some(*id) && !slot.packed)
         {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
             slot.hedge_issued = false;
+            slot.packed = false;
             return decode_block_body(slot.client.body_bytes(), id, into);
         }
-        if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.pending_id == Some(*id) && !slot.packed)
+        {
             return Err(StoreError::NotReady);
         }
         if let Some(winner) = self
             .slots
             .iter()
-            .position(|slot| slot.error_id == Some(*id))
+            .position(|slot| slot.error_id == Some(*id) && !slot.packed)
         {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.error_id = None;
             slot.hedge_issued = false;
+            slot.packed = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
         let started = Instant::now();
@@ -429,6 +439,7 @@ impl BlockStore for OwnedObjectStore {
             if matches!(result, Err(StoreError::NotReady)) {
                 slot.pending_id = Some(*id);
                 slot.started_at = Some(started);
+                slot.packed = false;
             }
             result
         };
@@ -448,9 +459,44 @@ impl BlockStore for OwnedObjectStore {
         into: &mut [u8],
         _scratch: &mut [u8],
     ) -> Result<(usize, BlockType), StoreError> {
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.ready_id == Some(*expected) && slot.packed)
+        {
+            let slot = &mut self.slots[winner];
+            slot.ready_id = None;
+            slot.hedge_issued = false;
+            slot.packed = false;
+            if slot.client.body_bytes().len() != length {
+                return Err(StoreError::Corrupt(super::BlockError::Truncated));
+            }
+            return decode_packed_block(slot.client.body_bytes(), expected, into);
+        }
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.pending_id == Some(*expected) && slot.packed)
+        {
+            return Err(StoreError::NotReady);
+        }
+        if let Some(winner) = self
+            .slots
+            .iter()
+            .position(|slot| slot.error_id == Some(*expected) && slot.packed)
+        {
+            let slot = &mut self.slots[winner];
+            slot.error_id = None;
+            slot.hedge_issued = false;
+            slot.packed = false;
+            return Err(slot.pending_error.take().expect("checked above"));
+        }
         let started = Instant::now();
+        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+            return Err(StoreError::NotReady);
+        };
         let result = get_packed_block(
-            &mut self.slots[0].client,
+            &mut slot.client,
             self.prefix,
             container,
             offset,
@@ -458,6 +504,11 @@ impl BlockStore for OwnedObjectStore {
             expected,
             into,
         );
+        if matches!(result, Err(StoreError::NotReady)) {
+            slot.pending_id = Some(*expected);
+            slot.started_at = Some(started);
+            slot.packed = true;
+        }
         if result.is_ok() {
             self.record_completed_read(started, length);
         }
@@ -493,6 +544,7 @@ impl BlockStore for OwnedObjectStore {
                 Err(ObjectError::WouldBlock) => {
                     slot.pending_id = Some(*id);
                     slot.started_at = Some(started);
+                    slot.packed = false;
                     None
                 }
                 Err(error) => return Err(store_error(error)),
@@ -515,26 +567,32 @@ impl BlockStore for OwnedObjectStore {
         if let Some(winner) = self
             .slots
             .iter()
-            .position(|slot| slot.ready_id == Some(*id))
+            .position(|slot| slot.ready_id == Some(*id) && !slot.packed)
         {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
             slot.hedge_issued = false;
+            slot.packed = false;
             return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
         }
-        if self.slots.iter().any(|slot| slot.pending_id == Some(*id)) {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.pending_id == Some(*id) && !slot.packed)
+        {
             return Ok(None);
         }
         if let Some(winner) = self
             .slots
             .iter()
-            .position(|slot| slot.error_id == Some(*id))
+            .position(|slot| slot.error_id == Some(*id) && !slot.packed)
         {
             self.release_siblings(*id, winner);
             let slot = &mut self.slots[winner];
             slot.error_id = None;
             slot.hedge_issued = false;
+            slot.packed = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
         Ok(None)
@@ -768,6 +826,70 @@ mod tests {
         assert_eq!(stats.object_prefetch_saturated, 0);
         assert_eq!(stats.object_read_completions, 1);
         assert_eq!(stats.object_read_bytes, framed_len as u64);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn packed_read_remains_reactor_owned_until_its_extent_is_consumed() {
+        let payload = b"packed range body";
+        let mut framed = [0u8; super::super::BLOCK_SIZE];
+        let (expected, framed_len) = encode(payload, BlockType::SstData, 0, &mut framed).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = framed[..framed_len].to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let request_len = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..request_len]).unwrap();
+            assert!(request.contains(&format!("range: bytes={HEADER_LEN}-")));
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = format!("127.0.0.1:{port}");
+        config.object_store_bucket = "packed-reactor-test".to_string();
+        config.object_store_access_key = "key".to_string();
+        config.object_store_secret_key = "secret".to_string();
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+
+        let container = BlockId::of(b"packed container");
+        let mut output = [0u8; 64];
+        assert_eq!(
+            store.get_packed(&container, 0, framed_len, &expected, &mut output, &mut []),
+            Err(StoreError::NotReady)
+        );
+        assert!(store.async_reads_busy());
+        assert!(store.next_hedge_deadline().is_none());
+
+        let mut complete = false;
+        for _ in 0..10_000 {
+            if store.advance_pending_read(0).unwrap() {
+                complete = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(complete, "mock packed response did not complete");
+        assert!(store.async_reads_busy());
+        assert_eq!(
+            store
+                .get_packed(&container, 0, framed_len, &expected, &mut output, &mut [])
+                .unwrap(),
+            (payload.len(), BlockType::SstData)
+        );
+        assert_eq!(&output[..payload.len()], payload);
+        assert!(!store.async_reads_busy());
         server.join().unwrap();
     }
 

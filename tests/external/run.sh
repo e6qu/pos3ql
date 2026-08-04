@@ -550,7 +550,10 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
        > "$WORK/torture.out" 2>&1; then
     ok "crash torture ($(tail -1 "$WORK/torture.out"))"
   else
-    bad "crash torture"; tail -40 "$WORK/torture.out"
+    bad "crash torture"
+    tail -40 "$WORK/torture.out"
+    print -- "--- pos3ql server log after crash torture ---"
+    tail -80 "$WORK/server.log"
   fi
   "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1
   rm -rf "$TORTURE_SOCK"

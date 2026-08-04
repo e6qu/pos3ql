@@ -247,6 +247,7 @@ impl OwnedObjectStore {
                     // still live; count it so the lifecycle remains visible.
                     self.stats.object_read_stale_events =
                         self.stats.object_read_stale_events.saturating_add(1);
+                    return Ok(false);
                 }
                 return Ok(true);
             }
@@ -793,7 +794,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
 
-        assert!(store.advance_pending_read(0).unwrap());
+        assert!(!store.advance_pending_read(0).unwrap());
         assert_eq!(store.io_stats().object_read_stale_events, 1);
     }
 

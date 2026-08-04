@@ -903,7 +903,9 @@ columns to the fixed batch operators.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
-already finished request.
+already-complete response. Each live reactor registration has its own token;
+a queued readiness event for a hedge loser or consumed response is retired
+before it can address a later request that reuses the same fixed slot.
 
 The aggregate CI test job excludes the extended storage-VOPR test because the
 dedicated four-worker job is its sole authoritative execution. Running that

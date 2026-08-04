@@ -233,7 +233,8 @@ impl OwnedObjectStore {
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
-        self.slots.get(slot)?.client.pending_get_fd()
+        let slot = self.slots.get(slot)?;
+        slot.pending_id.and(slot.client.pending_get_fd())
     }
 
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
@@ -751,6 +752,10 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(complete, "mock object response did not complete");
+        assert!(
+            store.pending_read_fd(0).is_none(),
+            "a completed request must release reactor interest before its body is consumed"
+        );
         let mut output = [0u8; 64];
         assert_eq!(
             store.take_prefetch(&id, &mut output).unwrap(),

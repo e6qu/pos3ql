@@ -57,6 +57,11 @@ pub struct Server {
     shutdown_read: i32,
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
+    /// A registration token is consumed with its GET rather than being tied to
+    /// a reusable slot. A stale readiness event can therefore never advance a
+    /// later request which happened to reuse the same slot and descriptor.
+    block_read_tokens: FixedVec<Option<u64>>,
+    next_block_read_token: u64,
 }
 
 struct Slot {
@@ -124,8 +129,12 @@ impl Server {
         let mut slots = FixedVec::new(budget, "conn_slots", max_conns)?;
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
+        let mut block_read_tokens = FixedVec::new(budget, "block_read_tokens", block_read_slots)?;
         for _ in 0..block_read_slots {
             block_read_fds
+                .push(None)
+                .expect("sized from object_store_get_slots");
+            block_read_tokens
                 .push(None)
                 .expect("sized from object_store_get_slots");
         }
@@ -248,6 +257,8 @@ impl Server {
             tls_config,
             shutdown_read: pipe_fds[0],
             block_read_fds,
+            block_read_tokens,
+            next_block_read_token: BLOCK_IO_TOKEN,
         })
     }
 
@@ -487,11 +498,18 @@ impl Server {
     /// readable. Advances the pending response read; if it completes, the
     /// block is now cached and any parked statement is retried.
     fn advance_block_io(&mut self, slot: usize) -> std::io::Result<()> {
+        // A hedge winner may release a sibling request between poll and this
+        // event's turn. Its queued readiness is stale: retire its registration
+        // without asking the store to advance a slot that no longer has a GET.
+        if self.engine.pending_block_read_fd(slot) != self.block_read_fds[slot] {
+            return self.retire_block_read_interest(slot);
+        }
         if self
             .engine
             .advance_pending_block_read(slot)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?
         {
+            self.retire_block_read_interest(slot)?;
             // The GET completed and the block is cached. Wake parked
             // statements — they'll retry and find the block in cache.
             self.wake_lock_waiters();
@@ -509,21 +527,29 @@ impl Server {
             if wanted == self.block_read_fds[slot] {
                 continue;
             }
-            if let Some(fd) = self.block_read_fds[slot].take() {
-                self.reactor.deregister(fd)?;
-            }
+            self.retire_block_read_interest(slot)?;
             if let Some(fd) = wanted {
-                self.reactor
-                    .register_read(fd, BLOCK_IO_TOKEN - slot as u64)?;
+                let token = next_block_read_token(&mut self.next_block_read_token);
+                self.reactor.register_read(fd, token)?;
                 self.block_read_fds[slot] = Some(fd);
+                self.block_read_tokens[slot] = Some(token);
             }
         }
         Ok(())
     }
 
+    fn retire_block_read_interest(&mut self, slot: usize) -> std::io::Result<()> {
+        if let Some(fd) = self.block_read_fds[slot].take() {
+            self.reactor.deregister(fd)?;
+        }
+        self.block_read_tokens[slot] = None;
+        Ok(())
+    }
+
     fn block_slot(&self, token: u64) -> Option<usize> {
-        let slot = BLOCK_IO_TOKEN.checked_sub(token)? as usize;
-        (slot < self.block_read_fds.len()).then_some(slot)
+        self.block_read_tokens
+            .iter()
+            .position(|registered| *registered == Some(token))
     }
 
     /// Retries parked protocol messages after a transaction released row
@@ -776,6 +802,17 @@ fn token_for(index: u32, generation: u32) -> u64 {
     (u64::from(generation) << 32) | u64::from(index)
 }
 
+/// Returns a token unique for each live block-read registration. The three
+/// permanently reserved reactor tokens occupy the very end of the space, so
+/// the first allocatable token is immediately below them.
+fn next_block_read_token(next: &mut u64) -> u64 {
+    let token = *next;
+    *next = next
+        .checked_sub(1)
+        .expect("block-read token space exhausted");
+    token
+}
+
 /// Post-freeze-safe logging: io::Error's Display allocates (strerror into a
 /// String), so only the kind and raw code are printed.
 fn log_io(context: &str, e: &std::io::Error) {
@@ -791,7 +828,16 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
-    use super::bind_listener;
+    use super::{BLOCK_IO_TOKEN, bind_listener, next_block_read_token};
+
+    #[test]
+    fn block_read_registration_tokens_do_not_repeat() {
+        let mut next = BLOCK_IO_TOKEN;
+        let first = next_block_read_token(&mut next);
+        let second = next_block_read_token(&mut next);
+        assert_eq!(first, BLOCK_IO_TOKEN);
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn listener_rebinds_after_active_connection_closes() {

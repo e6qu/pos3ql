@@ -10360,11 +10360,11 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     let full_result = run_with(
         &mut full,
         &mut full_budget,
-        "SELECT count(*) FROM pruning_rows",
+        "SELECT sum(length(payload)) FROM pruning_rows",
     );
     assert_eq!(
         data_rows(&full_result),
-        ["600"],
+        ["307200"],
         "{}",
         String::from_utf8_lossy(&full_result)
     );
@@ -10408,8 +10408,8 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
         .saturating_sub(before_selective)
         .object_gets;
     assert!(
-        full_gets < 16,
-        "a cold sequential scan must consume each durable data block once, not point-reread every row: full={full_gets}"
+        full_gets < 32,
+        "a cold sequential scan must fetch each descriptor and demanded column extent once, not reread extents per row: full={full_gets}"
     );
     assert!(
         selective_gets <= full_gets,
@@ -10479,6 +10479,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut cold_budget = Budget::new(1 << 30);
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let before_cold = cold.storage.block_io_stats();
     let result = run_with_arena_bytes(
         &mut cold,
         &mut cold_budget,
@@ -10490,6 +10491,12 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
         ["287"],
         "{}",
         String::from_utf8_lossy(&result)
+    );
+    let cold_reads = cold.storage.block_io_stats().saturating_sub(before_cold);
+    assert!(
+        cold_reads.object_read_bytes < 1 << 20,
+        "an id-only cold PAX scan must not transfer the twenty wide payload columns: bytes={}",
+        cold_reads.object_read_bytes
     );
     drop(cold);
 

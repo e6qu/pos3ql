@@ -2124,16 +2124,34 @@ impl Checkpointer {
             crate::store::locate_data_block_ref(&mut *blocks, handle, index_buf, block_count - 1)
                 .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?
                 .ok_or(CheckpointSetupError::Corrupt("sst index names no blocks"))?;
-        let data_len =
-            crate::store::read_data_block_ref(&mut *blocks, last_reference, data_buf, index_buf)
-                .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
-        let mut at = 0usize;
         let mut max_rowid: Option<u64> = None;
-        while let Some((key, _, _, next)) =
-            crate::store::block_keys_at(&data_buf[..data_len], at, handle.versioned)
-        {
-            max_rowid = Some(key.rowid);
-            at = next;
+        let (data_len, block_type) = crate::store::read_data_block_raw_ref(
+            &mut *blocks,
+            last_reference,
+            data_buf,
+            index_buf,
+        )
+        .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+        if block_type == crate::store::BlockType::SstDataPaxV2 {
+            let layout = crate::store::pax_layout(&data_buf[..data_len])
+                .map_err(|_| CheckpointSetupError::Corrupt("sst PAX descriptor unreachable"))?;
+            for row in 0..layout.rows() {
+                let (key, _) = layout
+                    .row_key(&data_buf[..data_len], row)
+                    .map_err(|_| CheckpointSetupError::Corrupt("sst PAX descriptor unreachable"))?;
+                max_rowid = Some(key.rowid);
+            }
+        } else {
+            let decoded =
+                crate::store::decode_data_block(&data_buf[..data_len], block_type, index_buf)
+                    .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
+            let mut at = 0usize;
+            while let Some((key, _, _, next)) =
+                crate::store::block_keys_at(&index_buf[..decoded], at, handle.versioned)
+            {
+                max_rowid = Some(key.rowid);
+                at = next;
+            }
         }
         drop(blocks);
         if let Some(rowid) = max_rowid {

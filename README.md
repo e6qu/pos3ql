@@ -173,9 +173,10 @@ Working single-node database:
 
 Still to complete: the full PostgreSQL SQL/catalog/tooling surface, the two
 binary-wire exceptions above, logical replication, VSR productionization, and
-the object-storage execution capstone (PAX column-range vector execution and
-end-to-end late materialization). Verified packed range reads are already the
-provider-neutral object-storage boundary for that work. See [PLAN.md](PLAN.md) for
+the object-storage execution capstone (end-to-end late materialization through
+the remaining multi-table and deferred operators). PAX descriptors already name
+independent verified column ranges and feed bounded cold-scan vectors through the
+provider-neutral object-storage boundary. See [PLAN.md](PLAN.md) for
 the ordered plan and [BUGS.md](BUGS.md) for known divergences; the headline
 ones are summarized under **Limitations** below. [AGENTS.md](AGENTS.md) holds
 the standing directives, and [docs/terminology.md](docs/terminology.md) is the

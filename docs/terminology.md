@@ -289,8 +289,12 @@ The performance vocabulary of the object-storage LSM and its adaptive executor
   block's worth of rows per step in a push-based batched pipeline, rather than one
   row per call, for throughput.
 - **PAX** (row-group) — a within-block layout that keeps rows grouped by key but
-  clusters columns inside the block (Parquet-row-group style), enabling column
-  projection and better compression without leaving the row model.
+  clusters columns (Parquet-row-group style), enabling column projection and
+  better compression without leaving the row model. New PAX descriptors retain
+  keys and null maps while naming independently verified physical column extents.
+- **column extent** — one framed physical PAX column payload, addressed by its
+  immutable container, exact byte range, and content identity. A scan may fetch
+  only the extents proved necessary by its predicate and projection.
 - **free set** — the fixed structure tracking which grid blocks are free vs.
   allocated (after TigerBeetle's grid free set).
 - **cost model** — the planner's estimate of a plan's cost; the *storage-aware*

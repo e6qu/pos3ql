@@ -452,6 +452,10 @@ pub(crate) struct BlockIoStats {
     /// Elapsed wall time awaiting completed durable-block GET responses.
     /// Telemetry calibrates future plans only; it is not durable state.
     pub(crate) object_read_micros: u64,
+    /// Readiness events observed after their fixed request slot was released.
+    /// Kernel readiness is level-triggered, so this is expected lifecycle
+    /// telemetry rather than a failed durable read.
+    pub(crate) object_read_stale_events: u64,
     /// Speculative reads accepted into an owned fixed GET slot.
     pub(crate) object_prefetch_scheduled: u64,
     /// Speculative reads that reused an already-owned request or cache body.
@@ -479,6 +483,9 @@ impl BlockIoStats {
             object_read_micros: self
                 .object_read_micros
                 .saturating_sub(earlier.object_read_micros),
+            object_read_stale_events: self
+                .object_read_stale_events
+                .saturating_sub(earlier.object_read_stale_events),
             object_prefetch_scheduled: self
                 .object_prefetch_scheduled
                 .saturating_sub(earlier.object_prefetch_scheduled),

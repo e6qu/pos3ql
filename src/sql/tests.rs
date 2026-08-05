@@ -10618,6 +10618,36 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT id + id + id + id + id + id + id + id + id + id + id \
+         FROM wide_pax ORDER BY id LIMIT 1",
+        &["11"],
+        Some(1 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT l.id + l.id + l.id + l.id + l.id + l.id + l.id + l.id + l.id + l.id + l.id \
+         FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id \
+         WHERE r.id = 287 ORDER BY l.id LIMIT 1",
+        &["3157"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT d.id + d.id + d.id + d.id + d.id + d.id + d.id + d.id + d.id + d.id + d.id \
+         FROM (SELECT id FROM wide_pax) AS d \
+         JOIN wide_pax_right AS r ON d.id = r.id \
+         WHERE r.id = 287 ORDER BY d.id LIMIT 1",
+        &["3157"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT id, count(*) FROM wide_pax GROUP BY id ORDER BY id LIMIT 1",
         &["1|1"],
         None,

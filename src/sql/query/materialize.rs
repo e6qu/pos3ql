@@ -428,18 +428,19 @@ fn prepare_materialization<'a>(
     })
 }
 
-/// The physical PAX columns that a non-deferred materialization can observe.
+/// The physical PAX columns a materialization can observe.
 ///
-/// A deferred projection serializes the complete source row to evaluate after
-/// sorting, and a correlated predicate evaluates outside the scan. Neither
-/// shape has a complete demand set at the scan boundary.
+/// Postponed expressions are evaluated from their serialized source values
+/// after sorting, but those values have the same statically known column
+/// demand as an eager projection. Correlated predicates still evaluate outside
+/// this scan and therefore cannot establish that proof here.
 fn materialization_pax_columns<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
 ) -> Option<super::scan::PaxColumnDemand> {
-    if plan.any_postponed || plan.n_where_correlated != 0 {
+    if plan.n_where_correlated != 0 {
         return None;
     }
 

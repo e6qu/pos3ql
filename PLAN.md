@@ -931,6 +931,15 @@ while its physical partner probes selected PAX values once. Whole-row and
 nested-query shapes retain their established full-row path until they establish
 an equally complete proof.
 
+**Deferred-materialization demand slice (2026-08-05).** A costly projection
+that waits until after `ORDER BY`/`LIMIT` no longer widens the physical scan to
+every source column merely because its selected source values are serialized
+for later evaluation. The materializer derives one complete PAX mask from both
+eager and postponed expressions, predicates, join conditions, and sort keys;
+it carries just those decoded values through its immutable row representation.
+Cold regressions cover direct, joined, and external-run-derived inputs, so a
+deferred narrow projection cannot silently fetch wide payload extents.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

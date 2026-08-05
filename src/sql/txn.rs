@@ -141,6 +141,10 @@ pub(crate) enum DdlUndo {
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
     /// undo by reviving it.
     ViewDropped(u32),
+    /// CREATE PUBLICATION at this slot.
+    PublicationCreated(u32),
+    /// DROP PUBLICATION at this slot.
+    PublicationDropped(u32),
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.

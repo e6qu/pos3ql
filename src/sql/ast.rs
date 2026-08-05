@@ -136,6 +136,19 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    /// CREATE PUBLICATION name FOR { ALL TABLES | TABLE table [, ...] }
+    /// [WITH (publish = 'insert, update, delete, truncate')].
+    CreatePublication {
+        name: &'a str,
+        all_tables: bool,
+        tables: &'a [QualName<'a>],
+        publish: PublicationOperations,
+    },
+    /// DROP PUBLICATION [IF EXISTS] name [, ...].
+    DropPublication {
+        names: &'a [&'a str],
+        if_exists: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -391,6 +404,25 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+/// Row-change operations a publication emits through logical replication.
+/// PostgreSQL enables all four when the WITH clause is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationOperations {
+    pub insert: bool,
+    pub update: bool,
+    pub delete: bool,
+    pub truncate: bool,
+}
+
+impl PublicationOperations {
+    pub const ALL: Self = Self {
+        insert: true,
+        update: true,
+        delete: true,
+        truncate: true,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

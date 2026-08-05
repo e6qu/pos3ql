@@ -10008,6 +10008,50 @@ fn psql_catalog_listing_contracts() {
 }
 
 #[test]
+fn publications_are_transactional_and_catalog_visible() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_source (id int)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE PUBLICATION changes FOR TABLE publication_source WITH (publish = 'insert, delete'); COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pubname, pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication"
+        )),
+        ["changes|t|f|t|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_publication_rel"
+        )),
+        ["1"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP PUBLICATION changes; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_publication"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(

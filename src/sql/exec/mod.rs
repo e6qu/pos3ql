@@ -4987,17 +4987,152 @@ pub fn drop_schema(
 /// and checkpointed) and registers it. View DDL is applied immediately, not
 /// rolled back with the surrounding transaction (see BUGS.md).
 #[allow(clippy::too_many_arguments)]
+pub fn create_publication(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    name: &str,
+    all_tables: bool,
+    tables: &[QualName],
+    publish: crate::sql::ast::PublicationOperations,
+    responder: &mut Responder,
+) -> Outcome {
+    if all_tables && !tables.is_empty() {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "FOR ALL TABLES cannot name tables"
+        ));
+    }
+    let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+    for (index, table) in tables.iter().enumerate() {
+        let Some(crate::storage::ResolvedRelation::Table(slot)) =
+            storage.resolve_relation(table.schema, table.name, txn.txid)
+        else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"{}\" does not exist",
+                table.name
+            ));
+        };
+        if members[..index].contains(&(slot as u16)) {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "relation \"{}\" is already in publication",
+                table.name
+            ));
+        }
+        members[index] = slot as u16;
+    }
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    match storage.create_publication(
+        crate::storage::PublicationSpec {
+            name,
+            all_tables,
+            tables: &members[..tables.len()],
+            publish_insert: publish.insert,
+            publish_update: publish.update,
+            publish_delete: publish.delete,
+            publish_truncate: publish.truncate,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => {
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreatePublication {
+                    name: name.as_str(),
+                    all_tables,
+                    tables: members,
+                    table_count: tables.len(),
+                    publish_insert: publish.insert,
+                    publish_update: publish.update,
+                    publish_delete: publish.delete,
+                    publish_truncate: publish.truncate,
+                },
+            ) {
+                storage.rollback_publication_create(slot);
+                return sql_fail(error);
+            }
+            match txn.record_ddl(super::txn::DdlUndo::PublicationCreated(slot as u32)) {
+                Ok(()) => Ok(Ok(responder.command_complete("CREATE PUBLICATION")?)),
+                Err(error) => {
+                    storage.rollback_publication_create(slot);
+                    sql_fail(error)
+                }
+            }
+        }
+        Err(error) => sql_fail(error),
+    }
+}
+
+pub fn drop_publication(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    names: &[&str],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        match storage.drop_publication(name, txn.txid) {
+            Ok(Some(slot)) => {
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropPublication { name }) {
+                    storage.rollback_publication_drop(slot, txn.txid);
+                    return sql_fail(error);
+                }
+                if let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::PublicationDropped(slot as u32))
+                {
+                    storage.rollback_publication_drop(slot, txn.txid);
+                    return sql_fail(error);
+                }
+            }
+            Ok(None) if if_exists => responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "publication \"{}\" does not exist, skipping", name).as_str(),
+            )?,
+            Ok(None) => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "publication \"{}\" does not exist",
+                    name
+                ));
+            }
+            Err(error) => return sql_fail(error),
+        }
+    }
+    Ok(Ok(responder.command_complete("DROP PUBLICATION")?))
+}
+
+/// The user-supplied portion of CREATE VIEW, grouped to keep execution's
+/// transaction and response dependencies distinct from statement input.
+pub struct CreateViewCommand<'a> {
+    pub name: &'a QualName<'a>,
+    pub or_replace: bool,
+    pub sql: &'a str,
+    pub raw_path: &'a str,
+}
+
 pub fn create_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    name: &QualName,
-    or_replace: bool,
-    sql: &str,
-    raw_path: &str,
+    command: CreateViewCommand<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let CreateViewCommand {
+        name,
+        or_replace,
+        sql,
+        raw_path,
+    } = command;
     use core::fmt::Write;
     let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");

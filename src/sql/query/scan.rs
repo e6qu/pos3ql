@@ -9,7 +9,9 @@
 //! correlated subquery sees the row it is correlated with.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{BinaryOp, Expr, FromClause, JoinKind};
+use crate::sql::ast::{
+    BinaryOp, Expr, FromClause, JoinKind, Select, SelectItem, SetTree, TableRef,
+};
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums, eval_full, hash_key, sqlstate,
 };
@@ -64,8 +66,9 @@ pub(crate) type PaxColumnDemand = [u64; MAX_JOIN_TABLES];
 
 /// Builds the complete physical-column demand for a source scan.
 /// Returning `None` deliberately retains full decoding whenever an expression
-/// can observe a row shape this scan does not own (a derived row, outer
-/// reference, whole-row value, or nested query).
+/// can observe a row shape this scan does not own (a derived row or whole-row
+/// value). Correlated nested queries contribute their outer-column references
+/// to this scan's proof and retain their own independent inner proof.
 pub(crate) fn pax_column_demand(
     scope: &QueryScope,
     from: &FromClause,
@@ -84,6 +87,83 @@ fn pax_column_demand_bounded(
     expressions: &[&Expr],
 ) -> Option<PaxColumnDemand> {
     let mut columns = [0u64; MAX_JOIN_TABLES];
+    fn collect_table(table: &TableRef, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
+        if let Some(arguments) = table.func_args
+            && arguments
+                .iter()
+                .any(|argument| !collect(argument, scope, columns))
+        {
+            return false;
+        }
+        table
+            .subquery
+            .is_none_or(|select| collect_select(select, scope, columns))
+    }
+
+    fn collect_set(tree: &SetTree, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
+        match tree {
+            SetTree::Select(select) => collect_select(select, scope, columns),
+            SetTree::Op { left, right, .. } => {
+                collect_set(left, scope, columns) && collect_set(right, scope, columns)
+            }
+        }
+    }
+
+    fn collect_select(select: &Select, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
+        if let Some(body) = select.set_body
+            && !collect_set(body, scope, columns)
+        {
+            return false;
+        }
+        if let Some(from) = select.from
+            && (!collect_table(&from.base, scope, columns)
+                || from.joins.iter().any(|join| {
+                    !collect_table(&join.table, scope, columns)
+                        || join.on.is_some_and(|on| !collect(on, scope, columns))
+                }))
+        {
+            return false;
+        }
+        if select
+            .with
+            .iter()
+            .any(|cte| !collect_select(cte.query, scope, columns))
+        {
+            return false;
+        }
+        select.items.iter().all(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                collect(expression, scope, columns)
+            }
+            // A wildcard belongs to the nested select's own output. It cannot
+            // name an enclosing physical column.
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+        }) && select
+            .distinct_on
+            .iter()
+            .all(|expression| collect(expression, scope, columns))
+            && select
+                .where_clause
+                .is_none_or(|expression| collect(expression, scope, columns))
+            && select
+                .group_by
+                .iter()
+                .all(|expression| collect(expression, scope, columns))
+            && select
+                .having
+                .is_none_or(|expression| collect(expression, scope, columns))
+            && select
+                .order_by
+                .iter()
+                .all(|order| collect(order.expression, scope, columns))
+            && select
+                .limit
+                .is_none_or(|expression| collect(expression, scope, columns))
+            && select
+                .offset
+                .is_none_or(|expression| collect(expression, scope, columns))
+    }
+
     fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
@@ -91,10 +171,19 @@ fn pax_column_demand_bounded(
                     columns[table] |= 1u64 << column
                 }
                 Ok(ResolvedColumn::Table(_, _)) => {}
-                _ => return false,
+                // An unresolved name can be an enclosing correlated column.
+                // The select walker records it against the enclosing physical
+                // scope while this inner scan needs no local span for it.
+                Err(_) => {}
+                Ok(ResolvedColumn::Merged(_)) => return false,
             },
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => return false,
-            Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) => return false,
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+                return collect_select(select, scope, columns);
+            }
+            Expr::InSubquery {
+                operand, select, ..
+            } => return collect(operand, scope, columns) && collect_select(select, scope, columns),
             _ => {}
         }
         let mut complete = true;

@@ -940,6 +940,16 @@ it carries just those decoded values through its immutable row representation.
 Cold regressions cover direct, joined, and external-run-derived inputs, so a
 deferred narrow projection cannot silently fetch wide payload extents.
 
+**Correlated-demand slice (2026-08-05).** Correlated scalar, membership, and
+EXISTS predicates no longer make either side abandon PAX demand derivation.
+Nested expressions recursively register the outer columns they observe, while
+an inner scan treats those columns as supplied by its chained outer row and
+keeps only its local spans. Error-safe top-level `AND` conjuncts independent of
+the correlated node run in the source scan before the per-row probe; the
+complete predicate is still evaluated afterward with the correlated result.
+The cold regression proves a selective outer EXISTS probe reads only both key
+extents rather than a wide payload row or a probe per rejected outer row.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

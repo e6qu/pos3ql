@@ -21,8 +21,8 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
-    correlated_in_expression, correlated_where_passes, find_srf, merge_correlated,
-    pax_column_demand, postpone_cost, project_row_skipping, record_star_width,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, find_srf,
+    merge_correlated, pax_column_demand, postpone_cost, project_row_skipping, record_star_width,
     resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
     sql_fail, sql_ok, srf_max_count,
 };
@@ -320,11 +320,11 @@ fn prepare_materialization<'a>(
     let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
     let n_where_correlated =
         correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
-    let where_in_scan = if n_where_correlated == 0 {
-        statement.where_clause
-    } else {
-        None
-    };
+    let where_in_scan = correlated_scan_conjuncts(
+        statement.where_clause,
+        &where_correlated[..n_where_correlated],
+        arena,
+    )?;
 
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     for (key, order) in statement.order_by.iter().enumerate() {
@@ -430,20 +430,15 @@ fn prepare_materialization<'a>(
 
 /// The physical PAX columns a materialization can observe.
 ///
-/// Postponed expressions are evaluated from their serialized source values
-/// after sorting, but those values have the same statically known column
-/// demand as an eager projection. Correlated predicates still evaluate outside
-/// this scan and therefore cannot establish that proof here.
+/// Postponed expressions and correlated predicates are evaluated outside the
+/// direct scan, but their source-column dependencies remain statically known
+/// and belong in the same physical proof.
 fn materialization_pax_columns<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
 ) -> Option<super::scan::PaxColumnDemand> {
-    if plan.n_where_correlated != 0 {
-        return None;
-    }
-
     let mut expressions = [&Expr::Null; MAX_PROJ * 2 + 1];
     let mut count = 0usize;
     for item in statement.items {
@@ -455,7 +450,7 @@ fn materialization_pax_columns<'a>(
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
         }
     }
-    if let Some(predicate) = plan.where_in_scan {
+    if let Some(predicate) = statement.where_clause {
         expressions[count] = predicate;
         count += 1;
     }

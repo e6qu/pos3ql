@@ -33,9 +33,12 @@ def connect():
     return s
 
 
-def startup_payload(minor, user=b"postgres"):
+def startup_payload(minor, user=b"postgres", parameters=()):
     body = struct.pack("!i", (3 << 16) | minor)
-    body += b"user\x00" + user + b"\x00\x00"
+    body += b"user\x00" + user + b"\x00"
+    for key, value in parameters:
+        body += key.encode() + b"\x00" + value.encode() + b"\x00"
+    body += b"\x00"
     return struct.pack("!i", len(body) + 4) + body
 
 
@@ -69,6 +72,19 @@ def simple_query(s, text):
         out.append(item)
         if item[0] == b"Z":
             return out
+
+
+def row_description_type_oids(payload):
+    (count,) = struct.unpack("!h", payload[:2])
+    at = 2
+    oids = []
+    for _ in range(count):
+        end = payload.index(b"\x00", at)
+        at = end + 1
+        _, _, oid, _, _, _ = struct.unpack("!ihihih", payload[at : at + 18])
+        oids.append(oid)
+        at += 18
+    return oids
 
 
 def start_extended(s, text, max_rows=0):
@@ -203,6 +219,54 @@ def test_simple_query_and_empty():
     check("unknown message type: ErrorResponse", mtype == b"E")
     tail = s.recv(1)
     check("unknown message type: connection closed", tail == b"")
+    s.close()
+
+
+def test_logical_replication_simple_query_mode():
+    s = connect()
+    s.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+    drain_startup(s)
+
+    out = simple_query(s, "SELECT 1")
+    check(
+        "logical replication accepts ordinary simple SQL",
+        [m for m, _ in out] == [b"T", b"D", b"C", b"Z"],
+        [m for m, _ in out],
+    )
+
+    out = simple_query(s, "IDENTIFY_SYSTEM")
+    types = [m for m, _ in out]
+    check("logical IDENTIFY_SYSTEM result framing", types == [b"T", b"D", b"C", b"Z"], types)
+    if types == [b"T", b"D", b"C", b"Z"]:
+        check(
+            "logical IDENTIFY_SYSTEM timeline is int8",
+            row_description_type_oids(out[0][1]) == [25, 20, 25, 25],
+            row_description_type_oids(out[0][1]),
+        )
+    s.close()
+
+
+def test_physical_replication_identify_system_mode():
+    s = connect()
+    s.sendall(startup_payload(0, parameters=(("replication", "true"),)))
+    drain_startup(s)
+
+    out = simple_query(s, "IDENTIFY_SYSTEM")
+    types = [m for m, _ in out]
+    check("physical IDENTIFY_SYSTEM result framing", types == [b"T", b"D", b"C", b"Z"], types)
+    if types == [b"T", b"D", b"C", b"Z"]:
+        check(
+            "physical IDENTIFY_SYSTEM timeline is int8",
+            row_description_type_oids(out[0][1]) == [25, 20, 25, 25],
+            row_description_type_oids(out[0][1]),
+        )
+
+    out = simple_query(s, "SELECT 1")
+    check(
+        "physical replication does not accept ordinary SQL",
+        [m for m, _ in out] == [b"E", b"Z"],
+        [m for m, _ in out],
+    )
     s.close()
 
 

@@ -1932,8 +1932,8 @@ impl Conn {
             let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
             return Step::Close;
         };
-        if self.replication != ReplicationMode::None {
-            let identify_system = is_identify_system(text);
+        let identify_system = is_identify_system(text);
+        if is_replication_command(self.replication, identify_system) {
             return self.handle_replication_query(engine, identify_system, total);
         }
         self.arena.reset();
@@ -2042,21 +2042,25 @@ impl Conn {
         identify_system: bool,
         total: usize,
     ) -> Step {
-        if self.replication == ReplicationMode::Logical && identify_system {
+        if identify_system {
             let (system_id, lsn) = engine.replication_identity();
             let system_id = stack_format!(32, "{system_id}");
             let lsn = stack_format!(32, "0/{lsn:X}");
             let columns = [
                 crate::sql::types::ColDesc::new("systemid", crate::sql::types::oid::TEXT, -1),
-                crate::sql::types::ColDesc::new("timeline", crate::sql::types::oid::INT4, 4),
+                crate::sql::types::ColDesc::new("timeline", crate::sql::types::oid::INT8, 8),
                 crate::sql::types::ColDesc::new("xlogpos", crate::sql::types::oid::TEXT, -1),
                 crate::sql::types::ColDesc::new("dbname", crate::sql::types::oid::TEXT, -1),
             ];
             let values = [
                 Datum::Text(system_id.as_str()),
-                Datum::Int4(1),
+                Datum::Int8(1),
                 Datum::Text(lsn.as_str()),
-                Datum::Text("postgres"),
+                if self.replication == ReplicationMode::Logical {
+                    Datum::Text("postgres")
+                } else {
+                    Datum::Null
+                },
             ];
             let mut responder = Responder::new(&mut self.send);
             if responder
@@ -2131,6 +2135,13 @@ fn is_identify_system(text: &str) -> bool {
         .trim_end_matches(';')
         .trim_end()
         .eq_ignore_ascii_case("identify_system")
+}
+
+/// Logical replication uses replication commands and ordinary SQL on the same
+/// simple-query connection. Physical mode has no SQL database session, so all
+/// of its simple queries are replication commands.
+fn is_replication_command(mode: ReplicationMode, identify_system: bool) -> bool {
+    mode == ReplicationMode::Physical || (mode == ReplicationMode::Logical && identify_system)
 }
 
 enum Step {
@@ -2489,5 +2500,13 @@ mod tests {
         assert!(is_identify_system("IDENTIFY_SYSTEM"));
         assert!(is_identify_system(" identify_system ; \n"));
         assert!(!is_identify_system("IDENTIFY_SYSTEM; SELECT 1"));
+    }
+
+    #[test]
+    fn logical_replication_keeps_simple_sql_out_of_replication_command_dispatch() {
+        assert!(is_replication_command(ReplicationMode::Logical, true));
+        assert!(!is_replication_command(ReplicationMode::Logical, false));
+        assert!(is_replication_command(ReplicationMode::Physical, false));
+        assert!(!is_replication_command(ReplicationMode::None, true));
     }
 }

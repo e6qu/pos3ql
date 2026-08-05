@@ -41,8 +41,8 @@ mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
-    Chained, PaxColumnDemand, pax_column_demand, scan_source,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    Chained, PaxColumnDemand, pax_column_demand, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns,
 };
 
 mod scope;
@@ -4039,7 +4039,11 @@ pub fn first_from_match<'a>(
         sequences: None,
     };
     let mut found = false;
-    scan_source(
+    let pax_columns = match where_clause {
+        Some(predicate) => pax_column_demand(&scope, from, &[predicate]),
+        None => pax_column_demand(&scope, from, &[]),
+    };
+    scan_source_with_pax_columns(
         storage,
         &scope,
         from,
@@ -4049,6 +4053,7 @@ pub fn first_from_match<'a>(
         params,
         &hooks,
         Some(target),
+        pax_columns.as_ref(),
         &mut |jr| {
             let chained_row = Chained {
                 inner: jr,

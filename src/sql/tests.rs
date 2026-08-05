@@ -10685,6 +10685,14 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT (SELECT id FROM wide_pax WHERE id = 287 ORDER BY id)",
+        &["287"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT id FROM (SELECT id FROM wide_pax) AS projected WHERE id = 287",
         &["287"],
         None,

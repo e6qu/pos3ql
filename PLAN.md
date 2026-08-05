@@ -961,6 +961,16 @@ per-row correlated window probe. The cold wide-table regression pins a
 `row_number() OVER (ORDER BY id)` query to its two required key-vector passes,
 excluding every payload extent.
 
+**Subquery and DML-match demand slice (2026-08-05).** Plain scalar and array
+subqueries now derive demand from their selected value, predicate, ordering,
+and page expressions before their count and fill scans. `UPDATE ... FROM` and
+`DELETE ... USING` apply the same proof while locating the first joined match
+for a target row. The generic source-scan wrappers are gone: every executor
+now explicitly supplies either a complete mask or an explicit full-row
+decision, so an unproved physical scan cannot slip back in through a default.
+The forced-cold wide-table regression covers an ordered scalar subquery and
+keeps both source passes to key extents.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

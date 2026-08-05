@@ -21,8 +21,8 @@ use super::setops::materialize_set_body;
 use super::{
     Chained, MAX_AGGS, MAX_SUBQUERIES, MAX_WINDOWS, QueryScope, SUBQUERY_DEPTH, ScopeCols,
     ScopeSchema, arena_full, cmp_key_rows, collect_aggs, collect_windows, fold_aggregates,
-    fromless_aggregate_hooks, pax_column_demand, scan_source, scan_source_with_pax_columns,
-    select_into_rows, select_into_rows_recycling, where_passes,
+    fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
+    select_into_rows_recycling, where_passes,
 };
 use crate::sql::exec::MAX_PROJ;
 
@@ -1719,8 +1719,28 @@ fn run_subquery<'a>(
     // then fill), then sort and apply OFFSET/LIMIT so a subquery's own ORDER BY
     // / LIMIT is honored (element order matters for ARRAY(...) and scalar).
     let n_keys = select.order_by.len();
+    let mut expressions = [&Expr::Null; MAX_PROJ + 3];
+    expressions[0] = item;
+    let mut expression_count = 1;
+    if let Some(predicate) = select.where_clause {
+        expressions[expression_count] = predicate;
+        expression_count += 1;
+    }
+    for order in select.order_by {
+        expressions[expression_count] = order.expression;
+        expression_count += 1;
+    }
+    if let Some(limit) = select.limit {
+        expressions[expression_count] = limit;
+        expression_count += 1;
+    }
+    if let Some(offset) = select.offset {
+        expressions[expression_count] = offset;
+        expression_count += 1;
+    }
+    let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
     let mut count = 0usize;
-    scan_source(
+    scan_source_with_pax_columns(
         storage,
         &scope,
         from,
@@ -1730,6 +1750,7 @@ fn run_subquery<'a>(
         params,
         &hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |_| {
             count += 1;
             Ok(true)
@@ -1742,7 +1763,7 @@ fn run_subquery<'a>(
         .alloc_slice_with(count * n_keys, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut at = 0usize;
-    scan_source(
+    scan_source_with_pax_columns(
         storage,
         &scope,
         from,
@@ -1752,6 +1773,7 @@ fn run_subquery<'a>(
         params,
         &hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             let chained_row = Chained { inner: row, outer };
             vals[at] = eval_full(item, arena, params, &chained_row, &hooks)?;

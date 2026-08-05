@@ -144,6 +144,10 @@ pub struct Engine {
     /// `execute_simple`/`execute_extended` entry so LISTEN/UNLISTEN/NOTIFY can
     /// stamp their buffered ops without threading the id through every arm.
     current_conn_id: i32,
+    /// Stable identity exposed by the replication protocol. It is derived
+    /// from the durable namespace rather than process-local state, so a
+    /// restarted or cold-recovered server remains the same publisher.
+    replication_system_id: u64,
     /// Authenticated sessions per fixed role slot, used to enforce
     /// `CONNECTION LIMIT` without allocating in the server loop.
     role_connections: [u16; crate::storage::MAX_ROLES],
@@ -155,6 +159,7 @@ pub(crate) struct RoleLogin {
     pub can_login: bool,
     pub valid: bool,
     pub superuser: bool,
+    pub replication: bool,
     pub connection_limit: i32,
     pub password: Option<crate::storage::RolePassword>,
 }
@@ -387,6 +392,7 @@ impl Engine {
             can_login: attributes.can_login,
             valid,
             superuser: attributes.superuser,
+            replication: attributes.replication,
             connection_limit: attributes.connection_limit,
             password: attributes.has_password.then_some(attributes.password),
         })
@@ -503,13 +509,8 @@ impl Engine {
                 }))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
         }
-        // Startup reconciliation: the newest committed records are
-        // journaled-only whenever their upload failed before the crash (the
-        // batch marker is in-memory and does not survive a restart), so an
-        // errored commit is durable only in the local journal. Re-upload that
-        // tail — every committed record with an LSN past the newest segment —
-        // so a later journal loss cannot take records a client already
-        // observed. Best-effort: the records stay journal-durable either way.
+        // Startup reconciliation makes every recovered commit durable in the
+        // configured object store before the server admits any connection.
         if config.wal_upload
             && config.object_store_on
             && journal_tip > segment_tip
@@ -530,13 +531,7 @@ impl Engine {
                 segment.extend_from_slice(&crc.to_le_bytes());
                 segment.extend_from_slice(&body);
             }
-            if let Err(e) = c.upload_wal_segment(first, &segment) {
-                eprintln!(
-                    "pos3ql: startup WAL reconciliation upload failed ({}): {}",
-                    e.sqlstate,
-                    e.message.as_str()
-                );
-            }
+            c.upload_wal_segment(first, &segment)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
         storage.reconcile_serials();
@@ -570,8 +565,13 @@ impl Engine {
                 notify::OUTBOX,
             )?,
             current_conn_id: 0,
+            replication_system_id: crate::object_store::writer_id(config),
             role_connections: [0; crate::storage::MAX_ROLES],
         })
+    }
+
+    pub(crate) fn replication_identity(&self) -> (u64, u64) {
+        (self.replication_system_id, self.wal.last_lsn())
     }
 
     /// Starts a transaction if none is active.
@@ -612,12 +612,6 @@ impl Engine {
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
         self.storage.release_row_locks(txn.txid);
-        // A failed synchronous upload keeps its batch marker, so the next
-        // commit retries it. Whether *this* transaction added records to
-        // that batch decides who owns a retry failure below: the statement
-        // (its outcome really is unknown), or nobody (the records belong to
-        // commits already reported failed — the retry is background work).
-        let batch_bytes_before = self.wal.pending_batch_bytes();
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
@@ -982,23 +976,8 @@ impl Engine {
         // transaction invisible until the next restart resurrected it —
         // state a client could watch move backward and then forward.
         self.wal.commit();
-        let contributed = self.wal.pending_batch_bytes() > batch_bytes_before;
         let upload_result = if self.wal_upload {
-            match self.upload_wal_batch() {
-                Err(e) if !contributed => {
-                    // Retrying a previous commit's batch: everything in it
-                    // is locally durable and already reported failed to its
-                    // own client; a statement that wrote nothing must not
-                    // inherit the retry's error.
-                    eprintln!(
-                        "pos3ql: WAL segment upload retry failed ({}): {}",
-                        e.sqlstate,
-                        e.message.as_str()
-                    );
-                    Ok(())
-                }
-                result => result,
-            }
+            self.upload_wal_batch()
         } else {
             Ok(())
         };
@@ -1451,17 +1430,9 @@ impl Engine {
 
     /// Makes journaled work durable. Called once per query message, before
     /// results are flushed to the client.
-    pub fn commit_wal(&mut self) {
+    pub fn commit_wal(&mut self) -> Result<(), SqlError> {
         self.wal.commit();
-        // Best-effort upload; a failure here is surfaced on the next
-        // committing statement rather than crashing an unrelated one.
-        if let Err(e) = self.upload_wal_batch() {
-            eprintln!(
-                "pos3ql: WAL segment upload failed ({}): {}",
-                e.sqlstate,
-                e.message.as_str()
-            );
-        }
+        self.upload_wal_batch()
     }
 
     /// Uploads the just-committed WAL batch to the bucket (RPO=0 mode).
@@ -1491,23 +1462,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Best-effort retry of a pending (previously failed) WAL batch upload at
-    /// the start of a statement. An errored commit's records are promoted and
-    /// observable, but durable only in the local journal until a retry lands;
-    /// retrying before the statement's reads narrows the window in which a
-    /// journal loss could take them after they were observed. No-op when no
-    /// batch is pending.
-    fn retry_pending_wal_upload(&mut self) {
+    /// Makes a previously failed committed batch object-store durable before a
+    /// later statement can observe it.
+    fn retry_pending_wal_upload(&mut self) -> Result<(), SqlError> {
         if !self.wal_upload || self.wal.pending_batch_bytes() == 0 {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.upload_wal_batch() {
-            eprintln!(
-                "pos3ql: WAL segment upload retry failed ({}): {}",
-                e.sqlstate,
-                e.message.as_str()
-            );
-        }
+        self.upload_wal_batch()
     }
 
     /// Snapshots to object storage, then truncates the journal and compacts
@@ -1919,9 +1880,10 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
-        // Make any commit whose upload previously failed durable before this
-        // statement's reads can observe it (see retry_pending_wal_upload).
-        self.retry_pending_wal_upload();
+        if let Err(error) = self.retry_pending_wal_upload() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -2045,9 +2007,10 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
-        // Make any commit whose upload previously failed durable before this
-        // statement's reads can observe it (see retry_pending_wal_upload).
-        self.retry_pending_wal_upload();
+        if let Err(error) = self.retry_pending_wal_upload() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(true));
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {

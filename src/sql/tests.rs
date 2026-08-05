@@ -52,6 +52,95 @@ fn run_with_arena_bytes(
     run_with_guc(engine, budget, sql_text, arena_bytes, &mut guc)
 }
 
+fn assert_cold_pax_query(
+    config: &Config,
+    sql_text: &str,
+    expected: &[&str],
+    max_object_read_bytes: Option<u64>,
+) {
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(config, &mut budget).unwrap();
+    let before = engine.storage.block_io_stats();
+    let result = run_with_arena_bytes(&mut engine, &mut budget, sql_text, 1 << 20);
+    assert_eq!(
+        data_rows(&result),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&result)
+    );
+    if let Some(max_object_read_bytes) = max_object_read_bytes {
+        let reads = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            reads.object_read_bytes < max_object_read_bytes,
+            "cold PAX query must read only its demanded extents: bytes={}",
+            reads.object_read_bytes
+        );
+    }
+}
+
+#[inline(never)]
+fn prepare_cold_pax_fixture(config: &Config) {
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(config, &mut budget).unwrap();
+    let mut definition = String::from("CREATE TABLE wide_pax (id int PRIMARY KEY");
+    let mut selected = String::from("i");
+    for column in 0..20 {
+        definition.push_str(&format!(", payload_{column} text"));
+        selected.push_str(", repeat('x', 2048)");
+    }
+    definition.push(')');
+    assert!(
+        !String::from_utf8_lossy(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &definition,
+            1 << 20,
+        ))
+        .contains("ERROR")
+    );
+    for start in 1..=300 {
+        let inserted = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO wide_pax SELECT {selected} FROM generate_series({start}, {start}) AS g(i)"
+            ),
+            1 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    let right_definition = definition.replacen("wide_pax", "wide_pax_right", 1);
+    assert!(
+        !String::from_utf8_lossy(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &right_definition,
+            1 << 20,
+        ))
+        .contains("ERROR")
+    );
+    for start in 1..=300 {
+        let inserted = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO wide_pax_right SELECT {selected} FROM generate_series({start}, {start}) AS g(i)"
+            ),
+            1 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+}
+
 fn run_with_guc(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -3525,7 +3614,7 @@ fn data_survives_engine_restart() {
         run_with(&mut e, &mut budget, "DELETE FROM t WHERE id = 3");
         run_with(&mut e, &mut budget, "CREATE TABLE gone (x int)");
         run_with(&mut e, &mut budget, "DROP TABLE gone");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3554,7 +3643,7 @@ fn indexes_survive_restart() {
             &mut budget,
             "CREATE UNIQUE INDEX u ON t(a DESC NULLS LAST,b ASC NULLS FIRST)",
         );
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3597,7 +3686,7 @@ fn views_survive_restart() {
         );
         run_with(&mut e, &mut budget, "CREATE VIEW gone AS SELECT 1");
         run_with(&mut e, &mut budget, "DROP VIEW gone");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3637,7 +3726,7 @@ fn matview_survives_restart() {
             &mut budget,
             "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15",
         );
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3801,7 +3890,7 @@ fn sequence_survives_restart() {
         );
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 10
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3957,7 +4046,7 @@ fn expression_default_survives_restart() {
             "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)",
         );
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -4080,7 +4169,7 @@ fn generated_column_survives_restart() {
             "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)",
         );
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -4425,7 +4514,7 @@ fn identity_survives_restart() {
             "ALTER TABLE ic RENAME COLUMN v TO value",
         );
         run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME TO ic2");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -6494,7 +6583,7 @@ fn drop_schema_cascade_versions_surviving_foreign_keys() {
             "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
              WHERE r.relname = 'child' AND c.contype = 'f'",
         )),
-        ["1"],
+        &["1"],
         "another transaction must retain the committed inbound constraint"
     );
     run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
@@ -7465,7 +7554,7 @@ fn domains_survive_restart() {
         );
         run_with(&mut e, &mut b, "CREATE TABLE dt (a posint DEFAULT 7)");
         run_with(&mut e, &mut b, "INSERT INTO dt VALUES (42)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     // WAL replay: the domain and its column identity survive.
     {
@@ -7671,7 +7760,7 @@ fn enums_survive_restart() {
             "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')",
         );
         run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO feeling");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     // WAL replay: the enum, its rename, added value, ordering, and column
     // identity survive, including through grouped projection's schema lookup.
@@ -7765,7 +7854,7 @@ fn user_type_schema_identity_survives_restart() {
             "SELECT typname FROM pg_type WHERE typname IN ('signal','state') ORDER BY typname",
         );
         assert_eq!(data_rows(&bytes), ["signal", "state"]);
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     {
         let mut b = Budget::new(1 << 25);
@@ -10422,6 +10511,17 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
 
 #[test]
 fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
+    std::thread::Builder::new()
+        .name("cold-pax-regression".into())
+        .stack_size(4 << 20)
+        .spawn(cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack)
+        .expect("cold PAX test thread starts")
+        .join()
+        .expect("cold PAX test thread completes");
+}
+
+#[inline(never)]
+fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
@@ -10439,201 +10539,63 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     config.work_arena_bytes = 1 << 20;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 30);
-    let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut definition = String::from("CREATE TABLE wide_pax (id int PRIMARY KEY");
-    let mut selected = String::from("i");
-    for column in 0..20 {
-        definition.push_str(&format!(", payload_{column} text"));
-        selected.push_str(", repeat('x', 2048)");
-    }
-    definition.push(')');
-    assert!(
-        !String::from_utf8_lossy(&run_with_arena_bytes(
-            &mut engine,
-            &mut budget,
-            &definition,
-            1 << 20,
-        ))
-        .contains("ERROR")
-    );
-    for start in 1..=300 {
-        let end = start;
-        let inserted = run_with_arena_bytes(
-            &mut engine,
-            &mut budget,
-            &format!(
-                "INSERT INTO wide_pax SELECT {selected} FROM generate_series({start}, {end}) AS g(i)"
-            ),
-            1 << 20,
-        );
-        assert!(
-            !String::from_utf8_lossy(&inserted).contains("ERROR"),
-            "{}",
-            String::from_utf8_lossy(&inserted)
-        );
-    }
-    let right_definition = definition.replacen("wide_pax", "wide_pax_right", 1);
-    assert!(
-        !String::from_utf8_lossy(&run_with_arena_bytes(
-            &mut engine,
-            &mut budget,
-            &right_definition,
-            1 << 20,
-        ))
-        .contains("ERROR")
-    );
-    for start in 1..=300 {
-        let inserted = run_with_arena_bytes(
-            &mut engine,
-            &mut budget,
-            &format!(
-                "INSERT INTO wide_pax_right {}",
-                &format!("SELECT {selected} FROM generate_series({start}, {start}) AS g(i)")
-            ),
-            1 << 20,
-        );
-        assert!(
-            !String::from_utf8_lossy(&inserted).contains("ERROR"),
-            "{}",
-            String::from_utf8_lossy(&inserted)
-        );
-    }
-    let _ = engine.checkpoint().unwrap();
-    drop(engine);
+    prepare_cold_pax_fixture(&config);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut cold_budget = Budget::new(1 << 30);
-    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
-    let before_cold = cold.storage.block_io_stats();
-    let result = run_with_arena_bytes(
-        &mut cold,
-        &mut cold_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT id FROM wide_pax WHERE id = 287",
-        1 << 20,
+        &["287"],
+        Some(1 << 20),
     );
-    assert_eq!(
-        data_rows(&result),
-        ["287"],
-        "{}",
-        String::from_utf8_lossy(&result)
-    );
-    let cold_reads = cold.storage.block_io_stats().saturating_sub(before_cold);
-    assert!(
-        cold_reads.object_read_bytes < 1 << 20,
-        "an id-only cold PAX scan must not transfer the twenty wide payload columns: bytes={}",
-        cold_reads.object_read_bytes
-    );
-    drop(cold);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut join_budget = Budget::new(1 << 30);
-    let mut joined = Engine::new(&config, &mut join_budget).unwrap();
-    let before_join = joined.storage.block_io_stats();
-    let joined_result = run_with_arena_bytes(
-        &mut joined,
-        &mut join_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT l.id FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id WHERE r.id = 287",
-        1 << 20,
+        &["287"],
+        Some(2 << 20),
     );
-    assert_eq!(
-        data_rows(&joined_result),
-        ["287"],
-        "{}",
-        String::from_utf8_lossy(&joined_result)
-    );
-    let join_reads = joined.storage.block_io_stats().saturating_sub(before_join);
-    assert!(
-        join_reads.object_read_bytes < 2 << 20,
-        "a cold equi-join must read only its key and filter extents, not either table's wide payload columns: bytes={}",
-        join_reads.object_read_bytes
-    );
-    drop(joined);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut ordered_budget = Budget::new(1 << 30);
-    let mut ordered = Engine::new(&config, &mut ordered_budget).unwrap();
-    let ordered_result = run_with_arena_bytes(
-        &mut ordered,
-        &mut ordered_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT id FROM wide_pax ORDER BY id LIMIT 1",
-        1 << 20,
+        &["1"],
+        None,
     );
-    assert_eq!(
-        data_rows(&ordered_result),
-        ["1"],
-        "{}",
-        String::from_utf8_lossy(&ordered_result)
-    );
-    drop(ordered);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut grouped_budget = Budget::new(1 << 30);
-    let mut grouped = Engine::new(&config, &mut grouped_budget).unwrap();
-    let grouped_result = run_with_arena_bytes(
-        &mut grouped,
-        &mut grouped_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT id, count(*) FROM wide_pax GROUP BY id ORDER BY id LIMIT 1",
-        1 << 20,
+        &["1|1"],
+        None,
     );
-    assert_eq!(
-        data_rows(&grouped_result),
-        ["1|1"],
-        "{}",
-        String::from_utf8_lossy(&grouped_result)
-    );
-    drop(grouped);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut derived_budget = Budget::new(1 << 30);
-    let mut derived = Engine::new(&config, &mut derived_budget).unwrap();
-    let derived_result = run_with_arena_bytes(
-        &mut derived,
-        &mut derived_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT id FROM (SELECT id FROM wide_pax) AS projected WHERE id = 287",
-        1 << 20,
+        &["287"],
+        None,
     );
-    assert_eq!(
-        data_rows(&derived_result),
-        ["287"],
-        "{}",
-        String::from_utf8_lossy(&derived_result)
-    );
-    drop(derived);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut aggregate_budget = Budget::new(1 << 30);
-    let mut aggregate = Engine::new(&config, &mut aggregate_budget).unwrap();
-    let aggregate_result = run_with_arena_bytes(
-        &mut aggregate,
-        &mut aggregate_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT (SELECT count(*) FROM wide_pax)",
-        1 << 20,
+        &["300"],
+        None,
     );
-    assert_eq!(
-        data_rows(&aggregate_result),
-        ["300"],
-        "{}",
-        String::from_utf8_lossy(&aggregate_result)
-    );
-    drop(aggregate);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut exists_budget = Budget::new(1 << 30);
-    let mut exists = Engine::new(&config, &mut exists_budget).unwrap();
-    let exists_result = run_with_arena_bytes(
-        &mut exists,
-        &mut exists_budget,
+    assert_cold_pax_query(
+        &config,
         "SELECT EXISTS (SELECT 1 FROM wide_pax)",
-        1 << 20,
+        &["t"],
+        None,
     );
-    assert_eq!(
-        data_rows(&exists_result),
-        ["t"],
-        "{}",
-        String::from_utf8_lossy(&exists_result)
-    );
-    drop(exists);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -11025,12 +10987,18 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
         &mut budget,
         "INSERT INTO rc VALUES (2, 'unuploaded')",
     );
-    bucket.borrow_mut().faults.transient_per_mille = 0;
     assert!(
         String::from_utf8_lossy(&failed).contains("58030"),
         "the failed upload must surface as an I/O error: {}",
         String::from_utf8_lossy(&failed)
     );
+    let fenced = run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id");
+    assert!(
+        String::from_utf8_lossy(&fenced).contains("58030"),
+        "a later statement must not observe a local-only commit: {}",
+        String::from_utf8_lossy(&fenced)
+    );
+    bucket.borrow_mut().faults.transient_per_mille = 0;
     // Crash without any intervening statement (no eager retry): row 2 lives
     // only in the journal.
     drop(engine);

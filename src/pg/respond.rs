@@ -470,11 +470,17 @@ impl<'b> Responder<'b> {
     /// CopyInResponse / CopyOutResponse. `binary` selects PostgreSQL's format
     /// code (1 = binary, 0 = text/CSV) for the overall message and every column.
     pub fn copy_in_response(&mut self, n_columns: usize, binary: bool) -> Result<(), WireFull> {
-        self.copy_response(b'G', n_columns, binary)
+        self.copy_response(wire::MSG_COPY_IN_RESPONSE, n_columns, binary)
     }
 
     pub fn copy_out_response(&mut self, n_columns: usize, binary: bool) -> Result<(), WireFull> {
-        self.copy_response(b'H', n_columns, binary)
+        self.copy_response(wire::MSG_COPY_OUT_RESPONSE, n_columns, binary)
+    }
+
+    /// CopyBothResponse enters PostgreSQL's replication COPY mode. Logical
+    /// replication carries binary payloads, but has no relation columns.
+    pub fn copy_both_response(&mut self) -> Result<(), WireFull> {
+        self.copy_response(wire::MSG_COPY_BOTH_RESPONSE, 0, true)
     }
 
     fn copy_response(&mut self, kind: u8, n_columns: usize, binary: bool) -> Result<(), WireFull> {
@@ -1151,5 +1157,13 @@ mod tests {
         let text = core::str::from_utf8(&bytes[5..]).unwrap();
         assert!(text.contains("42601"));
         assert!(text.contains("syntax error"));
+    }
+
+    #[test]
+    fn copy_both_response_is_binary_and_columnless() {
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        Responder::new(&mut buffer).copy_both_response().unwrap();
+        assert_eq!(buffer.readable(), &[b'W', 0, 0, 0, 7, 1, 0, 0]);
     }
 }

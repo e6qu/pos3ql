@@ -41,7 +41,7 @@ mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
-    Chained, PaxColumnDemand, pax_column_demand, scan_source, scan_source_recycling,
+    Chained, PaxColumnDemand, pax_column_demand, scan_source,
     scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
 };
 

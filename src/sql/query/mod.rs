@@ -85,8 +85,8 @@ use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
 use subquery::{
-    correlated_in_expression, correlated_where_passes, merge_correlated, prepare_outer_subqueries,
-    subquery_witness, walk_children,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
+    prepare_outer_subqueries, subquery_witness, walk_children,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
@@ -2226,28 +2226,26 @@ pub fn select_query<'a>(
         let mut skipped = 0u64;
         let mut wire_full = false;
         let mut wire_result: Result<(), WireFull> = Ok(());
-        // With correlated subqueries, WHERE is applied per row against merged
-        // hooks (which include the correlated results); otherwise the scan
-        // applies WHERE directly for the common, faster path.
-        let where_in_scan = if n_where_correlated == 0 {
-            statement.where_clause
-        } else {
-            None
+        // The scan applies only error-safe WHERE conjuncts independent of
+        // correlated subqueries. The complete predicate still runs per row
+        // against merged hooks after those subqueries have been evaluated.
+        let where_in_scan = match correlated_scan_conjuncts(
+            statement.where_clause,
+            &where_correlated[..n_where_correlated],
+            arena,
+        ) {
+            Ok(predicate) => predicate,
+            Err(error) => return sql_fail(error),
         };
         // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(statement.items);
         // This stream is the only path whose projection is consumed directly
         // from the scan callback. Its complete row demand is therefore known
-        // here: projection expressions plus the in-scan WHERE. Every other
+        // here: projection expressions plus the complete WHERE. Every other
         // scan path retains full rows until it proves an equivalent contract.
-        let pax_columns = streaming_pax_columns(
-            &scope,
-            from,
-            statement.items,
-            where_in_scan,
-            n_where_correlated,
-        );
+        let pax_columns =
+            streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -3407,11 +3405,11 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    let where_in_scan = if n_where_correlated == 0 {
-        statement.where_clause
-    } else {
-        None
-    };
+    let where_in_scan = correlated_scan_conjuncts(
+        statement.where_clause,
+        &where_correlated[..n_where_correlated],
+        arena,
+    )?;
     let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
     let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
     let stop_after = offset.saturating_add(limit);
@@ -3509,13 +3507,7 @@ fn select_into_rows_mode<'a>(
         }
         Ok(produced < stop_after)
     };
-    let pax_columns = streaming_pax_columns(
-        &scope,
-        from,
-        statement.items,
-        where_in_scan,
-        n_where_correlated,
-    );
+    let pax_columns = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
     if recycle_rows {
         scan_source_recycling_with_pax_columns(
             storage,
@@ -3551,12 +3543,8 @@ fn streaming_pax_columns<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     items: &'a [SelectItem<'a>],
-    where_in_scan: Option<&'a Expr<'a>>,
-    n_where_correlated: usize,
+    where_clause: Option<&'a Expr<'a>>,
 ) -> Option<PaxColumnDemand> {
-    if n_where_correlated != 0 {
-        return None;
-    }
     let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
     let mut count = 0usize;
     for item in items {
@@ -3567,7 +3555,7 @@ fn streaming_pax_columns<'a>(
         expressions[count] = expression;
         count += 1;
     }
-    if let Some(where_clause) = where_in_scan {
+    if let Some(where_clause) = where_clause {
         expressions[count] = where_clause;
         count += 1;
     }

@@ -7,7 +7,7 @@
 //! outer row, with the outer row's columns chained onto the inner scope.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, Select, SelectItem, SetTree};
+use crate::sql::ast::{BinaryOp, Expr, Select, SelectItem, SetTree};
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, SubqueryList, SubqueryListProbe, SubqueryValues, eval_full,
     sqlstate,
@@ -460,6 +460,58 @@ pub(super) fn correlated_in_expression<'a>(
             out[selected] = node;
             selected += 1;
         }
+    }
+    Ok(selected)
+}
+
+/// The error-safe top-level WHERE conjuncts that do not depend on a correlated
+/// subquery. They can run in the source scan; the caller still evaluates the
+/// original predicate after it has supplied the correlated values.
+pub(super) fn correlated_scan_conjuncts<'a>(
+    predicate: Option<&'a Expr<'a>>,
+    correlated: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    if correlated.is_empty() {
+        return Ok(Some(predicate));
+    }
+    fn contains(expression: &Expr, nodes: &[&Expr]) -> bool {
+        if nodes.iter().any(|node| core::ptr::eq(*node, expression)) {
+            return true;
+        }
+        let mut found = false;
+        let _ = walk_children(expression, &mut |child| {
+            if contains(child, nodes) {
+                found = true;
+            }
+            Ok(())
+        });
+        found
+    }
+
+    let mut conjuncts = [predicate; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+        return Ok(None);
+    }
+    let mut selected = None;
+    for conjunct in &conjuncts[..count] {
+        if contains(conjunct, correlated) || !super::plan::is_error_safe(conjunct) {
+            continue;
+        }
+        selected = Some(match selected {
+            None => *conjunct,
+            Some(left) => arena
+                .alloc(Expr::Binary {
+                    operator: BinaryOp::And,
+                    left,
+                    right: conjunct,
+                })
+                .map_err(|_| arena_full())?,
+        });
     }
     Ok(selected)
 }

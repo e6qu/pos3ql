@@ -918,6 +918,16 @@ same descriptor format, while older PAX-v1 groups remain readable. The
 forced-cold wide-table regression caps an id-only scan below one MiB of object
 transfer, making a full-payload regression observable rather than inferred.
 
+**Multi-source PAX demand slice (2026-08-05).** Physical demand is now a
+fixed per-base-table proof for the bounded two-source execution shape: join
+ON, WHERE, projection, grouping, ordering, and aggregate consumers contribute
+the columns each source may expose. The bounded hash join carries selected PAX
+values on both build and probe sides, so a cold wide equi-join reads each
+source's key/filter extents once instead of materializing payload rows or
+repeating inner descriptor reads. Derived, whole-row, nested-query, and wider
+recursive range-table shapes retain their established full-row path until they
+establish an equally complete non-recursive proof.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

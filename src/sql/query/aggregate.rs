@@ -15,8 +15,8 @@ use crate::sql_err;
 use crate::storage::Storage;
 
 use super::{
-    Chained, MAX_AGGS, QueryScope, arena_full, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, single_table_pax_columns,
+    Chained, MAX_AGGS, QueryScope, arena_full, pax_column_demand,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
 };
 
 struct JsonAggregateDisplay<'a> {
@@ -94,7 +94,7 @@ pub(crate) fn fold_aggregates<'a>(
         expressions[expression_count] = predicate;
         expression_count += 1;
     }
-    let pax_columns = single_table_pax_columns(scope, &expressions[..expression_count]);
+    let pax_columns = pax_column_demand(scope, from, &expressions[..expression_count]);
     let mut visit = |row: &super::JoinRow<'_, 'a, '_>| {
         let chained_row = Chained {
             inner: row,

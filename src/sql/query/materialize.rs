@@ -21,9 +21,9 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
-    correlated_in_expression, correlated_where_passes, find_srf, merge_correlated, postpone_cost,
-    project_row_skipping, record_star_width, resolve_order_target,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, single_table_pax_columns,
+    correlated_in_expression, correlated_where_passes, find_srf, merge_correlated,
+    pax_column_demand, postpone_cost, project_row_skipping, record_star_width,
+    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
     sql_fail, sql_ok, srf_max_count,
 };
 
@@ -436,8 +436,9 @@ fn prepare_materialization<'a>(
 fn materialization_pax_columns<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
-) -> Option<[bool; crate::storage::MAX_COLUMNS]> {
+) -> Option<super::scan::PaxColumnDemand> {
     if plan.any_postponed || plan.n_where_correlated != 0 {
         return None;
     }
@@ -461,7 +462,7 @@ fn materialization_pax_columns<'a>(
         expressions[count] = expression.expect("resolved");
         count += 1;
     }
-    single_table_pax_columns(scope, &expressions[..count])
+    pax_column_demand(scope, from, &expressions[..count])
 }
 
 /// The row-producing half of DISTINCT / ORDER BY execution: materialize
@@ -484,7 +485,7 @@ pub(crate) fn materialized_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(statement, scope, correlated, arena)?;
-    let pax_columns = materialization_pax_columns(statement, scope, &plan);
+    let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,
         n_on,
@@ -964,7 +965,7 @@ pub(crate) fn external_materialized_into<'a>(
     emit: &mut ExternalRowEmitter<'_>,
 ) -> Result<u64, SqlError> {
     let plan = prepare_materialization(statement, scope, correlated, arena)?;
-    let pax_columns = materialization_pax_columns(statement, scope, &plan);
+    let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {

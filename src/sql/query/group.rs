@@ -21,8 +21,8 @@ use super::plan::where_passes;
 use super::subquery::merge_correlated;
 use super::{
     JoinRow, MAX_AGGS, MAX_SUBQUERIES, Outcome, QueryScope, ScopeSchema, arena_full,
-    expr_contains_node, resolve_order_target, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, single_table_pax_columns, sql_fail, sql_ok,
+    expr_contains_node, pax_column_demand, resolve_order_target,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -117,7 +117,7 @@ pub(super) fn groups_for_mask<'a>(
     order_exprs: &[Option<&'a Expr<'a>>],
     width: usize,
     n_order: usize,
-    pax_columns: Option<&[bool; crate::storage::MAX_COLUMNS]>,
+    pax_columns: Option<&super::scan::PaxColumnDemand>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     // WHERE with correlated subqueries is applied per row in the callbacks.
@@ -626,7 +626,7 @@ pub(super) fn grouped_rows<'a>(
             expressions[count] = order.expression;
             count += 1;
         }
-        single_table_pax_columns(scope, &expressions[..count])
+        pax_column_demand(scope, from, &expressions[..count])
     } else {
         None
     };

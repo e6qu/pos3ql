@@ -41,8 +41,8 @@ mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
-    Chained, scan_source, scan_source_recycling, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, single_table_pax_columns,
+    Chained, PaxColumnDemand, pax_column_demand, scan_source, scan_source_recycling,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
 };
 
 mod scope;
@@ -2241,8 +2241,13 @@ pub fn select_query<'a>(
         // from the scan callback. Its complete row demand is therefore known
         // here: projection expressions plus the in-scan WHERE. Every other
         // scan path retains full rows until it proves an equivalent contract.
-        let pax_columns =
-            streaming_pax_columns(&scope, statement.items, where_in_scan, n_where_correlated);
+        let pax_columns = streaming_pax_columns(
+            &scope,
+            from,
+            statement.items,
+            where_in_scan,
+            n_where_correlated,
+        );
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -3504,8 +3509,13 @@ fn select_into_rows_mode<'a>(
         }
         Ok(produced < stop_after)
     };
-    let pax_columns =
-        streaming_pax_columns(&scope, statement.items, where_in_scan, n_where_correlated);
+    let pax_columns = streaming_pax_columns(
+        &scope,
+        from,
+        statement.items,
+        where_in_scan,
+        n_where_correlated,
+    );
     if recycle_rows {
         scan_source_recycling_with_pax_columns(
             storage,
@@ -3539,10 +3549,11 @@ fn select_into_rows_mode<'a>(
 
 fn streaming_pax_columns<'a>(
     scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
     items: &'a [SelectItem<'a>],
     where_in_scan: Option<&'a Expr<'a>>,
     n_where_correlated: usize,
-) -> Option<[bool; crate::storage::MAX_COLUMNS]> {
+) -> Option<PaxColumnDemand> {
     if n_where_correlated != 0 {
         return None;
     }
@@ -3560,7 +3571,7 @@ fn streaming_pax_columns<'a>(
         expressions[count] = where_clause;
         count += 1;
     }
-    single_table_pax_columns(scope, &expressions[..count])
+    pax_column_demand(scope, from, &expressions[..count])
 }
 
 /// Projects one source row through the select items.

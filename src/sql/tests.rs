@@ -10435,7 +10435,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     config.wal_bytes = 32 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    config.memtable_bytes = 16 << 20;
+    config.memtable_bytes = 32 << 20;
     config.work_arena_bytes = 1 << 20;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
@@ -10473,6 +10473,32 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
             String::from_utf8_lossy(&inserted)
         );
     }
+    let right_definition = definition.replacen("wide_pax", "wide_pax_right", 1);
+    assert!(
+        !String::from_utf8_lossy(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &right_definition,
+            1 << 20,
+        ))
+        .contains("ERROR")
+    );
+    for start in 1..=300 {
+        let inserted = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO wide_pax_right {}",
+                &format!("SELECT {selected} FROM generate_series({start}, {start}) AS g(i)")
+            ),
+            1 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
     let _ = engine.checkpoint().unwrap();
     drop(engine);
 
@@ -10499,6 +10525,30 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
         cold_reads.object_read_bytes
     );
     drop(cold);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut join_budget = Budget::new(1 << 30);
+    let mut joined = Engine::new(&config, &mut join_budget).unwrap();
+    let before_join = joined.storage.block_io_stats();
+    let joined_result = run_with_arena_bytes(
+        &mut joined,
+        &mut join_budget,
+        "SELECT l.id FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id WHERE r.id = 287",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&joined_result),
+        ["287"],
+        "{}",
+        String::from_utf8_lossy(&joined_result)
+    );
+    let join_reads = joined.storage.block_io_stats().saturating_sub(before_join);
+    assert!(
+        join_reads.object_read_bytes < 2 << 20,
+        "a cold equi-join must read only its key and filter extents, not either table's wide payload columns: bytes={}",
+        join_reads.object_read_bytes
+    );
+    drop(joined);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut ordered_budget = Budget::new(1 << 30);

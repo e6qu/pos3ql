@@ -74,7 +74,8 @@ const KIND_DROP_PUBLICATION: u8 = 36;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
-const LAST_KIND: u8 = KIND_COMMIT;
+const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
+const LAST_KIND: u8 = KIND_CREATE_REPLICATION_SLOT;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -312,6 +313,10 @@ pub(crate) enum WalOp<'a> {
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
     Commit,
+    CreateReplicationSlot {
+        name: &'a str,
+        restart_lsn: u64,
+    },
     CreateIndex {
         schema: &'a str,
         name: &'a str,
@@ -1037,6 +1042,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
         WalOp::Commit => KIND_COMMIT,
+        WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1147,6 +1153,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + name.len() + 1 + 1 + table_count * 2,
         WalOp::DropPublication { name } => 1 + name.len(),
         WalOp::Commit => 0,
+        WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::CreateIndex {
             schema,
             name,
@@ -1456,6 +1463,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::DropPublication { name } => name_bytes(buffer, name),
         WalOp::Commit => true,
+        WalOp::CreateReplicationSlot { name, restart_lsn } => {
+            name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
+        }
         WalOp::CreateIndex {
             schema,
             name,
@@ -2248,6 +2258,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (at == payload.len()).then_some(WalOp::DropPublication { name })
         }
         KIND_COMMIT => (at == payload.len()).then_some(WalOp::Commit),
+        KIND_CREATE_REPLICATION_SLOT => {
+            let name = take_name(&mut at)?;
+            let restart_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            (at == payload.len()).then_some(WalOp::CreateReplicationSlot { name, restart_lsn })
+        }
         KIND_CREATE_MATVIEW => {
             let name = take_name(&mut at)?;
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
@@ -3232,12 +3248,20 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                10,
+                &WalOp::CreateReplicationSlot {
+                    name: "changes",
+                    restart_lsn: 10,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 9);
+        assert_eq!(seen.len(), 10);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -3279,10 +3303,15 @@ mod tests {
             "comment removal: {}",
             seen[8]
         );
-        assert_eq!(wal.last_lsn(), 9);
+        assert!(
+            seen[9].contains("CreateReplicationSlot") && seen[9].contains("changes"),
+            "replication slot: {}",
+            seen[9]
+        );
+        assert_eq!(wal.last_lsn(), 10);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            10,
+            11,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

@@ -65,6 +65,8 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Fixed number of durable logical replication slots.
+    pub max_replication_slots: usize,
     /// Open SQL cursors per connection (DECLARE ... CURSOR).
     pub max_cursors: usize,
     /// Bytes of materialized rows one cursor may hold.
@@ -168,6 +170,7 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_replication_slots: 16,
             max_cursors: 4,
             cursor_bytes: 256 * 1024,
             table_rows: 8192,
@@ -250,6 +253,10 @@ impl Config {
                 "max_connections" => {
                     config.max_connections =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "max_replication_slots" => {
+                    config.max_replication_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "auth" => {
                     if !matches!(value, "trust" | "password" | "scram-sha-256") {
@@ -639,12 +646,14 @@ mod tests {
 # development overrides
 listen_addr = 0.0.0.0:5432
 max_connections = 128
+max_replication_slots = 12
 memtable_bytes = 16MiB   # small for tests
 sql_arena_bytes = 4096
 ";
         let c = Config::parse(text).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
+        assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.

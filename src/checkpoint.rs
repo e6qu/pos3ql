@@ -1646,6 +1646,10 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_publication(storage, line)?;
                 }
+                Some("rslot") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_replication_slot(storage, line)?;
+                }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
                     let has_links = matches!(tag, Some("sq3") | Some("sq4"));
@@ -2986,6 +2990,24 @@ impl Checkpointer {
                 ),
             )?;
         }
+        // A replication slot's active flag is process-local; only its resume
+        // positions survive a checkpoint and restart.
+        for (_, slot) in storage.replication_slots_with_slots() {
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            for byte in slot.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rslot {} {} {}",
+                    name.as_str(),
+                    slot.restart_lsn,
+                    slot.confirmed_flush_lsn,
+                ),
+            )?;
+        }
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
         for (matview_slot, mv) in storage.matviews_with_slots() {
@@ -4127,6 +4149,30 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         })?;
     storage.commit_publication_create(slot);
     Ok(())
+}
+
+fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _ = words.next();
+    let name = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("replication slot name"))
+        .and_then(decode_hex_name)?;
+    let restart_lsn = parse_field(words.next(), "replication slot restart LSN")?;
+    let confirmed_flush_lsn = parse_field(words.next(), "replication slot confirmed LSN")?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt(
+            "trailing replication slot fields",
+        ));
+    }
+    storage
+        .restore_replication_slot(sql_name(&name)?, restart_lsn, confirmed_flush_lsn)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest replication slot rejected: {}",
+                error.message.as_str()
+            ))
+        })
 }
 
 #[inline(never)]

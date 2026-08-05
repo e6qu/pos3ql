@@ -925,8 +925,11 @@ contribute the columns each source may expose. The bounded hash join carries
 selected PAX values on both build and probe sides, while the recursive join
 cursor carries the same selected values at every inner depth. A cold wide
 three-way equi-join therefore reads its key/filter extents rather than
-materializing payload rows. Derived, whole-row, and nested-query shapes retain
-their established full-row path until they establish an equally complete proof.
+materializing payload rows. A materialized derived input, including one carried
+by an immutable external run, can now build the same bounded hash table once
+while its physical partner probes selected PAX values once. Whole-row and
+nested-query shapes retain their established full-row path until they establish
+an equally complete proof.
 
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an

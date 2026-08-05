@@ -71,10 +71,7 @@ pub(crate) fn pax_column_demand(
     from: &FromClause,
     expressions: &[&Expr],
 ) -> Option<PaxColumnDemand> {
-    if scope.n == 0
-        || scope.derived[..scope.n].iter().any(Option::is_some)
-        || scope.defs[..scope.n].iter().any(Option::is_none)
-    {
+    if scope.n == 0 || scope.defs[..scope.n].iter().any(Option::is_none) {
         return None;
     }
     pax_column_demand_bounded(scope, from, expressions)
@@ -90,7 +87,10 @@ fn pax_column_demand_bounded(
     fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(ResolvedColumn::Table(table, column)) => columns[table] |= 1u64 << column,
+                Ok(ResolvedColumn::Table(table, column)) if scope.derived[table].is_none() => {
+                    columns[table] |= 1u64 << column
+                }
+                Ok(ResolvedColumn::Table(_, _)) => {}
                 _ => return false,
             },
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => return false,
@@ -961,13 +961,13 @@ pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
 #[derive(Clone, Copy)]
 struct HashEntry<'a> {
     hash: u64,
-    rowid: u64,
+    rowid: Option<u64>,
     row: BoundRow<'a>,
 }
 
 const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
     hash: 0,
-    rowid: 0,
+    rowid: None,
     row: BoundRow::Encoded(&[]),
 };
 
@@ -1096,13 +1096,20 @@ pub(crate) fn select_hash_join_plan<'a>(
     ) {
         return Ok(None);
     }
-    let probe_table = order[0];
-    let build_table = order[1];
-    if scope.lateral[probe_table]
-        || scope.lateral[build_table]
-        || scope.derived[probe_table].is_some()
-        || scope.derived[build_table].is_some()
+    let first_table = order[0];
+    let second_table = order[1];
+    if scope.lateral[first_table] || scope.lateral[second_table] {
+        return Ok(None);
+    }
+    let (probe_table, build_table) = if scope.derived[first_table].is_some()
+        && scope.derived[second_table].is_none()
+        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
     {
+        (second_table, first_table)
+    } else {
+        (first_table, second_table)
+    };
+    if scope.derived[probe_table].is_some() {
         return Ok(None);
     }
     let on = join.on.or(scope.join_on[0]);
@@ -1112,7 +1119,14 @@ pub(crate) fn select_hash_join_plan<'a>(
         return Ok(None);
     };
     const MAX_HASH_ENTRIES: usize = 1 << 15;
-    let build_capacity = storage.planning_row_estimate(scope.slots[build_table]) as usize;
+    let build_capacity = if let Some(run) = scope.external_runs[build_table] {
+        usize::try_from(run.rows()).map_err(|_| arena_full())?
+    } else {
+        scope.derived[build_table].map_or_else(
+            || storage.planning_row_estimate(scope.slots[build_table]) as usize,
+            <[&[u8]]>::len,
+        )
+    };
     if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
         return Ok(None);
     }
@@ -1286,6 +1300,8 @@ fn scan_source_mode<'a>(
         let on = plan.on;
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs[build_t].expect("resolved");
+        let build_derived_rows = scope.derived[build_t];
+        let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
         let completed = (|| -> Result<bool, SqlError> {
             let buckets_len = (build_count * 2).next_power_of_two().max(16);
@@ -1332,7 +1348,38 @@ fn scan_source_mode<'a>(
                     }
                 }};
             }
-            if let Some(demand) = pax_columns.map(|demand| demand[build_t])
+            macro_rules! insert_derived {
+                ($bytes:expr) => {{
+                    let bytes = $bytes;
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    for (column, value) in values.iter_mut().enumerate().take(build_def.n_columns) {
+                        *value =
+                            crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+                    }
+                    insert_build!(
+                        None,
+                        BoundRow::Encoded(bytes),
+                        &values[..build_def.n_columns]
+                    );
+                }};
+            }
+            if let Some(run) = build_external_run {
+                let mut reader = storage.external_run_reader()?;
+                storage
+                    .with_block_store(|blocks| reader.start(blocks, run))
+                    .expect("external run has a block store")?;
+                while let Some(bytes) = reader.row() {
+                    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                    insert_derived!(bytes);
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("external run has a block store")?;
+                }
+            } else if let Some(rows) = build_derived_rows {
+                for &bytes in rows {
+                    insert_derived!(bytes);
+                }
+            } else if let Some(demand) = pax_columns.map(|demand| demand[build_t])
                 && storage.spill_rows_are_unshadowed(build_slot)
             {
                 storage.for_each_spilled_row_batch(
@@ -1350,7 +1397,7 @@ fn scan_source_mode<'a>(
                                     "PAX scan did not return selected values"
                                 ));
                             };
-                            insert_build!(spilled.rowid, BoundRow::Values(values), values);
+                            insert_build!(Some(spilled.rowid), BoundRow::Values(values), values);
                         }
                         Ok(ControlFlow::Continue(()))
                     },
@@ -1382,7 +1429,7 @@ fn scan_source_mode<'a>(
                     let bucket = (hash as usize) & (buckets_len - 1);
                     entries[n] = HashEntry {
                         hash,
-                        rowid,
+                        rowid: Some(rowid),
                         row: BoundRow::Encoded(bytes),
                     };
                     next[n] = buckets[bucket];
@@ -1466,7 +1513,7 @@ fn scan_source_mode<'a>(
                                             bound[probe_t] = Some(BoundRow::Values(values));
                                             rowids[probe_t] = Some(spilled.rowid);
                                             bound[build_t] = Some(entry.row);
-                                            rowids[build_t] = Some(entry.rowid);
+                                            rowids[build_t] = entry.rowid;
                                             let row = assemble(
                                                 scope,
                                                 &bound,
@@ -1608,7 +1655,7 @@ fn scan_source_mode<'a>(
                                     bound[probe_t] = Some(BoundRow::Encoded(bytes));
                                     bound_rowids[probe_t] = Some(rowid);
                                     bound[build_t] = Some(entry.row);
-                                    bound_rowids[build_t] = Some(entry.rowid);
+                                    bound_rowids[build_t] = entry.rowid;
                                     let row = assemble(
                                         scope,
                                         bound,

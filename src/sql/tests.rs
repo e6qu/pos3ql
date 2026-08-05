@@ -10594,6 +10594,14 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT r.id FROM (SELECT id FROM wide_pax) AS l JOIN wide_pax_right AS r ON l.id = r.id WHERE r.id = 287",
+        &["287"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT l.id FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id JOIN wide_pax_third AS t ON r.id = t.id WHERE l.id = 287",
         &["287"],
         Some(3 << 20),

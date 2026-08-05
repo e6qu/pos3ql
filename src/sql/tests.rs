@@ -138,6 +138,29 @@ fn prepare_cold_pax_fixture(config: &Config) {
             String::from_utf8_lossy(&inserted)
         );
     }
+    let third_definition = definition.replacen("wide_pax", "wide_pax_third", 1);
+    assert!(
+        !String::from_utf8_lossy(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &third_definition,
+            1 << 20,
+        ))
+        .contains("ERROR")
+    );
+    let inserted = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "INSERT INTO wide_pax_third SELECT {selected} FROM generate_series(287, 287) AS g(i)"
+        ),
+        1 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&inserted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
     assert!(engine.checkpoint().unwrap());
 }
 
@@ -3193,6 +3216,17 @@ fn multiway_equijoin_prunes_early() {
 
 #[test]
 fn range_table_covers_wide_conformance_queries() {
+    std::thread::Builder::new()
+        .name("wide-range-table-regression".into())
+        .stack_size(4 << 20)
+        .spawn(range_table_covers_wide_conformance_queries_on_sized_stack)
+        .expect("wide range-table test thread starts")
+        .join()
+        .expect("wide range-table test thread completes");
+}
+
+#[inline(never)]
+fn range_table_covers_wide_conformance_queries_on_sized_stack() {
     // The vendored SQLLogicTest select5 workload reaches seventeen relations
     // in one range table. This used to fail at a second, executor-only limit
     // even though the configured catalog could hold every relation.
@@ -10555,6 +10589,14 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         "SELECT l.id FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id WHERE r.id = 287",
         &["287"],
         Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT l.id FROM wide_pax AS l JOIN wide_pax_right AS r ON l.id = r.id JOIN wide_pax_third AS t ON r.id = t.id WHERE l.id = 287",
+        &["287"],
+        Some(3 << 20),
     );
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();

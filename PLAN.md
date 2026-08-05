@@ -950,6 +950,17 @@ complete predicate is still evaluated afterward with the correlated result.
 The cold regression proves a selective outer EXISTS probe reads only both key
 extents rather than a wide payload row or a probe per rejected outer row.
 
+**Window-demand slice (2026-08-05).** Window execution now carries the same
+complete per-source PAX proof through both its resident two-pass materializer
+and its external partition and projection rescans. Window arguments,
+partition/order keys, query predicates, projection, distinct keys, and final
+ordering all contribute to the mask; wildcard and whole-record shapes retain
+the complete-row path. Correlated WHERE terms use the common error-safe
+conjunct split, so independent filters still narrow the source scan before a
+per-row correlated window probe. The cold wide-table regression pins a
+`row_number() OVER (ORDER BY id)` query to its two required key-vector passes,
+excluding every payload extent.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

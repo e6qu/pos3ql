@@ -21,12 +21,71 @@ use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
 use super::group::row_passes_correlated_where;
+use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WIN_KEYS, MAX_WINDOWS,
     Outcome, QueryScope, arena_full, collect_grouped_aggs, keys_equal, merge_correlated,
-    project_row, record_star_width, resolve_order_target, rewrite_grouped_expr, scan_source,
-    scan_source_recycling, sql_fail, sql_ok, window_row,
+    pax_column_demand, project_row, record_star_width, resolve_order_target, rewrite_grouped_expr,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
+    window_row,
 };
+
+fn window_scan_where<'a>(
+    statement: &'a Select<'a>,
+    correlated: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let count =
+        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
+    correlated_scan_conjuncts(statement.where_clause, &where_correlated[..count], arena)
+}
+
+fn window_pax_columns<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    win_nodes: &[&'a Expr<'a>],
+) -> Option<super::PaxColumnDemand> {
+    let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_WINDOWS + 3];
+    let mut count = 0usize;
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                expressions[count] = expression;
+                count += 1;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+                return None;
+            }
+        }
+    }
+    for expression in win_nodes {
+        expressions[count] = expression;
+        count += 1;
+    }
+    if let Some(expression) = statement.where_clause {
+        expressions[count] = expression;
+        count += 1;
+    }
+    for order in statement.order_by {
+        expressions[count] = order.expression;
+        count += 1;
+    }
+    for expression in statement.distinct_on {
+        expressions[count] = expression;
+        count += 1;
+    }
+    if let Some(expression) = statement.limit {
+        expressions[count] = expression;
+        count += 1;
+    }
+    if let Some(expression) = statement.offset {
+        expressions[count] = expression;
+        count += 1;
+    }
+    pax_column_demand(scope, from, &expressions[..count])
+}
 
 /// Windows over a grouped query: PostgreSQL evaluates window functions after
 /// GROUP BY / HAVING, over the grouped rows. Rewrites the statement into the
@@ -1149,12 +1208,8 @@ pub(crate) fn project_window_rows<'a>(
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
-    // WHERE with correlated subqueries is applied per row in the callbacks.
-    let scan_where = if correlated.is_empty() {
-        statement.where_clause
-    } else {
-        None
-    };
+    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let pax_columns = window_pax_columns(statement, scope, from, win_nodes);
     // Flat-row column offsets per table.
     let mut offs = [0usize; MAX_JOIN_TABLES];
     let mut total = 0usize;
@@ -1165,7 +1220,7 @@ pub(crate) fn project_window_rows<'a>(
 
     // Pass 1: count source rows.
     let mut count = 0usize;
-    scan_source(
+    scan_source_with_pax_columns(
         storage,
         scope,
         from,
@@ -1175,6 +1230,7 @@ pub(crate) fn project_window_rows<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -1198,7 +1254,7 @@ pub(crate) fn project_window_rows<'a>(
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
     let mut at = 0usize;
-    scan_source(
+    scan_source_with_pax_columns(
         storage,
         scope,
         from,
@@ -1208,6 +1264,7 @@ pub(crate) fn project_window_rows<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -1438,12 +1495,8 @@ pub(crate) fn external_window_into<'a>(
     offset: u64,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
-    // WHERE with correlated subqueries is applied per row in the callbacks.
-    let scan_where = if correlated.is_empty() {
-        statement.where_clause
-    } else {
-        None
-    };
+    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let pax_columns = window_pax_columns(statement, scope, from, win_nodes);
     // Flat-row column offsets per table.
     let mut offs = [0usize; MAX_JOIN_TABLES];
     let mut total = 0usize;
@@ -1507,7 +1560,7 @@ pub(crate) fn external_window_into<'a>(
                 compare_encoded_order(left, right, n_partition, spec.order_by)
             };
         let mut position = 0i64;
-        scan_source_recycling(
+        scan_source_recycling_with_pax_columns(
             storage,
             scope,
             from,
@@ -1517,6 +1570,7 @@ pub(crate) fn external_window_into<'a>(
             params,
             hooks,
             outer,
+            pax_columns.as_ref(),
             &mut |row| {
                 if !row_passes_correlated_where(
                     correlated,
@@ -1726,7 +1780,7 @@ pub(crate) fn external_window_into<'a>(
     };
     let win_count = win_nodes.len();
     let mut position = 0i64;
-    scan_source_recycling(
+    scan_source_recycling_with_pax_columns(
         storage,
         scope,
         from,
@@ -1736,6 +1790,7 @@ pub(crate) fn external_window_into<'a>(
         params,
         hooks,
         outer,
+        pax_columns.as_ref(),
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,

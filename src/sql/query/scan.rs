@@ -980,37 +980,6 @@ pub(crate) fn scan_source_with_pax_columns<'a>(
     )
 }
 
-/// Streaming variant of [`scan_source`] that recycles every source row and
-/// its evaluation scratch after the callback returns. The callback must
-/// consume or copy every arena-backed value before returning.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_source_recycling<'a>(
-    storage: &'a Storage,
-    scope: &QueryScope<'a>,
-    from: &'a FromClause<'a>,
-    txid: u32,
-    where_clause: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
-    scan_source_recycling_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        where_clause,
-        arena,
-        params,
-        hooks,
-        outer,
-        None,
-        f,
-    )
-}
-
 /// Recycling scan with optional complete per-source PAX demand masks.
 /// Omitted columns are represented as NULL and therefore this is valid only
 /// when the caller has proved they cannot be observed downstream.

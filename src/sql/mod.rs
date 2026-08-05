@@ -4666,6 +4666,7 @@ fn requalify_schema_element<'a>(
 /// Reapplies one journal record to storage during recovery.
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
+        WalOp::Commit => {}
         WalOp::CreateTable(def) => {
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema

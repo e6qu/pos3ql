@@ -3987,7 +3987,9 @@ fn sequence_advance_in_creating_transaction_survives_restart() {
 #[test]
 fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut config = test_config("sequence_journal_retry");
-    config.wal_bytes = 120;
+    // Reserve the durable transaction marker as well as the CREATE record;
+    // this remains too small for the later absolute sequence retry record.
+    config.wal_bytes = 144;
     let mut budget = Budget::new(1 << 25);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");

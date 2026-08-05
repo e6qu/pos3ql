@@ -71,7 +71,10 @@ const KIND_REWRITE_TABLE: u8 = 33;
 const KIND_SET_DEFAULT_ACL: u8 = 34;
 const KIND_CREATE_PUBLICATION: u8 = 35;
 const KIND_DROP_PUBLICATION: u8 = 36;
-const LAST_KIND: u8 = KIND_DROP_PUBLICATION;
+/// A durable transaction boundary. Logical replication may expose only the
+/// records preceding one of these markers.
+const KIND_COMMIT: u8 = 37;
+const LAST_KIND: u8 = KIND_COMMIT;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -306,6 +309,9 @@ pub(crate) enum WalOp<'a> {
     DropPublication {
         name: &'a str,
     },
+    /// Marks every preceding record in the committed batch as one atomic
+    /// transaction. It has no storage replay effect of its own.
+    Commit,
     CreateIndex {
         schema: &'a str,
         name: &'a str,
@@ -800,6 +806,11 @@ impl Wal {
             return Ok(lsn_floor);
         };
         let staged_len = self.stages[index].buffer.len();
+        if staged_len == 0 {
+            self.stages[index].buffer.clear();
+            self.stages[index].transaction_id = 0;
+            return Ok(lsn_floor);
+        }
         let staged = self.stages[index].buffer.readable();
         let mut record_count = 0_u64;
         let mut staged_offset = 0;
@@ -823,8 +834,10 @@ impl Wal {
         }
         let final_lsn = lsn_floor
             .checked_add(record_count)
+            .and_then(|lsn| lsn.checked_add(1))
             .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted"))?;
-        if self.buffer.capacity() - self.buffer.len() < staged_len {
+        let commit_bytes = HEADER_LEN;
+        if self.buffer.capacity() - self.buffer.len() < staged_len + commit_bytes {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction exceeds wal_buffer_bytes ({}); raise it or commit in smaller batches",
@@ -834,7 +847,7 @@ impl Wal {
         if self
             .write_offset
             .checked_add(self.buffer.len() as u64)
-            .and_then(|used| used.checked_add(staged_len as u64))
+            .and_then(|used| used.checked_add((staged_len + commit_bytes) as u64))
             .is_none_or(|used| used > self.capacity)
         {
             return Err(sql_err!(
@@ -878,16 +891,19 @@ impl Wal {
             filled[offset..offset + 4].copy_from_slice(&crc.to_le_bytes());
             offset += total;
         }
-        assert_eq!(next_lsn, final_lsn);
+        assert_eq!(next_lsn + 1, final_lsn);
+        // The marker is appended only after every operation has been assigned
+        // its final LSN and checksum, so a torn tail can never look committed.
+        append_record(&mut self.buffer, final_lsn, &WalOp::Commit)?;
         if staged_len > 0 && self.batch_first_lsn == 0 {
             self.batch_first_lsn = lsn_floor + 1;
             self.batch_start_offset = self.write_offset + durable_mark as u64;
         }
-        self.last_lsn = next_lsn;
-        self.dirty = staged_len > 0;
+        self.last_lsn = final_lsn;
+        self.dirty = true;
         self.stages[index].buffer.clear();
         self.stages[index].transaction_id = 0;
-        Ok(next_lsn)
+        Ok(final_lsn)
     }
 
     /// Appends one already-committed record. This exists for recovery-format
@@ -1020,6 +1036,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
+        WalOp::Commit => KIND_COMMIT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1129,6 +1146,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name, table_count, ..
         } => 1 + name.len() + 1 + 1 + table_count * 2,
         WalOp::DropPublication { name } => 1 + name.len(),
+        WalOp::Commit => 0,
         WalOp::CreateIndex {
             schema,
             name,
@@ -1437,6 +1455,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropPublication { name } => name_bytes(buffer, name),
+        WalOp::Commit => true,
         WalOp::CreateIndex {
             schema,
             name,
@@ -2228,6 +2247,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
         }
+        KIND_COMMIT => (at == payload.len()).then_some(WalOp::Commit),
         KIND_CREATE_MATVIEW => {
             let name = take_name(&mut at)?;
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
@@ -3429,19 +3449,21 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(wal.commit_stage(22, 50).unwrap(), 51);
+            assert_eq!(wal.commit_stage(22, 50).unwrap(), 52);
             wal.commit();
             wal.discard_stage(33);
-            assert_eq!(wal.commit_stage(11, 51).unwrap(), 52);
+            assert_eq!(wal.commit_stage(11, 52).unwrap(), 54);
             wal.commit();
         }
 
         let mut replay_budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 4);
         assert!(seen[0].starts_with("51:") && seen[0].contains("middle"));
-        assert!(seen[1].starts_with("52:") && seen[1].contains("late"));
+        assert!(seen[1].starts_with("52:Commit"));
+        assert!(seen[2].starts_with("53:") && seen[2].contains("late"));
+        assert!(seen[3].starts_with("54:Commit"));
         assert!(!seen.iter().any(|record| {
             record.contains("savepoint_discarded") || record.contains("rolled_back")
         }));
@@ -3656,7 +3678,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            assert_eq!(wal.commit_stage(1, 16).unwrap(), 32);
+            assert_eq!(wal.commit_stage(1, 16).unwrap(), 33);
         });
         wal.commit();
     }

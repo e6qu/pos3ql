@@ -19,6 +19,7 @@ use crate::sql::parser::Parser;
 use crate::sql::prep::SqlPreparedPool;
 use crate::sql::txn::TxnState;
 use crate::sql::types::Datum;
+use crate::stack_format;
 use crate::storage::SqlName;
 use crate::util::StackStr;
 
@@ -37,6 +38,10 @@ fn reject_role_login(
     let missing_verifier =
         !matches!(mode, AuthMode::Trust) && role.password.is_none() && !bootstrap_fallback;
     !role.can_login || !role.valid || missing_verifier
+}
+
+fn reject_replication_login(mode: ReplicationMode, role: crate::sql::RoleLogin) -> bool {
+    mode != ReplicationMode::None && !role.superuser && !role.replication
 }
 
 struct Prepared {
@@ -81,6 +86,13 @@ pub enum Phase {
     SkipToSync,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplicationMode {
+    None,
+    Physical,
+    Logical,
+}
+
 /// Server-wide authentication context, fixed at startup.
 pub struct AuthContext {
     pub mode: AuthMode,
@@ -111,6 +123,7 @@ pub struct Conn {
     authenticated_role: Option<u16>,
     auth_password: StackStr<256>,
     auth_reject: bool,
+    replication: ReplicationMode,
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
@@ -186,6 +199,7 @@ impl Conn {
             authenticated_role: None,
             auth_password: StackStr::new(),
             auth_reject: false,
+            replication: ReplicationMode::None,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             prepared,
@@ -230,6 +244,7 @@ impl Conn {
         self.authenticated_role = None;
         self.auth_password = StackStr::new();
         self.auth_reject = false;
+        self.replication = ReplicationMode::None;
         self.copy = None;
         self.copy_buf.clear();
         self.phase = Phase::Startup;
@@ -559,7 +574,22 @@ impl Conn {
                     user_seen = !value.is_empty();
                     self.guc.set_session_user(value);
                 }
-                "database" | "options" | "replication" => {}
+                "database" | "options" => {}
+                "replication" => {
+                    self.replication = match value {
+                        "database" => ReplicationMode::Logical,
+                        "true" | "on" | "yes" | "1" => ReplicationMode::Physical,
+                        "false" | "off" | "no" | "0" => ReplicationMode::None,
+                        _ => {
+                            let mut responder = Responder::new(&mut self.send);
+                            let _ = responder.error(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "invalid replication startup parameter",
+                            );
+                            return Step::Close;
+                        }
+                    };
+                }
                 _ if key.starts_with("_pq_.") => {
                     if n_unknown < unknown_protocol_options.len() {
                         // The name outlives the buffer read only within this
@@ -607,7 +637,8 @@ impl Conn {
             self.auth_login = Some(role);
             let bootstrap_fallback =
                 session_user.as_str() == "postgres" && !auth.password.is_empty();
-            self.auth_reject = reject_role_login(auth.mode, role, bootstrap_fallback);
+            self.auth_reject = reject_role_login(auth.mode, role, bootstrap_fallback)
+                || reject_replication_login(self.replication, role);
             if let Some(password) = role.password {
                 self.auth_role_password = Some(password);
                 self.role_scram = Some(ScramServer {
@@ -853,6 +884,20 @@ impl Conn {
         let total = 1 + len as usize;
         if data.len() < total {
             return Step::NeedMoreData;
+        }
+
+        if self.replication != ReplicationMode::None
+            && !matches!(
+                msg_type,
+                wire::FMSG_QUERY | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
+            )
+        {
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(
+                sqlstate::PROTOCOL_VIOLATION,
+                "replication connections accept only the simple query protocol",
+            );
+            return Step::Close;
         }
 
         if self.copy.is_some() {
@@ -1887,6 +1932,10 @@ impl Conn {
             let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
             return Step::Close;
         };
+        if self.replication != ReplicationMode::None {
+            let identify_system = is_identify_system(text);
+            return self.handle_replication_query(engine, identify_system, total);
+        }
         self.arena.reset();
         let mark = self.send.mark();
         // Stream large results: put the socket in blocking mode so the
@@ -1987,6 +2036,58 @@ impl Conn {
         step
     }
 
+    fn handle_replication_query(
+        &mut self,
+        engine: &Engine,
+        identify_system: bool,
+        total: usize,
+    ) -> Step {
+        if self.replication == ReplicationMode::Logical && identify_system {
+            let (system_id, lsn) = engine.replication_identity();
+            let system_id = stack_format!(32, "{system_id}");
+            let lsn = stack_format!(32, "0/{lsn:X}");
+            let columns = [
+                crate::sql::types::ColDesc::new("systemid", crate::sql::types::oid::TEXT, -1),
+                crate::sql::types::ColDesc::new("timeline", crate::sql::types::oid::INT4, 4),
+                crate::sql::types::ColDesc::new("xlogpos", crate::sql::types::oid::TEXT, -1),
+                crate::sql::types::ColDesc::new("dbname", crate::sql::types::oid::TEXT, -1),
+            ];
+            let values = [
+                Datum::Text(system_id.as_str()),
+                Datum::Int4(1),
+                Datum::Text(lsn.as_str()),
+                Datum::Text("postgres"),
+            ];
+            let mut responder = Responder::new(&mut self.send);
+            if responder
+                .row_description(&columns)
+                .and_then(|()| responder.data_row(&values))
+                .and_then(|()| responder.command_complete("IDENTIFY_SYSTEM"))
+                .and_then(|()| responder.ready_for_query(b'I'))
+                .is_err()
+            {
+                return Step::Close;
+            }
+            self.recv.consume(total);
+            return Step::Continue;
+        }
+        let message = match self.replication {
+            ReplicationMode::Physical => "physical replication is not supported",
+            ReplicationMode::Logical => "logical replication commands are not implemented yet",
+            ReplicationMode::None => unreachable!("only replication connections reach this path"),
+        };
+        let mut responder = Responder::new(&mut self.send);
+        if responder
+            .error(sqlstate::FEATURE_NOT_SUPPORTED, message)
+            .and_then(|()| responder.ready_for_query(b'I'))
+            .is_err()
+        {
+            return Step::Close;
+        }
+        self.recv.consume(total);
+        Step::Continue
+    }
+
     /// Writes as much of the send buffer as the socket accepts.
     /// `Err` means the connection is broken.
     fn flush(&mut self) -> Result<(), ()> {
@@ -2023,6 +2124,13 @@ impl Conn {
         }
         Ok(())
     }
+}
+
+fn is_identify_system(text: &str) -> bool {
+    text.trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .eq_ignore_ascii_case("identify_system")
 }
 
 enum Step {
@@ -2334,6 +2442,7 @@ mod tests {
             can_login: true,
             valid: true,
             superuser: true,
+            replication: true,
             connection_limit: -1,
             password: None,
         };
@@ -2341,5 +2450,44 @@ mod tests {
         assert!(reject_role_login(AuthMode::Password, login, false));
         assert!(reject_role_login(AuthMode::ScramSha256, login, false));
         assert!(!reject_role_login(AuthMode::Password, login, true));
+    }
+
+    #[test]
+    fn replication_requires_a_replication_role_or_superuser() {
+        let login = crate::sql::RoleLogin {
+            slot: 0,
+            can_login: true,
+            valid: true,
+            superuser: false,
+            replication: false,
+            connection_limit: -1,
+            password: None,
+        };
+        assert!(reject_replication_login(ReplicationMode::Logical, login));
+        assert!(reject_replication_login(ReplicationMode::Physical, login));
+        assert!(!reject_replication_login(ReplicationMode::None, login));
+        let replication_login = crate::sql::RoleLogin {
+            replication: true,
+            ..login
+        };
+        assert!(!reject_replication_login(
+            ReplicationMode::Logical,
+            replication_login
+        ));
+        let superuser_login = crate::sql::RoleLogin {
+            superuser: true,
+            ..login
+        };
+        assert!(!reject_replication_login(
+            ReplicationMode::Physical,
+            superuser_login
+        ));
+    }
+
+    #[test]
+    fn identify_system_command_accepts_simple_query_terminators() {
+        assert!(is_identify_system("IDENTIFY_SYSTEM"));
+        assert!(is_identify_system(" identify_system ; \n"));
+        assert!(!is_identify_system("IDENTIFY_SYSTEM; SELECT 1"));
     }
 }

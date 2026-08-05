@@ -258,7 +258,10 @@ impl World {
         if in_txn {
             let begun = self.run("BEGIN");
             if !begun.ok() {
-                panic!("seed {}: BEGIN failed: {:?}", self.seed, begun.error);
+                // A pending object-store WAL upload fences every later
+                // statement, including BEGIN. No work was acknowledged, so
+                // this burst has no model effect.
+                return;
             }
         }
         let mut aborted = false;

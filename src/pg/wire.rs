@@ -40,6 +40,9 @@ pub const MSG_CLOSE_COMPLETE: u8 = b'3';
 pub const MSG_NO_DATA: u8 = b'n';
 pub const MSG_PARAMETER_DESCRIPTION: u8 = b't';
 pub const MSG_PORTAL_SUSPENDED: u8 = b's';
+pub const MSG_COPY_IN_RESPONSE: u8 = b'G';
+pub const MSG_COPY_OUT_RESPONSE: u8 = b'H';
+pub const MSG_COPY_BOTH_RESPONSE: u8 = b'W';
 
 // Frontend message type bytes.
 pub const FMSG_QUERY: u8 = b'Q';

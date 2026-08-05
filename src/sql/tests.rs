@@ -3525,7 +3525,7 @@ fn data_survives_engine_restart() {
         run_with(&mut e, &mut budget, "DELETE FROM t WHERE id = 3");
         run_with(&mut e, &mut budget, "CREATE TABLE gone (x int)");
         run_with(&mut e, &mut budget, "DROP TABLE gone");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3554,7 +3554,7 @@ fn indexes_survive_restart() {
             &mut budget,
             "CREATE UNIQUE INDEX u ON t(a DESC NULLS LAST,b ASC NULLS FIRST)",
         );
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3597,7 +3597,7 @@ fn views_survive_restart() {
         );
         run_with(&mut e, &mut budget, "CREATE VIEW gone AS SELECT 1");
         run_with(&mut e, &mut budget, "DROP VIEW gone");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3637,7 +3637,7 @@ fn matview_survives_restart() {
             &mut budget,
             "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15",
         );
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3801,7 +3801,7 @@ fn sequence_survives_restart() {
         );
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 10
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -3957,7 +3957,7 @@ fn expression_default_survives_restart() {
             "CREATE TABLE t (id bigint DEFAULT nextval('s'), v int)",
         );
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -4080,7 +4080,7 @@ fn generated_column_survives_restart() {
             "CREATE TABLE g (a int, c int GENERATED ALWAYS AS (a + 1) STORED)",
         );
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -4425,7 +4425,7 @@ fn identity_survives_restart() {
             "ALTER TABLE ic RENAME COLUMN v TO value",
         );
         run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME TO ic2");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -7465,7 +7465,7 @@ fn domains_survive_restart() {
         );
         run_with(&mut e, &mut b, "CREATE TABLE dt (a posint DEFAULT 7)");
         run_with(&mut e, &mut b, "INSERT INTO dt VALUES (42)");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     // WAL replay: the domain and its column identity survive.
     {
@@ -7671,7 +7671,7 @@ fn enums_survive_restart() {
             "INSERT INTO et VALUES (1,'happy'),(2,'meh'),(3,'sad')",
         );
         run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO feeling");
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     // WAL replay: the enum, its rename, added value, ordering, and column
     // identity survive, including through grouped projection's schema lookup.
@@ -7765,7 +7765,7 @@ fn user_type_schema_identity_survives_restart() {
             "SELECT typname FROM pg_type WHERE typname IN ('signal','state') ORDER BY typname",
         );
         assert_eq!(data_rows(&bytes), ["signal", "state"]);
-        e.commit_wal();
+        e.commit_wal().unwrap();
     }
     {
         let mut b = Budget::new(1 << 25);
@@ -11025,12 +11025,18 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
         &mut budget,
         "INSERT INTO rc VALUES (2, 'unuploaded')",
     );
-    bucket.borrow_mut().faults.transient_per_mille = 0;
     assert!(
         String::from_utf8_lossy(&failed).contains("58030"),
         "the failed upload must surface as an I/O error: {}",
         String::from_utf8_lossy(&failed)
     );
+    let fenced = run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id");
+    assert!(
+        String::from_utf8_lossy(&fenced).contains("58030"),
+        "a later statement must not observe a local-only commit: {}",
+        String::from_utf8_lossy(&fenced)
+    );
+    bucket.borrow_mut().faults.transient_per_mille = 0;
     // Crash without any intervening statement (no eager retry): row 2 lives
     // only in the journal.
     drop(engine);

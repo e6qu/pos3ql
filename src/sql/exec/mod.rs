@@ -5028,13 +5028,15 @@ pub fn create_publication(
         Err(error) => return sql_fail(error),
     };
     match storage.create_publication(
-        name,
-        all_tables,
-        &members[..tables.len()],
-        publish.insert,
-        publish.update,
-        publish.delete,
-        publish.truncate,
+        crate::storage::PublicationSpec {
+            name,
+            all_tables,
+            tables: &members[..tables.len()],
+            publish_insert: publish.insert,
+            publish_update: publish.update,
+            publish_delete: publish.delete,
+            publish_truncate: publish.truncate,
+        },
         txn.txid,
     ) {
         Ok(slot) => {
@@ -5108,17 +5110,29 @@ pub fn drop_publication(
     Ok(Ok(responder.command_complete("DROP PUBLICATION")?))
 }
 
+/// The user-supplied portion of CREATE VIEW, grouped to keep execution's
+/// transaction and response dependencies distinct from statement input.
+pub struct CreateViewCommand<'a> {
+    pub name: &'a QualName<'a>,
+    pub or_replace: bool,
+    pub sql: &'a str,
+    pub raw_path: &'a str,
+}
+
 pub fn create_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    name: &QualName,
-    or_replace: bool,
-    sql: &str,
-    raw_path: &str,
+    command: CreateViewCommand<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let CreateViewCommand {
+        name,
+        or_replace,
+        sql,
+        raw_path,
+    } = command;
     use core::fmt::Write;
     let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");

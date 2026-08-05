@@ -1331,6 +1331,20 @@ pub struct PublicationDef {
     pub pending: Option<PendingDdl>,
 }
 
+/// The immutable definition supplied when a publication enters the catalog.
+/// Grouping the options keeps every durable creation path (SQL, WAL replay,
+/// and manifests) on the same semantic boundary.
+#[derive(Clone, Copy)]
+pub struct PublicationSpec<'a> {
+    pub name: SqlName,
+    pub all_tables: bool,
+    pub tables: &'a [u16],
+    pub publish_insert: bool,
+    pub publish_update: bool,
+    pub publish_delete: bool,
+    pub publish_truncate: bool,
+}
+
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
@@ -8844,16 +8858,10 @@ impl Storage {
 
     pub fn create_publication(
         &mut self,
-        name: SqlName,
-        all_tables: bool,
-        tables: &[u16],
-        publish_insert: bool,
-        publish_update: bool,
-        publish_delete: bool,
-        publish_truncate: bool,
+        spec: PublicationSpec<'_>,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if tables.len() > MAX_PUBLICATION_TABLES {
+        if spec.tables.len() > MAX_PUBLICATION_TABLES {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many tables in publication (limit {})",
@@ -8861,22 +8869,22 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.name == name)
+            (publication.name == spec.name)
                 .then_some(publication.pending?)
                 .filter(|pending| pending.txid != txid)
                 .map(|pending| pending.txid)
         }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
         if self
             .publications
             .iter()
-            .any(|publication| publication.visible_to(txid) && publication.name == name)
+            .any(|publication| publication.visible_to(txid) && publication.name == spec.name)
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "publication \"{}\" already exists",
-                name.as_str()
+                spec.name.as_str()
             ));
         }
         let Some(slot) = self
@@ -8891,18 +8899,18 @@ impl Storage {
             ));
         };
         let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
-        members[..tables.len()].copy_from_slice(tables);
+        members[..spec.tables.len()].copy_from_slice(spec.tables);
         self.catalog_seq += 1;
         self.publications[slot] = PublicationDef {
             created_at: self.catalog_seq,
-            name,
-            all_tables,
+            name: spec.name,
+            all_tables: spec.all_tables,
             tables: members,
-            table_count: tables.len(),
-            publish_insert,
-            publish_update,
-            publish_delete,
-            publish_truncate,
+            table_count: spec.tables.len(),
+            publish_insert: spec.publish_insert,
+            publish_update: spec.publish_update,
+            publish_delete: spec.publish_delete,
+            publish_truncate: spec.publish_truncate,
             ownership: self.initial_ownership(txid),
             live: false,
             pending: Some(PendingDdl {

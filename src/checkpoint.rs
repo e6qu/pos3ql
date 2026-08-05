@@ -4108,13 +4108,15 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     }
     let slot = storage
         .create_publication(
-            sql_name(&name)?,
-            flags & 1 != 0,
-            &tables[..count],
-            flags & 2 != 0,
-            flags & 4 != 0,
-            flags & 8 != 0,
-            flags & 16 != 0,
+            crate::storage::PublicationSpec {
+                name: sql_name(&name)?,
+                all_tables: flags & 1 != 0,
+                tables: &tables[..count],
+                publish_insert: flags & 2 != 0,
+                publish_update: flags & 4 != 0,
+                publish_delete: flags & 8 != 0,
+                publish_truncate: flags & 16 != 0,
+            },
             0,
         )
         .map_err(|error| {

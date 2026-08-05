@@ -237,26 +237,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_publication") => finish(
-            def_of(
-                "pg_publication",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("pubname", ColType::Text),
-                    ("pubowner", ColType::Int4),
-                    ("puballtables", ColType::Bool),
-                    ("pubinsert", ColType::Bool),
-                    ("pubupdate", ColType::Bool),
-                    ("pubdelete", ColType::Bool),
-                    ("pubtruncate", ColType::Bool),
-                    ("pubviaroot", ColType::Bool),
-                    ("pubgencols", ColType::Bpchar),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_publication") => pg_publication(storage, arena),
         (false, "pg_publication_namespace") => finish(
             def_of(
                 "pg_publication_namespace",
@@ -270,21 +251,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_publication_rel") => finish(
-            def_of(
-                "pg_publication_rel",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("prpubid", ColType::Int4),
-                    ("prrelid", ColType::Int4),
-                    ("prqual", ColType::Text),
-                    ("prattrs", ColType::Array(super::types::ArrElem::Int4)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_publication_rel") => pg_publication_rel(storage, arena),
         (false, "pg_subscription") => finish(
             def_of(
                 "pg_subscription",
@@ -2428,6 +2395,94 @@ fn pg_stats<'a>(
         }
     }
     finish(def, &rows[..count], arena)
+}
+
+fn publication_oid(slot: usize) -> i32 {
+    FIRST_USER_OID + 80_000 + slot as i32
+}
+
+fn pg_publication<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_publication",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("pubname", ColType::Text),
+            ("pubowner", ColType::Int4),
+            ("puballtables", ColType::Bool),
+            ("pubinsert", ColType::Bool),
+            ("pubupdate", ColType::Bool),
+            ("pubdelete", ColType::Bool),
+            ("pubtruncate", ColType::Bool),
+            ("pubviaroot", ColType::Bool),
+            ("pubgencols", ColType::Bpchar),
+        ],
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (slot, publication) in storage.publications_with_slots() {
+        rows[count] = row(
+            &[
+                Datum::Int4(6104),
+                Datum::Int4(publication_oid(slot)),
+                text(publication.name.as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(publication.ownership.owner as usize)),
+                Datum::Bool(publication.all_tables),
+                Datum::Bool(publication.publish_insert),
+                Datum::Bool(publication.publish_update),
+                Datum::Bool(publication.publish_delete),
+                Datum::Bool(publication.publish_truncate),
+                Datum::Bool(false),
+                text("n", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_publication_rel<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_publication_rel",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("prpubid", ColType::Int4),
+            ("prrelid", ColType::Int4),
+            ("prqual", ColType::Text),
+            ("prattrs", ColType::Array(super::types::ArrElem::Int4)),
+        ],
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (publication_slot, publication) in storage.publications_with_slots() {
+        if publication.all_tables {
+            continue;
+        }
+        for table_slot in &publication.tables[..publication.table_count] {
+            if count == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_publication_rel exceeds {} rows",
+                    rows.len()
+                ));
+            }
+            rows[count] = row(
+                &[
+                    Datum::Int4(6106),
+                    Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
+                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(table_oid(storage, *table_slot as usize)),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_class<'a>(

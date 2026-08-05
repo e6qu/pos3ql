@@ -23,6 +23,9 @@ use crate::util::StackStr;
 
 pub(crate) use rowenc::MAX_COLUMNS;
 
+/// Maximum explicit relation membership entries in one publication.
+pub(crate) const MAX_PUBLICATION_TABLES: usize = 256;
+
 /// Rows handed from the durable merge cursor to the executor. The fixed batch
 /// boundary lets one resident SST block feed a bounded scan step rather than
 /// crossing the storage/executor seam once per row.
@@ -1309,6 +1312,34 @@ pub struct ViewDef {
     pub pending: Option<PendingDdl>,
 }
 
+/// A logical publication.  Publications are database-scoped catalog objects;
+/// relation membership is stored as stable table slots and is resolved again
+/// when the replication stream is opened.
+#[derive(Clone, Copy)]
+pub struct PublicationDef {
+    pub created_at: u64,
+    pub name: SqlName,
+    pub all_tables: bool,
+    pub tables: [u16; MAX_PUBLICATION_TABLES],
+    pub table_count: usize,
+    pub publish_insert: bool,
+    pub publish_update: bool,
+    pub publish_delete: bool,
+    pub publish_truncate: bool,
+    pub ownership: Ownership,
+    pub live: bool,
+    pub pending: Option<PendingDdl>,
+}
+
+impl PublicationDef {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.creating,
+            _ => self.live,
+        }
+    }
+}
+
 impl ViewDef {
     /// Whether `txid` sees this view exist.
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
@@ -2373,6 +2404,7 @@ pub struct Storage {
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
+    publications: FixedVec<PublicationDef>,
     view_dependencies: FixedVec<StoredQueryDependencies>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -2923,6 +2955,25 @@ impl Storage {
         }
         let view_dependencies =
             stored_query_dependency_slots(budget, "view_dependencies", config.max_tables)?;
+        let mut publications = FixedVec::new(budget, "publications", config.max_tables)?;
+        for _ in 0..config.max_tables {
+            publications
+                .push(PublicationDef {
+                    created_at: 0,
+                    name: SqlName::parse("").expect("empty name fits"),
+                    all_tables: false,
+                    tables: [u16::MAX; MAX_PUBLICATION_TABLES],
+                    table_count: 0,
+                    publish_insert: true,
+                    publish_update: true,
+                    publish_delete: true,
+                    publish_truncate: true,
+                    ownership: Ownership::BOOTSTRAP,
+                    live: false,
+                    pending: None,
+                })
+                .expect("sized to max_tables");
+        }
         let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
         for _ in 0..config.max_tables {
             matviews
@@ -3089,6 +3140,7 @@ impl Storage {
             pending_table_defs,
             pending_table_statistics,
             views,
+            publications,
             view_dependencies,
             matviews,
             matview_dependencies,
@@ -8774,6 +8826,143 @@ impl Storage {
 
     pub(crate) fn view_count(&self) -> usize {
         self.views.len()
+    }
+
+    /// Committed publications for catalog visibility and replication setup.
+    pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
+        self.publications
+            .iter()
+            .filter(|publication| publication.live)
+    }
+
+    pub fn publications_with_slots(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
+        self.publications
+            .iter()
+            .enumerate()
+            .filter(|(_, publication)| publication.live)
+    }
+
+    pub fn create_publication(
+        &mut self,
+        name: SqlName,
+        all_tables: bool,
+        tables: &[u16],
+        publish_insert: bool,
+        publish_update: bool,
+        publish_delete: bool,
+        publish_truncate: bool,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if tables.len() > MAX_PUBLICATION_TABLES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many tables in publication (limit {})",
+                MAX_PUBLICATION_TABLES
+            ));
+        }
+        if let Some(blocker) = self.publications.iter().find_map(|publication| {
+            (publication.name == name)
+                .then_some(publication.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self
+            .publications
+            .iter()
+            .any(|publication| publication.visible_to(txid) && publication.name == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "publication \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .publications
+            .iter()
+            .position(|publication| !publication.live && publication.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many publications (limit {})",
+                self.publications.len()
+            ));
+        };
+        let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
+        members[..tables.len()].copy_from_slice(tables);
+        self.catalog_seq += 1;
+        self.publications[slot] = PublicationDef {
+            created_at: self.catalog_seq,
+            name,
+            all_tables,
+            tables: members,
+            table_count: tables.len(),
+            publish_insert,
+            publish_update,
+            publish_delete,
+            publish_truncate,
+            ownership: self.initial_ownership(txid),
+            live: false,
+            pending: Some(PendingDdl {
+                txid,
+                creating: true,
+            }),
+        };
+        Ok(slot)
+    }
+
+    pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
+        if let Some(blocker) = self.publications.iter().find_map(|publication| {
+            (publication.name.as_str() == name)
+                .then_some(publication.pending?)
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
+        }
+        let Some(slot) = self.publications.iter().position(|publication| {
+            publication.visible_to(txid) && publication.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        let publication = &mut self.publications[slot];
+        if matches!(publication.pending, Some(pending) if pending.txid == txid && pending.creating)
+        {
+            publication.live = false;
+            publication.pending = None;
+        } else {
+            publication.pending = Some(PendingDdl {
+                txid,
+                creating: false,
+            });
+        }
+        Ok(Some(slot))
+    }
+
+    pub fn commit_publication_create(&mut self, slot: usize) {
+        self.publications[slot].live = true;
+        self.publications[slot].pending = None;
+    }
+    pub fn commit_publication_drop(&mut self, slot: usize) {
+        self.publications[slot].live = false;
+        self.publications[slot].pending = None;
+    }
+    pub fn rollback_publication_create(&mut self, slot: usize) {
+        self.publications[slot].live = false;
+        self.publications[slot].pending = None;
+    }
+    pub fn rollback_publication_drop(&mut self, slot: usize, txid: u32) {
+        let publication = &mut self.publications[slot];
+        if publication.live {
+            publication.pending = None;
+        } else {
+            publication.pending = Some(PendingDdl {
+                txid,
+                creating: true,
+            });
+        }
     }
 
     /// The stored SELECT text of a view visible to `txid`, if `name` names one

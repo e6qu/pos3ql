@@ -69,7 +69,9 @@ const KIND_SET_OBJECT_OWNER: u8 = 31;
 const KIND_SET_OBJECT_ACL: u8 = 32;
 const KIND_REWRITE_TABLE: u8 = 33;
 const KIND_SET_DEFAULT_ACL: u8 = 34;
-const LAST_KIND: u8 = KIND_SET_DEFAULT_ACL;
+const KIND_CREATE_PUBLICATION: u8 = 35;
+const KIND_DROP_PUBLICATION: u8 = 36;
+const LAST_KIND: u8 = KIND_DROP_PUBLICATION;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -289,6 +291,19 @@ pub(crate) enum WalOp<'a> {
     },
     DropView {
         schema: &'a str,
+        name: &'a str,
+    },
+    CreatePublication {
+        name: &'a str,
+        all_tables: bool,
+        tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
+        table_count: usize,
+        publish_insert: bool,
+        publish_update: bool,
+        publish_delete: bool,
+        publish_truncate: bool,
+    },
+    DropPublication {
         name: &'a str,
     },
     CreateIndex {
@@ -1003,6 +1018,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
+        WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
+        WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1108,6 +1125,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::CreatePublication {
+            name, table_count, ..
+        } => 1 + name.len() + 1 + 1 + table_count * 2,
+        WalOp::DropPublication { name } => 1 + name.len(),
         WalOp::CreateIndex {
             schema,
             name,
@@ -1394,6 +1415,28 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::CreatePublication {
+            name,
+            all_tables,
+            tables,
+            table_count,
+            publish_insert,
+            publish_update,
+            publish_delete,
+            publish_truncate,
+        } => {
+            let flags = u8::from(*all_tables)
+                | (u8::from(*publish_insert) << 1)
+                | (u8::from(*publish_update) << 2)
+                | (u8::from(*publish_delete) << 3)
+                | (u8::from(*publish_truncate) << 4);
+            let mut ok = name_bytes(buffer, name) && buffer.append(&[flags, *table_count as u8]);
+            for table in &tables[..*table_count] {
+                ok = ok && buffer.append(&table.to_le_bytes());
+            }
+            ok
+        }
+        WalOp::DropPublication { name } => name_bytes(buffer, name),
         WalOp::CreateIndex {
             schema,
             name,
@@ -2155,6 +2198,35 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 "public"
             };
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
+        }
+        KIND_CREATE_PUBLICATION => {
+            let name = take_name(&mut at)?;
+            let flags = *payload.get(at)?;
+            at += 1;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            if count > crate::storage::MAX_PUBLICATION_TABLES {
+                return None;
+            }
+            let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+            for table in &mut tables[..count] {
+                *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+            }
+            (at == payload.len()).then_some(WalOp::CreatePublication {
+                name,
+                all_tables: flags & 1 != 0,
+                tables,
+                table_count: count,
+                publish_insert: flags & 2 != 0,
+                publish_update: flags & 4 != 0,
+                publish_delete: flags & 8 != 0,
+                publish_truncate: flags & 16 != 0,
+            })
+        }
+        KIND_DROP_PUBLICATION => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropPublication { name })
         }
         KIND_CREATE_MATVIEW => {
             let name = take_name(&mut at)?;

@@ -301,6 +301,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
         | Stmt::DropView { .. }
+        | Stmt::CreatePublication { .. }
+        | Stmt::DropPublication { .. }
         | Stmt::CreateTableAs { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::DropMaterializedView { .. }
@@ -1046,6 +1048,12 @@ impl Engine {
                     );
                 }
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
+                DdlUndo::PublicationCreated(slot) => {
+                    self.storage.commit_publication_create(*slot as usize)
+                }
+                DdlUndo::PublicationDropped(slot) => {
+                    self.storage.commit_publication_drop(*slot as usize)
+                }
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -1229,6 +1237,12 @@ impl Engine {
             DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
             DdlUndo::ViewDropped(slot) => {
                 self.storage.rollback_view_drop(slot as usize, txid);
+            }
+            DdlUndo::PublicationCreated(slot) => {
+                self.storage.rollback_publication_create(slot as usize)
+            }
+            DdlUndo::PublicationDropped(slot) => {
+                self.storage.rollback_publication_drop(slot as usize, txid)
             }
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
@@ -3354,6 +3368,29 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreatePublication {
+                name,
+                all_tables,
+                tables,
+                publish,
+            } => exec::create_publication(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *all_tables,
+                tables,
+                *publish,
+                responder,
+            ),
+            Stmt::DropPublication { names, if_exists } => exec::drop_publication(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
             Stmt::CreateTableAs {
                 name,
                 columns,
@@ -4759,6 +4796,33 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropView { schema, name } => {
             if let Some(slot) = storage.drop_view(schema, name, 0)? {
                 storage.commit_view_drop(slot);
+            }
+        }
+        WalOp::CreatePublication {
+            name,
+            all_tables,
+            tables,
+            table_count,
+            publish_insert,
+            publish_update,
+            publish_delete,
+            publish_truncate,
+        } => {
+            let slot = storage.create_publication(
+                crate::storage::SqlName::parse(name)?,
+                all_tables,
+                &tables[..table_count],
+                publish_insert,
+                publish_update,
+                publish_delete,
+                publish_truncate,
+                0,
+            )?;
+            storage.commit_publication_create(slot);
+        }
+        WalOp::DropPublication { name } => {
+            if let Some(slot) = storage.drop_publication(name, 0)? {
+                storage.commit_publication_drop(slot);
             }
         }
         WalOp::CreateMatview {

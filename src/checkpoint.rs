@@ -1642,6 +1642,10 @@ impl Checkpointer {
                         tag == Some("mv4"),
                     )?;
                 }
+                Some("pub") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_publication(storage, line)?;
+                }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
                     let has_links = matches!(tag, Some("sq3") | Some("sq4"));
@@ -2955,6 +2959,33 @@ impl Checkpointer {
             )?;
         }
         // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
+        // Publications: database-scoped names plus explicit table slots.
+        for (_, publication) in storage.publications_with_slots() {
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            for byte in publication.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            let flags = u8::from(publication.all_tables)
+                | (u8::from(publication.publish_insert) << 1)
+                | (u8::from(publication.publish_update) << 2)
+                | (u8::from(publication.publish_delete) << 3)
+                | (u8::from(publication.publish_truncate) << 4);
+            let mut members = StackStr::<1024>::new();
+            for table in &publication.tables[..publication.table_count] {
+                let _ = write!(members, " {table}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "pub {} {} {}{}",
+                    name.as_str(),
+                    flags,
+                    publication.table_count,
+                    members.as_str()
+                ),
+            )?;
+        }
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
         for (matview_slot, mv) in storage.matviews_with_slots() {
@@ -4051,6 +4082,48 @@ fn load_legacy_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     if let Some(old_slot) = old_slot {
         storage.commit_view_drop(old_slot);
     }
+    Ok(())
+}
+
+fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _ = words.next();
+    let name = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("pub name"))
+        .and_then(decode_hex_name)?;
+    let flags: u8 = parse_field(words.next(), "pub flags")?;
+    let count: usize = parse_field(words.next(), "pub table count")?;
+    if count > crate::storage::MAX_PUBLICATION_TABLES {
+        return Err(CheckpointSetupError::Corrupt(
+            "pub table count exceeds limit",
+        ));
+    }
+    let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+    for table in &mut tables[..count] {
+        *table = parse_field(words.next(), "pub table")?;
+    }
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("trailing pub fields"));
+    }
+    let slot = storage
+        .create_publication(
+            sql_name(&name)?,
+            flags & 1 != 0,
+            &tables[..count],
+            flags & 2 != 0,
+            flags & 4 != 0,
+            flags & 8 != 0,
+            flags & 16 != 0,
+            0,
+        )
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest publication rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    storage.commit_publication_create(slot);
     Ok(())
 }
 

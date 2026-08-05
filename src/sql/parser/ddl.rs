@@ -9,7 +9,10 @@ use super::{
     ColumnDef, CreateTable, DropTable, FkAction, LikeClause, MAX_LIST, ParseError, Parser,
     QualName, Stmt, TableConstraint, Tok,
 };
-use crate::sql::ast::{AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck, RoleOptions};
+use crate::sql::ast::{
+    AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck, PublicationOperations,
+    RoleOptions,
+};
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
@@ -35,6 +38,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
+        }
+        if self.eat_ident("publication")? {
+            return self.create_publication();
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
@@ -832,6 +838,62 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn create_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("publication name")?;
+        self.expect_ident("for")?;
+        let (all_tables, tables) = if self.eat_ident("all")? {
+            self.expect_ident("tables")?;
+            (true, &[][..])
+        } else {
+            self.expect_ident("table")?;
+            let mut entries: [QualName; MAX_LIST] = [QualName {
+                schema: None,
+                name: "",
+            }; MAX_LIST];
+            let mut count = 0;
+            loop {
+                if count == MAX_LIST {
+                    return Err(self.limit("publication tables", MAX_LIST));
+                }
+                entries[count] = self.qual_name("table name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            (false, self.arena_slice(&entries[..count])?)
+        };
+        let mut publish = PublicationOperations::ALL;
+        if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            self.expect_ident("publish")?;
+            self.expect_op("=")?;
+            let value = self.str_literal("publication publish option")?;
+            publish = PublicationOperations {
+                insert: false,
+                update: false,
+                delete: false,
+                truncate: false,
+            };
+            for operation in value.split(',').map(str::trim) {
+                match operation.to_ascii_lowercase().as_str() {
+                    "insert" => publish.insert = true,
+                    "update" => publish.update = true,
+                    "delete" => publish.delete = true,
+                    "truncate" => publish.truncate = true,
+                    _ => return Err(self.err_here("invalid publication publish operation")),
+                }
+            }
+            self.expect_op(")")?;
+        }
+        Ok(Stmt::CreatePublication {
+            name,
+            all_tables,
+            tables,
+            publish,
+        })
+    }
+
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
@@ -858,6 +920,20 @@ impl<'a> Parser<'a> {
                 names,
                 if_exists,
                 cascade,
+            });
+        }
+        if self.eat_ident("publication")? {
+            let (names, if_exists) = self.drop_targets("publication name")?;
+            let mut publication_names: [&str; MAX_LIST] = [""; MAX_LIST];
+            for (index, name) in names.iter().enumerate() {
+                if name.schema.is_some() {
+                    return Err(self.err_here("publication names cannot be schema-qualified"));
+                }
+                publication_names[index] = name.name;
+            }
+            return Ok(Stmt::DropPublication {
+                names: self.arena_slice(&publication_names[..names.len()])?,
+                if_exists,
             });
         }
         if self.eat_ident("materialized")? {

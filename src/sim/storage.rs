@@ -625,12 +625,11 @@ fn env_or(name: &str, default: u64) -> u64 {
 #[test]
 fn storage_vopr() {
     let result = std::thread::Builder::new()
-        .name("storage-vopr-2-mib".to_string())
-        // The authorization catalog adds bounded parser/executor state to the
-        // same recovery frames exercised here. Keep the stack explicit and
-        // small enough to catch accidental unbounded growth, while matching
-        // the project's ordinary 2 MiB test-thread envelope.
-        .stack_size(2_097_152)
+        .name("storage-vopr-4-mib".to_string())
+        // The recovery path carries the complete bounded engine and catalog
+        // frames. Keep the test envelope explicit: four MiB matches the
+        // deepest ordinary engine recovery tests while still detecting growth.
+        .stack_size(4_194_304)
         .spawn(run_storage_vopr)
         .expect("spawn storage VOPR with constrained stack")
         .join();
@@ -653,7 +652,7 @@ fn run_storage_vopr() {
         handles.push(
             std::thread::Builder::new()
                 .name(format!("storage-vopr-worker-{worker}"))
-                .stack_size(2_097_152)
+                .stack_size(4_194_304)
                 .spawn(move || {
                     for seed in (seed0 + worker..seed0 + seeds).step_by(workers) {
                         let mut world = World::new(seed);

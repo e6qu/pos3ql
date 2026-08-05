@@ -72,7 +72,6 @@ pub(crate) fn pax_column_demand(
     expressions: &[&Expr],
 ) -> Option<PaxColumnDemand> {
     if scope.n == 0
-        || scope.n > 2
         || scope.derived[..scope.n].iter().any(Option::is_some)
         || scope.defs[..scope.n].iter().any(Option::is_none)
     {
@@ -1902,6 +1901,42 @@ fn scan_source_mode<'a>(
                 }
             }};
         }
+        macro_rules! visit_spilled_rows {
+            ($slot:expr, $index:ident, $aborted:ident) => {{
+                storage.for_each_spilled_row_batch(
+                    $slot,
+                    arena,
+                    recycle_rows,
+                    pax_columns.map(|demand| demand[order[depth]]),
+                    &mut |rows| {
+                        for spilled in rows {
+                            check_timeout()?;
+                            let this = $index;
+                            $index += 1;
+                            let keep_scanning = recycled(arena, recycle_rows, || {
+                                visit_candidate!(
+                                    this,
+                                    match spilled.representation {
+                                        crate::storage::SpilledRowRepresentation::Encoded(
+                                            bytes,
+                                        ) => BoundRow::Encoded(bytes),
+                                        crate::storage::SpilledRowRepresentation::Values(
+                                            values,
+                                        ) => BoundRow::Values(values),
+                                    },
+                                    Some(spilled.rowid)
+                                )
+                            })?;
+                            if !keep_scanning {
+                                $aborted = true;
+                                return Ok(core::ops::ControlFlow::Break(()));
+                            }
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+            }};
+        }
         // A LATERAL FROM item is re-run per outer row: assemble the row bound by
         // the tables to its left, resolve the item's body against it, and iterate
         // the resulting rows like a derived table's.
@@ -2018,42 +2053,7 @@ fn scan_source_mode<'a>(
             if candidates.is_none() && storage.spill_rows_are_unshadowed(slot) {
                 let mut index = 0usize;
                 let mut aborted = false;
-                storage.for_each_spilled_row_batch(
-                    slot,
-                    arena,
-                    recycle_rows,
-                    pax_columns.map(|demand| demand[order[depth]]),
-                    &mut |rows| {
-                        for spilled in rows {
-                            check_timeout()?;
-                            let this = index;
-                            index += 1;
-                            let keep_scanning = recycled(arena, recycle_rows, || {
-                                visit_candidate!(
-                                    this,
-                                    match spilled.representation {
-                                        crate::storage::SpilledRowRepresentation::Encoded(
-                                            bytes,
-                                        ) => {
-                                            BoundRow::Encoded(bytes)
-                                        }
-                                        crate::storage::SpilledRowRepresentation::Values(
-                                            values,
-                                        ) => {
-                                            BoundRow::Values(values)
-                                        }
-                                    },
-                                    Some(spilled.rowid)
-                                )
-                            })?;
-                            if !keep_scanning {
-                                aborted = true;
-                                return Ok(core::ops::ControlFlow::Break(()));
-                            }
-                        }
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    },
-                )?;
+                visit_spilled_rows!(slot, index, aborted);
                 if aborted {
                     return Ok(false);
                 }
@@ -2112,24 +2112,28 @@ fn scan_source_mode<'a>(
             let slot = scope.slots[order[depth]];
             let mut index = 0usize;
             let mut aborted = false;
-            storage.for_each_row_state(slot, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                check_timeout()?;
-                let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                let this = index;
-                index += 1;
-                let keep_scanning = recycled(arena, recycle_rows, || {
-                    let bytes = storage.row_bytes(slot, rowid, home, arena)?;
-                    visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+            if storage.spill_rows_are_unshadowed(slot) {
+                visit_spilled_rows!(slot, index, aborted);
+            } else {
+                storage.for_each_row_state(slot, &mut |rowid, state| {
+                    use core::ops::ControlFlow;
+                    check_timeout()?;
+                    let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    let this = index;
+                    index += 1;
+                    let keep_scanning = recycled(arena, recycle_rows, || {
+                        let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                    })?;
+                    if !keep_scanning {
+                        aborted = true;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(()))
                 })?;
-                if !keep_scanning {
-                    aborted = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                Ok(ControlFlow::Continue(()))
-            })?;
+            }
             if aborted {
                 return Ok(false);
             }

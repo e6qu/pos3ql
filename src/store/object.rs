@@ -870,12 +870,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let body = framed[..framed_len].to_vec();
+        let (request_started, request_started_rx) = mpsc::channel();
+        let (release_response_tx, release_response) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
             let request_len = stream.read(&mut request).unwrap();
             let request = std::str::from_utf8(&request[..request_len]).unwrap();
             assert!(request.contains(&format!("range: bytes={HEADER_LEN}-")));
+            request_started.send(()).unwrap();
+            release_response.recv().unwrap();
             write!(
                 stream,
                 "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -902,8 +906,10 @@ mod tests {
             store.get_packed(&container, 0, framed_len, &expected, &mut output, &mut []),
             Err(StoreError::NotReady)
         );
+        request_started_rx.recv().unwrap();
         assert!(store.async_reads_busy());
         assert!(store.next_hedge_deadline().is_none());
+        release_response_tx.send(()).unwrap();
 
         let mut complete = false;
         for _ in 0..10_000 {

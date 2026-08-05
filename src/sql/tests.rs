@@ -10677,6 +10677,16 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT o.id, count(*) FROM wide_pax AS o \
+         WHERE EXISTS (SELECT 1 FROM wide_pax_right AS i WHERE i.id = o.id) \
+         AND o.id = 287 GROUP BY o.id",
+        &["287|1"],
+        Some(6 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT row_number() OVER (ORDER BY id) FROM wide_pax WHERE id = 287",
         &["1"],
         Some(2 << 20),

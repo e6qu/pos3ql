@@ -18,7 +18,7 @@ use crate::sql::exec::MAX_PROJ;
 
 use super::aggregate::AggState;
 use super::plan::where_passes;
-use super::subquery::merge_correlated;
+use super::subquery::{correlated_in_expression, correlated_scan_conjuncts, merge_correlated};
 use super::{
     JoinRow, MAX_AGGS, MAX_SUBQUERIES, Outcome, QueryScope, ScopeSchema, arena_full,
     expr_contains_node, pax_column_demand, resolve_order_target,
@@ -109,6 +109,7 @@ pub(super) fn groups_for_mask<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    scan_where: Option<&'a Expr<'a>>,
     correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     mask: u64,
@@ -120,12 +121,6 @@ pub(super) fn groups_for_mask<'a>(
     pax_columns: Option<&super::scan::PaxColumnDemand>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
-    // WHERE with correlated subqueries is applied per row in the callbacks.
-    let scan_where = if correlated.is_empty() {
-        statement.where_clause
-    } else {
-        None
-    };
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -596,49 +591,48 @@ pub(super) fn grouped_rows<'a>(
         return Err(ungrouped_error(column, scope));
     }
 
-    let pax_columns = if correlated.is_empty() {
-        let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_AGGS + 2];
-        let mut count = 0usize;
-        for item in statement.items {
-            let SelectItem::Expr { expression, .. } = item else {
-                unreachable!("grouped stars were expanded and validated")
-            };
-            expressions[count] = expression;
-            count += 1;
-        }
-        for expression in statement.group_by {
-            expressions[count] = expression;
-            count += 1;
-        }
-        for (_, expression) in agg_nodes {
-            expressions[count] = expression;
-            count += 1;
-        }
-        if let Some(predicate) = statement.where_clause {
-            expressions[count] = predicate;
-            count += 1;
-        }
-        if let Some(predicate) = statement.having {
-            expressions[count] = predicate;
-            count += 1;
-        }
-        for order in statement.order_by {
-            expressions[count] = order.expression;
-            count += 1;
-        }
-        pax_column_demand(scope, from, &expressions[..count])
-    } else {
-        None
-    };
+    let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_AGGS + 2];
+    let mut count = 0usize;
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
+            unreachable!("grouped stars were expanded and validated")
+        };
+        expressions[count] = expression;
+        count += 1;
+    }
+    for expression in statement.group_by {
+        expressions[count] = expression;
+        count += 1;
+    }
+    for (_, expression) in agg_nodes {
+        expressions[count] = expression;
+        count += 1;
+    }
+    if let Some(predicate) = statement.where_clause {
+        expressions[count] = predicate;
+        count += 1;
+    }
+    if let Some(predicate) = statement.having {
+        expressions[count] = predicate;
+        count += 1;
+    }
+    for order in statement.order_by {
+        expressions[count] = order.expression;
+        count += 1;
+    }
+    let pax_columns = pax_column_demand(scope, from, &expressions[..count]);
 
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
     // with correlated subqueries is applied per row here too, so every pass
     // sees the same filtered sequence.
-    let scan_where = if correlated.is_empty() {
-        statement.where_clause
-    } else {
-        None
-    };
+    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
+    let where_correlated_count =
+        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
+    let scan_where = correlated_scan_conjuncts(
+        statement.where_clause,
+        &where_correlated[..where_correlated_count],
+        arena,
+    )?;
     let mut row_count = 0usize;
     scan_source_recycling_with_pax_columns(
         storage,
@@ -729,6 +723,7 @@ pub(super) fn grouped_rows<'a>(
             arena,
             params,
             hooks,
+            scan_where,
             correlated,
             outer,
             mask,

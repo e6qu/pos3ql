@@ -971,6 +971,13 @@ decision, so an unproved physical scan cannot slip back in through a default.
 The forced-cold wide-table regression covers an ordered scalar subquery and
 keeps both source passes to key extents.
 
+**Grouped-correlated demand slice (2026-08-05).** Grouped execution now
+retains PAX demand when a WHERE clause contains a correlated subquery, and
+shares the error-safe independent-conjunct split across its count, key-sort,
+and aggregate passes. A selective grouped `EXISTS` query therefore filters
+before probing and carries only key vectors through each pass, rather than
+repeatedly scanning full payload rows for every rejected candidate.
+
 An immediately completed asynchronous object GET is retained as a completed
 slot for its eventual consumer, so reactor progress cannot re-advance an
 already-complete response. A queued readiness event for a hedge loser or a

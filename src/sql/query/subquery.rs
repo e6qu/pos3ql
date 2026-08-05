@@ -21,8 +21,8 @@ use super::setops::materialize_set_body;
 use super::{
     Chained, MAX_AGGS, MAX_SUBQUERIES, MAX_WINDOWS, QueryScope, SUBQUERY_DEPTH, ScopeCols,
     ScopeSchema, arena_full, cmp_key_rows, collect_aggs, collect_windows, fold_aggregates,
-    fromless_aggregate_hooks, scan_source, scan_source_with_pax_columns, select_into_rows,
-    select_into_rows_recycling, single_table_pax_columns, where_passes,
+    fromless_aggregate_hooks, pax_column_demand, scan_source, scan_source_with_pax_columns,
+    select_into_rows, select_into_rows_recycling, where_passes,
 };
 use crate::sql::exec::MAX_PROJ;
 
@@ -862,8 +862,8 @@ fn subquery_exists<'a>(
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
     let mut found = false;
     let pax_columns = match select.where_clause {
-        Some(predicate) => single_table_pax_columns(&scope, &[predicate]),
-        None => single_table_pax_columns(&scope, &[]),
+        Some(predicate) => pax_column_demand(&scope, from, &[predicate]),
+        None => pax_column_demand(&scope, from, &[]),
     };
     scan_source_with_pax_columns(
         storage,

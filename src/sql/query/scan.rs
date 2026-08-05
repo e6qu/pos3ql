@@ -55,22 +55,43 @@ enum BoundRow<'a> {
     Values(&'a [Datum<'a>]),
 }
 
-/// Builds the complete physical-column demand for a plain one-table scan.
+/// Fixed physical-column demand for every base table in one source scan.
+///
+/// The masks live in statement stack/arena state rather than a growable plan
+/// structure: every source must have a complete proof before PAX may omit a
+/// column from its decoded row.
+pub(crate) type PaxColumnDemand = [u64; MAX_JOIN_TABLES];
+
+/// Builds the complete physical-column demand for a source scan.
 /// Returning `None` deliberately retains full decoding whenever an expression
-/// can observe a row shape this scan does not own (a join, derived row, outer
-/// reference, or whole-row value).
-pub(crate) fn single_table_pax_columns(
+/// can observe a row shape this scan does not own (a derived row, outer
+/// reference, whole-row value, or nested query).
+pub(crate) fn pax_column_demand(
     scope: &QueryScope,
+    from: &FromClause,
     expressions: &[&Expr],
-) -> Option<[bool; MAX_COLUMNS]> {
-    if scope.n != 1 || scope.derived[0].is_some() || scope.defs[0].is_none() {
+) -> Option<PaxColumnDemand> {
+    if scope.n == 0
+        || scope.n > 2
+        || scope.derived[..scope.n].iter().any(Option::is_some)
+        || scope.defs[..scope.n].iter().any(Option::is_none)
+    {
         return None;
     }
-    let mut columns = [false; MAX_COLUMNS];
-    fn collect(expression: &Expr, scope: &QueryScope, columns: &mut [bool; MAX_COLUMNS]) -> bool {
+    pax_column_demand_bounded(scope, from, expressions)
+}
+
+#[inline(never)]
+fn pax_column_demand_bounded(
+    scope: &QueryScope,
+    from: &FromClause,
+    expressions: &[&Expr],
+) -> Option<PaxColumnDemand> {
+    let mut columns = [0u64; MAX_JOIN_TABLES];
+    fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(ResolvedColumn::Table(0, column)) => columns[column] = true,
+                Ok(ResolvedColumn::Table(table, column)) => columns[table] |= 1u64 << column,
                 _ => return false,
             },
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => return false,
@@ -88,6 +109,13 @@ pub(crate) fn single_table_pax_columns(
     }
     for expression in expressions {
         if !collect(expression, scope, &mut columns) {
+            return None;
+        }
+    }
+    for (index, join) in from.joins.iter().enumerate() {
+        if let Some(condition) = join.on.or(scope.join_on[index])
+            && !collect(condition, scope, &mut columns)
+        {
             return None;
         }
     }
@@ -831,7 +859,7 @@ pub(crate) fn scan_source<'a>(
     )
 }
 
-/// Source scan with an optional complete single-table PAX demand mask.
+/// Source scan with optional complete per-source PAX demand masks.
 /// Omitted columns are represented as NULL and therefore this is valid only
 /// when the caller has proved they cannot be observed downstream.
 #[allow(clippy::too_many_arguments)]
@@ -845,7 +873,7 @@ pub(crate) fn scan_source_with_pax_columns<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    pax_columns: Option<&[bool; MAX_COLUMNS]>,
+    pax_columns: Option<&PaxColumnDemand>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
@@ -895,7 +923,7 @@ pub(crate) fn scan_source_recycling<'a>(
     )
 }
 
-/// Recycling scan with an optional complete single-table PAX demand mask.
+/// Recycling scan with optional complete per-source PAX demand masks.
 /// Omitted columns are represented as NULL and therefore this is valid only
 /// when the caller has proved they cannot be observed downstream.
 #[allow(clippy::too_many_arguments)]
@@ -909,7 +937,7 @@ pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    pax_columns: Option<&[bool; MAX_COLUMNS]>,
+    pax_columns: Option<&PaxColumnDemand>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
@@ -935,13 +963,13 @@ pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
 struct HashEntry<'a> {
     hash: u64,
     rowid: u64,
-    bytes: &'a [u8],
+    row: BoundRow<'a>,
 }
 
 const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
     hash: 0,
     rowid: 0,
-    bytes: &[],
+    row: BoundRow::Encoded(&[]),
 };
 
 /// Whether two join-key column types compare and hash identically to the `=`
@@ -1112,7 +1140,7 @@ fn scan_source_mode<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     recycle_rows: bool,
-    pax_columns: Option<&[bool; MAX_COLUMNS]>,
+    pax_columns: Option<&PaxColumnDemand>,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
@@ -1248,6 +1276,7 @@ fn scan_source_mode<'a>(
         plan: HashJoinPlan<'a>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
+        pax_columns: Option<&PaxColumnDemand>,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<(), SqlError> {
         use core::ops::ControlFlow;
@@ -1276,35 +1305,93 @@ fn scan_source_mode<'a>(
             let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
             let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
-            storage.for_each_row_state(build_slot, &mut |rowid, state| {
-                let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
-                let mut buffer = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, build_schema, &mut buffer)?;
-                let mut any_null = false;
-                for i in 0..nkeys {
-                    key_vals[i] = buffer[keys[i].1];
-                    if key_vals[i].is_null() {
-                        any_null = true;
-                        break;
+            macro_rules! insert_build {
+                ($rowid:expr, $row:expr, $values:expr) => {{
+                    let values = $values;
+                    let mut any_null = false;
+                    for i in 0..nkeys {
+                        key_vals[i] = values[keys[i].1];
+                        if key_vals[i].is_null() {
+                            any_null = true;
+                            break;
+                        }
                     }
-                }
-                if any_null {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                if n == entries.len() {
-                    return Err(arena_full());
-                }
-                let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
-                let bucket = (hash as usize) & (buckets_len - 1);
-                entries[n] = HashEntry { hash, rowid, bytes };
-                next[n] = buckets[bucket];
-                buckets[bucket] = n as u32;
-                n += 1;
-                Ok(ControlFlow::Continue(()))
-            })?;
+                    if !any_null {
+                        if n == entries.len() {
+                            return Err(arena_full());
+                        }
+                        let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                        let bucket = (hash as usize) & (buckets_len - 1);
+                        entries[n] = HashEntry {
+                            hash,
+                            rowid: $rowid,
+                            row: $row,
+                        };
+                        next[n] = buckets[bucket];
+                        buckets[bucket] = n as u32;
+                        n += 1;
+                    }
+                }};
+            }
+            if let Some(demand) = pax_columns.map(|demand| demand[build_t])
+                && storage.spill_rows_are_unshadowed(build_slot)
+            {
+                storage.for_each_spilled_row_batch(
+                    build_slot,
+                    arena,
+                    false,
+                    Some(demand),
+                    &mut |rows| {
+                        for spilled in rows {
+                            let crate::storage::SpilledRowRepresentation::Values(values) =
+                                spilled.representation
+                            else {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX scan did not return selected values"
+                                ));
+                            };
+                            insert_build!(spilled.rowid, BoundRow::Values(values), values);
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    },
+                )?;
+            } else {
+                storage.for_each_row_state(build_slot, &mut |rowid, state| {
+                    let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)?
+                    else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
+                    let mut buffer = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, build_schema, &mut buffer)?;
+                    let mut any_null = false;
+                    for i in 0..nkeys {
+                        key_vals[i] = buffer[keys[i].1];
+                        if key_vals[i].is_null() {
+                            any_null = true;
+                            break;
+                        }
+                    }
+                    if any_null {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    if n == entries.len() {
+                        return Err(arena_full());
+                    }
+                    let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                    let bucket = (hash as usize) & (buckets_len - 1);
+                    entries[n] = HashEntry {
+                        hash,
+                        rowid,
+                        row: BoundRow::Encoded(bytes),
+                    };
+                    next[n] = buckets[bucket];
+                    buckets[bucket] = n as u32;
+                    n += 1;
+                    Ok(ControlFlow::Continue(()))
+                })?;
+            }
 
             // Probe: scan the outer side once, resolving each row's key
             // against the build table. The outer side is iterated in the same
@@ -1316,6 +1403,145 @@ fn scan_source_mode<'a>(
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             probe_def.schema(&mut probe_schema);
             let probe_schema = &probe_schema[..probe_def.n_columns];
+            if let Some(demand) = pax_columns.map(|demand| demand[probe_t])
+                && storage.spill_rows_are_unshadowed(probe_slot)
+            {
+                let mut stopped = false;
+                storage.for_each_spilled_row_batch(
+                    probe_slot,
+                    arena,
+                    recycle_rows,
+                    Some(demand),
+                    &mut |rows| {
+                        for spilled in rows {
+                            check_timeout()?;
+                            let crate::storage::SpilledRowRepresentation::Values(values) =
+                                spilled.representation
+                            else {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX scan did not return selected values"
+                                ));
+                            };
+                            let mut any_null = false;
+                            for i in 0..nkeys {
+                                key_vals[i] = values[keys[i].0];
+                                if key_vals[i].is_null() {
+                                    any_null = true;
+                                    break;
+                                }
+                            }
+                            let mut matched_any = false;
+                            if !any_null {
+                                let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                                let mut index = buckets[(hash as usize) & (buckets_len - 1)];
+                                while index != u32::MAX {
+                                    let entry = &entries[index as usize];
+                                    if entry.hash == hash {
+                                        let mut build_values = [Datum::Null; MAX_COLUMNS];
+                                        match entry.row {
+                                            BoundRow::Encoded(bytes) => rowenc::decode(
+                                                bytes,
+                                                build_schema,
+                                                &mut build_values,
+                                            )?,
+                                            BoundRow::Values(row_values) => build_values
+                                                [..row_values.len()]
+                                                .copy_from_slice(row_values),
+                                        }
+                                        let mut keys_match = true;
+                                        for key in 0..nkeys {
+                                            if !compare_datums(
+                                                &build_values[keys[key].1],
+                                                &key_vals[key],
+                                            )?
+                                            .is_eq()
+                                            {
+                                                keys_match = false;
+                                                break;
+                                            }
+                                        }
+                                        if keys_match {
+                                            let mut bound = [None::<BoundRow>; 2];
+                                            let mut rowids = [None; 2];
+                                            bound[probe_t] = Some(BoundRow::Values(values));
+                                            rowids[probe_t] = Some(spilled.rowid);
+                                            bound[build_t] = Some(entry.row);
+                                            rowids[build_t] = Some(entry.rowid);
+                                            let row = assemble(
+                                                scope,
+                                                &bound,
+                                                &rowids,
+                                                order,
+                                                2,
+                                                decode_buffers,
+                                                arena,
+                                            )?;
+                                            if let Some(condition) = on {
+                                                let chained = Chained { inner: &row, outer };
+                                                if !matches!(
+                                                    eval_full(
+                                                        condition, arena, params, &chained, hooks
+                                                    )?,
+                                                    Datum::Bool(true)
+                                                ) {
+                                                    index = next[index as usize];
+                                                    continue;
+                                                }
+                                            }
+                                            matched_any = true;
+                                            if let Some(predicate) = where_clause {
+                                                let chained = Chained { inner: &row, outer };
+                                                if !where_passes(
+                                                    predicate, arena, params, &chained, hooks,
+                                                )? {
+                                                    index = next[index as usize];
+                                                    continue;
+                                                }
+                                            }
+                                            if !f(&row)? {
+                                                stopped = true;
+                                                return Ok(ControlFlow::Break(()));
+                                            }
+                                        }
+                                    }
+                                    index = next[index as usize];
+                                }
+                            }
+                            if !matched_any && plan.preserves_probe_rows {
+                                let mut bound = [None::<BoundRow>; 2];
+                                let mut rowids = [None; 2];
+                                bound[probe_t] = Some(BoundRow::Values(values));
+                                rowids[probe_t] = Some(spilled.rowid);
+                                let row = assemble(
+                                    scope,
+                                    &bound,
+                                    &rowids,
+                                    order,
+                                    2,
+                                    decode_buffers,
+                                    arena,
+                                )?;
+                                let passes = if let Some(predicate) = where_clause {
+                                    let chained = Chained { inner: &row, outer };
+                                    where_passes(predicate, arena, params, &chained, hooks)?
+                                } else {
+                                    true
+                                };
+                                if passes && !f(&row)? {
+                                    stopped = true;
+                                    return Ok(ControlFlow::Break(()));
+                                }
+                            }
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    },
+                )?;
+                if stopped {
+                    return Ok(true);
+                }
+                return Ok(true);
+            }
             // Collect and sort the probe table's visible rows to match the
             // nested loop's output order.
             let probe_count = storage.visible_row_count(probe_slot, txid)?;
@@ -1361,7 +1587,14 @@ fn scan_source_mode<'a>(
                             let entry = &entries[idx as usize];
                             if entry.hash == hash {
                                 let mut build_buf = [Datum::Null; MAX_COLUMNS];
-                                rowenc::decode(entry.bytes, build_schema, &mut build_buf)?;
+                                match entry.row {
+                                    BoundRow::Encoded(bytes) => {
+                                        rowenc::decode(bytes, build_schema, &mut build_buf)?;
+                                    }
+                                    BoundRow::Values(values) => {
+                                        build_buf[..values.len()].copy_from_slice(values);
+                                    }
+                                }
                                 let mut matched = true;
                                 for i in 0..nkeys {
                                     if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq()
@@ -1375,7 +1608,7 @@ fn scan_source_mode<'a>(
                                     let bound_rowids = &mut [None, None];
                                     bound[probe_t] = Some(BoundRow::Encoded(bytes));
                                     bound_rowids[probe_t] = Some(rowid);
-                                    bound[build_t] = Some(BoundRow::Encoded(entry.bytes));
+                                    bound[build_t] = Some(entry.row);
                                     bound_rowids[build_t] = Some(entry.rowid);
                                     let row = assemble(
                                         scope,
@@ -1585,7 +1818,7 @@ fn scan_source_mode<'a>(
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
-        pax_columns: Option<&[bool; MAX_COLUMNS]>,
+        pax_columns: Option<&PaxColumnDemand>,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -1789,7 +2022,7 @@ fn scan_source_mode<'a>(
                     slot,
                     arena,
                     recycle_rows,
-                    pax_columns,
+                    pax_columns.map(|demand| demand[order[depth]]),
                     &mut |rows| {
                         for spilled in rows {
                             check_timeout()?;
@@ -2080,6 +2313,7 @@ fn scan_source_mode<'a>(
             hash_plan,
             decode_buffers,
             recycle_rows,
+            pax_columns,
             f,
         )?;
         return Ok(());

@@ -2512,8 +2512,8 @@ impl ExternalRunAccess {
 }
 
 /// A row-state walk releases its block context before invoking its callback.
-/// Nested joins therefore share one context; an ownership token invalidates
-/// resident-block markers if the callback's nested walk reused it.
+/// Nested walks invalidate only buffer residency; the cursor retains enough
+/// logical position to reload the same immutable block on resumption.
 const SCAN_CONTEXTS: usize = 1;
 const EXTERNAL_RUN_CONTEXTS: usize = 8;
 
@@ -5628,15 +5628,22 @@ impl Storage {
                 for cursor in &mut cursors[..n] {
                     cursor.loaded = None;
                     cursor.loaded_len = 0;
-                    cursor.raw_len = 0;
-                    cursor.raw_row = 0;
-                    cursor.head_raw_row = 0;
+                    cursor.loaded_type = None;
                     cursor.pax_layout = None;
                     cursor.pax_value_cursors = [0; MAX_COLUMNS];
                     cursor.head_pax_values = [None; MAX_COLUMNS];
+                    if cursor.head.is_some() {
+                        cursor.raw_row = cursor.head_raw_row;
+                        cursor.head = None;
+                    }
                 }
                 context.owner = walk_id;
                 context.pax_values_owner = None;
+                for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                    if !cursor.done {
+                        Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+                    }
+                }
             }
             let mut verdict: Option<SpillVersion> = None;
             for (member, cursor) in cursors[..n].iter().enumerate() {
@@ -5940,9 +5947,11 @@ impl Storage {
         table_slot: usize,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
-        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        decoded_columns: Option<u64>,
         each: &mut SpilledRowBatchVisitor<'a, 'callback>,
     ) -> Result<(), SqlError> {
+        let decoded_columns =
+            decoded_columns.map(|mask| core::array::from_fn(|column| mask & (1u64 << column) != 0));
         let rows = arena
             .alloc_slice_with(SPILL_SCAN_BATCH_ROWS, |_| SpilledRow {
                 rowid: 0,
@@ -5962,7 +5971,7 @@ impl Storage {
             table_slot,
             arena,
             false,
-            decoded_columns,
+            decoded_columns.as_ref(),
             &mut |rowid, representation| {
                 rows[len] = SpilledRow {
                     rowid,
@@ -6077,6 +6086,7 @@ impl Storage {
                 }
             }
             if cursor.loaded != Some(cursor.ordinal) {
+                let resume_raw_row = cursor.raw_row;
                 let mut blocks = spill.blocks.borrow_mut();
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
@@ -6146,6 +6156,9 @@ impl Storage {
                 .then(|| crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len]))
                 .transpose()
                 .map_err(spill_read_error)?;
+                if cursor.pax_layout.is_some() && cursor.head.is_some() {
+                    cursor.raw_row = resume_raw_row;
+                }
                 cursor.pax_value_cursors = cursor
                     .pax_layout
                     .as_ref()

@@ -836,17 +836,8 @@ impl<'b> Responder<'b> {
                     }
                     m.bytes(text.as_bytes());
                 }
-                Datum::Range { text, .. } | Datum::Multirange { text, .. } => {
-                    // The binary range/multirange format requires re-parsing the
-                    // bounds into typed datums (numeric bounds need an arena),
-                    // which this arena-free wire primitive has no access to.
-                    // COPY BINARY encodes ranges via the arena-aware path in
-                    // `copy_out`; the only path reaching here is an extended-
-                    // protocol Bind requesting binary results for a range column
-                    // (rare), which receives the canonical text form.
-                    m.i32(text.len() as i32);
-                    m.bytes(text.as_bytes());
-                }
+                Datum::Range { text, kind } => Self::encode_range_binary(m, text, *kind),
+                Datum::Multirange { text, kind } => Self::encode_multirange_binary(m, text, *kind),
                 Datum::Bit { bits, .. } => {
                     // int32 bit length, then ceil(len/8) bytes, bits packed
                     // MSB-first with the last byte's low bits zero-padded.
@@ -962,26 +953,19 @@ impl<'b> Responder<'b> {
                         }
                     });
                 }
-                Datum::Record(_) => {
-                    use core::fmt::Write as _;
-                    struct Counter(usize);
-                    impl core::fmt::Write for Counter {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0 += s.len();
-                            Ok(())
+                Datum::Record(fields) => {
+                    // PostgreSQL's anonymous-record send format is a field
+                    // count followed by each field's type OID and its ordinary
+                    // binary field representation. Records are transient, but
+                    // binary Bind results may still contain ROW(...) or a
+                    // whole-row reference.
+                    m.field(|m| {
+                        m.i32(fields.len() as i32);
+                        for field in *fields {
+                            m.i32(field.type_oid);
+                            Self::encode_value_binary(m, &field.value);
                         }
-                    }
-                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
-                    impl core::fmt::Write for MsgWriter<'_, '_> {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0.bytes(s.as_bytes());
-                            Ok(())
-                        }
-                    }
-                    let mut counter = Counter(0);
-                    let _ = write!(counter, "{v}");
-                    m.i32(counter.0 as i32);
-                    let _ = write!(MsgWriter(m), "{v}");
+                    });
                 }
                 Datum::Numeric(nm) => {
                     // PostgreSQL numeric binary: i16 ndigits, weight, sign,
@@ -1002,6 +986,183 @@ impl<'b> Responder<'b> {
                     }
                 }
             }
+        }
+    }
+
+    /// Writes the binary body of one built-in range from its canonical text.
+    /// Range values retain text in `Datum`, so this intentionally parses only
+    /// into stack state and never requires a connection or statement arena.
+    fn encode_range_binary(message: &mut MsgOut, text: &str, kind: crate::sql::types::RangeKind) {
+        message.field(|message| Self::encode_range_binary_body(message, text, kind));
+    }
+
+    fn encode_range_binary_body(
+        message: &mut MsgOut,
+        text: &str,
+        kind: crate::sql::types::RangeKind,
+    ) {
+        let parsed = crate::sql::range::parse(text).expect("range datums are canonical");
+        if parsed.empty {
+            message.u8(0x01);
+            return;
+        }
+        let mut flags = 0u8;
+        if parsed.lower_inc {
+            flags |= 0x02;
+        }
+        if parsed.upper_inc {
+            flags |= 0x04;
+        }
+        if parsed.lower.is_none() {
+            flags |= 0x08;
+        }
+        if parsed.upper.is_none() {
+            flags |= 0x10;
+        }
+        message.u8(flags);
+        if let Some(lower) = parsed.lower {
+            Self::encode_range_bound_binary(message, lower, kind);
+        }
+        if let Some(upper) = parsed.upper {
+            Self::encode_range_bound_binary(message, upper, kind);
+        }
+    }
+
+    fn encode_multirange_binary(
+        message: &mut MsgOut,
+        text: &str,
+        kind: crate::sql::types::RangeKind,
+    ) {
+        message.field(|message| {
+            let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+            let count = crate::sql::range::split_components(text, &mut components)
+                .expect("multirange datums are canonical");
+            message.i32(count as i32);
+            for component in &components[..count] {
+                message.field(|message| Self::encode_range_binary_body(message, component, kind));
+            }
+        });
+    }
+
+    fn encode_range_bound_binary(
+        message: &mut MsgOut,
+        text: &str,
+        kind: crate::sql::types::RangeKind,
+    ) {
+        use crate::sql::types::RangeKind;
+        match kind {
+            RangeKind::Int4 => {
+                let value = text.parse::<i32>().expect("canonical int4 range bound");
+                message.i32(4);
+                message.bytes(&value.to_be_bytes());
+            }
+            RangeKind::Int8 => {
+                let value = text.parse::<i64>().expect("canonical int8 range bound");
+                message.i32(8);
+                message.bytes(&value.to_be_bytes());
+            }
+            RangeKind::Date => {
+                let value =
+                    crate::sql::datetime::parse_date(text).expect("canonical date range bound");
+                message.i32(4);
+                message.bytes(&value.to_be_bytes());
+            }
+            RangeKind::Ts | RangeKind::Tstz => {
+                let value = crate::sql::datetime::parse_timestamp(text, kind == RangeKind::Tstz)
+                    .expect("canonical timestamp range bound");
+                message.i32(8);
+                message.bytes(&value.to_be_bytes());
+            }
+            RangeKind::Num => Self::encode_numeric_text_binary(message, text),
+        }
+    }
+
+    /// Encodes canonical numeric text without allocating an intermediate
+    /// `Numeric`. Range text never uses exponent notation, so a bounded
+    /// decimal scan is sufficient and preserves the displayed scale.
+    fn encode_numeric_text_binary(message: &mut MsgOut, text: &str) {
+        use crate::sql::numeric::{DEC_DIGITS, MAX_NDIGITS};
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("nan") {
+            message.i32(8);
+            message.i16(0);
+            message.i16(0);
+            message.i16(-0x4000);
+            message.i16(0);
+            return;
+        }
+        let bytes = text.as_bytes();
+        let (negative, digits) = match bytes.first() {
+            Some(b'-') => (true, &bytes[1..]),
+            Some(b'+') => (false, &bytes[1..]),
+            _ => (false, bytes),
+        };
+        let mut decimal = [0u8; MAX_NDIGITS * DEC_DIGITS];
+        let mut count = 0usize;
+        let mut point = None;
+        for byte in digits {
+            if *byte == b'.' {
+                point = Some(count);
+            } else {
+                debug_assert!(byte.is_ascii_digit(), "canonical numeric range bound");
+                decimal[count] = *byte - b'0';
+                count += 1;
+            }
+        }
+        let integer_digits = point.unwrap_or(count);
+        let scale = (count - integer_digits) as u16;
+        let mut first = 0usize;
+        while first < count && decimal[first] == 0 {
+            first += 1;
+        }
+        let mut last = count;
+        while last > first && decimal[last - 1] == 0 {
+            last -= 1;
+        }
+        if first == last {
+            message.i32(8);
+            message.i16(0);
+            message.i16(0);
+            message.i16(0);
+            message.i16(scale as i16);
+            return;
+        }
+        let most_significant_weight = integer_digits as i64 - 1 - first as i64;
+        let lead = (3 - most_significant_weight.rem_euclid(4)) % 4;
+        let base_count = (lead as usize + last - first).div_ceil(DEC_DIGITS);
+        debug_assert!(
+            base_count <= MAX_NDIGITS,
+            "canonical numeric range bound fits"
+        );
+        let mut base = [0i16; MAX_NDIGITS];
+        for (index, slot) in base.iter_mut().enumerate().take(base_count) {
+            let mut value = 0i16;
+            for offset in 0..DEC_DIGITS {
+                let decimal_index = index * DEC_DIGITS + offset;
+                let digit = if decimal_index < lead as usize {
+                    0
+                } else {
+                    decimal
+                        .get(first + decimal_index - lead as usize)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                value = value * 10 + digit as i16;
+            }
+            *slot = value;
+        }
+        let mut base_last = base_count;
+        while base_last > 0 && base[base_last - 1] == 0 {
+            base_last -= 1;
+        }
+        let base_weight = (most_significant_weight + lead).div_euclid(4);
+        message.i32((8 + base_last * 2) as i32);
+        message.i16(base_last as i16);
+        message.i16(base_weight as i16);
+        message.i16(if negative { 0x4000 } else { 0 });
+        message.i16(scale as i16);
+        for digit in &base[..base_last] {
+            message.i16(*digit);
         }
     }
 
@@ -1135,7 +1296,7 @@ impl<'b> Responder<'b> {
 mod tests {
     use super::*;
     use crate::mem::Budget;
-    use crate::sql::types::oid;
+    use crate::sql::types::{RangeKind, RecordField, oid};
 
     #[test]
     fn select_one_wire_bytes() {
@@ -1179,5 +1340,88 @@ mod tests {
         let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
         Responder::new(&mut buffer).copy_both_response().unwrap();
         assert_eq!(buffer.readable(), &[b'W', 0, 0, 0, 7, 1, 0, 0]);
+    }
+
+    #[test]
+    fn binary_record_uses_field_oids_and_binary_field_values() {
+        let fields = [
+            RecordField {
+                name: "id",
+                type_oid: oid::INT4,
+                value: Datum::Int4(42),
+            },
+            RecordField {
+                name: "note",
+                type_oid: oid::TEXT,
+                value: Datum::Null,
+            },
+        ];
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut message, &Datum::Record(&fields));
+        message.finish().unwrap();
+        assert_eq!(
+            buffer.readable(),
+            &[
+                b'd', 0, 0, 0, 32, // CopyData outer frame.
+                0, 0, 0, 24, // record body length.
+                0, 0, 0, 2, // field count.
+                0, 0, 0, 23, // int4 OID.
+                0, 0, 0, 4, 0, 0, 0, 42, // int4 value.
+                0, 0, 0, 25, // text OID.
+                0xff, 0xff, 0xff, 0xff, // NULL field.
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_range_uses_flags_and_typed_bounds() {
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(
+            &mut message,
+            &Datum::Range {
+                text: "[1,5)",
+                kind: RangeKind::Int4,
+            },
+        );
+        message.finish().unwrap();
+        assert_eq!(
+            &buffer.readable()[5..],
+            &[
+                0, 0, 0, 17,   // range body length.
+                0x02, // lower inclusive.
+                0, 0, 0, 4, 0, 0, 0, 1, // lower int4.
+                0, 0, 0, 4, 0, 0, 0, 5, // upper int4.
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_multirange_nests_binary_ranges() {
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(
+            &mut message,
+            &Datum::Multirange {
+                text: "{[1,3),[5,7)}",
+                kind: RangeKind::Int4,
+            },
+        );
+        message.finish().unwrap();
+        assert_eq!(
+            &buffer.readable()[5..],
+            &[
+                0, 0, 0, 46, // multirange body length.
+                0, 0, 0, 2, // component count.
+                0, 0, 0, 17, 0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0,
+                3, // first range.
+                0, 0, 0, 17, 0x02, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0,
+                7, // second range.
+            ]
+        );
     }
 }

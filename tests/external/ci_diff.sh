@@ -366,12 +366,12 @@ else
   bad "LISTEN / NOTIFY"; cat "$WORK/listen.out"
 fi
 
-# --- extended-protocol binary parameters (composite types over the wire) ------
-echo "=== binary parameters (real PostgreSQL vs pos3ql) ==="
+# --- extended-protocol binary composites (parameters and results) -------------
+echo "=== binary composites (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/binary_param_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/binparam.out" 2>&1; then
-  ok "binary parameters ($(tail -1 "$WORK/binparam.out"))"
+  ok "binary composites ($(tail -1 "$WORK/binparam.out"))"
 else
-  bad "binary parameters"; cat "$WORK/binparam.out"
+  bad "binary composites"; cat "$WORK/binparam.out"
 fi
 fi
 

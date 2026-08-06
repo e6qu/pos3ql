@@ -800,4 +800,31 @@ mod tests {
         assert_eq!(projected_row_width(encoded), values.len());
         assert!(decode_projected_pub(encoded, values.len() - 1).is_null());
     }
+
+    #[test]
+    fn structural_decode_preserves_record_fields() {
+        use crate::sql::types::{RecordField, oid};
+
+        let mut budget = Budget::new(64 * 1024);
+        let arena = Arena::new(&mut budget, "record projected row", 32 * 1024).unwrap();
+        let fields = [
+            RecordField {
+                name: "f1",
+                type_oid: oid::INT4,
+                value: Datum::Int4(42),
+            },
+            RecordField {
+                name: "f2",
+                type_oid: oid::TEXT,
+                value: Datum::Null,
+            },
+        ];
+        let encoded = encode_projected_pub(&[Datum::Record(&fields)], &arena).unwrap();
+
+        assert_eq!(decode_projected_pub(encoded, 0), Datum::Text("(42,)"));
+        assert_eq!(
+            decode_projected_col_record(encoded, 0, &arena).unwrap(),
+            Datum::Record(&fields)
+        );
+    }
 }

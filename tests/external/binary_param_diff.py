@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Extended-protocol binary parameter differential: real PostgreSQL vs pos3ql.
+"""Extended-protocol binary composite differential: real PostgreSQL vs pos3ql.
 
 psycopg's `%b` placeholder forces a parameter onto the wire in binary format, so
 these bind composite parameters (arrays, ranges, multiranges) in binary and
 check the value the server decodes and echoes back matches PostgreSQL exactly.
 Scalar binary params were already exercised elsewhere; the point here is the
-composite receive codec reached through the parameter path.
+composite receive codec reached through the parameter path. The result cases
+request binary DataRows too, covering the send side for ranges, multiranges,
+and anonymous records.
 
   binary_param_diff.py --pg PORT --p3 PORT [--host HOST]
 """
@@ -43,9 +45,33 @@ CASES = [
 ]
 
 
+# These contain no parameters: psycopg's `binary=True` asks each server for a
+# binary Result format and decodes it through its PostgreSQL codecs. Comparing
+# decoded values against real PostgreSQL catches a text payload mislabeled as
+# binary just as reliably as comparing raw frames, while also exercising all
+# subtype codecs clients actually use.
+RESULT_CASES = [
+    "SELECT '[1,5)'::int4range",
+    "SELECT '[100,200]'::int8range",
+    "SELECT '[1.25,300.00)'::numrange",
+    "SELECT '[2024-01-02,2024-01-05)'::daterange",
+    "SELECT '[\"2024-01-02 03:04:05\",\"2024-01-05 06:07:08\")'::tsrange",
+    "SELECT '(,5)'::int4range",
+    "SELECT 'empty'::int4range",
+    "SELECT '{[1,3),[5,7)}'::int4multirange",
+    "SELECT ROW(42::int4, NULL::text)",
+]
+
+
 def run_case(conn, sql, param):
     cur = conn.cursor()
     cur.execute(sql, param)
+    return cur.fetchone()[0]
+
+
+def run_result_case(conn, sql):
+    cur = conn.cursor()
+    cur.execute(sql, binary=True)
     return cur.fetchone()[0]
 
 
@@ -75,7 +101,30 @@ def main():
             fails += 1
             print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
 
-    print("binary-param: %d check(s) failed" % fails)
+    for sql in RESULT_CASES:
+        pg_error = None
+        try:
+            r_pg = run_result_case(pg, sql)
+        except Exception as e:
+            r_pg = f"ERROR:{type(e).__name__}"
+            pg_error = repr(e)
+        p3_error = None
+        try:
+            r_p3 = run_result_case(p3, sql)
+        except Exception as e:
+            r_p3 = f"ERROR:{type(e).__name__}"
+            p3_error = repr(e)
+        if r_pg == r_p3:
+            print("ok:   %-34s -> %s" % (sql, r_pg))
+        else:
+            fails += 1
+            print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
+            if pg_error is not None:
+                print("      PostgreSQL error: %s" % pg_error)
+            if p3_error is not None:
+                print("      pos3ql error: %s" % p3_error)
+
+    print("binary-composite: %d check(s) failed" % fails)
     sys.exit(1 if fails else 0)
 
 

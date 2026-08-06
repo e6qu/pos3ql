@@ -849,7 +849,10 @@ pub(super) fn grouped_select<'a>(
     for row in &out_rows[start..end] {
         let mut out = [Datum::Null; MAX_PROJ];
         for (i, slot) in out.iter_mut().take(width).enumerate() {
-            *slot = crate::sql::exec::decode_projected_pub(row, i);
+            *slot = match crate::sql::exec::decode_projected_col_record(row, i, arena) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            };
         }
         responder.data_row(&out[..width])?;
         emitted += 1;

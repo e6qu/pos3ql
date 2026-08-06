@@ -1345,6 +1345,18 @@ pub struct PublicationSpec<'a> {
     pub publish_truncate: bool,
 }
 
+/// Durable state required to resume a logical replication consumer. A slot is
+/// database-scoped and deliberately carries only the pgoutput-compatible
+/// fields; physical XLOG slots are outside pos3ql's object-native design.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplicationSlotDef {
+    pub name: SqlName,
+    pub restart_lsn: u64,
+    pub confirmed_flush_lsn: u64,
+    pub active: bool,
+    pub live: bool,
+}
+
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
@@ -2419,6 +2431,7 @@ pub struct Storage {
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     publications: FixedVec<PublicationDef>,
+    replication_slots: FixedVec<ReplicationSlotDef>,
     view_dependencies: FixedVec<StoredQueryDependencies>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -2863,6 +2876,7 @@ impl Storage {
                 + size_of::<MatviewDef>()
                 + size_of::<StoredQueryDependencies>()
                 + size_of::<IndexDef>())
+            + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
@@ -2987,6 +3001,19 @@ impl Storage {
                     pending: None,
                 })
                 .expect("sized to max_tables");
+        }
+        let mut replication_slots =
+            FixedVec::new(budget, "replication_slots", config.max_replication_slots)?;
+        for _ in 0..config.max_replication_slots {
+            replication_slots
+                .push(ReplicationSlotDef {
+                    name: SqlName::EMPTY,
+                    restart_lsn: 0,
+                    confirmed_flush_lsn: 0,
+                    active: false,
+                    live: false,
+                })
+                .expect("sized to max_replication_slots");
         }
         let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
         for _ in 0..config.max_tables {
@@ -3155,6 +3182,7 @@ impl Storage {
             pending_table_statistics,
             views,
             publications,
+            replication_slots,
             view_dependencies,
             matviews,
             matview_dependencies,
@@ -8856,6 +8884,75 @@ impl Storage {
             .filter(|(_, publication)| publication.live)
     }
 
+    pub(crate) fn create_replication_slot(
+        &mut self,
+        name: SqlName,
+        restart_lsn: u64,
+    ) -> Result<usize, SqlError> {
+        if self
+            .replication_slots
+            .iter()
+            .any(|slot| slot.live && slot.name == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "replication slot \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let Some(index) = self.replication_slots.iter().position(|slot| !slot.live) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many replication slots (limit {})",
+                self.replication_slots.len()
+            ));
+        };
+        self.replication_slots[index] = ReplicationSlotDef {
+            name,
+            restart_lsn,
+            confirmed_flush_lsn: restart_lsn,
+            active: false,
+            live: true,
+        };
+        Ok(index)
+    }
+
+    pub(crate) fn replication_slot(&self, name: &str) -> Option<&ReplicationSlotDef> {
+        self.replication_slots
+            .iter()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+    }
+
+    pub(crate) fn replication_slots_with_slots(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ReplicationSlotDef)> {
+        self.replication_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.live)
+    }
+
+    pub(crate) fn replication_slot_capacity(&self) -> usize {
+        self.replication_slots.len()
+    }
+
+    pub(crate) fn restore_replication_slot(
+        &mut self,
+        name: SqlName,
+        restart_lsn: u64,
+        confirmed_flush_lsn: u64,
+    ) -> Result<(), SqlError> {
+        if confirmed_flush_lsn < restart_lsn {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "replication slot confirmed LSN precedes restart LSN"
+            ));
+        }
+        let slot = self.create_replication_slot(name, restart_lsn)?;
+        self.replication_slots[slot].confirmed_flush_lsn = confirmed_flush_lsn;
+        Ok(())
+    }
+
     pub fn create_publication(
         &mut self,
         spec: PublicationSpec<'_>,
@@ -11170,5 +11267,27 @@ mod tests {
         assert!(SqlName::parse(&long).is_err());
         let ok = "y".repeat(63);
         assert_eq!(SqlName::parse(&ok).unwrap().as_str(), ok);
+    }
+
+    #[test]
+    fn replication_slots_are_bounded_and_have_resume_positions() {
+        let mut config = test_config();
+        config.max_replication_slots = 1;
+        let mut budget = Budget::new(1 << 22);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage
+            .create_replication_slot(SqlName::parse("changes").unwrap(), 42)
+            .unwrap();
+        let slot = storage.replication_slot("changes").unwrap();
+        assert_eq!(slot.restart_lsn, 42);
+        assert_eq!(slot.confirmed_flush_lsn, 42);
+        assert!(!slot.active);
+        assert_eq!(
+            storage
+                .create_replication_slot(SqlName::parse("other").unwrap(), 43)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
     }
 }

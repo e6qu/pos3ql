@@ -13,12 +13,14 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::pg::auth::{AuthMode, ScramFlow, ScramServer, ScramStep};
 use crate::sql::Engine;
+use crate::sql::eval::SqlError;
 use crate::sql::eval::sqlstate;
 use crate::sql::guc::GucState;
 use crate::sql::parser::Parser;
 use crate::sql::prep::SqlPreparedPool;
 use crate::sql::txn::TxnState;
 use crate::sql::types::Datum;
+use crate::sql_err;
 use crate::stack_format;
 use crate::storage::SqlName;
 use crate::util::StackStr;
@@ -1933,7 +1935,7 @@ impl Conn {
             return Step::Close;
         };
         let identify_system = is_identify_system(text);
-        if is_replication_command(self.replication, identify_system) {
+        if is_replication_command(self.replication, text) {
             return self.handle_replication_query(engine, identify_system, total);
         }
         self.arena.reset();
@@ -2038,7 +2040,7 @@ impl Conn {
 
     fn handle_replication_query(
         &mut self,
-        engine: &Engine,
+        engine: &mut Engine,
         identify_system: bool,
         total: usize,
     ) -> Step {
@@ -2074,6 +2076,90 @@ impl Conn {
             }
             self.recv.consume(total);
             return Step::Continue;
+        }
+        if self.replication == ReplicationMode::Logical {
+            let command = {
+                let payload = &self.recv.readable()[5..total];
+                let Ok(text) = MsgIn::new(payload).cstr() else {
+                    let mut responder = Responder::new(&mut self.send);
+                    let _ =
+                        responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
+                    return Step::Close;
+                };
+                parse_logical_replication_command(text)
+            };
+            match command {
+                Ok(LogicalReplicationCommand::CreateSlot { name }) => {
+                    let restart_lsn = match engine.create_replication_slot(name) {
+                        Ok(lsn) => lsn,
+                        Err(error) => {
+                            let mut responder = Responder::new(&mut self.send);
+                            if responder
+                                .error(error.sqlstate, error.message.as_str())
+                                .and_then(|()| responder.ready_for_query(b'I'))
+                                .is_err()
+                            {
+                                return Step::Close;
+                            }
+                            self.recv.consume(total);
+                            return Step::Continue;
+                        }
+                    };
+                    let lsn = stack_format!(32, "0/{restart_lsn:X}");
+                    let columns = [
+                        crate::sql::types::ColDesc::new(
+                            "slot_name",
+                            crate::sql::types::oid::TEXT,
+                            -1,
+                        ),
+                        crate::sql::types::ColDesc::new(
+                            "consistent_point",
+                            crate::sql::types::oid::TEXT,
+                            -1,
+                        ),
+                        crate::sql::types::ColDesc::new(
+                            "snapshot_name",
+                            crate::sql::types::oid::TEXT,
+                            -1,
+                        ),
+                        crate::sql::types::ColDesc::new(
+                            "output_plugin",
+                            crate::sql::types::oid::TEXT,
+                            -1,
+                        ),
+                    ];
+                    let values = [
+                        Datum::Text(name.as_str()),
+                        Datum::Text(lsn.as_str()),
+                        Datum::Null,
+                        Datum::Text("pgoutput"),
+                    ];
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder
+                        .row_description(&columns)
+                        .and_then(|()| responder.data_row(&values))
+                        .and_then(|()| responder.command_complete("CREATE_REPLICATION_SLOT"))
+                        .and_then(|()| responder.ready_for_query(b'I'))
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
+                Err(error) => {
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder
+                        .error(error.sqlstate, error.message.as_str())
+                        .and_then(|()| responder.ready_for_query(b'I'))
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
+            }
         }
         let message = match self.replication {
             ReplicationMode::Physical => "physical replication is not supported",
@@ -2140,8 +2226,77 @@ fn is_identify_system(text: &str) -> bool {
 /// Logical replication uses replication commands and ordinary SQL on the same
 /// simple-query connection. Physical mode has no SQL database session, so all
 /// of its simple queries are replication commands.
-fn is_replication_command(mode: ReplicationMode, identify_system: bool) -> bool {
-    mode == ReplicationMode::Physical || (mode == ReplicationMode::Logical && identify_system)
+fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
+    mode == ReplicationMode::Physical
+        || (mode == ReplicationMode::Logical
+            && (is_identify_system(text)
+                || text
+                    .trim_start()
+                    .get(..23)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("create_replication_slot"))))
+}
+
+enum LogicalReplicationCommand {
+    CreateSlot { name: SqlName },
+}
+
+fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCommand, SqlError> {
+    let text = text.trim().trim_end_matches(';').trim_end();
+    let mut words = text.split_ascii_whitespace();
+    let command = words.next().unwrap_or_default();
+    if !command.eq_ignore_ascii_case("create_replication_slot") {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "expected CREATE_REPLICATION_SLOT"
+        ));
+    }
+    let name = words.next().ok_or_else(|| {
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE_REPLICATION_SLOT requires a slot name"
+        )
+    })?;
+    if !is_replication_slot_name(name) {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "invalid replication slot name"
+        ));
+    }
+    let kind = words.next().ok_or_else(|| {
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE_REPLICATION_SLOT requires LOGICAL pgoutput"
+        )
+    })?;
+    let plugin = words.next().ok_or_else(|| {
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE_REPLICATION_SLOT requires LOGICAL pgoutput"
+        )
+    })?;
+    if !kind.eq_ignore_ascii_case("logical") || !plugin.eq_ignore_ascii_case("pgoutput") {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "only LOGICAL pgoutput replication slots are supported"
+        ));
+    }
+    if words.next().is_some() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing CREATE_REPLICATION_SLOT input"
+        ));
+    }
+    Ok(LogicalReplicationCommand::CreateSlot {
+        name: SqlName::parse(name)?,
+    })
+}
+
+fn is_replication_slot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 enum Step {
@@ -2496,6 +2651,32 @@ mod tests {
     }
 
     #[test]
+    fn logical_slot_creation_command_is_strict_and_pgoutput_only() {
+        let command =
+            parse_logical_replication_command("CREATE_REPLICATION_SLOT changes LOGICAL pgoutput;")
+                .unwrap();
+        let LogicalReplicationCommand::CreateSlot { name } = command;
+        assert_eq!(name.as_str(), "changes");
+        assert!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL test_decoding"
+            )
+            .is_err()
+        );
+        assert!(parse_logical_replication_command("CREATE_REPLICATION_SLOT changes").is_err());
+        assert!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput trailing"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_logical_replication_command("CREATE_REPLICATION_SLOT bad/name LOGICAL pgoutput")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn identify_system_command_accepts_simple_query_terminators() {
         assert!(is_identify_system("IDENTIFY_SYSTEM"));
         assert!(is_identify_system(" identify_system ; \n"));
@@ -2504,9 +2685,25 @@ mod tests {
 
     #[test]
     fn logical_replication_keeps_simple_sql_out_of_replication_command_dispatch() {
-        assert!(is_replication_command(ReplicationMode::Logical, true));
-        assert!(!is_replication_command(ReplicationMode::Logical, false));
-        assert!(is_replication_command(ReplicationMode::Physical, false));
-        assert!(!is_replication_command(ReplicationMode::None, true));
+        assert!(is_replication_command(
+            ReplicationMode::Logical,
+            "IDENTIFY_SYSTEM"
+        ));
+        assert!(is_replication_command(
+            ReplicationMode::Logical,
+            "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput"
+        ));
+        assert!(!is_replication_command(
+            ReplicationMode::Logical,
+            "SELECT 1"
+        ));
+        assert!(is_replication_command(
+            ReplicationMode::Physical,
+            "SELECT 1"
+        ));
+        assert!(!is_replication_command(
+            ReplicationMode::None,
+            "IDENTIFY_SYSTEM"
+        ));
     }
 }

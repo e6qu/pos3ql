@@ -404,6 +404,61 @@ fn role_catalog_replays_from_wal() {
 }
 
 #[test]
+fn logical_replication_slot_survives_wal_and_checkpoint_recovery() {
+    let mut config = test_config("logical-slot-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("logical-slot-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let restart_lsn = engine
+        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .unwrap();
+    assert_eq!(
+        engine
+            .storage
+            .replication_slot("changes")
+            .unwrap()
+            .restart_lsn,
+        restart_lsn
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 28);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        recovered
+            .storage
+            .replication_slot("changes")
+            .unwrap()
+            .confirmed_flush_lsn,
+        restart_lsn
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut checkpoint_budget = Budget::new(1 << 28);
+    let mut checkpoint_recovered = Engine::new(&config, &mut checkpoint_budget).unwrap();
+    let output = run_with(
+        &mut checkpoint_recovered,
+        &mut checkpoint_budget,
+        "SELECT slot_name, plugin, slot_type, active, restart_lsn, confirmed_flush_lsn
+           FROM pg_replication_slots",
+    );
+    let lsn = format!("0/{restart_lsn:X}");
+    assert_eq!(
+        data_rows(&output),
+        [format!("changes|pgoutput|logical|f|{lsn}|{lsn}")]
+    );
+}
+
+#[test]
 fn object_ownership_and_acl_enforce_and_replay() {
     let config = test_config("object-acl-wal-replay");
     let mut budget = Budget::new(1 << 27);

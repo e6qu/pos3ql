@@ -46,6 +46,7 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
         "pg_opfamily" => 2753,
         "pg_extension" => 3079,
         "pg_default_acl" => 826,
+        "pg_replication_slots" => 121,
         "pg_transform" => 3576,
         _ => return None,
     })
@@ -87,6 +88,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_publication"
                 | "pg_publication_rel"
                 | "pg_publication_namespace"
+                | "pg_replication_slots"
                 | "pg_subscription"
                 | "pg_subscription_rel"
                 | "pg_foreign_table"
@@ -252,6 +254,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_publication_rel") => pg_publication_rel(storage, arena),
+        (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
         (false, "pg_subscription") => finish(
             def_of(
                 "pg_subscription",
@@ -2481,6 +2484,61 @@ fn pg_publication_rel<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTa
             )?;
             count += 1;
         }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_replication_slots<'a>(
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_replication_slots",
+        &[
+            ("slot_name", ColType::Name),
+            ("plugin", ColType::Name),
+            ("slot_type", ColType::Text),
+            ("datoid", ColType::Int4),
+            ("database", ColType::Name),
+            ("temporary", ColType::Bool),
+            ("active", ColType::Bool),
+            ("active_pid", ColType::Int4),
+            ("xmin", ColType::Text),
+            ("catalog_xmin", ColType::Text),
+            ("restart_lsn", ColType::Text),
+            ("confirmed_flush_lsn", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, slot) in storage.replication_slots_with_slots() {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_replication_slots exceeds {} rows",
+                rows.len()
+            ));
+        }
+        let restart_lsn = stack_format!(32, "0/{:X}", slot.restart_lsn);
+        let confirmed_lsn = stack_format!(32, "0/{:X}", slot.confirmed_flush_lsn);
+        rows[count] = row(
+            &[
+                text(slot.name.as_str(), arena)?,
+                text("pgoutput", arena)?,
+                text("logical", arena)?,
+                Datum::Int4(5),
+                text("postgres", arena)?,
+                Datum::Bool(false),
+                Datum::Bool(slot.active),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                text(restart_lsn.as_str(), arena)?,
+                text(confirmed_lsn.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
     }
     finish(definition, &rows[..count], arena)
 }

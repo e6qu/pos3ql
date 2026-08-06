@@ -2788,6 +2788,18 @@ fn generate_series_table_function() {
         )),
         ["100"]
     );
+    // PostgreSQL's strict set-returning functions produce no rows when any
+    // bound is NULL; pg_dump reaches this shape while inspecting optional
+    // publication column lists.
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT count(*) FROM generate_series(0, array_upper(NULL::int2[], 1)) g"
+        )),
+        ["0"]
+    );
 }
 
 #[test]

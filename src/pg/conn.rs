@@ -32,6 +32,11 @@ use super::wire::{self, MsgIn, WireFull};
 /// Most parameters one Bind may carry.
 pub const MAX_BIND_PARAMS: usize = 32;
 
+/// Idle logical streams still need protocol traffic so a downstream can tell a
+/// quiet publisher from a dead connection. PostgreSQL's `k` frame carries that
+/// liveness signal; this fixed cadence is independent of client activity.
+const REPLICATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 fn reject_role_login(
     mode: AuthMode,
     role: crate::sql::RoleLogin,
@@ -103,8 +108,43 @@ struct ReplicationStream {
     /// pgoutput defaults to text; binary tuples require explicit negotiation.
     binary: bool,
     proto_version: u8,
+    /// Durable slot confirmation, advanced only by a valid standby flush.
     cursor_lsn: u64,
+    /// Connection-local send cursor. Reconnect starts again at `cursor_lsn`,
+    /// while a live stream must not re-emit an already queued transaction.
+    scan_lsn: u64,
     last_sent_lsn: u64,
+    last_message_at: Instant,
+    reply_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StandbyStatusUpdate {
+    flush_lsn: u64,
+    reply_requested: bool,
+}
+
+/// Decodes the complete physical-replication status envelope shared by
+/// logical CopyBoth streams. Acknowledgements describe one ordered receiver
+/// frontier: bytes written are at least bytes flushed, which are at least
+/// bytes applied.
+fn standby_status_update(payload: &[u8]) -> Option<StandbyStatusUpdate> {
+    if payload.len() != 34 || payload[0] != b'r' {
+        return None;
+    }
+    let write_lsn = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+    let flush_lsn = u64::from_be_bytes(payload[9..17].try_into().ok()?);
+    let apply_lsn = u64::from_be_bytes(payload[17..25].try_into().ok()?);
+    let _client_time = i64::from_be_bytes(payload[25..33].try_into().ok()?);
+    let reply_requested = match payload[33] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    (write_lsn >= flush_lsn && flush_lsn >= apply_lsn).then_some(StandbyStatusUpdate {
+        flush_lsn,
+        reply_requested,
+    })
 }
 
 /// Server-wide authentication context, fixed at startup.
@@ -1059,26 +1099,26 @@ impl Conn {
         match msg_type {
             wire::FMSG_COPY_DATA => {
                 let payload = &self.recv.readable()[5..total];
-                if payload.len() != 34 || payload[0] != b'r' {
+                let Some(status) = standby_status_update(payload) else {
                     return Step::Close;
-                }
-                let flush_lsn = u64::from_be_bytes(payload[9..17].try_into().unwrap());
+                };
                 let stream = self
                     .replication_stream
                     .as_mut()
                     .expect("active replication stream");
-                if flush_lsn > stream.last_sent_lsn {
+                if status.flush_lsn > stream.last_sent_lsn {
                     return Step::Close;
                 }
-                if flush_lsn > stream.cursor_lsn {
+                if status.flush_lsn > stream.cursor_lsn {
                     if engine
-                        .advance_replication_slot(stream.slot.as_str(), flush_lsn)
+                        .advance_replication_slot(stream.slot.as_str(), status.flush_lsn)
                         .is_err()
                     {
                         return Step::Close;
                     }
-                    stream.cursor_lsn = flush_lsn;
+                    stream.cursor_lsn = status.flush_lsn;
                 }
+                stream.reply_requested = status.reply_requested;
                 Step::Continue
             }
             wire::FMSG_FLUSH => Step::Continue,
@@ -1099,19 +1139,47 @@ impl Conn {
         };
         let mark = self.send.mark();
         let mut responder = Responder::new(&mut self.send);
+        let now = Instant::now();
         match engine.emit_replication_transaction(
-            stream.cursor_lsn,
+            stream.scan_lsn,
             stream.publication.as_str(),
             stream.binary,
             stream.proto_version,
             &mut self.copy_buf,
             &mut responder,
         ) {
-            Ok(Some(lsn)) => {
-                stream.last_sent_lsn = lsn;
+            Ok(Some((lsn, emitted))) => {
+                stream.scan_lsn = lsn;
+                if emitted {
+                    stream.last_sent_lsn = lsn;
+                    stream.last_message_at = now;
+                }
                 After::Continue
             }
-            Ok(None) => After::Continue,
+            Ok(None) => {
+                if !stream.reply_requested
+                    && now.duration_since(stream.last_message_at) < REPLICATION_KEEPALIVE_INTERVAL
+                {
+                    return After::Continue;
+                }
+                let (_, wal_end) = engine.replication_identity();
+                if responder
+                    .copy_data(&|message| {
+                        message.u8(b'k');
+                        message.i64(wal_end as i64);
+                        message.i64(crate::sql::datetime::now_micros());
+                        message.u8(u8::from(stream.reply_requested));
+                    })
+                    .is_err()
+                {
+                    self.send.truncate_to(mark);
+                    return After::Close;
+                }
+                stream.last_sent_lsn = stream.last_sent_lsn.max(wal_end);
+                stream.last_message_at = now;
+                stream.reply_requested = false;
+                After::Continue
+            }
             Err(_) => {
                 self.send.truncate_to(mark);
                 After::Close
@@ -1123,6 +1191,20 @@ impl Conn {
         if let Some(stream) = self.replication_stream.take() {
             engine.deactivate_replication_slot(stream.slot.as_str());
         }
+    }
+
+    /// The next time an idle CopyBoth stream must be serviced. This gives the
+    /// reactor an explicit wakeup edge instead of making replication liveness
+    /// depend on unrelated socket traffic.
+    pub(crate) fn replication_keepalive_remaining(&self) -> Option<Duration> {
+        let stream = self.replication_stream.as_ref()?;
+        if !self.send.is_empty() || stream.reply_requested {
+            return Some(Duration::ZERO);
+        }
+        Some(
+            REPLICATION_KEEPALIVE_INTERVAL
+                .saturating_sub(Instant::now().duration_since(stream.last_message_at)),
+        )
     }
 
     fn copy_data_chunk(&mut self, engine: &mut Engine, total: usize) {
@@ -2302,7 +2384,10 @@ impl Conn {
                         binary,
                         proto_version,
                         cursor_lsn,
+                        scan_lsn: cursor_lsn,
                         last_sent_lsn: cursor_lsn,
+                        last_message_at: Instant::now(),
+                        reply_requested: false,
                     });
                     if matches!(self.pump_replication(engine), After::Close) {
                         self.stop_replication(engine);
@@ -3169,5 +3254,30 @@ mod tests {
             ReplicationMode::None,
             "IDENTIFY_SYSTEM"
         ));
+    }
+
+    #[test]
+    fn standby_status_requires_an_ordered_complete_frontier() {
+        let mut status = [0_u8; 34];
+        status[0] = b'r';
+        status[1..9].copy_from_slice(&30_u64.to_be_bytes());
+        status[9..17].copy_from_slice(&20_u64.to_be_bytes());
+        status[17..25].copy_from_slice(&10_u64.to_be_bytes());
+        status[25..33].copy_from_slice(&42_i64.to_be_bytes());
+        status[33] = 1;
+        assert_eq!(
+            standby_status_update(&status),
+            Some(StandbyStatusUpdate {
+                flush_lsn: 20,
+                reply_requested: true,
+            })
+        );
+
+        status[17..25].copy_from_slice(&21_u64.to_be_bytes());
+        assert_eq!(standby_status_update(&status), None);
+        status[17..25].copy_from_slice(&10_u64.to_be_bytes());
+        status[33] = 2;
+        assert_eq!(standby_status_update(&status), None);
+        assert_eq!(standby_status_update(&status[..33]), None);
     }
 }

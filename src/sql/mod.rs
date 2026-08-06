@@ -827,7 +827,7 @@ impl Engine {
         proto_version: u8,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
-    ) -> Result<Option<u64>, SqlError> {
+    ) -> Result<Option<(u64, bool)>, SqlError> {
         let storage = &self.storage;
         let publication = storage.publication(publication_name).ok_or_else(|| {
             sql_err!(
@@ -836,7 +836,35 @@ impl Engine {
                 publication_name
             )
         })?;
+        let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
+            // Slot-confirmation records make replication progress durable but
+            // are publisher bookkeeping, not changes in a publication. If
+            // they crossed the pgoutput boundary, acknowledging one would
+            // generate another visible transaction indefinitely.
+            let mut at = 0usize;
+            let mut publication_change = false;
+            while at < transaction.len() {
+                let length =
+                    u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
+                let total = crate::wal::HEADER_LEN + length;
+                let operation = crate::wal::decode_record(&transaction[at + 16..at + total])
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt committed WAL record")
+                    })?;
+                if !matches!(
+                    operation,
+                    WalOp::Commit { .. } | WalOp::AdvanceReplicationSlot { .. }
+                ) {
+                    publication_change = true;
+                    break;
+                }
+                at += total;
+            }
+            if !publication_change {
+                return Ok(());
+            }
+            emitted = true;
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut truncates = [PendingTruncate {
@@ -1163,10 +1191,13 @@ impl Engine {
             if let Some(lsn) =
                 checkpointer.next_committed_wal_transaction(floor, scratch, &mut encode)?
             {
-                return Ok(Some(lsn));
+                return Ok(Some((lsn, emitted)));
             }
         }
-        self.wal.next_committed_after(floor, scratch, encode)
+        Ok(self
+            .wal
+            .next_committed_after(floor, scratch, encode)?
+            .map(|lsn| (lsn, emitted)))
     }
 
     /// Starts a transaction if none is active.

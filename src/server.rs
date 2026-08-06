@@ -299,6 +299,7 @@ impl Server {
             let timeout = [
                 checkpoint_timeout,
                 self.next_lock_wait_timeout(),
+                self.next_replication_keepalive_timeout(),
                 hedge_timeout,
             ]
             .into_iter()
@@ -506,6 +507,13 @@ impl Server {
         self.slots
             .iter()
             .filter_map(|slot| slot.conn.lock_wait_remaining())
+            .min()
+    }
+
+    fn next_replication_keepalive_timeout(&self) -> Option<Duration> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.conn.replication_keepalive_remaining())
             .min()
     }
 

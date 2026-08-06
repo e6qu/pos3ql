@@ -1,0 +1,5 @@
+[env]
+# The bounded engine/recovery fixture exceeds Rust's platform-default test
+# worker stack on some hosts. Keep the test command itself portable; CI and
+# local `cargo test` therefore exercise the same fixed envelope.
+RUST_MIN_STACK = { value = "16777216", force = true }

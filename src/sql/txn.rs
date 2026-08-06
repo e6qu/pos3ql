@@ -27,6 +27,7 @@ pub type PriorPending = Option<Option<RowLoc>>;
 pub struct Savepoint {
     pub name: StackStr<63>,
     pub touched_mark: usize,
+    pub truncate_mark: usize,
     pub ddl_mark: usize,
     pub statistics_mark: usize,
     pub wal_mark: usize,
@@ -48,6 +49,7 @@ pub struct Savepoint {
 #[derive(Clone, Copy)]
 pub(crate) struct StatementMark {
     pub touched: usize,
+    pub truncates: usize,
     pub ddl: usize,
     pub statistics: usize,
     pub wal: usize,
@@ -58,6 +60,20 @@ pub(crate) struct StatementMark {
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
+pub const MAX_TRUNCATE_TABLES: usize = 16;
+pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
+
+/// One SQL TRUNCATE command, retained until commit so durable logical
+/// decoding preserves its statement-level semantics instead of inferring them
+/// from the row deletes used by the heap.
+#[derive(Clone, Copy)]
+pub(crate) struct TruncateEvent {
+    pub command_id: u32,
+    pub tables: [u16; MAX_TRUNCATE_TABLES],
+    pub table_count: usize,
+    pub cascade: bool,
+    pub restart_identity: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnMode {
@@ -101,6 +117,8 @@ pub struct TxnState {
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
     touched: FixedVec<(u32, u64, PriorPending)>,
+    truncates: FixedVec<TruncateEvent>,
+    truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
     /// Transaction-private ANALYZE versions, kept outside `DdlUndo`. The
@@ -264,6 +282,12 @@ impl TxnState {
             snapshot_taken: false,
             command_id: 1,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
+            truncates: FixedVec::new(budget, "txn_truncates", MAX_TXN_DDL)?,
+            truncate_wal_tables: FixedBuf::new(
+                budget,
+                "txn_truncate_wal_tables",
+                MAX_TRUNCATE_WAL_TABLE_BYTES,
+            )?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
             statistics_undo: FixedVec::new(budget, "txn_statistics_undo", MAX_TXN_ANALYZE)?,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
@@ -364,6 +388,24 @@ impl TxnState {
 
     pub fn touched(&self) -> &[(u32, u64, PriorPending)] {
         &self.touched
+    }
+
+    pub(crate) fn record_truncate(&mut self, event: TruncateEvent) -> Result<(), SqlError> {
+        self.truncates.push(event).map_err(|_| {
+            sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction contains more than {} TRUNCATE commands",
+                MAX_TXN_DDL
+            )
+        })
+    }
+
+    pub(crate) fn truncates(&self) -> &[TruncateEvent] {
+        &self.truncates
+    }
+
+    pub(crate) fn truncate_wal_tables(&mut self) -> &mut FixedBuf {
+        &mut self.truncate_wal_tables
     }
 
     /// Buffers a NOTIFY, collapsing an identical (channel, payload) already
@@ -476,6 +518,7 @@ impl TxnState {
                 s
             },
             touched_mark: self.touched.len(),
+            truncate_mark: self.truncates.len(),
             ddl_mark: self.ddl.len(),
             statistics_mark: self.statistics_undo.len(),
             wal_mark,
@@ -497,6 +540,7 @@ impl TxnState {
     pub(crate) fn statement_mark(&self, wal: usize, lock: u64) -> StatementMark {
         StatementMark {
             touched: self.touched.len(),
+            truncates: self.truncates.len(),
             ddl: self.ddl.len(),
             statistics: self.statistics_undo.len(),
             wal,
@@ -540,6 +584,12 @@ impl TxnState {
     pub fn rewind_touched(&mut self, touched_mark: usize) {
         while self.touched.len() > touched_mark {
             self.touched.pop();
+        }
+    }
+
+    pub(crate) fn rewind_truncates(&mut self, truncate_mark: usize) {
+        while self.truncates.len() > truncate_mark {
+            self.truncates.pop();
         }
     }
 
@@ -594,6 +644,8 @@ impl TxnState {
         self.snapshot_lsn = None;
         self.snapshot_taken = false;
         self.touched.clear();
+        self.truncates.clear();
+        self.truncate_wal_tables.clear();
         self.ddl.clear();
         self.statistics_undo.clear();
         self.savepoints.clear();

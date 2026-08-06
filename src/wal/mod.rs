@@ -78,7 +78,8 @@ const KIND_COMMIT: u8 = 37;
 const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
-const LAST_KIND: u8 = KIND_ADVANCE_REPLICATION_SLOT;
+const KIND_TRUNCATE: u8 = 41;
+const LAST_KIND: u8 = KIND_TRUNCATE;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -287,6 +288,7 @@ pub(crate) enum WalOp<'a> {
         /// The previous committed image, retained for pgoutput's replica
         /// identity tuple. Inserts carry no old image.
         old_row: Option<&'a [u8]>,
+        command_id: u32,
     },
     Delete {
         schema: &'a str,
@@ -295,6 +297,18 @@ pub(crate) enum WalOp<'a> {
         /// The removed committed image, retained for pgoutput's replica
         /// identity tuple.
         old_row: Option<&'a [u8]>,
+        command_id: u32,
+    },
+    /// Statement-level logical change. Heap rows remain separate DELETE WAL
+    /// records for recovery; the command lets pgoutput publish the protocol's
+    /// compact truncate message without guessing from those records.
+    Truncate {
+        /// Length-prefixed schema/table pairs, excluding the count byte.
+        tables: &'a [u8],
+        table_count: usize,
+        cascade: bool,
+        restart_identity: bool,
+        command_id: u32,
     },
     CreateView {
         schema: &'a str,
@@ -1137,6 +1151,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
         WalOp::Delete { .. } => KIND_DELETE,
+        WalOp::Truncate { .. } => KIND_TRUNCATE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
@@ -1244,13 +1259,17 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + schema.len()
                 + 2
                 + old_row.map_or(0, |old| 4 + old.len())
+                + 4
         }
         WalOp::Delete {
             schema,
             table,
             old_row,
             ..
-        } => 1 + table.len() + 8 + 1 + schema.len() + 1 + old_row.map_or(0, |old| 4 + old.len()),
+        } => {
+            1 + table.len() + 8 + 1 + schema.len() + 1 + old_row.map_or(0, |old| 4 + old.len()) + 4
+        }
+        WalOp::Truncate { tables, .. } => 1 + tables.len() + 1 + 4,
         WalOp::CreateView {
             schema,
             name,
@@ -1532,6 +1551,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             row,
             is_update,
             old_row,
+            command_id,
         } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
@@ -1543,12 +1563,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && old_row.is_none_or(|old| {
                     buffer.append(&(old.len() as u32).to_le_bytes()) && buffer.append(old)
                 })
+                && buffer.append(&command_id.to_le_bytes())
         }
         WalOp::Delete {
             schema,
             table,
             rowid,
             old_row,
+            command_id,
         } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
@@ -1557,6 +1579,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && old_row.is_none_or(|old| {
                     buffer.append(&(old.len() as u32).to_le_bytes()) && buffer.append(old)
                 })
+                && buffer.append(&command_id.to_le_bytes())
+        }
+        WalOp::Truncate {
+            tables,
+            table_count,
+            cascade,
+            restart_identity,
+            command_id,
+        } => {
+            *table_count <= u8::MAX as usize
+                && buffer.append(&[*table_count as u8])
+                && buffer.append(tables)
+                && buffer.append(&[u8::from(*cascade) | (u8::from(*restart_identity) << 1)])
+                && buffer.append(&command_id.to_le_bytes())
         }
         WalOp::CreateView {
             schema,
@@ -2319,6 +2355,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 };
                 (is_update, old_row)
             };
+            let command_id = if at == payload.len() {
+                0
+            } else {
+                let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                command_id
+            };
             (at == payload.len()).then_some(WalOp::Upsert {
                 schema,
                 table,
@@ -2326,6 +2369,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 row,
                 is_update,
                 old_row,
+                command_id,
             })
         }
         KIND_DELETE => {
@@ -2353,11 +2397,46 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     None
                 }
             };
+            let command_id = if at == payload.len() {
+                0
+            } else {
+                let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                command_id
+            };
             (at == payload.len()).then_some(WalOp::Delete {
                 schema,
                 table,
                 rowid,
                 old_row,
+                command_id,
+            })
+        }
+        KIND_TRUNCATE => {
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            if count > crate::sql::txn::MAX_TRUNCATE_TABLES {
+                return None;
+            }
+            let tables_start = at;
+            for _ in 0..count {
+                let _ = take_name(&mut at)?;
+                let _ = take_name(&mut at)?;
+            }
+            let tables_end = at;
+            let flags = *payload.get(at)?;
+            at += 1;
+            if flags & !3 != 0 {
+                return None;
+            }
+            let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            (at == payload.len()).then_some(WalOp::Truncate {
+                tables: &payload[tables_start..tables_end],
+                table_count: count,
+                cascade: flags & 1 != 0,
+                restart_identity: flags & 2 != 0,
+                command_id,
             })
         }
         KIND_CREATE_VIEW => {
@@ -3367,6 +3446,7 @@ mod tests {
                     row: b"ROWBYTES",
                     is_update: false,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3377,6 +3457,7 @@ mod tests {
                     table: "t",
                     rowid: 1,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3652,6 +3733,7 @@ mod tests {
                     table: "late",
                     rowid: 1,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3664,6 +3746,7 @@ mod tests {
                     table: "savepoint_discarded",
                     rowid: 2,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3676,6 +3759,7 @@ mod tests {
                     table: "middle",
                     rowid: 20,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3687,6 +3771,7 @@ mod tests {
                     table: "rolled_back",
                     rowid: 30,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3723,6 +3808,7 @@ mod tests {
             table: "t",
             rowid: 1,
             old_row: None,
+            command_id: 0,
         };
         wal.stage(1, 1, &operation).unwrap();
         wal.stage(2, 2, &operation).unwrap();
@@ -3730,6 +3816,43 @@ mod tests {
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         wal.discard_stage(1);
         wal.stage(3, 3, &operation).unwrap();
+    }
+
+    #[test]
+    fn truncate_round_trips_as_a_statement_event() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "truncate wal", 1024).unwrap();
+        let expected_tables = [
+            6, b'p', b'u', b'b', b'l', b'i', b'c', 5, b'f', b'i', b'r', b's', b't', 5, b'a', b'u',
+            b'd', b'i', b't', 6, b's', b'e', b'c', b'o', b'n', b'd',
+        ];
+        append_record(
+            &mut buffer,
+            9,
+            &WalOp::Truncate {
+                tables: &expected_tables,
+                table_count: 2,
+                cascade: true,
+                restart_identity: true,
+                command_id: 17,
+            },
+        )
+        .unwrap();
+        let WalOp::Truncate {
+            tables,
+            table_count,
+            cascade,
+            restart_identity,
+            command_id,
+        } = decode_record(&buffer.readable()[16..]).unwrap()
+        else {
+            panic!("expected truncate WAL operation")
+        };
+        assert_eq!(table_count, 2);
+        assert_eq!(tables, expected_tables);
+        assert!(cascade);
+        assert!(restart_identity);
+        assert_eq!(command_id, 17);
     }
 
     #[test]
@@ -3747,6 +3870,7 @@ mod tests {
                         table: "t",
                         rowid: lsn,
                         old_row: None,
+                        command_id: 0,
                     },
                 )
                 .unwrap();
@@ -3762,6 +3886,7 @@ mod tests {
                 table: "t",
                 rowid: 1,
                 old_row: None,
+                command_id: 0,
             });
         bytes[record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
@@ -3791,6 +3916,7 @@ mod tests {
                         table: "t",
                         rowid: lsn,
                         old_row: None,
+                        command_id: 0,
                     },
                 )
                 .unwrap();
@@ -3820,6 +3946,7 @@ mod tests {
                         table: "t",
                         rowid: lsn,
                         old_row: None,
+                        command_id: 0,
                     },
                 )
                 .unwrap();
@@ -3834,6 +3961,7 @@ mod tests {
                     table: "t",
                     rowid: 11,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3844,6 +3972,7 @@ mod tests {
                     table: "t",
                     rowid: 12,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap();
@@ -3878,6 +4007,7 @@ mod tests {
                     row: &[0u8; 32],
                     is_update: false,
                     old_row: None,
+                    command_id: 0,
                 },
             ) {
                 Ok(()) => {}
@@ -3906,6 +4036,7 @@ mod tests {
                     row: &big,
                     is_update: false,
                     old_row: None,
+                    command_id: 0,
                 },
             )
             .unwrap_err();
@@ -3928,6 +4059,7 @@ mod tests {
                         table: "t",
                         rowid: lsn,
                         old_row: None,
+                        command_id: 0,
                     },
                 )
                 .unwrap();
@@ -3951,6 +4083,7 @@ mod tests {
                 table: "t",
                 rowid: 1,
                 old_row: None,
+                command_id: 0,
             },
         )
         .unwrap();

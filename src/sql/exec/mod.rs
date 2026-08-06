@@ -12264,12 +12264,25 @@ pub fn truncate(
             }
         }
     }
+    let mut truncated_tables = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
+    for (position, &table_index) in list[..n].iter().enumerate() {
+        truncated_tables[position] = table_index as u16;
+    }
+    if let Err(error) = txn.record_truncate(crate::sql::txn::TruncateEvent {
+        command_id: txn.command_id(),
+        tables: truncated_tables,
+        table_count: n,
+        cascade,
+        restart_identity,
+    }) {
+        return sql_fail(error);
+    }
     responder.command_complete("TRUNCATE TABLE")?;
     sql_ok()
 }
 
 /// The most tables one TRUNCATE can name, its CASCADE closure included.
-const MAX_TRUNCATE_TABLES: usize = 16;
+const MAX_TRUNCATE_TABLES: usize = crate::sql::txn::MAX_TRUNCATE_TABLES;
 
 /// ALTER TABLE, autocommit-only: rewrites are journaled as DROP, CREATE,
 /// full re-UPSERT within one WAL batch, so replay reproduces the new
@@ -13418,6 +13431,7 @@ fn alter_table_inner(
                 row: storage.heap.get(new_loc),
                 is_update: false,
                 old_row: None,
+                command_id: txn.command_id(),
             },
         ) {
             return sql_fail(e);

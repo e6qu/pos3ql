@@ -102,6 +102,7 @@ struct ReplicationStream {
     publication: StackStr<63>,
     /// pgoutput defaults to text; binary tuples require explicit negotiation.
     binary: bool,
+    proto_version: u8,
     cursor_lsn: u64,
     last_sent_lsn: u64,
 }
@@ -1102,6 +1103,7 @@ impl Conn {
             stream.cursor_lsn,
             stream.publication.as_str(),
             stream.binary,
+            stream.proto_version,
             &mut self.copy_buf,
             &mut responder,
         ) {
@@ -2276,6 +2278,7 @@ impl Conn {
                     name,
                     publication,
                     binary,
+                    proto_version,
                 }) => {
                     let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
                         Ok(lsn) => lsn,
@@ -2297,6 +2300,7 @@ impl Conn {
                         slot: name,
                         publication,
                         binary,
+                        proto_version,
                         cursor_lsn,
                         last_sent_lsn: cursor_lsn,
                     });
@@ -2415,6 +2419,7 @@ enum LogicalReplicationCommand {
         name: SqlName,
         publication: StackStr<63>,
         binary: bool,
+        proto_version: u8,
     },
 }
 
@@ -2477,7 +2482,7 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
                 "logical START_REPLICATION currently requires LSN 0/0"
             ));
         }
-        let (publication, binary) = parse_pgoutput_options(input)?;
+        let (publication, binary, proto_version) = parse_pgoutput_options(input)?;
         let mut publication_name = StackStr::new();
         use core::fmt::Write;
         write!(publication_name, "{publication}").map_err(|_| {
@@ -2490,6 +2495,7 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
             name: SqlName::parse(name)?,
             publication: publication_name,
             binary,
+            proto_version,
         });
     }
     if !command.eq_ignore_ascii_case("create_replication_slot") {
@@ -2565,7 +2571,7 @@ fn is_valid_lsn(value: &str) -> bool {
 /// Parses pgoutput's parenthesized option list without accepting ignored
 /// keys. Values are SQL-style single-quoted strings; the bounded publication
 /// name is copied only after every option has been validated.
-fn parse_pgoutput_options(input: &str) -> Result<(&str, bool), SqlError> {
+fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
     let mut input = input.trim();
     let Some(body) = input.strip_prefix('(') else {
         return Err(sql_err!(
@@ -2665,12 +2671,16 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool), SqlError> {
             ));
         }
     }
-    if proto_version != Some("1") {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "only pgoutput proto_version '1' is supported"
-        ));
-    }
+    let proto_version = match proto_version {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "pgoutput requires proto_version '1' or '2'"
+            ));
+        }
+    };
     let publication = publication.ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -2683,7 +2693,7 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool), SqlError> {
             "only one logical pgoutput publication is supported"
         ));
     }
-    Ok((publication, binary))
+    Ok((publication, binary, proto_version))
 }
 
 fn is_replication_slot_name(name: &str) -> bool {
@@ -3088,6 +3098,7 @@ mod tests {
             name,
             publication,
             binary,
+            proto_version,
         } = command
         else {
             panic!("expected START_REPLICATION")
@@ -3095,6 +3106,7 @@ mod tests {
         assert_eq!(name.as_str(), "changes");
         assert_eq!(publication.as_str(), "changes_pub");
         assert!(!binary);
+        assert_eq!(proto_version, 1);
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'true', proto_version '1')",
         )
@@ -3103,6 +3115,14 @@ mod tests {
             panic!("expected START_REPLICATION")
         };
         assert!(binary);
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { proto_version, .. } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        assert_eq!(proto_version, 2);
         assert!(
             parse_logical_replication_command(
                 "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1')"
@@ -3110,7 +3130,7 @@ mod tests {
             .is_err()
         );
         for input in [
-            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '3', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', streaming 'true')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/1 (proto_version '1', publication_names 'changes_pub')",

@@ -380,6 +380,91 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingTruncate {
+    command_id: u32,
+    table_slots: [u16; crate::sql::txn::MAX_TRUNCATE_TABLES],
+    table_count: usize,
+    cascade: bool,
+    restart_identity: bool,
+    emitted: bool,
+}
+
+fn emit_pending_truncates(
+    storage: &Storage,
+    publication: &crate::storage::PublicationDef,
+    proto_version: u8,
+    end_lsn: u64,
+    command_id: u32,
+    truncates: &mut [PendingTruncate],
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    for truncate in truncates {
+        if truncate.emitted || truncate.command_id > command_id {
+            continue;
+        }
+        let mut relation_ids = [0_u32; crate::sql::txn::MAX_TRUNCATE_TABLES];
+        let mut relation_count = 0usize;
+        for &table_slot in &truncate.table_slots[..truncate.table_count] {
+            let table_slot = table_slot as usize;
+            let selected = publication.all_tables
+                || publication.tables[..publication.table_count].contains(&(table_slot as u16));
+            if !selected || !publication.publish_truncate {
+                continue;
+            }
+            let definition = storage.table_def(table_slot, 0);
+            let relation_id = table_slot as u32 + 1;
+            responder
+                .copy_data(&|message| {
+                    pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                        pgoutput::relation(
+                            plugin,
+                            relation_id,
+                            definition.schema.as_str(),
+                            definition.name.as_str(),
+                            definition.columns(),
+                        )
+                    })
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "replication transaction exceeds connection send buffer"
+                    )
+                })?;
+            relation_ids[relation_count] = relation_id;
+            relation_count += 1;
+        }
+        if relation_count != 0 {
+            if proto_version < 2 {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "pgoutput proto_version '2' is required for TRUNCATE"
+                ));
+            }
+            responder
+                .copy_data(&|message| {
+                    pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                        pgoutput::truncate(
+                            plugin,
+                            &relation_ids[..relation_count],
+                            truncate.cascade,
+                            truncate.restart_identity,
+                        )
+                    })
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "replication transaction exceeds connection send buffer"
+                    )
+                })?;
+        }
+        truncate.emitted = true;
+    }
+    Ok(())
+}
+
 impl Engine {
     pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
         let slot = self.storage.find_role(name)?;
@@ -739,6 +824,7 @@ impl Engine {
         floor: u64,
         publication_name: &str,
         binary: bool,
+        proto_version: u8,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<u64>, SqlError> {
@@ -753,6 +839,15 @@ impl Engine {
         let mut encode = |end_lsn, transaction: &[u8]| {
             let mut at = 0usize;
             let mut transaction_id = 0u32;
+            let mut truncates = [PendingTruncate {
+                command_id: 0,
+                table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
+                table_count: 0,
+                cascade: false,
+                restart_identity: false,
+                emitted: false,
+            }; crate::sql::txn::MAX_TXN_DDL];
+            let mut truncate_count = 0usize;
             while at < transaction.len() {
                 let length =
                     u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
@@ -761,6 +856,84 @@ impl Engine {
                     crate::wal::decode_record(&transaction[at + 16..at + total])
                 {
                     transaction_id = id;
+                }
+                if let Some(WalOp::Truncate {
+                    tables,
+                    table_count,
+                    cascade,
+                    restart_identity,
+                    command_id,
+                }) = crate::wal::decode_record(&transaction[at + 16..at + total])
+                {
+                    if truncate_count == truncates.len() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "replication transaction contains too many TRUNCATE commands"
+                        ));
+                    }
+                    let mut table_slots = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
+                    let mut table_at = 0usize;
+                    for table_slot in &mut table_slots[..table_count] {
+                        let schema_length = *tables.get(table_at).ok_or_else(|| {
+                            sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt truncate WAL schema")
+                        })? as usize;
+                        table_at += 1;
+                        let schema = core::str::from_utf8(
+                            tables
+                                .get(table_at..table_at + schema_length)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROTOCOL_VIOLATION,
+                                        "corrupt truncate WAL schema"
+                                    )
+                                })?,
+                        )
+                        .map_err(|_| {
+                            sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt truncate WAL schema")
+                        })?;
+                        table_at += schema_length;
+                        let table_length = *tables.get(table_at).ok_or_else(|| {
+                            sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt truncate WAL table")
+                        })? as usize;
+                        table_at += 1;
+                        let table = core::str::from_utf8(
+                            tables
+                                .get(table_at..table_at + table_length)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROTOCOL_VIOLATION,
+                                        "corrupt truncate WAL table"
+                                    )
+                                })?,
+                        )
+                        .map_err(|_| {
+                            sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt truncate WAL table")
+                        })?;
+                        table_at += table_length;
+                        let Some(found_table_slot) = storage.find_table(schema, table) else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "replication WAL refers to unknown table \"{}\"",
+                                table
+                            ));
+                        };
+                        *table_slot = found_table_slot as u16;
+                    }
+                    if table_at != tables.len() {
+                        return Err(sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "corrupt truncate WAL table list"
+                        ));
+                    }
+                    truncates[truncate_count] = PendingTruncate {
+                        command_id,
+                        table_slots,
+                        table_count,
+                        cascade,
+                        restart_identity,
+                        emitted: false,
+                    };
+                    truncate_count += 1;
                 }
                 at += total;
             }
@@ -794,8 +967,18 @@ impl Engine {
                         row,
                         is_update,
                         old_row,
+                        command_id,
                         ..
                     } => {
+                        emit_pending_truncates(
+                            storage,
+                            publication,
+                            proto_version,
+                            end_lsn,
+                            command_id,
+                            &mut truncates[..truncate_count],
+                            responder,
+                        )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_TABLE,
@@ -879,6 +1062,7 @@ impl Engine {
                         schema,
                         table,
                         old_row,
+                        command_id,
                         ..
                     } => {
                         let Some(table_slot) = storage.find_table(schema, table) else {
@@ -891,7 +1075,22 @@ impl Engine {
                         let selected = publication.all_tables
                             || publication.tables[..publication.table_count]
                                 .contains(&(table_slot as u16));
-                        if selected && publication.publish_delete {
+                        let suppressed_by_truncate =
+                            truncates[..truncate_count].iter().any(|truncate| {
+                                truncate.command_id >= command_id
+                                    && truncate.table_slots[..truncate.table_count]
+                                        .contains(&(table_slot as u16))
+                            });
+                        if selected && publication.publish_delete && !suppressed_by_truncate {
+                            emit_pending_truncates(
+                                storage,
+                                publication,
+                                proto_version,
+                                end_lsn,
+                                command_id,
+                                &mut truncates[..truncate_count],
+                                responder,
+                            )?;
                             let old = old_row.ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::PROTOCOL_VIOLATION,
@@ -935,10 +1134,20 @@ impl Engine {
                                 .map_err(|_| overflow())?;
                         }
                     }
+                    WalOp::Truncate { .. } => {}
                     _ => {}
                 }
                 at += total;
             }
+            emit_pending_truncates(
+                storage,
+                publication,
+                proto_version,
+                end_lsn,
+                u32::MAX,
+                &mut truncates[..truncate_count],
+                responder,
+            )?;
             responder
                 .copy_data(&|message| {
                     pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
@@ -998,6 +1207,34 @@ impl Engine {
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
         self.storage.release_row_locks(txn.txid);
+        for event_index in 0..txn.truncates().len() {
+            let event = txn.truncates()[event_index];
+            let transaction_id = txn.txid;
+            let tables = txn.truncate_wal_tables();
+            tables.clear();
+            for &table_slot in &event.tables[..event.table_count] {
+                let definition = self.storage.table_def(table_slot as usize, transaction_id);
+                for name in [definition.schema.as_str(), definition.name.as_str()] {
+                    assert!(tables.append(&[name.len() as u8]) && tables.append(name.as_bytes()));
+                }
+            }
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                transaction_id,
+                lsn,
+                &WalOp::Truncate {
+                    tables: tables.readable(),
+                    table_count: event.table_count,
+                    cascade: event.cascade,
+                    restart_identity: event.restart_identity,
+                    command_id: event.command_id,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
             // A row may be written several times in one transaction; journal
@@ -1036,6 +1273,7 @@ impl Engine {
                                     row: self.storage.heap.get(loc),
                                     is_update: true,
                                     old_row: Some(old_row),
+                                    command_id: p.cid,
                                 },
                             )
                         })
@@ -1050,6 +1288,7 @@ impl Engine {
                         row: self.storage.heap.get(loc),
                         is_update: false,
                         old_row: None,
+                        command_id: p.cid,
                     },
                 ),
                 (None, Some(old_home)) => {
@@ -1063,6 +1302,7 @@ impl Engine {
                                     table: name.as_str(),
                                     rowid,
                                     old_row: Some(old_row),
+                                    command_id: p.cid,
                                 },
                             )
                         })
@@ -1812,6 +2052,7 @@ impl Engine {
                 .rollback_table_statistics(txn.statistics_undo()[index].table as usize, txn.txid);
         }
         txn.rewind_touched(mark.touched);
+        txn.rewind_truncates(mark.truncates);
         txn.rewind_ddl(mark.ddl);
         txn.rewind_statistics(mark.statistics);
         txn.rewind_notifications(
@@ -1842,6 +2083,7 @@ impl Engine {
                 .rollback_table_statistics(undo.table as usize, txn.txid);
         }
         txn.rewind_touched(sp.touched_mark);
+        txn.rewind_truncates(sp.truncate_mark);
         txn.rewind_ddl(sp.ddl_mark);
         txn.rewind_statistics(sp.statistics_mark);
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
@@ -3450,12 +3692,14 @@ impl Engine {
                     row: self.storage.heap.get(location),
                     is_update: false,
                     old_row: None,
+                    command_id: pending.cid,
                 },
                 None => WalOp::Delete {
                     schema: table_definition.schema.as_str(),
                     table: table_definition.name.as_str(),
                     rowid,
                     old_row: None,
+                    command_id: pending.cid,
                 },
             };
             records = records.saturating_add(1);
@@ -5089,6 +5333,7 @@ fn requalify_schema_element<'a>(
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
         WalOp::Commit { .. } => {}
+        WalOp::Truncate { .. } => {}
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             storage.create_replication_slot(crate::storage::SqlName::parse(name)?, restart_lsn)?;
         }

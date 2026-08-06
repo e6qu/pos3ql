@@ -111,8 +111,6 @@ std::thread_local! {
     /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
     /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
     static DEADLINE: Cell<i64> = const { Cell::new(0) };
-    /// Amortizes the clock read in [`check_timeout`] to roughly 1 in 1024 calls.
-    static TICK: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Arms `statement_timeout` for the current statement (`timeout_ms == 0` clears
@@ -131,19 +129,13 @@ pub fn disarm_timeout() {
     DEADLINE.with(|d| d.set(0));
 }
 
-/// Errors 57014 if the armed statement deadline has passed. Called at scan
-/// boundaries; the clock is only read about once per 1024 calls.
+/// Errors 57014 if the armed statement deadline has passed. Every scan
+/// boundary reads the deadline: amortization can turn an expired statement
+/// into a successful partial result when a small outer scan owns a huge inner
+/// nested loop.
 pub fn check_timeout() -> Result<(), SqlError> {
     let dl = DEADLINE.with(|d| d.get());
     if dl == 0 {
-        return Ok(());
-    }
-    let t = TICK.with(|c| {
-        let v = c.get().wrapping_add(1);
-        c.set(v);
-        v
-    });
-    if !t.is_multiple_of(1024) {
         return Ok(());
     }
     if super::datetime::now_micros() >= dl {

@@ -828,6 +828,55 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// Reads the earliest whole committed transaction after `floor` from the
+    /// retained object-store WAL. The transaction is rebuilt in the caller's
+    /// fixed buffer using the ordinary journal frame layout, so live logical
+    /// decoding and startup recovery validate the same record boundary.
+    pub(crate) fn next_committed_wal_transaction(
+        &mut self,
+        floor: u64,
+        scratch: &mut FixedBuf,
+        mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    ) -> Result<Option<u64>, SqlError> {
+        scratch.clear();
+        let mut complete_lsn = None;
+        self.replay_wal_segments(floor, |lsn, record| {
+            if complete_lsn.is_some() {
+                return Ok(());
+            }
+            let payload_len = record.len().checked_sub(8).ok_or_else(|| {
+                sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt uploaded WAL record")
+            })?;
+            let total = crate::wal::HEADER_LEN + payload_len;
+            if scratch.capacity() - scratch.len() < total {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "one committed WAL transaction exceeds replication buffer"
+                ));
+            }
+            let mut header = [0u8; crate::wal::HEADER_LEN];
+            header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+            header[8..16].copy_from_slice(&lsn.to_le_bytes());
+            header[16..].copy_from_slice(record);
+            assert!(scratch.append(&header));
+            if matches!(
+                crate::wal::decode_record(record),
+                Some(crate::wal::WalOp::Commit { .. })
+            ) {
+                complete_lsn = Some(lsn);
+            }
+            Ok(())
+        })
+        .map_err(|error| sql_err!(sqlstate::IO_ERROR, "logical WAL read failed: {error}"))?;
+        let Some(end_lsn) = complete_lsn else {
+            scratch.clear();
+            return Ok(None);
+        };
+        apply(end_lsn, scratch.readable())?;
+        scratch.clear();
+        Ok(Some(end_lsn))
+    }
+
     /// Deletes uploaded WAL segments whose records are entirely covered by
     /// the current manifest LSN. Called after a checkpoint.
     pub(crate) fn prune_wal_segments(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {

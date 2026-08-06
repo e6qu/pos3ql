@@ -32,7 +32,8 @@ use crate::storage::{
 
 use crc32c::crc32c;
 
-const HEADER_LEN: usize = 24;
+/// On-disk record header length shared by recovery and logical decoding.
+pub(crate) const HEADER_LEN: usize = 24;
 const TABLE_STATISTICS_V2: u8 = u8::MAX;
 
 const KIND_CREATE: u8 = 1;
@@ -281,11 +282,19 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         rowid: u64,
         row: &'a [u8],
+        /// True when this replaces a committed row rather than inserting one.
+        is_update: bool,
+        /// The previous committed image, retained for pgoutput's replica
+        /// identity tuple. Inserts carry no old image.
+        old_row: Option<&'a [u8]>,
     },
     Delete {
         schema: &'a str,
         table: &'a str,
         rowid: u64,
+        /// The removed committed image, retained for pgoutput's replica
+        /// identity tuple.
+        old_row: Option<&'a [u8]>,
     },
     CreateView {
         schema: &'a str,
@@ -983,8 +992,8 @@ impl Wal {
 
     /// Reads one complete transaction strictly newer than `floor` without
     /// changing recovery state. `scratch` is caller-owned fixed storage: the
-    /// callback runs only after the transaction's Commit record has passed
-    /// CRC and framing validation.
+    /// callback receives the complete framed transaction only after its Commit
+    /// record has passed CRC and framing validation.
     pub fn next_committed_after(
         &self,
         floor: u64,
@@ -1049,15 +1058,7 @@ impl Wal {
             if header[16] != KIND_COMMIT {
                 continue;
             }
-            let mut at = 0usize;
-            while at < scratch.len() {
-                let record = &scratch.readable()[at..];
-                let payload_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as usize;
-                let total = HEADER_LEN + payload_len;
-                let lsn = u64::from_le_bytes(record[8..16].try_into().unwrap());
-                apply(lsn, &record[16..total])?;
-                at += total;
-            }
+            apply(lsn, scratch.readable())?;
             scratch.clear();
             return Ok(Some(lsn));
         }
@@ -1229,9 +1230,27 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + previous_schema.len() + 1 + previous_name.len() + column_mapping.len() * 2,
         WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::Upsert {
-            schema, table, row, ..
-        } => 1 + table.len() + 8 + 4 + row.len() + 1 + schema.len(),
-        WalOp::Delete { schema, table, .. } => 1 + table.len() + 8 + 1 + schema.len(),
+            schema,
+            table,
+            row,
+            old_row,
+            ..
+        } => {
+            1 + table.len()
+                + 8
+                + 4
+                + row.len()
+                + 1
+                + schema.len()
+                + 2
+                + old_row.map_or(0, |old| 4 + old.len())
+        }
+        WalOp::Delete {
+            schema,
+            table,
+            old_row,
+            ..
+        } => 1 + table.len() + 8 + 1 + schema.len() + 1 + old_row.map_or(0, |old| 4 + old.len()),
         WalOp::CreateView {
             schema,
             name,
@@ -1511,21 +1530,33 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             rowid,
             row,
+            is_update,
+            old_row,
         } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && buffer.append(&(row.len() as u32).to_le_bytes())
                 && buffer.append(row)
                 && name_bytes(buffer, schema)
+                && buffer.append(&[u8::from(*is_update)])
+                && buffer.append(&[u8::from(old_row.is_some())])
+                && old_row.is_none_or(|old| {
+                    buffer.append(&(old.len() as u32).to_le_bytes()) && buffer.append(old)
+                })
         }
         WalOp::Delete {
             schema,
             table,
             rowid,
+            old_row,
         } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && name_bytes(buffer, schema)
+                && buffer.append(&[u8::from(old_row.is_some())])
+                && old_row.is_none_or(|old| {
+                    buffer.append(&(old.len() as u32).to_le_bytes()) && buffer.append(old)
+                })
         }
         WalOp::CreateView {
             schema,
@@ -2269,11 +2300,32 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 "public"
             };
+            let (is_update, old_row) = if at == payload.len() {
+                (false, None)
+            } else {
+                let is_update = *payload.get(at)? != 0;
+                at += 1;
+                let has_old = *payload.get(at)? != 0;
+                at += 1;
+                let old_row = if has_old {
+                    let length =
+                        u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                    at += 4;
+                    let old = payload.get(at..at + length)?;
+                    at += length;
+                    Some(old)
+                } else {
+                    None
+                };
+                (is_update, old_row)
+            };
             (at == payload.len()).then_some(WalOp::Upsert {
                 schema,
                 table,
                 rowid,
                 row,
+                is_update,
+                old_row,
             })
         }
         KIND_DELETE => {
@@ -2285,10 +2337,27 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 "public"
             };
+            let old_row = if at == payload.len() {
+                None
+            } else {
+                let has_old = *payload.get(at)? != 0;
+                at += 1;
+                if has_old {
+                    let length =
+                        u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                    at += 4;
+                    let old = payload.get(at..at + length)?;
+                    at += length;
+                    Some(old)
+                } else {
+                    None
+                }
+            };
             (at == payload.len()).then_some(WalOp::Delete {
                 schema,
                 table,
                 rowid,
+                old_row,
             })
         }
         KIND_CREATE_VIEW => {
@@ -3296,6 +3365,8 @@ mod tests {
                     table: "t",
                     rowid: 1,
                     row: b"ROWBYTES",
+                    is_update: false,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3305,6 +3376,7 @@ mod tests {
                     schema: "public",
                     table: "t",
                     rowid: 1,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3579,6 +3651,7 @@ mod tests {
                     schema: "public",
                     table: "late",
                     rowid: 1,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3590,6 +3663,7 @@ mod tests {
                     schema: "public",
                     table: "savepoint_discarded",
                     rowid: 2,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3601,6 +3675,7 @@ mod tests {
                     schema: "public",
                     table: "middle",
                     rowid: 20,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3611,6 +3686,7 @@ mod tests {
                     schema: "public",
                     table: "rolled_back",
                     rowid: 30,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3646,6 +3722,7 @@ mod tests {
             schema: "public",
             table: "t",
             rowid: 1,
+            old_row: None,
         };
         wal.stage(1, 1, &operation).unwrap();
         wal.stage(2, 2, &operation).unwrap();
@@ -3669,6 +3746,7 @@ mod tests {
                         schema: "public",
                         table: "t",
                         rowid: lsn,
+                        old_row: None,
                     },
                 )
                 .unwrap();
@@ -3683,6 +3761,7 @@ mod tests {
                 schema: "public",
                 table: "t",
                 rowid: 1,
+                old_row: None,
             });
         bytes[record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
@@ -3711,6 +3790,7 @@ mod tests {
                         schema: "public",
                         table: "t",
                         rowid: lsn,
+                        old_row: None,
                     },
                 )
                 .unwrap();
@@ -3739,6 +3819,7 @@ mod tests {
                         schema: "public",
                         table: "t",
                         rowid: lsn,
+                        old_row: None,
                     },
                 )
                 .unwrap();
@@ -3752,6 +3833,7 @@ mod tests {
                     schema: "public",
                     table: "t",
                     rowid: 11,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3761,6 +3843,7 @@ mod tests {
                     schema: "public",
                     table: "t",
                     rowid: 12,
+                    old_row: None,
                 },
             )
             .unwrap();
@@ -3793,6 +3876,8 @@ mod tests {
                     table: "t",
                     rowid: lsn,
                     row: &[0u8; 32],
+                    is_update: false,
+                    old_row: None,
                 },
             ) {
                 Ok(()) => {}
@@ -3819,6 +3904,8 @@ mod tests {
                     table: "t",
                     rowid: 1,
                     row: &big,
+                    is_update: false,
+                    old_row: None,
                 },
             )
             .unwrap_err();
@@ -3840,6 +3927,7 @@ mod tests {
                         schema: "public",
                         table: "t",
                         rowid: lsn,
+                        old_row: None,
                     },
                 )
                 .unwrap();
@@ -3862,6 +3950,7 @@ mod tests {
                 schema: "public",
                 table: "t",
                 rowid: 1,
+                old_row: None,
             },
         )
         .unwrap();
@@ -3879,8 +3968,19 @@ mod tests {
         let mut count = 0;
         assert_eq!(
             wal.next_committed_after(0, &mut scratch, |lsn, record| {
-                seen[count] = (lsn, record[0]);
-                count += 1;
+                let mut at = 0;
+                while at < record.len() {
+                    let length =
+                        u32::from_le_bytes(record[at + 4..at + 8].try_into().unwrap()) as usize;
+                    let total = HEADER_LEN + length;
+                    seen[count] = (
+                        u64::from_le_bytes(record[at + 8..at + 16].try_into().unwrap()),
+                        record[at + 16],
+                    );
+                    count += 1;
+                    at += total;
+                }
+                assert_eq!(lsn, commit_lsn);
                 Ok(())
             })
             .unwrap(),
@@ -3890,10 +3990,11 @@ mod tests {
         assert_eq!(seen[0].1, KIND_DELETE);
         assert_eq!(seen[1].1, KIND_COMMIT);
         let mut transaction_id = 0;
-        wal.next_committed_after(0, &mut scratch, |_, record| {
+        wal.next_committed_after(0, &mut scratch, |_, transaction| {
+            let commit = &transaction[transaction.len() - (HEADER_LEN + 4)..];
             if let WalOp::Commit {
                 transaction_id: value,
-            } = decode_record(record).unwrap()
+            } = decode_record(&commit[16..]).unwrap()
             {
                 transaction_id = value;
             }

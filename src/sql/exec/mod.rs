@@ -13416,6 +13416,8 @@ fn alter_table_inner(
                 table: new_def.name.as_str(),
                 rowid,
                 row: storage.heap.get(new_loc),
+                is_update: false,
+                old_row: None,
             },
         ) {
             return sql_fail(e);

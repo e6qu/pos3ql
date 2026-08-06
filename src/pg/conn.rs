@@ -95,6 +95,15 @@ enum ReplicationMode {
     Logical,
 }
 
+/// One active logical CopyBoth stream. All durable state remains in the slot;
+/// this holds only the connection-owned cursor and negotiated publication.
+struct ReplicationStream {
+    slot: SqlName,
+    publication: StackStr<63>,
+    cursor_lsn: u64,
+    last_sent_lsn: u64,
+}
+
 /// Server-wide authentication context, fixed at startup.
 pub struct AuthContext {
     pub mode: AuthMode,
@@ -126,6 +135,7 @@ pub struct Conn {
     auth_password: StackStr<256>,
     auth_reject: bool,
     replication: ReplicationMode,
+    replication_stream: Option<ReplicationStream>,
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
@@ -202,6 +212,7 @@ impl Conn {
             auth_password: StackStr::new(),
             auth_reject: false,
             replication: ReplicationMode::None,
+            replication_stream: None,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             prepared,
@@ -247,6 +258,7 @@ impl Conn {
         self.auth_password = StackStr::new();
         self.auth_reject = false;
         self.replication = ReplicationMode::None;
+        self.replication_stream = None;
         self.copy = None;
         self.copy_buf.clear();
         self.phase = Phase::Startup;
@@ -889,6 +901,11 @@ impl Conn {
         }
 
         if self.replication != ReplicationMode::None
+            && !(self.replication_stream.is_some()
+                && matches!(
+                    msg_type,
+                    wire::FMSG_COPY_DATA | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
+                ))
             && !matches!(
                 msg_type,
                 wire::FMSG_QUERY | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
@@ -900,6 +917,14 @@ impl Conn {
                 "replication connections accept only the simple query protocol",
             );
             return Step::Close;
+        }
+
+        if self.replication_stream.is_some() {
+            let step = self.process_replication_stream_message(engine, msg_type, total);
+            if !matches!(step, Step::Close) {
+                self.recv.consume(total);
+            }
+            return step;
         }
 
         if self.copy.is_some() {
@@ -1019,6 +1044,79 @@ impl Conn {
                     Step::Continue
                 }
             }
+        }
+    }
+
+    fn process_replication_stream_message(
+        &mut self,
+        engine: &mut Engine,
+        msg_type: u8,
+        total: usize,
+    ) -> Step {
+        match msg_type {
+            wire::FMSG_COPY_DATA => {
+                let payload = &self.recv.readable()[5..total];
+                if payload.len() != 34 || payload[0] != b'r' {
+                    return Step::Close;
+                }
+                let flush_lsn = u64::from_be_bytes(payload[9..17].try_into().unwrap());
+                let stream = self
+                    .replication_stream
+                    .as_mut()
+                    .expect("active replication stream");
+                if flush_lsn > stream.last_sent_lsn {
+                    return Step::Close;
+                }
+                if flush_lsn > stream.cursor_lsn {
+                    if engine
+                        .advance_replication_slot(stream.slot.as_str(), flush_lsn)
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                    stream.cursor_lsn = flush_lsn;
+                }
+                Step::Continue
+            }
+            wire::FMSG_FLUSH => Step::Continue,
+            wire::FMSG_TERMINATE => Step::Close,
+            _ => Step::Close,
+        }
+    }
+
+    /// Emits at most one complete transaction each reactor turn. A full send
+    /// buffer leaves the durable cursor unchanged, so reconnect/retry cannot
+    /// skip a transaction.
+    pub(crate) fn pump_replication(&mut self, engine: &mut Engine) -> After {
+        if !self.send.is_empty() {
+            return After::Continue;
+        }
+        let Some(stream) = self.replication_stream.as_mut() else {
+            return After::Continue;
+        };
+        let mark = self.send.mark();
+        let mut responder = Responder::new(&mut self.send);
+        match engine.emit_replication_transaction(
+            stream.cursor_lsn,
+            stream.publication.as_str(),
+            &mut self.copy_buf,
+            &mut responder,
+        ) {
+            Ok(Some(lsn)) => {
+                stream.last_sent_lsn = lsn;
+                After::Continue
+            }
+            Ok(None) => After::Continue,
+            Err(_) => {
+                self.send.truncate_to(mark);
+                After::Close
+            }
+        }
+    }
+
+    pub(crate) fn stop_replication(&mut self, engine: &mut Engine) {
+        if let Some(stream) = self.replication_stream.take() {
+            engine.deactivate_replication_slot(stream.slot.as_str());
         }
     }
 
@@ -2171,6 +2269,36 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
+                Ok(LogicalReplicationCommand::Start { name, publication }) => {
+                    let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
+                        Ok(lsn) => lsn,
+                        Err(error) => {
+                            let mut responder = Responder::new(&mut self.send);
+                            let _ = responder
+                                .error(error.sqlstate, error.message.as_str())
+                                .and_then(|()| responder.ready_for_query(b'I'));
+                            self.recv.consume(total);
+                            return Step::Continue;
+                        }
+                    };
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder.copy_both_response().is_err() {
+                        engine.deactivate_replication_slot(name.as_str());
+                        return Step::Close;
+                    }
+                    self.replication_stream = Some(ReplicationStream {
+                        slot: name,
+                        publication,
+                        cursor_lsn,
+                        last_sent_lsn: cursor_lsn,
+                    });
+                    if matches!(self.pump_replication(engine), After::Close) {
+                        self.stop_replication(engine);
+                        return Step::Close;
+                    }
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 Err(error) => {
                     let mut responder = Responder::new(&mut self.send);
                     if responder
@@ -2256,6 +2384,10 @@ fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
             && (is_identify_system(text)
                 || text
                     .trim_start()
+                    .get(..17)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("start_replication"))
+                || text
+                    .trim_start()
                     .get(..23)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("create_replication_slot"))
                 || text
@@ -2265,8 +2397,16 @@ fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
 }
 
 enum LogicalReplicationCommand {
-    CreateSlot { name: SqlName },
-    DropSlot { name: SqlName },
+    CreateSlot {
+        name: SqlName,
+    },
+    DropSlot {
+        name: SqlName,
+    },
+    Start {
+        name: SqlName,
+        publication: StackStr<63>,
+    },
 }
 
 fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCommand, SqlError> {
@@ -2288,6 +2428,64 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
         }
         return Ok(LogicalReplicationCommand::DropSlot {
             name: SqlName::parse(name)?,
+        });
+    }
+    if command.eq_ignore_ascii_case("start_replication") {
+        let slot_keyword = words
+            .next()
+            .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires SLOT"))?;
+        let name = words.next().ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "START_REPLICATION requires a slot name"
+            )
+        })?;
+        let logical = words.next().ok_or_else(|| {
+            sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires LOGICAL")
+        })?;
+        let _lsn = words
+            .next()
+            .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires an LSN"))?;
+        let mut publication = None;
+        while let Some(option) = words.next() {
+            if option
+                .trim_matches(|byte| matches!(byte, '(' | ')' | ','))
+                .eq_ignore_ascii_case("publication_names")
+            {
+                publication = words
+                    .next()
+                    .map(|value| value.trim_matches(|byte| matches!(byte, '(' | ')' | ',' | '\'')));
+                break;
+            }
+        }
+        let publication = publication.ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "START_REPLICATION requires publication_names"
+            )
+        })?;
+        if !slot_keyword.eq_ignore_ascii_case("slot")
+            || !logical.eq_ignore_ascii_case("logical")
+            || !is_replication_slot_name(name)
+            || publication.is_empty()
+            || publication.contains(',')
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "only one logical pgoutput publication is supported"
+            ));
+        }
+        let mut publication_name = StackStr::new();
+        use core::fmt::Write;
+        write!(publication_name, "{publication}").map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "publication name is too long"
+            )
+        })?;
+        return Ok(LogicalReplicationCommand::Start {
+            name: SqlName::parse(name)?,
+            publication: publication_name,
         });
     }
     if !command.eq_ignore_ascii_case("create_replication_slot") {
@@ -2727,6 +2925,25 @@ mod tests {
             panic!("expected DROP_REPLICATION_SLOT")
         };
         assert_eq!(name.as_str(), "changes");
+    }
+
+    #[test]
+    fn logical_start_replication_requires_one_publication() {
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { name, publication } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        assert_eq!(name.as_str(), "changes");
+        assert_eq!(publication.as_str(), "changes_pub");
+        assert!(
+            parse_logical_replication_command(
+                "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1')"
+            )
+            .is_err()
+        );
     }
 
     #[test]

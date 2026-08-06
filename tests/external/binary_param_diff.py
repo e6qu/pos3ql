@@ -102,19 +102,27 @@ def main():
             print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
 
     for sql in RESULT_CASES:
+        pg_error = None
         try:
             r_pg = run_result_case(pg, sql)
         except Exception as e:
             r_pg = f"ERROR:{type(e).__name__}"
+            pg_error = repr(e)
+        p3_error = None
         try:
             r_p3 = run_result_case(p3, sql)
         except Exception as e:
             r_p3 = f"ERROR:{type(e).__name__}"
+            p3_error = repr(e)
         if r_pg == r_p3:
             print("ok:   %-34s -> %s" % (sql, r_pg))
         else:
             fails += 1
             print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
+            if pg_error is not None:
+                print("      PostgreSQL error: %s" % pg_error)
+            if p3_error is not None:
+                print("      pos3ql error: %s" % p3_error)
 
     print("binary-composite: %d check(s) failed" % fails)
     sys.exit(1 if fails else 0)

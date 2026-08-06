@@ -93,6 +93,10 @@ impl<'a> MsgOut<'a> {
         self.bytes(&v.to_be_bytes())
     }
 
+    pub fn i64(&mut self, v: i64) -> &mut Self {
+        self.bytes(&v.to_be_bytes())
+    }
+
     pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.ok = self.ok && self.buffer.append(v);
         self

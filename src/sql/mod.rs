@@ -632,6 +632,59 @@ impl Engine {
         Ok(restart_lsn)
     }
 
+    pub(crate) fn drop_replication_slot(
+        &mut self,
+        name: crate::storage::SqlName,
+    ) -> Result<(), SqlError> {
+        let slot = self
+            .storage
+            .replication_slot(name.as_str())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    name.as_str()
+                )
+            })?;
+        if slot.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                name.as_str()
+            ));
+        }
+        self.next_txid = self.next_txid.wrapping_add(1).max(1);
+        let transaction_id = self.next_txid;
+        let lsn =
+            self.storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
+        if let Err(error) = self.wal.stage(
+            transaction_id,
+            lsn,
+            &WalOp::DropReplicationSlot {
+                name: name.as_str(),
+            },
+        ) {
+            self.wal.discard_stage(transaction_id);
+            return Err(error);
+        }
+        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.wal.discard_stage(transaction_id);
+                return Err(error);
+            }
+        };
+        self.wal.commit();
+        self.storage.drop_replication_slot(name.as_str())?;
+        self.storage.set_lsn(commit_lsn);
+        if self.wal_upload {
+            self.upload_wal_batch()?;
+        }
+        Ok(())
+    }
+
     /// Starts a transaction if none is active.
     fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode, guc: &GucState) {
         if txn.is_active() {
@@ -1737,7 +1790,15 @@ impl Engine {
             if self.wal_upload
                 && let Some(ckpt) = self.ckpt.as_mut()
             {
-                let _ = ckpt.prune_wal_segments(lsn);
+                // A checkpoint covers its own state, but not a logical
+                // consumer's history. Retain the segment straddling the
+                // oldest slot restart point until the slot advances or drops.
+                let retain_through = self
+                    .storage
+                    .oldest_replication_restart_lsn()
+                    .unwrap_or(lsn)
+                    .min(lsn);
+                let _ = ckpt.prune_wal_segments(retain_through);
             }
             self.wal.reset_after_checkpoint();
         }
@@ -4722,10 +4783,15 @@ fn requalify_schema_element<'a>(
 /// Reapplies one journal record to storage during recovery.
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
-        WalOp::Commit => {}
+        WalOp::Commit { .. } => {}
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             storage.create_replication_slot(crate::storage::SqlName::parse(name)?, restart_lsn)?;
         }
+        WalOp::DropReplicationSlot { name } => storage.drop_replication_slot(name)?,
+        WalOp::AdvanceReplicationSlot {
+            name,
+            confirmed_flush_lsn,
+        } => storage.advance_replication_slot(name, confirmed_flush_lsn)?,
         WalOp::CreateTable(def) => {
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema

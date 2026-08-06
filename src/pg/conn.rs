@@ -2147,6 +2147,30 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
+                Ok(LogicalReplicationCommand::DropSlot { name }) => {
+                    if let Err(error) = engine.drop_replication_slot(name) {
+                        let mut responder = Responder::new(&mut self.send);
+                        if responder
+                            .error(error.sqlstate, error.message.as_str())
+                            .and_then(|()| responder.ready_for_query(b'I'))
+                            .is_err()
+                        {
+                            return Step::Close;
+                        }
+                        self.recv.consume(total);
+                        return Step::Continue;
+                    }
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder
+                        .command_complete("DROP_REPLICATION_SLOT")
+                        .and_then(|()| responder.ready_for_query(b'I'))
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 Err(error) => {
                     let mut responder = Responder::new(&mut self.send);
                     if responder
@@ -2233,17 +2257,39 @@ fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
                 || text
                     .trim_start()
                     .get(..23)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("create_replication_slot"))))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("create_replication_slot"))
+                || text
+                    .trim_start()
+                    .get(..21)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("drop_replication_slot"))))
 }
 
 enum LogicalReplicationCommand {
     CreateSlot { name: SqlName },
+    DropSlot { name: SqlName },
 }
 
 fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCommand, SqlError> {
     let text = text.trim().trim_end_matches(';').trim_end();
     let mut words = text.split_ascii_whitespace();
     let command = words.next().unwrap_or_default();
+    if command.eq_ignore_ascii_case("drop_replication_slot") {
+        let name = words.next().ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "DROP_REPLICATION_SLOT requires a slot name"
+            )
+        })?;
+        if !is_replication_slot_name(name) || words.next().is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid DROP_REPLICATION_SLOT input"
+            ));
+        }
+        return Ok(LogicalReplicationCommand::DropSlot {
+            name: SqlName::parse(name)?,
+        });
+    }
     if !command.eq_ignore_ascii_case("create_replication_slot") {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -2655,7 +2701,9 @@ mod tests {
         let command =
             parse_logical_replication_command("CREATE_REPLICATION_SLOT changes LOGICAL pgoutput;")
                 .unwrap();
-        let LogicalReplicationCommand::CreateSlot { name } = command;
+        let LogicalReplicationCommand::CreateSlot { name } = command else {
+            panic!("expected CREATE_REPLICATION_SLOT")
+        };
         assert_eq!(name.as_str(), "changes");
         assert!(
             parse_logical_replication_command(
@@ -2674,6 +2722,11 @@ mod tests {
             parse_logical_replication_command("CREATE_REPLICATION_SLOT bad/name LOGICAL pgoutput")
                 .is_err()
         );
+        let dropped = parse_logical_replication_command("DROP_REPLICATION_SLOT changes").unwrap();
+        let LogicalReplicationCommand::DropSlot { name } = dropped else {
+            panic!("expected DROP_REPLICATION_SLOT")
+        };
+        assert_eq!(name.as_str(), "changes");
     }
 
     #[test]

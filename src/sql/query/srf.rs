@@ -1317,19 +1317,29 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     if start_val.is_null() {
         return Ok(&[]);
     }
-    let as_i64 = |e: &'a Expr<'a>| -> Result<i64, SqlError> {
-        match crate::sql::eval::eval(e, arena, params, columns)? {
-            Datum::Int4(v) => Ok(v as i64),
-            Datum::Int8(v) => Ok(v),
-            _ => Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "generate_series requires integer arguments"
-            )),
-        }
+    let as_i64 = |value: Datum<'a>| match value {
+        Datum::Int4(value) => Ok(Some(value as i64)),
+        Datum::Int8(value) => Ok(Some(value)),
+        Datum::Null => Ok(None),
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "generate_series requires integer arguments"
+        )),
     };
-    let start = as_i64(args[0])?;
-    let stop = as_i64(args[1])?;
-    let step = if args.len() == 3 { as_i64(args[2])? } else { 1 };
+    let Some(start) = as_i64(start_val)? else {
+        return Ok(&[]);
+    };
+    let Some(stop) = as_i64(crate::sql::eval::eval(args[1], arena, params, columns)?)? else {
+        return Ok(&[]);
+    };
+    let step = if args.len() == 3 {
+        let Some(step) = as_i64(crate::sql::eval::eval(args[2], arena, params, columns)?)? else {
+            return Ok(&[]);
+        };
+        step
+    } else {
+        1
+    };
     if step == 0 {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,

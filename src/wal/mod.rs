@@ -75,7 +75,9 @@ const KIND_DROP_PUBLICATION: u8 = 36;
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
 const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
-const LAST_KIND: u8 = KIND_CREATE_REPLICATION_SLOT;
+const KIND_DROP_REPLICATION_SLOT: u8 = 39;
+const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
+const LAST_KIND: u8 = KIND_ADVANCE_REPLICATION_SLOT;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -312,10 +314,19 @@ pub(crate) enum WalOp<'a> {
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
-    Commit,
+    Commit {
+        transaction_id: u32,
+    },
     CreateReplicationSlot {
         name: &'a str,
         restart_lsn: u64,
+    },
+    DropReplicationSlot {
+        name: &'a str,
+    },
+    AdvanceReplicationSlot {
+        name: &'a str,
+        confirmed_flush_lsn: u64,
     },
     CreateIndex {
         schema: &'a str,
@@ -899,7 +910,11 @@ impl Wal {
         assert_eq!(next_lsn + 1, final_lsn);
         // The marker is appended only after every operation has been assigned
         // its final LSN and checksum, so a torn tail can never look committed.
-        append_record(&mut self.buffer, final_lsn, &WalOp::Commit)?;
+        append_record(
+            &mut self.buffer,
+            final_lsn,
+            &WalOp::Commit { transaction_id },
+        )?;
         if staged_len > 0 && self.batch_first_lsn == 0 {
             self.batch_first_lsn = lsn_floor + 1;
             self.batch_start_offset = self.write_offset + durable_mark as u64;
@@ -964,6 +979,90 @@ impl Wal {
     pub fn read_range(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         self.file.read_exact_at(out, offset)
+    }
+
+    /// Reads one complete transaction strictly newer than `floor` without
+    /// changing recovery state. `scratch` is caller-owned fixed storage: the
+    /// callback runs only after the transaction's Commit record has passed
+    /// CRC and framing validation.
+    pub fn next_committed_after(
+        &self,
+        floor: u64,
+        scratch: &mut FixedBuf,
+        mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    ) -> Result<Option<u64>, SqlError> {
+        scratch.clear();
+        let mut offset = 0u64;
+        let mut previous_lsn = 0u64;
+        while offset < self.write_offset {
+            let mut header = [0u8; HEADER_LEN];
+            self.file
+                .read_exact_at(&mut header, offset)
+                .map_err(|_| sql_err!(sqlstate::IO_ERROR, "cannot read durable WAL record"))?;
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let total = HEADER_LEN.checked_add(payload_len).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "corrupt durable WAL record length"
+                )
+            })?;
+            if total > self.buffer.capacity()
+                || offset
+                    .checked_add(total as u64)
+                    .is_none_or(|end| end > self.write_offset)
+                || lsn <= previous_lsn
+            {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "corrupt durable WAL record"
+                ));
+            }
+            previous_lsn = lsn;
+            if lsn <= floor {
+                offset += total as u64;
+                continue;
+            }
+            if scratch.capacity() - scratch.len() < total {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "one committed WAL transaction exceeds replication buffer"
+                ));
+            }
+            let mark = scratch.mark();
+            assert!(scratch.append(&header));
+            let payload = &mut scratch.writable()[..payload_len];
+            self.file
+                .read_exact_at(payload, offset + HEADER_LEN as u64)
+                .map_err(|_| sql_err!(sqlstate::IO_ERROR, "cannot read durable WAL payload"))?;
+            scratch.advance(payload_len);
+            if crc32c(&scratch.filled_mut()[mark + 4..mark + total])
+                != u32::from_le_bytes(header[..4].try_into().unwrap())
+                || decode_op(header[16], &scratch.readable()[mark + 24..mark + total]).is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "corrupt durable WAL record"
+                ));
+            }
+            offset += total as u64;
+            if header[16] != KIND_COMMIT {
+                continue;
+            }
+            let mut at = 0usize;
+            while at < scratch.len() {
+                let record = &scratch.readable()[at..];
+                let payload_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as usize;
+                let total = HEADER_LEN + payload_len;
+                let lsn = u64::from_le_bytes(record[8..16].try_into().unwrap());
+                apply(lsn, &record[16..total])?;
+                at += total;
+            }
+            scratch.clear();
+            return Ok(Some(lsn));
+        }
+        scratch.clear();
+        Ok(None)
     }
 
     /// Makes everything appended so far durable. Aborts the process on I/O
@@ -1041,8 +1140,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
-        WalOp::Commit => KIND_COMMIT,
+        WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
+        WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
+        WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1152,8 +1253,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name, table_count, ..
         } => 1 + name.len() + 1 + 1 + table_count * 2,
         WalOp::DropPublication { name } => 1 + name.len(),
-        WalOp::Commit => 0,
+        WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
+        WalOp::DropReplicationSlot { name } => 1 + name.len(),
+        WalOp::AdvanceReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::CreateIndex {
             schema,
             name,
@@ -1462,10 +1565,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropPublication { name } => name_bytes(buffer, name),
-        WalOp::Commit => true,
+        WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
         }
+        WalOp::DropReplicationSlot { name } => name_bytes(buffer, name),
+        WalOp::AdvanceReplicationSlot {
+            name,
+            confirmed_flush_lsn,
+        } => name_bytes(buffer, name) && buffer.append(&confirmed_flush_lsn.to_le_bytes()),
         WalOp::CreateIndex {
             schema,
             name,
@@ -2257,12 +2365,29 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
         }
-        KIND_COMMIT => (at == payload.len()).then_some(WalOp::Commit),
+        KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
+        KIND_COMMIT => {
+            let transaction_id = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            (payload.len() == 4).then_some(WalOp::Commit { transaction_id })
+        }
         KIND_CREATE_REPLICATION_SLOT => {
             let name = take_name(&mut at)?;
             let restart_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             (at == payload.len()).then_some(WalOp::CreateReplicationSlot { name, restart_lsn })
+        }
+        KIND_DROP_REPLICATION_SLOT => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropReplicationSlot { name })
+        }
+        KIND_ADVANCE_REPLICATION_SLOT => {
+            let name = take_name(&mut at)?;
+            let confirmed_flush_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            (at == payload.len()).then_some(WalOp::AdvanceReplicationSlot {
+                name,
+                confirmed_flush_lsn,
+            })
         }
         KIND_CREATE_MATVIEW => {
             let name = take_name(&mut at)?;
@@ -3256,12 +3381,22 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                11,
+                &WalOp::AdvanceReplicationSlot {
+                    name: "changes",
+                    confirmed_flush_lsn: 11,
+                },
+            )
+            .unwrap();
+            wal.append_committed(12, &WalOp::DropReplicationSlot { name: "changes" })
+                .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), 12);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -3308,10 +3443,12 @@ mod tests {
             "replication slot: {}",
             seen[9]
         );
-        assert_eq!(wal.last_lsn(), 10);
+        assert!(seen[10].contains("AdvanceReplicationSlot"), "{}", seen[10]);
+        assert!(seen[11].contains("DropReplicationSlot"), "{}", seen[11]);
+        assert_eq!(wal.last_lsn(), 12);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            11,
+            13,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",
@@ -3710,5 +3847,64 @@ mod tests {
             assert_eq!(wal.commit_stage(1, 16).unwrap(), 33);
         });
         wal.commit();
+    }
+
+    #[test]
+    fn committed_cursor_never_exposes_a_partial_transaction() {
+        let dir = temp_dir("committed-cursor");
+        let config = test_config(&dir);
+        let mut budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut budget).unwrap();
+        wal.stage(
+            1,
+            1,
+            &WalOp::Delete {
+                schema: "public",
+                table: "t",
+                rowid: 1,
+            },
+        )
+        .unwrap();
+        wal.commit();
+        let mut scratch = FixedBuf::new(&mut budget, "cursor scratch", 4096).unwrap();
+        assert!(
+            wal.next_committed_after(0, &mut scratch, |_, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+
+        let commit_lsn = wal.commit_stage(1, 0).unwrap();
+        wal.commit();
+        let mut seen = [(0u64, 0u8); 2];
+        let mut count = 0;
+        assert_eq!(
+            wal.next_committed_after(0, &mut scratch, |lsn, record| {
+                seen[count] = (lsn, record[0]);
+                count += 1;
+                Ok(())
+            })
+            .unwrap(),
+            Some(commit_lsn)
+        );
+        assert_eq!(count, 2);
+        assert_eq!(seen[0].1, KIND_DELETE);
+        assert_eq!(seen[1].1, KIND_COMMIT);
+        let mut transaction_id = 0;
+        wal.next_committed_after(0, &mut scratch, |_, record| {
+            if let WalOp::Commit {
+                transaction_id: value,
+            } = decode_record(record).unwrap()
+            {
+                transaction_id = value;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(transaction_id, 1);
+        assert!(
+            wal.next_committed_after(commit_lsn, &mut scratch, |_, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
     }
 }

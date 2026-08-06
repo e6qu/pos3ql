@@ -510,6 +510,16 @@ impl<'b> Responder<'b> {
         })
     }
 
+    /// One raw binary replication CopyData frame. Unlike COPY rows, logical
+    /// replication payloads carry their own message boundaries and no newline.
+    pub fn copy_data(&mut self, write: &dyn Fn(&mut MsgOut)) -> Result<(), WireFull> {
+        self.with_retry(|buffer| {
+            let mut message = MsgOut::begin(buffer, b'd');
+            write(&mut message);
+            message.finish()
+        })
+    }
+
     /// The binary COPY file header: the 11-byte signature, an int32 flags word,
     /// and an int32 header-extension length (both zero). One CopyData message.
     pub fn copy_binary_header(&mut self) -> Result<(), WireFull> {

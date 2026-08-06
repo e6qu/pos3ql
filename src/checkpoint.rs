@@ -741,20 +741,38 @@ impl Checkpointer {
     /// neither source alone spans the committed history (the journal may
     /// restart mid-history after a disk wipe or end early at a torn write,
     /// and the segments lack whatever a failed upload left journaled-only).
-    /// Startup only (allocates while listing/parsing).
+    /// The key roster uses startup-reserved scratch, so callers can also use
+    /// this read-only path while serving a logical replication stream.
+    #[inline(never)]
     pub(crate) fn replay_wal_segments(
         &mut self,
         floor: u64,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<(), CheckpointSetupError> {
-        let mut keys: Vec<String> = Vec::new();
+        self.doomed_scratch.clear();
+        let mut overflow = false;
         self.client
-            .list("wal/", |k| keys.push(k.to_string()))
+            .list("wal/", |key| {
+                if self.doomed_scratch.len() == self.doomed_scratch.capacity() {
+                    overflow = true;
+                } else {
+                    self.doomed_scratch.push(crate::stack_format!(64, "{key}"));
+                }
+            })
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("list wal: {e}")))?;
-        keys.sort();
-        for key in &keys {
+        if overflow {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "too many WAL segments (limit {})",
+                self.doomed_scratch.capacity()
+            )));
+        }
+        self.doomed_scratch
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        for index in 0..self.doomed_scratch.len() {
+            let key = self.doomed_scratch[index];
             // Key is wal/<20-digit first lsn>.seg
             let Some(digits) = key
+                .as_str()
                 .strip_prefix("wal/")
                 .and_then(|k| k.strip_suffix(".seg"))
             else {
@@ -772,7 +790,7 @@ impl Checkpointer {
             let mut offset = 0u64;
             loop {
                 let to = offset + self.client.response_capacity() as u64 - 1;
-                match self.client.get(key, Some((offset, to))) {
+                match self.client.get(key.as_str(), Some((offset, to))) {
                     Ok(_) => {}
                     // Past the end of the object: the segment is fully read.
                     Err(ObjectError::Status { code: 416, .. }) => break,
@@ -797,7 +815,8 @@ impl Checkpointer {
                         break;
                     }
                     return Err(CheckpointSetupError::ObjectStore(format!(
-                        "wal record in {key} exceeds object_store_response_bytes; raise it past wal_buffer_bytes"
+                        "wal record in {} exceeds object_store_response_bytes; raise it past wal_buffer_bytes",
+                        key.as_str()
                     )));
                 }
                 offset += consumed as u64;

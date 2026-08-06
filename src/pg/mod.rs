@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod conn;
+pub mod pgoutput;
 pub mod respond;
 pub mod tls;
 pub mod wire;

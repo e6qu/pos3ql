@@ -405,6 +405,18 @@ fn role_catalog_replays_from_wal() {
 
 #[test]
 fn logical_replication_slot_survives_wal_and_checkpoint_recovery() {
+    let result = std::thread::Builder::new()
+        .name("logical-slot-recovery".to_string())
+        .stack_size(16 << 20)
+        .spawn(logical_replication_slot_survives_wal_and_checkpoint_recovery_body)
+        .expect("spawn bounded slot recovery test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut config = test_config("logical-slot-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -5488,6 +5500,16 @@ fn vacuum_and_analyze() {
 
 #[test]
 fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
+    let result = std::thread::Builder::new()
+        .name("analyze-wal-recovery".to_string())
+        .stack_size(16 << 20)
+        .spawn(analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body)
+        .expect("spawn bounded analyze recovery test")
+        .join();
+    result.expect("analyze recovery test panicked");
+}
+
+fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body() {
     let config = test_config("analyze-wal-recovery");
     {
         let mut budget = Budget::new(1 << 26);
@@ -11182,6 +11204,18 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
 
 #[test]
 fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
+    let result = std::thread::Builder::new()
+        .name("failed-wal-upload-recovery".to_string())
+        .stack_size(16 << 20)
+        .spawn(failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body)
+        .expect("spawn bounded upload recovery test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
@@ -11268,6 +11302,18 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
 
 #[test]
 fn cold_start_then_commit_then_crash_recovers_every_record() {
+    let result = std::thread::Builder::new()
+        .name("cold-wal-recovery".to_string())
+        .stack_size(16 << 20)
+        .spawn(cold_start_then_commit_then_crash_recovers_every_record_body)
+        .expect("spawn bounded cold recovery test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
@@ -11586,6 +11632,18 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
 
 #[test]
 fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
+    let result = std::thread::Builder::new()
+        .name("transaction-wal-cold-recovery".to_string())
+        .stack_size(16 << 20)
+        .spawn(transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_body)
+        .expect("spawn bounded transaction recovery test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_body() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);

@@ -8936,6 +8936,14 @@ impl Storage {
         self.replication_slots.len()
     }
 
+    /// The oldest durable point any logical consumer may still request.
+    /// WAL segment collection must retain the segment straddling this LSN.
+    pub(crate) fn oldest_replication_restart_lsn(&self) -> Option<u64> {
+        self.replication_slots_with_slots()
+            .map(|(_, slot)| slot.restart_lsn)
+            .min()
+    }
+
     pub(crate) fn restore_replication_slot(
         &mut self,
         name: SqlName,
@@ -8950,6 +8958,62 @@ impl Storage {
         }
         let slot = self.create_replication_slot(name, restart_lsn)?;
         self.replication_slots[slot].confirmed_flush_lsn = confirmed_flush_lsn;
+        Ok(())
+    }
+
+    pub(crate) fn drop_replication_slot(&mut self, name: &str) -> Result<(), SqlError> {
+        let Some(slot) = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+        else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "replication slot \"{}\" does not exist",
+                name
+            ));
+        };
+        if slot.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                name
+            ));
+        }
+        *slot = ReplicationSlotDef {
+            name: SqlName::EMPTY,
+            restart_lsn: 0,
+            confirmed_flush_lsn: 0,
+            active: false,
+            live: false,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn advance_replication_slot(
+        &mut self,
+        name: &str,
+        confirmed_flush_lsn: u64,
+    ) -> Result<(), SqlError> {
+        let Some(slot) = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+        else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "replication slot \"{}\" does not exist",
+                name
+            ));
+        };
+        if confirmed_flush_lsn < slot.confirmed_flush_lsn {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "replication slot confirmed LSN cannot move backwards"
+            ));
+        }
+        slot.confirmed_flush_lsn = confirmed_flush_lsn;
+        slot.restart_lsn = confirmed_flush_lsn;
         Ok(())
     }
 
@@ -11289,5 +11353,12 @@ mod tests {
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
+        storage.advance_replication_slot("changes", 47).unwrap();
+        let slot = storage.replication_slot("changes").unwrap();
+        assert_eq!(slot.restart_lsn, 47);
+        assert_eq!(slot.confirmed_flush_lsn, 47);
+        assert_eq!(storage.oldest_replication_restart_lsn(), Some(47));
+        storage.drop_replication_slot("changes").unwrap();
+        assert!(storage.replication_slot("changes").is_none());
     }
 }

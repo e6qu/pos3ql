@@ -66,6 +66,10 @@ jobs:
 
       - name: Test
         run: cargo test --locked -- --skip sim::storage::storage_vopr --skip sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache
+        env:
+          # The engine's bounded cold-recovery call chain needs this much
+          # stack in every ordinary lib-test worker.
+          RUST_MIN_STACK: 16777216
 
   # Independent deterministic seeds run on four bounded workers. This retains
   # the endurance sweep while keeping the PR critical path near five minutes.

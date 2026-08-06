@@ -2799,7 +2799,10 @@ pub fn constant_select<'a>(
     for row in &out_rows[start..end] {
         let mut values = [Datum::Null; MAX_PROJ];
         for (i, slot) in values.iter_mut().take(width).enumerate() {
-            *slot = super::exec::decode_projected_pub(row, i);
+            *slot = match super::exec::decode_projected_col_record(row, i, arena) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            };
         }
         responder.data_row(&values[..width])?;
         rows += 1;
@@ -3078,7 +3081,7 @@ fn select_into_rows_mode<'a>(
         for row in &rows[start..start + n] {
             let mut out = [Datum::Null; MAX_PROJ];
             for (i, slot) in out.iter_mut().take(width).enumerate() {
-                *slot = super::exec::decode_projected_pub(row, i);
+                *slot = super::exec::decode_projected_col_record(row, i, arena)?;
             }
             emit(&out[..width])?;
         }

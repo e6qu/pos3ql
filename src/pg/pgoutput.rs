@@ -101,6 +101,17 @@ pub fn delete(message: &mut MsgOut, relation_id: u32, old_values: &[Datum], bina
     tuple(message, old_values, binary);
 }
 
+/// pgoutput Truncate, available from protocol version 2. The option byte is
+/// bit 0 for CASCADE and bit 1 for RESTART IDENTITY.
+pub fn truncate(message: &mut MsgOut, relation_ids: &[u32], cascade: bool, restart_identity: bool) {
+    message.u8(b'T');
+    message.i32(relation_ids.len() as i32);
+    message.u8(u8::from(cascade) | (u8::from(restart_identity) << 1));
+    for relation_id in relation_ids {
+        message.i32(*relation_id as i32);
+    }
+}
+
 fn tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.u8(b'N');
     message.i16(values.len() as i16);
@@ -167,5 +178,20 @@ mod tests {
         assert_eq!(&bytes[18..20], b"42");
         assert_eq!(bytes[28], b'b');
         assert_eq!(&bytes[29..33], &4i32.to_be_bytes());
+    }
+
+    #[test]
+    fn truncate_carries_all_relations_and_options() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        truncate(&mut frame, &[7, 11], true, true);
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(bytes[5], b'T');
+        assert_eq!(&bytes[6..10], &2i32.to_be_bytes());
+        assert_eq!(bytes[10], 3);
+        assert_eq!(&bytes[11..15], &7i32.to_be_bytes());
+        assert_eq!(&bytes[15..19], &11i32.to_be_bytes());
     }
 }

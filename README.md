@@ -50,9 +50,8 @@ engineering discipline.
 pos3ql targets PostgreSQL client compatibility, not a copy of PostgreSQL's
 storage engine. Text SQL and the v3 simple/extended wire protocol are the
 compatibility surface; COPY binary and binary Bind/Result encodings are exact
-for each implemented stored type. The remaining binary-wire exceptions are
-anonymous `record` (rejected loudly) and range/multirange extended results
-(currently rendered as canonical text).
+for each implemented stored type, including arrays, ranges, multiranges, and
+anonymous records.
 
 The durable journal is pos3ql WAL: it is checksummed, ordered by LSN, and
 recovered from the provider-neutral object store. PostgreSQL physical XLOG is
@@ -171,8 +170,8 @@ Working single-node database:
   MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
   cold-start durability scenarios, differential vs PostgreSQL 18).
 
-Still to complete: the full PostgreSQL SQL/catalog/tooling surface, the two
-binary-wire exceptions above, logical-replication protocol breadth and the subscriber migration path, VSR productionization, and
+Still to complete: the full PostgreSQL SQL/catalog/tooling surface,
+logical-replication protocol breadth and the subscriber migration path, VSR productionization, and
 the object-storage execution capstone (end-to-end late materialization through
 the remaining multi-table and deferred operators). PAX descriptors already name
 independent verified column ranges and feed bounded cold-scan vectors through the

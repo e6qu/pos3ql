@@ -3417,6 +3417,16 @@ fn named_timezone_dst_rendering() {
 
 #[test]
 fn commit_makes_writes_visible_and_durable() {
+    std::thread::Builder::new()
+        .name("transaction-durability".into())
+        .stack_size(4 << 20)
+        .spawn(commit_makes_writes_visible_and_durable_on_sized_stack)
+        .expect("transaction durability test thread starts")
+        .join()
+        .expect("transaction durability test thread completes");
+}
+
+fn commit_makes_writes_visible_and_durable_on_sized_stack() {
     let config = test_config("txn-durable");
     let mut b = Budget::new(1 << 25);
     {

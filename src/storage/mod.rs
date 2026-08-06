@@ -8884,6 +8884,12 @@ impl Storage {
             .filter(|(_, publication)| publication.live)
     }
 
+    /// Committed publication lookup for replication protocol setup.
+    pub(crate) fn publication(&self, name: &str) -> Option<&PublicationDef> {
+        self.live_publications()
+            .find(|publication| publication.name.as_str() == name)
+    }
+
     pub(crate) fn create_replication_slot(
         &mut self,
         name: SqlName,
@@ -9015,6 +9021,39 @@ impl Storage {
         slot.confirmed_flush_lsn = confirmed_flush_lsn;
         slot.restart_lsn = confirmed_flush_lsn;
         Ok(())
+    }
+
+    pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
+        let slot = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    name
+                )
+            })?;
+        if slot.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                name
+            ));
+        }
+        slot.active = true;
+        Ok(slot.confirmed_flush_lsn)
+    }
+
+    pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
+        if let Some(slot) = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+        {
+            slot.active = false;
+        }
     }
 
     pub fn create_publication(

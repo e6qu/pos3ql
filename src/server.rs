@@ -322,6 +322,7 @@ impl Server {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
             }
+            self.pump_replication_streams();
             // A lock timeout can be the event that woke the reactor, with no
             // socket readiness and no lock-generation change.
             self.wake_lock_waiters();
@@ -678,6 +679,7 @@ impl Server {
     fn release(&mut self, index: usize) {
         // Drop the connection's LISTEN registrations so its channels free up and
         // no stale entry can match a later connection that reuses the id.
+        self.slots[index].conn.stop_replication(&mut self.engine);
         self.engine.drop_connection(self.slots[index].conn.id());
         if let Some(role) = self.slots[index].conn.authenticated_role() {
             self.engine.release_role_connection(role);
@@ -696,6 +698,18 @@ impl Server {
         self.free
             .push(index as u32)
             .expect("released slot cannot exceed capacity");
+    }
+
+    fn pump_replication_streams(&mut self) {
+        for index in 0..self.slots.len() {
+            if !self.slots[index].conn.is_open() {
+                continue;
+            }
+            match self.slots[index].conn.pump_replication(&mut self.engine) {
+                After::Continue => self.sync_write_interest(index),
+                After::Close => self.release(index),
+            }
+        }
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {

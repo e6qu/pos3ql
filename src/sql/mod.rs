@@ -38,7 +38,9 @@ use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::pg::pgoutput;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
@@ -685,6 +687,275 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
+        self.storage.activate_replication_slot(name)
+    }
+
+    pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
+        self.storage.deactivate_replication_slot(name);
+    }
+
+    pub(crate) fn advance_replication_slot(
+        &mut self,
+        name: &str,
+        confirmed_flush_lsn: u64,
+    ) -> Result<(), SqlError> {
+        self.next_txid = self.next_txid.wrapping_add(1).max(1);
+        let transaction_id = self.next_txid;
+        let lsn =
+            self.storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
+        self.wal.stage(
+            transaction_id,
+            lsn,
+            &WalOp::AdvanceReplicationSlot {
+                name,
+                confirmed_flush_lsn,
+            },
+        )?;
+        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.wal.discard_stage(transaction_id);
+                return Err(error);
+            }
+        };
+        self.wal.commit();
+        self.storage
+            .advance_replication_slot(name, confirmed_flush_lsn)?;
+        self.storage.set_lsn(commit_lsn);
+        if self.wal_upload {
+            self.upload_wal_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Emits the next complete committed transaction selected by one logical
+    /// publication. The cursor advances only after every CopyData frame for
+    /// that transaction fitted in the caller's fixed send buffer.
+    pub(crate) fn emit_replication_transaction(
+        &mut self,
+        floor: u64,
+        publication_name: &str,
+        scratch: &mut FixedBuf,
+        responder: &mut Responder,
+    ) -> Result<Option<u64>, SqlError> {
+        let storage = &self.storage;
+        let publication = storage.publication(publication_name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                publication_name
+            )
+        })?;
+        let mut encode = |end_lsn, transaction: &[u8]| {
+            let mut at = 0usize;
+            let mut transaction_id = 0u32;
+            while at < transaction.len() {
+                let length =
+                    u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
+                let total = crate::wal::HEADER_LEN + length;
+                if let Some(WalOp::Commit { transaction_id: id }) =
+                    crate::wal::decode_record(&transaction[at + 16..at + total])
+                {
+                    transaction_id = id;
+                }
+                at += total;
+            }
+            let overflow = || {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "replication transaction exceeds connection send buffer"
+                )
+            };
+            responder
+                .copy_data(&|message| {
+                    pgoutput::xlog_data(message, floor, end_lsn, |plugin| {
+                        pgoutput::begin(plugin, end_lsn, transaction_id)
+                    })
+                })
+                .map_err(|_| overflow())?;
+            at = 0;
+            while at < transaction.len() {
+                let length =
+                    u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
+                let total = crate::wal::HEADER_LEN + length;
+                let lsn = u64::from_le_bytes(transaction[at + 8..at + 16].try_into().unwrap());
+                let operation = crate::wal::decode_record(&transaction[at + 16..at + total])
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt committed WAL record")
+                    })?;
+                match operation {
+                    WalOp::Upsert {
+                        schema,
+                        table,
+                        row,
+                        is_update,
+                        old_row,
+                        ..
+                    } => {
+                        let Some(table_slot) = storage.find_table(schema, table) else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "replication WAL refers to unknown table \"{}\"",
+                                table
+                            ));
+                        };
+                        let selected = publication.all_tables
+                            || publication.tables[..publication.table_count]
+                                .contains(&(table_slot as u16));
+                        if selected
+                            && ((is_update && publication.publish_update)
+                                || (!is_update && publication.publish_insert))
+                        {
+                            let definition = storage.table_def(table_slot, 0);
+                            let mut schema_types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                            let column_count = definition.schema(&mut schema_types);
+                            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                            crate::storage::rowenc::decode(
+                                row,
+                                &schema_types[..column_count],
+                                &mut values,
+                            )?;
+                            let relation_id = table_slot as u32 + 1;
+                            responder
+                                .copy_data(&|message| {
+                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                        pgoutput::relation(
+                                            plugin,
+                                            relation_id,
+                                            schema,
+                                            table,
+                                            definition.columns(),
+                                        )
+                                    })
+                                })
+                                .map_err(|_| overflow())?;
+                            if is_update {
+                                let old = old_row.ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROTOCOL_VIOLATION,
+                                        "update WAL record lacks replica identity"
+                                    )
+                                })?;
+                                let mut old_values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                                crate::storage::rowenc::decode(
+                                    old,
+                                    &schema_types[..column_count],
+                                    &mut old_values,
+                                )?;
+                                responder
+                                    .copy_data(&|message| {
+                                        pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                            pgoutput::update(
+                                                plugin,
+                                                relation_id,
+                                                &old_values[..column_count],
+                                                &values[..column_count],
+                                            )
+                                        })
+                                    })
+                                    .map_err(|_| overflow())?;
+                            } else {
+                                responder
+                                    .copy_data(&|message| {
+                                        pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                            pgoutput::insert(
+                                                plugin,
+                                                relation_id,
+                                                &values[..column_count],
+                                            )
+                                        })
+                                    })
+                                    .map_err(|_| overflow())?;
+                            }
+                        }
+                    }
+                    WalOp::Delete {
+                        schema,
+                        table,
+                        old_row,
+                        ..
+                    } => {
+                        let Some(table_slot) = storage.find_table(schema, table) else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "replication WAL refers to unknown table \"{}\"",
+                                table
+                            ));
+                        };
+                        let selected = publication.all_tables
+                            || publication.tables[..publication.table_count]
+                                .contains(&(table_slot as u16));
+                        if selected && publication.publish_delete {
+                            let old = old_row.ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROTOCOL_VIOLATION,
+                                    "delete WAL record lacks replica identity"
+                                )
+                            })?;
+                            let definition = storage.table_def(table_slot, 0);
+                            let mut schema_types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                            let column_count = definition.schema(&mut schema_types);
+                            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                            crate::storage::rowenc::decode(
+                                old,
+                                &schema_types[..column_count],
+                                &mut values,
+                            )?;
+                            let relation_id = table_slot as u32 + 1;
+                            responder
+                                .copy_data(&|message| {
+                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                        pgoutput::relation(
+                                            plugin,
+                                            relation_id,
+                                            schema,
+                                            table,
+                                            definition.columns(),
+                                        )
+                                    })
+                                })
+                                .map_err(|_| overflow())?;
+                            responder
+                                .copy_data(&|message| {
+                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                        pgoutput::delete(
+                                            plugin,
+                                            relation_id,
+                                            &values[..column_count],
+                                        )
+                                    })
+                                })
+                                .map_err(|_| overflow())?;
+                        }
+                    }
+                    _ => {}
+                }
+                at += total;
+            }
+            responder
+                .copy_data(&|message| {
+                    pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                        pgoutput::commit(plugin, end_lsn)
+                    })
+                })
+                .map_err(|_| overflow())?;
+            Ok(())
+        };
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            // The checkpointer owns the object client; its serving cursor is
+            // read-only and uses its startup-reserved segment-list scratch.
+            if let Some(lsn) =
+                checkpointer.next_committed_wal_transaction(floor, scratch, &mut encode)?
+            {
+                return Ok(Some(lsn));
+            }
+        }
+        self.wal.next_committed_after(floor, scratch, encode)
+    }
+
     /// Starts a transaction if none is active.
     fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode, guc: &GucState) {
         if txn.is_active() {
@@ -747,8 +1018,25 @@ impl Engine {
             let name = def.name;
             let schema = def.schema;
             let lsn = self.storage.lsn() + 1;
-            let appended = match p.loc {
-                Some(loc) => self.wal.stage(
+            let appended = match (p.loc, state.committed) {
+                (Some(loc), Some(old_home)) => {
+                    self.storage
+                        .with_row_bytes(table as usize, rowid, old_home, |old_row| {
+                            self.wal.stage(
+                                txn.txid,
+                                lsn,
+                                &WalOp::Upsert {
+                                    schema: schema.as_str(),
+                                    table: name.as_str(),
+                                    rowid,
+                                    row: self.storage.heap.get(loc),
+                                    is_update: true,
+                                    old_row: Some(old_row),
+                                },
+                            )
+                        })
+                }
+                (Some(loc), None) => self.wal.stage(
                     txn.txid,
                     lsn,
                     &WalOp::Upsert {
@@ -756,17 +1044,26 @@ impl Engine {
                         table: name.as_str(),
                         rowid,
                         row: self.storage.heap.get(loc),
+                        is_update: false,
+                        old_row: None,
                     },
                 ),
-                None => self.wal.stage(
-                    txn.txid,
-                    lsn,
-                    &WalOp::Delete {
-                        schema: schema.as_str(),
-                        table: name.as_str(),
-                        rowid,
-                    },
-                ),
+                (None, Some(old_home)) => {
+                    self.storage
+                        .with_row_bytes(table as usize, rowid, old_home, |old_row| {
+                            self.wal.stage(
+                                txn.txid,
+                                lsn,
+                                &WalOp::Delete {
+                                    schema: schema.as_str(),
+                                    table: name.as_str(),
+                                    rowid,
+                                    old_row: Some(old_row),
+                                },
+                            )
+                        })
+                }
+                (None, None) => continue,
             };
             if let Err(e) = appended {
                 self.rollback_txn(txn, guc);
@@ -2058,8 +2355,9 @@ impl Engine {
                     emit_parse_warnings(&mut parser, responder)?;
                     let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
-                    );
-                    if let Err(mut e) = outcome? {
+                    )?;
+                    let outcome = outcome.and_then(|()| query::check_timeout());
+                    if let Err(mut e) = outcome {
                         if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                             || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                         {
@@ -2161,8 +2459,8 @@ impl Engine {
                 emit_parse_warnings(&mut parser, responder)?;
                 let outcome = self.execute_stmt(
                     &statement, arena, params, txn, sqlprep, cursors, guc, responder,
-                );
-                outcome?
+                )?;
+                outcome.and_then(|()| query::check_timeout())
             }
             Ok(None) => {
                 responder.empty_query_response()?;
@@ -3146,11 +3444,14 @@ impl Engine {
                     table: table_definition.name.as_str(),
                     rowid,
                     row: self.storage.heap.get(location),
+                    is_update: false,
+                    old_row: None,
                 },
                 None => WalOp::Delete {
                     schema: table_definition.schema.as_str(),
                     table: table_definition.name.as_str(),
                     rowid,
+                    old_row: None,
                 },
             };
             records = records.saturating_add(1);
@@ -4858,6 +5159,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             table,
             rowid,
             row,
+            ..
         } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {
@@ -4881,6 +5183,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             schema,
             table,
             rowid,
+            ..
         } => {
             let Some(index) = storage.find_table(schema, table) else {
                 return Err(SqlError {

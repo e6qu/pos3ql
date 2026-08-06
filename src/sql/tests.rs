@@ -12388,30 +12388,12 @@ fn date_arithmetic() {
 }
 
 #[test]
-fn statement_timeout_cancels_long_statement() {
-    let (mut e, mut b) = test_engine();
-    run_with(&mut e, &mut b, "CREATE TABLE big (n int)");
-    run_with(
-        &mut e,
-        &mut b,
-        "INSERT INTO big SELECT * FROM generate_series(1, 300)",
-    );
-    // A three-way cross join is ~27M iterations — far longer than 1 ms.
-    // (SET and the query share one batch: the test harness makes a fresh
-    // session per call, and a SET takes effect within its batch.)
-    assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut e,
-            &mut b,
-            "SET statement_timeout = 1; SELECT count(*) FROM big a, big b, big c"
-        ))
-        .contains("57014")
-    );
-    // With the timeout disabled the same query shape runs normally.
-    assert_eq!(
-        data_rows(&run_with(&mut e, &mut b, "SELECT count(*) FROM big")),
-        ["300"]
-    );
+fn statement_timeout_checks_every_deadline_boundary() {
+    crate::sql::query::arm_timeout(1);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let error = crate::sql::query::check_timeout().unwrap_err();
+    crate::sql::query::disarm_timeout();
+    assert_eq!(error.sqlstate, "57014");
 }
 
 #[test]

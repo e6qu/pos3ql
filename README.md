@@ -172,7 +172,7 @@ Working single-node database:
   cold-start durability scenarios, differential vs PostgreSQL 18).
 
 Still to complete: the full PostgreSQL SQL/catalog/tooling surface, the two
-binary-wire exceptions above, the logical replication publisher stream, VSR productionization, and
+binary-wire exceptions above, logical-replication protocol breadth and the subscriber migration path, VSR productionization, and
 the object-storage execution capstone (end-to-end late materialization through
 the remaining multi-table and deferred operators). PAX descriptors already name
 independent verified column ranges and feed bounded cold-scan vectors through the

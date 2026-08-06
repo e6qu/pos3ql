@@ -64,6 +64,10 @@ def frontend_message(kind, payload=b""):
     return kind + struct.pack("!i", len(payload) + 4) + payload
 
 
+def standby_status(end_lsn):
+    return frontend_message(b"d", b"r" + struct.pack("!QQQQB", end_lsn, end_lsn, end_lsn, 0, 0))
+
+
 def simple_query(s, text):
     s.sendall(frontend_message(b"Q", text.encode() + b"\x00"))
     out = []
@@ -244,6 +248,53 @@ def test_logical_replication_simple_query_mode():
             row_description_type_oids(out[0][1]),
         )
     s.close()
+
+
+def test_pgoutput_startup_options_and_default_text_tuples():
+    setup = connect()
+    setup.sendall(startup_payload(0))
+    drain_startup(setup)
+    simple_query(
+        setup,
+        "DROP PUBLICATION IF EXISTS wire_replication_pub; "
+        "DROP TABLE IF EXISTS wire_replication; "
+        "CREATE TABLE wire_replication (id integer); "
+        "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication",
+    )
+
+    stream = connect()
+    stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+    drain_startup(stream)
+    simple_query(stream, "CREATE_REPLICATION_SLOT wire_replication_slot LOGICAL pgoutput")
+    stream.sendall(
+        frontend_message(
+            b"Q",
+            b"START_REPLICATION SLOT wire_replication_slot LOGICAL 0/0 "
+            b"(proto_version '1', publication_names 'wire_replication_pub')\x00",
+        )
+    )
+    kind, payload = read_message(stream)
+    check("pgoutput START_REPLICATION enters CopyBoth", kind == b"W", (kind, payload))
+
+    simple_query(setup, "INSERT INTO wire_replication VALUES (42)")
+    insert = None
+    for _ in range(64):
+        kind, payload = read_message(stream)
+        if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"I":
+            insert = payload
+        if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"C":
+            end_lsn = struct.unpack("!Q", payload[9:17])[0]
+            stream.sendall(standby_status(end_lsn))
+            if insert is not None:
+                break
+    check(
+        "pgoutput defaults to text tuples unless binary is negotiated",
+        insert is not None and insert[33:34] == b"t" and insert[34:38] == struct.pack("!i", 2) and insert[38:40] == b"42",
+        insert,
+    )
+
+    stream.close()
+    setup.close()
 
 
 def test_physical_replication_identify_system_mode():

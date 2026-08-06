@@ -602,7 +602,11 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
-    fn encode_value_text(m: &mut MsgOut, v: &Datum, render: crate::sql::guc::RenderContext) {
+    pub(crate) fn encode_value_text(
+        m: &mut MsgOut,
+        v: &Datum,
+        render: crate::sql::guc::RenderContext,
+    ) {
         {
             match v {
                 Datum::Null => {

@@ -56,7 +56,10 @@ pub fn relation(
     message.i32(relation_id as i32);
     message.cstr(schema);
     message.cstr(name);
-    message.u8(b'd');
+    // Every row-change message below carries a complete old tuple.  Advertise
+    // the matching replica identity instead of claiming DEFAULT while sending
+    // a tuple shape a subscriber is not entitled to expect from DEFAULT.
+    message.u8(b'f');
     message.i16(columns.len() as i16);
     for column in columns {
         message.u8(u8::from(column.primary));
@@ -66,41 +69,50 @@ pub fn relation(
     }
 }
 
-/// pgoutput Insert with a binary new-tuple payload.
-pub fn insert(message: &mut MsgOut, relation_id: u32, values: &[Datum]) {
+/// pgoutput Insert with a negotiated text or binary new-tuple payload.
+pub fn insert(message: &mut MsgOut, relation_id: u32, values: &[Datum], binary: bool) {
     message.u8(b'I');
     message.i32(relation_id as i32);
-    tuple(message, values);
+    tuple(message, values, binary);
 }
 
 /// pgoutput Update. The previous tuple is emitted with the `O` tag, which is
 /// valid for FULL replica identity and lets subscribers apply changes without
 /// consulting the publisher's current heap.
-pub fn update(message: &mut MsgOut, relation_id: u32, old_values: &[Datum], new_values: &[Datum]) {
+pub fn update(
+    message: &mut MsgOut,
+    relation_id: u32,
+    old_values: &[Datum],
+    new_values: &[Datum],
+    binary: bool,
+) {
     message.u8(b'U');
     message.i32(relation_id as i32);
     message.u8(b'O');
-    tuple(message, old_values);
-    tuple(message, new_values);
+    tuple(message, old_values, binary);
+    tuple(message, new_values, binary);
 }
 
 /// pgoutput Delete with the removed tuple under FULL replica identity.
-pub fn delete(message: &mut MsgOut, relation_id: u32, old_values: &[Datum]) {
+pub fn delete(message: &mut MsgOut, relation_id: u32, old_values: &[Datum], binary: bool) {
     message.u8(b'D');
     message.i32(relation_id as i32);
     message.u8(b'O');
-    tuple(message, old_values);
+    tuple(message, old_values, binary);
 }
 
-fn tuple(message: &mut MsgOut, values: &[Datum]) {
+fn tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.u8(b'N');
     message.i16(values.len() as i16);
     for value in values {
         if matches!(value, Datum::Null) {
             message.u8(b'n');
-        } else {
+        } else if binary {
             message.u8(b'b');
             Responder::encode_value_binary(message, value);
+        } else {
+            message.u8(b't');
+            Responder::encode_value_text(message, value, crate::sql::guc::RenderContext::default());
         }
     }
 }
@@ -131,13 +143,29 @@ mod tests {
         let mut budget = Budget::new(1024);
         let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
         let mut frame = MsgOut::begin(&mut buffer, b'd');
-        update(&mut frame, 7, &[Datum::Int4(1)], &[Datum::Int4(2)]);
-        delete(&mut frame, 7, &[Datum::Int4(2)]);
+        update(&mut frame, 7, &[Datum::Int4(1)], &[Datum::Int4(2)], true);
+        delete(&mut frame, 7, &[Datum::Int4(2)], true);
         frame.finish().unwrap();
         let bytes = buffer.readable();
         assert_eq!(bytes[5], b'U');
         assert_eq!(bytes[10], b'O');
         assert_eq!(bytes[35], b'D');
         assert_eq!(bytes[40], b'O');
+    }
+
+    #[test]
+    fn default_pgoutput_tuples_are_text_and_binary_is_negotiated() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        insert(&mut frame, 7, &[Datum::Int4(42)], false);
+        insert(&mut frame, 7, &[Datum::Int4(42)], true);
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(bytes[13], b't');
+        assert_eq!(&bytes[14..18], &2i32.to_be_bytes());
+        assert_eq!(&bytes[18..20], b"42");
+        assert_eq!(bytes[28], b'b');
+        assert_eq!(&bytes[29..33], &4i32.to_be_bytes());
     }
 }

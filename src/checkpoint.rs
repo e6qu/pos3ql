@@ -844,21 +844,7 @@ impl Checkpointer {
             if complete_lsn.is_some() {
                 return Ok(());
             }
-            let payload_len = record.len().checked_sub(8).ok_or_else(|| {
-                sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt uploaded WAL record")
-            })?;
-            let total = crate::wal::HEADER_LEN + payload_len;
-            if scratch.capacity() - scratch.len() < total {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "one committed WAL transaction exceeds replication buffer"
-                ));
-            }
-            let mut header = [0u8; crate::wal::HEADER_LEN];
-            header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
-            header[8..16].copy_from_slice(&lsn.to_le_bytes());
-            header[16..].copy_from_slice(record);
-            assert!(scratch.append(&header));
+            append_uploaded_wal_record(scratch, lsn, record)?;
             if matches!(
                 crate::wal::decode_record(record),
                 Some(crate::wal::WalOp::Commit { .. })
@@ -3943,6 +3929,37 @@ impl Checkpointer {
     }
 }
 
+/// Reconstructs a local-journal frame from an uploaded record which starts at
+/// the kind byte. Object replay deliberately hands the decoder that compact
+/// suffix; logical streaming needs the complete journal frame expected by the
+/// common committed-transaction cursor.
+fn append_uploaded_wal_record(
+    scratch: &mut FixedBuf,
+    lsn: u64,
+    record: &[u8],
+) -> Result<(), SqlError> {
+    let payload_len = record
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt uploaded WAL record"))?;
+    let total = crate::wal::HEADER_LEN + payload_len;
+    if scratch.capacity() - scratch.len() < total {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "one committed WAL transaction exceeds replication buffer"
+        ));
+    }
+    let mark = scratch.mark();
+    assert!(scratch.append(&[0u8; 16]));
+    assert!(scratch.append(record));
+    let filled = scratch.filled_mut();
+    filled[mark + 4..mark + 8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    filled[mark + 8..mark + 16].copy_from_slice(&lsn.to_le_bytes());
+    let crc = crate::wal::crc32c::crc32c(&filled[mark + 4..mark + total]);
+    filled[mark..mark + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
 fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetupError> {
     let bytes = hex.as_bytes();
     if bytes.len() != 2 * N {
@@ -4477,6 +4494,8 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
 #[cfg(test)]
 mod stored_dependency_tests {
     use super::*;
+    use crate::mem::budget::Budget;
+    use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredQueryDependencies};
 
     #[test]
@@ -4497,5 +4516,24 @@ mod stored_dependency_tests {
             parse_stored_query_dependencies(&mut words, true).unwrap(),
             dependencies
         );
+    }
+
+    #[test]
+    fn uploaded_wal_record_reconstruction_keeps_the_full_commit_frame() {
+        let mut budget = Budget::new(1024);
+        let mut scratch = FixedBuf::new(&mut budget, "replication scratch", 128).unwrap();
+        let record = [37, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0];
+        append_uploaded_wal_record(&mut scratch, 44, &record).unwrap();
+        let frame = scratch.readable();
+        assert_eq!(frame.len(), crate::wal::HEADER_LEN + 4);
+        assert_eq!(u64::from_le_bytes(frame[8..16].try_into().unwrap()), 44);
+        assert_eq!(
+            crate::wal::crc32c::crc32c(&frame[4..]),
+            u32::from_le_bytes(frame[..4].try_into().unwrap())
+        );
+        assert!(matches!(
+            crate::wal::decode_record(&frame[16..]),
+            Some(crate::wal::WalOp::Commit { transaction_id: 9 })
+        ));
     }
 }

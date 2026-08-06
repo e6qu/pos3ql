@@ -100,6 +100,8 @@ enum ReplicationMode {
 struct ReplicationStream {
     slot: SqlName,
     publication: StackStr<63>,
+    /// pgoutput defaults to text; binary tuples require explicit negotiation.
+    binary: bool,
     cursor_lsn: u64,
     last_sent_lsn: u64,
 }
@@ -1099,6 +1101,7 @@ impl Conn {
         match engine.emit_replication_transaction(
             stream.cursor_lsn,
             stream.publication.as_str(),
+            stream.binary,
             &mut self.copy_buf,
             &mut responder,
         ) {
@@ -2269,7 +2272,11 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
-                Ok(LogicalReplicationCommand::Start { name, publication }) => {
+                Ok(LogicalReplicationCommand::Start {
+                    name,
+                    publication,
+                    binary,
+                }) => {
                     let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
                         Ok(lsn) => lsn,
                         Err(error) => {
@@ -2289,6 +2296,7 @@ impl Conn {
                     self.replication_stream = Some(ReplicationStream {
                         slot: name,
                         publication,
+                        binary,
                         cursor_lsn,
                         last_sent_lsn: cursor_lsn,
                     });
@@ -2406,21 +2414,22 @@ enum LogicalReplicationCommand {
     Start {
         name: SqlName,
         publication: StackStr<63>,
+        binary: bool,
     },
 }
 
 fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCommand, SqlError> {
     let text = text.trim().trim_end_matches(';').trim_end();
-    let mut words = text.split_ascii_whitespace();
-    let command = words.next().unwrap_or_default();
+    let mut input = text;
+    let command = take_replication_word(&mut input).unwrap_or_default();
     if command.eq_ignore_ascii_case("drop_replication_slot") {
-        let name = words.next().ok_or_else(|| {
+        let name = take_replication_word(&mut input).ok_or_else(|| {
             sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "DROP_REPLICATION_SLOT requires a slot name"
             )
         })?;
-        if !is_replication_slot_name(name) || words.next().is_some() {
+        if !is_replication_slot_name(name) || take_replication_word(&mut input).is_some() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "invalid DROP_REPLICATION_SLOT input"
@@ -2431,50 +2440,44 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
         });
     }
     if command.eq_ignore_ascii_case("start_replication") {
-        let slot_keyword = words
-            .next()
+        let slot_keyword = take_replication_word(&mut input)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires SLOT"))?;
-        let name = words.next().ok_or_else(|| {
+        let name = take_replication_word(&mut input).ok_or_else(|| {
             sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "START_REPLICATION requires a slot name"
             )
         })?;
-        let logical = words.next().ok_or_else(|| {
+        let logical = take_replication_word(&mut input).ok_or_else(|| {
             sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires LOGICAL")
         })?;
-        let _lsn = words
-            .next()
+        let lsn = take_replication_word(&mut input)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires an LSN"))?;
-        let mut publication = None;
-        while let Some(option) = words.next() {
-            if option
-                .trim_matches(|byte| matches!(byte, '(' | ')' | ','))
-                .eq_ignore_ascii_case("publication_names")
-            {
-                publication = words
-                    .next()
-                    .map(|value| value.trim_matches(|byte| matches!(byte, '(' | ')' | ',' | '\'')));
-                break;
-            }
-        }
-        let publication = publication.ok_or_else(|| {
-            sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "START_REPLICATION requires publication_names"
-            )
-        })?;
         if !slot_keyword.eq_ignore_ascii_case("slot")
             || !logical.eq_ignore_ascii_case("logical")
             || !is_replication_slot_name(name)
-            || publication.is_empty()
-            || publication.contains(',')
         {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "only one logical pgoutput publication is supported"
+                sqlstate::SYNTAX_ERROR,
+                "invalid START_REPLICATION input"
             ));
         }
+        if !is_valid_lsn(lsn) {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid START_REPLICATION LSN"
+            ));
+        }
+        // A logical slot owns its retained position. Accepting another LSN
+        // and then silently starting from the slot cursor can skip or repeat
+        // data, so the one semantically supported spelling is explicit.
+        if !lsn.eq_ignore_ascii_case("0/0") {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "logical START_REPLICATION currently requires LSN 0/0"
+            ));
+        }
+        let (publication, binary) = parse_pgoutput_options(input)?;
         let mut publication_name = StackStr::new();
         use core::fmt::Write;
         write!(publication_name, "{publication}").map_err(|_| {
@@ -2486,6 +2489,7 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
         return Ok(LogicalReplicationCommand::Start {
             name: SqlName::parse(name)?,
             publication: publication_name,
+            binary,
         });
     }
     if !command.eq_ignore_ascii_case("create_replication_slot") {
@@ -2494,7 +2498,7 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
             "expected CREATE_REPLICATION_SLOT"
         ));
     }
-    let name = words.next().ok_or_else(|| {
+    let name = take_replication_word(&mut input).ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
             "CREATE_REPLICATION_SLOT requires a slot name"
@@ -2506,13 +2510,13 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
             "invalid replication slot name"
         ));
     }
-    let kind = words.next().ok_or_else(|| {
+    let kind = take_replication_word(&mut input).ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
             "CREATE_REPLICATION_SLOT requires LOGICAL pgoutput"
         )
     })?;
-    let plugin = words.next().ok_or_else(|| {
+    let plugin = take_replication_word(&mut input).ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
             "CREATE_REPLICATION_SLOT requires LOGICAL pgoutput"
@@ -2524,7 +2528,7 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
             "only LOGICAL pgoutput replication slots are supported"
         ));
     }
-    if words.next().is_some() {
+    if take_replication_word(&mut input).is_some() {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "trailing CREATE_REPLICATION_SLOT input"
@@ -2533,6 +2537,153 @@ fn parse_logical_replication_command(text: &str) -> Result<LogicalReplicationCom
     Ok(LogicalReplicationCommand::CreateSlot {
         name: SqlName::parse(name)?,
     })
+}
+
+fn take_replication_word<'a>(input: &mut &'a str) -> Option<&'a str> {
+    *input = input.trim_start_matches(char::is_whitespace);
+    if input.is_empty() {
+        return None;
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let (word, rest) = input.split_at(end);
+    *input = rest;
+    Some(word)
+}
+
+fn is_valid_lsn(value: &str) -> bool {
+    let Some((high, low)) = value.split_once('/') else {
+        return false;
+    };
+    !high.is_empty()
+        && !low.is_empty()
+        && high.len() <= 8
+        && low.len() <= 8
+        && high.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && low.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Parses pgoutput's parenthesized option list without accepting ignored
+/// keys. Values are SQL-style single-quoted strings; the bounded publication
+/// name is copied only after every option has been validated.
+fn parse_pgoutput_options(input: &str) -> Result<(&str, bool), SqlError> {
+    let mut input = input.trim();
+    let Some(body) = input.strip_prefix('(') else {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "START_REPLICATION requires pgoutput options"
+        ));
+    };
+    input = body;
+    let mut publication = None;
+    let mut proto_version = None;
+    let mut binary = false;
+    let mut saw_binary = false;
+    loop {
+        input = input.trim_start();
+        if let Some(rest) = input.strip_prefix(')') {
+            if !rest.trim().is_empty() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "trailing START_REPLICATION input"
+                ));
+            }
+            break;
+        }
+        let key_end = input
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(input.len());
+        if key_end == 0 {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid pgoutput option name"
+            ));
+        }
+        let key = &input[..key_end];
+        input = input[key_end..].trim_start();
+        if let Some(rest) = input.strip_prefix('=') {
+            input = rest.trim_start();
+        }
+        let Some(rest) = input.strip_prefix('\'') else {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "pgoutput option values must be quoted"
+            ));
+        };
+        let Some(end) = rest.find('\'') else {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "unterminated pgoutput option value"
+            ));
+        };
+        let value = &rest[..end];
+        input = rest[end + 1..].trim_start();
+        if let Some(rest) = input.strip_prefix(',') {
+            input = rest;
+        } else if !input.starts_with(')') {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "pgoutput options require commas"
+            ));
+        }
+        if key.eq_ignore_ascii_case("proto_version") {
+            if proto_version.replace(value).is_some() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput proto_version"
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("publication_names") {
+            if publication.replace(value).is_some() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput publication_names"
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("binary") {
+            if saw_binary {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput binary option"
+                ));
+            }
+            binary = match value {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "pgoutput binary must be 'true' or 'false'"
+                    ));
+                }
+            };
+            saw_binary = true;
+        } else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "unsupported pgoutput option \"{}\"",
+                key
+            ));
+        }
+    }
+    if proto_version != Some("1") {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "only pgoutput proto_version '1' is supported"
+        ));
+    }
+    let publication = publication.ok_or_else(|| {
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "START_REPLICATION requires publication_names"
+        )
+    })?;
+    if publication.is_empty() || publication.contains(',') {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "only one logical pgoutput publication is supported"
+        ));
+    }
+    Ok((publication, binary))
 }
 
 fn is_replication_slot_name(name: &str) -> bool {
@@ -2928,22 +3079,45 @@ mod tests {
     }
 
     #[test]
-    fn logical_start_replication_requires_one_publication() {
+    fn logical_start_replication_strictly_negotiates_pgoutput() {
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub')",
         )
         .unwrap();
-        let LogicalReplicationCommand::Start { name, publication } = command else {
+        let LogicalReplicationCommand::Start {
+            name,
+            publication,
+            binary,
+        } = command
+        else {
             panic!("expected START_REPLICATION")
         };
         assert_eq!(name.as_str(), "changes");
         assert_eq!(publication.as_str(), "changes_pub");
+        assert!(!binary);
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'true', proto_version '1')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { binary, .. } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        assert!(binary);
         assert!(
             parse_logical_replication_command(
                 "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1')"
             )
             .is_err()
         );
+        for input in [
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', streaming 'true')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/1 (proto_version '1', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1' publication_names 'changes_pub')",
+        ] {
+            assert!(parse_logical_replication_command(input).is_err(), "{input}");
+        }
     }
 
     #[test]

@@ -738,6 +738,7 @@ impl Engine {
         &mut self,
         floor: u64,
         publication_name: &str,
+        binary: bool,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<u64>, SqlError> {
@@ -853,6 +854,7 @@ impl Engine {
                                                 relation_id,
                                                 &old_values[..column_count],
                                                 &values[..column_count],
+                                                binary,
                                             )
                                         })
                                     })
@@ -865,6 +867,7 @@ impl Engine {
                                                 plugin,
                                                 relation_id,
                                                 &values[..column_count],
+                                                binary,
                                             )
                                         })
                                     })
@@ -925,6 +928,7 @@ impl Engine {
                                             plugin,
                                             relation_id,
                                             &values[..column_count],
+                                            binary,
                                         )
                                     })
                                 })

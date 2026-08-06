@@ -1338,6 +1338,69 @@ fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_tex
 }
 
 #[test]
+fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
+    std::thread::Builder::new()
+        .name("logical-truncate-pgoutput".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack)
+        .expect("logical truncate test thread starts")
+        .join()
+        .expect("logical truncate test thread completes");
+}
+
+fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE t (id int); CREATE PUBLICATION changes FOR TABLE t WITH (publish = 'truncate'); INSERT INTO t VALUES (1)",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(&mut engine, &mut budget, &mut transaction, "TRUNCATE t");
+
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let lsn = engine
+        .emit_replication_transaction(
+            floor,
+            "changes",
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("truncate transaction is retained");
+    assert!(lsn > floor);
+    assert!(
+        send.readable().windows(1).any(|bytes| bytes == b"T"),
+        "pgoutput v2 must publish a truncate message"
+    );
+
+    let mut v1_scratch =
+        crate::mem::FixedBuf::new(&mut budget, "v1 replication scratch", 1 << 16).unwrap();
+    let mut v1_send =
+        crate::mem::FixedBuf::new(&mut budget, "v1 replication send", 1 << 16).unwrap();
+    let error = engine
+        .emit_replication_transaction(
+            floor,
+            "changes",
+            false,
+            1,
+            &mut v1_scratch,
+            &mut Responder::new(&mut v1_send),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.sqlstate,
+        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED
+    );
+}
+
+#[test]
 fn explicit_rollback_discards_writes() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();

@@ -334,6 +334,28 @@ pub struct ColumnMeta {
     pub user_type_schema: Option<SqlName>,
 }
 
+/// A durable schema-qualified user-type identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserTypeName {
+    pub schema: SqlName,
+    pub name: SqlName,
+}
+
+impl ColumnMeta {
+    /// Returns the complete user-type identity, rejecting a malformed partial
+    /// pair before it can be mistaken for a built-in type.
+    pub fn user_type_name(&self) -> Result<Option<UserTypeName>, SqlError> {
+        match (self.user_type_schema, self.domain) {
+            (None, None) => Ok(None),
+            (Some(schema), Some(name)) => Ok(Some(UserTypeName { schema, name })),
+            _ => Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "user-defined column type has an incomplete durable identity"
+            )),
+        }
+    }
+}
+
 /// The durable identity of a table column's declared type.
 ///
 /// `ColType` deliberately describes the representation used by the executor;
@@ -9774,19 +9796,10 @@ impl Storage {
             _ => {}
         }
 
-        let (schema, name) = match (column.user_type_schema, column.domain) {
-            (None, None) => {
-                return Ok(DeclaredColumnType::Builtin {
-                    oid: column.ctype.oid(),
-                });
-            }
-            (Some(schema), Some(name)) => (schema, name),
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::PROTOCOL_VIOLATION,
-                    "user-defined column type has an incomplete durable identity"
-                ));
-            }
+        let Some(UserTypeName { schema, name }) = column.user_type_name()? else {
+            return Ok(DeclaredColumnType::Builtin {
+                oid: column.ctype.oid(),
+            });
         };
         if let Some(slot) = self.domain_slot(schema.as_str(), name.as_str(), txid) {
             return Ok(DeclaredColumnType::UserDefined {

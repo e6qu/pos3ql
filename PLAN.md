@@ -26,6 +26,14 @@ acknowledged data in durable mode.
 
 ## Phases
 
+Recent protocol-fidelity work now treats a table column's **declared type
+identity** as distinct from its executor representation. Domains deliberately
+use their base representation both during evaluation and in result metadata,
+while parameter inference, `pg_attribute`, and pgoutput resolve the durable
+catalog identity first. This is a structural rule: a missing named type is an
+error, never a base-type substitution. The regression coverage exercises both
+enums and domains through each contract.
+
 | # | Phase | Milestone | Status |
 |---|-------|-----------|--------|
 | P0 | Scaffolding & memory core | Fixed-budget allocation w/ loud exhaustion, alloc guard, PCG32, config | **done** |

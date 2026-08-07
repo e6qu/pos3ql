@@ -875,6 +875,29 @@ fn message_types(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn row_description_type_oids(bytes: &[u8]) -> Vec<i32> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if tag == b'T' {
+            let payload = &bytes[offset + 5..offset + 1 + length];
+            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+            let mut fields = &payload[2..];
+            let mut oids = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name_end = fields.iter().position(|byte| *byte == 0).unwrap();
+                fields = &fields[name_end + 1..];
+                oids.push(i32::from_be_bytes(fields[6..10].try_into().unwrap()));
+                fields = &fields[18..]; // table OID + attribute number + type metadata
+            }
+            return oids;
+        }
+        offset += 1 + length;
+    }
+    panic!("response has no RowDescription")
+}
+
 fn command_tags(bytes: &[u8]) -> Vec<String> {
     let mut tags = Vec::new();
     let mut index = 0;
@@ -1312,6 +1335,68 @@ fn select_one_still_works() {
     let (mut e, mut b) = test_engine();
     let bytes = run_with(&mut e, &mut b, "SELECT 1");
     assert_eq!(message_types(&bytes), [b'T', b'D', b'C']);
+}
+
+#[test]
+fn declared_user_types_survive_protocol_description_and_parameter_inference() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE protocol_state AS ENUM ('ready'); \
+         CREATE DOMAIN protocol_count AS integer CHECK (VALUE > 0); \
+         CREATE TABLE protocol_types (state protocol_state, count protocol_count)",
+    );
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        engine
+            .storage
+            .enum_slot("public", "protocol_state", 0)
+            .unwrap() as u16,
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "protocol_count", 0)
+            .unwrap() as u16,
+    );
+
+    for query in [
+        "SELECT state, count FROM protocol_types",
+        "SELECT * FROM protocol_types",
+        "SELECT (protocol_types).* FROM protocol_types",
+    ] {
+        assert_eq!(
+            row_description_type_oids(&run_with(&mut engine, &mut budget, query)),
+            [enum_oid, crate::sql::types::oid::INT4],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT atttypid FROM pg_attribute \
+             WHERE attrelid = 'protocol_types'::regclass AND attnum > 0 ORDER BY attnum",
+        )),
+        [enum_oid.to_string(), domain_oid.to_string()]
+    );
+
+    let arena = Arena::new(&mut budget, "parameter inference", 1 << 18).unwrap();
+    let transaction = TxnState::new(&mut budget, 64).unwrap();
+    let inferred = engine.infer_param_types(
+        "INSERT INTO protocol_types (state, count) VALUES ($1, $2)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[..2], [enum_oid, domain_oid]);
+    let inferred = engine.infer_param_types(
+        "UPDATE protocol_types SET count = $1 WHERE state = $2",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[..2], [domain_oid, enum_oid]);
 }
 
 /// Like run_with but with a caller-owned TxnState, so explicit

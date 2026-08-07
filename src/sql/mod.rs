@@ -410,31 +410,14 @@ fn replication_column_types(
     let mut type_oids = [0_i32; crate::storage::MAX_COLUMNS];
     let mut types = [None; crate::storage::MAX_COLUMNS];
     for (index, column) in columns.iter().enumerate() {
-        let Some(name) = column.domain else {
-            type_oids[index] = column.ctype.oid();
-            continue;
-        };
-        let schema = column.user_type_schema.ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "user-defined replication column type lacks a schema"
-            )
-        })?;
-        if let Some(slot) = storage.domain_slot(schema.as_str(), name.as_str(), 0) {
-            let oid = crate::sql::types::oid::domain_oid(slot as u16);
-            type_oids[index] = oid;
-            types[index] = Some(ReplicationType { oid, schema, name });
-        } else if let Some(slot) = storage.enum_slot(schema.as_str(), name.as_str(), 0) {
-            let oid = crate::sql::types::oid::enum_oid(slot as u16);
-            type_oids[index] = oid;
-            types[index] = Some(ReplicationType { oid, schema, name });
-        } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "replication column type \"{}.{}\" does not exist",
-                schema.as_str(),
-                name.as_str()
-            ));
+        let identity = storage.column_type_identity(column, 0)?;
+        type_oids[index] = identity.oid();
+        if let Some((schema, name)) = identity.user_type() {
+            types[index] = Some(ReplicationType {
+                oid: identity.oid(),
+                schema,
+                name,
+            });
         }
     }
     Ok((type_oids, types))
@@ -3024,7 +3007,12 @@ impl Engine {
         };
         let def = self.storage.table_def(slot, txid);
         let index = def.column_index(col)?;
-        Some(def.columns()[index].ctype.oid())
+        Some(
+            self.storage
+                .column_type_identity(&def.columns()[index], txid)
+                .expect("table column type identity is catalog-validated")
+                .oid(),
+        )
     }
 
     fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
@@ -3067,7 +3055,12 @@ impl Engine {
                             } else {
                                 ins.columns.get(i).and_then(|c| d.column_index(c))
                             };
-                            ci.map(|ci| d.columns()[ci].ctype.oid())
+                            ci.map(|ci| {
+                                self.storage
+                                    .column_type_identity(&d.columns()[ci], txid)
+                                    .expect("table column type identity is catalog-validated")
+                                    .oid()
+                            })
                         });
                         if let Some(ty) = ty {
                             set(oids, value, ty);

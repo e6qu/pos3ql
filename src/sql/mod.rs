@@ -45,7 +45,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{RowHome, RowLoc, SqlName, Storage};
+use crate::storage::{ColumnMeta, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
@@ -390,6 +390,111 @@ struct PendingTruncate {
     emitted: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ReplicationType {
+    oid: i32,
+    schema: SqlName,
+    name: SqlName,
+}
+
+fn replication_column_types(
+    storage: &Storage,
+    columns: &[ColumnMeta],
+) -> Result<
+    (
+        [i32; crate::storage::MAX_COLUMNS],
+        [Option<ReplicationType>; crate::storage::MAX_COLUMNS],
+    ),
+    SqlError,
+> {
+    let mut type_oids = [0_i32; crate::storage::MAX_COLUMNS];
+    let mut types = [None; crate::storage::MAX_COLUMNS];
+    for (index, column) in columns.iter().enumerate() {
+        let Some(name) = column.domain else {
+            type_oids[index] = column.ctype.oid();
+            continue;
+        };
+        let schema = column.user_type_schema.ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "user-defined replication column type lacks a schema"
+            )
+        })?;
+        if let Some(slot) = storage.domain_slot(schema.as_str(), name.as_str(), 0) {
+            let oid = crate::sql::types::oid::domain_oid(slot as u16);
+            type_oids[index] = oid;
+            types[index] = Some(ReplicationType { oid, schema, name });
+        } else if let Some(slot) = storage.enum_slot(schema.as_str(), name.as_str(), 0) {
+            let oid = crate::sql::types::oid::enum_oid(slot as u16);
+            type_oids[index] = oid;
+            types[index] = Some(ReplicationType { oid, schema, name });
+        } else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "replication column type \"{}.{}\" does not exist",
+                schema.as_str(),
+                name.as_str()
+            ));
+        }
+    }
+    Ok((type_oids, types))
+}
+
+fn emit_replication_relation(
+    storage: &Storage,
+    definition: &crate::storage::TableDef,
+    relation_id: u32,
+    responder: &mut Responder,
+    end_lsn: u64,
+) -> Result<(), SqlError> {
+    let columns = definition.columns();
+    let (type_oids, types) = replication_column_types(storage, columns)?;
+    let overflow = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "replication transaction exceeds connection send buffer"
+        )
+    };
+    for (index, type_info) in types.iter().enumerate().take(columns.len()) {
+        let Some(type_info) = type_info else {
+            continue;
+        };
+        if types[..index]
+            .iter()
+            .flatten()
+            .any(|prior| prior.oid == type_info.oid)
+        {
+            continue;
+        }
+        responder
+            .copy_data(&|message| {
+                pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                    pgoutput::type_message(
+                        plugin,
+                        type_info.oid,
+                        type_info.schema.as_str(),
+                        type_info.name.as_str(),
+                    )
+                })
+            })
+            .map_err(|_| overflow())?;
+    }
+    responder
+        .copy_data(&|message| {
+            pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                pgoutput::relation(
+                    plugin,
+                    relation_id,
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    columns,
+                    &type_oids[..columns.len()],
+                )
+            })
+        })
+        .map_err(|_| overflow())
+}
+
 fn emit_pending_truncates(
     storage: &Storage,
     publication_names: &[SqlName],
@@ -417,24 +522,7 @@ fn emit_pending_truncates(
             }
             let definition = storage.table_def(table_slot, 0);
             let relation_id = table_slot as u32 + 1;
-            responder
-                .copy_data(&|message| {
-                    pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
-                        pgoutput::relation(
-                            plugin,
-                            relation_id,
-                            definition.schema.as_str(),
-                            definition.name.as_str(),
-                            definition.columns(),
-                        )
-                    })
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "replication transaction exceeds connection send buffer"
-                    )
-                })?;
+            emit_replication_relation(storage, definition, relation_id, responder, end_lsn)?;
             relation_ids[relation_count] = relation_id;
             relation_count += 1;
         }
@@ -1139,19 +1227,13 @@ impl Engine {
                                 &mut values,
                             )?;
                             let relation_id = table_slot as u32 + 1;
-                            responder
-                                .copy_data(&|message| {
-                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
-                                        pgoutput::relation(
-                                            plugin,
-                                            relation_id,
-                                            schema,
-                                            table,
-                                            definition.columns(),
-                                        )
-                                    })
-                                })
-                                .map_err(|_| overflow())?;
+                            emit_replication_relation(
+                                storage,
+                                definition,
+                                relation_id,
+                                responder,
+                                end_lsn,
+                            )?;
                             if is_update {
                                 let old = old_row.ok_or_else(|| {
                                     sql_err!(
@@ -1246,19 +1328,13 @@ impl Engine {
                                 &mut values,
                             )?;
                             let relation_id = table_slot as u32 + 1;
-                            responder
-                                .copy_data(&|message| {
-                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
-                                        pgoutput::relation(
-                                            plugin,
-                                            relation_id,
-                                            schema,
-                                            table,
-                                            definition.columns(),
-                                        )
-                                    })
-                                })
-                                .map_err(|_| overflow())?;
+                            emit_replication_relation(
+                                storage,
+                                definition,
+                                relation_id,
+                                responder,
+                                end_lsn,
+                            )?;
                             responder
                                 .copy_data(&|message| {
                                     pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {

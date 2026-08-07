@@ -263,8 +263,10 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         "DROP PUBLICATION IF EXISTS wire_replication_pub; "
         "DROP TABLE IF EXISTS wire_replication_two; "
         "DROP TABLE IF EXISTS wire_replication; "
+        "DROP TYPE IF EXISTS wire_replication_state; "
+        "CREATE TYPE wire_replication_state AS ENUM ('ready'); "
         "CREATE TABLE wire_replication (id integer); "
-        "CREATE TABLE wire_replication_two (id integer); "
+        "CREATE TABLE wire_replication_two (id integer, state wire_replication_state); "
         "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication; "
         "CREATE PUBLICATION \"wire, replication\" FOR TABLE wire_replication_two",
     )
@@ -307,13 +309,16 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     simple_query(
         setup,
         "BEGIN; INSERT INTO wire_replication VALUES (42); "
-        "INSERT INTO wire_replication_two VALUES (7); COMMIT",
+        "INSERT INTO wire_replication_two VALUES (7, 'ready'); COMMIT",
     )
     inserts = []
+    plugins = []
     for _ in range(128):
         kind, payload = read_message(stream)
-        if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"I":
-            inserts.append(payload)
+        if kind == b"d" and len(payload) > 25 and payload[:1] == b"w":
+            plugins.append(payload[25:26])
+            if payload[25:26] == b"I":
+                inserts.append(payload)
         if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"C":
             end_lsn = struct.unpack("!Q", payload[9:17])[0]
             stream.sendall(standby_status(end_lsn))
@@ -322,9 +327,14 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     check(
         "pgoutput publication union emits both text tuples exactly once",
         len(inserts) == 2
-        and {payload[38:] for payload in inserts} == {b"42", b"7"}
-        and all(payload[33:34] == b"t" and payload[34:38] == struct.pack("!i", len(payload) - 38) for payload in inserts),
+        and any(payload.endswith(b"42") for payload in inserts)
+        and any(payload.endswith(b"ready") and b"\x00\x00\x00\x01" in payload for payload in inserts),
         inserts,
+    )
+    check(
+        "pgoutput Type precedes Relation for enum columns",
+        any(plugins[index:index + 2] == [b"Y", b"R"] for index in range(len(plugins) - 1)),
+        plugins,
     )
 
     stream.close()

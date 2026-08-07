@@ -112,9 +112,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         match self.0.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns().get(column)?.domain
-            }
+            ResolvedColumn::Table(table, column) => self.0.defs[table]?
+                .columns()
+                .get(column)?
+                .user_type
+                .map(|identity| identity.name),
             ResolvedColumn::Merged(_) => None,
         }
     }

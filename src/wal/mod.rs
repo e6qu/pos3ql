@@ -1202,9 +1202,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 // auto_increment_step (i64).
                 n += 8;
                 // User-defined column: name, then a format marker and schema.
-                if let Some(d) = &c.domain {
-                    n += 1 + d.as_str().len();
-                    n += 2 + c.user_type_schema.map_or(0, |schema| schema.as_str().len());
+                if let Some(identity) = c.user_type {
+                    n += 1 + identity.name.as_str().len();
+                    n += 2 + identity.schema.as_str().len();
                 }
             }
             // uniques
@@ -1477,7 +1477,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.is_generated) << 4)
                     | (u8::from(c.is_identity) << 5)
                     | (u8::from(c.identity_always) << 6)
-                    | (u8::from(c.domain.is_some()) << 7);
+                    | (u8::from(c.user_type.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 ok &= append_default(buffer, &c.default_value);
@@ -1485,13 +1485,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&(de.len() as u16).to_le_bytes());
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
-                if let Some(d) = &c.domain {
-                    ok &= name_bytes(buffer, d.as_str());
+                if let Some(identity) = c.user_type {
+                    ok &= name_bytes(buffer, identity.name.as_str());
                     ok &= buffer.append(&[u8::MAX]);
-                    let schema = c
-                        .user_type_schema
-                        .expect("user-defined column carries its type schema");
-                    ok &= name_bytes(buffer, schema.as_str());
+                    ok &= name_bytes(buffer, identity.schema.as_str());
                 }
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -2137,8 +2134,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     is_identity: false,
                     identity_always: false,
                     auto_increment_step: 1,
-                    domain: None,
-                    user_type_schema: None,
+                    user_type: None,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 ..TableDef::empty()
@@ -2163,22 +2159,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let auto_increment_step =
                     i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
                 at += 8;
-                // Bit 7 set (in a journal written by this build or later) means a
-                // domain name follows; older journals have it clear.
-                let (domain, user_type_schema) = if meta[1] & 128 != 0 {
-                    let domain = Some(SqlName::parse(take_name(&mut at)?).ok()?);
+                // Bit 7 set means a durable user-type identity follows.
+                let user_type = if meta[1] & 128 != 0 {
+                    let name = SqlName::parse(take_name(&mut at)?).ok()?;
                     let schema = if payload.get(at).copied() == Some(u8::MAX) {
                         at += 1;
-                        Some(SqlName::parse(take_name(&mut at)?).ok()?)
+                        SqlName::parse(take_name(&mut at)?).ok()?
                     } else {
-                        // Journals written before schemas were included retain
-                        // an unresolved schema; startup accepts it only when
-                        // the name identifies exactly one visible type.
-                        None
+                        return None;
                     };
-                    (domain, schema)
+                    Some(crate::storage::UserTypeName { schema, name })
                 } else {
-                    (None, None)
+                    None
                 };
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
@@ -2194,8 +2186,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     is_identity: meta[1] & 32 != 0,
                     identity_always: meta[1] & 64 != 0,
                     auto_increment_step,
-                    domain,
-                    user_type_schema,
+                    user_type,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -3342,8 +3333,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
-                domain: None,
-                user_type_schema: None,
+                user_type: None,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -3362,8 +3352,7 @@ mod tests {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
-            domain: None,
-            user_type_schema: None,
+            user_type: None,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -3379,8 +3368,7 @@ mod tests {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
-            domain: None,
-            user_type_schema: None,
+            user_type: None,
         };
         // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
         // round-trip covers every constraint kind.

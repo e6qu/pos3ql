@@ -1,15 +1,4 @@
-//! Write-ahead log: one preallocated journal file, TigerBeetle-style —
-//! opened once at startup, so the post-freeze path never builds paths or
-//! opens files. Records are CRC-32C-checksummed and strictly
-//! LSN-increasing; recovery replays until the first invalid or
-//! non-monotonic record, which also makes a recycled journal (after a
-//! future checkpoint truncation) safe against stale tails.
-//!
-//! Durability: `commit` writes buffered records and issues
-//! `fcntl(F_FULLFSYNC)` on macOS (plain fsync does not reach the platter
-//! there). A failed durability write aborts the process: memory state is
-//! already ahead of the journal, and restart-and-replay is the only
-//! consistent recovery.
+//! Preallocated, checksummed write-ahead log and recovery codec.
 
 pub(crate) mod crc32c;
 
@@ -1370,10 +1359,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateDomain(def) => {
             let de = def.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
-            let parent = def.base_domain.map(|d| d.as_str().len()).unwrap_or(0);
+            let parent = def.base_domain.map(|d| d.name.as_str().len()).unwrap_or(0);
             let parent_schema = def
-                .base_domain_schema
-                .map(|schema| schema.as_str().len())
+                .base_domain
+                .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
             let mut n = 1
                 + def.name.as_str().len()
@@ -1762,13 +1751,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[DOMAIN_PAYLOAD_WITH_PARENT])
                 && name_bytes(
                     buffer,
-                    def.base_domain.as_ref().map(|d| d.as_str()).unwrap_or(""),
+                    def.base_domain
+                        .as_ref()
+                        .map(|d| d.name.as_str())
+                        .unwrap_or(""),
                 )
                 && name_bytes(
                     buffer,
-                    def.base_domain_schema
+                    def.base_domain
                         .as_ref()
-                        .map(|schema| schema.as_str())
+                        .map(|identity| identity.schema.as_str())
                         .unwrap_or(""),
                 )
                 && buffer.append(&[def.base.code()])
@@ -2763,25 +2755,30 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let (base_domain, base_domain_schema) =
-                if *payload.get(at)? == DOMAIN_PAYLOAD_WITH_PARENT {
-                    at += 1;
-                    let base_domain_name = take_name(&mut at)?;
-                    let base_domain = if base_domain_name.is_empty() {
-                        None
-                    } else {
-                        Some(SqlName::parse(base_domain_name).ok()?)
-                    };
-                    let base_domain_schema_name = take_name(&mut at)?;
-                    let base_domain_schema = if base_domain_schema_name.is_empty() {
-                        None
-                    } else {
-                        Some(SqlName::parse(base_domain_schema_name).ok()?)
-                    };
-                    (base_domain, base_domain_schema)
+            let base_domain = if *payload.get(at)? == DOMAIN_PAYLOAD_WITH_PARENT {
+                at += 1;
+                let base_domain_name = take_name(&mut at)?;
+                let base_domain = if base_domain_name.is_empty() {
+                    None
                 } else {
-                    (None, None)
+                    Some(SqlName::parse(base_domain_name).ok()?)
                 };
+                let base_domain_schema_name = take_name(&mut at)?;
+                let base_domain_schema = if base_domain_schema_name.is_empty() {
+                    None
+                } else {
+                    Some(SqlName::parse(base_domain_schema_name).ok()?)
+                };
+                match (base_domain, base_domain_schema) {
+                    (None, None) => None,
+                    (Some(name), Some(schema)) => {
+                        Some(crate::storage::UserTypeName { schema, name })
+                    }
+                    _ => return None,
+                }
+            } else {
+                None
+            };
             let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
             at += 1;
             let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
@@ -2818,7 +2815,6 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name: SqlName::parse(name).ok()?,
                 ownership: crate::storage::Ownership::BOOTSTRAP,
                 base_domain,
-                base_domain_schema,
                 base,
                 base_type_mod,
                 not_null,
@@ -3701,9 +3697,30 @@ mod tests {
         assert_eq!(domain.name.as_str(), "positive");
         assert_eq!(domain.base, ColType::Int4);
         assert_eq!(domain.base_domain, None);
-        assert_eq!(domain.base_domain_schema, None);
         assert_eq!(domain.default_expr.expect("domain default").as_str(), "7");
         assert_eq!(domain.checks()[0].expression.as_str(), "VALUE > 0");
+    }
+
+    #[test]
+    fn domain_payload_rejects_partial_parent_identity() {
+        fn push_name(payload: &mut Vec<u8>, value: &str) {
+            payload.push(value.len() as u8);
+            payload.extend_from_slice(value.as_bytes());
+        }
+
+        let mut payload = Vec::new();
+        push_name(&mut payload, "child");
+        push_name(&mut payload, "public");
+        payload.push(DOMAIN_PAYLOAD_WITH_PARENT);
+        push_name(&mut payload, "parent");
+        push_name(&mut payload, "");
+        payload.push(ColType::Int4.code());
+        payload.extend_from_slice(&(-1_i32).to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&(0_u16).to_le_bytes());
+        payload.push(0);
+
+        assert!(decode_op(KIND_CREATE_DOMAIN, &payload).is_none());
     }
 
     #[test]

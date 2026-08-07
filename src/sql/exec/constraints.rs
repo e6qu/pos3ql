@@ -50,17 +50,14 @@ pub(crate) fn coerce_domain_value<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage.domain(slot);
     let value = if let Some(parent_name) = domain.base_domain {
-        let parent_schema = domain
-            .base_domain_schema
-            .expect("parent domain identity carries its schema");
         let parent = storage
-            .domain_slot(parent_schema.as_str(), parent_name.as_str(), txid)
+            .domain_slot(parent_name.schema.as_str(), parent_name.name.as_str(), txid)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "base domain \"{}.{}\" does not exist",
-                    parent_schema.as_str(),
-                    parent_name.as_str()
+                    parent_name.schema.as_str(),
+                    parent_name.name.as_str()
                 )
             })?;
         coerce_domain_value(storage, parent, value, txid, arena, params)?

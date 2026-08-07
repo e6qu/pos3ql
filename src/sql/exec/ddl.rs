@@ -1,11 +1,4 @@
-//! Turning a parsed `CREATE TABLE` into the definition the storage layer keeps.
-//!
-//! Column metadata from the column definitions, then the constraints attached
-//! over it: PRIMARY KEY and UNIQUE (single-column ones ride the column flags,
-//! wider ones become keys of their own), CHECK with its references validated
-//! against the columns that exist, and FOREIGN KEY resolved against the parent
-//! it names. Constraint names follow PostgreSQL's generated spelling when the
-//! statement does not give one.
+//! CREATE TABLE definition and constraint construction.
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};

@@ -5818,7 +5818,6 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // exists, else create it committed (txid 0).
             let spec = crate::storage::DomainSpec {
                 base_domain: def.base_domain,
-                base_domain_schema: def.base_domain_schema,
                 base: def.base,
                 base_type_mod: def.base_type_mod,
                 not_null: def.not_null,

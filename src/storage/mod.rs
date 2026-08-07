@@ -1488,8 +1488,7 @@ pub struct DomainDef {
     /// Immediate parent when this domain was declared over another domain.
     /// The value representation is flattened to `base`, but the parent chain
     /// remains explicit so every inherited NOT NULL/CHECK is enforced.
-    pub base_domain: Option<SqlName>,
-    pub base_domain_schema: Option<SqlName>,
+    pub base_domain: Option<UserTypeName>,
     pub base: ColType,
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
     /// before the domain's own constraints.
@@ -1509,7 +1508,6 @@ impl DomainDef {
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
         base_domain: None,
-        base_domain_schema: None,
         base: ColType::Bool,
         base_type_mod: -1,
         not_null: false,
@@ -1536,8 +1534,7 @@ impl DomainDef {
 /// the executor and handed to storage (apart from the `live`/`pending` state).
 #[derive(Clone, Copy)]
 pub struct DomainSpec {
-    pub base_domain: Option<SqlName>,
-    pub base_domain_schema: Option<SqlName>,
+    pub base_domain: Option<UserTypeName>,
     pub base: ColType,
     pub base_type_mod: i32,
     pub not_null: bool,
@@ -9879,7 +9876,6 @@ impl Storage {
             name,
             ownership,
             base_domain: spec.base_domain,
-            base_domain_schema: spec.base_domain_schema,
             base: spec.base,
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
@@ -9896,7 +9892,6 @@ impl Storage {
     pub fn alter_domain(&mut self, slot: usize, spec: DomainSpec) {
         let d = &mut self.domains[slot];
         d.base_domain = spec.base_domain;
-        d.base_domain_schema = spec.base_domain_schema;
         d.base = spec.base;
         d.base_type_mod = spec.base_type_mod;
         d.not_null = spec.not_null;

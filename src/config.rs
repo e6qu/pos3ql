@@ -17,12 +17,6 @@ pub struct Config {
     pub max_connections: u32,
     /// Authentication: trust | password | scram-sha-256.
     pub auth: String,
-    /// This node's replica id within the cluster (0-based). Single-node
-    /// deployments leave the cluster empty and this is 0.
-    pub replica_id: u32,
-    /// Peer addresses `host:port` for VSR, one per replica, in id order.
-    /// Empty means a standalone single node (a cluster of one).
-    pub cluster: Vec<String>,
     /// Shared password for password/scram auth (all users).
     pub password: String,
     /// Per-connection receive buffer (wire protocol messages are bounded
@@ -154,8 +148,6 @@ impl Config {
             max_connections: 64,
             auth: "trust".to_string(),
             password: String::new(),
-            replica_id: 0,
-            cluster: Vec::new(),
             conn_recv_buffer_bytes: 64 * KIB,
             conn_send_buffer_bytes: 64 * KIB,
             sql_arena_bytes: MIB,
@@ -268,17 +260,6 @@ impl Config {
                     config.auth = value.to_string();
                 }
                 "password" => config.password = value.to_string(),
-                "replica_id" => {
-                    config.replica_id =
-                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))?
-                }
-                "cluster" => {
-                    config.cluster = value
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
                 "conn_recv_buffer_bytes" => {
                     config.conn_recv_buffer_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -669,6 +650,14 @@ sql_arena_bytes = 4096
             err.message.contains("unknown key 'max_conections'"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn inactive_cluster_settings_are_rejected_instead_of_ignored() {
+        for setting in ["replica_id = 1", "cluster = one:7000,two:7000"] {
+            let error = Config::parse(setting).unwrap_err();
+            assert!(error.message.contains("unknown key"), "{error}");
+        }
     }
 
     #[test]

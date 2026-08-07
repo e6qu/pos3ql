@@ -95,11 +95,24 @@ pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
             _ => return None,
         })
     }
-    let bytes = input.trim_end_matches('=').as_bytes();
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len() - padding].contains(&b'=') {
+        return None;
+    }
+    if !bytes.is_empty() {
+        let last = value(bytes[bytes.len() - padding - 1])?;
+        if (padding == 1 && last & 0b11 != 0) || (padding == 2 && last & 0b1111 != 0) {
+            return None;
+        }
+    }
     let mut w = 0usize;
     let mut acc = 0u32;
     let mut bits = 0u32;
-    for &c in bytes {
+    for &c in &bytes[..bytes.len() - padding] {
         acc = (acc << 6) | u32::from(value(c)?);
         bits += 6;
         if bits >= 8 {
@@ -111,7 +124,117 @@ pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
             w += 1;
         }
     }
-    Some(w)
+    (w == bytes.len() / 4 * 3 - padding).then_some(w)
+}
+
+struct ScramClientFirst<'a> {
+    bare: &'a str,
+    nonce: &'a str,
+}
+
+struct ScramClientFinal<'a> {
+    channel: &'a str,
+    nonce: &'a str,
+    proof: &'a str,
+    without_proof: &'a str,
+}
+
+fn valid_scram_username(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b',' => return false,
+            b'=' => {
+                let Some(escape) = bytes.get(at + 1..at + 3) else {
+                    return false;
+                };
+                if !matches!(escape, b"2C" | b"3D") {
+                    return false;
+                }
+                at += 3;
+            }
+            byte if byte < 0x20 || byte == 0x7f => return false,
+            _ => at += 1,
+        }
+    }
+    true
+}
+
+fn valid_scram_nonce(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b',')
+}
+
+fn valid_scram_extension(field: &str) -> bool {
+    let Some((name, value)) = field.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !value.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+        && !name.eq_ignore_ascii_case("c")
+        && !name.eq_ignore_ascii_case("m")
+        && !name.eq_ignore_ascii_case("n")
+        && !name.eq_ignore_ascii_case("p")
+        && !name.eq_ignore_ascii_case("r")
+}
+
+fn parse_scram_client_first(input: &str) -> Result<ScramClientFirst<'_>, &'static str> {
+    let bare = input
+        .strip_prefix("n,,")
+        .or_else(|| input.strip_prefix("y,,"))
+        .ok_or("unsupported SCRAM channel binding")?;
+    let mut fields = bare.split(',');
+    let username = fields
+        .next()
+        .and_then(|field| field.strip_prefix("n="))
+        .ok_or("malformed client-first-message")?;
+    let nonce = fields
+        .next()
+        .and_then(|field| field.strip_prefix("r="))
+        .ok_or("missing nonce in client-first-message")?;
+    if !valid_scram_username(username) || !valid_scram_nonce(nonce) {
+        return Err("malformed client-first-message");
+    }
+    if !fields.all(valid_scram_extension) {
+        return Err("malformed client-first-message");
+    }
+    Ok(ScramClientFirst { bare, nonce })
+}
+
+fn parse_scram_client_final(input: &str) -> Result<ScramClientFinal<'_>, &'static str> {
+    let (without_proof, proof) = input
+        .rsplit_once(",p=")
+        .ok_or("malformed client-final-message")?;
+    if proof.is_empty() || proof.contains(',') {
+        return Err("malformed client-final-message");
+    }
+    let mut fields = without_proof.split(',');
+    let channel = fields
+        .next()
+        .and_then(|field| field.strip_prefix("c="))
+        .ok_or("malformed client-final-message")?;
+    let nonce = fields
+        .next()
+        .and_then(|field| field.strip_prefix("r="))
+        .ok_or("malformed client-final-message")?;
+    if channel.is_empty() || !valid_scram_nonce(nonce) || !fields.all(valid_scram_extension) {
+        return Err("malformed client-final-message");
+    }
+    Ok(ScramClientFinal {
+        channel,
+        nonce,
+        proof,
+        without_proof,
+    })
 }
 
 /// Per-connection SCRAM exchange state.
@@ -148,24 +271,15 @@ impl ScramFlow {
         client_first: &str,
         server_nonce_raw: &[u8; NONCE_RAW],
     ) -> Result<ScramStep, &'static str> {
-        // GS2 header: we accept only "n,," (no channel binding).
-        let bare = client_first
-            .strip_prefix("n,,")
-            .or_else(|| client_first.strip_prefix("y,,"))
-            .ok_or("unsupported SCRAM channel binding")?;
-        self.client_first_bare.clear();
-        let _ = core::fmt::Write::write_str(&mut self.client_first_bare, bare);
-
-        let mut client_nonce = None;
-        for field in bare.split(',') {
-            if let Some(r) = field.strip_prefix("r=") {
-                client_nonce = Some(r);
-            }
+        let first = parse_scram_client_first(client_first)?;
+        if first.bare.len() > 256 || first.nonce.len() + 24 > 96 {
+            return Err("SCRAM client-first-message exceeds fixed capacity");
         }
-        let client_nonce = client_nonce.ok_or("missing nonce in client-first-message")?;
+        self.client_first_bare.clear();
+        let _ = core::fmt::Write::write_str(&mut self.client_first_bare, first.bare);
 
         self.nonce.clear();
-        let _ = core::fmt::Write::write_str(&mut self.nonce, client_nonce);
+        let _ = core::fmt::Write::write_str(&mut self.nonce, first.nonce);
         {
             let mut b64 = StackStr::<512>::new();
             b64_encode(server_nonce_raw, &mut b64);
@@ -195,35 +309,26 @@ impl ScramFlow {
         server: &ScramServer,
         client_final: &str,
     ) -> Result<ScramStep, &'static str> {
-        let mut channel = None;
-        let mut nonce = None;
-        let mut proof_b64 = None;
-        let mut without_proof_len = client_final.len();
-        for field in client_final.split(',') {
-            if let Some(v) = field.strip_prefix("c=") {
-                channel = Some(v);
-            } else if let Some(v) = field.strip_prefix("r=") {
-                nonce = Some(v);
-            } else if let Some(v) = field.strip_prefix("p=") {
-                proof_b64 = Some(v);
-                without_proof_len = client_final.len() - field.len() - 1;
-            }
-        }
-        let (Some(channel), Some(nonce), Some(proof_b64)) = (channel, nonce, proof_b64) else {
-            return Err("malformed client-final-message");
-        };
-        if channel != "biws" && channel != "eSws" {
+        let final_message = parse_scram_client_final(client_final)?;
+        if final_message.channel != "biws" && final_message.channel != "eSws" {
             return Err("unsupported channel binding in client-final-message");
         }
-        if nonce != self.nonce.as_str() {
+        if final_message.nonce != self.nonce.as_str() {
             return Err("SCRAM nonce mismatch");
         }
         let mut proof = [0u8; 32];
-        if b64_decode(proof_b64, &mut proof) != Some(32) {
+        if b64_decode(final_message.proof, &mut proof) != Some(32) {
             return Err("malformed SCRAM proof");
         }
 
         // AuthMessage = client-first-bare , server-first , client-final-no-proof
+        let auth_message_len = self.client_first_bare.as_str().len()
+            + self.server_first.as_str().len()
+            + final_message.without_proof.len()
+            + 2;
+        if auth_message_len > 768 {
+            return Err("SCRAM authentication message exceeds fixed capacity");
+        }
         let mut auth_message = StackStr::<768>::new();
         let _ = core::fmt::Write::write_fmt(
             &mut auth_message,
@@ -231,7 +336,7 @@ impl ScramFlow {
                 "{},{},{}",
                 self.client_first_bare.as_str(),
                 self.server_first.as_str(),
-                &client_final[..without_proof_len]
+                final_message.without_proof
             ),
         );
 
@@ -270,6 +375,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scram_messages_reject_duplicate_or_reordered_required_attributes() {
+        for input in [
+            "n,,n=user,r=nonce,r=again",
+            "n,,r=nonce,n=user",
+            "n,,n=user,r=",
+            "n,,n=user,r=nonce,m=required",
+        ] {
+            assert!(parse_scram_client_first(input).is_err(), "{input}");
+        }
+        for input in [
+            "r=nonce,c=biws,p=proof",
+            "c=biws,r=nonce,p=proof,p=again",
+            "c=biws,r=nonce,p=proof,a=late",
+            "c=biws,r=nonce,m=required,p=proof",
+        ] {
+            assert!(parse_scram_client_final(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
     fn base64_roundtrip() {
         for input in [
             b"".as_slice(),
@@ -292,6 +417,15 @@ mod tests {
         let mut enc = StackStr::<512>::new();
         b64_encode(b"foob", &mut enc);
         assert_eq!(enc.as_str(), "Zm9vYg==");
+    }
+
+    #[test]
+    fn base64_rejects_malformed_padding() {
+        let mut out = [0u8; 8];
+        for input in ["A", "AAA", "A===", "A=AA", "Zh==", "Zg=", "Zg==="] {
+            assert_eq!(b64_decode(input, &mut out), None, "{input}");
+        }
+        assert_eq!(b64_decode("Zg==", &mut out), Some(1));
     }
 
     /// RFC 7677 §3 example exchange: user "user", password "pencil".

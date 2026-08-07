@@ -326,12 +326,10 @@ pub struct ColumnMeta {
     pub identity_always: bool,
     /// The auto-increment step: 1 for `serial`, or the identity `INCREMENT BY`.
     pub auto_increment_step: i64,
-    /// When the column was declared with a user-defined type, its stable name
-    /// and schema. Runtime enum/domain slots are rebound from this identity
-    /// after restart; storing both parts prevents same-named types in different
-    /// schemas from aliasing each other.
-    pub domain: Option<SqlName>,
-    pub user_type_schema: Option<SqlName>,
+    /// When the column was declared with a user-defined type, its stable
+    /// schema-qualified identity. Runtime enum/domain slots are rebound from
+    /// this identity after restart.
+    pub user_type: Option<UserTypeName>,
 }
 
 /// A durable schema-qualified user-type identity.
@@ -339,21 +337,6 @@ pub struct ColumnMeta {
 pub struct UserTypeName {
     pub schema: SqlName,
     pub name: SqlName,
-}
-
-impl ColumnMeta {
-    /// Returns the complete user-type identity, rejecting a malformed partial
-    /// pair before it can be mistaken for a built-in type.
-    pub fn user_type_name(&self) -> Result<Option<UserTypeName>, SqlError> {
-        match (self.user_type_schema, self.domain) {
-            (None, None) => Ok(None),
-            (Some(schema), Some(name)) => Ok(Some(UserTypeName { schema, name })),
-            _ => Err(sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "user-defined column type has an incomplete durable identity"
-            )),
-        }
-    }
 }
 
 /// The durable identity of a table column's declared type.
@@ -432,8 +415,7 @@ impl ColumnMeta {
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
-        domain: None,
-        user_type_schema: None,
+        user_type: None,
     };
 }
 
@@ -3010,8 +2992,7 @@ impl Storage {
                             is_identity: false,
                             identity_always: false,
                             auto_increment_step: 1,
-                            domain: None,
-                            user_type_schema: None,
+                            user_type: None,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -8657,25 +8638,22 @@ impl Storage {
             let col = &def.columns[i];
             match col.ctype {
                 ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => {
-                    let name = col.domain.ok_or_else(|| {
+                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
-                            "reloaded enum column has no type name"
+                            "reloaded enum column has no type identity"
                         )
                     })?;
-                    let slot = match col.user_type_schema {
-                        Some(schema) => self
-                            .enum_slot(schema.as_str(), name.as_str(), 0)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "enum type \"{}.{}\" for a reloaded column does not exist",
-                                    schema.as_str(),
-                                    name.as_str()
-                                )
-                            })?,
-                        None => self.unique_enum_slot_by_name(name.as_str(), 0)?,
-                    };
+                    let slot = self
+                        .enum_slot(schema.as_str(), name.as_str(), 0)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "enum type \"{}.{}\" for a reloaded column does not exist",
+                                schema.as_str(),
+                                name.as_str()
+                            )
+                        })?;
                     def.columns[i].ctype = if matches!(col.ctype, ColType::Array(_)) {
                         ColType::Array(ArrElem::Enum(slot as u16))
                     } else {
@@ -8683,25 +8661,22 @@ impl Storage {
                     };
                 }
                 ColType::Array(ArrElem::Domain { .. }) => {
-                    let name = col.domain.ok_or_else(|| {
+                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
-                            "reloaded domain-array column has no type name"
+                            "reloaded domain-array column has no type identity"
                         )
                     })?;
-                    let slot = match col.user_type_schema {
-                        Some(schema) => self
-                            .domain_slot(schema.as_str(), name.as_str(), 0)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "domain type \"{}.{}\" for a reloaded column does not exist",
-                                    schema.as_str(),
-                                    name.as_str()
-                                )
-                            })?,
-                        None => self.unique_domain_slot_by_name(name.as_str(), 0)?,
-                    };
+                    let slot = self
+                        .domain_slot(schema.as_str(), name.as_str(), 0)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain type \"{}.{}\" for a reloaded column does not exist",
+                                schema.as_str(),
+                                name.as_str()
+                            )
+                        })?;
                     let domain = self.domain(slot);
                     let element = ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
                         sql_err!(
@@ -9724,29 +9699,6 @@ impl Storage {
             .find(|d| d.visible_to(txid) && d.name.as_str() == name)
     }
 
-    fn unique_domain_slot_by_name(&self, name: &str, txid: u32) -> Result<usize, SqlError> {
-        let mut matches = self
-            .domains
-            .iter()
-            .enumerate()
-            .filter(|(_, domain)| domain.visible_to(txid) && domain.name.as_str() == name);
-        let Some((slot, _)) = matches.next() else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "domain type \"{}\" for a reloaded column does not exist",
-                name
-            ));
-        };
-        if matches.next().is_some() {
-            return Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "domain type \"{}\" for a reloaded column is ambiguous",
-                name
-            ));
-        }
-        Ok(slot)
-    }
-
     /// The domain named `(schema, name)` visible to `txid`, by slot.
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.domains.iter().position(|d| {
@@ -9770,18 +9722,35 @@ impl Storage {
 
         match column.ctype {
             ColType::Array(ArrElem::Domain { slot, .. }) => {
+                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "domain-array column type lacks its durable identity"
+                    )
+                })?;
+                if self.domain_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "domain-array column type does not match its durable identity"
+                    ));
+                }
                 return Ok(DeclaredColumnType::Builtin {
                     oid: oid::domain_array_oid(slot),
                 });
             }
             ColType::Enum(slot) => {
-                let (schema, name) =
-                    column.user_type_schema.zip(column.domain).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROTOCOL_VIOLATION,
-                            "enum column type lacks its durable name and schema"
-                        )
-                    })?;
+                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "enum column type lacks its durable identity"
+                    )
+                })?;
+                if self.enum_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "enum column type does not match its durable identity"
+                    ));
+                }
                 return Ok(DeclaredColumnType::UserDefined {
                     oid: oid::enum_oid(slot),
                     schema,
@@ -9789,6 +9758,18 @@ impl Storage {
                 });
             }
             ColType::Array(ArrElem::Enum(slot)) => {
+                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "enum-array column type lacks its durable identity"
+                    )
+                })?;
+                if self.enum_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "enum-array column type does not match its durable identity"
+                    ));
+                }
                 return Ok(DeclaredColumnType::Builtin {
                     oid: oid::enum_array_oid(slot),
                 });
@@ -9796,7 +9777,7 @@ impl Storage {
             _ => {}
         }
 
-        let Some(UserTypeName { schema, name }) = column.user_type_name()? else {
+        let Some(UserTypeName { schema, name }) = column.user_type else {
             return Ok(DeclaredColumnType::Builtin {
                 oid: column.ctype.oid(),
             });
@@ -9842,11 +9823,9 @@ impl Storage {
     pub fn domain_in_use(&self, schema: &str, name: &str) -> Option<(SqlName, SqlName)> {
         for table in self.tables.iter().filter(|t| t.live) {
             for col in table.def.columns() {
-                if col.domain.is_some_and(|domain| domain.as_str() == name)
-                    && col
-                        .user_type_schema
-                        .is_some_and(|domain_schema| domain_schema.as_str() == schema)
-                {
+                if col.user_type.is_some_and(|identity| {
+                    identity.name.as_str() == name && identity.schema.as_str() == schema
+                }) {
                     return Some((table.def.name, col.name));
                 }
             }
@@ -10070,27 +10049,6 @@ impl Storage {
             .position(|e| e.visible_to(txid) && e.name.as_str() == name)
     }
 
-    fn unique_enum_slot_by_name(&self, name: &str, txid: u32) -> Result<usize, SqlError> {
-        let mut matches = self.enums.iter().enumerate().filter(|(_, enumeration)| {
-            enumeration.visible_to(txid) && enumeration.name.as_str() == name
-        });
-        let Some((slot, _)) = matches.next() else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "enum type \"{}\" for a reloaded column does not exist",
-                name
-            ));
-        };
-        if matches.next().is_some() {
-            return Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "enum type \"{}\" for a reloaded column is ambiguous",
-                name
-            ));
-        }
-        Ok(slot)
-    }
-
     /// The enum named `(schema, name)` visible to `txid`, by slot.
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
@@ -10210,7 +10168,9 @@ impl Storage {
                         ColType::Array(ArrElem::Enum(s)) if s as usize == slot
                     );
                 if uses_enum {
-                    column.domain = Some(new_name);
+                    if let Some(identity) = &mut column.user_type {
+                        identity.name = new_name;
+                    }
                     changed = true;
                 }
             }
@@ -11355,8 +11315,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
-                domain: None,
-                user_type_schema: None,
+                user_type: None,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -11376,8 +11335,7 @@ mod tests {
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
-                domain: None,
-                user_type_schema: None,
+                user_type: None,
             };
         }
         def
@@ -11390,12 +11348,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_user_type_identity_is_never_treated_as_a_builtin() {
+    fn user_type_identity_is_atomic() {
         let config = test_config();
         let mut budget = Budget::new(1 << 22);
         let storage = Storage::new(&config, &mut budget).unwrap();
         let mut column = ColumnMeta::EMPTY;
-        column.domain = Some(SqlName::parse("missing_schema").unwrap());
+        column.ctype = ColType::Enum(0);
         assert_eq!(
             storage
                 .declared_column_type(&column, 0)
@@ -11403,8 +11361,10 @@ mod tests {
                 .sqlstate,
             sqlstate::PROTOCOL_VIOLATION
         );
-        column.domain = None;
-        column.user_type_schema = Some(SqlName::parse("public").unwrap());
+        column.user_type = Some(UserTypeName {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("missing_type").unwrap(),
+        });
         assert_eq!(
             storage
                 .declared_column_type(&column, 0)

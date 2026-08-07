@@ -109,9 +109,11 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         {
             return None;
         }
-        self.def
-            .column_index(name)
-            .and_then(|i| self.def.columns()[i].domain)
+        self.def.column_index(name).and_then(|i| {
+            self.def.columns()[i]
+                .user_type
+                .map(|identity| identity.name)
+        })
     }
 }
 
@@ -4311,20 +4313,19 @@ pub fn drop_schema(
                 }
                 if !def.columns().iter().any(|column| {
                     if column
-                        .user_type_schema
-                        .is_some_and(|schema| in_listed(storage, schema.as_str()))
+                        .user_type
+                        .is_some_and(|identity| in_listed(storage, identity.schema.as_str()))
                     {
                         return true;
                     }
-                    let Some(domain_name) = column.domain else {
+                    let Some(identity) = column.user_type else {
                         return false;
                     };
-                    let Some(domain_schema) = column.user_type_schema else {
-                        return false;
-                    };
-                    let Some(domain_slot) =
-                        storage.domain_slot(domain_schema.as_str(), domain_name.as_str(), txn.txid)
-                    else {
+                    let Some(domain_slot) = storage.domain_slot(
+                        identity.schema.as_str(),
+                        identity.name.as_str(),
+                        txn.txid,
+                    ) else {
                         return false;
                     };
                     let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
@@ -4353,14 +4354,13 @@ pub fn drop_schema(
             let mut column_count = 0;
             for column in def.columns() {
                 let directly_in_schema = column
-                    .user_type_schema
-                    .is_some_and(|schema| in_listed(storage, schema.as_str()));
+                    .user_type
+                    .is_some_and(|identity| in_listed(storage, identity.schema.as_str()));
                 let through_domain = column
-                    .domain
-                    .zip(column.user_type_schema)
-                    .and_then(|(domain_name, domain_schema)| {
+                    .user_type
+                    .and_then(|identity| {
                         storage
-                            .domain_slot(domain_schema.as_str(), domain_name.as_str(), txn.txid)
+                            .domain_slot(identity.schema.as_str(), identity.name.as_str(), txn.txid)
                             .map(|domain_slot| {
                                 let parent_in_schema = (0..storage.domain_count()).any(|parent| {
                                     schema_domains[parent]
@@ -5598,7 +5598,7 @@ pub fn create_table_as(
     };
     def.n_columns = n_cols;
     for i in 0..n_cols {
-        let Some((ctype, domain, user_type_schema)) =
+        let Some((ctype, user_type)) =
             materialized_column_type(storage, txn.txid, columns[i].type_oid)
         else {
             return sql_fail(sql_err!(
@@ -5631,8 +5631,7 @@ pub fn create_table_as(
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
-            domain,
-            user_type_schema,
+            user_type,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -5814,11 +5813,7 @@ fn materialized_column_type(
     storage: &Storage,
     txid: u32,
     type_oid: i32,
-) -> Option<(
-    ColType,
-    Option<crate::storage::SqlName>,
-    Option<crate::storage::SqlName>,
-)> {
+) -> Option<(ColType, Option<crate::storage::UserTypeName>)> {
     use crate::sql::types::{ArrElem, oid};
     if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
         .contains(&type_oid)
@@ -5826,8 +5821,10 @@ fn materialized_column_type(
         let domain = storage.domain((type_oid - oid::FIRST_DOMAIN) as usize);
         return domain.visible_to(txid).then_some((
             domain.base,
-            Some(domain.name),
-            Some(domain.schema),
+            Some(crate::storage::UserTypeName {
+                schema: domain.schema,
+                name: domain.name,
+            }),
         ));
     }
     if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
@@ -5838,8 +5835,10 @@ fn materialized_column_type(
         let element = ArrElem::domain(slot as u16, domain.base)?;
         return domain.visible_to(txid).then_some((
             ColType::Array(element),
-            Some(domain.name),
-            Some(domain.schema),
+            Some(crate::storage::UserTypeName {
+                schema: domain.schema,
+                name: domain.name,
+            }),
         ));
     }
     let ctype = coltype_of_oid(type_oid)?;
@@ -5849,11 +5848,14 @@ fn materialized_column_type(
             if !enumeration.visible_to(txid) {
                 return None;
             }
-            (Some(enumeration.name), Some(enumeration.schema))
+            Some(crate::storage::UserTypeName {
+                schema: enumeration.schema,
+                name: enumeration.name,
+            })
         }
-        _ => (None, None),
+        _ => None,
     };
-    Some((ctype, user_type.0, user_type.1))
+    Some((ctype, user_type))
 }
 
 /// REFRESH MATERIALIZED VIEW: re-run the stored query, replacing every row of
@@ -7017,8 +7019,11 @@ fn drop_domain_selection(
                 let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
                 let mut column_count = 0;
                 for column in def.columns() {
-                    if column.domain == Some(domain_name)
-                        && column.user_type_schema == Some(domain_schema)
+                    if column.user_type
+                        == Some(crate::storage::UserTypeName {
+                            schema: domain_schema,
+                            name: domain_name,
+                        })
                     {
                         columns[column_count] = column.name;
                         column_count += 1;
@@ -7117,10 +7122,11 @@ fn domain_column_in_use(
         }
         let def = storage.table_def(table_index, txid);
         for column in def.columns() {
-            if column.domain.is_some_and(|name| name == domain.name)
-                && column
-                    .user_type_schema
-                    .is_some_and(|schema| schema == domain.schema)
+            if column.user_type
+                == Some(crate::storage::UserTypeName {
+                    schema: domain.schema,
+                    name: domain.name,
+                })
             {
                 return Some((def.schema, def.name, column.name));
             }
@@ -7397,14 +7403,11 @@ fn validate_domain_rows(
         let mut affected = [false; MAX_COLUMNS];
         let mut any = false;
         for (column_index, column) in def.columns().iter().enumerate() {
-            let Some(domain_name) = column.domain else {
-                continue;
-            };
-            let Some(domain_schema) = column.user_type_schema else {
+            let Some(identity) = column.user_type else {
                 continue;
             };
             let Some(domain_slot) =
-                storage.domain_slot(domain_schema.as_str(), domain_name.as_str(), txid)
+                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
             else {
                 continue;
             };
@@ -7443,12 +7446,11 @@ fn validate_domain_rows(
                 if !affected[column_index] {
                     continue;
                 }
-                let domain_name = def.columns()[column_index].domain.expect("affected domain");
-                let domain_schema = def.columns()[column_index]
-                    .user_type_schema
-                    .expect("affected domain schema");
+                let identity = def.columns()[column_index]
+                    .user_type
+                    .expect("affected domain");
                 let leaf = storage
-                    .domain_slot(domain_schema.as_str(), domain_name.as_str(), txid)
+                    .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                     .expect("affected domain remains visible");
                 let _ = coerce_domain_value(
                     storage,

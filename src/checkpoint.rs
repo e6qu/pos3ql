@@ -1028,13 +1028,24 @@ impl Checkpointer {
                     } else {
                         Some(sql_name(&decode_hex_name(domain_hex)?)?)
                     };
+                    let user_type = match (user_type_schema, domain) {
+                        (None, None) => None,
+                        (Some(schema), Some(name)) => {
+                            Some(crate::storage::UserTypeName { schema, name })
+                        }
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "column user type identity is incomplete",
+                            ));
+                        }
+                    };
                     let name = rest_of(line, if has_user_type_schema { 9 } else { 8 })?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
                     def.columns[*seen] = ColumnMeta {
                         name: sql_name(name)?,
-                        domain,
+                        user_type,
                         ctype: ColType::from_code(type_code)
                             .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?,
                         type_mod,
@@ -1048,7 +1059,6 @@ impl Checkpointer {
                         is_identity: not_null & 32 != 0,
                         identity_always: not_null & 64 != 0,
                         auto_increment_step,
-                        user_type_schema,
                     };
                     *seen += 1;
                 }
@@ -2685,11 +2695,12 @@ impl Checkpointer {
                     | (u8::from(c.is_generated) << 4)
                     | (u8::from(c.is_identity) << 5)
                     | (u8::from(c.identity_always) << 6);
-                // The domain type name, hex-encoded (`0` = ordinary base type),
+                // The user-defined type name, hex-encoded (`0` = ordinary base type),
                 // before the name (which may contain spaces).
                 let mut domain_schema_hex = StackStr::<130>::new();
-                match &c.user_type_schema {
-                    Some(schema) => {
+                match c.user_type {
+                    Some(identity) => {
+                        let schema = identity.schema;
                         for byte in schema.as_str().as_bytes() {
                             let _ = write!(domain_schema_hex, "{byte:02x}");
                         }
@@ -2699,9 +2710,9 @@ impl Checkpointer {
                     }
                 }
                 let mut domain_hex = StackStr::<130>::new();
-                match &c.domain {
-                    Some(d) => {
-                        for b in d.as_str().as_bytes() {
+                match c.user_type {
+                    Some(identity) => {
+                        for b in identity.name.as_str().as_bytes() {
                             let _ = write!(domain_hex, "{b:02x}");
                         }
                     }
@@ -4455,8 +4466,7 @@ fn empty_column() -> ColumnMeta {
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
-        domain: None,
-        user_type_schema: None,
+        user_type: None,
     }
 }
 

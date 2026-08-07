@@ -118,8 +118,10 @@ pub(crate) fn check_domain_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
-        let Some(dname) = col.domain else { continue };
-        // Enum identity also lives in `domain`, as do enum/domain array element
+        let Some(user_type) = col.user_type else {
+            continue;
+        };
+        // Enum identity also lives in `user_type`, as do enum/domain array element
         // identities. Only a scalar domain applies its constraint to the whole
         // column value; a domain array validates each element while coercing.
         if matches!(
@@ -130,10 +132,9 @@ pub(crate) fn check_domain_constraints(
         ) {
             continue;
         }
-        let Some(schema) = col.user_type_schema else {
-            continue;
-        };
-        let Some(slot) = storage.domain_slot(schema.as_str(), dname.as_str(), txid) else {
+        let Some(slot) =
+            storage.domain_slot(user_type.schema.as_str(), user_type.name.as_str(), txid)
+        else {
             continue;
         };
         let value = values.get(i).copied().unwrap_or(Datum::Null);

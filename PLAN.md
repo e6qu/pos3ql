@@ -37,13 +37,12 @@ enums and domains through each contract.
 The conversion is now context-typed as well: there is no generic declared-type
 OID accessor for a result-metadata caller to misuse. Prepared parameters,
 catalog attributes, and replication each name their conversion explicitly;
-result descriptions remain constructed from the value representation. Durable
-user-type schema/name metadata is checked as an all-or-nothing identity until
-the next storage-layout migration folds the pair into one field.
+result descriptions remain constructed from the value representation.
 
-The read-side pairing is now centralized as `UserTypeName`; every schema
-consumer receives a complete identity or a loud error rather than rebuilding
-the two optional metadata fields independently.
+Durable user-type identity is now a single optional `UserTypeName`, carried
+unchanged through DDL, catalog consumers, WAL, and checkpoints. A name without
+its schema is therefore not a state `ColumnMeta` can represent; recovery
+rejects an incomplete serialized identity before it can enter the catalog.
 
 | # | Phase | Milestone | Status |
 |---|-------|-----------|--------|

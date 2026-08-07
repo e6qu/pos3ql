@@ -447,9 +447,11 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         name: &str,
     ) -> Option<crate::storage::SqlName> {
         match self.scope.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(t, c) => {
-                self.scope.defs[t].and_then(|def| def.columns().get(c).and_then(|col| col.domain))
-            }
+            ResolvedColumn::Table(t, c) => self.scope.defs[t].and_then(|def| {
+                def.columns()
+                    .get(c)
+                    .and_then(|col| col.user_type.map(|identity| identity.name))
+            }),
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
         }

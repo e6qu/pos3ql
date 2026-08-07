@@ -2256,8 +2256,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
-            domain: None,
-            user_type_schema: None,
+            user_type: None,
         }; MAX_COLUMNS],
         n_columns: specification.columns.len(),
         ..TableDef::empty()

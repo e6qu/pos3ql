@@ -105,8 +105,7 @@ fn empty_meta() -> ColumnMeta {
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
-        domain: None,
-        user_type_schema: None,
+        user_type: None,
     }
 }
 
@@ -120,81 +119,88 @@ pub(super) fn build_column(
 ) -> Result<ColumnMeta, SqlError> {
     // A base type resolves statically; an unknown name falls back to the
     // domain catalog (base type + identity) then the enum catalog (its own
-    // `ColType::Enum` plus the enum name, carried in `domain`, so the column's
+    // `ColType::Enum` plus its durable identity, so the column's
     // type persists as a name that reloads to the right slot). User-defined
     // array types follow the same path while keeping their element identity.
-    let (ctype, type_mod, domain, user_type_schema, domain_default) =
-        match ColType::from_sql_name(c.type_name) {
-            Some(ct) => (ct, c.type_mod, None, None, None),
-            None => {
-                if let Some(element_name) = c.type_name.strip_suffix("[]") {
-                    if let Some(slot) = storage.resolve_domain_slot(element_name, txid) {
-                        let d = storage.domain(slot);
-                        let Some(element) = crate::sql::types::ArrElem::domain(slot as u16, d.base)
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "arrays of domain {} require a scalar base type",
-                                element_name
-                            ));
-                        };
-                        (
-                            ColType::Array(element),
-                            -1,
-                            Some(d.name),
-                            Some(d.schema),
-                            None,
-                        )
-                    } else if let Some(slot) = storage.resolve_enum_slot(element_name, txid) {
-                        let definition = storage.enum_def(slot);
-                        (
-                            ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16)),
-                            -1,
-                            Some(definition.name),
-                            Some(definition.schema),
-                            None,
-                        )
-                    } else {
+    let (ctype, type_mod, user_type, domain_default) = match ColType::from_sql_name(c.type_name) {
+        Some(ct) => (ct, c.type_mod, None, None),
+        None => {
+            if let Some(element_name) = c.type_name.strip_suffix("[]") {
+                if let Some(slot) = storage.resolve_domain_slot(element_name, txid) {
+                    let d = storage.domain(slot);
+                    let Some(element) = crate::sql::types::ArrElem::domain(slot as u16, d.base)
+                    else {
                         return Err(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "type \"{}\" does not exist",
-                            c.type_name
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "arrays of domain {} require a scalar base type",
+                            element_name
                         ));
-                    }
+                    };
+                    (
+                        ColType::Array(element),
+                        -1,
+                        Some(crate::storage::UserTypeName {
+                            schema: d.schema,
+                            name: d.name,
+                        }),
+                        None,
+                    )
+                } else if let Some(slot) = storage.resolve_enum_slot(element_name, txid) {
+                    let definition = storage.enum_def(slot);
+                    (
+                        ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16)),
+                        -1,
+                        Some(crate::storage::UserTypeName {
+                            schema: definition.schema,
+                            name: definition.name,
+                        }),
+                        None,
+                    )
                 } else {
-                    match storage.find_domain(c.type_name, txid) {
-                        Some(d) => (
-                            d.base,
-                            d.base_type_mod,
-                            Some(d.name),
-                            Some(d.schema),
-                            d.default_expr,
-                        ),
-                        None => match storage.resolve_enum_slot(c.type_name, txid) {
-                            Some(slot) => {
-                                let definition = storage.enum_def(slot);
-                                (
-                                    ColType::Enum(slot as u16),
-                                    -1,
-                                    Some(definition.name),
-                                    Some(definition.schema),
-                                    None,
-                                )
-                            }
-                            None => {
-                                return Err(sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "type \"{}\" does not exist",
-                                    c.type_name
-                                ));
-                            }
-                        },
-                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        c.type_name
+                    ));
+                }
+            } else {
+                match storage.find_domain(c.type_name, txid) {
+                    Some(d) => (
+                        d.base,
+                        d.base_type_mod,
+                        Some(crate::storage::UserTypeName {
+                            schema: d.schema,
+                            name: d.name,
+                        }),
+                        d.default_expr,
+                    ),
+                    None => match storage.resolve_enum_slot(c.type_name, txid) {
+                        Some(slot) => {
+                            let definition = storage.enum_def(slot);
+                            (
+                                ColType::Enum(slot as u16),
+                                -1,
+                                Some(crate::storage::UserTypeName {
+                                    schema: definition.schema,
+                                    name: definition.name,
+                                }),
+                                None,
+                            )
+                        }
+                        None => {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "type \"{}\" does not exist",
+                                c.type_name
+                            ));
+                        }
+                    },
                 }
             }
-        };
-    if let (Some(type_name), Some(type_schema)) = (domain, user_type_schema) {
-        storage.require_type_usage(type_schema.as_str(), type_name.as_str(), txid)?;
+        }
+    };
+    if let Some(identity) = user_type {
+        storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
     }
     // A GENERATED column stores its expression in `default_expr` with the
     // `is_generated` flag; it cannot also carry a DEFAULT.
@@ -261,8 +267,7 @@ pub(super) fn build_column(
         is_identity,
         identity_always,
         auto_increment_step,
-        domain,
-        user_type_schema,
+        user_type,
     })
 }
 

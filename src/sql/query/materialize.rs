@@ -208,9 +208,11 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         name: &str,
     ) -> Option<crate::storage::SqlName> {
         match self.0.find_column(qualifier, name).ok()? {
-            super::scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns().get(column)?.domain
-            }
+            super::scope::ResolvedColumn::Table(table, column) => self.0.defs[table]?
+                .columns()
+                .get(column)?
+                .user_type
+                .map(|identity| identity.name),
             super::scope::ResolvedColumn::Merged(_) => None,
         }
     }

@@ -259,10 +259,14 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     drain_startup(setup)
     simple_query(
         setup,
+        "DROP PUBLICATION IF EXISTS wire_replication_two_pub; "
         "DROP PUBLICATION IF EXISTS wire_replication_pub; "
+        "DROP TABLE IF EXISTS wire_replication_two; "
         "DROP TABLE IF EXISTS wire_replication; "
         "CREATE TABLE wire_replication (id integer); "
-        "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication",
+        "CREATE TABLE wire_replication_two (id integer); "
+        "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication; "
+        "CREATE PUBLICATION wire_replication_two_pub FOR TABLE wire_replication_two",
     )
 
     stream = connect()
@@ -273,7 +277,7 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         frontend_message(
             b"Q",
             b"START_REPLICATION SLOT wire_replication_slot LOGICAL 0/0 "
-            b"(proto_version '1', publication_names 'wire_replication_pub')\x00",
+            b"(proto_version '1', publication_names 'wire_replication_pub,wire_replication_two_pub')\x00",
         )
     )
     kind, payload = read_message(stream)
@@ -300,21 +304,27 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         keepalive,
     )
 
-    simple_query(setup, "INSERT INTO wire_replication VALUES (42)")
-    insert = None
-    for _ in range(64):
+    simple_query(
+        setup,
+        "BEGIN; INSERT INTO wire_replication VALUES (42); "
+        "INSERT INTO wire_replication_two VALUES (7); COMMIT",
+    )
+    inserts = []
+    for _ in range(128):
         kind, payload = read_message(stream)
         if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"I":
-            insert = payload
+            inserts.append(payload)
         if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"C":
             end_lsn = struct.unpack("!Q", payload[9:17])[0]
             stream.sendall(standby_status(end_lsn))
-            if insert is not None:
+            if len(inserts) == 2:
                 break
     check(
-        "pgoutput defaults to text tuples unless binary is negotiated",
-        insert is not None and insert[33:34] == b"t" and insert[34:38] == struct.pack("!i", 2) and insert[38:40] == b"42",
-        insert,
+        "pgoutput publication union emits both text tuples exactly once",
+        len(inserts) == 2
+        and {payload[38:] for payload in inserts} == {b"42", b"7"}
+        and all(payload[33:34] == b"t" and payload[34:38] == struct.pack("!i", len(payload) - 38) for payload in inserts),
+        inserts,
     )
 
     stream.close()

@@ -259,14 +259,14 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     drain_startup(setup)
     simple_query(
         setup,
-        "DROP PUBLICATION IF EXISTS wire_replication_two_pub; "
+        "DROP PUBLICATION IF EXISTS \"wire, replication\"; "
         "DROP PUBLICATION IF EXISTS wire_replication_pub; "
         "DROP TABLE IF EXISTS wire_replication_two; "
         "DROP TABLE IF EXISTS wire_replication; "
         "CREATE TABLE wire_replication (id integer); "
         "CREATE TABLE wire_replication_two (id integer); "
         "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication; "
-        "CREATE PUBLICATION wire_replication_two_pub FOR TABLE wire_replication_two",
+        "CREATE PUBLICATION \"wire, replication\" FOR TABLE wire_replication_two",
     )
 
     stream = connect()
@@ -277,7 +277,7 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         frontend_message(
             b"Q",
             b"START_REPLICATION SLOT wire_replication_slot LOGICAL 0/0 "
-            b"(proto_version '1', publication_names 'wire_replication_pub,wire_replication_two_pub')\x00",
+            b"(proto_version '1', publication_names 'wire_replication_pub,\"wire, replication\"')\x00",
         )
     )
     kind, payload = read_message(stream)

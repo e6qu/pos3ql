@@ -45,7 +45,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{RowHome, RowLoc, Storage};
+use crate::storage::{RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
@@ -392,7 +392,7 @@ struct PendingTruncate {
 
 fn emit_pending_truncates(
     storage: &Storage,
-    publication_names: &str,
+    publication_names: &[SqlName],
     proto_version: u8,
     end_lsn: u64,
     command_id: u32,
@@ -478,16 +478,16 @@ enum PublicationOperation {
 
 fn publication_selects(
     storage: &Storage,
-    publication_names: &str,
+    publication_names: &[SqlName],
     table_slot: usize,
     operation: PublicationOperation,
 ) -> Result<bool, SqlError> {
-    for name in publication_names.split(',') {
-        let publication = storage.publication(name).ok_or_else(|| {
+    for name in publication_names {
+        let publication = storage.publication(name.as_str()).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "publication \"{}\" does not exist",
-                name
+                name.as_str()
             )
         })?;
         let member = publication.all_tables
@@ -862,19 +862,19 @@ impl Engine {
     pub(crate) fn emit_replication_transaction(
         &mut self,
         floor: u64,
-        publication_names: &str,
+        publication_names: &[SqlName],
         binary: bool,
         proto_version: u8,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<(u64, bool)>, SqlError> {
         let storage = &self.storage;
-        for name in publication_names.split(',') {
-            if name.is_empty() || storage.publication(name).is_none() {
+        for name in publication_names {
+            if storage.publication(name.as_str()).is_none() {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "publication \"{}\" does not exist",
-                    name
+                    name.as_str()
                 ));
             }
         }

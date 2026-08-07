@@ -1371,6 +1371,17 @@ fn logical_replication_unions_multiple_publications() {
 }
 
 #[test]
+fn logical_replication_selects_a_quoted_publication_name() {
+    std::thread::Builder::new()
+        .name("logical-quoted-publication".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_selects_a_quoted_publication_name_on_sized_stack)
+        .expect("logical quoted publication test thread starts")
+        .join()
+        .expect("logical quoted publication test thread completes");
+}
+
+#[test]
 fn logical_replication_omits_transactions_without_published_changes() {
     std::thread::Builder::new()
         .name("logical-publication-filter".into())
@@ -1404,7 +1415,7 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
     let (_, emitted) = engine
         .emit_replication_transaction(
             floor,
-            "changes",
+            &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
             2,
             &mut scratch,
@@ -1440,7 +1451,10 @@ fn logical_replication_unions_multiple_publications_on_sized_stack() {
     let (_, emitted) = engine
         .emit_replication_transaction(
             floor,
-            "left_changes,right_changes",
+            &[
+                crate::storage::SqlName::parse("left_changes").unwrap(),
+                crate::storage::SqlName::parse("right_changes").unwrap(),
+            ],
             false,
             2,
             &mut scratch,
@@ -1457,6 +1471,41 @@ fn logical_replication_unions_multiple_publications_on_sized_stack() {
         2,
         "the publication union must emit each selected table change once"
     );
+}
+
+fn logical_replication_selects_a_quoted_publication_name_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE quoted_publication_table (id int); \
+         CREATE PUBLICATION \"sales, west\" FOR TABLE quoted_publication_table",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO quoted_publication_table VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("sales, west").unwrap()],
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("quoted publication transaction is retained");
+    assert!(emitted);
+    assert!(send.readable().windows(1).any(|bytes| bytes == b"I"));
 }
 
 fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
@@ -1479,7 +1528,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
     let (_, emitted) = engine
         .emit_replication_transaction(
             floor,
-            "changes",
+            &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
             2,
             &mut scratch,
@@ -1509,7 +1558,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
     let (lsn, emitted) = engine
         .emit_replication_transaction(
             floor,
-            "changes",
+            &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
             2,
             &mut scratch,
@@ -1531,7 +1580,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
     let error = engine
         .emit_replication_transaction(
             floor,
-            "changes",
+            &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
             1,
             &mut v1_scratch,

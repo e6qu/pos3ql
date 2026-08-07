@@ -334,7 +334,7 @@ pub struct ColumnMeta {
     pub user_type_schema: Option<SqlName>,
 }
 
-/// The wire/catalog identity of a declared table column type.
+/// The durable identity of a table column's declared type.
 ///
 /// `ColType` deliberately describes the representation used by the executor;
 /// that is not sufficient for a domain, whose values use its base
@@ -342,7 +342,7 @@ pub struct ColumnMeta {
 /// distinction at one catalog boundary prevents callers from accidentally
 /// reporting the storage type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnTypeIdentity {
+pub enum DeclaredColumnType {
     Builtin {
         oid: i32,
     },
@@ -353,14 +353,36 @@ pub enum ColumnTypeIdentity {
     },
 }
 
-impl ColumnTypeIdentity {
-    pub const fn oid(self) -> i32 {
+/// An OID accepted only by prepared-statement parameter inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParameterTypeOid(i32);
+
+impl ParameterTypeOid {
+    pub(crate) const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl DeclaredColumnType {
+    pub(crate) const fn parameter_oid(self) -> ParameterTypeOid {
+        ParameterTypeOid(self.schema_oid())
+    }
+
+    pub(crate) const fn catalog_oid(self) -> i32 {
+        self.schema_oid()
+    }
+
+    pub(crate) const fn replication_oid(self) -> i32 {
+        self.schema_oid()
+    }
+
+    const fn schema_oid(self) -> i32 {
         match self {
             Self::Builtin { oid } | Self::UserDefined { oid, .. } => oid,
         }
     }
 
-    pub const fn user_type(self) -> Option<(SqlName, SqlName)> {
+    pub(crate) const fn replication_user_type(self) -> Option<(SqlName, SqlName)> {
         match self {
             Self::Builtin { .. } => None,
             Self::UserDefined { schema, name, .. } => Some((schema, name)),
@@ -9710,23 +9732,23 @@ impl Storage {
         })
     }
 
-    /// Resolves the client-visible identity of a table column's declared type.
+    /// Resolves a table column's declared type for schema metadata.
     ///
-    /// Domains keep their base [`ColType`] for execution, so using
-    /// `column.ctype.oid()` at a protocol or catalog boundary is incorrect.
-    /// This is the sole conversion from durable column metadata to a wire OID;
-    /// a named type that cannot be resolved is a catalog invariant violation,
-    /// never an invitation to report its base type instead.
-    pub fn column_type_identity(
+    /// Domains keep their base [`ColType`] for execution, so schema metadata
+    /// cannot derive its OID from `column.ctype.oid()`.
+    /// Its context-specific accessors intentionally do not expose a generic
+    /// OID conversion: result metadata follows the base-type contract for
+    /// domains, while parameters, catalogs, and replication use this identity.
+    pub fn declared_column_type(
         &self,
         column: &ColumnMeta,
         txid: u32,
-    ) -> Result<ColumnTypeIdentity, SqlError> {
+    ) -> Result<DeclaredColumnType, SqlError> {
         use crate::sql::types::oid;
 
         match column.ctype {
             ColType::Array(ArrElem::Domain { slot, .. }) => {
-                return Ok(ColumnTypeIdentity::Builtin {
+                return Ok(DeclaredColumnType::Builtin {
                     oid: oid::domain_array_oid(slot),
                 });
             }
@@ -9738,34 +9760,43 @@ impl Storage {
                             "enum column type lacks its durable name and schema"
                         )
                     })?;
-                return Ok(ColumnTypeIdentity::UserDefined {
+                return Ok(DeclaredColumnType::UserDefined {
                     oid: oid::enum_oid(slot),
                     schema,
                     name,
                 });
             }
             ColType::Array(ArrElem::Enum(slot)) => {
-                return Ok(ColumnTypeIdentity::Builtin {
+                return Ok(DeclaredColumnType::Builtin {
                     oid: oid::enum_array_oid(slot),
                 });
             }
             _ => {}
         }
 
-        let Some((schema, name)) = column.user_type_schema.zip(column.domain) else {
-            return Ok(ColumnTypeIdentity::Builtin {
-                oid: column.ctype.oid(),
-            });
+        let (schema, name) = match (column.user_type_schema, column.domain) {
+            (None, None) => {
+                return Ok(DeclaredColumnType::Builtin {
+                    oid: column.ctype.oid(),
+                });
+            }
+            (Some(schema), Some(name)) => (schema, name),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "user-defined column type has an incomplete durable identity"
+                ));
+            }
         };
         if let Some(slot) = self.domain_slot(schema.as_str(), name.as_str(), txid) {
-            return Ok(ColumnTypeIdentity::UserDefined {
+            return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::domain_oid(slot as u16),
                 schema,
                 name,
             });
         }
         if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), txid) {
-            return Ok(ColumnTypeIdentity::UserDefined {
+            return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::enum_oid(slot as u16),
                 schema,
                 name,
@@ -11343,6 +11374,31 @@ mod tests {
     fn stored_query_dependency_arrays_live_outside_catalog_definitions() {
         assert!(size_of::<ViewDef>() < size_of::<StoredQueryDependencies>());
         assert!(size_of::<MatviewDef>() < size_of::<StoredQueryDependencies>());
+    }
+
+    #[test]
+    fn incomplete_user_type_identity_is_never_treated_as_a_builtin() {
+        let config = test_config();
+        let mut budget = Budget::new(1 << 22);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut column = ColumnMeta::EMPTY;
+        column.domain = Some(SqlName::parse("missing_schema").unwrap());
+        assert_eq!(
+            storage
+                .declared_column_type(&column, 0)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROTOCOL_VIOLATION
+        );
+        column.domain = None;
+        column.user_type_schema = Some(SqlName::parse("public").unwrap());
+        assert_eq!(
+            storage
+                .declared_column_type(&column, 0)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROTOCOL_VIOLATION
+        );
     }
 
     #[test]

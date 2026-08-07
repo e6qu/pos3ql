@@ -34,6 +34,13 @@ catalog identity first. This is a structural rule: a missing named type is an
 error, never a base-type substitution. The regression coverage exercises both
 enums and domains through each contract.
 
+The conversion is now context-typed as well: there is no generic declared-type
+OID accessor for a result-metadata caller to misuse. Prepared parameters,
+catalog attributes, and replication each name their conversion explicitly;
+result descriptions remain constructed from the value representation. Durable
+user-type schema/name metadata is checked as an all-or-nothing identity until
+the next storage-layout migration folds the pair into one field.
+
 | # | Phase | Milestone | Status |
 |---|-------|-----------|--------|
 | P0 | Scaffolding & memory core | Fixed-budget allocation w/ loud exhaustion, alloc guard, PCG32, config | **done** |

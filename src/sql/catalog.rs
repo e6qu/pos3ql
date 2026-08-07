@@ -3425,8 +3425,12 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
     Ok(Datum::Int2Vector(raw))
 }
 
-fn column_type_oid(storage: &Storage, column: &ColumnMeta, txid: u32) -> Result<i32, SqlError> {
-    Ok(storage.column_type_identity(column, txid)?.oid())
+fn catalog_column_type_oid(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+) -> Result<i32, SqlError> {
+    Ok(storage.declared_column_type(column, txid)?.catalog_oid())
 }
 
 fn pg_attribute<'a>(
@@ -3476,7 +3480,7 @@ fn pg_attribute<'a>(
                 &[
                     Datum::Int4(table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, c, txid)?),
+                    Datum::Int4(catalog_column_type_oid(storage, c, txid)?),
                     Datum::Int4(i as i32 + 1),
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
@@ -3527,7 +3531,7 @@ fn pg_attribute<'a>(
                 &[
                     Datum::Int4(info.oid),
                     text(column.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, column, txid)?),
+                    Datum::Int4(catalog_column_type_oid(storage, column, txid)?),
                     Datum::Int4(attribute as i32 + 1),
                     Datum::Bool(false),
                     Datum::Int4(i32::from(column.ctype.typlen())),

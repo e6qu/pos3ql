@@ -1370,6 +1370,52 @@ fn logical_replication_unions_multiple_publications() {
         .expect("logical publication union test thread completes");
 }
 
+#[test]
+fn logical_replication_omits_transactions_without_published_changes() {
+    std::thread::Builder::new()
+        .name("logical-publication-filter".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_omits_transactions_without_published_changes_on_sized_stack)
+        .expect("logical publication filter test thread starts")
+        .join()
+        .expect("logical publication filter test thread completes");
+}
+
+fn logical_replication_omits_transactions_without_published_changes_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE published_table (id int); CREATE TABLE hidden_table (id int); \
+         CREATE PUBLICATION changes FOR TABLE published_table",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO hidden_table VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            "changes",
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("unpublished transaction is retained for the stream cursor");
+    assert!(!emitted);
+    assert!(send.is_empty());
+}
+
 fn logical_replication_unions_multiple_publications_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();

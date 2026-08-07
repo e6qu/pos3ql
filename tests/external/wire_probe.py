@@ -64,8 +64,11 @@ def frontend_message(kind, payload=b""):
     return kind + struct.pack("!i", len(payload) + 4) + payload
 
 
-def standby_status(end_lsn):
-    return frontend_message(b"d", b"r" + struct.pack("!QQQQB", end_lsn, end_lsn, end_lsn, 0, 0))
+def standby_status(end_lsn, reply_requested=False):
+    return frontend_message(
+        b"d",
+        b"r" + struct.pack("!QQQQB", end_lsn, end_lsn, end_lsn, 0, int(reply_requested)),
+    )
 
 
 def simple_query(s, text):
@@ -275,6 +278,27 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     )
     kind, payload = read_message(stream)
     check("pgoutput START_REPLICATION enters CopyBoth", kind == b"W", (kind, payload))
+
+    # A client may ping a quiet publisher by requesting an immediate status
+    # reply. The server must return the replication-protocol `k` envelope,
+    # not an empty CopyData frame or a pgoutput plugin message.
+    stream.sendall(standby_status(0, reply_requested=True))
+    keepalive = None
+    for _ in range(64):
+        kind, payload = read_message(stream)
+        if kind == b"d" and len(payload) == 18 and payload[:1] == b"k":
+            keepalive = payload
+            break
+        if kind == b"d" and len(payload) > 25 and payload[:1] == b"w" and payload[25:26] == b"C":
+            stream.sendall(standby_status(struct.unpack("!Q", payload[9:17])[0]))
+    keepalive_end_lsn = struct.unpack("!Q", keepalive[1:9])[0] if keepalive else None
+    check(
+        "standby reply request receives a primary keepalive",
+        keepalive is not None
+        and keepalive[-1:] == b"\x01"
+        and keepalive_end_lsn is not None,
+        keepalive,
+    )
 
     simple_query(setup, "INSERT INTO wire_replication VALUES (42)")
     insert = None

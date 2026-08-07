@@ -1348,6 +1348,49 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
         .expect("logical truncate test thread completes");
 }
 
+#[test]
+fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
+    std::thread::Builder::new()
+        .name("logical-slot-acknowledgement".into())
+        .stack_size(4 << 20)
+        .spawn(logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack)
+        .expect("logical slot acknowledgement test thread starts")
+        .join()
+        .expect("logical slot acknowledgement test thread completes");
+}
+
+fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE t (id int); CREATE PUBLICATION changes FOR TABLE t",
+    );
+    let floor = engine
+        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .unwrap();
+    engine.advance_replication_slot("changes", floor).unwrap();
+
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            "changes",
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("slot acknowledgement transaction is retained");
+    assert!(!emitted);
+    assert!(send.is_empty());
+}
+
 fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -1363,7 +1406,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
     let mut scratch =
         crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
     let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
-    let lsn = engine
+    let (lsn, emitted) = engine
         .emit_replication_transaction(
             floor,
             "changes",
@@ -1374,6 +1417,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
         )
         .unwrap()
         .expect("truncate transaction is retained");
+    assert!(emitted, "published truncate must emit pgoutput frames");
     assert!(lsn > floor);
     assert!(
         send.readable().windows(1).any(|bytes| bytes == b"T"),

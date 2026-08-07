@@ -3425,21 +3425,8 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
     Ok(Datum::Int2Vector(raw))
 }
 
-fn column_type_oid(storage: &Storage, column: &ColumnMeta, txid: u32) -> i32 {
-    match (column.ctype, column.domain, column.user_type_schema) {
-        (ColType::Array(super::types::ArrElem::Domain { slot, .. }), _, _) => {
-            super::types::oid::domain_array_oid(slot)
-        }
-        (ColType::Enum(slot), _, _) => super::types::oid::enum_oid(slot),
-        (ColType::Array(super::types::ArrElem::Enum(slot)), _, _) => {
-            super::types::oid::enum_array_oid(slot)
-        }
-        (_, Some(name), Some(schema)) => storage
-            .domain_slot(schema.as_str(), name.as_str(), txid)
-            .map(|slot| super::types::oid::domain_oid(slot as u16))
-            .unwrap_or_else(|| column.ctype.oid()),
-        _ => column.ctype.oid(),
-    }
+fn column_type_oid(storage: &Storage, column: &ColumnMeta, txid: u32) -> Result<i32, SqlError> {
+    Ok(storage.column_type_identity(column, txid)?.oid())
 }
 
 fn pg_attribute<'a>(
@@ -3489,7 +3476,7 @@ fn pg_attribute<'a>(
                 &[
                     Datum::Int4(table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, c, txid)),
+                    Datum::Int4(column_type_oid(storage, c, txid)?),
                     Datum::Int4(i as i32 + 1),
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
@@ -3540,7 +3527,7 @@ fn pg_attribute<'a>(
                 &[
                     Datum::Int4(info.oid),
                     text(column.name.as_str(), arena)?,
-                    Datum::Int4(column_type_oid(storage, column, txid)),
+                    Datum::Int4(column_type_oid(storage, column, txid)?),
                     Datum::Int4(attribute as i32 + 1),
                     Datum::Bool(false),
                     Datum::Int4(i32::from(column.ctype.typlen())),

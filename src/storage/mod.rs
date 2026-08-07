@@ -334,6 +334,40 @@ pub struct ColumnMeta {
     pub user_type_schema: Option<SqlName>,
 }
 
+/// The wire/catalog identity of a declared table column type.
+///
+/// `ColType` deliberately describes the representation used by the executor;
+/// that is not sufficient for a domain, whose values use its base
+/// representation while clients must still see the domain OID. Keeping this
+/// distinction at one catalog boundary prevents callers from accidentally
+/// reporting the storage type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnTypeIdentity {
+    Builtin {
+        oid: i32,
+    },
+    UserDefined {
+        oid: i32,
+        schema: SqlName,
+        name: SqlName,
+    },
+}
+
+impl ColumnTypeIdentity {
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Builtin { oid } | Self::UserDefined { oid, .. } => oid,
+        }
+    }
+
+    pub const fn user_type(self) -> Option<(SqlName, SqlName)> {
+        match self {
+            Self::Builtin { .. } => None,
+            Self::UserDefined { schema, name, .. } => Some((schema, name)),
+        }
+    }
+}
+
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
 /// Ample for real defaults (`nextval('schema.seq')`, `now()`,
 /// `gen_random_uuid()`, …); a longer one is a loud error, never silent growth.
@@ -9674,6 +9708,75 @@ impl Storage {
         self.domains.iter().position(|d| {
             d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
         })
+    }
+
+    /// Resolves the client-visible identity of a table column's declared type.
+    ///
+    /// Domains keep their base [`ColType`] for execution, so using
+    /// `column.ctype.oid()` at a protocol or catalog boundary is incorrect.
+    /// This is the sole conversion from durable column metadata to a wire OID;
+    /// a named type that cannot be resolved is a catalog invariant violation,
+    /// never an invitation to report its base type instead.
+    pub fn column_type_identity(
+        &self,
+        column: &ColumnMeta,
+        txid: u32,
+    ) -> Result<ColumnTypeIdentity, SqlError> {
+        use crate::sql::types::oid;
+
+        match column.ctype {
+            ColType::Array(ArrElem::Domain { slot, .. }) => {
+                return Ok(ColumnTypeIdentity::Builtin {
+                    oid: oid::domain_array_oid(slot),
+                });
+            }
+            ColType::Enum(slot) => {
+                let (schema, name) =
+                    column.user_type_schema.zip(column.domain).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "enum column type lacks its durable name and schema"
+                        )
+                    })?;
+                return Ok(ColumnTypeIdentity::UserDefined {
+                    oid: oid::enum_oid(slot),
+                    schema,
+                    name,
+                });
+            }
+            ColType::Array(ArrElem::Enum(slot)) => {
+                return Ok(ColumnTypeIdentity::Builtin {
+                    oid: oid::enum_array_oid(slot),
+                });
+            }
+            _ => {}
+        }
+
+        let Some((schema, name)) = column.user_type_schema.zip(column.domain) else {
+            return Ok(ColumnTypeIdentity::Builtin {
+                oid: column.ctype.oid(),
+            });
+        };
+        if let Some(slot) = self.domain_slot(schema.as_str(), name.as_str(), txid) {
+            return Ok(ColumnTypeIdentity::UserDefined {
+                oid: oid::domain_oid(slot as u16),
+                schema,
+                name,
+            });
+        }
+        if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), txid) {
+            return Ok(ColumnTypeIdentity::UserDefined {
+                oid: oid::enum_oid(slot as u16),
+                schema,
+                name,
+            });
+        }
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "declared column type \"{}.{}\" does not exist",
+            schema.as_str(),
+            name.as_str()
+        ))
     }
 
     pub fn domain(&self, slot: usize) -> &DomainDef {

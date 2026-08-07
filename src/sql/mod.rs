@@ -410,11 +410,11 @@ fn replication_column_types(
     let mut type_oids = [0_i32; crate::storage::MAX_COLUMNS];
     let mut types = [None; crate::storage::MAX_COLUMNS];
     for (index, column) in columns.iter().enumerate() {
-        let identity = storage.column_type_identity(column, 0)?;
-        type_oids[index] = identity.oid();
-        if let Some((schema, name)) = identity.user_type() {
+        let declared_type = storage.declared_column_type(column, 0)?;
+        type_oids[index] = declared_type.replication_oid();
+        if let Some((schema, name)) = declared_type.replication_user_type() {
             types[index] = Some(ReplicationType {
-                oid: identity.oid(),
+                oid: declared_type.replication_oid(),
                 schema,
                 name,
             });
@@ -2997,7 +2997,7 @@ impl Engine {
     }
 
     /// The OID of a named column of a visible table, if resolvable.
-    fn column_oid(&self, table: &ast::QualName, col: &str, txid: u32) -> Option<i32> {
+    fn parameter_type_oid(&self, table: &ast::QualName, col: &str, txid: u32) -> Option<i32> {
         let slot = match self
             .storage
             .resolve_relation(table.schema, table.name, txid)
@@ -3009,9 +3009,10 @@ impl Engine {
         let index = def.column_index(col)?;
         Some(
             self.storage
-                .column_type_identity(&def.columns()[index], txid)
-                .expect("table column type identity is catalog-validated")
-                .oid(),
+                .declared_column_type(&def.columns()[index], txid)
+                .expect("table column declared type is catalog-validated")
+                .parameter_oid()
+                .raw(),
         )
     }
 
@@ -3057,9 +3058,10 @@ impl Engine {
                             };
                             ci.map(|ci| {
                                 self.storage
-                                    .column_type_identity(&d.columns()[ci], txid)
-                                    .expect("table column type identity is catalog-validated")
-                                    .oid()
+                                    .declared_column_type(&d.columns()[ci], txid)
+                                    .expect("table column declared type is catalog-validated")
+                                    .parameter_oid()
+                                    .raw()
                             })
                         });
                         if let Some(ty) = ty {
@@ -3070,7 +3072,7 @@ impl Engine {
             }
             Stmt::Update(u) => {
                 for (col, value) in u.assignments {
-                    if let Some(ty) = self.column_oid(&u.table, col, txid) {
+                    if let Some(ty) = self.parameter_type_oid(&u.table, col, txid) {
                         set(oids, value, ty);
                     }
                 }
@@ -3156,7 +3158,7 @@ impl Engine {
                         if let (Expr::Column { name, .. }, Expr::Param(n)) = (c, p)
                             && *n >= 1
                             && (*n as usize) <= MAX_BIND_PARAMS
-                            && let Some(ty) = self.column_oid(table, name, txid)
+                            && let Some(ty) = self.parameter_type_oid(table, name, txid)
                         {
                             oids[*n as usize - 1] = ty;
                         }

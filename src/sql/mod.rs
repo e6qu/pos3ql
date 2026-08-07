@@ -880,33 +880,6 @@ impl Engine {
         }
         let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
-            // Slot-confirmation records make replication progress durable but
-            // are publisher bookkeeping, not changes in a publication. If
-            // they crossed the pgoutput boundary, acknowledging one would
-            // generate another visible transaction indefinitely.
-            let mut at = 0usize;
-            let mut publication_change = false;
-            while at < transaction.len() {
-                let length =
-                    u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
-                let total = crate::wal::HEADER_LEN + length;
-                let operation = crate::wal::decode_record(&transaction[at + 16..at + total])
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt committed WAL record")
-                    })?;
-                if !matches!(
-                    operation,
-                    WalOp::Commit { .. } | WalOp::AdvanceReplicationSlot { .. }
-                ) {
-                    publication_change = true;
-                    break;
-                }
-                at += total;
-            }
-            if !publication_change {
-                return Ok(());
-            }
-            emitted = true;
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut truncates = [PendingTruncate {
@@ -1007,6 +980,96 @@ impl Engine {
                 }
                 at += total;
             }
+            // A pgoutput transaction exists only when at least one operation
+            // selected by the publication union survives statement-level
+            // TRUNCATE suppression. Catalog and slot WAL stay durable but do
+            // not manufacture an empty subscriber transaction.
+            let mut publication_change = false;
+            for truncate in &truncates[..truncate_count] {
+                for table_slot in &truncate.table_slots[..truncate.table_count] {
+                    if publication_selects(
+                        storage,
+                        publication_names,
+                        *table_slot as usize,
+                        PublicationOperation::Truncate,
+                    )? {
+                        publication_change = true;
+                        break;
+                    }
+                }
+                if publication_change {
+                    break;
+                }
+            }
+            at = 0;
+            while !publication_change && at < transaction.len() {
+                let length =
+                    u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
+                let total = crate::wal::HEADER_LEN + length;
+                let operation = crate::wal::decode_record(&transaction[at + 16..at + total])
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt committed WAL record")
+                    })?;
+                publication_change = match operation {
+                    WalOp::Upsert {
+                        schema,
+                        table,
+                        is_update,
+                        ..
+                    } => {
+                        let table_slot = storage.find_table(schema, table).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "replication WAL refers to unknown table \"{}\"",
+                                table
+                            )
+                        })?;
+                        publication_selects(
+                            storage,
+                            publication_names,
+                            table_slot,
+                            if is_update {
+                                PublicationOperation::Update
+                            } else {
+                                PublicationOperation::Insert
+                            },
+                        )?
+                    }
+                    WalOp::Delete {
+                        schema,
+                        table,
+                        command_id,
+                        ..
+                    } => {
+                        let table_slot = storage.find_table(schema, table).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "replication WAL refers to unknown table \"{}\"",
+                                table
+                            )
+                        })?;
+                        let suppressed_by_truncate =
+                            truncates[..truncate_count].iter().any(|truncate| {
+                                truncate.command_id >= command_id
+                                    && truncate.table_slots[..truncate.table_count]
+                                        .contains(&(table_slot as u16))
+                            });
+                        !suppressed_by_truncate
+                            && publication_selects(
+                                storage,
+                                publication_names,
+                                table_slot,
+                                PublicationOperation::Delete,
+                            )?
+                    }
+                    _ => false,
+                };
+                at += total;
+            }
+            if !publication_change {
+                return Ok(());
+            }
+            emitted = true;
             let overflow = || {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,

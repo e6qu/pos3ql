@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::mem::FixedVec;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
@@ -101,10 +102,9 @@ enum ReplicationMode {
 }
 
 /// One active logical CopyBoth stream. All durable state remains in the slot;
-/// this holds only the connection-owned cursor and negotiated publication.
+/// this holds only the connection-owned cursor and negotiated stream settings.
 struct ReplicationStream {
     slot: SqlName,
-    publication: StackStr<255>,
     /// pgoutput defaults to text; binary tuples require explicit negotiation.
     binary: bool,
     proto_version: u8,
@@ -179,6 +179,9 @@ pub struct Conn {
     auth_reject: bool,
     replication: ReplicationMode,
     replication_stream: Option<ReplicationStream>,
+    /// Parsed pgoutput publication names. Its startup-sized capacity matches
+    /// the configured bound on publications in storage.
+    replication_publications: FixedVec<SqlName>,
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
@@ -256,6 +259,11 @@ impl Conn {
             auth_reject: false,
             replication: ReplicationMode::None,
             replication_stream: None,
+            replication_publications: FixedVec::new(
+                budget,
+                "replication_publications",
+                config.max_tables,
+            )?,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             prepared,
@@ -302,6 +310,7 @@ impl Conn {
         self.auth_reject = false;
         self.replication = ReplicationMode::None;
         self.replication_stream = None;
+        self.replication_publications.clear();
         self.copy = None;
         self.copy_buf.clear();
         self.phase = Phase::Startup;
@@ -1142,7 +1151,7 @@ impl Conn {
         let now = Instant::now();
         match engine.emit_replication_transaction(
             stream.scan_lsn,
-            stream.publication.as_str(),
+            self.replication_publications.as_slice(),
             stream.binary,
             stream.proto_version,
             &mut self.copy_buf,
@@ -1191,6 +1200,7 @@ impl Conn {
         if let Some(stream) = self.replication_stream.take() {
             engine.deactivate_replication_slot(stream.slot.as_str());
         }
+        self.replication_publications.clear();
     }
 
     /// The next time an idle CopyBoth stream must be serviced. This gives the
@@ -2363,6 +2373,17 @@ impl Conn {
                     binary,
                     proto_version,
                 }) => {
+                    self.replication_publications.clear();
+                    if let Err(error) =
+                        parse_publication_names(publication, &mut self.replication_publications)
+                    {
+                        let mut responder = Responder::new(&mut self.send);
+                        let _ = responder
+                            .error(error.sqlstate, error.message.as_str())
+                            .and_then(|()| responder.ready_for_query(b'I'));
+                        self.recv.consume(total);
+                        return Step::Continue;
+                    }
                     let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
                         Ok(lsn) => lsn,
                         Err(error) => {
@@ -2379,15 +2400,8 @@ impl Conn {
                         engine.deactivate_replication_slot(name.as_str());
                         return Step::Close;
                     }
-                    let mut publication_name = StackStr::new();
-                    use core::fmt::Write;
-                    if write!(publication_name, "{publication}").is_err() {
-                        engine.deactivate_replication_slot(name.as_str());
-                        return Step::Close;
-                    }
                     self.replication_stream = Some(ReplicationStream {
                         slot: name,
-                        publication: publication_name,
                         binary,
                         proto_version,
                         cursor_lsn,
@@ -2767,22 +2781,120 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
             "START_REPLICATION requires publication_names"
         )
     })?;
-    if publication.is_empty() {
+    if publication.trim().is_empty() {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "START_REPLICATION requires publication_names"
         ));
     }
-    for name in publication.split(',') {
-        if name.is_empty() {
+    if publication.trim_end().ends_with(',') {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "publication_names contains an empty name"
+        ));
+    }
+    Ok((publication, binary, proto_version))
+}
+
+fn parse_publication_names(
+    input: &str,
+    publications: &mut FixedVec<SqlName>,
+) -> Result<(), SqlError> {
+    use core::fmt::Write;
+
+    let mut input = input.trim();
+    if input.is_empty() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "START_REPLICATION requires publication_names"
+        ));
+    }
+    loop {
+        input = input.trim_start();
+        if input.is_empty() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "publication_names contains an empty name"
             ));
         }
-        SqlName::parse(name)?;
+        let mut name = StackStr::<64>::new();
+        let rest = if let Some(quoted) = input.strip_prefix('"') {
+            let mut quoted = quoted;
+            loop {
+                let Some(character) = quoted.chars().next() else {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "unterminated quoted publication name"
+                    ));
+                };
+                quoted = &quoted[character.len_utf8()..];
+                if character == '"' {
+                    if let Some(rest) = quoted.strip_prefix('"') {
+                        quoted = rest;
+                        let _ = name.write_char('"');
+                        continue;
+                    }
+                    break quoted;
+                }
+                let _ = name.write_char(character);
+            }
+        } else {
+            let end = input.find(',').unwrap_or(input.len());
+            let token = input[..end].trim_end();
+            if token.is_empty()
+                || !token.chars().enumerate().all(|(index, character)| {
+                    if index == 0 {
+                        character == '_' || character.is_alphabetic() || !character.is_ascii()
+                    } else {
+                        character == '_'
+                            || character == '$'
+                            || character.is_alphanumeric()
+                            || !character.is_ascii()
+                    }
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "invalid unquoted publication name"
+                ));
+            }
+            for character in token.chars() {
+                let _ = name.write_char(character.to_ascii_lowercase());
+            }
+            &input[end..]
+        };
+        if name.as_str().is_empty() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "publication_names contains an empty name"
+            ));
+        }
+        if name.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::NAME_TOO_LONG,
+                "publication name is longer than 63 bytes"
+            ));
+        }
+        publications
+            .push(SqlName::parse(name.as_str())?)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "publication_names exceeds configured publication capacity"
+                )
+            })?;
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let Some(rest) = rest.strip_prefix(',') else {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "publication_names require commas"
+            ));
+        };
+        input = rest;
     }
-    Ok((publication, binary, proto_version))
 }
 
 fn is_replication_slot_name(name: &str) -> bool {
@@ -3245,6 +3357,25 @@ mod tests {
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1' publication_names 'changes_pub')",
         ] {
             assert!(parse_logical_replication_command(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn pgoutput_publication_names_follow_standard_identifier_quoting() {
+        let mut budget = Budget::new(4 * core::mem::size_of::<SqlName>());
+        let mut publications = FixedVec::new(&mut budget, "test publications", 4).unwrap();
+        parse_publication_names("\"sales, west\", Plain, \"say\"\"hi\"", &mut publications)
+            .unwrap();
+        assert_eq!(publications.as_slice()[0].as_str(), "sales, west");
+        assert_eq!(publications.as_slice()[1].as_str(), "plain");
+        assert_eq!(publications.as_slice()[2].as_str(), "say\"hi");
+
+        for input in ["\"unterminated", "name trailing", "name,,other", ""] {
+            publications.clear();
+            assert!(
+                parse_publication_names(input, &mut publications).is_err(),
+                "{input}"
+            );
         }
     }
 

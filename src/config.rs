@@ -517,6 +517,7 @@ impl Config {
             + self.sql_arena_bytes
             + self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
+            + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
             + crate::sql::cursor::CursorPool::budget_bytes(self)
             + self.txn_rows * 12;
         MemoryPlan {
@@ -755,12 +756,16 @@ sql_arena_bytes = 4096
         c.cursor_bytes = 64;
         c.copy_line_bytes = 50;
         let plan = c.memory_plan(500, 250);
-        // 50+100+200+300 + 2*30 + 2*(20+40) + cursor pool per connection.
+        // 50+100+200+300 + 2*30 + 2*(20+40) + publication selection + cursor pool.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
-        assert_eq!(plan.connections, (950 + cursor_pool) * 10);
+        let publication_selection = c.max_tables * core::mem::size_of::<crate::storage::SqlName>();
+        assert_eq!(
+            plan.connections,
+            (950 + publication_selection + cursor_pool) * 10
+        );
         assert_eq!(
             plan.total(),
-            (950 + cursor_pool) * 10 + 1000 + 2000 + 500 + 250
+            (950 + publication_selection + cursor_pool) * 10 + 1000 + 2000 + 500 + 250
         );
     }
 

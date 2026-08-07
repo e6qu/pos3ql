@@ -1359,6 +1359,60 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
         .expect("logical slot acknowledgement test thread completes");
 }
 
+#[test]
+fn logical_replication_unions_multiple_publications() {
+    std::thread::Builder::new()
+        .name("logical-publication-union".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_unions_multiple_publications_on_sized_stack)
+        .expect("logical publication union test thread starts")
+        .join()
+        .expect("logical publication union test thread completes");
+}
+
+fn logical_replication_unions_multiple_publications_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE left_table (id int); CREATE TABLE right_table (id int); \
+         CREATE PUBLICATION left_changes FOR TABLE left_table WITH (publish = 'insert'); \
+         CREATE PUBLICATION right_changes FOR TABLE right_table WITH (publish = 'insert')",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO left_table VALUES (1); INSERT INTO right_table VALUES (2)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            "left_changes,right_changes",
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("published transaction is retained");
+    assert!(emitted);
+    assert_eq!(
+        send.readable()
+            .windows(1)
+            .filter(|bytes| *bytes == b"I")
+            .count(),
+        2,
+        "the publication union must emit each selected table change once"
+    );
+}
+
 fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();

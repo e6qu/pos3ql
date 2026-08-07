@@ -392,7 +392,7 @@ struct PendingTruncate {
 
 fn emit_pending_truncates(
     storage: &Storage,
-    publication: &crate::storage::PublicationDef,
+    publication_names: &str,
     proto_version: u8,
     end_lsn: u64,
     command_id: u32,
@@ -407,9 +407,12 @@ fn emit_pending_truncates(
         let mut relation_count = 0usize;
         for &table_slot in &truncate.table_slots[..truncate.table_count] {
             let table_slot = table_slot as usize;
-            let selected = publication.all_tables
-                || publication.tables[..publication.table_count].contains(&(table_slot as u16));
-            if !selected || !publication.publish_truncate {
+            if !publication_selects(
+                storage,
+                publication_names,
+                table_slot,
+                PublicationOperation::Truncate,
+            )? {
                 continue;
             }
             let definition = storage.table_def(table_slot, 0);
@@ -463,6 +466,43 @@ fn emit_pending_truncates(
         truncate.emitted = true;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PublicationOperation {
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+}
+
+fn publication_selects(
+    storage: &Storage,
+    publication_names: &str,
+    table_slot: usize,
+    operation: PublicationOperation,
+) -> Result<bool, SqlError> {
+    for name in publication_names.split(',') {
+        let publication = storage.publication(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                name
+            )
+        })?;
+        let member = publication.all_tables
+            || publication.tables[..publication.table_count].contains(&(table_slot as u16));
+        let publishes = match operation {
+            PublicationOperation::Insert => publication.publish_insert,
+            PublicationOperation::Update => publication.publish_update,
+            PublicationOperation::Delete => publication.publish_delete,
+            PublicationOperation::Truncate => publication.publish_truncate,
+        };
+        if member && publishes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Engine {
@@ -822,20 +862,22 @@ impl Engine {
     pub(crate) fn emit_replication_transaction(
         &mut self,
         floor: u64,
-        publication_name: &str,
+        publication_names: &str,
         binary: bool,
         proto_version: u8,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<(u64, bool)>, SqlError> {
         let storage = &self.storage;
-        let publication = storage.publication(publication_name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "publication \"{}\" does not exist",
-                publication_name
-            )
-        })?;
+        for name in publication_names.split(',') {
+            if name.is_empty() || storage.publication(name).is_none() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "publication \"{}\" does not exist",
+                    name
+                ));
+            }
+        }
         let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
             // Slot-confirmation records make replication progress durable but
@@ -1000,7 +1042,7 @@ impl Engine {
                     } => {
                         emit_pending_truncates(
                             storage,
-                            publication,
+                            publication_names,
                             proto_version,
                             end_lsn,
                             command_id,
@@ -1014,13 +1056,16 @@ impl Engine {
                                 table
                             ));
                         };
-                        let selected = publication.all_tables
-                            || publication.tables[..publication.table_count]
-                                .contains(&(table_slot as u16));
-                        if selected
-                            && ((is_update && publication.publish_update)
-                                || (!is_update && publication.publish_insert))
-                        {
+                        if publication_selects(
+                            storage,
+                            publication_names,
+                            table_slot,
+                            if is_update {
+                                PublicationOperation::Update
+                            } else {
+                                PublicationOperation::Insert
+                            },
+                        )? {
                             let definition = storage.table_def(table_slot, 0);
                             let mut schema_types = [ColType::Bool; crate::storage::MAX_COLUMNS];
                             let column_count = definition.schema(&mut schema_types);
@@ -1100,19 +1145,22 @@ impl Engine {
                                 table
                             ));
                         };
-                        let selected = publication.all_tables
-                            || publication.tables[..publication.table_count]
-                                .contains(&(table_slot as u16));
                         let suppressed_by_truncate =
                             truncates[..truncate_count].iter().any(|truncate| {
                                 truncate.command_id >= command_id
                                     && truncate.table_slots[..truncate.table_count]
                                         .contains(&(table_slot as u16))
                             });
-                        if selected && publication.publish_delete && !suppressed_by_truncate {
+                        if publication_selects(
+                            storage,
+                            publication_names,
+                            table_slot,
+                            PublicationOperation::Delete,
+                        )? && !suppressed_by_truncate
+                        {
                             emit_pending_truncates(
                                 storage,
-                                publication,
+                                publication_names,
                                 proto_version,
                                 end_lsn,
                                 command_id,
@@ -1169,7 +1217,7 @@ impl Engine {
             }
             emit_pending_truncates(
                 storage,
-                publication,
+                publication_names,
                 proto_version,
                 end_lsn,
                 u32::MAX,

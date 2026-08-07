@@ -51,7 +51,9 @@ pub fn relation(
     schema: &str,
     name: &str,
     columns: &[ColumnMeta],
+    type_oids: &[i32],
 ) {
+    debug_assert_eq!(columns.len(), type_oids.len());
     message.u8(b'R');
     message.i32(relation_id as i32);
     message.cstr(schema);
@@ -61,12 +63,21 @@ pub fn relation(
     // a tuple shape a subscriber is not entitled to expect from DEFAULT.
     message.u8(b'f');
     message.i16(columns.len() as i16);
-    for column in columns {
+    for (column, type_oid) in columns.iter().zip(type_oids) {
         message.u8(u8::from(column.primary));
         message.cstr(column.name.as_str());
-        message.i32(column.ctype.oid());
+        message.i32(*type_oid);
         message.i32(column.type_mod);
     }
+}
+
+/// pgoutput Type declaration. Subscribers must receive this before a Relation
+/// that refers to a non-built-in type OID.
+pub fn type_message(message: &mut MsgOut, type_oid: i32, schema: &str, name: &str) {
+    message.u8(b'Y');
+    message.i32(type_oid);
+    message.cstr(schema);
+    message.cstr(name);
 }
 
 /// pgoutput Insert with a negotiated text or binary new-tuple payload.

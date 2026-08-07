@@ -1382,6 +1382,17 @@ fn logical_replication_selects_a_quoted_publication_name() {
 }
 
 #[test]
+fn logical_replication_declares_user_types_before_relations() {
+    std::thread::Builder::new()
+        .name("logical-replication-types".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_declares_user_types_before_relations_on_sized_stack)
+        .expect("logical replication type test thread starts")
+        .join()
+        .expect("logical replication type test thread completes");
+}
+
+#[test]
 fn logical_replication_omits_transactions_without_published_changes() {
     std::thread::Builder::new()
         .name("logical-publication-filter".into())
@@ -1506,6 +1517,58 @@ fn logical_replication_selects_a_quoted_publication_name_on_sized_stack() {
         .expect("quoted publication transaction is retained");
     assert!(emitted);
     assert!(send.readable().windows(1).any(|bytes| bytes == b"I"));
+}
+
+fn logical_replication_declares_user_types_before_relations_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TYPE replication_state AS ENUM ('ready'); \
+         CREATE DOMAIN replication_count AS integer CHECK (VALUE > 0); \
+         CREATE TABLE typed_replication (state replication_state, count replication_count); \
+         CREATE PUBLICATION typed_changes FOR TABLE typed_replication",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO typed_replication VALUES ('ready', 1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("typed_changes").unwrap()],
+            false,
+            2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("typed replication transaction is retained");
+    assert!(emitted);
+    let bytes = send.readable();
+    let enum_type = b"Y\x00\x01\xd4\xc0public\x00replication_state\x00";
+    let domain_type = b"Y\x00\x01\xad\xb0public\x00replication_count\x00";
+    let enum_at = bytes
+        .windows(enum_type.len())
+        .position(|window| window == enum_type)
+        .expect("enum Type message must precede Relation");
+    let domain_at = bytes
+        .windows(domain_type.len())
+        .position(|window| window == domain_type)
+        .expect("domain Type message must precede Relation");
+    let relation_at = bytes
+        .iter()
+        .position(|byte| *byte == b'R')
+        .expect("Relation message follows type declarations");
+    assert!(enum_at < relation_at && domain_at < relation_at);
 }
 
 fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {

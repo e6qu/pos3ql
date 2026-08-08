@@ -2171,7 +2171,7 @@ impl Conn {
             let mut responder = Responder::new(&mut self.send);
             // Over TLS the drain must encrypt through the session onto the
             // blocking socket; in the clear it writes the fd directly.
-            if !engine.publication_required() {
+            if !engine.publication_required() || simple_query_can_stream(text) {
                 if let Some(session) = self.tls.as_mut() {
                     responder = responder.with_flush_tls(session, self.stream.as_mut().unwrap());
                 } else if let Some(fd) = fd {
@@ -2513,6 +2513,24 @@ fn is_identify_system(text: &str) -> bool {
         .trim_end_matches(';')
         .trim_end()
         .eq_ignore_ascii_case("identify_system")
+}
+
+/// A streaming simple query cannot contain a commit-capable statement.  Keep
+/// this deliberately narrow: unsupported forms stay buffered behind the
+/// object-store publication barrier instead of relying on a best-effort
+/// classification.
+fn simple_query_can_stream(text: &str) -> bool {
+    let statement = text.trim().trim_end_matches(';').trim_end();
+    if statement.is_empty() || statement.contains(';') {
+        return false;
+    }
+    let Some(first) = statement.split_ascii_whitespace().next() else {
+        return false;
+    };
+    first.eq_ignore_ascii_case("select")
+        || first.eq_ignore_ascii_case("show")
+        || first.eq_ignore_ascii_case("values")
+        || first.eq_ignore_ascii_case("table")
 }
 
 /// Logical replication uses replication commands and ordinary SQL on the same
@@ -3406,6 +3424,27 @@ mod tests {
         assert!(is_identify_system("IDENTIFY_SYSTEM"));
         assert!(is_identify_system(" identify_system ; \n"));
         assert!(!is_identify_system("IDENTIFY_SYSTEM; SELECT 1"));
+    }
+
+    #[test]
+    fn only_single_read_only_simple_queries_may_stream_before_publication() {
+        for query in [
+            "SELECT 1",
+            " show search_path; ",
+            "VALUES (1)",
+            "TABLE users",
+        ] {
+            assert!(simple_query_can_stream(query), "{query}");
+        }
+        for query in [
+            "",
+            "WITH rows AS (SELECT 1) SELECT * FROM rows",
+            "SELECT 1; SELECT 2",
+            "INSERT INTO users VALUES (1)",
+            "SELECT 1; INSERT INTO users VALUES (1)",
+        ] {
+            assert!(!simple_query_can_stream(query), "{query}");
+        }
     }
 
     #[test]

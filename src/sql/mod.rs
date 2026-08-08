@@ -2169,7 +2169,7 @@ impl Engine {
                 sequence.dirty.set(true);
             }
             DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
-            DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize),
+            DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize, txid),
             DdlUndo::RoleChanged { slot, prior } => {
                 self.storage.rollback_role_change(slot as usize, prior);
             }

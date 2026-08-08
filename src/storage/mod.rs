@@ -1436,11 +1436,13 @@ pub struct ViewDef {
     /// so it must re-resolve under the creator's path, not the reader's.
     pub creation_path: StackStr<128>,
     pub ownership: Ownership,
-    pub live: bool,
-    /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
-    /// mirroring `Table::pending_ddl`): other transactions see `live`; the
-    /// owner sees the pending existence.
-    pub pending: Option<PendingDdl>,
+    ddl_state: CatalogDdlState,
+}
+
+impl ViewDef {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
 }
 
 /// A logical publication.  Publications are database-scoped catalog objects;
@@ -1490,16 +1492,6 @@ pub(crate) struct ReplicationSlotDef {
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
-    }
-}
-
-impl ViewDef {
-    /// Whether `txid` sees this view exist.
-    pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
     }
 }
 
@@ -1583,7 +1575,7 @@ impl DomainDef {
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
-            Some(p) if p.txid == txid => p.creating,
+            Some(pending) if pending.txid == txid => pending.creating,
             _ => self.live,
         }
     }
@@ -1776,8 +1768,7 @@ pub struct SequenceDef {
     /// `SequenceAdvance` and clears it, regardless of whether the surrounding
     /// transaction committed (advances are non-transactional).
     pub dirty: Cell<bool>,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    ddl_state: CatalogDdlState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1825,10 +1816,7 @@ pub struct SeqSpec {
 
 impl SequenceDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 
     /// Advances the generator and returns the next value, or the 2200H overflow
@@ -1938,24 +1926,18 @@ impl IndexDef {
 /// How many schemas may exist at once, including the built-in "public".
 pub(crate) const MAX_SCHEMAS: usize = 32;
 
-/// A named schema (namespace for tables, views and indexes). Catalog MVCC
-/// mirrors `Table`: `live` is the committed image, `pending` an uncommitted
-/// CREATE/DROP owned by one transaction.
+/// A named schema (namespace for tables, views and indexes).
 #[derive(Clone, Copy)]
 pub struct SchemaDef {
     pub name: SqlName,
     pub ownership: Ownership,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    ddl_state: CatalogDdlState,
 }
 
 impl SchemaDef {
     /// Whether `txid` sees this schema exist.
     pub fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 }
 
@@ -2929,7 +2911,7 @@ impl Storage {
 
     pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
         for slot in 0..self.views.len() {
-            if self.views[slot].live {
+            if self.views[slot].ddl_state == CatalogDdlState::Present {
                 let serialized = self.view_dependencies[slot];
                 self.view_dependencies[slot] =
                     self.rebind_stored_query_dependencies(serialized, 0)?;
@@ -2953,7 +2935,7 @@ impl Storage {
         name: SqlName,
     ) {
         for view_slot in 0..self.views.len() {
-            if self.views[view_slot].live || self.views[view_slot].pending.is_some() {
+            if self.views[view_slot].ddl_state != CatalogDdlState::Absent {
                 self.view_dependencies[view_slot].rename(class, slot, schema, name);
             }
         }
@@ -2973,7 +2955,7 @@ impl Storage {
         name: SqlName,
     ) {
         for view_slot in 0..self.views.len() {
-            if self.views[view_slot].live || self.views[view_slot].pending.is_some() {
+            if self.views[view_slot].ddl_state != CatalogDdlState::Absent {
                 self.view_dependencies[view_slot]
                     .replace_slot(class, old_slot, new_slot, schema, name);
             }
@@ -3095,8 +3077,7 @@ impl Storage {
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
                     ownership: Ownership::BOOTSTRAP,
-                    live: false,
-                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
         }
@@ -3170,8 +3151,7 @@ impl Storage {
                     last_value: Cell::new(1),
                     is_called: Cell::new(false),
                     dirty: Cell::new(false),
-                    live: false,
-                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to MAX_SEQUENCES");
         }
@@ -3195,8 +3175,11 @@ impl Storage {
                         SqlName::EMPTY
                     },
                     ownership: Ownership::BOOTSTRAP,
-                    live: i == 0,
-                    pending: None,
+                    ddl_state: if i == 0 {
+                        CatalogDdlState::Present
+                    } else {
+                        CatalogDdlState::Absent
+                    },
                 })
                 .expect("sized to MAX_SCHEMAS");
         }
@@ -3333,9 +3316,9 @@ impl Storage {
     /// Committed-catalog schema lookup (ignores uncommitted DDL): journal
     /// replay and the durable image.
     pub fn find_schema(&self, name: &str) -> Option<usize> {
-        self.schemas
-            .iter()
-            .position(|n| n.live && n.name.as_str() == name)
+        self.schemas.iter().position(|schema| {
+            schema.ddl_state == CatalogDdlState::Present && schema.name.as_str() == name
+        })
     }
 
     /// Transaction-scoped schema lookup: `txid` sees its own uncommitted
@@ -3534,12 +3517,12 @@ impl Storage {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].live,
-            AccessClass::View => self.views[slot].live,
+            AccessClass::View => self.views[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::MaterializedView => {
                 self.matviews[slot].ddl_state == CatalogDdlState::Present
             }
-            AccessClass::Sequence => self.sequences[slot].live,
-            AccessClass::Schema => self.schemas[slot].live,
+            AccessClass::Sequence => self.sequences[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Schema => self.schemas[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Domain => self.domains[slot].live,
             AccessClass::Enum => self.enums[slot].live,
             AccessClass::Index => self.indexes[slot].live,
@@ -4848,7 +4831,10 @@ impl Storage {
     /// Committed schemas with their slot indices, for checkpoint and catalog
     /// output.
     pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas.iter().enumerate().filter(|(_, n)| n.live)
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter(|(_, schema)| schema.ddl_state == CatalogDdlState::Present)
     }
 
     /// Schemas visible to `txid`, for catalog output inside a transaction.
@@ -5056,7 +5042,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        self.alloc_schema(name, None)
+        self.alloc_schema(name, CatalogDdlState::Present)
     }
 
     /// Transactional create: the schema exists only for `txid` until commit.
@@ -5083,10 +5069,8 @@ impl Storage {
         }
         if let Some(owner) = self.schemas.iter().find_map(|schema| {
             (schema.name.as_str() == name.as_str())
-                .then_some(schema.pending)
-                .flatten()
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(schema.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             self.row_locks.borrow_mut().wait_for(txid, owner)?;
             return Err(sql_err!(
@@ -5095,24 +5079,18 @@ impl Storage {
                 name.as_str(),
             ));
         }
-        self.alloc_schema(
-            name,
-            Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
-        )
+        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid })
     }
 
     fn alloc_schema(
         &mut self,
         name: SqlName,
-        pending: Option<PendingDdl>,
+        ddl_state: CatalogDdlState,
     ) -> Result<usize, SqlError> {
         let Some(slot) = self
             .schemas
             .iter()
-            .position(|n| !n.live && n.pending.is_none())
+            .position(|schema| schema.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5120,7 +5098,7 @@ impl Storage {
                 self.schemas.len()
             ));
         };
-        let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
+        let ownership = self.initial_ownership(ddl_state.pending_txid().unwrap_or(0));
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Schema,
             slot: slot as u16,
@@ -5128,8 +5106,7 @@ impl Storage {
         self.schemas[slot] = SchemaDef {
             name,
             ownership,
-            live: pending.is_none(),
-            pending,
+            ddl_state,
         };
         Ok(slot)
     }
@@ -5138,49 +5115,37 @@ impl Storage {
     pub fn drop_schema(&mut self, slot: usize) {
         let name = self.schemas[slot].name;
         self.drop_object_comments(CommentClass::Schema, "", name.as_str());
-        self.schemas[slot].live = false;
-        self.schemas[slot].pending = None;
+        self.schemas[slot].ddl_state = CatalogDdlState::Absent;
     }
 
     /// Transactional drop: the schema stays visible to other transactions
     /// until `txid` commits. The owner's own pending-create evaporates.
     pub fn drop_schema_in(&mut self, slot: usize, txid: u32) {
-        let n = &mut self.schemas[slot];
-        if matches!(n.pending, Some(p) if p.txid == txid && p.creating) {
-            n.live = false;
-            n.pending = None;
-        } else {
-            n.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        let schema = &mut self.schemas[slot];
+        schema.ddl_state = schema.ddl_state.drop_by(txid);
     }
 
     /// Promotes an uncommitted CREATE SCHEMA into the committed catalog.
     pub fn commit_schema_create(&mut self, slot: usize) {
-        self.schemas[slot].live = true;
-        self.schemas[slot].pending = None;
+        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.commit_create();
     }
 
     /// Applies a committed DROP SCHEMA.
     pub fn commit_schema_drop(&mut self, slot: usize) {
         let name = self.schemas[slot].name;
         self.drop_object_comments(CommentClass::Schema, "", name.as_str());
-        self.schemas[slot].live = false;
-        self.schemas[slot].pending = None;
+        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.commit_drop();
     }
 
     /// Rolls back an uncommitted CREATE SCHEMA, freeing the slot.
     pub fn rollback_schema_create(&mut self, slot: usize) {
-        self.schemas[slot].live = false;
-        self.schemas[slot].pending = None;
+        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_create();
     }
 
     /// Rolls back an uncommitted DROP SCHEMA: it returns to the committed
     /// image unchanged.
-    pub fn rollback_schema_drop(&mut self, slot: usize) {
-        self.schemas[slot].pending = None;
+    pub fn rollback_schema_drop(&mut self, slot: usize, txid: u32) {
+        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Computes the effective path a raw `search_path` value denotes for this
@@ -8958,17 +8923,24 @@ impl Storage {
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
-        self.views.iter().any(|v| v.live || v.pending.is_some())
+        self.views
+            .iter()
+            .any(|view| view.ddl_state != CatalogDdlState::Absent)
     }
 
     /// Committed views as (name, SELECT text), for checkpoint serialization.
     pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
-        self.views.iter().filter(|v| v.live)
+        self.views
+            .iter()
+            .filter(|view| view.ddl_state == CatalogDdlState::Present)
     }
 
     /// Committed views with their slot indices, for OID assignment.
     pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views.iter().enumerate().filter(|(_, v)| v.live)
+        self.views
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| view.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn view(&self, slot: usize) -> &ViewDef {
@@ -9415,11 +9387,16 @@ impl Storage {
     // --- Sequences -------------------------------------------------------
 
     pub fn live_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
-        self.sequences.iter().filter(|s| s.live)
+        self.sequences
+            .iter()
+            .filter(|sequence| sequence.ddl_state == CatalogDdlState::Present)
     }
 
     pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences.iter().enumerate().filter(|(_, s)| s.live)
+        self.sequences
+            .iter()
+            .enumerate()
+            .filter(|(_, sequence)| sequence.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {
@@ -9507,16 +9484,15 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
             (s.schema.as_str() == schema.as_str() && s.name.as_str() == name.as_str())
-                .then_some(s.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(s.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .sequences
             .iter()
-            .position(|s| !s.live && s.pending.is_none())
+            .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9547,11 +9523,7 @@ impl Storage {
             last_value: Cell::new(spec.start_value),
             is_called: Cell::new(false),
             dirty: Cell::new(false),
-            live: false,
-            pending: Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(new)
     }
@@ -9591,9 +9563,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
             (s.schema.as_str() == schema && s.name.as_str() == name)
-                .then_some(s.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(s.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -9602,53 +9573,35 @@ impl Storage {
         }) else {
             return Ok(None);
         };
-        let s = &mut self.sequences[i];
-        if matches!(s.pending, Some(p) if p.txid == txid && p.creating) {
-            s.live = false;
-            s.pending = None;
-        } else {
-            s.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        let sequence = &mut self.sequences[i];
+        sequence.ddl_state = sequence.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_sequence_create(&mut self, slot: usize) {
-        self.sequences[slot].live = true;
-        self.sequences[slot].pending = None;
+        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.commit_create();
     }
 
     pub fn commit_sequence_drop(&mut self, slot: usize) {
         let (schema, name) = (self.sequences[slot].schema, self.sequences[slot].name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.sequences[slot].live = false;
-        self.sequences[slot].pending = None;
+        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_sequence_create(&mut self, slot: usize) {
-        self.sequences[slot].live = false;
-        self.sequences[slot].pending = None;
+        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_sequence_drop(&mut self, slot: usize, txid: u32) {
-        let s = &mut self.sequences[slot];
-        if s.live {
-            s.pending = None;
-        } else if matches!(s.pending, Some(p) if p.txid == txid) {
-            s.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        let sequence = &mut self.sequences[slot];
+        sequence.ddl_state = sequence.ddl_state.rollback_drop(txid);
     }
 
     /// Applies a replayed/absolute `SequenceAdvance`: set value state directly,
     /// without marking dirty (replay must not re-journal).
     pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
         if let Some(i) = self.sequences.iter().position(|s| {
-            (s.live || s.pending.is_some())
+            (s.ddl_state != CatalogDdlState::Absent)
                 && s.schema.as_str() == schema
                 && s.name.as_str() == name
         }) {
@@ -10305,9 +10258,8 @@ impl Storage {
         }
         if let Some(blocker) = self.views.iter().find_map(|v| {
             (v.schema.as_str() == schema.as_str() && v.name.as_str() == name.as_str())
-                .then_some(v.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(v.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
@@ -10326,7 +10278,7 @@ impl Storage {
         let Some(new) = self
             .views
             .iter()
-            .position(|v| !v.live && v.pending.is_none())
+            .position(|v| v.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10350,11 +10302,7 @@ impl Storage {
             sql: query.sql,
             creation_path: query.creation_path,
             ownership,
-            live: false,
-            pending: Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         self.view_dependencies[new] = query.dependencies;
         Ok((new, existing))
@@ -10371,9 +10319,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.views.iter().find_map(|v| {
             (v.schema.as_str() == schema && v.name.as_str() == name)
-                .then_some(v.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(v.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -10390,15 +10337,7 @@ impl Storage {
     /// simply evaporates (never committed, nothing to keep).
     fn pending_drop_view(&mut self, slot: usize, txid: u32) {
         let v = &mut self.views[slot];
-        if matches!(v.pending, Some(p) if p.txid == txid && p.creating) {
-            v.live = false;
-            v.pending = None;
-        } else {
-            v.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        v.ddl_state = v.ddl_state.drop_by(txid);
     }
 
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
@@ -10406,7 +10345,10 @@ impl Storage {
         let schema = self.views[slot].schema;
         let name = self.views[slot].name;
         if let Some(old_slot) = self.views.iter().enumerate().find_map(|(old_slot, view)| {
-            (old_slot != slot && view.live && view.schema == schema && view.name == name)
+            (old_slot != slot
+                && view.ddl_state == CatalogDdlState::Present
+                && view.schema == schema
+                && view.name == name)
                 .then_some(old_slot)
         }) {
             self.replace_stored_query_dependency_slot(
@@ -10417,8 +10359,7 @@ impl Storage {
                 name,
             );
         }
-        self.views[slot].live = true;
-        self.views[slot].pending = None;
+        self.views[slot].ddl_state = self.views[slot].ddl_state.commit_create();
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
@@ -10428,35 +10369,29 @@ impl Storage {
         // slot. Comments belong to the logical same-named object and survive;
         // an ordinary DROP has no replacement and removes them.
         let replaced = self.views.iter().enumerate().any(|(other, view)| {
-            other != slot && view.live && view.schema == schema && view.name == name
+            other != slot
+                && view.ddl_state == CatalogDdlState::Present
+                && view.schema == schema
+                && view.name == name
         });
         if !replaced {
             self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
             self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         }
-        self.views[slot].live = false;
-        self.views[slot].pending = None;
+        self.views[slot].ddl_state = self.views[slot].ddl_state.commit_drop();
     }
 
     /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
     pub fn rollback_view_create(&mut self, slot: usize) {
-        self.views[slot].live = false;
-        self.views[slot].pending = None;
+        self.views[slot].ddl_state = self.views[slot].ddl_state.rollback_create();
     }
 
     /// Discards an uncommitted DROP VIEW (rollback). A committed view becomes
     /// visible again; a same-transaction pending-create (create + drop, then
     /// the drop rolled back to a savepoint) reverts to pending-create.
     pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
-        let v = &mut self.views[slot];
-        if v.live {
-            v.pending = None;
-        } else {
-            v.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        let view = &mut self.views[slot];
+        view.ddl_state = view.ddl_state.rollback_drop(txid);
     }
 
     pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {
@@ -10705,7 +10640,7 @@ impl Storage {
             }
         }
         for sequence in self.sequences.iter_mut() {
-            if !sequence.live {
+            if sequence.ddl_state != CatalogDdlState::Present {
                 continue;
             }
             let moves_with_table = matches!(

@@ -4,7 +4,7 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 
 ## Architecture objectives
 
-- PostgreSQL compatibility is the SQL, v3 wire, binary-format, catalog, and logical-replication boundary; PostgreSQL heap pages and physical XLOG are not.
+- PostgreSQL compatibility is SQL text, v3 wire bytes, catalog behavior, and logical replication where it suits the object-native design; PostgreSQL heap pages, physical XLOG, and binary-WAL replication are not targets.
 - Object storage is the only durable tier. RAM and local disk are bounded, disposable caches.
 - The engine uses one generic object-store gateway contract; provider protocols and SDKs remain outside the application.
 - Acknowledgement must have an object-native latency and request shape: immutable commit batches plus CAS publication, not one remote upload per transaction.
@@ -17,7 +17,7 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 2. **Object-store portability.** Complete: application configuration and transport use only the generic gateway contract; the deterministic simulator and integration gateway qualify that contract. No application provider adapter or provider-specific branch is permitted.
 3. **SQL and catalogs.** Close remaining language, type, privilege, collation, and introspection differences through strict PostgreSQL differential tests.
 4. **Wire and binary protocol.** Match PostgreSQL Bind, Result, COPY, cancellation, array/range/composite, and typmod bytes for every accepted type; reject malformed structured binary values rather than accepting valid prefixes.
-5. **Logical replication.** Complete pgoutput versions/messages, slot semantics, and logical subscription/apply for PostgreSQL migration.
+5. **Logical replication.** Keep pgoutput, slot, and subscription work only where it preserves object-native performance; physical/binary-WAL replication remains deliberately unsupported.
 6. **Physical-demand execution.** Preserve needed-block/column proofs through joins, correlation, sorting, grouping, windows, and spill.
 
 ## Current invariants

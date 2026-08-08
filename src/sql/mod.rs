@@ -2507,6 +2507,7 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        self.retry_pending_wal_upload()?;
         if self.post_publish_cleanup.is_some() {
             self.finish_post_publish_cleanup()?;
         }
@@ -2708,6 +2709,14 @@ impl Engine {
         // completes it. Checkpoint publication uses that client synchronously.
         if self.block_reads_pending() {
             return true;
+        }
+        if let Err(error) = self.retry_pending_wal_upload() {
+            eprintln!(
+                "pos3ql: auto-checkpoint failed ({}): {}",
+                error.sqlstate,
+                error.message.as_str()
+            );
+            return false;
         }
         if self.post_publish_cleanup.is_some() {
             return match self.finish_post_publish_cleanup() {

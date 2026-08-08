@@ -11180,8 +11180,10 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
     assert!(engine.commit_wal().is_err());
     assert!(engine.wal.pending_batch_bytes() > 0);
+    assert!(engine.checkpoint().is_err());
+    assert!(engine.wal.pending_batch_bytes() > 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
-    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);

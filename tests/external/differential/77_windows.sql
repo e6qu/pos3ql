@@ -103,12 +103,12 @@ FROM wf ORDER BY grp, val, name;
 SELECT DISTINCT grp, count(*) OVER (PARTITION BY grp) AS cnt FROM wf ORDER BY grp;
 SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS r FROM wf ORDER BY r, val, name;
 
--- PostgreSQL's parse-analysis rejections (0A000): DISTINCT, aggregate
--- ORDER BY, and FILTER on a non-aggregate call are not window-function
--- decorations
+-- PostgreSQL rejects DISTINCT and aggregate ORDER BY in a window call, but
+-- accepts FILTER on an aggregate window function.
 SELECT count(DISTINCT val) OVER (PARTITION BY grp) FROM wf;
 SELECT sum(DISTINCT val) OVER (ORDER BY val) FROM wf;
 SELECT array_agg(val ORDER BY val) OVER (PARTITION BY grp) FROM wf;
+SELECT sum(val) FILTER (WHERE val > 1) OVER (PARTITION BY grp) FROM wf;
 SELECT row_number() FILTER (WHERE true) OVER (ORDER BY val) FROM wf;
 SELECT lag(val) FILTER (WHERE true) OVER (ORDER BY val) FROM wf;
 

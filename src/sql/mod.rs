@@ -2509,7 +2509,6 @@ impl Engine {
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         if self.post_publish_cleanup.is_some() {
             self.finish_post_publish_cleanup()?;
-            return Ok(true);
         }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {

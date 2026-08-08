@@ -2,10 +2,9 @@
 # External conformance suite for pos3ql.
 #
 # Everything here tests from the OUTSIDE: the newest psql client (18.x)
-# over the real wire, raw-socket protocol probes, the psycopg driver, and
-# the newest MinIO as the object store. Nothing links against pos3ql.
+# over the real wire, raw-socket protocol probes, and the psycopg driver.
 #
-# Requirements: docker, psql 18+ (brew install libpq), python3, cargo.
+# Requirements: psql 18+ (brew install libpq), python3, cargo.
 # Usage: tests/external/run.sh [--keep]
 
 set -u
@@ -16,9 +15,8 @@ WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
 KEEP=${1:-}
 
 PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
-MINIO_PORT=${POS3QL_MINIO_PORT:-19311}
+GATEWAY_PORT=${POS3QL_GATEWAY_PORT:-19311}
 PG_PORT=${POS3QL_PG_PORT:-15433}
-MINIO_CONTAINER=pos3ql-external-minio
 
 PASS=0
 FAIL=0
@@ -93,7 +91,9 @@ cleanup() {
     for _ in {1..50}; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$SERVER_PID" 2>/dev/null
   fi
-  docker rm -f $MINIO_CONTAINER >/dev/null 2>&1
+  if [[ -n "${GATEWAY_PID:-}" ]]; then
+    kill "$GATEWAY_PID" 2>/dev/null
+  fi
   if [[ "$KEEP" == "--keep" ]]; then
     print -- "work dir kept: $WORK"
   else
@@ -102,26 +102,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "toolchain versions (targets: newest psql / MinIO)"
+step "toolchain versions"
 "$PSQL" --version || { bad "psql missing"; exit 1; }
-docker --version >/dev/null || { bad "docker missing"; exit 1; }
 
 step "build pos3ql (release)"
 cargo build --release -q || { bad "build"; exit 1; }
 ok "build"
 
-step "start MinIO (latest) and create bucket"
-docker rm -f $MINIO_CONTAINER >/dev/null 2>&1
-docker run -d --name $MINIO_CONTAINER -p ${MINIO_PORT}:9000 \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio:latest server /data >/dev/null || { bad "minio start"; exit 1; }
+step "start generic object-store gateway"
+python3 "$EXT/object_store_gateway.py" --root "$WORK/object-store" --port "$GATEWAY_PORT" \
+  > "$WORK/object-store.log" 2>&1 &
+GATEWAY_PID=$!
 for i in {1..50}; do
-  docker exec $MINIO_CONTAINER mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1 && break
-  sleep 0.2
+  nc -z 127.0.0.1 "$GATEWAY_PORT" && break
+  sleep 0.1
 done
-docker exec $MINIO_CONTAINER mc mb --ignore-existing local/pos3ql-external >/dev/null || { bad "bucket"; exit 1; }
-docker exec $MINIO_CONTAINER mc --version | head -1
-ok "minio $(docker run --rm minio/minio:latest --version 2>/dev/null | head -1 | awk '{print $3}')"
+ok "gateway (pid $GATEWAY_PID)"
 
 step "write config and start pos3ql"
 cat > "$WORK/server.conf" <<EOF
@@ -130,12 +126,10 @@ data_dir = ${WORK}/data
 max_connections = 8
 memtable_bytes = 16MiB
 wal_bytes = 16MiB
-s3 = on
-s3_endpoint = 127.0.0.1:${MINIO_PORT}
-s3_bucket = pos3ql-external
-s3_prefix = run-$$/
-s3_access_key = minioadmin
-s3_secret_key = minioadmin
+object_store = on
+object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+object_store_namespace = pos3ql-external
+object_store_prefix = run-$$/
 wal_upload = on
 wal_upload_sync = on
 sql_arena_bytes = 4MiB
@@ -148,7 +142,7 @@ work_arena_bytes = 192MiB
 # Smaller than one committed WAL batch can be (wal_buffer is 4MiB): the
 # object-WAL recovery below proves segments larger than the response buffer
 # stream back in ranged windows.
-s3_response_bytes = 256KiB
+object_store_response_bytes = 256KiB
 EOF
 start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
 SERVER_PID=$START_PID
@@ -325,21 +319,19 @@ rm -rf "$WORK/data"
 start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
 SERVER_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
-[[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers from MinIO (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
+[[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers through the gateway (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
 
 step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold start"
-# A config that says nothing but `s3 = on` gets the plan-of-record posture:
-# the commit's segment is in the bucket before the acknowledgement, so the
+# A config that says nothing but `object_store = on` gets the plan-of-record
+# posture: the commit batch is published before acknowledgement, so the
 # kill needs no drain pause and the wiped-disk recovery needs no checkpoint.
 cat > "$WORK/rpo0.conf" <<EOF
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
-s3 = on
-s3_endpoint = 127.0.0.1:${MINIO_PORT}
-s3_bucket = pos3ql-external
-s3_prefix = rpo0-$$/
-s3_access_key = minioadmin
-s3_secret_key = minioadmin
+object_store = on
+object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+object_store_namespace = pos3ql-external
+object_store_prefix = rpo0-$$/
 EOF
 start_pos3ql "$WORK/rpo0.conf" "$WORK/rpo0.log" $((PG_PORT + 2))
 RPO0_PID=$START_PID
@@ -401,12 +393,10 @@ listen_addr = 127.0.0.1:$((PG_PORT + 3))
 data_dir = ${WORK}/overlay-data
 memtable_bytes = 512KiB
 table_rows = 1024
-s3 = on
-s3_endpoint = 127.0.0.1:${MINIO_PORT}
-s3_bucket = pos3ql-external
-s3_prefix = overlay-$$/
-s3_access_key = minioadmin
-s3_secret_key = minioadmin
+object_store = on
+object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+object_store_namespace = pos3ql-external
+object_store_prefix = overlay-$$/
 work_arena_bytes = 96MiB
 EOF
 start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
@@ -570,66 +560,12 @@ fi # torture
 
 if want tls; then
 
-step "TLS to the bucket: durability cycle over HTTPS (rustls, isolated)"
-# A second MinIO with a self-signed certificate (MinIO enables TLS when certs
-# are present); pos3ql connects with s3_tls on, trusting the certificate via
-# s3_tls_ca_file. Commit, checkpoint, kill -9, wipe the disk: the cold start
-# rebuilds entirely over TLS.
-TLS_MINIO_PORT=$((MINIO_PORT + 1))
-TLS_MINIO_CONTAINER=pos3ql-external-minio-tls
-mkdir -p "$WORK/minio-certs"
-openssl req -x509 -newkey rsa:2048 -keyout "$WORK/minio-certs/private.key" \
-  -out "$WORK/minio-certs/public.crt" -days 30 -nodes -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-  -addext "basicConstraints=critical,CA:FALSE" 2>/dev/null
-chmod 644 "$WORK/minio-certs/private.key" "$WORK/minio-certs/public.crt"
-docker rm -f $TLS_MINIO_CONTAINER >/dev/null 2>&1
-# create + cp + start (not a bind mount): Docker Desktop on macOS mounts an
-# empty directory for unshared paths, silently — MinIO would come up plain
-# HTTP and the whole step would test nothing.
-if docker create --name $TLS_MINIO_CONTAINER -p ${TLS_MINIO_PORT}:9000 \
-    -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio:latest server /data >/dev/null 2>&1 \
-  && docker cp "$WORK/minio-certs/private.key" $TLS_MINIO_CONTAINER:/root/.minio/certs/private.key \
-  && docker cp "$WORK/minio-certs/public.crt" $TLS_MINIO_CONTAINER:/root/.minio/certs/public.crt \
-  && docker start $TLS_MINIO_CONTAINER >/dev/null; then
-  for i in {1..40}; do
-    docker exec $TLS_MINIO_CONTAINER mc alias set local https://localhost:9000 minioadmin minioadmin --insecure >/dev/null 2>&1 && break
-    sleep 0.5
-  done
-  docker exec $TLS_MINIO_CONTAINER mc mb --insecure --ignore-existing local/pos3ql-tls >/dev/null 2>&1
-  cat > "$WORK/tls-server.conf" <<EOF
-listen_addr = 127.0.0.1:$((PG_PORT + 1))
-data_dir = ${WORK}/tls-data
-s3 = on
-s3_tls = on
-s3_tls_ca_file = ${WORK}/minio-certs/public.crt
-s3_endpoint = 127.0.0.1:${TLS_MINIO_PORT}
-s3_bucket = pos3ql-tls
-s3_prefix = tls-run/
-s3_access_key = minioadmin
-s3_secret_key = minioadmin
-wal_upload = on
-EOF
-  start_pos3ql "$WORK/tls-server.conf" "$WORK/tls-server.log" $((PG_PORT + 1))
-  TLS_SERVER_PID=$START_PID
-  "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -q \
-    -c "CREATE TABLE tlst (id int, v text)" \
-    -c "INSERT INTO tlst VALUES (1, 'over-tls')" \
-    -c "CHECKPOINT" >/dev/null 2>&1
-  kill -9 $TLS_SERVER_PID 2>/dev/null; wait $TLS_SERVER_PID 2>/dev/null
-  rm -rf "$WORK/tls-data"
-  start_pos3ql "$WORK/tls-server.conf" "$WORK/tls-server.log" $((PG_PORT + 1))
-  TLS_SERVER_PID=$START_PID
-  tls_out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 1)) -U postgres -X -t -A -c "SELECT v FROM tlst" 2>&1)
-  [[ "$tls_out" == "over-tls" ]] && ok "TLS cold start from the bucket" \
-    || { bad "TLS cold start (got: $tls_out)"; tail -5 "$WORK/tls-server.log"; }
-  kill -9 $TLS_SERVER_PID 2>/dev/null; wait $TLS_SERVER_PID 2>/dev/null
-  docker rm -f $TLS_MINIO_CONTAINER >/dev/null 2>&1
+step "object-store TLS is covered by the gateway unit suite"
+if cargo test --lib object_store::http::tests::tls_round_trip >/dev/null; then
+  ok "generic gateway TLS round trip"
 else
-  print -- "SKIP: docker cannot mount $WORK for MinIO TLS certs"
+  bad "generic gateway TLS round trip"
 fi
-
 # --- Server-side TLS: the client connects over TLS (no object store needed) --
 step "server-side TLS: psql connects with sslmode=require"
 STLS_PORT=$((PG_PORT + 2))
@@ -640,7 +576,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "$WORK/server-tls/key.pem" \
 cat > "$WORK/server-tls.conf" <<EOF
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data
-s3 = off
+object_store = off
 sql_arena_bytes = 32MiB
 work_arena_bytes = 64MiB
 tls_on = on
@@ -696,12 +632,9 @@ step "forced-spill differential: the whole suite with a 256KiB memtable over the
 # through the cache tiers — while the reference PostgreSQL sees plain SQL.
 # Pure-SQL semantics must be indistinguishable from the in-memory run.
 if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  docker exec $MINIO_CONTAINER mc mb --ignore-existing local/pos3ql-external >/dev/null 2>&1
-  if POS3QL_DIFF_S3=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_EXTRA_CONF="s3_endpoint = 127.0.0.1:${MINIO_PORT}
-s3_bucket = pos3ql-external
-s3_prefix = spilldiff-$$/
-s3_access_key = minioadmin
-s3_secret_key = minioadmin
+  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+object_store_namespace = pos3ql-external
+object_store_prefix = spilldiff-$$/
 wal_upload = on
 wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then

@@ -1,4 +1,4 @@
-//! Minimal PEM parsing, shared by the TLS client (`s3::tls`) and the TLS
+//! Minimal PEM parsing, shared by the object-store TLS client and the TLS
 //! server (`pg::tls`). The codebase refuses a base64 dependency, so the decoder
 //! is hand-rolled; this all runs at startup, while allocation is still free.
 

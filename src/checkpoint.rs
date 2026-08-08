@@ -5,7 +5,9 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
+use crate::object_store::{
+    ByteRange, Client as ObjectStore, EntityTag, Error as ObjectError, Precondition,
+};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::ColType;
 use crate::sql_err;
@@ -198,11 +200,11 @@ pub(crate) struct Checkpointer {
     roster_scratch: Vec<BlockId>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
-    manifest_etag: Option<StackStr<80>>,
+    manifest_etag: Option<EntityTag>,
     manifest_lsn: u64,
     /// CAS-published root of the immutable commit-batch chain.  A batch PUT
     /// alone is intentionally not recoverable until this pointer advances.
-    commit_head_etag: Option<StackStr<80>>,
+    commit_head_etag: Option<EntityTag>,
     commit_head: Option<CommitBatchId>,
     /// Per-slot SST from the last published manifest; clean tables reuse
     /// these handles (delta checkpoints). Capacity is reserved at startup so
@@ -775,7 +777,7 @@ impl Checkpointer {
         )
         .expect("commit head fits its fixed buffer");
         let precondition = match &self.commit_head_etag {
-            Some(etag) => Precondition::IfMatch(etag.as_str()),
+            Some(etag) => Precondition::IfMatch(etag),
             None => Precondition::IfNoneMatchAny,
         };
         let etag = match self
@@ -840,7 +842,7 @@ impl Checkpointer {
     ) -> Result<(), CheckpointSetupError> {
         self.doomed_scratch.clear();
         let mut batch = self.commit_head;
-        while let Some(current) = batch.filter(|batch| batch.first_lsn > floor) {
+        while let Some(current) = batch {
             if self.doomed_scratch.len() == self.doomed_scratch.capacity() {
                 return Err(CheckpointSetupError::ObjectStore(format!(
                     "commit-head chain exceeds fixed limit {}",
@@ -872,6 +874,13 @@ impl Checkpointer {
                 current.digest
             ));
             batch = previous;
+            // A batch is identified by its first record, not its last. The
+            // first batch at or before the floor may straddle it, so replay it
+            // and let record framing discard covered records. Its predecessor
+            // cannot contribute a record past this batch's first LSN.
+            if current.first_lsn <= floor {
+                break;
+            }
         }
         for index in (0..self.doomed_scratch.len()).rev() {
             let key = self.doomed_scratch[index];
@@ -884,7 +893,10 @@ impl Checkpointer {
             let mut offset = 0u64;
             loop {
                 let to = offset + self.client.response_capacity() as u64 - 1;
-                match self.client.get(key.as_str(), Some((offset, to))) {
+                match self.client.get(
+                    key.as_str(),
+                    Some(ByteRange::new(offset, to).expect("nonempty WAL record range")),
+                ) {
                     Ok(_) => {}
                     // Past the end of the object: the segment is fully read.
                     Err(ObjectError::Status { code: 416, .. }) => break,
@@ -995,6 +1007,14 @@ impl Checkpointer {
             }
             self.client
                 .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
+            let descriptor = key
+                .as_str()
+                .strip_suffix(".batch")
+                .map(|stem| crate::stack_format!(72, "{}.head", stem))
+                .expect("listed commit batch has its checked suffix");
+            self.client
+                .delete(descriptor.as_str())
                 .map_err(object_store_to_sql)?;
         }
         if overflow {
@@ -2380,7 +2400,10 @@ impl Checkpointer {
 
         // Footer first.
         self.client
-            .get(key, Some((entries_end, total_bytes - 1)))
+            .get(
+                key,
+                Some(ByteRange::new(entries_end, total_bytes - 1).expect("SST entries exist")),
+            )
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("sst footer: {e}")))?;
         let f = self.client.body_bytes();
         if f.len() != SST_FOOTER_LEN {
@@ -2399,7 +2422,10 @@ impl Checkpointer {
         while offset < entries_end {
             let to = (offset + self.client.response_capacity() as u64 - 1).min(entries_end - 1);
             self.client
-                .get(key, Some((offset, to)))
+                .get(
+                    key,
+                    Some(ByteRange::new(offset, to).expect("SST block range is ordered")),
+                )
                 .map_err(|e| CheckpointSetupError::ObjectStore(format!("sst read: {e}")))?;
             // Parse complete entries; partially fetched ones re-fetch from
             // their start on the next round.
@@ -3543,7 +3569,7 @@ impl Checkpointer {
 
         // Publish via CAS.
         let precondition = match &self.manifest_etag {
-            Some(etag) => Precondition::IfMatch(etag.as_str()),
+            Some(etag) => Precondition::IfMatch(etag),
             None => Precondition::IfNoneMatchAny,
         };
         let etag = match self
@@ -3582,7 +3608,7 @@ impl Checkpointer {
                     .put(
                         MANIFEST_KEY,
                         self.manifest_buf.readable(),
-                        Precondition::IfMatch(refreshed.etag.as_str()),
+                        Precondition::IfMatch(&refreshed.etag),
                     )
                     .map_err(object_store_to_sql)?
             }

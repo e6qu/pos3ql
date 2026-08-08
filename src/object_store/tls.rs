@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::mem::guard;
 
 /// A connection to the object store: plaintext, or TLS over the same socket.
-pub enum Transport {
+pub(crate) enum Transport {
     Plain(TcpStream),
     Tls(Option<Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>>),
 }

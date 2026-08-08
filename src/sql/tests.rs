@@ -447,12 +447,12 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut config = test_config("logical-slot-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("logical-slot-{}", std::process::id());
+    config.object_store_namespace = format!("logical-slot-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
@@ -709,14 +709,14 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     let mut config = test_config(&format!("role-acl-cold-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-role-acl-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-role-acl-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -784,7 +784,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(restarted);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -10828,7 +10828,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let mut config = test_config(&format!("object-snapshot-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-object-snapshot-{}-{sequence}", std::process::id());
+    config.object_store_namespace =
+        format!("sql-object-snapshot-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -10836,7 +10837,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.value_index_rows = 1;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -10994,7 +10995,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         "an incomplete one-entry RAM cache must enforce uniqueness through the durable index"
     );
     drop(restarted);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11007,12 +11008,12 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     let mut config = test_config(&format!("commit-batch-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-commit-batch-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-commit-batch-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11034,6 +11035,64 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
         .unwrap();
     assert_eq!(count, 1, "one flush must publish one immutable batch");
 
+    let mut first_lsn = None;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("commits/", |key| {
+            if let Some(stem) = key
+                .strip_prefix("commits/")
+                .and_then(|key| key.strip_suffix(".batch"))
+            {
+                first_lsn = Some(
+                    stem.split_once('-')
+                        .expect("commit batch key has its LSN separator")
+                        .0
+                        .parse::<u64>()
+                        .expect("commit batch key has a numeric LSN"),
+                );
+            }
+        })
+        .unwrap();
+    let first_lsn = first_lsn.expect("published batch exists");
+    let mut replayed = Vec::new();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .replay_commit_batches(first_lsn, |lsn, _| {
+            replayed.push(lsn);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        replayed.iter().any(|lsn| *lsn > first_lsn),
+        "the boundary batch must replay records after its first LSN"
+    );
+
+    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (3)");
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    let mut batches = 0;
+    let mut descriptors = 0;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("commits/", |key| {
+            batches += usize::from(key.ends_with(".batch"));
+            descriptors += usize::from(key.ends_with(".head"));
+        })
+        .unwrap();
+    assert_eq!(batches, 1, "compaction retains its replay boundary batch");
+    assert_eq!(
+        descriptors, 1,
+        "compaction removes a deleted batch's descriptor"
+    );
+
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -11044,10 +11103,10 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
             &mut budget,
             "SELECT id FROM batched ORDER BY id"
         )),
-        ["1", "2"]
+        ["1", "2", "3"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11060,12 +11119,13 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     let mut config = test_config(&format!("commit-batch-ambiguous-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-commit-ambiguous-{}-{sequence}", std::process::id());
+    config.object_store_namespace =
+        format!("sql-commit-ambiguous-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
-    let bucket = crate::object_store::sim::open_bucket(&config.object_store_bucket, 17);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 17);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11074,14 +11134,14 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
         &mut budget,
         "CREATE TABLE retry_batch (id int)",
     );
-    bucket.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
     assert!(engine.commit_wal().is_err());
     assert!(engine.wal.pending_batch_bytes() > 0);
-    bucket.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
     engine.commit_wal().unwrap();
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     drop(engine);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11094,7 +11154,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     let mut config = test_config(&format!("object-pruning-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-object-pruning-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-object-pruning-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
@@ -11104,7 +11164,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     const {
         assert!(600 > crate::storage::SPILL_SCAN_BATCH_ROWS);
     }
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11202,7 +11262,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
         "the planner must not choose a primary-key probe more expensive than the sequential durable scan: selective={selective_gets}, full={full_gets}"
     );
     drop(selective);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11226,7 +11286,8 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     let mut config = test_config(&format!("pax-column-demand-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-pax-column-demand-{}-{sequence}", std::process::id());
+    config.object_store_namespace =
+        format!("sql-pax-column-demand-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 32 << 20;
@@ -11234,7 +11295,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     config.memtable_bytes = 32 << 20;
     config.work_arena_bytes = 1 << 20;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     prepare_cold_pax_fixture(&config);
 
@@ -11386,7 +11447,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         &["t"],
         None,
     );
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11399,7 +11460,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     let mut config = test_config(&format!("external-runs-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-external-runs-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-external-runs-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 16 << 20;
@@ -11410,7 +11471,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     // The sorted projection is about 1.5 MiB. This bound proves execution
     // recycles batches instead of retaining the result in the work arena.
     config.work_arena_bytes = 512 << 10;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new((1 << 28) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11738,7 +11799,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     }
 
     drop(restarted);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11763,13 +11824,13 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     let mut config = test_config(&format!("reconcile-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-reconcile-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-reconcile-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
-    let bucket = crate::object_store::sim::open_bucket(&config.object_store_bucket, 7);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 7);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
 
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11783,7 +11844,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     // Force the next commit's WAL upload to fail: the row is promoted and
     // visible (an errored commit's outcome is unknown) but durable only in the
     // local journal.
-    bucket.borrow_mut().faults.transient_per_mille = 1000;
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
     let failed = run_with(
         &mut engine,
         &mut budget,
@@ -11800,7 +11861,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
         "a later statement must not observe a local-only commit: {}",
         String::from_utf8_lossy(&fenced)
     );
-    bucket.borrow_mut().faults.transient_per_mille = 0;
+    namespace.borrow_mut().faults.transient_per_mille = 0;
     // Crash without any intervening statement (no eager retry): row 2 lives
     // only in the journal.
     drop(engine);
@@ -11836,7 +11897,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
         "row 2 survives a wiped journal because reconciliation uploaded it"
     );
     drop(engine);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11861,12 +11922,13 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     let mut config = test_config(&format!("cold-then-crash-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-cold-then-crash-{}-{sequence}", std::process::id());
+    config.object_store_namespace =
+        format!("sql-cold-then-crash-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
 
     // Generation 1: write rows WITHOUT a checkpoint, so they live only as
@@ -11926,7 +11988,7 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
         "both generations survive the post-cold-start crash"
     );
     drop(engine);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11939,11 +12001,11 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     let mut config = test_config(&format!("external-sets-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-external-sets-{}-{sequence}", std::process::id());
+    config.object_store_namespace = format!("sql-external-sets-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -11992,7 +12054,7 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
         "set multisets must traverse BlockStore: {traffic:?}"
     );
     drop(engine);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -12005,7 +12067,8 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     let mut config = test_config(&format!("external-windows-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-external-windows-{}-{sequence}", std::process::id());
+    config.object_store_namespace =
+        format!("sql-external-windows-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -12022,7 +12085,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     // this arena, so only the spilled path can evaluate the queries below;
     // per-partition compute_window stays O(partition).
     config.work_arena_bytes = 2 << 20;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -12166,7 +12229,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
         "cold window evaluation must cross the durable block boundary: {cold_traffic:?}"
     );
     drop(restarted);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -12191,7 +12254,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     let mut config = test_config(&format!("object-transaction-wal-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!(
+    config.object_store_namespace = format!(
         "sql-object-transaction-wal-{}-{sequence}",
         std::process::id()
     );
@@ -12202,7 +12265,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 16;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -12374,7 +12437,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         ["15"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -14077,12 +14140,12 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     let mut config = test_config(&format!("external-in-witness-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket =
+    config.object_store_namespace =
         format!("sql-external-in-witness-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -14213,6 +14276,6 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
             "7|10|520", "8|10|530", "9|10|540"
         ]
     );
-    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

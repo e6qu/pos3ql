@@ -36,7 +36,7 @@ use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::Budget;
 use crate::mem::buffer::FixedBuf;
-use crate::object_store::sim::{SimBucket, drop_bucket, open_bucket};
+use crate::object_store::sim::{SimNamespace, drop_namespace, open_namespace};
 use crate::pg::respond::Responder;
 use crate::prng::Pcg32;
 use crate::sql::Engine;
@@ -83,7 +83,7 @@ struct World {
     seed: u64,
     rng: Pcg32,
     config: Config,
-    bucket: Rc<RefCell<SimBucket>>,
+    namespace: Rc<RefCell<SimNamespace>>,
     session: Option<Session>,
     /// Committed state a client was told about, id → row.
     model: BTreeMap<i64, Row>,
@@ -100,7 +100,7 @@ fn vopr_config(seed: u64) -> Config {
     config.data_dir = dir.to_str().unwrap().to_string();
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("vopr-{}-{seed}", std::process::id());
+    config.object_store_namespace = format!("vopr-{}-{seed}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -130,13 +130,13 @@ impl World {
     fn new(seed: u64) -> Self {
         let config = vopr_config(seed);
         let _ = std::fs::remove_dir_all(&config.data_dir);
-        drop_bucket(&config.object_store_bucket);
-        let bucket = open_bucket(&config.object_store_bucket, seed);
+        drop_namespace(&config.object_store_namespace);
+        let namespace = open_namespace(&config.object_store_namespace, seed);
         let mut world = Self {
             seed,
             rng: Pcg32::new(seed, 0x5709a6e), // storage-VOPR stream
             config,
-            bucket,
+            namespace,
             session: None,
             model: BTreeMap::new(),
             uncertain: BTreeMap::new(),
@@ -211,8 +211,8 @@ impl World {
         outcome
     }
 
-    fn faults(&self) -> std::cell::RefMut<'_, SimBucket> {
-        self.bucket.borrow_mut()
+    fn faults(&self) -> std::cell::RefMut<'_, SimNamespace> {
+        self.namespace.borrow_mut()
     }
 
     fn clear_faults(&mut self) {
@@ -415,7 +415,7 @@ impl World {
             "seed {} [{context}]: recovered state diverges from the model",
             self.seed
         );
-        let blind = self.bucket.borrow().blind_overwrites.clone();
+        let blind = self.namespace.borrow().blind_overwrites.clone();
         assert!(
             blind.is_empty(),
             "seed {} [{context}]: blind overwrites changed object bytes: {blind:?}",
@@ -473,7 +473,7 @@ impl World {
         self.start_engine();
         self.verify("cold start");
         assert!(
-            self.bucket.borrow().object_count() > 0,
+            self.namespace.borrow().object_count() > 0,
             "seed {}: a cold start recovered from an empty bucket",
             self.seed
         );
@@ -528,7 +528,7 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         self.session = None;
-        drop_bucket(&self.config.object_store_bucket);
+        drop_namespace(&self.config.object_store_namespace);
         let _ = std::fs::remove_dir_all(&self.config.data_dir);
     }
 }
@@ -664,7 +664,7 @@ fn run_storage_vopr() {
                             "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket",
                             world.steps_taken,
                             world.model.len(),
-                            world.bucket.borrow().object_count(),
+                            world.namespace.borrow().object_count(),
                         );
                     }
                 })

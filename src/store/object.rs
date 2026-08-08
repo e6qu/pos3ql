@@ -1,4 +1,4 @@
-//! The object-storage backend: the bucket as the system of record.
+//! The object-storage backend: the namespace is the system of record.
 //!
 //! One object per block, named by the block's identity. That naming is what
 //! makes the write path forgiving: a PUT that times out after the object landed
@@ -7,14 +7,14 @@
 //! write anywhere in this layer, so two writers racing on the same block agree
 //! by construction rather than by locking.
 //!
-//! Reads verify. A block arriving from a bucket has crossed a network and a
+//! Reads verify. A block arriving from the namespace has crossed a network and a
 //! service this process does not control, so the identity hash is checked as
 //! well as the CRC — the one case a checksum cannot cover is being handed a
 //! *different* block that is itself intact.
 
 use crate::mem::budget::Budget;
 use crate::mem::fixed_vec::FixedVec;
-use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
+use crate::object_store::{ByteRange, Client as ObjectStore, Error as ObjectError, Precondition};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -123,7 +123,10 @@ fn get_packed_block(
     let mut key_buffer = [0u8; 128];
     let key = key_of(prefix, container, &mut key_buffer);
     let result = client
-        .get(key, Some((start as u64, end as u64)))
+        .get(
+            key,
+            Some(ByteRange::new(start as u64, end as u64).expect("packed range is ordered")),
+        )
         .map_err(store_error)?;
     if result.len != length {
         return Err(StoreError::Corrupt(super::BlockError::Truncated));
@@ -137,7 +140,7 @@ fn decode_block_body(
     into: &mut [u8],
 ) -> Result<(usize, BlockType), StoreError> {
     // Verified against the name it was fetched under, not merely against
-    // its own header — a bucket handing back a different intact block is
+    // its own header — a namespace handing back a different intact block is
     // exactly what content-addressing is here to catch.
     let block = decode(body, true)?;
     if block.id != *id {
@@ -150,7 +153,7 @@ fn decode_block_body(
     Ok((block.payload.len(), block.block_type))
 }
 
-/// The bucket store that owns its client and scratch — the long-lived form a
+/// The namespace store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
     write_client: ObjectStore,
@@ -608,10 +611,10 @@ impl BlockStore for OwnedObjectStore {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         self.stats.object_contains = self.stats.object_contains.saturating_add(1);
-        match self.slots[0]
-            .client
-            .get(key, Some((0, HEADER_LEN as u64 - 1)))
-        {
+        match self.slots[0].client.get(
+            key,
+            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
+        ) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -708,7 +711,10 @@ impl BlockStore for ObjectBlockStore<'_> {
         // Only the header is fetched: presence is a property of the object, and
         // dragging the payload across to learn it would make an existence check
         // cost as much as a read.
-        match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
+        match self.client.get(
+            key,
+            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
+        ) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -756,9 +762,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "pool-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "pool-test".to_string();
         config.object_store_get_slots = 2;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -793,7 +797,7 @@ mod tests {
             assert!(request_len > 0, "client sent an empty request");
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nETag: \"prefetch-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -805,7 +809,7 @@ mod tests {
                     Ok((mut writer, _)) => {
                         read_request(&mut writer);
                         writer
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .write_all(b"HTTP/1.1 200 OK\r\nETag: \"prefetch-write\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .unwrap();
                         return;
                     }
@@ -827,9 +831,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "prefetch-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "prefetch-test".to_string();
         config.object_store_get_slots = 1;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -882,7 +884,7 @@ mod tests {
             release_response.recv().unwrap();
             write!(
                 stream,
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nETag: \"packed-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -892,9 +894,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "packed-reactor-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "packed-reactor-test".to_string();
         config.object_store_get_slots = 1;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
             write_response.recv().unwrap();
             write!(
                 hedge,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nETag: \"hedge-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -1051,9 +1051,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "hedge-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "hedge-test".to_string();
         config.object_store_get_slots = 2;
         config.object_store_hedge_after_ms = 1;
         let mut budget = Budget::new(16 << 20);

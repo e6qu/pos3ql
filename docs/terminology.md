@@ -3,7 +3,7 @@
 ## Naming
 
 - Spell identifiers out: `interval`, `buffer`, `expression`, `statement`, and `index`, not abbreviations.
-- Standard acronyms are allowed: SQL, WAL, SST, LSN, OID, S3, HTTP, TLS, UUID, JSON, AWS, and VSR.
+- Standard acronyms are allowed: SQL, WAL, SST, LSN, OID, HTTP, TLS, UUID, JSON, and VSR.
 - Established module names are allowed: `ast`, `eval`, `exec`, `guc`, `io`, `mem`, `pg`, `sim`, `sql`, `vsr`, and `wal`.
 - Use a coined term only when it carries a repeated, specific meaning; define it here.
 - Single-letter names are limited to conventional local indices and published algorithm notation.
@@ -19,7 +19,7 @@
 - `wal`: durable journal encoding and replay.
 - `checkpoint`: SST publication and cold recovery.
 - `store`: block formats and cache tiers.
-- `s3`: S3-compatible object-store adapter.
+- `entity tag`: an opaque, strong, quoted object generation token used for compare-and-swap.
 - `vsr`: Viewstamped Replication.
 - `sim`: deterministic fault simulation.
 

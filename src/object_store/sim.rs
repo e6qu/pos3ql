@@ -1,9 +1,9 @@
-//! The virtual bucket: a deterministic, in-process object store standing in
+//! A virtual namespace: a deterministic, in-process object store standing in
 //! for the provider-neutral [`crate::object_store::Client`] — the storage
 //! VOPR's seam.
 //!
 //! `object_store = sim` routes every object operation here instead of a socket. The
-//! bucket is plain memory shared by every client opened on the same name
+//! namespace is plain memory shared by every client opened on the same name
 //! (the checkpointer holds two, exactly as it holds two real clients), and
 //! every fault it injects is drawn from a PCG stream, so a failing run
 //! reproduces exactly from its seed. The faults are the ones a real bucket
@@ -13,7 +13,7 @@
 //! for a crash, since everything after it is what a restarted process would
 //! find.
 //!
-//! The bucket also *watches*: an unconditional overwrite that changes an
+//! The namespace also *watches*: an unconditional overwrite that changes an
 //! existing object's bytes is recorded, because the engine's key discipline
 //! forbids it — blocks are content-addressed (a rewrite is byte-identical
 //! by construction), the manifest moves only by compare-and-swap, and a WAL
@@ -34,12 +34,11 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::prng::Pcg32;
 use crate::stack_format;
-use crate::util::StackStr;
 
-use crate::object_store::{Error, GetResult, Precondition};
+use crate::object_store::{ByteRange, EntityTag, Error, GetResult, Precondition};
 
 /// Fault probabilities in parts per thousand, plus the outage schedule.
-/// All zeros (the default) is a perfectly healthy bucket.
+/// All zeros (the default) is a perfectly healthy namespace.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FaultPlan {
     /// Every operation whose index is at or past this fails with an I/O
@@ -62,10 +61,10 @@ struct StoredObject {
     etag: u64,
 }
 
-/// The shared bucket state. One per name, held behind `Rc<RefCell<..>>` by
+/// The shared namespace state. One per name, held behind `Rc<RefCell<..>>` by
 /// every [`SimClient`] opened on it and by the test harness steering faults.
-pub(crate) struct SimBucket {
-    /// Sorted by key, so LIST order is S3's lexicographic order.
+pub(crate) struct SimNamespace {
+    /// Sorted by key, matching the gateway's lexicographic LIST order.
     objects: Vec<StoredObject>,
     next_etag: u64,
     /// Operations served so far — the clock `fail_from_op` is measured on.
@@ -76,7 +75,7 @@ pub(crate) struct SimBucket {
     pub(crate) blind_overwrites: Vec<String>,
 }
 
-impl SimBucket {
+impl SimNamespace {
     fn new(seed: u64) -> Self {
         Self {
             objects: Vec::new(),
@@ -121,42 +120,43 @@ impl SimBucket {
 
 fn io_fault(detail: &str) -> Error {
     Error::Io {
-        context: "virtual bucket",
+        context: "virtual namespace",
         kind: std::io::ErrorKind::ConnectionReset,
         detail: stack_format!(160, "{detail}"),
     }
 }
 
-fn etag_text(etag: u64) -> StackStr<80> {
-    stack_format!(80, "\"sim-{etag:016x}\"")
+fn entity_tag(etag: u64) -> EntityTag {
+    EntityTag::parse(stack_format!(80, "\"sim-{etag:016x}\"").as_str())
+        .expect("simulated ETag has portable syntax")
 }
 
 thread_local! {
-    /// One bucket per name per thread. Tests run on their own threads and
-    /// name buckets uniquely, so incarnations of the same engine (restart,
-    /// cold start) find the same bucket while tests stay isolated.
-    static BUCKETS: RefCell<Vec<(String, Rc<RefCell<SimBucket>>)>> =
+    /// One namespace per name per thread. Tests run on their own threads and
+    /// name namespaces uniquely, so incarnations of the same engine (restart,
+    /// cold start) find the same namespace while tests stay isolated.
+    static NAMESPACES: RefCell<Vec<(String, Rc<RefCell<SimNamespace>>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
-/// Opens (or creates) the named bucket. The harness opens it first to hold
+/// Opens (or creates) the named namespace. The harness opens it first to hold
 /// the fault-steering handle; the engine's clients then share it.
-pub(crate) fn open_bucket(name: &str, seed: u64) -> Rc<RefCell<SimBucket>> {
-    BUCKETS.with(|buckets| {
-        let mut buckets = buckets.borrow_mut();
-        if let Some((_, bucket)) = buckets.iter().find(|(n, _)| n == name) {
-            return Rc::clone(bucket);
+pub(crate) fn open_namespace(name: &str, seed: u64) -> Rc<RefCell<SimNamespace>> {
+    NAMESPACES.with(|namespaces| {
+        let mut namespaces = namespaces.borrow_mut();
+        if let Some((_, namespace)) = namespaces.iter().find(|(n, _)| n == name) {
+            return Rc::clone(namespace);
         }
-        let bucket = Rc::new(RefCell::new(SimBucket::new(seed)));
-        buckets.push((name.to_string(), Rc::clone(&bucket)));
-        bucket
+        let namespace = Rc::new(RefCell::new(SimNamespace::new(seed)));
+        namespaces.push((name.to_string(), Rc::clone(&namespace)));
+        namespace
     })
 }
 
-/// Drops the named bucket, so a harness can start a world from nothing.
+/// Drops the named namespace, so a harness can start a world from nothing.
 #[cfg(test)]
-pub(crate) fn drop_bucket(name: &str) {
-    BUCKETS.with(|buckets| buckets.borrow_mut().retain(|(n, _)| n != name));
+pub(crate) fn drop_namespace(name: &str) {
+    NAMESPACES.with(|namespaces| namespaces.borrow_mut().retain(|(n, _)| n != name));
 }
 
 /// The client half: what [`crate::object_store::Client::Simulator`] holds.
@@ -166,7 +166,7 @@ pub(crate) fn drop_bucket(name: &str) {
 /// statuses, DELETE of a missing key succeeding, LIST in key order with the
 /// configured key prefix stripped.
 pub(crate) struct SimClient {
-    bucket: Rc<RefCell<SimBucket>>,
+    namespace: Rc<RefCell<SimNamespace>>,
     key_prefix: String,
     body: FixedBuf,
 }
@@ -174,7 +174,7 @@ pub(crate) struct SimClient {
 impl SimClient {
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         Ok(Self {
-            bucket: open_bucket(&config.object_store_bucket, 0),
+            namespace: open_namespace(&config.object_store_namespace, 0),
             key_prefix: config.object_store_prefix.clone(),
             body: FixedBuf::new(
                 budget,
@@ -196,9 +196,9 @@ impl SimClient {
         key: &str,
         body: &[u8],
         precondition: Precondition,
-    ) -> Result<StackStr<80>, Error> {
+    ) -> Result<EntityTag, Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let position = bucket.find(&full);
         match (&precondition, &position) {
@@ -206,7 +206,7 @@ impl SimClient {
                 return Err(status(412, "precondition failed: object exists"));
             }
             (Precondition::IfMatch(expected), Ok(at)) => {
-                if etag_text(bucket.objects[*at].etag).as_str() != *expected {
+                if entity_tag(bucket.objects[*at].etag) != **expected {
                     return Err(status(412, "precondition failed: etag mismatch"));
                 }
             }
@@ -246,12 +246,12 @@ impl SimClient {
             // Applied above — the response is what got lost.
             return Err(io_fault("simulated ambiguous PUT (applied, response lost)"));
         }
-        Ok(etag_text(etag))
+        Ok(entity_tag(etag))
     }
 
-    pub(crate) fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, Error> {
+    pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let at = match bucket.find(&full) {
             Ok(at) => at,
@@ -260,7 +260,9 @@ impl SimClient {
         let total = bucket.objects[at].bytes.len();
         let (from, to) = match range {
             None => (0usize, total),
-            Some((offset, to)) => {
+            Some(range) => {
+                let offset = range.first();
+                let to = range.last();
                 if offset >= total as u64 {
                     return Err(status(416, "range not satisfiable"));
                 }
@@ -286,7 +288,7 @@ impl SimClient {
         }
         Ok(GetResult {
             len,
-            etag: etag_text(bucket.objects[at].etag),
+            etag: entity_tag(bucket.objects[at].etag),
         })
     }
 
@@ -300,7 +302,7 @@ impl SimClient {
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         if let Ok(at) = bucket.find(&full) {
             bucket.objects.remove(at);
@@ -314,7 +316,7 @@ impl SimClient {
         mut each: impl FnMut(&str),
     ) -> Result<usize, Error> {
         let full_prefix = self.full_key(prefix);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let mut count = 0usize;
         for object in &bucket.objects {
@@ -338,11 +340,11 @@ fn status(code: u16, message: &str) -> Error {
 mod tests {
     use super::*;
 
-    fn client(name: &str) -> (SimClient, Rc<RefCell<SimBucket>>) {
-        drop_bucket(name);
-        let bucket = open_bucket(name, 7);
+    fn client(name: &str) -> (SimClient, Rc<RefCell<SimNamespace>>) {
+        drop_namespace(name);
+        let bucket = open_namespace(name, 7);
         let mut config = Config::default_dev();
-        config.object_store_bucket = name.to_string();
+        config.object_store_namespace = name.to_string();
         config.object_store_prefix = "p/".to_string();
         config.object_store_response_bytes = 64;
         let mut budget = Budget::new(1 << 20);
@@ -359,10 +361,11 @@ mod tests {
         assert_eq!(got.etag.as_str(), tag.as_str());
         // Inclusive range; a range past the end clamps; one starting past
         // the end is 416 (the WAL replay loop's terminator).
-        c.get("k", Some((6, 100))).unwrap();
+        c.get("k", Some(ByteRange::new(6, 100).unwrap())).unwrap();
         assert_eq!(c.body_bytes(), b"world");
         assert!(matches!(
-            c.get("k", Some((11, 12))).unwrap_err(),
+            c.get("k", Some(ByteRange::new(11, 12).unwrap()))
+                .unwrap_err(),
             Error::Status { code: 416, .. }
         ));
         // Oversized bodies refuse like the real client.
@@ -384,19 +387,16 @@ mod tests {
                 .unwrap_err()
                 .is_precondition_failed()
         );
-        let second = c
-            .put("m", b"v2", Precondition::IfMatch(first.as_str()))
-            .unwrap();
+        let second = c.put("m", b"v2", Precondition::IfMatch(&first)).unwrap();
         // The stale tag loses.
         assert!(
-            c.put("m", b"v3", Precondition::IfMatch(first.as_str()))
+            c.put("m", b"v3", Precondition::IfMatch(&first))
                 .unwrap_err()
                 .is_precondition_failed()
         );
-        c.put("m", b"v3", Precondition::IfMatch(second.as_str()))
-            .unwrap();
+        c.put("m", b"v3", Precondition::IfMatch(&second)).unwrap();
         assert!(
-            c.put("absent", b"x", Precondition::IfMatch(second.as_str()))
+            c.put("absent", b"x", Precondition::IfMatch(&second))
                 .unwrap_err()
                 .is_precondition_failed()
         );

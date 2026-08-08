@@ -1,13 +1,13 @@
 //! Server-side TLS for the PostgreSQL wire protocol.
 //!
 //! rustls is the one whitelisted dependency (TLS is never hand-rolled); this
-//! module and [`crate::s3::tls`] are its only doors. The [`rustls::ServerConfig`]
+//! module and [`crate::object_store::http::tls`] are its only doors. The [`rustls::ServerConfig`]
 //! is built at startup, before the allocator freezes; every *runtime* rustls
 //! call — session construction, the handshake pump, record I/O, teardown — runs
 //! inside [`crate::mem::guard::tls_scope`], so its allocations are charged
 //! against `tls_pool_bytes` and abort loudly past it.
 //!
-//! Unlike the blocking S3 client ([`crate::s3::tls`] wraps `StreamOwned`), the
+//! Unlike the blocking object-store client ([`crate::object_store::http::tls`] wraps `StreamOwned`), the
 //! server socket is non-blocking and driven by the kqueue reactor, so this uses
 //! the low-level `read_tls`/`process_new_packets`/`write_tls` API and translates
 //! rustls's read/write wants into the reactor's read/write interest.

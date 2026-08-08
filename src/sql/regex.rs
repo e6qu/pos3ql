@@ -884,10 +884,10 @@ mod tests {
         let r2 = find_captures("[0-9]+", "abc123", 0, false, &mut s2).unwrap();
         assert_eq!(r2, Some(((3, 6), 0)));
         // A repeated group keeps its last iteration.
-        let mut s3 = [(-1i64, -1i64); MAX_GROUPS];
-        let r3 = find_captures("(ab)+", "ababab", 0, false, &mut s3).unwrap();
+        let mut third_spans = [(-1i64, -1i64); MAX_GROUPS];
+        let r3 = find_captures("(ab)+", "ababab", 0, false, &mut third_spans).unwrap();
         assert_eq!(r3, Some(((0, 6), 1)));
-        assert_eq!(s3[0], (4, 6));
+        assert_eq!(third_spans[0], (4, 6));
         // 'g'-style second match starts after the first.
         let mut s4 = [(-1i64, -1i64); MAX_GROUPS];
         let r4 = find_captures("([0-9]+)", "a1b22", 3, false, &mut s4).unwrap();

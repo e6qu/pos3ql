@@ -5636,6 +5636,15 @@ fn requalify_schema_element<'a>(
             columns,
             unique: *unique,
         },
+        ast::CreateSchemaElement::Sequence {
+            name,
+            if_not_exists,
+            options,
+        } => Stmt::CreateSequence {
+            name: requalify(*name)?,
+            if_not_exists: *if_not_exists,
+            options: *options,
+        },
     };
     arena
         .alloc(rewritten)

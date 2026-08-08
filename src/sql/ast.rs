@@ -28,6 +28,11 @@ pub enum CreateSchemaElement<'a> {
         columns: &'a [IndexColumn<'a>],
         unique: bool,
     },
+    Sequence {
+        name: QualName<'a>,
+        if_not_exists: bool,
+        options: SeqOptions<'a>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

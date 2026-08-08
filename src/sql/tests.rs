@@ -6917,7 +6917,8 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
         "CREATE SCHEMA typed_schema
            CREATE TABLE rows (id integer)
            CREATE VIEW row_view AS SELECT id FROM rows
-           CREATE INDEX rows_id ON rows (id);",
+           CREATE INDEX rows_id ON rows (id)
+           CREATE SEQUENCE row_ids;",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -6929,14 +6930,15 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
             &mut engine,
             &mut budget,
             "INSERT INTO typed_schema.rows VALUES (7);
-             SELECT id FROM typed_schema.row_view;",
+             SELECT id FROM typed_schema.row_view;
+             SELECT nextval('typed_schema.row_ids');",
         )),
-        ["7"]
+        ["7", "1"]
     );
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SCHEMA invalid_schema CREATE SEQUENCE sequence_inside_schema",
+        "CREATE SCHEMA invalid_schema CREATE DOMAIN domain_inside_schema AS integer",
     );
     assert!(
         String::from_utf8_lossy(&rejected).contains("42601"),

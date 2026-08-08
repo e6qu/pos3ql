@@ -764,10 +764,19 @@ impl<'a> Parser<'a> {
                     columns,
                     unique,
                 },
+                Stmt::CreateSequence {
+                    name,
+                    if_not_exists,
+                    options,
+                } => CreateSchemaElement::Sequence {
+                    name,
+                    if_not_exists,
+                    options,
+                },
                 _ => {
-                    return Err(
-                        self.err_here("CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX")
-                    );
+                    return Err(self.err_here(
+                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, or SEQUENCE",
+                    ));
                 }
             };
             elements[n] = self

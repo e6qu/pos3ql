@@ -66,29 +66,40 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
-            "array_length" | "cardinality" | "array_upper" => {
+            "array_length" | "cardinality" | "array_upper" | "array_lower" => {
+                arity(if name == "cardinality" { 1 } else { 2 })?;
                 let a = eval_full(args[0], arena, params, row, hooks)?;
                 match a {
                     Datum::Array { raw, .. } => {
-                        let n = array::len(raw);
-                        // array_length/array_upper of an empty array is NULL (PG).
-                        if n == 0 && name != "cardinality" {
-                            Ok(Datum::Null)
-                        } else {
-                            Ok(Datum::Int4(n as i32))
+                        let shape = array::shape(raw).expect("array datum invariant");
+                        if name == "cardinality" {
+                            return Ok(Datum::Int4(shape.element_count() as i32));
                         }
+                        let dimension = match eval_full(args[1], arena, params, row, hooks)? {
+                            Datum::Int2(value) => value as i64,
+                            Datum::Int4(value) => value as i64,
+                            Datum::Int8(value) => value,
+                            Datum::Null => return Ok(Datum::Null),
+                            value => {
+                                return Err(type_mismatch(
+                                    "array dimension must be an integer",
+                                    &value,
+                                ));
+                            }
+                        };
+                        if dimension < 1 || dimension as usize > shape.dimension_count() {
+                            return Ok(Datum::Null);
+                        }
+                        let index = dimension as usize - 1;
+                        Ok(match name {
+                            "array_length" => Datum::Int4(shape.dimension(index).unwrap() as i32),
+                            "array_upper" => Datum::Int4(shape.upper_bound(index).unwrap()),
+                            "array_lower" => Datum::Int4(shape.lower_bound(index).unwrap()),
+                            _ => unreachable!(),
+                        })
                     }
                     Datum::Null => Ok(Datum::Null),
                     _ => Err(type_mismatch("array_length requires an array", &a)),
-                }
-            }
-            "array_lower" => {
-                // Lower bound is always 1 for our arrays.
-                let a = eval_full(args[0], arena, params, row, hooks)?;
-                match a {
-                    Datum::Array { raw, .. } if array::len(raw) > 0 => Ok(Datum::Int4(1)),
-                    Datum::Array { .. } | Datum::Null => Ok(Datum::Null),
-                    _ => Err(type_mismatch("array_lower requires an array", &a)),
                 }
             }
             "array_position" => {
@@ -171,11 +182,8 @@ pub(crate) fn dispatch<'a>(
                 let arr = eval_full(args[array_index], arena, params, row, hooks)?;
                 let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
                 let (source, raw) = match arr {
-                    Datum::Array { element, raw } => (element, raw),
-                    Datum::Null => (
-                        ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text),
-                        &[0u8, 0u8][..],
-                    ),
+                    Datum::Array { element, raw } => (element, Some(raw)),
+                    Datum::Null => (ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text), None),
                     _ => {
                         return Err(type_mismatch(
                             "array_append/prepend requires an array",
@@ -191,6 +199,13 @@ pub(crate) fn dispatch<'a>(
                 };
                 let mut items = [Datum::Null; 1024];
                 let mut n = 0usize;
+                let source_shape = raw.map(|raw| array::shape(raw).expect("array datum invariant"));
+                if source_shape.is_some_and(|shape| shape.dimension_count() > 1) {
+                    return Err(sql_err!(
+                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                        "cannot append an element to a multidimensional array"
+                    ));
+                }
                 let coerced = if elem.is_null() {
                     Datum::Null
                 } else {
@@ -200,7 +215,9 @@ pub(crate) fn dispatch<'a>(
                     items[n] = coerced;
                     n += 1;
                 }
-                n = load_array(raw, source, element, &mut items, n, arena)?;
+                if let Some(raw) = raw {
+                    n = load_array(raw, source, element, &mut items, n, arena)?;
+                }
                 if name == "array_append" {
                     if n == items.len() {
                         return Err(sql_err!(
@@ -213,7 +230,18 @@ pub(crate) fn dispatch<'a>(
                 }
                 Ok(Datum::Array {
                     element,
-                    raw: array::build(&items[..n], arena)?,
+                    raw: array::build_shaped(
+                        &items[..n],
+                        array::Shape::new(
+                            &[n],
+                            &[match (source_shape, name) {
+                                (Some(shape), "array_prepend") => shape.lower_bound(0).unwrap(),
+                                (Some(shape), _) => shape.lower_bound(0).unwrap(),
+                                (None, _) => 1,
+                            }],
+                        )?,
+                        arena,
+                    )?,
                 })
             }
             // `array_cat(a, b)`: concatenate two arrays of the same element type.
@@ -221,32 +249,17 @@ pub(crate) fn dispatch<'a>(
                 arity(2)?;
                 let a = eval_full(args[0], arena, params, row, hooks)?;
                 let b = eval_full(args[1], arena, params, row, hooks)?;
-                let (a_elem, a_raw, b_elem, b_raw) = match (a, b) {
-                    (
-                        Datum::Array {
-                            element: ae,
-                            raw: ar,
-                        },
-                        Datum::Array {
-                            element: be,
-                            raw: br,
-                        },
-                    ) => (ae, ar, be, br),
+                match (a, b) {
+                    (Datum::Array { .. }, Datum::Array { .. }) => {
+                        super::super::array_concat(a, b, arena)
+                    }
                     (Datum::Array { element, raw }, Datum::Null)
                     | (Datum::Null, Datum::Array { element, raw }) => {
-                        return Ok(Datum::Array { element, raw });
+                        Ok(Datum::Array { element, raw })
                     }
-                    (Datum::Null, Datum::Null) => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("array_cat requires arrays", &a)),
-                };
-                let element = unify_arr_elem(a_elem, b_elem);
-                let mut items = [Datum::Null; 1024];
-                let mut n = load_array(a_raw, a_elem, element, &mut items, 0, arena)?;
-                n = load_array(b_raw, b_elem, element, &mut items, n, arena)?;
-                Ok(Datum::Array {
-                    element,
-                    raw: array::build(&items[..n], arena)?,
-                })
+                    (Datum::Null, Datum::Null) => Ok(Datum::Null),
+                    _ => Err(type_mismatch("array_cat requires arrays", &a)),
+                }
             }
             // `array_remove(arr, elem)`: drop every element equal to `elem`
             // (NULL-safe). `array_replace(arr, from, to)`: replace every match.
@@ -260,6 +273,13 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch(name, &arr)),
                 };
+                let shape = array::shape(raw).expect("array datum invariant");
+                if !is_replace && shape.dimension_count() > 1 {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "array_remove does not support multidimensional arrays"
+                    ));
+                }
                 let (element, replacement) = if is_replace {
                     let to = eval_full(args[2], arena, params, row, hooks)?;
                     // The result promotes to hold both the kept and replaced values.
@@ -304,7 +324,11 @@ pub(crate) fn dispatch<'a>(
                 }
                 Ok(Datum::Array {
                     element,
-                    raw: array::build(&items[..n], arena)?,
+                    raw: if is_replace {
+                        array::build_shaped(&items[..n], shape, arena)?
+                    } else {
+                        array::build(&items[..n], arena)?
+                    },
                 })
             }
             // `trim_array(arr, n)`: drop the last `n` elements; `n` must be in range.
@@ -317,6 +341,16 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch("trim_array requires an array", &arr)),
                 };
+                if array::shape(raw)
+                    .expect("array datum invariant")
+                    .dimension_count()
+                    > 1
+                {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "trim_array does not support multidimensional arrays"
+                    ));
+                }
                 if count.is_null() {
                     return Ok(Datum::Null);
                 }
@@ -342,8 +376,6 @@ pub(crate) fn dispatch<'a>(
                     raw: array::build(&items[..keep.min(n)], arena)?,
                 })
             }
-            // `array_ndims`: 1 for a non-empty array, NULL for an empty one (we only
-            // have one-dimensional arrays). `array_dims`: the `[1:n]` bound text.
             "array_ndims" | "array_dims" => {
                 arity(1)?;
                 let arr = eval_full(args[0], arena, params, row, hooks)?;
@@ -352,17 +384,26 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch(name, &arr)),
                 };
-                let total = array::len(raw);
-                if total == 0 {
+                let shape = array::shape(raw).expect("array datum invariant");
+                if shape.dimension_count() == 0 {
                     return Ok(Datum::Null);
                 }
                 if name == "array_ndims" {
-                    Ok(Datum::Int4(1))
+                    Ok(Datum::Int4(shape.dimension_count() as i32))
                 } else {
+                    let mut text = crate::util::StackStr::<128>::new();
+                    for index in 0..shape.dimension_count() {
+                        use core::fmt::Write as _;
+                        write!(
+                            text,
+                            "[{}:{}]",
+                            shape.lower_bound(index).unwrap(),
+                            shape.upper_bound(index).unwrap()
+                        )
+                        .map_err(|_| arena_full())?;
+                    }
                     Ok(Datum::Text(
-                        arena
-                            .alloc_str_display(format_args!("[1:{total}]"))
-                            .map_err(|_| arena_full())?,
+                        arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
                     ))
                 }
             }
@@ -440,7 +481,9 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
             }
             "array_fill" => {
-                arity(2)?;
+                if args.len() != 2 && args.len() != 3 || star {
+                    return Err(arity_err(name, args.len()));
+                }
                 let value = eval_full(args[0], arena, params, row, hooks)?;
                 let dims = eval_full(args[1], arena, params, row, hooks)?;
                 if dims.is_null() {
@@ -452,34 +495,80 @@ pub(crate) fn dispatch<'a>(
                 let Datum::Array { element, raw } = dims else {
                     return Err(type_mismatch(name, &dims));
                 };
-                if array::len(raw) != 1 {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "only one-dimensional array_fill is supported"
+                let dims_shape = array::shape(raw).expect("array datum invariant");
+                if dims_shape.dimension_count() > 1 || element != ArrElem::Int4 {
+                    return Err(type_mismatch(
+                        "array_fill dimensions must be an integer array",
+                        &dims,
                     ));
                 }
-                let count = match array::get(raw, element, 0) {
-                    Some(Datum::Int4(n)) => n,
-                    _ => {
+                let dimension_count = array::len(raw);
+                if dimension_count > array::MAX_DIMENSIONS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "array has too many dimensions"
+                    ));
+                }
+                let mut dimensions = [0usize; array::MAX_DIMENSIONS];
+                for (index, destination) in dimensions.iter_mut().take(dimension_count).enumerate()
+                {
+                    let Some(Datum::Int4(value)) = array::get(raw, element, index) else {
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
                             "dimension values cannot be null"
                         ));
+                    };
+                    if value < 0 {
+                        return Err(sql_err!(
+                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                            "array size exceeds the maximum allowed"
+                        ));
                     }
-                };
-                if count < 0 {
-                    return Err(sql_err!(
-                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                        "array size exceeds the maximum allowed"
-                    ));
+                    *destination = value as usize;
                 }
+                let mut lower_bounds = [1i32; array::MAX_DIMENSIONS];
+                if args.len() == 3 {
+                    let lows = eval_full(args[2], arena, params, row, hooks)?;
+                    let Datum::Array {
+                        element: low_element,
+                        raw: low_raw,
+                    } = lows
+                    else {
+                        return Err(type_mismatch(
+                            "array_fill lower bounds must be an integer array",
+                            &lows,
+                        ));
+                    };
+                    if low_element != ArrElem::Int4 || array::len(low_raw) != dimension_count {
+                        return Err(sql_err!(
+                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                            "dimension array and lower bound array must have the same length"
+                        ));
+                    }
+                    for (index, destination) in
+                        lower_bounds.iter_mut().take(dimension_count).enumerate()
+                    {
+                        let Some(Datum::Int4(value)) = array::get(low_raw, low_element, index)
+                        else {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "low bound values cannot be null"
+                            ));
+                        };
+                        *destination = value;
+                    }
+                }
+                let shape = array::Shape::new(
+                    &dimensions[..dimension_count],
+                    &lower_bounds[..dimension_count],
+                )?;
                 let elem = ArrElem::from_datum(&value).unwrap_or(ArrElem::Int4);
                 let filled = arena
-                    .alloc_slice_with(count as usize, |_| value)
+                    .alloc_slice_with(shape.element_count(), |_| value)
                     .map_err(|_| arena_full())?;
                 Ok(Datum::Array {
                     element: elem,
-                    raw: array::build(filled, arena)?,
+                    raw: array::build_shaped(filled, shape, arena)?,
                 })
             }
             "string_to_array" => {

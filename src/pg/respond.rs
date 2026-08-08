@@ -170,8 +170,9 @@ fn binary_value_len(value: &Datum) -> usize {
                 .saturating_add(count.saturating_mul(6))
         }
         Datum::Array { element, raw } => {
-            let count = crate::sql::array::len(raw);
-            let mut bytes = 12usize.saturating_add(usize::from(count != 0).saturating_mul(8));
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let count = shape.element_count();
+            let mut bytes = 12usize.saturating_add(shape.dimension_count().saturating_mul(8));
             for index in 0..count {
                 let item = crate::sql::array::get(raw, *element, index).unwrap_or(Datum::Null);
                 bytes = bytes
@@ -930,28 +931,24 @@ impl<'b> Responder<'b> {
                     m.bytes(label.as_bytes());
                 }
                 Datum::Array { element, raw } => {
-                    // int32 ndim (0 for empty, else 1 — arrays are strictly
-                    // one-dimensional here), int32 has-null flag, int32 element
-                    // OID; then for a non-empty array one dim descriptor
-                    // {count, lower-bound=1}; then each element as int32 length
-                    // (-1 for NULL) + its binary (elements are always scalars).
                     let elem_oid = match element {
                         crate::sql::types::ArrElem::Domain { slot, .. } => {
                             crate::sql::types::oid::domain_oid(*slot)
                         }
                         _ => element.to_coltype().oid(),
                     };
-                    let count = crate::sql::array::len(raw);
+                    let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+                    let count = shape.element_count();
                     m.field(|m| {
-                        m.i32(if count == 0 { 0 } else { 1 });
+                        m.i32(shape.dimension_count() as i32);
                         let has_null = (0..count).any(|i| {
                             crate::sql::array::get(raw, *element, i).is_none_or(|d| d.is_null())
                         });
                         m.i32(i32::from(has_null));
                         m.i32(elem_oid);
-                        if count > 0 {
-                            m.i32(count as i32);
-                            m.i32(1);
+                        for index in 0..shape.dimension_count() {
+                            m.i32(shape.dimension(index).unwrap() as i32);
+                            m.i32(shape.lower_bound(index).unwrap());
                         }
                         for i in 0..count {
                             let elem =
@@ -1319,6 +1316,7 @@ impl<'b> Responder<'b> {
 mod tests {
     use super::*;
     use crate::mem::Budget;
+    use crate::mem::arena::Arena;
     use crate::sql::types::{RangeKind, RecordField, oid};
 
     #[test]
@@ -1394,6 +1392,45 @@ mod tests {
                 0, 0, 0, 4, 0, 0, 0, 42, // int4 value.
                 0, 0, 0, 25, // text OID.
                 0xff, 0xff, 0xff, 0xff, // NULL field.
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_array_emits_dimensions_and_lower_bounds() {
+        let mut arena_budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut arena_budget, "binary array", 1 << 12).unwrap();
+        let shape = crate::sql::array::Shape::new(&[2, 2], &[2, 4]).unwrap();
+        let raw = crate::sql::array::build_shaped(
+            &[
+                Datum::Int4(1),
+                Datum::Int4(2),
+                Datum::Int4(3),
+                Datum::Int4(4),
+            ],
+            shape,
+            &arena,
+        )
+        .unwrap();
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(
+            &mut message,
+            &Datum::Array {
+                element: crate::sql::types::ArrElem::Int4,
+                raw,
+            },
+        );
+        message.finish().unwrap();
+        assert_eq!(
+            &buffer.readable()[9..37],
+            &[
+                0, 0, 0, 2, // dimensions
+                0, 0, 0, 0, // no nulls
+                0, 0, 0, 23, // int4 OID
+                0, 0, 0, 2, 0, 0, 0, 2, // first dimension
+                0, 0, 0, 2, 0, 0, 0, 4, // second dimension
             ]
         );
     }

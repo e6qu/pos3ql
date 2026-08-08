@@ -23,6 +23,17 @@ SELECT (ARRAY['a','b','c','d'])[2:3];
 SELECT pg_typeof((ARRAY[1,2,3])[1:2]);
 SELECT array_length((ARRAY[1,2,3,4,5])[2:4], 1);
 
+-- Rectangular arrays retain every dimension and lower bound through text input,
+-- constructors, subscripting, slicing, comparison, and dimensional functions.
+SELECT '{{1,2},{3,4}}'::int[];
+SELECT ('{{1,2},{3,4}}'::int[])[2][1];
+SELECT array_ndims('{{1,2},{3,4}}'::int[]), array_length('{{1,2},{3,4}}'::int[], 2), cardinality('{{1,2},{3,4}}'::int[]);
+SELECT array_dims('[2:3][4:5]={{1,2},{3,4}}'::int[]), array_lower('[2:3][4:5]={{1,2},{3,4}}'::int[], 1), array_upper('[2:3][4:5]={{1,2},{3,4}}'::int[], 2);
+SELECT ('[2:3][4:5]={{1,2},{3,4}}'::int[])[3][5], ('[2:3][4:5]={{1,2},{3,4}}'::int[])[2:2];
+SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8]);
+SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]];
+SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]] = '{{1,2},{3,4}}'::int[];
+
 -- Composes with || and other array functions.
 SELECT (ARRAY[1,2,3])[1:2] || (ARRAY[4,5])[1:1];
 SELECT array_agg(x) FROM unnest((ARRAY[10,20,30,40])[2:3]) AS x;

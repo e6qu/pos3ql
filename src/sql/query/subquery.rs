@@ -1385,7 +1385,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         },
         ColType::Array(element) => Datum::Array {
             element,
-            raw: &[0, 0],
+            raw: crate::sql::array::EMPTY,
         },
         ColType::Int2Vector => Datum::Int2Vector(&[]),
         ColType::Float4 => Datum::Float4(0.0),

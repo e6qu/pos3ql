@@ -9,7 +9,7 @@ use crate::util::StackStr;
 
 use super::ast::{BinaryOp, Expr, UnaryOp};
 use super::numeric::Numeric;
-use super::types::{ColType, Datum};
+use super::types::{ArrElem, ColType, Datum};
 
 mod cast;
 pub mod funcs;
@@ -1395,7 +1395,8 @@ pub fn eval_full<'a>(
             ))
         }
         Expr::Array(items) => {
-            // Evaluate each element, unify to a common element type, build blob.
+            // A nested constructor adds one rectangular dimension; scalar members
+            // form the final dimension.
             let mut vals = [Datum::Null; 256];
             if items.len() > vals.len() {
                 return Err(sql_err!(
@@ -1410,6 +1411,55 @@ pub fn eval_full<'a>(
                     element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
                 }
                 vals[i] = v;
+            }
+            if let Some(Datum::Array { element, raw }) = vals.first().copied() {
+                let child = super::array::shape(raw).expect("array datum invariant");
+                if child.dimension_count() == super::array::MAX_DIMENSIONS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "array has too many dimensions"
+                    ));
+                }
+                let mut flattened = [Datum::Null; super::array::MAX_ELEMENTS];
+                let mut count = 0usize;
+                for value in vals.iter().take(items.len()) {
+                    let Datum::Array {
+                        element: member_element,
+                        raw: member_raw,
+                    } = *value
+                    else {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "ARRAY could not convert type {} to {}[]",
+                            type_name_of(value),
+                            element.array_name()
+                        ));
+                    };
+                    let member_shape =
+                        super::array::shape(member_raw).expect("array datum invariant");
+                    if member_element != element || member_shape != child {
+                        return Err(sql_err!(
+                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                            "multidimensional arrays must have array expressions with matching dimensions"
+                        ));
+                    }
+                    count = load_array(
+                        member_raw,
+                        member_element,
+                        element,
+                        &mut flattened,
+                        count,
+                        arena,
+                    )?;
+                }
+                return Ok(Datum::Array {
+                    element,
+                    raw: super::array::build_shaped(
+                        &flattened[..count],
+                        child.with_first(items.len(), 1)?,
+                        arena,
+                    )?,
+                });
             }
             let element = element.unwrap_or(super::types::ArrElem::Int4);
             // Coerce each element to the unified type.
@@ -1441,14 +1491,29 @@ pub fn eval_full<'a>(
             };
             match b {
                 Datum::Array { element, raw } => {
-                    // PostgreSQL array subscripts are 1-based.
-                    if index < 1 {
+                    let shape = super::array::shape(raw).expect("array datum invariant");
+                    if shape.dimension_count() == 0 {
                         return Ok(Datum::Null);
                     }
-                    Ok(
-                        super::array::get(raw, element, (index - 1) as usize)
-                            .unwrap_or(Datum::Null),
-                    )
+                    let lower = i64::from(shape.lower_bound(0).unwrap());
+                    let upper = i64::from(shape.upper_bound(0).unwrap());
+                    if index < lower || index > upper {
+                        return Ok(Datum::Null);
+                    }
+                    let block = shape.element_count() / shape.dimension(0).unwrap();
+                    let start = usize::try_from(index - lower).unwrap() * block;
+                    if shape.dimension_count() == 1 {
+                        return Ok(super::array::get(raw, element, start).unwrap());
+                    }
+                    let items = arena
+                        .alloc_slice_with(block, |offset| {
+                            super::array::get(raw, element, start + offset).unwrap()
+                        })
+                        .map_err(|_| arena_full())?;
+                    Ok(Datum::Array {
+                        element,
+                        raw: super::array::build_shaped(items, shape.without_first()?, arena)?,
+                    })
                 }
                 Datum::Text(value)
                     if matches!(
@@ -1487,8 +1552,8 @@ pub fn eval_full<'a>(
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("cannot slice a non-array", &b)),
             };
-            // Resolve each bound (1-based, inclusive); an omitted bound defaults
-            // to the array's first/last element, and a NULL bound yields NULL.
+            // Resolve the leading-dimension bounds; chained slices address the
+            // remaining dimensions.
             let bound = |e: &Expr<'a>| -> Result<Option<i64>, SqlError> {
                 match eval_full(e, arena, params, row, hooks)? {
                     Datum::Int2(x) => Ok(Some(x as i64)),
@@ -1498,37 +1563,50 @@ pub fn eval_full<'a>(
                     other => Err(type_mismatch("array slice bound must be integer", &other)),
                 }
             };
-            let n = super::array::len(raw) as i64;
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            if shape.dimension_count() == 0 {
+                return Ok(Datum::Array { element, raw });
+            }
+            let first_lower = i64::from(shape.lower_bound(0).unwrap());
+            let first_upper = i64::from(shape.upper_bound(0).unwrap());
             let lo = match lower {
                 Some(e) => match bound(e)? {
                     Some(v) => v,
                     None => return Ok(Datum::Null),
                 },
-                None => 1,
+                None => first_lower,
             };
             let hi = match upper {
                 Some(e) => match bound(e)? {
                     Some(v) => v,
                     None => return Ok(Datum::Null),
                 },
-                None => n,
+                None => first_upper,
             };
-            // Clamp to the array's 1..n range; an empty overlap is an empty array.
-            let lo = lo.max(1);
-            let hi = hi.min(n);
+            let lo = lo.max(first_lower);
+            let hi = hi.min(first_upper);
+            let block = shape.element_count() / shape.dimension(0).unwrap();
             let items: &[Datum] = if lo > hi {
                 &[]
             } else {
                 arena
-                    .alloc_slice_with((hi - lo + 1) as usize, |i| {
-                        super::array::get(raw, element, (lo as usize - 1) + i)
-                            .unwrap_or(Datum::Null)
+                    .alloc_slice_with((hi - lo + 1) as usize * block, |i| {
+                        let start = (lo - first_lower) as usize * block;
+                        super::array::get(raw, element, start + i).unwrap()
                     })
                     .map_err(|_| arena_full())?
             };
             Ok(Datum::Array {
                 element,
-                raw: super::array::build(items, arena)?,
+                raw: if items.is_empty() {
+                    super::array::build(items, arena)?
+                } else {
+                    super::array::build_shaped(
+                        items,
+                        shape.sliced_first((hi - lo + 1) as usize)?,
+                        arena,
+                    )?
+                },
             })
         }
         Expr::Field { base, field } => {
@@ -2346,6 +2424,13 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
+        Expr::Array(items) => items
+            .first()
+            .and_then(|item| static_type(item, row))
+            .and_then(|ctype| match ctype {
+                ColType::Array(element) => Some(ColType::Array(element)),
+                scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
+            }),
         Expr::Unary {
             operator: UnaryOp::Neg,
             operand,
@@ -2382,6 +2467,11 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Case {
             whens, otherwise, ..
         } => case_result_type(whens, otherwise, row),
+        Expr::Subscript { base, .. } => match static_type(base, row) {
+            Some(ColType::Array(element)) => Some(element.to_coltype()),
+            Some(ctype) if matches!(base, Expr::Subscript { .. }) => Some(ctype),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3112,10 +3202,63 @@ fn concat<'a>(
 /// PostgreSQL's `array || array`, `array || element`, and `element || array`.
 fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let element = match (&l, &r) {
-        (Datum::Array { element, .. }, _) | (_, Datum::Array { element, .. }) => *element,
+        (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) => {
+            unify_arr_elem(*left, *right)
+        }
+        (Datum::Array { element, .. }, scalar) | (scalar, Datum::Array { element, .. }) => {
+            ArrElem::from_datum(scalar).map_or(*element, |scalar| unify_arr_elem(*element, scalar))
+        }
         _ => unreachable!("caller ensures one side is an array"),
     };
-    let mut items = [Datum::Null; 4096];
+    let left_shape = match l {
+        Datum::Array { raw, .. } => Some(super::array::shape(raw).expect("array datum invariant")),
+        _ => None,
+    };
+    let right_shape = match r {
+        Datum::Array { raw, .. } => Some(super::array::shape(raw).expect("array datum invariant")),
+        _ => None,
+    };
+    let result_shape = match (left_shape, right_shape) {
+        (Some(left), Some(right)) if left.dimension_count() == 0 => right,
+        (Some(left), Some(right)) if right.dimension_count() == 0 => left,
+        (Some(left), Some(right)) => {
+            if left.dimension_count() != right.dimension_count()
+                || (1..left.dimension_count())
+                    .any(|index| left.dimension(index) != right.dimension(index))
+            {
+                return Err(sql_err!(
+                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                    "cannot concatenate incompatible multidimensional arrays"
+                ));
+            }
+            left.without_first()?.with_first(
+                left.dimension(0).unwrap() + right.dimension(0).unwrap(),
+                left.lower_bound(0).unwrap(),
+            )?
+        }
+        (Some(shape), None) => {
+            if shape.dimension_count() > 1 {
+                return Err(sql_err!(
+                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                    "cannot append an element to a multidimensional array"
+                ));
+            }
+            let lower = shape.lower_bound(0).unwrap_or(1);
+            super::array::Shape::new(&[shape.element_count() + 1], &[lower])?
+        }
+        (None, Some(shape)) => {
+            if shape.dimension_count() > 1 {
+                return Err(sql_err!(
+                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                    "cannot prepend an element to a multidimensional array"
+                ));
+            }
+            let lower = shape.lower_bound(0).unwrap_or(1);
+            super::array::Shape::new(&[shape.element_count() + 1], &[lower])?
+        }
+        (None, None) => unreachable!("caller ensures an array operand"),
+    };
+    let mut items = [Datum::Null; super::array::MAX_ELEMENTS];
     let mut n = 0usize;
     for side in [l, r] {
         match side {
@@ -3127,9 +3270,14 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
                             "array size exceeds the maximum allowed"
                         ));
                     }
-                    items[n] = super::array::get(raw, e, i).ok_or_else(|| {
+                    let value = super::array::get(raw, e, i).ok_or_else(|| {
                         sql_err!(sqlstate::INTERNAL_ERROR, "corrupt array element")
                     })?;
+                    items[n] = if value.is_null() || e == element {
+                        value
+                    } else {
+                        cast_to(value, element.to_coltype(), arena)?
+                    };
                     n += 1;
                 }
             }
@@ -3140,14 +3288,18 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
                         "array size exceeds the maximum allowed"
                     ));
                 }
-                items[n] = scalar;
+                items[n] = if scalar.is_null() {
+                    scalar
+                } else {
+                    cast_to(scalar, element.to_coltype(), arena)?
+                };
                 n += 1;
             }
         }
     }
     Ok(Datum::Array {
         element,
-        raw: super::array::build(&items[..n], arena)?,
+        raw: super::array::build_shaped(&items[..n], result_shape, arena)?,
     })
 }
 

@@ -3089,6 +3089,16 @@ fn array_type() {
     assert!(run("SELECT (ARRAY[1,2,3])[NULL:2] IS NULL").contains('t'));
     // A slice keeps the array type (not the element type).
     assert!(run("SELECT pg_typeof((ARRAY[1,2,3])[1:2])").contains("integer[]"));
+    assert!(run("SELECT '{{1,2},{3,4}}'::int[]").contains("{{1,2},{3,4}}"));
+    assert!(run("SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]]").contains("{{1,2},{3,4}}"));
+    assert!(run("SELECT ('{{1,2},{3,4}}'::int[])[2][1]").contains('3'));
+    assert!(run("SELECT array_ndims('{{1,2},{3,4}}'::int[])").contains('2'));
+    assert!(run("SELECT array_dims('[2:3][4:5]={{1,2},{3,4}}'::int[])").contains("[2:3][4:5]"));
+    assert!(run("SELECT ('[2:3][4:5]={{1,2},{3,4}}'::int[])[3][5]").contains('4'));
+    assert!(
+        run("SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8])")
+            .contains("[4:5][8:10]={{7,7,7},{7,7,7}}")
+    );
 }
 
 #[test]

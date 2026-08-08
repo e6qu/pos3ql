@@ -129,7 +129,7 @@ pub enum ColType {
     Json,
     /// Binary/normalized JSON (canonicalized on input).
     Jsonb,
-    /// A one-dimensional array of a scalar element type.
+    /// An array of a scalar element type.
     Array(ArrElem),
     Uuid,
     Bytea,
@@ -189,7 +189,7 @@ const RANGE_KINDS: u8 = 6;
 impl ColType {
     /// Maps a SQL type name (already case-folded) to a column type.
     pub fn from_sql_name(name: &str) -> Option<Self> {
-        // `element[]` is a one-dimensional array of a scalar element type.
+        // `element[]` is an array of a scalar element type.
         if let Some(base) = name.strip_suffix("[]") {
             return ArrElem::from_coltype(ColType::from_sql_name(base)?).map(ColType::Array);
         }
@@ -609,7 +609,7 @@ impl ColType {
     }
 }
 
-/// The element type of a one-dimensional array. A distinct (non-recursive)
+/// The scalar element type of an array. A distinct (non-recursive)
 /// enum so `ColType`/`Datum` stay `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrElem {
@@ -1272,9 +1272,7 @@ pub enum Datum<'a> {
         text: &'a str,
         jsonb: bool,
     },
-    /// A one-dimensional array: the element type plus the serialized element
-    /// bytes (`u16 count` then `u32 len + element encoding` per element). Kept
-    /// as raw bytes so decoding from storage needs no separate allocation.
+    /// An array's element type and canonical shaped row encoding.
     Array {
         element: ArrElem,
         raw: &'a [u8],

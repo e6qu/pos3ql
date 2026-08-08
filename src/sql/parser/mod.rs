@@ -3739,7 +3739,7 @@ impl<'a> Parser<'a> {
         } else {
             -1
         };
-        // A trailing `[]` (repeatable) makes it a one-dimensional array type.
+        // Repeated `[]` spell the same scalar-element array type.
         if self.peeked == Tok::Op("[") {
             self.advance()?;
             self.expect_op("]")?;

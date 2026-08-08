@@ -2952,10 +2952,6 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
-        if let Err(error) = self.retry_post_publish_cleanup() {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
@@ -2964,6 +2960,29 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
+        let statement = match parser.next_stmt() {
+            Ok(Some(statement)) => statement,
+            Ok(None) => {
+                responder.empty_query_response()?;
+                return Ok(ExtendedExecutionStatus::Complete(true));
+            }
+            Err(e) => {
+                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.abort_explicit_txn(txn, guc);
+                } else if txn.is_explicit() {
+                    txn.failed = true;
+                }
+                report_parse_error(responder, &e)?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+        };
+        if self.post_publish_cleanup.is_some()
+            && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && let Err(error) = self.retry_post_publish_cleanup()
+        {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
@@ -2971,30 +2990,12 @@ impl Engine {
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-        let outcome = match parser.next_stmt() {
-            Ok(Some(statement)) => {
-                emit_parse_warnings(&mut parser, responder)?;
-                let outcome = self.execute_stmt(
-                    &statement, arena, params, txn, sqlprep, cursors, guc, responder,
-                )?;
-                outcome.and_then(|()| query::check_timeout())
-            }
-            Ok(None) => {
-                responder.empty_query_response()?;
-                Ok(())
-            }
-            Err(e) => {
-                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.abort_explicit_txn(txn, guc);
-                } else if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
-                }
-                report_parse_error(responder, &e)?;
-                return Ok(ExtendedExecutionStatus::Complete(false));
-            }
-        };
+        emit_parse_warnings(&mut parser, responder)?;
+        let outcome = self
+            .execute_stmt(
+                &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+            )?
+            .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit

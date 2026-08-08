@@ -1136,6 +1136,77 @@ pub struct PendingDdl {
     pub creating: bool,
 }
 
+/// A catalog object's committed existence and transaction-local DDL. The
+/// variants include a create followed by drop, which savepoint rollback must
+/// restore as a pending create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogDdlState {
+    Absent,
+    Present,
+    PendingCreate { txid: u32 },
+    PendingDrop { txid: u32 },
+    PendingCreateDrop { txid: u32 },
+}
+
+impl CatalogDdlState {
+    pub const fn visible_to(self, txid: u32) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Present => true,
+            Self::PendingCreate { txid: owner } => owner == txid,
+            Self::PendingDrop { txid: owner } => owner != txid,
+            Self::PendingCreateDrop { .. } => false,
+        }
+    }
+
+    pub const fn pending_txid(self) -> Option<u32> {
+        match self {
+            Self::PendingCreate { txid }
+            | Self::PendingDrop { txid }
+            | Self::PendingCreateDrop { txid } => Some(txid),
+            Self::Absent | Self::Present => None,
+        }
+    }
+
+    fn drop_by(self, txid: u32) -> Self {
+        match self {
+            Self::PendingCreate { txid: owner } if owner == txid => {
+                Self::PendingCreateDrop { txid }
+            }
+            Self::Present => Self::PendingDrop { txid },
+            _ => panic!("catalog DDL drop does not match object state"),
+        }
+    }
+
+    fn commit_create(self) -> Self {
+        match self {
+            Self::PendingCreate { .. } => Self::Present,
+            Self::PendingCreateDrop { txid } => Self::PendingDrop { txid },
+            _ => panic!("catalog CREATE commit does not match object state"),
+        }
+    }
+
+    fn commit_drop(self) -> Self {
+        assert!(matches!(self, Self::PendingDrop { .. }));
+        Self::Absent
+    }
+
+    fn rollback_create(self) -> Self {
+        assert!(matches!(self, Self::PendingCreate { .. }));
+        Self::Absent
+    }
+
+    fn rollback_drop(self, txid: u32) -> Self {
+        match self {
+            Self::PendingDrop { txid: owner } if owner == txid => Self::Present,
+            Self::PendingCreateDrop { txid: owner } if owner == txid => {
+                Self::PendingCreate { txid }
+            }
+            _ => panic!("catalog DROP rollback does not match object state"),
+        }
+    }
+}
+
 /// The maximum number of ALTER TABLE commands one transaction may apply to a
 /// single table. This is a static-memory bound, not an accept-and-ignore limit.
 pub(crate) const MAX_PENDING_TABLE_DEFS: usize = 8;
@@ -1387,8 +1458,7 @@ pub struct PublicationDef {
     pub publish_delete: bool,
     pub publish_truncate: bool,
     pub ownership: Ownership,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    pub ddl_state: CatalogDdlState,
 }
 
 /// The immutable definition supplied when a publication enters the catalog.
@@ -1419,10 +1489,7 @@ pub(crate) struct ReplicationSlotDef {
 
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(pending) if pending.txid == txid => pending.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 }
 
@@ -1449,16 +1516,12 @@ pub struct MatviewDef {
     pub ownership: Ownership,
     /// False after `WITH NO DATA` until the first REFRESH.
     pub populated: bool,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    pub ddl_state: CatalogDdlState,
 }
 
 impl MatviewDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 }
 
@@ -2873,7 +2936,7 @@ impl Storage {
             }
         }
         for slot in 0..self.matviews.len() {
-            if self.matviews[slot].live {
+            if self.matviews[slot].ddl_state == CatalogDdlState::Present {
                 let serialized = self.matview_dependencies[slot];
                 self.matview_dependencies[slot] =
                     self.rebind_stored_query_dependencies(serialized, 0)?;
@@ -2895,7 +2958,7 @@ impl Storage {
             }
         }
         for matview_slot in 0..self.matviews.len() {
-            if self.matviews[matview_slot].live || self.matviews[matview_slot].pending.is_some() {
+            if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
                 self.matview_dependencies[matview_slot].rename(class, slot, schema, name);
             }
         }
@@ -2916,7 +2979,7 @@ impl Storage {
             }
         }
         for matview_slot in 0..self.matviews.len() {
-            if self.matviews[matview_slot].live || self.matviews[matview_slot].pending.is_some() {
+            if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
                 self.matview_dependencies[matview_slot]
                     .replace_slot(class, old_slot, new_slot, schema, name);
             }
@@ -3053,8 +3116,7 @@ impl Storage {
                     publish_delete: true,
                     publish_truncate: true,
                     ownership: Ownership::BOOTSTRAP,
-                    live: false,
-                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
         }
@@ -3082,8 +3144,7 @@ impl Storage {
                     creation_path: StackStr::new(),
                     ownership: Ownership::BOOTSTRAP,
                     populated: false,
-                    live: false,
-                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
         }
@@ -3474,7 +3535,9 @@ impl Storage {
         match object.class {
             AccessClass::Table => self.tables[slot].live,
             AccessClass::View => self.views[slot].live,
-            AccessClass::MaterializedView => self.matviews[slot].live,
+            AccessClass::MaterializedView => {
+                self.matviews[slot].ddl_state == CatalogDdlState::Present
+            }
             AccessClass::Sequence => self.sequences[slot].live,
             AccessClass::Schema => self.schemas[slot].live,
             AccessClass::Domain => self.domains[slot].live,
@@ -8924,14 +8987,14 @@ impl Storage {
     pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
         self.publications
             .iter()
-            .filter(|publication| publication.live)
+            .filter(|publication| publication.ddl_state == CatalogDdlState::Present)
     }
 
     pub fn publications_with_slots(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
         self.publications
             .iter()
             .enumerate()
-            .filter(|(_, publication)| publication.live)
+            .filter(|(_, publication)| publication.ddl_state == CatalogDdlState::Present)
     }
 
     /// Committed publication lookup for replication protocol setup.
@@ -9120,9 +9183,8 @@ impl Storage {
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
             (publication.name == spec.name)
-                .then_some(publication.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(publication.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
@@ -9140,7 +9202,7 @@ impl Storage {
         let Some(slot) = self
             .publications
             .iter()
-            .position(|publication| !publication.live && publication.pending.is_none())
+            .position(|publication| publication.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9162,11 +9224,7 @@ impl Storage {
             publish_delete: spec.publish_delete,
             publish_truncate: spec.publish_truncate,
             ownership: self.initial_ownership(txid),
-            live: false,
-            pending: Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(slot)
     }
@@ -9174,9 +9232,8 @@ impl Storage {
     pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
             (publication.name.as_str() == name)
-                .then_some(publication.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(publication.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -9186,41 +9243,22 @@ impl Storage {
             return Ok(None);
         };
         let publication = &mut self.publications[slot];
-        if matches!(publication.pending, Some(pending) if pending.txid == txid && pending.creating)
-        {
-            publication.live = false;
-            publication.pending = None;
-        } else {
-            publication.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        publication.ddl_state = publication.ddl_state.drop_by(txid);
         Ok(Some(slot))
     }
 
     pub fn commit_publication_create(&mut self, slot: usize) {
-        self.publications[slot].live = true;
-        self.publications[slot].pending = None;
+        self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_create();
     }
     pub fn commit_publication_drop(&mut self, slot: usize) {
-        self.publications[slot].live = false;
-        self.publications[slot].pending = None;
+        self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_drop();
     }
     pub fn rollback_publication_create(&mut self, slot: usize) {
-        self.publications[slot].live = false;
-        self.publications[slot].pending = None;
+        self.publications[slot].ddl_state = self.publications[slot].ddl_state.rollback_create();
     }
     pub fn rollback_publication_drop(&mut self, slot: usize, txid: u32) {
         let publication = &mut self.publications[slot];
-        if publication.live {
-            publication.pending = None;
-        } else {
-            publication.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        publication.ddl_state = publication.ddl_state.rollback_drop(txid);
     }
 
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
@@ -9236,14 +9274,16 @@ impl Storage {
 
     /// Committed materialized views, for checkpoint serialization.
     pub fn live_matviews(&self) -> impl Iterator<Item = &MatviewDef> {
-        self.matviews.iter().filter(|m| m.live)
+        self.matviews
+            .iter()
+            .filter(|m| m.ddl_state == CatalogDdlState::Present)
     }
 
     pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
         self.matviews
             .iter()
             .enumerate()
-            .filter(|(_, matview)| matview.live)
+            .filter(|(_, matview)| matview.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
@@ -9290,16 +9330,15 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
             (m.schema.as_str() == schema.as_str() && m.name.as_str() == name.as_str())
-                .then_some(m.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(m.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .matviews
             .iter()
-            .position(|m| !m.live && m.pending.is_none())
+            .position(|m| m.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9321,11 +9360,7 @@ impl Storage {
             creation_path: query.creation_path,
             ownership,
             populated,
-            live: false,
-            pending: Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         self.matview_dependencies[new] = query.dependencies;
         Ok(new)
@@ -9339,9 +9374,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
             (m.schema.as_str() == schema && m.name.as_str() == name)
-                .then_some(m.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(m.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -9356,44 +9390,26 @@ impl Storage {
 
     fn pending_drop_matview(&mut self, slot: usize, txid: u32) {
         let m = &mut self.matviews[slot];
-        if matches!(m.pending, Some(p) if p.txid == txid && p.creating) {
-            m.live = false;
-            m.pending = None;
-        } else {
-            m.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        m.ddl_state = m.ddl_state.drop_by(txid);
     }
 
     pub fn commit_matview_create(&mut self, slot: usize) {
-        self.matviews[slot].live = true;
-        self.matviews[slot].pending = None;
+        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_create();
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
         let (schema, name) = (self.matviews[slot].schema, self.matviews[slot].name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.matviews[slot].live = false;
-        self.matviews[slot].pending = None;
+        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_matview_create(&mut self, slot: usize) {
-        self.matviews[slot].live = false;
-        self.matviews[slot].pending = None;
+        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
         let m = &mut self.matviews[slot];
-        if m.live {
-            m.pending = None;
-        } else if matches!(m.pending, Some(p) if p.txid == txid) {
-            m.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        m.ddl_state = m.ddl_state.rollback_drop(txid);
     }
 
     // --- Sequences -------------------------------------------------------
@@ -11429,6 +11445,53 @@ mod tests {
                 .unwrap()
         );
         storage.ensure_no_pending_replay_table_rewrite().unwrap();
+    }
+
+    #[test]
+    fn catalog_ddl_state_has_one_visibility_rule() {
+        assert!(!CatalogDdlState::Absent.visible_to(1));
+        assert!(CatalogDdlState::Present.visible_to(1));
+        assert!(CatalogDdlState::PendingCreate { txid: 1 }.visible_to(1));
+        assert!(!CatalogDdlState::PendingCreate { txid: 1 }.visible_to(2));
+        assert!(!CatalogDdlState::PendingDrop { txid: 1 }.visible_to(1));
+        assert!(CatalogDdlState::PendingDrop { txid: 1 }.visible_to(2));
+    }
+
+    #[test]
+    fn catalog_ddl_state_transitions_preserve_the_committed_baseline() {
+        assert_eq!(
+            CatalogDdlState::PendingCreate { txid: 1 }.commit_create(),
+            CatalogDdlState::Present
+        );
+        assert_eq!(
+            CatalogDdlState::PendingDrop { txid: 1 }.commit_drop(),
+            CatalogDdlState::Absent
+        );
+        assert_eq!(
+            CatalogDdlState::PendingCreate { txid: 1 }.rollback_create(),
+            CatalogDdlState::Absent
+        );
+        assert_eq!(
+            CatalogDdlState::PendingDrop { txid: 1 }.rollback_drop(1),
+            CatalogDdlState::Present
+        );
+        let created_then_dropped = CatalogDdlState::PendingCreate { txid: 1 }.drop_by(1);
+        assert_eq!(
+            created_then_dropped,
+            CatalogDdlState::PendingCreateDrop { txid: 1 }
+        );
+        assert_eq!(
+            created_then_dropped.rollback_drop(1),
+            CatalogDdlState::PendingCreate { txid: 1 }
+        );
+        assert_eq!(
+            created_then_dropped.commit_create().commit_drop(),
+            CatalogDdlState::Absent
+        );
+        assert_eq!(
+            CatalogDdlState::Present.drop_by(1),
+            CatalogDdlState::PendingDrop { txid: 1 }
+        );
     }
 
     #[test]

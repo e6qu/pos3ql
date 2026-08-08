@@ -4947,6 +4947,7 @@ impl Engine {
             ),
             Stmt::DeclareCursor {
                 name,
+                binary,
                 scroll,
                 hold,
                 sql,
@@ -4985,7 +4986,11 @@ impl Engine {
                             )));
                         }
                     };
-                    let mut capture = Responder::new(cursors.result_buffer(at));
+                    let mut capture = if *binary {
+                        Responder::for_binary_cursor(cursors.result_buffer(at))
+                    } else {
+                        Responder::new(cursors.result_buffer(at))
+                    };
                     capture.set_render(guc.render());
                     match &parsed {
                         Stmt::Select(sel) => {

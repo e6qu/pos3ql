@@ -384,19 +384,15 @@ impl<'a> Parser<'a> {
     }
 
     /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
-    /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed). BINARY
-    /// is refused loudly (binary-format simple-query rows are not produced).
+    /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed).
     fn declare_cursor(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // declare
         let name = self.col_ident("cursor name")?;
+        let mut binary = false;
         let mut scroll = false;
         loop {
             if self.eat_ident("binary")? {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: crate::stack_format!(96, "BINARY cursors are not supported"),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                });
+                binary = true;
             } else if self.eat_ident("insensitive")? || self.eat_ident("asensitive")? {
                 // Materialization makes every cursor insensitive.
             } else if self.eat_ident("scroll")? {
@@ -426,6 +422,7 @@ impl<'a> Parser<'a> {
         let sql = self.text[start..end].trim();
         Ok(Stmt::DeclareCursor {
             name,
+            binary,
             scroll,
             hold,
             sql,

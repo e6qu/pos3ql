@@ -2586,6 +2586,7 @@ impl Checkpointer {
         }
         let lsn = storage.lsn();
         self.publish(storage, lsn)?;
+        storage.clear_dirty_through(&self.sliced_generation);
         self.sweeping = false;
         Ok(CheckpointStep::Published { lsn })
     }

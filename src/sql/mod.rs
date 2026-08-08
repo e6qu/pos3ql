@@ -2821,10 +2821,6 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
-        if let Err(error) = self.retry_post_publish_cleanup() {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExecutionStatus::Complete);
-        }
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
@@ -2849,6 +2845,13 @@ impl Engine {
                     if statement_index < resume_statement {
                         statement_index += 1;
                         continue;
+                    }
+                    if self.post_publish_cleanup.is_some()
+                        && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+                        && let Err(error) = self.retry_post_publish_cleanup()
+                    {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(ExecutionStatus::Complete);
                     }
                     if self.pending_copy.take().is_some() {
                         // COPY FROM STDIN takes over the connection; a

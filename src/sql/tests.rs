@@ -191,6 +191,33 @@ fn run_with_guc(
     buffer.readable().to_vec()
 }
 
+/// Stages one implicit transaction through the same executor entry point as a
+/// connection, deliberately leaving publication to the caller's flush
+/// boundary.
+fn stage_without_publication(engine: &mut Engine, budget: &mut Budget, sql_text: &str) {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(budget, 1024).unwrap();
+    let mut pool = test_pool(budget);
+    let mut cursors = test_cursors(budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple_from(
+            sql_text,
+            0,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut responder,
+            1,
+            false,
+        )
+        .unwrap();
+}
+
 /// Runs one simple-query message as a specific connection id (for LISTEN /
 /// NOTIFY, whose semantics are cross-connection).
 fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str) -> Vec<u8> {
@@ -426,7 +453,7 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
         .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
@@ -691,7 +718,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -10811,7 +10838,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.value_index_rows = 1;
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -10967,6 +10994,93 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         "an incomplete one-entry RAM cache must enforce uniqueness through the durable index"
     );
     drop(restarted);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("commit-batch-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-commit-batch-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    stage_without_publication(&mut engine, &mut budget, "CREATE TABLE batched (id int)");
+    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (1)");
+    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (2)");
+    assert!(engine.wal.pending_batch_bytes() > 0);
+    engine.commit_wal().unwrap();
+
+    let mut count = 0;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("commits/", |key| {
+            count += usize::from(key.ends_with(".batch"))
+        })
+        .unwrap();
+    assert_eq!(count, 1, "one flush must publish one immutable batch");
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id FROM batched ORDER BY id"
+        )),
+        ["1", "2"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn ambiguous_commit_batch_put_is_idempotently_adopted() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("commit-batch-ambiguous-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-commit-ambiguous-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_bucket(&config.object_store_bucket);
+    let bucket = crate::object_store::sim::open_bucket(&config.object_store_bucket, 17);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE retry_batch (id int)",
+    );
+    bucket.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(engine.commit_wal().is_err());
+    assert!(engine.wal.pending_batch_bytes() > 0);
+    bucket.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    engine.commit_wal().unwrap();
+    assert_eq!(engine.wal.pending_batch_bytes(), 0);
+    drop(engine);
     crate::object_store::sim::drop_bucket(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

@@ -87,15 +87,13 @@ pub struct Config {
     /// seam. Implies `object_store_on`; refused by the real server binary (the
     /// virtual bucket allocates freely and exists for simulation tests).
     pub object_store_sim: bool,
-    /// Upload committed WAL batches to durable object storage. Required with
-    /// `object_store = on`: the local disk is a cache, so an acknowledged
-    /// commit must not live only there.
+    /// Publish committed journal batches to durable object storage. Required
+    /// with `object_store = on`: local disk is a cache.
     pub wal_upload: bool,
-    /// A commit blocks until its WAL batch is in the bucket (RPO=0 against
-    /// total local-disk loss). Required with object storage.
+    /// Success waits for commit-batch publication (RPO=0 against cache loss).
+    /// Required with object storage.
     pub wal_upload_sync: bool,
-    /// Scratch for staging a committed WAL batch before its object PUT. Must
-    /// hold at least one full journal batch.
+    /// Scratch for a published commit batch. Must hold one journal batch.
     pub wal_upload_buffer_bytes: usize,
     /// Endpoint for the configured adapter. The first adapter speaks the
     /// S3-compatible HTTP API used by AWS, MinIO, and compatibility gateways.

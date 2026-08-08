@@ -2821,8 +2821,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 default_expr,
                 checks,
                 n_checks,
-                live: false,
-                pending: None,
+                ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
         }
         KIND_DROP_DOMAIN => {
@@ -2855,8 +2854,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 ownership: crate::storage::Ownership::BOOTSTRAP,
                 members,
                 n_members,
-                live: false,
-                pending: None,
+                ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
         }
         KIND_DROP_ENUM => {

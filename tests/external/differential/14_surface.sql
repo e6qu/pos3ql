@@ -28,7 +28,7 @@ SELECT CASE 1 WHEN 1 THEN 'a' ELSE 'b' END;
 SELECT COALESCE(NULL, 1);
 SELECT NULLIF(1,1);
 SELECT GREATEST(1,2), LEAST(1,2);
--- (the column label is `case` here, not `?column?` — B-102)
+-- The column label is `case` here, not `?column?`.
 SELECT 1 IS DISTINCT FROM 2 AS d;
 SELECT 1 IS NOT DISTINCT FROM 2 AS d;
 SELECT NULL IS NULL, 1 IS NOT NULL;
@@ -90,7 +90,7 @@ SELECT EXISTS (SELECT row_number() OVER ());
 SELECT * FROM (SELECT row_number() OVER () n) x;
 SELECT row_number() OVER () UNION SELECT 5 ORDER BY 1;
 -- forms whose value moves, asserted by shape instead
--- (PostgreSQL types these as `name`; this engine has no such type — B-103)
+-- PostgreSQL types these as `name`; this engine has no such type.
 SELECT user = current_user;
 SELECT 1 LIMIT ALL;
 SELECT 1 LIMIT ALL OFFSET 0;
@@ -103,7 +103,7 @@ DROP TABLE sfc;
 -- `null`, or carries a comma, brace, quote, backslash or space — so a
 -- timestamp comes out quoted, not only a string
 -- (the column label of `ARRAY[...]::text` is `text` here, `array` in
---  PostgreSQL — same family as B-102)
+-- PostgreSQL)
 SELECT ARRAY['a b','c,d','','null','q"r']::text AS a;
 SELECT ARRAY[1,2]::text AS a, ARRAY['x','y']::text AS b, ARRAY[1.5,2.5]::text AS c, ARRAY[true,false]::text AS d;
 SELECT ARRAY['2020-01-01'::date]::text AS a;

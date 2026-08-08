@@ -3,7 +3,7 @@
 -- tools that introspect a schema read the answer literally.
 --
 -- The modifier is always taken from `pg_attribute` rather than written as a
--- literal: the two engines encode the temporal precisions differently (B-140),
+-- literal: the two engines encode the temporal precisions differently,
 -- so the same integer does not mean the same thing to both, while each
 -- engine's own stored value does.
 

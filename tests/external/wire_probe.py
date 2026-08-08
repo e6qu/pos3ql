@@ -502,6 +502,121 @@ def test_extended_copy():
     s.close()
 
 
+def binary_array(element_oid, values):
+    body = struct.pack("!iii", 1, int(any(value is None for value in values)), element_oid)
+    body += struct.pack("!ii", len(values), 1)
+    for value in values:
+        if value is None:
+            body += struct.pack("!i", -1)
+        else:
+            body += struct.pack("!i", len(value)) + value
+    return body
+
+
+def extended_binary_parameter(s, text, oid, value):
+    parse = frontend_message(
+        b"P", b"\x00" + text.encode() + b"\x00" + struct.pack("!hi", 1, oid)
+    )
+    encoded_value = struct.pack("!i", -1) if value is None else struct.pack("!i", len(value)) + value
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 1, 1, 1) + encoded_value + struct.pack("!h", 0),
+    )
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            return out
+
+
+def first_text_row(messages):
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    if row is None or row[:2] != b"\x00\x01":
+        return None
+    (length,) = struct.unpack("!i", row[2:6])
+    return row[6 : 6 + length].decode() if length >= 0 and len(row) == 6 + length else None
+
+
+def has_sqlstate(messages, state):
+    return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
+
+
+def test_catalog_aware_binary_bind_parameters():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(
+        s,
+        "CREATE TYPE wire_binary_state AS ENUM ('ready', 'blocked'); "
+        "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
+        "CREATE DOMAIN wire_binary_required AS integer NOT NULL",
+    )
+
+    enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
+    domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_positive'")))
+    enum_array_oid = 160000 + enum_oid - 120000
+    domain_array_oid = 150000 + domain_oid - 110000
+    required_domain_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
+    )
+    cases = [
+        ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
+        ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
+        (
+            "enum array",
+            "SELECT $1::wire_binary_state[]",
+            enum_array_oid,
+            binary_array(enum_oid, [b"ready", b"blocked"]),
+            "{ready,blocked}",
+            None,
+        ),
+        (
+            "domain array",
+            "SELECT $1::wire_binary_positive[]",
+            domain_array_oid,
+            binary_array(domain_oid, [struct.pack("!i", 3), struct.pack("!i", 5)]),
+            "{3,5}",
+            None,
+        ),
+        ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),
+        (
+            "invalid domain",
+            "SELECT $1::wire_binary_positive",
+            domain_oid,
+            struct.pack("!i", -1),
+            None,
+            "23514",
+        ),
+        (
+            "invalid domain array",
+            "SELECT $1::wire_binary_positive[]",
+            domain_array_oid,
+            binary_array(domain_oid, [struct.pack("!i", -1)]),
+            None,
+            "23514",
+        ),
+        ("null required domain", "SELECT $1::wire_binary_required", required_domain_oid, None, None, "23502"),
+    ]
+    for name, text, oid, value, expected, state in cases:
+        messages = extended_binary_parameter(s, text, oid, value)
+        if expected is not None:
+            check(
+                f"binary Bind catalog {name}",
+                first_text_row(messages) == expected,
+                messages,
+            )
+        else:
+            check(
+                f"binary Bind catalog {name} rejects invalid value",
+                has_sqlstate(messages, state),
+                messages,
+            )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

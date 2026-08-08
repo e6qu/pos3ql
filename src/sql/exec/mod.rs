@@ -9302,7 +9302,8 @@ pub fn copy_row_binary(
         } else {
             let field = &row[at..at + flen as usize];
             at += flen as usize;
-            let decoded = decode_binary_field_with_storage(col.ctype, field, arena, Some(storage))?;
+            let decoded =
+                decode_binary_field_with_catalog(col.ctype, field, arena, storage, txn.txid)?;
             coerce(decoded, &col, storage, arena)?
         };
         explicit[col_index] = true;
@@ -9362,14 +9363,27 @@ pub(crate) fn decode_binary_field<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_binary_field_with_storage(ctype, bytes, arena, None)
+    decode_binary_field_with_context(ctype, bytes, arena, None)
 }
 
-fn decode_binary_field_with_storage<'a>(
+/// Decodes binary input whose declared type was resolved through the active
+/// catalog. `txid` makes domain constraints observe the same catalog view as
+/// the statement that supplied the parameter.
+pub(crate) fn decode_binary_field_with_catalog<'a>(
     ctype: ColType,
     bytes: &'a [u8],
     arena: &'a Arena,
-    storage: Option<&Storage>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<Datum<'a>, SqlError> {
+    decode_binary_field_with_context(ctype, bytes, arena, Some((storage, txid)))
+}
+
+fn decode_binary_field_with_context<'a>(
+    ctype: ColType,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    catalog: Option<(&Storage, u32)>,
 ) -> Result<Datum<'a>, SqlError> {
     use crate::sql::types::oid as oids;
     let bad = || {
@@ -9418,7 +9432,7 @@ fn decode_binary_field_with_storage<'a>(
         ColType::Cidr => via(oids::CIDR),
         ColType::Macaddr => via(oids::MACADDR),
         ColType::Macaddr8 => via(oids::MACADDR8),
-        ColType::Array(element) => decode_binary_array(element, bytes, arena, storage),
+        ColType::Array(element) => decode_binary_array(element, bytes, arena, catalog),
         ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
         ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),
         ColType::Bit { varying } => decode_binary_bit(varying, bytes, arena),
@@ -9429,7 +9443,7 @@ fn decode_binary_field_with_storage<'a>(
         )),
         ColType::Enum(slot) => {
             let label = core::str::from_utf8(bytes).map_err(|_| bad())?;
-            let Some(storage) = storage else {
+            let Some((storage, _)) = catalog else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "binary input of a user-defined enum requires catalog context"
@@ -9501,13 +9515,16 @@ fn decode_binary_array<'a>(
     element: crate::sql::types::ArrElem,
     bytes: &'a [u8],
     arena: &'a Arena,
-    storage: Option<&Storage>,
+    catalog: Option<(&Storage, u32)>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary array");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
     let ndim = reader.i32().map_err(|_| bad())?;
-    let _has_null = reader.i32().map_err(|_| bad())?;
-    let _element_oid = reader.i32().map_err(|_| bad())?;
+    let has_null = reader.i32().map_err(|_| bad())?;
+    let element_oid = reader.i32().map_err(|_| bad())?;
+    if !(0..=1).contains(&has_null) || element_oid != element.element_oid() {
+        return Err(bad());
+    }
     if ndim == 0 {
         if !reader.done() {
             return Err(bad());
@@ -9533,17 +9550,19 @@ fn decode_binary_array<'a>(
     }
     let element_type = element.to_coltype();
     let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let mut saw_null = false;
     for slot in items.iter_mut().take(count as usize) {
         let len = reader.i32().map_err(|_| bad())?;
         if len < 0 {
             *slot = Datum::Null;
+            saw_null = true;
             continue;
         }
         let field = reader.take(len as usize).map_err(|_| bad())?;
-        let value = decode_binary_field_with_storage(element_type, field, arena, storage)?;
+        let value = decode_binary_field_with_context(element_type, field, arena, catalog)?;
         *slot = match element {
             crate::sql::types::ArrElem::Domain { slot, .. } => {
-                let Some(storage) = storage else {
+                let Some((storage, txid)) = catalog else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "binary input of a domain array requires catalog context"
@@ -9553,7 +9572,7 @@ fn decode_binary_array<'a>(
                     storage,
                     slot as usize,
                     value,
-                    u32::MAX,
+                    txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
                 )?
@@ -9562,6 +9581,9 @@ fn decode_binary_array<'a>(
         };
     }
     if !reader.done() {
+        return Err(bad());
+    }
+    if (has_null != 0) != saw_null {
         return Err(bad());
     }
     Ok(Datum::Array {

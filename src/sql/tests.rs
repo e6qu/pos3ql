@@ -1426,6 +1426,139 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
 }
 
+#[test]
+fn binary_parameters_resolve_catalog_types_before_decoding() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE binary_state AS ENUM ('ready', 'blocked'); \
+         CREATE DOMAIN binary_positive AS integer CHECK (VALUE > 0); \
+         CREATE DOMAIN binary_required AS integer NOT NULL",
+    );
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        engine
+            .storage
+            .enum_slot("public", "binary_state", 0)
+            .unwrap() as u16,
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_positive", 0)
+            .unwrap() as u16,
+    );
+    let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
+
+    assert_eq!(
+        engine
+            .decode_binary_parameter(enum_oid, b"ready", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "ready"
+    );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(domain_oid, &7_i32.to_be_bytes(), &arena, 0)
+            .unwrap()
+            .to_string(),
+        "7"
+    );
+    let invalid_enum = engine
+        .decode_binary_parameter(enum_oid, b"missing", &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_enum.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
+    let invalid_domain = engine
+        .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_domain.sqlstate, sqlstate::CHECK_VIOLATION);
+    let required_domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_required", 0)
+            .unwrap() as u16,
+    );
+    let null_domain = engine
+        .coerce_parameter_null(required_domain_oid, &arena, 0)
+        .unwrap_err();
+    assert_eq!(null_domain.sqlstate, sqlstate::NOT_NULL_VIOLATION);
+
+    let mut enum_array = Vec::new();
+    enum_array.extend_from_slice(&1_i32.to_be_bytes());
+    enum_array.extend_from_slice(&0_i32.to_be_bytes());
+    enum_array.extend_from_slice(&enum_oid.to_be_bytes());
+    enum_array.extend_from_slice(&2_i32.to_be_bytes());
+    enum_array.extend_from_slice(&1_i32.to_be_bytes());
+    for value in [b"ready".as_slice(), b"blocked".as_slice()] {
+        enum_array.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        enum_array.extend_from_slice(value);
+    }
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::enum_array_oid(
+                    engine
+                        .storage
+                        .enum_slot("public", "binary_state", 0)
+                        .unwrap() as u16,
+                ),
+                &enum_array,
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{ready,blocked}"
+    );
+
+    let mut domain_array = Vec::new();
+    domain_array.extend_from_slice(&1_i32.to_be_bytes());
+    domain_array.extend_from_slice(&0_i32.to_be_bytes());
+    domain_array.extend_from_slice(&domain_oid.to_be_bytes());
+    domain_array.extend_from_slice(&2_i32.to_be_bytes());
+    domain_array.extend_from_slice(&1_i32.to_be_bytes());
+    for value in [3_i32, 5_i32] {
+        domain_array.extend_from_slice(&4_i32.to_be_bytes());
+        domain_array.extend_from_slice(&value.to_be_bytes());
+    }
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::domain_array_oid(
+                    engine
+                        .storage
+                        .domain_slot("public", "binary_positive", 0)
+                        .unwrap() as u16,
+                ),
+                &domain_array,
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{3,5}"
+    );
+    domain_array[8..12].copy_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+    let wrong_element_oid = engine
+        .decode_binary_parameter(
+            crate::sql::types::oid::domain_array_oid(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_positive", 0)
+                    .unwrap() as u16,
+            ),
+            &domain_array,
+            &arena,
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(wrong_element_oid.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    let missing_type = engine
+        .decode_binary_parameter(crate::sql::types::oid::enum_oid(31), b"ready", &arena, 0)
+        .unwrap_err();
+    assert_eq!(missing_type.sqlstate, sqlstate::UNDEFINED_OBJECT);
+}
+
 /// Like run_with but with a caller-owned TxnState, so explicit
 /// transactions span calls (one call ≈ one wire message).
 fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_text: &str) -> String {

@@ -159,6 +159,16 @@ pub struct Engine {
     role_connections: [u16; crate::storage::MAX_ROLES],
 }
 
+/// A binary Bind parameter type after its OID has been resolved against the
+/// active catalog. Keeping user-defined identities distinct prevents a raw OID
+/// from being mistaken for a built-in type or indexing an absent catalog slot.
+#[derive(Clone, Copy)]
+enum BinaryParameterType {
+    Builtin(ColType),
+    Domain { slot: usize, base: ColType },
+    DomainArray(crate::sql::types::ArrElem),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RoleLogin {
     pub slot: u16,
@@ -581,6 +591,134 @@ fn publication_selects(
 }
 
 impl Engine {
+    pub(crate) fn coerce_parameter_null<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<Datum<'a>, SqlError> {
+        // An untyped NULL remains the protocol's unknown value. Every resolved
+        // domain, however, must enforce its NOT NULL and CHECK constraints.
+        if oid == 0 {
+            return Ok(Datum::Null);
+        }
+        match self.resolve_binary_parameter_type(oid, txid)? {
+            BinaryParameterType::Domain { slot, .. } => exec::coerce_domain_value(
+                &self.storage,
+                slot,
+                Datum::Null,
+                txid,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            ),
+            BinaryParameterType::Builtin(_) | BinaryParameterType::DomainArray(_) => {
+                Ok(Datum::Null)
+            }
+        }
+    }
+
+    pub(crate) fn decode_binary_parameter<'a>(
+        &self,
+        oid: i32,
+        bytes: &'a [u8],
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<Datum<'a>, SqlError> {
+        let parameter_type = self.resolve_binary_parameter_type(oid, txid)?;
+        match parameter_type {
+            BinaryParameterType::Builtin(ctype) => {
+                exec::decode_binary_field_with_catalog(ctype, bytes, arena, &self.storage, txid)
+            }
+            BinaryParameterType::Domain { slot, base } => {
+                let value = exec::decode_binary_field_with_catalog(
+                    base,
+                    bytes,
+                    arena,
+                    &self.storage,
+                    txid,
+                )?;
+                exec::coerce_domain_value(
+                    &self.storage,
+                    slot,
+                    value,
+                    txid,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                )
+            }
+            BinaryParameterType::DomainArray(element) => exec::decode_binary_field_with_catalog(
+                ColType::Array(element),
+                bytes,
+                arena,
+                &self.storage,
+                txid,
+            ),
+        }
+    }
+
+    fn resolve_binary_parameter_type(
+        &self,
+        oid: i32,
+        txid: u32,
+    ) -> Result<BinaryParameterType, SqlError> {
+        use crate::sql::types::oid as oids;
+
+        let unknown_type = || {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "binary parameter type OID {} does not exist",
+                oid
+            )
+        };
+        let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
+        if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+            .contains(&oid)
+        {
+            let domain = self.storage.domain(domain_slot);
+            if !domain.visible_to(txid) {
+                return Err(unknown_type());
+            }
+            return Ok(BinaryParameterType::Domain {
+                slot: domain_slot,
+                base: domain.base,
+            });
+        }
+        let domain_array_slot = (oid - oids::FIRST_DOMAIN_ARRAY) as usize;
+        if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+            .contains(&oid)
+        {
+            let domain = self.storage.domain(domain_array_slot);
+            if !domain.visible_to(txid) {
+                return Err(unknown_type());
+            }
+            let element = crate::sql::types::ArrElem::domain(domain_array_slot as u16, domain.base)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "binary input of an array-valued domain is not supported"
+                    )
+                })?;
+            return Ok(BinaryParameterType::DomainArray(element));
+        }
+
+        let ctype = ColType::from_oid(oid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "binary format for parameter type OID {} is not implemented",
+                oid
+            )
+        })?;
+        match ctype {
+            ColType::Enum(slot) | ColType::Array(crate::sql::types::ArrElem::Enum(slot))
+                if slot as usize >= self.storage.enum_count()
+                    || !self.storage.enum_def(slot as usize).visible_to(txid) =>
+            {
+                Err(unknown_type())
+            }
+            _ => Ok(BinaryParameterType::Builtin(ctype)),
+        }
+    }
+
     pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
         let slot = self.storage.find_role(name)?;
         let attributes = self.storage.role(slot).attributes;

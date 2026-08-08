@@ -2008,19 +2008,34 @@ impl Conn {
                 .enumerate()
             {
                 if len == u32::MAX {
-                    params[i] = Datum::Null;
+                    match engine.coerce_parameter_null(param_oids[i], &self.arena, self.txn.txid) {
+                        Ok(value) => params[i] = value,
+                        Err(error) => {
+                            return ext_err(
+                                &mut self.send,
+                                &mut self.phase,
+                                error.sqlstate,
+                                error.message.as_str(),
+                            );
+                        }
+                    }
                     continue;
                 }
                 let bytes = &raw[offset as usize..(offset + len) as usize];
                 if portal.binary[i] {
-                    match decode_binary_param(param_oids[i], bytes, &self.arena) {
+                    match engine.decode_binary_parameter(
+                        param_oids[i],
+                        bytes,
+                        &self.arena,
+                        self.txn.txid,
+                    ) {
                         Ok(v) => params[i] = v,
-                        Err(message) => {
+                        Err(error) => {
                             return ext_err(
                                 &mut self.send,
                                 &mut self.phase,
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                message,
+                                error.sqlstate,
+                                error.message.as_str(),
                             );
                         }
                     }

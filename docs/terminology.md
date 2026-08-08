@@ -3,8 +3,8 @@
 ## Naming
 
 - Spell identifiers out: `interval`, `buffer`, `expression`, `statement`, and `index`, not abbreviations.
-- Standard acronyms are allowed: SQL, WAL, SST, LSN, OID, HTTP, TLS, UUID, JSON, and VSR.
-- Established module names are allowed: `ast`, `eval`, `exec`, `guc`, `io`, `mem`, `pg`, `sim`, `sql`, `vsr`, and `wal`.
+- Standard acronyms are allowed: SQL, WAL, SST, LSN, OID, HTTP, TLS, UUID, and JSON.
+- Established module names are allowed: `ast`, `eval`, `exec`, `guc`, `io`, `mem`, `pg`, `sim`, `sql`, and `wal`.
 - Use a coined term only when it carries a repeated, specific meaning; define it here.
 - Single-letter names are limited to conventional local indices and published algorithm notation.
 
@@ -20,7 +20,6 @@
 - `checkpoint`: SST publication and cold recovery.
 - `store`: block formats and cache tiers.
 - `entity tag`: an opaque, strong, quoted object generation token used for compare-and-swap.
-- `vsr`: Viewstamped Replication.
 - `sim`: deterministic fault simulation.
 
 ## Glossary
@@ -38,5 +37,4 @@
 - **physical-demand proof**: the columns a query path may read from a physical row.
 - **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
-- **VSR**: Viewstamped Replication, the consensus protocol used by pos3ql.
 - **WAL**: checksummed local journal encoding used for recovery and logical replication; it is not PostgreSQL physical XLOG.

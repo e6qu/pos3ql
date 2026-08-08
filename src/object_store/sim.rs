@@ -1,9 +1,9 @@
-//! The virtual bucket: a deterministic, in-process object store standing in
+//! A virtual namespace: a deterministic, in-process object store standing in
 //! for the provider-neutral [`crate::object_store::Client`] — the storage
 //! VOPR's seam.
 //!
 //! `object_store = sim` routes every object operation here instead of a socket. The
-//! bucket is plain memory shared by every client opened on the same name
+//! namespace is plain memory shared by every client opened on the same name
 //! (the checkpointer holds two, exactly as it holds two real clients), and
 //! every fault it injects is drawn from a PCG stream, so a failing run
 //! reproduces exactly from its seed. The faults are the ones a real bucket
@@ -13,7 +13,7 @@
 //! for a crash, since everything after it is what a restarted process would
 //! find.
 //!
-//! The bucket also *watches*: an unconditional overwrite that changes an
+//! The namespace also *watches*: an unconditional overwrite that changes an
 //! existing object's bytes is recorded, because the engine's key discipline
 //! forbids it — blocks are content-addressed (a rewrite is byte-identical
 //! by construction), the manifest moves only by compare-and-swap, and a WAL
@@ -38,7 +38,7 @@ use crate::stack_format;
 use crate::object_store::{ByteRange, EntityTag, Error, GetResult, Precondition};
 
 /// Fault probabilities in parts per thousand, plus the outage schedule.
-/// All zeros (the default) is a perfectly healthy bucket.
+/// All zeros (the default) is a perfectly healthy namespace.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FaultPlan {
     /// Every operation whose index is at or past this fails with an I/O
@@ -61,10 +61,10 @@ struct StoredObject {
     etag: u64,
 }
 
-/// The shared bucket state. One per name, held behind `Rc<RefCell<..>>` by
+/// The shared namespace state. One per name, held behind `Rc<RefCell<..>>` by
 /// every [`SimClient`] opened on it and by the test harness steering faults.
-pub(crate) struct SimBucket {
-    /// Sorted by key, so LIST order is S3's lexicographic order.
+pub(crate) struct SimNamespace {
+    /// Sorted by key, matching the gateway's lexicographic LIST order.
     objects: Vec<StoredObject>,
     next_etag: u64,
     /// Operations served so far — the clock `fail_from_op` is measured on.
@@ -75,7 +75,7 @@ pub(crate) struct SimBucket {
     pub(crate) blind_overwrites: Vec<String>,
 }
 
-impl SimBucket {
+impl SimNamespace {
     fn new(seed: u64) -> Self {
         Self {
             objects: Vec::new(),
@@ -120,7 +120,7 @@ impl SimBucket {
 
 fn io_fault(detail: &str) -> Error {
     Error::Io {
-        context: "virtual bucket",
+        context: "virtual namespace",
         kind: std::io::ErrorKind::ConnectionReset,
         detail: stack_format!(160, "{detail}"),
     }
@@ -132,31 +132,31 @@ fn entity_tag(etag: u64) -> EntityTag {
 }
 
 thread_local! {
-    /// One bucket per name per thread. Tests run on their own threads and
-    /// name buckets uniquely, so incarnations of the same engine (restart,
-    /// cold start) find the same bucket while tests stay isolated.
-    static BUCKETS: RefCell<Vec<(String, Rc<RefCell<SimBucket>>)>> =
+    /// One namespace per name per thread. Tests run on their own threads and
+    /// name namespaces uniquely, so incarnations of the same engine (restart,
+    /// cold start) find the same namespace while tests stay isolated.
+    static NAMESPACES: RefCell<Vec<(String, Rc<RefCell<SimNamespace>>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
-/// Opens (or creates) the named bucket. The harness opens it first to hold
+/// Opens (or creates) the named namespace. The harness opens it first to hold
 /// the fault-steering handle; the engine's clients then share it.
-pub(crate) fn open_bucket(name: &str, seed: u64) -> Rc<RefCell<SimBucket>> {
-    BUCKETS.with(|buckets| {
-        let mut buckets = buckets.borrow_mut();
-        if let Some((_, bucket)) = buckets.iter().find(|(n, _)| n == name) {
-            return Rc::clone(bucket);
+pub(crate) fn open_namespace(name: &str, seed: u64) -> Rc<RefCell<SimNamespace>> {
+    NAMESPACES.with(|namespaces| {
+        let mut namespaces = namespaces.borrow_mut();
+        if let Some((_, namespace)) = namespaces.iter().find(|(n, _)| n == name) {
+            return Rc::clone(namespace);
         }
-        let bucket = Rc::new(RefCell::new(SimBucket::new(seed)));
-        buckets.push((name.to_string(), Rc::clone(&bucket)));
-        bucket
+        let namespace = Rc::new(RefCell::new(SimNamespace::new(seed)));
+        namespaces.push((name.to_string(), Rc::clone(&namespace)));
+        namespace
     })
 }
 
-/// Drops the named bucket, so a harness can start a world from nothing.
+/// Drops the named namespace, so a harness can start a world from nothing.
 #[cfg(test)]
-pub(crate) fn drop_bucket(name: &str) {
-    BUCKETS.with(|buckets| buckets.borrow_mut().retain(|(n, _)| n != name));
+pub(crate) fn drop_namespace(name: &str) {
+    NAMESPACES.with(|namespaces| namespaces.borrow_mut().retain(|(n, _)| n != name));
 }
 
 /// The client half: what [`crate::object_store::Client::Simulator`] holds.
@@ -166,7 +166,7 @@ pub(crate) fn drop_bucket(name: &str) {
 /// statuses, DELETE of a missing key succeeding, LIST in key order with the
 /// configured key prefix stripped.
 pub(crate) struct SimClient {
-    bucket: Rc<RefCell<SimBucket>>,
+    namespace: Rc<RefCell<SimNamespace>>,
     key_prefix: String,
     body: FixedBuf,
 }
@@ -174,7 +174,7 @@ pub(crate) struct SimClient {
 impl SimClient {
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         Ok(Self {
-            bucket: open_bucket(&config.object_store_bucket, 0),
+            namespace: open_namespace(&config.object_store_namespace, 0),
             key_prefix: config.object_store_prefix.clone(),
             body: FixedBuf::new(
                 budget,
@@ -198,7 +198,7 @@ impl SimClient {
         precondition: Precondition,
     ) -> Result<EntityTag, Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let position = bucket.find(&full);
         match (&precondition, &position) {
@@ -251,7 +251,7 @@ impl SimClient {
 
     pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let at = match bucket.find(&full) {
             Ok(at) => at,
@@ -302,7 +302,7 @@ impl SimClient {
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         let full = self.full_key(key);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         if let Ok(at) = bucket.find(&full) {
             bucket.objects.remove(at);
@@ -316,7 +316,7 @@ impl SimClient {
         mut each: impl FnMut(&str),
     ) -> Result<usize, Error> {
         let full_prefix = self.full_key(prefix);
-        let mut bucket = self.bucket.borrow_mut();
+        let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         let mut count = 0usize;
         for object in &bucket.objects {
@@ -340,11 +340,11 @@ fn status(code: u16, message: &str) -> Error {
 mod tests {
     use super::*;
 
-    fn client(name: &str) -> (SimClient, Rc<RefCell<SimBucket>>) {
-        drop_bucket(name);
-        let bucket = open_bucket(name, 7);
+    fn client(name: &str) -> (SimClient, Rc<RefCell<SimNamespace>>) {
+        drop_namespace(name);
+        let bucket = open_namespace(name, 7);
         let mut config = Config::default_dev();
-        config.object_store_bucket = name.to_string();
+        config.object_store_namespace = name.to_string();
         config.object_store_prefix = "p/".to_string();
         config.object_store_response_bytes = 64;
         let mut budget = Budget::new(1 << 20);

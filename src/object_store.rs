@@ -3,9 +3,8 @@
 //! WAL upload, manifests, garbage collection, checkpoints, and the block cache
 //! all speak this module's six semantics: immutable or conditional PUT,
 //! whole/ranged GET, LIST, DELETE, and compare-and-swap through an ETag.  A
-//! backend may be AWS S3, MinIO, a GCS/Azure compatibility gateway, a future
-//! native adapter, or the deterministic simulator; code above this boundary
-//! cannot observe which one it is.
+//! backend is selected by the gateway; code above this boundary cannot observe
+//! its concrete durable store.
 //!
 //! The concrete adapter choice is an enum rather than a trait object.  That
 //! keeps dispatch allocation-free and makes the fixed startup memory budget
@@ -13,9 +12,10 @@
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::s3::S3Client;
+use crate::object_store::http::HttpClient;
 use crate::util::StackStr;
 
+pub mod http;
 pub(crate) mod sim;
 
 /// A strong object generation token returned by the provider.
@@ -192,20 +192,13 @@ impl Error {
 #[derive(Debug)]
 pub(crate) enum SetupError {
     Budget(BudgetError),
-    Credentials(&'static str),
-    Adapter(crate::s3::S3SetupError),
+    Adapter(http::HttpSetupError),
 }
 
 impl std::fmt::Display for SetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::Credentials(what) => {
-                write!(
-                    formatter,
-                    "object storage is enabled but credentials are missing ({what})"
-                )
-            }
             Self::Adapter(error) => write!(formatter, "{error}"),
         }
     }
@@ -219,51 +212,35 @@ impl From<BudgetError> for SetupError {
     }
 }
 
-impl From<crate::s3::S3SetupError> for SetupError {
-    fn from(error: crate::s3::S3SetupError) -> Self {
+impl From<http::HttpSetupError> for SetupError {
+    fn from(error: http::HttpSetupError) -> Self {
         Self::Adapter(error)
     }
 }
 
 /// One durable-object client.
 ///
-/// Provider-specific signing, endpoint behavior, and retry dialects terminate
-/// inside an adapter variant.  Adding a native provider therefore changes this
-/// module and that adapter only; storage, WAL, cache, and query code remain
-/// unchanged.
+/// The network client speaks the gateway contract; the simulator implements
+/// the same semantics for deterministic tests.
 #[allow(
     clippy::large_enum_variant,
     reason = "two long-lived instances per process; boxing buys nothing"
 )]
 pub(crate) enum Client {
-    S3(S3Client),
+    Http(HttpClient),
     Simulator(sim::SimClient),
 }
 
 impl Client {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        S3Client::budget_bytes(config)
+        HttpClient::budget_bytes(config)
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, SetupError> {
-        let mut config = config.clone();
-        // Credentials and their conventional environment fallbacks are an
-        // adapter concern. The simulator signs nothing.
-        if config.object_store_access_key.is_empty() && !config.object_store_sim {
-            config.object_store_access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-                SetupError::Credentials("object_store_access_key / AWS_ACCESS_KEY_ID")
-            })?;
-        }
-        if config.object_store_secret_key.is_empty() && !config.object_store_sim {
-            config.object_store_secret_key =
-                std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-                    SetupError::Credentials("object_store_secret_key / AWS_SECRET_ACCESS_KEY")
-                })?;
-        }
         if config.object_store_sim {
-            Ok(Self::Simulator(sim::SimClient::new(&config, budget)?))
+            Ok(Self::Simulator(sim::SimClient::new(config, budget)?))
         } else {
-            Ok(Self::S3(S3Client::new(&config, budget)?))
+            Ok(Self::Http(HttpClient::new(config, budget)?))
         }
     }
 
@@ -274,14 +251,14 @@ impl Client {
         precondition: Precondition<'_>,
     ) -> Result<EntityTag, Error> {
         match self {
-            Self::S3(client) => client.put(key, body, precondition),
+            Self::Http(client) => client.put(key, body, precondition),
             Self::Simulator(client) => client.put(key, body, precondition),
         }
     }
 
     pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         match self {
-            Self::S3(client) => client.get(key, range),
+            Self::Http(client) => client.get(key, range),
             Self::Simulator(client) => client.get(key, range),
         }
     }
@@ -289,7 +266,7 @@ impl Client {
     /// Bytes returned by the most recent successful GET.
     pub(crate) fn body_bytes(&self) -> &[u8] {
         match self {
-            Self::S3(client) => client.body_bytes(),
+            Self::Http(client) => client.body_bytes(),
             Self::Simulator(client) => client.body_bytes(),
         }
     }
@@ -297,40 +274,40 @@ impl Client {
     /// Maximum whole or ranged response the adapter can return.
     pub(crate) fn response_capacity(&self) -> usize {
         match self {
-            Self::S3(client) => client.response_capacity(),
+            Self::Http(client) => client.response_capacity(),
             Self::Simulator(client) => client.response_capacity(),
         }
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         match self {
-            Self::S3(client) => client.delete(key),
+            Self::Http(client) => client.delete(key),
             Self::Simulator(client) => client.delete(key),
         }
     }
 
     pub(crate) fn list(&mut self, prefix: &str, each: impl FnMut(&str)) -> Result<usize, Error> {
         match self {
-            Self::S3(client) => client.list(prefix, each),
+            Self::Http(client) => client.list(prefix, each),
             Self::Simulator(client) => client.list(prefix, each),
         }
     }
 
     pub(crate) fn pending_get_fd(&self) -> Option<std::os::fd::RawFd> {
         match self {
-            Self::S3(client) => client.pending_fd(),
+            Self::Http(client) => client.pending_fd(),
             Self::Simulator(_) => None,
         }
     }
 
     pub(crate) fn enable_async_gets(&mut self) {
-        if let Self::S3(client) = self {
+        if let Self::Http(client) = self {
             client.enable_async_gets();
         }
     }
 
     pub(crate) fn disable_async_gets(&mut self) {
-        if let Self::S3(client) = self {
+        if let Self::Http(client) = self {
             client.disable_async_gets();
         }
     }
@@ -340,7 +317,7 @@ impl Client {
     /// more data is needed.
     pub(crate) fn advance_get(&mut self) -> Result<(), Error> {
         match self {
-            Self::S3(client) => client.advance_pending().map(|_| ()),
+            Self::Http(client) => client.advance_pending().map(|_| ()),
             Self::Simulator(_) => Ok(()),
         }
     }
@@ -348,7 +325,7 @@ impl Client {
     /// Discards an incomplete response after a terminal read error.
     pub(crate) fn clear_pending_get(&mut self) {
         match self {
-            Self::S3(client) => client.clear_pending(),
+            Self::Http(client) => client.clear_pending(),
             Self::Simulator(_) => {}
         }
     }
@@ -362,13 +339,13 @@ pub(crate) fn writer_id(config: &Config) -> u64 {
 
     let mut low = Crc32c::new();
     low.update(config.object_store_endpoint.as_bytes());
-    low.update(config.object_store_bucket.as_bytes());
+    low.update(config.object_store_namespace.as_bytes());
     low.update(config.object_store_prefix.as_bytes());
     low.update(config.data_dir.as_bytes());
     let mut high = Crc32c::new();
     high.update(config.data_dir.as_bytes());
     high.update(config.object_store_prefix.as_bytes());
-    high.update(config.object_store_bucket.as_bytes());
+    high.update(config.object_store_namespace.as_bytes());
     high.update(config.object_store_endpoint.as_bytes());
     (u64::from(high.finish()) << 32) | u64::from(low.finish())
 }
@@ -380,9 +357,9 @@ mod tests {
     fn simulated() -> Client {
         let mut config = Config::default_dev();
         config.object_store_sim = true;
-        config.object_store_bucket = format!("object-contract-{}", std::process::id());
-        sim::drop_bucket(&config.object_store_bucket);
-        let _bucket = sim::open_bucket(&config.object_store_bucket, 7);
+        config.object_store_namespace = format!("object-contract-{}", std::process::id());
+        sim::drop_namespace(&config.object_store_namespace);
+        let _namespace = sim::open_namespace(&config.object_store_namespace, 7);
         let mut budget = Budget::new(Client::budget_bytes(&config) + 4096);
         Client::new(&config, &mut budget).unwrap()
     }
@@ -441,12 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn writer_identity_covers_endpoint_bucket_prefix_and_journal() {
+    fn writer_identity_covers_endpoint_namespace_prefix_and_journal() {
         let base = Config::default_dev();
         let baseline = writer_id(&base);
         for mutate in [
             |config: &mut Config| config.object_store_endpoint.push('x'),
-            |config: &mut Config| config.object_store_bucket.push('x'),
+            |config: &mut Config| config.object_store_namespace.push('x'),
             |config: &mut Config| config.object_store_prefix.push('x'),
             |config: &mut Config| config.data_dir.push('x'),
         ] {

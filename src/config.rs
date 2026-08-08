@@ -83,9 +83,9 @@ pub struct Config {
     /// configured namespace and a wiped node cold-starts from it.
     pub object_store_on: bool,
     /// `object_store = sim`: storage backed by the in-process deterministic
-    /// virtual bucket instead of a network endpoint — the storage VOPR's
+    /// virtual namespace instead of a network endpoint — the storage VOPR's
     /// seam. Implies `object_store_on`; refused by the real server binary (the
-    /// virtual bucket allocates freely and exists for simulation tests).
+    /// virtual namespace allocates freely and exists for simulation tests).
     pub object_store_sim: bool,
     /// Publish committed journal batches to durable object storage. Required
     /// with `object_store = on`: local disk is a cache.
@@ -95,17 +95,14 @@ pub struct Config {
     pub wal_upload_sync: bool,
     /// Scratch for a published commit batch. Must hold one journal batch.
     pub wal_upload_buffer_bytes: usize,
-    /// Endpoint for the configured adapter. The first adapter speaks the
-    /// S3-compatible HTTP API used by AWS, MinIO, and compatibility gateways.
+    /// Generic object-store gateway authority (host:port).
     pub object_store_endpoint: String,
-    pub object_store_bucket: String,
-    /// Prepended to every object key; lets databases share a bucket.
+    /// Gateway namespace isolating this database's durable objects.
+    pub object_store_namespace: String,
+    /// Optional opaque bearer token for the gateway.
+    pub object_store_token: String,
+    /// Prepended to every object key within the namespace.
     pub object_store_prefix: String,
-    pub object_store_region: String,
-    /// Empty means "read AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the
-    /// environment at startup".
-    pub object_store_access_key: String,
-    pub object_store_secret_key: String,
     /// Request/response head assembly buffer.
     pub object_store_head_bytes: usize,
     /// Largest response body (bounds ranged GETs and LIST pages).
@@ -174,11 +171,9 @@ impl Config {
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
-            object_store_bucket: "pos3ql".to_string(),
+            object_store_namespace: "pos3ql".to_string(),
+            object_store_token: String::new(),
             object_store_prefix: String::new(),
-            object_store_region: "us-east-1".to_string(),
-            object_store_access_key: String::new(),
-            object_store_secret_key: String::new(),
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
             object_store_get_slots: 4,
@@ -211,25 +206,7 @@ impl Config {
             };
             let key = key.trim();
             let value = value.trim();
-            // `s3*` remains a strict compatibility alias for existing
-            // deployments. Canonicalize before duplicate detection so two
-            // spellings cannot quietly override one setting.
-            let canonical_key = match key {
-                "s3" => "object_store",
-                "s3_endpoint" => "object_store_endpoint",
-                "s3_bucket" => "object_store_bucket",
-                "s3_prefix" => "object_store_prefix",
-                "s3_region" => "object_store_region",
-                "s3_access_key" => "object_store_access_key",
-                "s3_secret_key" => "object_store_secret_key",
-                "s3_head_bytes" => "object_store_head_bytes",
-                "s3_response_bytes" => "object_store_response_bytes",
-                "s3_get_slots" => "object_store_get_slots",
-                "s3_hedge_after_ms" => "object_store_hedge_after_ms",
-                "s3_tls" => "object_store_tls",
-                "s3_tls_ca_file" => "object_store_tls_ca_file",
-                other => other,
-            };
+            let canonical_key = key;
             if seen.iter().any(|seen_key| seen_key == canonical_key) {
                 return Err(ConfigError::at(
                     line_no,
@@ -384,11 +361,9 @@ impl Config {
                     }
                 },
                 "object_store_endpoint" => config.object_store_endpoint = value.to_string(),
-                "object_store_bucket" => config.object_store_bucket = value.to_string(),
+                "object_store_namespace" => config.object_store_namespace = value.to_string(),
+                "object_store_token" => config.object_store_token = value.to_string(),
                 "object_store_prefix" => config.object_store_prefix = value.to_string(),
-                "object_store_region" => config.object_store_region = value.to_string(),
-                "object_store_access_key" => config.object_store_access_key = value.to_string(),
-                "object_store_secret_key" => config.object_store_secret_key = value.to_string(),
                 "object_store_head_bytes" => {
                     config.object_store_head_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -666,7 +641,7 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn object_store_defaults_to_commit_durable_on_bucket() {
+    fn object_store_defaults_to_commit_durable_in_namespace() {
         let c = Config::parse("object_store = on\n").unwrap();
         assert!(
             c.wal_upload && c.wal_upload_sync,
@@ -698,19 +673,19 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn legacy_s3_names_are_strict_aliases() {
-        let legacy = Config::parse(
-            "s3 = on\ns3_endpoint = minio:9000\ns3_bucket = db\ns3_get_slots = 7\ns3_hedge_after_ms = 175\ns3_tls = on\n",
-        )
-        .unwrap();
-        let neutral = Config::parse(
-            "object_store = on\nobject_store_endpoint = minio:9000\nobject_store_bucket = db\nobject_store_get_slots = 7\nobject_store_hedge_after_ms = 175\nobject_store_tls = on\n",
-        )
-        .unwrap();
-        assert_eq!(legacy, neutral);
-        let error = Config::parse("s3 = on\nobject_store = off\n").unwrap_err();
-        assert_eq!(error.line, 2);
-        assert!(error.message.contains("duplicate setting 'object_store'"));
+    fn provider_configuration_is_rejected() {
+        for key in [
+            "s3",
+            "s3_endpoint",
+            "object_store_bucket",
+            "object_store_region",
+            "object_store_access_key",
+            "object_store_secret_key",
+        ] {
+            let error = Config::parse(&format!("{key} = value\n")).unwrap_err();
+            assert_eq!(error.line, 1);
+            assert!(error.message.contains("unknown key"), "{error}");
+        }
     }
 
     #[test]

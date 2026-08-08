@@ -1,13 +1,13 @@
-//! Integration test against a real contract-preserving object store.
+//! Integration test against a real generic object-store gateway.
 //!
 //! Skipped unless `POS3QL_OBJECT_STORE_ENDPOINT` is set. Once enabled, the
-//! endpoint, bucket, region, access key, and secret key are all required so a
-//! qualification run never tests accidental development defaults.
+//! endpoint and namespace are required so qualification never tests defaults.
 
 use pos3ql::config::Config;
 use pos3ql::mem::{Arena, Budget, FixedBuf};
+use pos3ql::object_store::http::HttpClient;
+use pos3ql::object_store::{ByteRange, Precondition};
 use pos3ql::pg::respond::Responder;
-use pos3ql::s3::{ByteRange, Precondition, S3Client};
 use pos3ql::sql::Engine;
 
 const ENGINE_BUDGET_BYTES: usize = 512 << 20;
@@ -16,14 +16,9 @@ fn configured() -> Option<Config> {
     let endpoint = std::env::var("POS3QL_OBJECT_STORE_ENDPOINT").ok()?;
     let mut config = Config::default_dev();
     config.object_store_endpoint = endpoint;
-    config.object_store_bucket = std::env::var("POS3QL_OBJECT_STORE_BUCKET")
-        .expect("POS3QL_OBJECT_STORE_BUCKET is required with an endpoint");
-    config.object_store_region = std::env::var("POS3QL_OBJECT_STORE_REGION")
-        .expect("POS3QL_OBJECT_STORE_REGION is required with an endpoint");
-    config.object_store_access_key = std::env::var("POS3QL_OBJECT_STORE_ACCESS_KEY")
-        .expect("POS3QL_OBJECT_STORE_ACCESS_KEY is required with an endpoint");
-    config.object_store_secret_key = std::env::var("POS3QL_OBJECT_STORE_SECRET_KEY")
-        .expect("POS3QL_OBJECT_STORE_SECRET_KEY is required with an endpoint");
+    config.object_store_namespace = std::env::var("POS3QL_OBJECT_STORE_NAMESPACE")
+        .expect("POS3QL_OBJECT_STORE_NAMESPACE is required with an endpoint");
+    config.object_store_token = std::env::var("POS3QL_OBJECT_STORE_TOKEN").unwrap_or_default();
     config.object_store_tls = match std::env::var("POS3QL_OBJECT_STORE_TLS") {
         Ok(value) if matches!(value.as_str(), "on" | "true") => true,
         Ok(value) if matches!(value.as_str(), "off" | "false") => false,
@@ -35,10 +30,10 @@ fn configured() -> Option<Config> {
     Some(config)
 }
 
-fn client() -> Option<S3Client> {
+fn client() -> Option<HttpClient> {
     let config = configured()?;
     let mut budget = Budget::new(16 << 20);
-    Some(S3Client::new(&config, &mut budget).unwrap())
+    Some(HttpClient::new(&config, &mut budget).unwrap())
 }
 
 fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
@@ -121,7 +116,7 @@ fn rpo_zero_disk_loss_recovery() {
         );
         run_sql(&mut e, &mut budget, "INSERT INTO ledger VALUES (3, 300)");
     }
-    // Total disk loss: brand-new empty data dir, same bucket+prefix.
+    // Total disk loss: brand-new empty data dir, same namespace+prefix.
     let mut cfg2 = cfg.clone();
     let dir = std::env::temp_dir().join(format!("pos3ql-rpo-{}-wiped", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -171,7 +166,7 @@ fn delta_checkpoint_carries_clean_tables() {
     }
     run_sql(&mut e, &mut budget, "CHECKPOINT");
 
-    // Cold start from the bucket: both tables intact.
+    // Cold start from the namespace: both tables intact.
     let mut cfg2 = cfg.clone();
     let dir = std::env::temp_dir().join(format!("pos3ql-delta-{}-b", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -188,7 +183,7 @@ fn delta_checkpoint_carries_clean_tables() {
 }
 
 #[test]
-fn checkpoint_and_cold_start_from_bucket() {
+fn checkpoint_and_cold_start_from_namespace() {
     let Some(config_a) = engine_config("cold", "a") else {
         eprintln!("POS3QL_OBJECT_STORE_ENDPOINT not set; skipping");
         return;
@@ -242,11 +237,11 @@ fn checkpoint_and_cold_start_from_bucket() {
         assert!(out.contains("bolt") && out.contains("150"), "{out}");
         assert!(out.contains("screw"), "tail insert lost: {out}");
         assert!(!out.contains("nut"), "tail delete lost: {out}");
-        // Checkpoint everything so the bucket alone carries full state.
+        // Checkpoint everything so the namespace alone carries full state.
         run_sql(&mut e, &mut budget, "CHECKPOINT");
     }
 
-    // Node B: same bucket+prefix, EMPTY data dir — cold start.
+    // Node B: same namespace+prefix, EMPTY data dir — cold start.
     let mut config_b = config_a.clone();
     let dir_b = std::env::temp_dir().join(format!("pos3ql-ckpt-{}-cold-b", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir_b);

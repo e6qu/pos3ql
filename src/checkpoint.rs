@@ -842,7 +842,7 @@ impl Checkpointer {
     ) -> Result<(), CheckpointSetupError> {
         self.doomed_scratch.clear();
         let mut batch = self.commit_head;
-        while let Some(current) = batch.filter(|batch| batch.first_lsn > floor) {
+        while let Some(current) = batch {
             if self.doomed_scratch.len() == self.doomed_scratch.capacity() {
                 return Err(CheckpointSetupError::ObjectStore(format!(
                     "commit-head chain exceeds fixed limit {}",
@@ -874,6 +874,13 @@ impl Checkpointer {
                 current.digest
             ));
             batch = previous;
+            // A batch is identified by its first record, not its last. The
+            // first batch at or before the floor may straddle it, so replay it
+            // and let record framing discard covered records. Its predecessor
+            // cannot contribute a record past this batch's first LSN.
+            if current.first_lsn <= floor {
+                break;
+            }
         }
         for index in (0..self.doomed_scratch.len()).rev() {
             let key = self.doomed_scratch[index];
@@ -1000,6 +1007,14 @@ impl Checkpointer {
             }
             self.client
                 .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
+            let descriptor = key
+                .as_str()
+                .strip_suffix(".batch")
+                .map(|stem| crate::stack_format!(72, "{}.head", stem))
+                .expect("listed commit batch has its checked suffix");
+            self.client
+                .delete(descriptor.as_str())
                 .map_err(object_store_to_sql)?;
         }
         if overflow {

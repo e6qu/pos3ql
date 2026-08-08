@@ -1,4 +1,4 @@
-//! The object-storage backend: the bucket as the system of record.
+//! The object-storage backend: the namespace is the system of record.
 //!
 //! One object per block, named by the block's identity. That naming is what
 //! makes the write path forgiving: a PUT that times out after the object landed
@@ -7,7 +7,7 @@
 //! write anywhere in this layer, so two writers racing on the same block agree
 //! by construction rather than by locking.
 //!
-//! Reads verify. A block arriving from a bucket has crossed a network and a
+//! Reads verify. A block arriving from the namespace has crossed a network and a
 //! service this process does not control, so the identity hash is checked as
 //! well as the CRC — the one case a checksum cannot cover is being handed a
 //! *different* block that is itself intact.
@@ -140,7 +140,7 @@ fn decode_block_body(
     into: &mut [u8],
 ) -> Result<(usize, BlockType), StoreError> {
     // Verified against the name it was fetched under, not merely against
-    // its own header — a bucket handing back a different intact block is
+    // its own header — a namespace handing back a different intact block is
     // exactly what content-addressing is here to catch.
     let block = decode(body, true)?;
     if block.id != *id {
@@ -153,7 +153,7 @@ fn decode_block_body(
     Ok((block.payload.len(), block.block_type))
 }
 
-/// The bucket store that owns its client and scratch — the long-lived form a
+/// The namespace store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
     write_client: ObjectStore,
@@ -762,9 +762,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "pool-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "pool-test".to_string();
         config.object_store_get_slots = 2;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -833,9 +831,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "prefetch-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "prefetch-test".to_string();
         config.object_store_get_slots = 1;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -898,9 +894,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "packed-reactor-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "packed-reactor-test".to_string();
         config.object_store_get_slots = 1;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
@@ -1057,9 +1051,7 @@ mod tests {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
-        config.object_store_bucket = "hedge-test".to_string();
-        config.object_store_access_key = "key".to_string();
-        config.object_store_secret_key = "secret".to_string();
+        config.object_store_namespace = "hedge-test".to_string();
         config.object_store_get_slots = 2;
         config.object_store_hedge_after_ms = 1;
         let mut budget = Budget::new(16 << 20);

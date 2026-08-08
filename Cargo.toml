@@ -5,7 +5,7 @@ edition = "2024"
 
 # Dependency policy: std + libc only. libc provides raw syscall bindings
 # (kqueue/epoll, sockets, low-level file I/O) that have no std equivalent.
-# Everything else — PG wire protocol, SQL parser, HTTP/SigV4 S3 client,
+# Everything else — PG wire protocol, SQL parser, generic object-store HTTP client,
 # SHA-256/HMAC, CRC32C, PRNG, event loop — is implemented in this crate so
 # that all memory is statically allocated at startup and the core stays
 # deterministic for simulation testing.
@@ -13,7 +13,7 @@ edition = "2024"
 libc = "0.2"
 # The single whitelisted exception to the libc-only policy (see AGENTS.md and
 # PLAN.md Stage G): TLS is never hand-rolled. rustls runs isolated — every
-# call from the S3 client enters through `mem::guard::tls_scope`, whose
+# call from the object-store client enters through `mem::guard::tls_scope`, whose
 # allocations are counted against a startup-configured budget and abort loudly
 # past it, so the static-memory discipline holds everywhere else.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

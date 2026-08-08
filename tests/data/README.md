@@ -1,7 +1,7 @@
 # Test fixtures
 
 `tls-test-cert.pem` / `tls-test-key.pem` — a self-signed certificate for the
-in-process TLS round-trip test (`s3::tests::tls_round_trip`). Test-only trust:
+in-process TLS round-trip test (`object_store::http::tests::tls_round_trip`). Test-only trust:
 the test passes the certificate as `object_store_tls_ca_file`; nothing outside tests
 reads these files. Generated locally (2026-07-24, 20-year validity) with:
 

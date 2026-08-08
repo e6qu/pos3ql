@@ -418,7 +418,32 @@ impl Conn {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return After::Close,
         }
-        let after = self.process(engine, cancel_key, auth, tls_config);
+        // A failed prior publication is retried before this readable batch
+        // can observe its locally journaled state.  Close on failure: the
+        // client receives no success frame and can resolve the unknown
+        // outcome by reconnecting, rather than running behind a local-only
+        // commit.
+        if engine.commit_wal().is_err() {
+            return After::Close;
+        }
+        let output_mark = self.send.mark();
+        let mut after = self.process(engine, cancel_key, auth, tls_config);
+        if after != After::Close
+            && let Err(error) = engine.commit_wal()
+        {
+            // No success response may cross the object-store durability
+            // boundary.  The journal remains available for a later retry,
+            // but this client receives an explicit unknown-outcome error.
+            self.send.truncate_to(output_mark);
+            let mut responder = Responder::new(&mut self.send);
+            if responder
+                .error(error.sqlstate, error.message.as_str())
+                .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                .is_err()
+            {
+                after = After::Close;
+            }
+        }
         let flushed = self.flush();
         self.activate_pending_tls();
         match flushed {
@@ -1969,7 +1994,6 @@ impl Conn {
                     lock_timeout_expired,
                 )
             };
-            engine.maybe_checkpoint();
             let pending_copy = engine.take_pending_copy();
             self.arena.reset();
             match result {
@@ -2147,10 +2171,12 @@ impl Conn {
             let mut responder = Responder::new(&mut self.send);
             // Over TLS the drain must encrypt through the session onto the
             // blocking socket; in the clear it writes the fd directly.
-            if let Some(session) = self.tls.as_mut() {
-                responder = responder.with_flush_tls(session, self.stream.as_mut().unwrap());
-            } else if let Some(fd) = fd {
-                responder = responder.with_flush(fd);
+            if !engine.publication_required() {
+                if let Some(session) = self.tls.as_mut() {
+                    responder = responder.with_flush_tls(session, self.stream.as_mut().unwrap());
+                } else if let Some(fd) = fd {
+                    responder = responder.with_flush(fd);
+                }
             }
             engine.execute_simple_from(
                 text,
@@ -2168,10 +2194,6 @@ impl Conn {
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);
         }
-        // Transactions fsync at commit; only checkpoint housekeeping
-        // remains here (safe while transactions are open: it snapshots
-        // committed state only).
-        engine.maybe_checkpoint();
         let status = self.txn.status_byte();
         let step = match result {
             Ok(crate::sql::ExecutionStatus::Complete) => {

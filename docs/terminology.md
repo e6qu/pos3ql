@@ -30,7 +30,8 @@
 - **checkpoint**: immutable SST publication through a compare-and-swap manifest.
 - **cold start**: recovery with RAM and local disk caches absent.
 - **declared type identity**: the schema-qualified type visible in catalog, parameter, and replication metadata; distinct from an executor value type.
-- **durable mode**: `object_store = on`; acknowledgement requires uploaded WAL.
+- **commit batch**: immutable journal bytes plus a descriptor; recoverable only after the CAS commit head names it.
+- **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
 - **manifest**: compare-and-swap root naming the current immutable storage state.
 - **MVCC**: visibility by transaction and commit LSN.
 - **PAX**: column-oriented row groups inside an SST, allowing selective column reads.
@@ -38,4 +39,4 @@
 - **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
 - **VSR**: Viewstamped Replication, the consensus protocol used by pos3ql.
-- **WAL**: checksummed write-ahead log used for recovery and logical replication.
+- **WAL**: checksummed local journal encoding used for recovery and logical replication; it is not PostgreSQL physical XLOG.

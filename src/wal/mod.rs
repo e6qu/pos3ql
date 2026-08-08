@@ -23,6 +23,30 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
+
+/// One contiguous, committed journal range ready for immutable publication.
+/// Construction is private to the journal, so callers cannot pair an LSN with
+/// offsets from another batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedBatch {
+    first_lsn: u64,
+    start: u64,
+    end: u64,
+}
+
+impl CommittedBatch {
+    pub const fn first_lsn(self) -> u64 {
+        self.first_lsn
+    }
+
+    pub const fn byte_len(self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+}
 const TABLE_STATISTICS_V2: u8 = u8::MAX;
 
 const KIND_CREATE: u8 = 1;
@@ -964,17 +988,16 @@ impl Wal {
         Ok(())
     }
 
-    /// The batch just committed: (first LSN, file byte range). Valid only
-    /// immediately after commit(), before the next append.
-    pub fn last_committed_batch(&self) -> Option<(u64, u64, u64)> {
+    /// The committed range awaiting immutable publication.
+    pub fn last_committed_batch(&self) -> Option<CommittedBatch> {
         if self.batch_first_lsn == 0 {
             return None;
         }
-        Some((
-            self.batch_first_lsn,
-            self.batch_start_offset,
-            self.write_offset,
-        ))
+        Some(CommittedBatch {
+            first_lsn: self.batch_first_lsn,
+            start: self.batch_start_offset,
+            end: self.write_offset,
+        })
     }
 
     /// Bytes of committed-but-not-yet-uploaded WAL accumulated in the current

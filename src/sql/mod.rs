@@ -690,11 +690,11 @@ impl Engine {
             recovered.insert(lsn, record.to_vec());
             Ok(())
         })?;
-        // RPO=0: merge any WAL segments in the bucket newer than what the
+        // RPO=0: merge any commit batches in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
         let mut segment_tip = floor;
         if let Some(c) = ckpt.as_mut() {
-            c.replay_wal_segments(floor, |lsn, record| {
+            c.replay_commit_batches(floor, |lsn, record| {
                 segment_tip = segment_tip.max(lsn);
                 recovered.entry(lsn).or_insert_with(|| record.to_vec());
                 Ok(())
@@ -731,7 +731,7 @@ impl Engine {
                 segment.extend_from_slice(&crc.to_le_bytes());
                 segment.extend_from_slice(&body);
             }
-            c.upload_wal_segment(first, &segment)?;
+            c.publish_commit_batch(first, &segment)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
         storage.reconcile_serials();
@@ -824,9 +824,6 @@ impl Engine {
         self.wal.commit();
         self.storage.create_replication_slot(name, restart_lsn)?;
         self.storage.set_lsn(commit_lsn);
-        if self.wal_upload {
-            self.upload_wal_batch()?;
-        }
         Ok(restart_lsn)
     }
 
@@ -877,9 +874,6 @@ impl Engine {
         self.wal.commit();
         self.storage.drop_replication_slot(name.as_str())?;
         self.storage.set_lsn(commit_lsn);
-        if self.wal_upload {
-            self.upload_wal_batch()?;
-        }
         Ok(())
     }
 
@@ -921,9 +915,6 @@ impl Engine {
         self.storage
             .advance_replication_slot(name, confirmed_flush_lsn)?;
         self.storage.set_lsn(commit_lsn);
-        if self.wal_upload {
-            self.upload_wal_batch()?;
-        }
         Ok(())
     }
 
@@ -1786,6 +1777,21 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        // Keep the publication object inside its startup-reserved buffer.
+        // A full preceding batch is published before adding this transaction;
+        // therefore a single transaction is the largest unpublishable unit.
+        let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        let next_batch_bytes = self
+            .wal
+            .pending_batch_bytes()
+            .saturating_add(staged_bytes)
+            .saturating_add(crate::wal::HEADER_LEN as u64);
+        if next_batch_bytes > self.wal_seg_buf.capacity() as u64
+            && let Err(error) = self.commit_wal()
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let commit_lsn = match self.wal.commit_stage(txn.txid, self.storage.lsn()) {
             Ok(lsn) => lsn,
             Err(error) => {
@@ -1820,20 +1826,11 @@ impl Engine {
                 self.storage.clear_statistics_wal_dirty(slot);
             }
         }
-        // One fsync per transaction, before any promotion: this is the
-        // durability point — and the point of no return. A restart replays
-        // everything past it, so from here the transaction commits in this
-        // incarnation too, whatever the bucket says: an upload failure below
-        // is reported to the client (outcome unknown) only after the
-        // promotions, never instead of them. Failing first left a committed
-        // transaction invisible until the next restart resurrected it —
-        // state a client could watch move backward and then forward.
+        // The local journal makes the batch crash-recoverable while it waits
+        // for the protocol publication barrier.  The connection releases no
+        // successful response until that barrier has published the immutable
+        // batch to object storage.
         self.wal.commit();
-        let upload_result = if self.wal_upload {
-            self.upload_wal_batch()
-        } else {
-            Ok(())
-        };
         let mut altered_tables = [(usize::MAX, false); txn::MAX_TXN_DDL];
         let mut altered_count = 0usize;
         let mut index_tables = [usize::MAX; txn::MAX_TXN_DDL];
@@ -2053,7 +2050,7 @@ impl Engine {
         let notify_result = self.flush_committed_notifications(txn);
         guc.commit_transaction();
         txn.clear();
-        notify_result.and(index_result).and(upload_result)
+        notify_result.and(index_result)
     }
 
     /// Applies a committing transaction's buffered LISTEN/UNLISTEN to the shared
@@ -2295,35 +2292,44 @@ impl Engine {
         txn.failed = sp.failed;
     }
 
-    /// Makes journaled work durable. Called once per query message, before
-    /// results are flushed to the client.
+    /// Publishes every committed journal record accumulated since the prior
+    /// protocol flush.  This is the object-store acknowledgement barrier.
     pub fn commit_wal(&mut self) -> Result<(), SqlError> {
         self.wal.commit();
         self.upload_wal_batch()
     }
 
-    /// Uploads the just-committed WAL batch to the bucket (RPO=0 mode).
+    /// Whether success responses must remain buffered until commit-batch
+    /// publication completes.
+    pub(crate) const fn publication_required(&self) -> bool {
+        self.wal_upload
+    }
+
+    /// Publishes the accumulated immutable commit batch to the bucket.
     fn upload_wal_batch(&mut self) -> Result<(), SqlError> {
         if !self.wal_upload {
             return Ok(());
         }
-        let Some((first_lsn, start, end)) = self.wal.last_committed_batch() else {
+        let Some(batch) = self.wal.last_committed_batch() else {
             return Ok(());
         };
-        if end <= start {
+        if batch.byte_len() == 0 {
             self.wal.clear_batch_marker();
             return Ok(());
         }
-        let len = (end - start) as usize;
-        self.wal_seg_buf.resize(len, 0);
-        if self.wal.read_range(start, &mut self.wal_seg_buf).is_err() {
+        self.wal_seg_buf.resize(batch.byte_len(), 0);
+        if self
+            .wal
+            .read_range(batch.start(), &mut self.wal_seg_buf)
+            .is_err()
+        {
             return Err(SqlError {
                 sqlstate: sqlstate::IO_ERROR,
                 message: stack_format!(192, "cannot read WAL batch for upload"),
             });
         }
         if let Some(c) = self.ckpt.as_mut() {
-            c.upload_wal_segment(first_lsn, &self.wal_seg_buf)?;
+            c.publish_commit_batch(batch.first_lsn(), &self.wal_seg_buf)?;
         }
         self.wal.clear_batch_marker();
         Ok(())
@@ -2542,7 +2548,7 @@ impl Engine {
                     .oldest_replication_restart_lsn()
                     .unwrap_or(lsn)
                     .min(lsn);
-                let _ = ckpt.prune_wal_segments(retain_through);
+                let _ = ckpt.prune_commit_batches(retain_through);
             }
             self.wal.reset_after_checkpoint();
         }
@@ -2735,9 +2741,23 @@ impl Engine {
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<ExecutionStatus, WireFull> {
-        self.execute_simple_from(
+        // Embedders that call the engine directly have no protocol reactor to
+        // provide the response barrier. Preserve the same acknowledgement
+        // contract here; network connections use `execute_simple_from` and
+        // publish once per readable batch instead.
+        if let Err(error) = self.retry_pending_wal_upload() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
+        let output_mark = responder.buffer.mark();
+        let result = self.execute_simple_from(
             text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
-        )
+        )?;
+        if let Err(error) = self.commit_wal() {
+            responder.buffer.truncate_to(output_mark);
+            responder.error(error.sqlstate, error.message.as_str())?;
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2755,10 +2775,6 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
-        if let Err(error) = self.retry_pending_wal_upload() {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExecutionStatus::Complete);
-        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -2883,10 +2899,6 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
-        if let Err(error) = self.retry_pending_wal_upload() {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExtendedExecutionStatus::Complete(true));
-        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {

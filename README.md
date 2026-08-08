@@ -5,7 +5,7 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 ## Architecture
 
 - PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including binary Bind, Result, and COPY for implemented types.
-- Durable state: checksummed WAL, immutable SST blocks, and a compare-and-swap manifest. A node can cold-start with an empty local disk.
+- Durable state: immutable commit batches, immutable SST blocks, and compare-and-swap roots. A node can cold-start with an empty local disk.
 - Object storage: the engine depends only on immutable or conditional PUT, full/ranged GET, LIST, DELETE, and ETag compare-and-swap. The S3-compatible adapter works with S3 and MinIO; other providers require an adapter or gateway with the same contract.
 - Memory: all runtime memory is budgeted at startup. Pools and queues have fixed limits; exhaustion is an error.
 - Determinism: the core is event-driven and runs under deterministic fault simulation.
@@ -14,11 +14,11 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 
 | Mode | Acknowledgement | Survives local-disk loss |
 |---|---|---|
-| `object_store = off` | local WAL sync | no |
-| `object_store = on` | local WAL sync and object-store WAL upload | yes |
-| VSR (roadmap) | quorum ordering and object-store WAL upload | yes |
+| `object_store = off` | local journal sync | no |
+| `object_store = on` | immutable commit batch PUT and commit-head CAS | yes |
+| VSR (roadmap) | quorum ordering and object-store publication | yes |
 
-With object storage enabled, an acknowledgement waits for durable WAL in the bucket. Checkpoints publish immutable table state through a compare-and-swap manifest; recovery replays newer uploaded WAL. Local disk is never a durable special case in this mode.
+With object storage enabled, the server groups transactions received in one readable protocol batch, publishes their immutable journal bytes, then advances a CAS commit head before releasing success responses. Checkpoints publish immutable table state through a separate CAS manifest. Recovery follows the commit head beyond that manifest; local disk is a cache.
 
 ## Status
 

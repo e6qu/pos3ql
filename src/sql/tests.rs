@@ -6909,6 +6909,43 @@ fn comment_rolls_back() {
 }
 
 #[test]
+fn create_schema_embedded_elements_are_typed_and_requalified() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA typed_schema
+           CREATE TABLE rows (id integer)
+           CREATE VIEW row_view AS SELECT id FROM rows
+           CREATE INDEX rows_id ON rows (id);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO typed_schema.rows VALUES (7);
+             SELECT id FROM typed_schema.row_view;",
+        )),
+        ["7"]
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA invalid_schema CREATE SEQUENCE sequence_inside_schema",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("42601"),
+        "the parser must reject non-schema elements: {}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
 fn pg_restore_clean_owner_and_schema_cascade_surface() {
     let (mut e, mut b) = test_engine();
     let created = run_with(

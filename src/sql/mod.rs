@@ -4578,16 +4578,53 @@ impl Engine {
                         Ok(r) => r,
                         Err(e) => return Ok(Err(e)),
                     };
-                    if let Err(e) = self.execute_stmt(
-                        requalified,
-                        arena,
-                        params,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                    )? {
+                    let result = if let Stmt::CreateView {
+                        name,
+                        or_replace,
+                        sql,
+                    } = requalified
+                    {
+                        let schema = name
+                            .schema
+                            .expect("CREATE SCHEMA requalification assigns a schema");
+                        let schema_path = match eval::quote_ident_str(schema, arena) {
+                            Ok(path) => path,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        let role = guc.current_role();
+                        let path = self
+                            .storage
+                            .compute_path(schema_path, role.as_str(), txn.txid);
+                        let old_path = self.storage.swap_path(path);
+                        let result = exec::create_view(
+                            &mut self.storage,
+                            &mut self.wal,
+                            txn,
+                            exec::CreateViewCommand {
+                                name,
+                                or_replace: *or_replace,
+                                sql,
+                                raw_path: schema_path,
+                            },
+                            arena,
+                            responder,
+                        );
+                        self.storage.swap_path(old_path);
+                        result
+                    } else {
+                        self.execute_stmt(
+                            requalified,
+                            arena,
+                            params,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                        )
+                    };
+                    let result = result?;
+                    if let Err(e) = result {
                         return Ok(Err(e));
                     }
                 }
@@ -5555,7 +5592,7 @@ fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), W
 /// element that already names that schema passes through; one naming another
 /// schema is PostgreSQL's 42P15.
 fn requalify_schema_element<'a>(
-    element: &'a Stmt<'a>,
+    element: &'a ast::CreateSchemaElement<'a>,
     schema: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
@@ -5575,11 +5612,11 @@ fn requalify_schema_element<'a>(
         }
     };
     let rewritten = match element {
-        Stmt::CreateTable(c) => Stmt::CreateTable(ast::CreateTable {
+        ast::CreateSchemaElement::Table(c) => Stmt::CreateTable(ast::CreateTable {
             name: requalify(c.name)?,
             ..*c
         }),
-        Stmt::CreateView {
+        ast::CreateSchemaElement::View {
             name,
             or_replace,
             sql,
@@ -5588,7 +5625,7 @@ fn requalify_schema_element<'a>(
             or_replace: *or_replace,
             sql,
         },
-        Stmt::CreateIndex {
+        ast::CreateSchemaElement::Index {
             name,
             table,
             columns,
@@ -5599,13 +5636,6 @@ fn requalify_schema_element<'a>(
             columns,
             unique: *unique,
         },
-        other => {
-            let _ = other;
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "unsupported CREATE SCHEMA element"
-            ));
-        }
     };
     arena
         .alloc(rewritten)

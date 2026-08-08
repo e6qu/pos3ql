@@ -10,8 +10,8 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterTypeAction, CreateDomain, DomainCheck, PublicationOperations,
-    RoleOptions,
+    AlterDomainAction, AlterTypeAction, CreateDomain, CreateSchemaElement, DomainCheck,
+    PublicationOperations, RoleOptions,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -725,21 +725,51 @@ impl<'a> Parser<'a> {
             };
             n
         };
-        let mut elements: [&'a Stmt<'a>; 16] = [&Stmt::Begin(""); 16];
+        static EMPTY_SCHEMA_ELEMENT: CreateSchemaElement<'static> =
+            CreateSchemaElement::Table(CreateTable {
+                name: QualName {
+                    schema: None,
+                    name: "",
+                },
+                columns: &[],
+                constraints: &[],
+                likes: &[],
+                if_not_exists: false,
+            });
+        let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
         let mut n = 0usize;
         while self.peeked == Tok::Ident("create") {
             if n == elements.len() {
                 return Err(self.limit("schema elements", elements.len()));
             }
-            let element = self.create()?;
-            if !matches!(
-                element,
-                Stmt::CreateTable(_) | Stmt::CreateView { .. } | Stmt::CreateIndex { .. }
-            ) {
-                return Err(
-                    self.err_here("CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX")
-                );
-            }
+            let element = match self.create()? {
+                Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
+                Stmt::CreateView {
+                    name,
+                    or_replace,
+                    sql,
+                } => CreateSchemaElement::View {
+                    name,
+                    or_replace,
+                    sql,
+                },
+                Stmt::CreateIndex {
+                    name,
+                    table,
+                    columns,
+                    unique,
+                } => CreateSchemaElement::Index {
+                    name,
+                    table,
+                    columns,
+                    unique,
+                },
+                _ => {
+                    return Err(
+                        self.err_here("CREATE SCHEMA elements may be CREATE TABLE, VIEW, or INDEX")
+                    );
+                }
+            };
             elements[n] = self
                 .arena
                 .alloc(element)

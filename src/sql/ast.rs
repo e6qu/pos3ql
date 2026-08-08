@@ -12,6 +12,24 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+/// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
+/// from [`Stmt`] makes the parser's grammar guarantee available to execution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreateSchemaElement<'a> {
+    Table(CreateTable<'a>),
+    View {
+        name: QualName<'a>,
+        or_replace: bool,
+        sql: &'a str,
+    },
+    Index {
+        name: &'a str,
+        table: QualName<'a>,
+        columns: &'a [IndexColumn<'a>],
+        unique: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceTarget<'a> {
     pub table: QualName<'a>,
@@ -284,13 +302,13 @@ pub enum Stmt<'a> {
     /// `Select` above; this variant appears only when a set operator is present.
     SetQuery(SetQuery<'a>),
     /// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [element ...].
-    /// Elements are the embedded CREATE statements, executed with the new
+    /// Elements are the grammar-permitted CREATE forms, executed with the new
     /// schema as their creation target.
     CreateSchema {
         name: &'a str,
         authorization: Option<&'a str>,
         if_not_exists: bool,
-        elements: &'a [&'a Stmt<'a>],
+        elements: &'a [&'a CreateSchemaElement<'a>],
     },
     /// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
     DropSchema {

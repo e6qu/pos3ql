@@ -879,6 +879,16 @@ impl ArrElem {
         }
     }
 
+    /// The PostgreSQL element-type OID carried inside a binary array value.
+    /// Domain arrays retain the domain identity here even though their stored
+    /// values use the domain's base representation.
+    pub fn element_oid(self) -> i32 {
+        match self {
+            ArrElem::Domain { slot, .. } => oid::domain_oid(slot),
+            _ => self.to_coltype().oid(),
+        }
+    }
+
     pub fn code(self) -> u8 {
         match self {
             ArrElem::Bool => 0,

@@ -3196,6 +3196,7 @@ pub(crate) fn decode_binary_param<'a>(
         _ => match crate::sql::types::ColType::from_oid(oid) {
             Some(
                 ctype @ (crate::sql::types::ColType::Array(_)
+                | crate::sql::types::ColType::Int2Vector
                 | crate::sql::types::ColType::Range(_)
                 | crate::sql::types::ColType::Multirange(_)
                 | crate::sql::types::ColType::Bit { .. }),
@@ -3423,6 +3424,26 @@ mod tests {
                 Datum::Int4(12_345)
             );
         }
+    }
+
+    #[test]
+    fn binary_int2vector_uses_postgresql_array_representation() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary int2vector test", 64).expect("test arena");
+        let bytes = [
+            0, 0, 0, 1, // dimensions
+            0, 0, 0, 0, // no nulls
+            0, 0, 0, 21, // int2 element OID
+            0, 0, 0, 2, // length
+            0, 0, 0, 1, // lower bound
+            0, 0, 0, 2, 0, 1, // first element
+            0, 0, 0, 2, 0, 2, // second element
+        ];
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::INT2VECTOR, &bytes, &arena)
+                .expect("int2vector decodes"),
+            Datum::Int2Vector(&[1, 0, 2, 0])
+        );
     }
 
     #[test]

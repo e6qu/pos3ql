@@ -1136,14 +1136,16 @@ pub struct PendingDdl {
     pub creating: bool,
 }
 
-/// A catalog object's committed existence and at most one transaction-local
-/// CREATE or DROP. The variants exclude impossible baseline/pending pairs.
+/// A catalog object's committed existence and transaction-local DDL. The
+/// variants include a create followed by drop, which savepoint rollback must
+/// restore as a pending create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogDdlState {
     Absent,
     Present,
     PendingCreate { txid: u32 },
     PendingDrop { txid: u32 },
+    PendingCreateDrop { txid: u32 },
 }
 
 impl CatalogDdlState {
@@ -1153,27 +1155,35 @@ impl CatalogDdlState {
             Self::Present => true,
             Self::PendingCreate { txid: owner } => owner == txid,
             Self::PendingDrop { txid: owner } => owner != txid,
+            Self::PendingCreateDrop { .. } => false,
         }
     }
 
     pub const fn pending_txid(self) -> Option<u32> {
         match self {
-            Self::PendingCreate { txid } | Self::PendingDrop { txid } => Some(txid),
+            Self::PendingCreate { txid }
+            | Self::PendingDrop { txid }
+            | Self::PendingCreateDrop { txid } => Some(txid),
             Self::Absent | Self::Present => None,
         }
     }
 
     fn drop_by(self, txid: u32) -> Self {
         match self {
-            Self::PendingCreate { txid: owner } if owner == txid => Self::Absent,
+            Self::PendingCreate { txid: owner } if owner == txid => {
+                Self::PendingCreateDrop { txid }
+            }
             Self::Present => Self::PendingDrop { txid },
             _ => panic!("catalog DDL drop does not match object state"),
         }
     }
 
     fn commit_create(self) -> Self {
-        assert!(matches!(self, Self::PendingCreate { .. }));
-        Self::Present
+        match self {
+            Self::PendingCreate { .. } => Self::Present,
+            Self::PendingCreateDrop { txid } => Self::PendingDrop { txid },
+            _ => panic!("catalog CREATE commit does not match object state"),
+        }
     }
 
     fn commit_drop(self) -> Self {
@@ -1187,8 +1197,13 @@ impl CatalogDdlState {
     }
 
     fn rollback_drop(self, txid: u32) -> Self {
-        assert_eq!(self, Self::PendingDrop { txid });
-        Self::Present
+        match self {
+            Self::PendingDrop { txid: owner } if owner == txid => Self::Present,
+            Self::PendingCreateDrop { txid: owner } if owner == txid => {
+                Self::PendingCreate { txid }
+            }
+            _ => panic!("catalog DROP rollback does not match object state"),
+        }
     }
 }
 
@@ -11460,8 +11475,17 @@ mod tests {
             CatalogDdlState::PendingDrop { txid: 1 }.rollback_drop(1),
             CatalogDdlState::Present
         );
+        let created_then_dropped = CatalogDdlState::PendingCreate { txid: 1 }.drop_by(1);
         assert_eq!(
-            CatalogDdlState::PendingCreate { txid: 1 }.drop_by(1),
+            created_then_dropped,
+            CatalogDdlState::PendingCreateDrop { txid: 1 }
+        );
+        assert_eq!(
+            created_then_dropped.rollback_drop(1),
+            CatalogDdlState::PendingCreate { txid: 1 }
+        );
+        assert_eq!(
+            created_then_dropped.commit_create().commit_drop(),
             CatalogDdlState::Absent
         );
         assert_eq!(

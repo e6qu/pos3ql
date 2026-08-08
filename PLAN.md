@@ -23,7 +23,7 @@ pos3ql WAL is its own checksummed, LSN-ordered recovery log. PostgreSQL physical
 
 - Static memory: all runtime memory is budgeted at startup; exhaustion is an error.
 - Type boundaries: executor value representation, result metadata, and declared catalog type identity are distinct contracts. Durable user-type and parent-domain identities are atomic and must agree with runtime slots.
-- Catalog DDL visibility uses named states where migrated, so a pending create/drop cannot contradict its committed baseline.
+- Catalog DDL visibility for publications, materialized views, views, schemas, and sequences is one explicit state, including create-then-drop savepoint recovery.
 - No silent fallback or no-op: missing data, unsupported semantics, and capacity limits fail loudly.
 - Verification: unit/property tests, external PostgreSQL differential tests, SQLLogicTest, psql/driver probes, crash recovery, cold-cache recovery, and deterministic fault simulation are required gates.
 

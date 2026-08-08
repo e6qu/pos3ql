@@ -70,6 +70,30 @@ jobs:
       - name: Test
         run: cargo test --locked -- --skip sim::storage::storage_vopr --skip sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache
 
+      - name: Object-store contract (MinIO)
+        run: |
+          set -eu
+          container=pos3ql-contract-minio
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$container" -p 19200:9000 \
+            -e MINIO_ROOT_USER=pos3ql-contract \
+            -e MINIO_ROOT_PASSWORD=pos3ql-contract-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for attempt in $(seq 1 50); do
+            if docker exec "$container" mc alias set local http://localhost:9000 pos3ql-contract pos3ql-contract-secret; then
+              break
+            fi
+            sleep 0.2
+          done
+          docker exec "$container" mc mb local/pos3ql-contract
+          POS3QL_OBJECT_STORE_ENDPOINT=127.0.0.1:19200 \
+          POS3QL_OBJECT_STORE_BUCKET=pos3ql-contract \
+          POS3QL_OBJECT_STORE_REGION=us-east-1 \
+          POS3QL_OBJECT_STORE_ACCESS_KEY=pos3ql-contract \
+          POS3QL_OBJECT_STORE_SECRET_KEY=pos3ql-contract-secret \
+          POS3QL_OBJECT_STORE_TLS=off \
+          cargo test --locked --test object_store_it
+
   # Independent deterministic seeds run on four bounded workers. This retains
   # the endurance sweep while keeping the PR critical path near five minutes.
   storage-vopr:

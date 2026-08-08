@@ -14,7 +14,7 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 ## Completion work
 
 1. **Object-native durability.** Complete: readable protocol batches publish immutable commit data and a CAS commit head before acknowledgement; checkpoints retain a separate CAS snapshot root. Next, compact commit-head history without weakening logical replay.
-2. **Object-store portability.** Qualify the shared contract and add native GCS/Azure adapters or documented contract-preserving gateways.
+2. **Object-store portability.** Shared contract, parsed authorities, typed strong ETags/ranges, and a gateway qualification suite are complete. Native GCS/Azure adapters remain an optimization, not a durability prerequisite.
 3. **SQL and catalogs.** Close remaining language, type, privilege, collation, and introspection differences through strict PostgreSQL differential tests.
 4. **Binary protocol.** Match PostgreSQL Bind, Result, COPY, array/range/composite, and typmod bytes for every accepted type.
 5. **Logical replication.** Complete pgoutput versions/messages, slot semantics, and logical subscription/apply for PostgreSQL migration.

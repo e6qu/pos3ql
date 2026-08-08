@@ -14,7 +14,7 @@
 
 use crate::mem::budget::Budget;
 use crate::mem::fixed_vec::FixedVec;
-use crate::object_store::{Client as ObjectStore, Error as ObjectError, Precondition};
+use crate::object_store::{ByteRange, Client as ObjectStore, Error as ObjectError, Precondition};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -123,7 +123,10 @@ fn get_packed_block(
     let mut key_buffer = [0u8; 128];
     let key = key_of(prefix, container, &mut key_buffer);
     let result = client
-        .get(key, Some((start as u64, end as u64)))
+        .get(
+            key,
+            Some(ByteRange::new(start as u64, end as u64).expect("packed range is ordered")),
+        )
         .map_err(store_error)?;
     if result.len != length {
         return Err(StoreError::Corrupt(super::BlockError::Truncated));
@@ -608,10 +611,10 @@ impl BlockStore for OwnedObjectStore {
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         self.stats.object_contains = self.stats.object_contains.saturating_add(1);
-        match self.slots[0]
-            .client
-            .get(key, Some((0, HEADER_LEN as u64 - 1)))
-        {
+        match self.slots[0].client.get(
+            key,
+            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
+        ) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -708,7 +711,10 @@ impl BlockStore for ObjectBlockStore<'_> {
         // Only the header is fetched: presence is a property of the object, and
         // dragging the payload across to learn it would make an existence check
         // cost as much as a read.
-        match self.client.get(key, Some((0, HEADER_LEN as u64 - 1))) {
+        match self.client.get(
+            key,
+            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
+        ) {
             Ok(_) => Ok(true),
             Err(ObjectError::Status { code: 404, .. }) => Ok(false),
             Err(e) => Err(store_error(e)),
@@ -793,7 +799,7 @@ mod tests {
             assert!(request_len > 0, "client sent an empty request");
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nETag: \"prefetch-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -805,7 +811,7 @@ mod tests {
                     Ok((mut writer, _)) => {
                         read_request(&mut writer);
                         writer
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .write_all(b"HTTP/1.1 200 OK\r\nETag: \"prefetch-write\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .unwrap();
                         return;
                     }
@@ -882,7 +888,7 @@ mod tests {
             release_response.recv().unwrap();
             write!(
                 stream,
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nETag: \"packed-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -1037,7 +1043,7 @@ mod tests {
             write_response.recv().unwrap();
             write!(
                 hedge,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nETag: \"hedge-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();

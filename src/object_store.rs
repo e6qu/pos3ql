@@ -18,6 +18,78 @@ use crate::util::StackStr;
 
 pub(crate) mod sim;
 
+/// A strong object generation token returned by the provider.
+///
+/// The quoted wire form is retained verbatim: it is opaque to pos3ql and can
+/// therefore round-trip through `If-Match` without giving a provider-specific
+/// interpretation to its generation scheme.
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct EntityTag(StackStr<80>);
+
+impl PartialEq for EntityTag {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for EntityTag {}
+
+impl EntityTag {
+    /// Parses the HTTP ETag form accepted by the portable compare-and-swap
+    /// contract. Weak validators cannot protect a durable publish.
+    pub fn parse(wire: &str) -> Result<Self, &'static str> {
+        if wire.len() < 2 || wire.len() > 80 {
+            return Err("bad ETag length");
+        }
+        if wire.starts_with("W/") {
+            return Err("weak ETag cannot compare-and-swap durable state");
+        }
+        let bytes = wire.as_bytes();
+        if bytes[0] != b'\"' || *bytes.last().unwrap() != b'\"' {
+            return Err("ETag must be quoted");
+        }
+        if bytes[1..bytes.len() - 1]
+            .iter()
+            .any(|byte| *byte == b'\"' || *byte == b'\\' || *byte < 0x21 || *byte == 0x7f)
+        {
+            return Err("bad ETag value");
+        }
+        Ok(Self(StackStr::from_str(wire)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// An inclusive byte range accepted by an object-store GET.
+///
+/// The constructor is the sole way to form a range, so a backwards HTTP
+/// `Range` header cannot reach any provider adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    first: u64,
+    last: u64,
+}
+
+impl ByteRange {
+    pub fn new(first: u64, last: u64) -> Result<Self, &'static str> {
+        if first > last {
+            return Err("byte range ends before it starts");
+        }
+        Ok(Self { first, last })
+    }
+
+    pub fn first(self) -> u64 {
+        self.first
+    }
+
+    pub fn last(self) -> u64 {
+        self.last
+    }
+}
+
 /// A condition attached to a write.
 #[derive(Debug, Clone, Copy)]
 pub enum Precondition<'a> {
@@ -26,14 +98,14 @@ pub enum Precondition<'a> {
     /// Create only; fail if the key already exists.
     IfNoneMatchAny,
     /// Replace only the exact generation named by this ETag.
-    IfMatch(&'a str),
+    IfMatch(&'a EntityTag),
 }
 
 /// Metadata returned with a successful object read.
 #[derive(Debug)]
 pub struct GetResult {
     pub len: usize,
-    pub etag: StackStr<80>,
+    pub etag: EntityTag,
 }
 
 /// A provider-neutral operation failure.
@@ -200,14 +272,14 @@ impl Client {
         key: &str,
         body: &[u8],
         precondition: Precondition<'_>,
-    ) -> Result<StackStr<80>, Error> {
+    ) -> Result<EntityTag, Error> {
         match self {
             Self::S3(client) => client.put(key, body, precondition),
             Self::Simulator(client) => client.put(key, body, precondition),
         }
     }
 
-    pub(crate) fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, Error> {
+    pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         match self {
             Self::S3(client) => client.get(key, range),
             Self::Simulator(client) => client.get(key, range),
@@ -333,21 +405,19 @@ mod tests {
         assert_eq!(client.body_bytes(), b"abcdef");
         assert_eq!(whole.etag.as_str(), first.as_str());
 
-        let range = client.get("prefix/a", Some((2, 4))).unwrap();
+        let range = client
+            .get("prefix/a", Some(ByteRange::new(2, 4).unwrap()))
+            .unwrap();
         assert_eq!(range.len, 3);
         assert_eq!(client.body_bytes(), b"cde");
 
         let second = client
-            .put(
-                "prefix/a",
-                b"updated",
-                Precondition::IfMatch(first.as_str()),
-            )
+            .put("prefix/a", b"updated", Precondition::IfMatch(&first))
             .unwrap();
         assert_ne!(second.as_str(), first.as_str());
         assert!(
             client
-                .put("prefix/a", b"stale", Precondition::IfMatch(first.as_str()))
+                .put("prefix/a", b"stale", Precondition::IfMatch(&first))
                 .unwrap_err()
                 .is_precondition_failed()
         );

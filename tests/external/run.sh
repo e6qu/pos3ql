@@ -19,6 +19,7 @@ PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
 MINIO_PORT=${POS3QL_MINIO_PORT:-19311}
 PG_PORT=${POS3QL_PG_PORT:-15433}
 MINIO_CONTAINER=pos3ql-external-minio
+MINIO_IMAGE=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
 
 PASS=0
 FAIL=0
@@ -102,7 +103,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "toolchain versions (targets: newest psql / MinIO)"
+step "toolchain versions (targets: newest psql / pinned MinIO)"
 "$PSQL" --version || { bad "psql missing"; exit 1; }
 docker --version >/dev/null || { bad "docker missing"; exit 1; }
 
@@ -110,18 +111,18 @@ step "build pos3ql (release)"
 cargo build --release -q || { bad "build"; exit 1; }
 ok "build"
 
-step "start MinIO (latest) and create bucket"
+step "start pinned MinIO and create bucket"
 docker rm -f $MINIO_CONTAINER >/dev/null 2>&1
 docker run -d --name $MINIO_CONTAINER -p ${MINIO_PORT}:9000 \
   -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio:latest server /data >/dev/null || { bad "minio start"; exit 1; }
+  $MINIO_IMAGE server /data >/dev/null || { bad "minio start"; exit 1; }
 for i in {1..50}; do
   docker exec $MINIO_CONTAINER mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1 && break
   sleep 0.2
 done
 docker exec $MINIO_CONTAINER mc mb --ignore-existing local/pos3ql-external >/dev/null || { bad "bucket"; exit 1; }
 docker exec $MINIO_CONTAINER mc --version | head -1
-ok "minio $(docker run --rm minio/minio:latest --version 2>/dev/null | head -1 | awk '{print $3}')"
+ok "minio $(docker run --rm $MINIO_IMAGE --version 2>/dev/null | head -1 | awk '{print $3}')"
 
 step "write config and start pos3ql"
 cat > "$WORK/server.conf" <<EOF
@@ -589,7 +590,7 @@ docker rm -f $TLS_MINIO_CONTAINER >/dev/null 2>&1
 # HTTP and the whole step would test nothing.
 if docker create --name $TLS_MINIO_CONTAINER -p ${TLS_MINIO_PORT}:9000 \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio:latest server /data >/dev/null 2>&1 \
+    $MINIO_IMAGE server /data >/dev/null 2>&1 \
   && docker cp "$WORK/minio-certs/private.key" $TLS_MINIO_CONTAINER:/root/.minio/certs/private.key \
   && docker cp "$WORK/minio-certs/public.crt" $TLS_MINIO_CONTAINER:/root/.minio/certs/public.crt \
   && docker start $TLS_MINIO_CONTAINER >/dev/null; then

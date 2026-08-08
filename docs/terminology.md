@@ -20,6 +20,7 @@
 - `checkpoint`: SST publication and cold recovery.
 - `store`: block formats and cache tiers.
 - `s3`: S3-compatible object-store adapter.
+- `entity tag`: an opaque, strong, quoted object generation token used for compare-and-swap.
 - `vsr`: Viewstamped Replication.
 - `sim`: deterministic fault simulation.
 

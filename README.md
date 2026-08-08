@@ -6,7 +6,7 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 
 - PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including binary Bind, Result, and COPY for implemented types.
 - Durable state: immutable commit batches, immutable SST blocks, and compare-and-swap roots. A node can cold-start with an empty local disk.
-- Object storage: the engine depends only on immutable or conditional PUT, full/ranged GET, LIST, DELETE, and ETag compare-and-swap. The S3-compatible adapter works with S3 and MinIO; other providers require an adapter or gateway with the same contract.
+- Object storage: the engine depends only on immutable or conditional PUT, full/ranged GET, LIST, DELETE, and strong-ETag compare-and-swap. The S3-compatible adapter works with S3 and MinIO; GCS/Azure need a contract-preserving gateway until native adapters exist. [Contract and qualification](docs/object-storage.md).
 - Memory: all runtime memory is budgeted at startup. Pools and queues have fixed limits; exhaustion is an error.
 - Determinism: the core is event-driven and runs under deterministic fault simulation.
 
@@ -32,7 +32,7 @@ The completion work is physical-demand propagation through query execution, logi
 
 ```sh
 docker run -d -p 19100:9000 -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+  -e MINIO_ROOT_PASSWORD=minioadmin minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
 docker exec <container> mc mb local/pos3ql
 cargo run --release -- --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U you
@@ -43,6 +43,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [PLAN.md](PLAN.md) — completion roadmap
 - [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
+- [docs/object-storage.md](docs/object-storage.md) — portable durability contract
 - [AGENTS.md](AGENTS.md) — contribution rules
 
 ## References

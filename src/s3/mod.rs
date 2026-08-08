@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
-pub use crate::object_store::{Error as S3Error, GetResult, Precondition};
+pub use crate::object_store::{ByteRange, EntityTag, Error as S3Error, GetResult, Precondition};
 use crate::stack_format;
 use crate::util::StackStr;
 
@@ -34,6 +34,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum S3SetupError {
     Budget(BudgetError),
+    Endpoint(&'static str),
     Resolve(String, std::io::Error),
     Tls(String),
 }
@@ -42,6 +43,7 @@ impl std::fmt::Display for S3SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(e) => write!(f, "{e}"),
+            Self::Endpoint(message) => write!(f, "bad object_store_endpoint: {message}"),
             Self::Resolve(endpoint, e) => {
                 write!(f, "cannot resolve object_store_endpoint '{endpoint}': {e}")
             }
@@ -55,6 +57,56 @@ impl std::error::Error for S3SetupError {}
 impl From<BudgetError> for S3SetupError {
     fn from(e: BudgetError) -> Self {
         Self::Budget(e)
+    }
+}
+
+/// A parsed object-store authority. The wire Host header, TCP target, and TLS
+/// server name derive from this one value instead of independently slicing a
+/// free-form endpoint string.
+struct Endpoint<'a> {
+    authority: &'a str,
+    tls_host: &'a str,
+}
+
+impl<'a> Endpoint<'a> {
+    fn parse(authority: &'a str) -> Result<Self, &'static str> {
+        if authority.is_empty() {
+            return Err("authority is empty");
+        }
+        if authority.contains(['/', '?', '#', '@']) || authority.contains("://") {
+            return Err("use host:port, not a URL or path");
+        }
+        if let Some(rest) = authority.strip_prefix('[') {
+            let (host, port) = rest
+                .split_once("]:")
+                .ok_or("IPv6 authority must be [host]:port")?;
+            if host.is_empty() {
+                return Err("host is empty");
+            }
+            parse_port(port)?;
+            return Ok(Self {
+                authority,
+                tls_host: host,
+            });
+        }
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or("authority must include a port")?;
+        if host.is_empty() || host.contains(':') {
+            return Err("IPv6 authority must be bracketed and include a port");
+        }
+        parse_port(port)?;
+        Ok(Self {
+            authority,
+            tls_host: host,
+        })
+    }
+}
+
+fn parse_port(port: &str) -> Result<(), &'static str> {
+    match port.parse::<u16>() {
+        Ok(1..) => Ok(()),
+        _ => Err("port must be in 1..=65535"),
     }
 }
 
@@ -93,6 +145,26 @@ struct PendingResponse {
     body_read: usize,
 }
 
+/// HTTP response metadata shared by verbs which either require an object
+/// generation (GET/PUT) or intentionally discard it (LIST/DELETE).
+struct Response {
+    len: usize,
+    etag: Option<EntityTag>,
+}
+
+/// A parsed HTTP response head. A body has exactly one framing rule.
+struct ResponseHead {
+    status: u16,
+    etag: Option<EntityTag>,
+    framing: BodyFraming,
+}
+
+enum BodyFraming {
+    ContentLength(usize),
+    Chunked,
+    Empty,
+}
+
 fn system_clock() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -106,7 +178,9 @@ impl S3Client {
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, S3SetupError> {
-        let host_header = config.object_store_endpoint.clone();
+        let endpoint =
+            Endpoint::parse(&config.object_store_endpoint).map_err(S3SetupError::Endpoint)?;
+        let host_header = endpoint.authority.to_string();
         let connect_addr = {
             use std::net::ToSocketAddrs;
             config
@@ -131,13 +205,8 @@ impl S3Client {
             secret_key: config.object_store_secret_key.clone(),
             stream: None,
             tls_context: if config.object_store_tls {
-                let host = config
-                    .object_store_endpoint
-                    .rsplit_once(':')
-                    .map(|(h, _)| h)
-                    .unwrap_or(config.object_store_endpoint.as_str());
                 Some(
-                    tls::build_context(host, &config.object_store_tls_ca_file)
+                    tls::build_context(endpoint.tls_host, &config.object_store_tls_ca_file)
                         .map_err(S3SetupError::Tls)?,
                 )
             } else {
@@ -166,7 +235,7 @@ impl S3Client {
         key: &str,
         body: &[u8],
         precondition: Precondition,
-    ) -> Result<StackStr<80>, S3Error> {
+    ) -> Result<EntityTag, S3Error> {
         let payload_hash = HexDigest::of(&sha256(body));
         let result = self.request(
             "PUT",
@@ -177,7 +246,9 @@ impl S3Client {
             precondition,
             None,
         )?;
-        Ok(result.etag)
+        result
+            .etag
+            .ok_or(S3Error::Protocol("PUT response missing ETag"))
     }
 
     /// Uploads an object whose body is produced by `write_body` (e.g. SST
@@ -191,7 +262,7 @@ impl S3Client {
         payload_sha256_hex: &str,
         precondition: Precondition,
         mut write_body: impl FnMut(&mut tls::Transport) -> std::io::Result<()>,
-    ) -> Result<StackStr<80>, S3Error> {
+    ) -> Result<EntityTag, S3Error> {
         let mut last: Option<S3Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
@@ -221,7 +292,7 @@ impl S3Client {
                 read_response(stream, &mut self.head, &mut self.body)
             });
             match result {
-                Ok(r) => return Ok(r.etag),
+                Ok(r) => return r.etag.ok_or(S3Error::Protocol("PUT response missing ETag")),
                 Err(e @ S3Error::Io { .. }) => {
                     self.stream = None;
                     last = Some(e);
@@ -238,12 +309,12 @@ impl S3Client {
     /// Downloads an object (or a byte range, inclusive). The bytes are in
     /// [`Self::body_bytes`] afterwards. When a non-blocking GET is in
     /// progress, advances it instead of starting a new request.
-    pub fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, S3Error> {
+    pub fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, S3Error> {
         if self.pending.is_some() {
             return self.advance_pending();
         }
         if !self.async_gets {
-            return self.request(
+            let response = self.request(
                 "GET",
                 key,
                 "",
@@ -251,7 +322,13 @@ impl S3Client {
                 EMPTY_SHA256_HEX,
                 Precondition::None,
                 range,
-            );
+            )?;
+            return Ok(GetResult {
+                len: response.len,
+                etag: response
+                    .etag
+                    .ok_or(S3Error::Protocol("GET response missing ETag"))?,
+            });
         }
         // Initiate: send the request (blocking write — fast), then switch to
         // non-blocking for the response read so the reactor can serve other
@@ -379,9 +456,18 @@ impl S3Client {
 
         // Phase 2: parse the head (once).
         let head_end = pending.head_end.unwrap();
-        let (status, content_length, etag, chunked) =
-            parse_head(&self.head.readable()[..head_end])?;
-        pending.status = status;
+        let response_head = parse_head(&self.head.readable()[..head_end])?;
+        let content_length = match response_head.framing {
+            BodyFraming::ContentLength(length) => length,
+            BodyFraming::Empty => 0,
+            BodyFraming::Chunked => {
+                self.clear_pending();
+                return Err(S3Error::Protocol(
+                    "chunked encoding not supported in non-blocking GET",
+                ));
+            }
+        };
+        pending.status = response_head.status;
         pending.content_length = content_length;
 
         if content_length > self.body.capacity() {
@@ -440,23 +526,18 @@ impl S3Client {
         // Phase 4: complete. Deregister from the reactor and restore blocking.
         let _ = self.stream.as_ref().unwrap().set_nonblocking(false);
         self.pending = None;
-        if chunked {
-            // The scheduler admits only fixed-length object responses.
-            self.clear_pending();
-            return Err(S3Error::Protocol(
-                "chunked encoding not supported in non-blocking GET",
-            ));
-        }
-        if !(200..300).contains(&status) {
+        if !(200..300).contains(&response_head.status) {
             let text = core::str::from_utf8(self.body.readable()).unwrap_or("");
             return Err(S3Error::Status {
-                code: status,
+                code: response_head.status,
                 message: stack_format!(256, "{}", text),
             });
         }
         Ok(GetResult {
             len: self.body.readable().len(),
-            etag,
+            etag: response_head
+                .etag
+                .ok_or(S3Error::Protocol("GET response missing ETag"))?,
         })
     }
 
@@ -558,8 +639,8 @@ impl S3Client {
         body: &[u8],
         payload_hash: &str,
         precondition: Precondition,
-        range: Option<(u64, u64)>,
-    ) -> Result<GetResult, S3Error> {
+        range: Option<ByteRange>,
+    ) -> Result<Response, S3Error> {
         // Drop any pending non-blocking GET so the connection is clean.
         self.clear_pending();
         let mut last: Option<S3Error> = None;
@@ -589,8 +670,8 @@ impl S3Client {
         body: &[u8],
         payload_hash: &str,
         precondition: Precondition,
-        range: Option<(u64, u64)>,
-    ) -> Result<GetResult, S3Error> {
+        range: Option<ByteRange>,
+    ) -> Result<Response, S3Error> {
         self.send_head_and_connect(
             method,
             key,
@@ -637,7 +718,7 @@ impl S3Client {
         content_length: u64,
         payload_hash: &str,
         precondition: Precondition,
-        range: Option<(u64, u64)>,
+        range: Option<ByteRange>,
     ) -> Result<(), S3Error> {
         let timestamp = sigv4::format_amz_timestamp((self.clock)());
 
@@ -697,11 +778,16 @@ impl S3Client {
                     full(write!(head, "if-none-match: *\r\n"))?;
                 }
                 Precondition::IfMatch(etag) => {
-                    full(write!(head, "if-match: {etag}\r\n"))?;
+                    full(write!(head, "if-match: {}\r\n", etag.as_str()))?;
                 }
             }
-            if let Some((from, to)) = range {
-                full(write!(head, "range: bytes={from}-{to}\r\n"))?;
+            if let Some(range) = range {
+                full(write!(
+                    head,
+                    "range: bytes={}-{}\r\n",
+                    range.first(),
+                    range.last()
+                ))?;
             }
             full(write!(head, "content-length: {content_length}\r\n"))?;
             full(write!(
@@ -756,7 +842,7 @@ fn read_response(
     stream: &mut tls::Transport,
     head: &mut FixedBuf,
     body: &mut FixedBuf,
-) -> Result<GetResult, S3Error> {
+) -> Result<Response, S3Error> {
     // Read until end of head.
     let head_end = loop {
         if let Some(pos) = find_head_end(head.readable()) {
@@ -781,54 +867,56 @@ fn read_response(
         head.advance(n);
     };
 
-    let (status, content_length, etag, chunked) = parse_head(&head.readable()[..head_end])?;
+    let response_head = parse_head(&head.readable()[..head_end])?;
 
-    if chunked {
-        read_chunked_body(stream, &head.readable()[head_end..], body)?;
-    } else {
-        let mut already = head.readable().len() - head_end;
-        if content_length > body.capacity() {
-            return Err(S3Error::ResponseTooLarge {
-                content_length,
-                capacity: body.capacity(),
-            });
-        }
-        // Move any body bytes that arrived with the head.
-        let take = already.min(content_length);
-        let leftover = &head.readable()[head_end..head_end + take];
-        assert!(body.append(leftover), "checked against capacity");
-        already = take;
-
-        while already < content_length {
-            let space = body.writable();
-            let want = (content_length - already).min(space.len());
-            let n = stream.read(&mut space[..want]).map_err(|e| S3Error::Io {
-                context: "read body",
-                kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
-            })?;
-            if n == 0 {
-                return Err(S3Error::Io {
-                    context: "read body",
-                    kind: std::io::ErrorKind::UnexpectedEof,
-                    detail: StackStr::new(),
+    match response_head.framing {
+        BodyFraming::Chunked => read_chunked_body(stream, &head.readable()[head_end..], body)?,
+        BodyFraming::Empty => {}
+        BodyFraming::ContentLength(content_length) => {
+            let mut already = head.readable().len() - head_end;
+            if content_length > body.capacity() {
+                return Err(S3Error::ResponseTooLarge {
+                    content_length,
+                    capacity: body.capacity(),
                 });
             }
-            body.advance(n);
-            already += n;
+            // Move any body bytes that arrived with the head.
+            let take = already.min(content_length);
+            let leftover = &head.readable()[head_end..head_end + take];
+            assert!(body.append(leftover), "checked against capacity");
+            already = take;
+
+            while already < content_length {
+                let space = body.writable();
+                let want = (content_length - already).min(space.len());
+                let n = stream.read(&mut space[..want]).map_err(|e| S3Error::Io {
+                    context: "read body",
+                    kind: e.kind(),
+                    detail: stack_format!(160, "{e}"),
+                })?;
+                if n == 0 {
+                    return Err(S3Error::Io {
+                        context: "read body",
+                        kind: std::io::ErrorKind::UnexpectedEof,
+                        detail: StackStr::new(),
+                    });
+                }
+                body.advance(n);
+                already += n;
+            }
         }
     }
 
-    if !(200..300).contains(&status) {
+    if !(200..300).contains(&response_head.status) {
         let text = core::str::from_utf8(body.readable()).unwrap_or("");
         return Err(S3Error::Status {
-            code: status,
+            code: response_head.status,
             message: stack_format!(256, "{}", text),
         });
     }
-    Ok(GetResult {
+    Ok(Response {
         len: body.readable().len(),
-        etag,
+        etag: response_head.etag,
     })
 }
 
@@ -975,7 +1063,7 @@ fn find_head_end(data: &[u8]) -> Option<usize> {
         .map(|p| p + 4)
 }
 
-fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>, bool), S3Error> {
+fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
     let text = core::str::from_utf8(head).map_err(|_| S3Error::Protocol("non-UTF-8 head"))?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().ok_or(S3Error::Protocol("empty response"))?;
@@ -989,27 +1077,50 @@ fn parse_head(head: &[u8]) -> Result<(u16, usize, StackStr<80>, bool), S3Error> 
         .and_then(|s| s.parse().ok())
         .ok_or(S3Error::Protocol("bad status"))?;
 
-    let mut content_length = 0usize;
-    let mut etag = StackStr::<80>::new();
+    let mut content_length = None;
+    let mut etag = None;
     let mut chunked = false;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
+        if line.is_empty() {
             continue;
-        };
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(S3Error::Protocol("malformed response header"))?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value
-                .parse()
-                .map_err(|_| S3Error::Protocol("bad content-length"))?;
+            if content_length.is_some() {
+                return Err(S3Error::Protocol("duplicate content-length header"));
+            }
+            content_length = Some(
+                value
+                    .parse()
+                    .map_err(|_| S3Error::Protocol("bad content-length"))?,
+            );
         } else if name.eq_ignore_ascii_case("etag") {
-            etag = stack_format!(80, "{}", value.trim_matches('"'));
-        } else if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.eq_ignore_ascii_case("chunked")
-        {
+            if etag.is_some() {
+                return Err(S3Error::Protocol("duplicate ETag header"));
+            }
+            etag = Some(EntityTag::parse(value).map_err(S3Error::Protocol)?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !value.eq_ignore_ascii_case("chunked") {
+                return Err(S3Error::Protocol("unsupported transfer-encoding"));
+            }
             chunked = true;
         }
     }
-    Ok((status, content_length, etag, chunked))
+    let framing = match (content_length, chunked) {
+        (Some(_), true) => return Err(S3Error::Protocol("response has conflicting framing")),
+        (Some(length), false) => BodyFraming::ContentLength(length),
+        (None, true) => BodyFraming::Chunked,
+        (None, false) if matches!(status, 204 | 304) => BodyFraming::Empty,
+        (None, false) => return Err(S3Error::Protocol("response missing body framing")),
+    };
+    Ok(ResponseHead {
+        status,
+        etag,
+        framing,
+    })
 }
 
 /// First occurrence of `<tag>text</tag>`; no entity decoding (S3 keys we
@@ -1198,7 +1309,7 @@ mod tests {
         // Two data chunks (with an extension on the first size line), a zero
         // chunk, and a trailer — the shape MinIO/GCS actually send.
         let (port, server) = mock_server(
-            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: t\r\n\r\n",
+            "HTTP/1.1 200 OK\r\netag: \"chunked\"\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: t\r\n\r\n",
             |_| {},
         );
         let config = test_config(port);
@@ -1253,7 +1364,7 @@ mod tests {
                 Precondition::IfNoneMatchAny,
             )
             .unwrap();
-        assert_eq!(etag.as_str(), "abc123");
+        assert_eq!(etag.as_str(), "\"abc123\"");
         server.join().unwrap();
     }
 
@@ -1269,10 +1380,65 @@ mod tests {
         let mut budget = Budget::new(1 << 20);
         let mut client = S3Client::new(&config, &mut budget).unwrap();
         client.with_clock(|| 1_440_938_160);
-        let got = client.get("k", Some((10, 14))).unwrap();
+        let got = client
+            .get("k", Some(ByteRange::new(10, 14).unwrap()))
+            .unwrap();
         assert_eq!(got.len, 5);
         assert_eq!(client.body_bytes(), b"hello");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_is_one_authority_for_tcp_host_and_tls() {
+        let ipv4 = Endpoint::parse("objects.example:443").unwrap();
+        assert_eq!(ipv4.authority, "objects.example:443");
+        assert_eq!(ipv4.tls_host, "objects.example");
+        let ipv6 = Endpoint::parse("[2001:db8::1]:9443").unwrap();
+        assert_eq!(ipv6.authority, "[2001:db8::1]:9443");
+        assert_eq!(ipv6.tls_host, "2001:db8::1");
+        for malformed in [
+            "https://objects.example:443",
+            "objects.example",
+            "objects.example:0",
+            "objects.example:65536",
+            "2001:db8::1:443",
+            "[2001:db8::1]",
+        ] {
+            assert!(Endpoint::parse(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn entity_tags_preserve_the_portable_wire_validator() {
+        assert_eq!(
+            EntityTag::parse("\"opaque-generation\"").unwrap().as_str(),
+            "\"opaque-generation\""
+        );
+        for invalid in [
+            "opaque-generation",
+            "W/\"weak\"",
+            "\"two\"\"tags\"",
+            "\"line\nfeed\"",
+        ] {
+            assert!(EntityTag::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(ByteRange::new(9, 8).is_err());
+    }
+
+    #[test]
+    fn response_framing_is_parsed_once_not_inferred_from_defaults() {
+        let fixed = parse_head(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n").unwrap();
+        assert!(matches!(fixed.framing, BodyFraming::ContentLength(7)));
+        let empty = parse_head(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        assert!(matches!(empty.framing, BodyFraming::Empty));
+        for malformed in [
+            b"HTTP/1.1 200 OK\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\ncontent-length: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nnot-a-header\r\n\r\n",
+        ] {
+            assert!(parse_head(malformed).is_err());
+        }
     }
 
     #[test]

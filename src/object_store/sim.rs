@@ -34,9 +34,8 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::prng::Pcg32;
 use crate::stack_format;
-use crate::util::StackStr;
 
-use crate::object_store::{Error, GetResult, Precondition};
+use crate::object_store::{ByteRange, EntityTag, Error, GetResult, Precondition};
 
 /// Fault probabilities in parts per thousand, plus the outage schedule.
 /// All zeros (the default) is a perfectly healthy bucket.
@@ -127,8 +126,9 @@ fn io_fault(detail: &str) -> Error {
     }
 }
 
-fn etag_text(etag: u64) -> StackStr<80> {
-    stack_format!(80, "\"sim-{etag:016x}\"")
+fn entity_tag(etag: u64) -> EntityTag {
+    EntityTag::parse(stack_format!(80, "\"sim-{etag:016x}\"").as_str())
+        .expect("simulated ETag has portable syntax")
 }
 
 thread_local! {
@@ -196,7 +196,7 @@ impl SimClient {
         key: &str,
         body: &[u8],
         precondition: Precondition,
-    ) -> Result<StackStr<80>, Error> {
+    ) -> Result<EntityTag, Error> {
         let full = self.full_key(key);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -206,7 +206,7 @@ impl SimClient {
                 return Err(status(412, "precondition failed: object exists"));
             }
             (Precondition::IfMatch(expected), Ok(at)) => {
-                if etag_text(bucket.objects[*at].etag).as_str() != *expected {
+                if entity_tag(bucket.objects[*at].etag) != **expected {
                     return Err(status(412, "precondition failed: etag mismatch"));
                 }
             }
@@ -246,10 +246,10 @@ impl SimClient {
             // Applied above — the response is what got lost.
             return Err(io_fault("simulated ambiguous PUT (applied, response lost)"));
         }
-        Ok(etag_text(etag))
+        Ok(entity_tag(etag))
     }
 
-    pub(crate) fn get(&mut self, key: &str, range: Option<(u64, u64)>) -> Result<GetResult, Error> {
+    pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         let full = self.full_key(key);
         let mut bucket = self.bucket.borrow_mut();
         bucket.operation_gate()?;
@@ -260,7 +260,9 @@ impl SimClient {
         let total = bucket.objects[at].bytes.len();
         let (from, to) = match range {
             None => (0usize, total),
-            Some((offset, to)) => {
+            Some(range) => {
+                let offset = range.first();
+                let to = range.last();
                 if offset >= total as u64 {
                     return Err(status(416, "range not satisfiable"));
                 }
@@ -286,7 +288,7 @@ impl SimClient {
         }
         Ok(GetResult {
             len,
-            etag: etag_text(bucket.objects[at].etag),
+            etag: entity_tag(bucket.objects[at].etag),
         })
     }
 
@@ -359,10 +361,11 @@ mod tests {
         assert_eq!(got.etag.as_str(), tag.as_str());
         // Inclusive range; a range past the end clamps; one starting past
         // the end is 416 (the WAL replay loop's terminator).
-        c.get("k", Some((6, 100))).unwrap();
+        c.get("k", Some(ByteRange::new(6, 100).unwrap())).unwrap();
         assert_eq!(c.body_bytes(), b"world");
         assert!(matches!(
-            c.get("k", Some((11, 12))).unwrap_err(),
+            c.get("k", Some(ByteRange::new(11, 12).unwrap()))
+                .unwrap_err(),
             Error::Status { code: 416, .. }
         ));
         // Oversized bodies refuse like the real client.
@@ -384,19 +387,16 @@ mod tests {
                 .unwrap_err()
                 .is_precondition_failed()
         );
-        let second = c
-            .put("m", b"v2", Precondition::IfMatch(first.as_str()))
-            .unwrap();
+        let second = c.put("m", b"v2", Precondition::IfMatch(&first)).unwrap();
         // The stale tag loses.
         assert!(
-            c.put("m", b"v3", Precondition::IfMatch(first.as_str()))
+            c.put("m", b"v3", Precondition::IfMatch(&first))
                 .unwrap_err()
                 .is_precondition_failed()
         );
-        c.put("m", b"v3", Precondition::IfMatch(second.as_str()))
-            .unwrap();
+        c.put("m", b"v3", Precondition::IfMatch(&second)).unwrap();
         assert!(
-            c.put("absent", b"x", Precondition::IfMatch(second.as_str()))
+            c.put("absent", b"x", Precondition::IfMatch(&second))
                 .unwrap_err()
                 .is_precondition_failed()
         );

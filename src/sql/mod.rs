@@ -5649,6 +5649,10 @@ fn requalify_schema_element<'a>(
             name: requalify(domain.name)?,
             ..*domain
         }),
+        ast::CreateSchemaElement::Enum { name, labels } => Stmt::CreateEnum {
+            name: requalify(*name)?,
+            labels,
+        },
     };
     arena
         .alloc(rewritten)

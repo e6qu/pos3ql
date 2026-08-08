@@ -34,6 +34,10 @@ pub enum CreateSchemaElement<'a> {
         options: SeqOptions<'a>,
     },
     Domain(CreateDomain<'a>),
+    Enum {
+        name: QualName<'a>,
+        labels: &'a [&'a str],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

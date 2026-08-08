@@ -774,9 +774,10 @@ impl<'a> Parser<'a> {
                     options,
                 },
                 Stmt::CreateDomain(domain) => CreateSchemaElement::Domain(domain),
+                Stmt::CreateEnum { name, labels } => CreateSchemaElement::Enum { name, labels },
                 _ => {
                     return Err(self.err_here(
-                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, or DOMAIN",
+                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, DOMAIN, or TYPE",
                     ));
                 }
             };

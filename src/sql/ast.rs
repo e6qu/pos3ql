@@ -33,6 +33,7 @@ pub enum CreateSchemaElement<'a> {
         if_not_exists: bool,
         options: SeqOptions<'a>,
     },
+    Domain(CreateDomain<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

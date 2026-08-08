@@ -5645,6 +5645,10 @@ fn requalify_schema_element<'a>(
             if_not_exists: *if_not_exists,
             options: *options,
         },
+        ast::CreateSchemaElement::Domain(domain) => Stmt::CreateDomain(ast::CreateDomain {
+            name: requalify(domain.name)?,
+            ..*domain
+        }),
     };
     arena
         .alloc(rewritten)

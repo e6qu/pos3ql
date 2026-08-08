@@ -6915,6 +6915,7 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
         &mut engine,
         &mut budget,
         "CREATE SCHEMA typed_schema
+           CREATE DOMAIN positive AS integer CHECK (VALUE > 0)
            CREATE TABLE rows (id integer)
            CREATE VIEW row_view AS SELECT id FROM rows
            CREATE INDEX rows_id ON rows (id)
@@ -6931,14 +6932,15 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
             &mut budget,
             "INSERT INTO typed_schema.rows VALUES (7);
              SELECT id FROM typed_schema.row_view;
-             SELECT nextval('typed_schema.row_ids');",
+             SELECT nextval('typed_schema.row_ids');
+             SELECT 7::typed_schema.positive;",
         )),
-        ["7", "1"]
+        ["7", "1", "7"]
     );
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SCHEMA invalid_schema CREATE DOMAIN domain_inside_schema AS integer",
+        "CREATE SCHEMA invalid_schema CREATE TYPE type_inside_schema AS ENUM ('invalid')",
     );
     assert!(
         String::from_utf8_lossy(&rejected).contains("42601"),

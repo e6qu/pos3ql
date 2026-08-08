@@ -773,9 +773,10 @@ impl<'a> Parser<'a> {
                     if_not_exists,
                     options,
                 },
+                Stmt::CreateDomain(domain) => CreateSchemaElement::Domain(domain),
                 _ => {
                     return Err(self.err_here(
-                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, or SEQUENCE",
+                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, or DOMAIN",
                     ));
                 }
             };

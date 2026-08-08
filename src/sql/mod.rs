@@ -2559,7 +2559,13 @@ impl Engine {
                     .min(lsn);
                 ckpt.prune_commit_batches(retain_through)?;
             }
-            self.wal.reset_after_checkpoint();
+            // A sliced checkpoint can publish a snapshot while later
+            // statements have already appended WAL. Retaining the journal in
+            // that case lets recovery replay the suffix above this manifest;
+            // only a checkpoint at the current tail may restart it.
+            if self.wal.last_lsn() <= lsn {
+                self.wal.reset_after_checkpoint();
+            }
         }
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
@@ -2584,9 +2590,8 @@ impl Engine {
     }
 
     fn begin_post_publish_cleanup(&mut self, lsn: u64) {
-        // The manifest now owns precisely the state that was dirty at
-        // publication. This must run once: a retry can follow newer writes.
-        self.storage.clear_dirty();
+        // Cleanup may retry, but publication already marked only the table
+        // generations the manifest captured as clean.
         self.post_publish_cleanup = Some(lsn);
     }
 

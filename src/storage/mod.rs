@@ -7330,10 +7330,12 @@ impl Storage {
         self.tables.len()
     }
 
-    /// Clears all per-table dirty flags (after a successful checkpoint).
-    pub fn clear_dirty(&mut self) {
-        for t in self.tables.iter_mut() {
-            t.dirty = false;
+    /// Clears only table images captured by a published checkpoint.
+    pub fn clear_dirty_through(&mut self, generations: &[u64]) {
+        for (slot, t) in self.tables.iter_mut().enumerate() {
+            if generations.get(slot).copied() == Some(t.generation) {
+                t.dirty = false;
+            }
             t.statistics_dirty = false;
             t.statistics_wal_dirty = false;
         }
@@ -11272,6 +11274,26 @@ mod tests {
             .create_table(make_def("overflow", &[("a", ColType::Bool, false)]))
             .unwrap_err();
         assert_eq!(err.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    }
+
+    #[test]
+    fn published_generation_cleanup_keeps_newer_table_writes_dirty() {
+        let config = test_config();
+        let mut budget = Budget::new(8 << 20);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let slot = storage
+            .create_table(make_def(
+                "checkpoint_generation",
+                &[("id", ColType::Int4, true)],
+            ))
+            .unwrap();
+        let captured = storage.table(slot).generation;
+        storage.table_mut(slot).mark_dirty();
+        storage.clear_dirty_through(&[captured]);
+        assert!(storage.table(slot).dirty);
+        let current = storage.table(slot).generation;
+        storage.clear_dirty_through(&[current]);
+        assert!(!storage.table(slot).dirty);
     }
 
     #[test]

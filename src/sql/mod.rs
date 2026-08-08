@@ -2532,7 +2532,7 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint? {
             Some(lsn) => {
-                self.post_publish_cleanup = Some(lsn);
+                self.begin_post_publish_cleanup(lsn);
                 self.finish_post_publish_cleanup()?;
                 Ok(true)
             }
@@ -2544,7 +2544,6 @@ impl Engine {
     /// everything at or below `lsn` is bucket-durable, so the local journal
     /// restarts and the heap compacts (spilling under memory pressure).
     fn after_publish(&mut self, lsn: u64) -> Result<(), SqlError> {
-        self.storage.clear_dirty();
         if !self.storage.has_active_snapshots() {
             if self.wal_upload
                 && let Some(ckpt) = self.ckpt.as_mut()
@@ -2583,12 +2582,26 @@ impl Engine {
         Ok(())
     }
 
+    fn begin_post_publish_cleanup(&mut self, lsn: u64) {
+        // The manifest now owns precisely the state that was dirty at
+        // publication. This must run once: a retry can follow newer writes.
+        self.storage.clear_dirty();
+        self.post_publish_cleanup = Some(lsn);
+    }
+
     fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
         let lsn = self
             .post_publish_cleanup
             .expect("post-publication cleanup has its published LSN");
         self.after_publish(lsn)?;
         self.post_publish_cleanup = None;
+        Ok(())
+    }
+
+    fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
+        if self.post_publish_cleanup.is_some() {
+            self.finish_post_publish_cleanup()?;
+        }
         Ok(())
     }
 
@@ -2736,7 +2749,7 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
-                self.post_publish_cleanup = Some(lsn);
+                self.begin_post_publish_cleanup(lsn);
                 if let Err(e) = self.finish_post_publish_cleanup() {
                     eprintln!(
                         "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
@@ -2808,6 +2821,10 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
+        if let Err(error) = self.retry_post_publish_cleanup() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
@@ -2932,6 +2949,10 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        if let Err(error) = self.retry_post_publish_cleanup() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,

@@ -11169,11 +11169,21 @@ fn published_checkpoint_cleanup_retries_after_object_store_failure() {
         .unwrap()
         .publish_commit_batch(1, b"checkpoint-covered")
         .unwrap();
-    engine.post_publish_cleanup = Some(1);
+    engine.begin_post_publish_cleanup(1);
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     assert!(!engine.maybe_checkpoint());
     assert!(engine.checkpoint_work_pending());
+    let fenced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE blocked_until_cleanup (id int)",
+    );
+    assert!(
+        String::from_utf8_lossy(&fenced).contains("58030"),
+        "a failed published cleanup must fence later writes: {}",
+        String::from_utf8_lossy(&fenced)
+    );
 
     namespace.borrow_mut().faults.transient_per_mille = 0;
     assert!(engine.maybe_checkpoint());

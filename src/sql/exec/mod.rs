@@ -8500,6 +8500,7 @@ fn rewrite_enum_label(
                         changed = true;
                     }
                     Datum::Array { element, raw } => {
+                        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
                         let count = crate::sql::array::len(raw);
                         let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
                         let mut array_changed = false;
@@ -8526,7 +8527,11 @@ fn rewrite_enum_label(
                         if array_changed {
                             values[column_index] = Datum::Array {
                                 element,
-                                raw: crate::sql::array::build(&items[..count], arena)?,
+                                raw: crate::sql::array::build_shaped(
+                                    &items[..count],
+                                    shape,
+                                    arena,
+                                )?,
                             };
                             changed = true;
                         }
@@ -9353,17 +9358,13 @@ pub fn copy_row_binary(
 }
 
 /// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's
-/// per-type binary receive format. Reuses the extended-protocol binary decoder
-/// for the shared scalar types; handles the ones it does not (`smallint` as a
-/// true int2, `timetz`, the text family, and the composite array / range /
-/// multirange / bit formats) directly. Only anonymous `record` is refused at
-/// [`copy_begin`], so it never reaches here.
+/// per-type binary receive format.
 pub(crate) fn decode_binary_field<'a>(
     ctype: ColType,
     bytes: &'a [u8],
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_binary_field_with_context(ctype, bytes, arena, None)
+    decode_binary_field_with_context(ctype, bytes, arena, BinaryDecodeContext::Plain)
 }
 
 /// Decodes binary input whose declared type was resolved through the active
@@ -9376,14 +9377,25 @@ pub(crate) fn decode_binary_field_with_catalog<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_binary_field_with_context(ctype, bytes, arena, Some((storage, txid)))
+    decode_binary_field_with_context(
+        ctype,
+        bytes,
+        arena,
+        BinaryDecodeContext::Catalog { storage, txid },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum BinaryDecodeContext<'a> {
+    Plain,
+    Catalog { storage: &'a Storage, txid: u32 },
 }
 
 fn decode_binary_field_with_context<'a>(
     ctype: ColType,
     bytes: &'a [u8],
     arena: &'a Arena,
-    catalog: Option<(&Storage, u32)>,
+    context: BinaryDecodeContext<'_>,
 ) -> Result<Datum<'a>, SqlError> {
     use crate::sql::types::oid as oids;
     let bad = || {
@@ -9432,18 +9444,14 @@ fn decode_binary_field_with_context<'a>(
         ColType::Cidr => via(oids::CIDR),
         ColType::Macaddr => via(oids::MACADDR),
         ColType::Macaddr8 => via(oids::MACADDR8),
-        ColType::Array(element) => decode_binary_array(element, bytes, arena, catalog),
+        ColType::Array(element) => decode_binary_array(element, bytes, arena, context),
         ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
         ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),
         ColType::Bit { varying } => decode_binary_bit(varying, bytes, arena),
-        ColType::Record => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY BINARY of type {} is not supported yet",
-            ctype.name()
-        )),
+        ColType::Record => decode_binary_record(bytes, arena, context),
         ColType::Enum(slot) => {
             let label = core::str::from_utf8(bytes).map_err(|_| bad())?;
-            let Some((storage, _)) = catalog else {
+            let BinaryDecodeContext::Catalog { storage, .. } = context else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "binary input of a user-defined enum requires catalog context"
@@ -9452,6 +9460,51 @@ fn decode_binary_field_with_context<'a>(
             coerce_enum_value(Datum::Text(label), slot, storage, arena)
         }
     }
+}
+
+fn decode_binary_record<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    context: BinaryDecodeContext<'_>,
+) -> Result<Datum<'a>, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary record");
+    let mut reader = crate::pg::wire::MsgIn::new(bytes);
+    let field_count = reader.i32().map_err(|_| bad())?;
+    if field_count < 0 || field_count as usize > RECORD_FIELD_NAMES.len() {
+        return Err(bad());
+    }
+    let fields = arena
+        .alloc_slice_with(field_count as usize, |_| super::types::RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "record exceeds the statement arena"
+            )
+        })?;
+    for (index, field) in fields.iter_mut().enumerate() {
+        let type_oid = reader.i32().map_err(|_| bad())?;
+        let length = reader.i32().map_err(|_| bad())?;
+        if length < -1 {
+            return Err(bad());
+        }
+        field.name = RECORD_FIELD_NAMES[index];
+        field.type_oid = type_oid;
+        field.value = if length == -1 {
+            Datum::Null
+        } else {
+            let bytes = reader.take(length as usize).map_err(|_| bad())?;
+            let field_type = ColType::from_oid(type_oid).ok_or_else(bad)?;
+            decode_binary_field_with_context(field_type, bytes, arena, context)?
+        };
+    }
+    if !reader.done() {
+        return Err(bad());
+    }
+    Ok(Datum::Record(fields))
 }
 
 /// Decodes PostgreSQL's `int2vector` send format. It is an `int2` array on
@@ -9507,15 +9560,12 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
     Ok(Datum::Int2Vector(raw))
 }
 
-/// Decodes the PostgreSQL binary array format: int32 ndim, int32 has-null,
-/// int32 element OID, then (for ndim > 0) one dim descriptor {count, lbound}
-/// and each element as int32 length (-1 = NULL) + its binary. Only the
-/// one-dimensional form this engine stores is accepted.
+/// Decodes PostgreSQL's binary array receive format.
 fn decode_binary_array<'a>(
     element: crate::sql::types::ArrElem,
     bytes: &'a [u8],
     arena: &'a Arena,
-    catalog: Option<(&Storage, u32)>,
+    context: BinaryDecodeContext<'_>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary array");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
@@ -9534,24 +9584,29 @@ fn decode_binary_array<'a>(
             raw: crate::sql::array::build(&[], arena)?,
         });
     }
-    if ndim != 1 {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY BINARY of multi-dimensional arrays is not supported"
-        ));
+    if ndim < 0 || ndim as usize > crate::sql::array::MAX_DIMENSIONS {
+        return Err(bad());
     }
-    let count = reader.i32().map_err(|_| bad())?;
-    let _lower_bound = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "array value too large"
-        ));
+    let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
+    let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
+    for index in 0..ndim as usize {
+        let dimension = reader.i32().map_err(|_| bad())?;
+        let lower_bound = reader.i32().map_err(|_| bad())?;
+        if dimension <= 0 {
+            return Err(bad());
+        }
+        dimensions[index] = dimension as usize;
+        lower_bounds[index] = lower_bound;
     }
+    let shape = crate::sql::array::Shape::new(
+        &dimensions[..ndim as usize],
+        &lower_bounds[..ndim as usize],
+    )?;
+    let count = shape.element_count();
     let element_type = element.to_coltype();
     let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
     let mut saw_null = false;
-    for slot in items.iter_mut().take(count as usize) {
+    for slot in items.iter_mut().take(count) {
         let len = reader.i32().map_err(|_| bad())?;
         if len < 0 {
             *slot = Datum::Null;
@@ -9559,10 +9614,10 @@ fn decode_binary_array<'a>(
             continue;
         }
         let field = reader.take(len as usize).map_err(|_| bad())?;
-        let value = decode_binary_field_with_context(element_type, field, arena, catalog)?;
+        let value = decode_binary_field_with_context(element_type, field, arena, context)?;
         *slot = match element {
             crate::sql::types::ArrElem::Domain { slot, .. } => {
-                let Some((storage, txid)) = catalog else {
+                let BinaryDecodeContext::Catalog { storage, txid } = context else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "binary input of a domain array requires catalog context"
@@ -9588,7 +9643,7 @@ fn decode_binary_array<'a>(
     }
     Ok(Datum::Array {
         element,
-        raw: crate::sql::array::build(&items[..count as usize], arena)?,
+        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
     })
 }
 
@@ -14551,6 +14606,56 @@ mod tests {
         ];
         let error = decode_binary_field(ColType::Int2Vector, &trailing, &arena).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    }
+
+    #[test]
+    fn binary_array_preserves_all_dimensions_and_bounds() {
+        let bytes = [
+            0, 0, 0, 2, // dimensions
+            0, 0, 0, 0, // no nulls
+            0, 0, 0, 23, // int4 element OID
+            0, 0, 0, 2, 0, 0, 0, 2, // first dimension and lower bound
+            0, 0, 0, 2, 0, 0, 0, 4, // second dimension and lower bound
+            0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 4, 0,
+            0, 0, 4,
+        ];
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "binary array", 1 << 12).unwrap();
+        let datum = decode_binary_field(
+            ColType::Array(crate::sql::types::ArrElem::Int4),
+            &bytes,
+            &arena,
+        )
+        .unwrap();
+        let Datum::Array { raw, .. } = datum else {
+            panic!("array expected");
+        };
+        let shape = crate::sql::array::shape(raw).unwrap();
+        assert_eq!(shape.dimension_count(), 2);
+        assert_eq!(
+            (shape.lower_bound(0), shape.upper_bound(1)),
+            (Some(2), Some(5))
+        );
+        assert_eq!(datum.to_string(), "[2:3][4:5]={{1,2},{3,4}}");
+    }
+
+    #[test]
+    fn binary_record_decodes_typed_fields() {
+        let bytes = [
+            0, 0, 0, 2, // field count
+            0, 0, 0, 23, // int4 OID
+            0, 0, 0, 4, 0, 0, 0, 42, 0, 0, 0, 25, // text OID
+            0, 0, 0, 2, b'h', b'i',
+        ];
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "binary record", 1 << 12).unwrap();
+        let datum = decode_binary_field(ColType::Record, &bytes, &arena).unwrap();
+        let Datum::Record(fields) = datum else {
+            panic!("record expected");
+        };
+        assert_eq!(fields[0].value, Datum::Int4(42));
+        assert_eq!(fields[1].value, Datum::Text("hi"));
+        assert_eq!((fields[0].name, fields[1].name), ("f1", "f2"));
     }
 
     #[test]

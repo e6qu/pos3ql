@@ -628,7 +628,7 @@ pub(crate) fn compare_datums_as(
             a.len().cmp(&b.len())
         }
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
-            // Element-wise, then by length (PostgreSQL array ordering).
+            // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
             for i in 0..length_a.min(length_b) {
                 let x = array::get(ra, *element, i).unwrap_or(Datum::Null);
@@ -638,7 +638,23 @@ pub(crate) fn compare_datums_as(
                     return Ok(c);
                 }
             }
-            length_a.cmp(&length_b)
+            let content = length_a.cmp(&length_b);
+            if !content.is_eq() {
+                return Ok(content);
+            }
+            let shape_a = array::shape(ra).expect("array datum invariant");
+            let shape_b = array::shape(rb).expect("array datum invariant");
+            for index in 0..shape_a.dimension_count().min(shape_b.dimension_count()) {
+                let dimensions = shape_a.dimension(index).cmp(&shape_b.dimension(index));
+                if !dimensions.is_eq() {
+                    return Ok(dimensions);
+                }
+                let bounds = shape_a.lower_bound(index).cmp(&shape_b.lower_bound(index));
+                if !bounds.is_eq() {
+                    return Ok(bounds);
+                }
+            }
+            shape_a.dimension_count().cmp(&shape_b.dimension_count())
         }
         (Datum::Date(a), Datum::Timestamp(b) | Datum::Timestamptz(b)) => {
             (i64::from(*a) * 86_400_000_000).cmp(b)

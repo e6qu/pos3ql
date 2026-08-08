@@ -274,7 +274,7 @@ enum AggKind {
     BitXor,
     StringAgg,
     /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
-    /// optionally sorted / DISTINCT, then builds a one-dimensional array.
+    /// optionally sorted / DISTINCT, then builds an array.
     ArrayAgg,
     /// `json_agg`/`jsonb_agg(expr [ORDER BY ...])`: buffers values, then
     /// serializes them to a JSON array. `star` distinguishes json vs jsonb.

@@ -1402,13 +1402,17 @@ pub fn infer_type_res(
                 .first()
                 .and_then(|e| infer_type_res(e, columns).ok())
                 .and_then(|(o, _)| coltype_of_oid(o))
-                .and_then(crate::sql::types::ArrElem::from_coltype)
+                .and_then(|ctype| match ctype {
+                    ColType::Array(element) => Some(element),
+                    scalar => crate::sql::types::ArrElem::from_coltype(scalar),
+                })
                 .unwrap_or(crate::sql::types::ArrElem::Text);
             of(ColType::Array(element))
         }
         Expr::Subscript { base, .. } => match coltype_of_oid(infer_type_res(base, columns)?.0) {
             Some(ColType::Array(e)) => of(e.to_coltype()),
             Some(ColType::Name) => of(ColType::Bpchar),
+            Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
             _ => (oid::UNKNOWN, -2),
         },
         // An array slice keeps the array type (unlike a subscript, which yields

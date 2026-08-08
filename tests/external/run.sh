@@ -58,7 +58,7 @@ bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 # port is never ours — a server leaked by an earlier interrupted run would
 # silently serve the whole suite while the fresh binary exits on its bind
 # failure (under coverage that reads as the external layer contributing no
-# profile — B-161). Refuse instead. And the probe succeeding only proves *a*
+# profile). Refuse instead. And the probe succeeding only proves *a*
 # server answered, so the started process must still be alive afterwards.
 START_PID=0
 start_pos3ql() { # <config> <log> <port>
@@ -401,7 +401,7 @@ work_arena_bytes = 96MiB
 EOF
 start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
 OVERLAY_PID=$START_PID
-# The scale table carries a PRIMARY KEY: the value index (B-169) makes a
+# The scale table carries a PRIMARY KEY: the value index makes a
 # uniqueness probe a hash seek against the committed rows rather than a scan of
 # the whole spilled SST forest, so a constrained table spills and grows past its
 # overlay without the old quadratic. This exercises the overlay/spill read path
@@ -427,7 +427,7 @@ out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
 
 # Uniqueness must hold across the spill boundary: a duplicate of a key long
 # evicted from the overlay must still be caught against its spilled row, not
-# silently inserted. Now that the probe is a value-index seek (B-169), this runs
+# silently inserted. Now that the probe is a value-index seek, this runs
 # at 5000 rows — far past the 1024 map — without the old quadratic cost.
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q \
   -c "CREATE TABLE uniq (id int PRIMARY KEY, v text)"

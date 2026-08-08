@@ -25,7 +25,7 @@
 #     which kill -9's every server it starts — SIGKILL never runs the profiler's
 #     atexit flush, so an instrumented torture shard yields zero .profraw and
 #     only pays the instrumentation tax for nothing. Its value is that it runs
-#     and passes (the whole of what B-168 restored).
+#     and passes.
 #
 # Ratchet, like tools/check-dups.sh: MIN may be raised as coverage improves and
 # is never lowered without a reason.
@@ -177,7 +177,7 @@ case "$SHARD" in
         # The external suites drive the *server binary* as a subprocess; if
         # they produced no profile beyond the in-process tests', the external
         # layer contributed nothing and the combined figure would read as a
-        # plausible-looking but far too low number (B-161). Fail loudly rather
+        # plausible-looking but far too low number. Fail loudly rather
         # than report a figure that claims to cover both layers but does not.
         ALL_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$ALL_PROFILES" -le "$LIB_PROFILES" ]; then

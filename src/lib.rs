@@ -1,12 +1,14 @@
 // Error values carry their message text inline (StackStr) because boxing
 // them would heap-allocate, which this codebase forbids after startup.
-#![allow(clippy::result_large_err)]
 // Dead-code detection only works when the public surface is honest: rustc
 // treats anything `pub`-reachable from the crate root as used, so a `pub` API
 // that nothing outside the crate consumes silently disables the check for
 // everything behind it. `unreachable_pub` keeps that surface from drifting back
 // open; `dead_code` (on by default) then does its job for the rest.
 #![warn(unreachable_pub)]
+// SQL errors own a fixed protocol-sized message so post-startup error paths
+// allocate nothing. Boxing them to satisfy Clippy would violate that invariant.
+#![allow(clippy::result_large_err)]
 
 pub(crate) mod checkpoint;
 pub mod config;
@@ -23,7 +25,6 @@ pub mod sql;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub(crate) mod util;
-pub(crate) mod vsr;
 pub(crate) mod wal;
 
 /// All heap memory flows through the guard so that "no allocation after

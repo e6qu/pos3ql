@@ -63,7 +63,6 @@ DROP TABLE tmt;
 SELECT '2020-01-01 12:34:56'::timestamp(7);
 SELECT '12:00:00'::time(7);
 SELECT '2020-01-01'::timestamptz(7);
--- (timetz is not implemented yet — B-092)
 SELECT '1 day'::interval(7);
 SELECT '2020-01-01'::timestamp(7), '12:00'::time(8);
 -- in range: no warning

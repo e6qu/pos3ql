@@ -72,10 +72,7 @@ pub fn digest(msg: &[u8]) -> [u8; 16] {
             *word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        // `i` drives the round function, the message-word index, the constant
-        // T[i], and the rotate amount — not a plain array walk.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..64 {
+        for (i, constant) in T.iter().copied().enumerate() {
             let (f, g) = if i < 16 {
                 ((b & c) | (!b & d), i)
             } else if i < 32 {
@@ -85,7 +82,7 @@ pub fn digest(msg: &[u8]) -> [u8; 16] {
             } else {
                 (c ^ (b | !d), (7 * i) % 16)
             };
-            let f = f.wrapping_add(a).wrapping_add(T[i]).wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(constant).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;

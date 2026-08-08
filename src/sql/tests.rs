@@ -6909,6 +6909,49 @@ fn comment_rolls_back() {
 }
 
 #[test]
+fn create_schema_embedded_elements_are_typed_and_requalified() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA typed_schema
+           CREATE DOMAIN positive AS integer CHECK (VALUE > 0)
+           CREATE TYPE mood AS ENUM ('ready', 'done')
+           CREATE TABLE rows (id integer)
+           CREATE VIEW row_view AS SELECT id FROM rows
+           CREATE INDEX rows_id ON rows (id)
+           CREATE SEQUENCE row_ids;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO typed_schema.rows VALUES (7);
+             SELECT id FROM typed_schema.row_view;
+             SELECT nextval('typed_schema.row_ids');
+             SELECT 7::typed_schema.positive;
+             SELECT 'ready'::typed_schema.mood;",
+        )),
+        ["7", "1", "7", "ready"]
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA invalid_schema CREATE MATERIALIZED VIEW view_inside_schema AS SELECT 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("42601"),
+        "the parser must reject non-schema elements: {}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
 fn pg_restore_clean_owner_and_schema_cascade_surface() {
     let (mut e, mut b) = test_engine();
     let created = run_with(
@@ -11137,9 +11180,59 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
     assert!(engine.commit_wal().is_err());
     assert!(engine.wal.pending_batch_bytes() > 0);
+    assert!(engine.checkpoint().is_err());
+    assert!(engine.wal.pending_batch_bytes() > 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
-    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn published_checkpoint_cleanup_retries_after_object_store_failure() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("post-publish-retry-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("sql-post-publish-retry-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 29);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .publish_commit_batch(1, b"checkpoint-covered")
+        .unwrap();
+    engine.begin_post_publish_cleanup(1);
+
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    assert!(!engine.maybe_checkpoint());
+    assert!(engine.checkpoint_work_pending());
+    let fenced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE blocked_until_cleanup (id int)",
+    );
+    assert!(
+        String::from_utf8_lossy(&fenced).contains("58030"),
+        "a failed published cleanup must fence later writes: {}",
+        String::from_utf8_lossy(&fenced)
+    );
+
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+    assert!(engine.maybe_checkpoint());
+    assert!(!engine.checkpoint_work_pending());
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -12538,6 +12631,11 @@ fn distinct_aggregates() {
             "SELECT count(distinct x) FROM t WHERE x IS NULL"
         )),
         ["0"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT count(distinct *) FROM t"))
+            .contains("42601"),
+        "DISTINCT * is invalid syntax, not an unsupported aggregate"
     );
     // avg(DISTINCT int) -> numeric with PG's 16-digit scale.
     assert_eq!(

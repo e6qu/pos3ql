@@ -16,7 +16,6 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 |---|---|---|
 | `object_store = off` | local journal sync | no |
 | `object_store = on` | immutable commit batch PUT and commit-head CAS | yes |
-| VSR (roadmap) | quorum ordering and object-store publication | yes |
 
 With object storage enabled, the server groups transactions received in one readable protocol batch, publishes their immutable journal bytes, then advances a CAS commit head before releasing success responses. Checkpoints publish immutable table state through a separate CAS manifest. Recovery follows the commit head beyond that manifest; local disk is a cache.
 
@@ -24,9 +23,9 @@ With object storage enabled, the server groups transactions received in one read
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, views, materialized views, indexes, sequences, domains, enums, SQL functions, CTEs, joins, windows, COPY, logical-replication publishing, and PostgreSQL catalog introspection used by common clients and dump/restore tools.
 
-Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage/consensus simulation.
+Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.
 
-The completion work is physical-demand propagation through query execution, logical-replication interoperability and subscription, remaining PostgreSQL SQL/catalog/tooling coverage, and production VSR routing. See [PLAN.md](PLAN.md).
+The completion work is physical-demand propagation through query execution, object-native logical-replication interoperability where practical, and remaining PostgreSQL SQL/catalog/tooling coverage. PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
 
 ## Quick start
 
@@ -47,5 +46,4 @@ psql -h 127.0.0.1 -p 5433 -U you
 ## References
 
 - [PostgreSQL frontend/backend protocol](https://www.postgresql.org/docs/current/protocol.html)
-- [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)
 - [TigerBeetle safety and design](https://docs.tigerbeetle.com/concepts/safety/)

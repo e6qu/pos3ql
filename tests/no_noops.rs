@@ -1,7 +1,7 @@
 //! Gate: the no-op guard (`tools/check-noops.sh`) must pass. This makes
 //! `cargo test` fail on any new silent accept-and-ignore of SQL/protocol
 //! semantics, so a gap gets implemented or rejected loudly — never quietly
-//! skipped. See BUGS.md B-019/B-020/B-021 for the tracked burn-down.
+//! skipped.
 
 use std::process::Command;
 

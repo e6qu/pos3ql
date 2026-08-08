@@ -1109,7 +1109,17 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call("make_interval", &slots);
         }
+        // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
+        let distinct = if self.peeked == Tok::Ident("distinct") {
+            self.advance()?;
+            true
+        } else {
+            false
+        };
         if self.peeked == Tok::Op("*") {
+            if distinct {
+                return Err(self.err_here("DISTINCT cannot be used with *"));
+            }
             self.advance()?;
             self.expect_op(")")?;
             let filter = self.parse_filter()?;
@@ -1124,13 +1134,6 @@ impl<'a> Parser<'a> {
                 filter,
             });
         }
-        // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
-        let distinct = if self.peeked == Tok::Ident("distinct") {
-            self.advance()?;
-            true
-        } else {
-            false
-        };
         let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
         let mut args: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
         let mut n = 0;

@@ -119,6 +119,10 @@ pub struct Engine {
     storage: Storage,
     wal: Wal,
     ckpt: Option<Checkpointer>,
+    /// A published manifest whose local bookkeeping still needs to finish.
+    /// Keeping this state makes publication and its cleanup one retriable
+    /// completion protocol instead of reporting success after the manifest.
+    post_publish_cleanup: Option<u64>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -745,6 +749,7 @@ impl Engine {
             storage,
             wal,
             ckpt,
+            post_publish_cleanup: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
             wal_seg_buf: Vec::with_capacity(upload_buf),
@@ -2502,6 +2507,10 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        self.retry_pending_wal_upload()?;
+        if self.post_publish_cleanup.is_some() {
+            self.finish_post_publish_cleanup()?;
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2524,7 +2533,8 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint? {
             Some(lsn) => {
-                self.after_publish(lsn)?;
+                self.begin_post_publish_cleanup(lsn);
+                self.finish_post_publish_cleanup()?;
                 Ok(true)
             }
             None => Ok(false),
@@ -2535,7 +2545,6 @@ impl Engine {
     /// everything at or below `lsn` is bucket-durable, so the local journal
     /// restarts and the heap compacts (spilling under memory pressure).
     fn after_publish(&mut self, lsn: u64) -> Result<(), SqlError> {
-        self.storage.clear_dirty();
         if !self.storage.has_active_snapshots() {
             if self.wal_upload
                 && let Some(ckpt) = self.ckpt.as_mut()
@@ -2548,9 +2557,15 @@ impl Engine {
                     .oldest_replication_restart_lsn()
                     .unwrap_or(lsn)
                     .min(lsn);
-                let _ = ckpt.prune_commit_batches(retain_through);
+                ckpt.prune_commit_batches(retain_through)?;
             }
-            self.wal.reset_after_checkpoint();
+            // A sliced checkpoint can publish a snapshot while later
+            // statements have already appended WAL. Retaining the journal in
+            // that case lets recovery replay the suffix above this manifest;
+            // only a checkpoint at the current tail may restart it.
+            if self.wal.last_lsn() <= lsn {
+                self.wal.reset_after_checkpoint();
+            }
         }
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
@@ -2571,6 +2586,28 @@ impl Engine {
         // pressure sheds bytes: the overlay keeps the working set, the
         // bucket keeps the rows.
         self.storage.evict_entries();
+        Ok(())
+    }
+
+    fn begin_post_publish_cleanup(&mut self, lsn: u64) {
+        // Cleanup may retry, but publication already marked only the table
+        // generations the manifest captured as clean.
+        self.post_publish_cleanup = Some(lsn);
+    }
+
+    fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
+        let lsn = self
+            .post_publish_cleanup
+            .expect("post-publication cleanup has its published LSN");
+        self.after_publish(lsn)?;
+        self.post_publish_cleanup = None;
+        Ok(())
+    }
+
+    fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
+        if self.post_publish_cleanup.is_some() {
+            self.finish_post_publish_cleanup()?;
+        }
         Ok(())
     }
 
@@ -2658,9 +2695,10 @@ impl Engine {
     }
 
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.ckpt
-            .as_ref()
-            .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
+        self.post_publish_cleanup.is_some()
+            || self.ckpt.as_ref().is_some_and(|c| {
+                c.sweep_active() || c.maintenance_pending() || c.merge_work_pending(&self.storage)
+            })
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -2677,6 +2715,27 @@ impl Engine {
         if self.block_reads_pending() {
             return true;
         }
+        if let Err(error) = self.retry_pending_wal_upload() {
+            eprintln!(
+                "pos3ql: auto-checkpoint failed ({}): {}",
+                error.sqlstate,
+                error.message.as_str()
+            );
+            return false;
+        }
+        if self.post_publish_cleanup.is_some() {
+            return match self.finish_post_publish_cleanup() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
+                        e.sqlstate,
+                        e.message.as_str()
+                    );
+                    false
+                }
+            };
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
         };
@@ -2684,6 +2743,7 @@ impl Engine {
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
         let history_full = self.storage.history_pressure();
         if !(ckpt.sweep_active()
+            || ckpt.maintenance_pending()
             || ckpt.merge_work_pending(&self.storage)
             || heap_full
             || wal_full
@@ -2703,7 +2763,8 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
-                if let Err(e) = self.after_publish(lsn) {
+                self.begin_post_publish_cleanup(lsn);
+                if let Err(e) = self.finish_post_publish_cleanup() {
                     eprintln!(
                         "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
                         e.sqlstate,
@@ -2798,6 +2859,13 @@ impl Engine {
                     if statement_index < resume_statement {
                         statement_index += 1;
                         continue;
+                    }
+                    if self.post_publish_cleanup.is_some()
+                        && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+                        && let Err(error) = self.retry_post_publish_cleanup()
+                    {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(ExecutionStatus::Complete);
                     }
                     if self.pending_copy.take().is_some() {
                         // COPY FROM STDIN takes over the connection; a
@@ -2906,6 +2974,29 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
+        let statement = match parser.next_stmt() {
+            Ok(Some(statement)) => statement,
+            Ok(None) => {
+                responder.empty_query_response()?;
+                return Ok(ExtendedExecutionStatus::Complete(true));
+            }
+            Err(e) => {
+                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.abort_explicit_txn(txn, guc);
+                } else if txn.is_explicit() {
+                    txn.failed = true;
+                }
+                report_parse_error(responder, &e)?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+        };
+        if self.post_publish_cleanup.is_some()
+            && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && let Err(error) = self.retry_post_publish_cleanup()
+        {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
@@ -2913,30 +3004,12 @@ impl Engine {
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-        let outcome = match parser.next_stmt() {
-            Ok(Some(statement)) => {
-                emit_parse_warnings(&mut parser, responder)?;
-                let outcome = self.execute_stmt(
-                    &statement, arena, params, txn, sqlprep, cursors, guc, responder,
-                )?;
-                outcome.and_then(|()| query::check_timeout())
-            }
-            Ok(None) => {
-                responder.empty_query_response()?;
-                Ok(())
-            }
-            Err(e) => {
-                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.abort_explicit_txn(txn, guc);
-                } else if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
-                }
-                report_parse_error(responder, &e)?;
-                return Ok(ExtendedExecutionStatus::Complete(false));
-            }
-        };
+        emit_parse_warnings(&mut parser, responder)?;
+        let outcome = self
+            .execute_stmt(
+                &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+            )?
+            .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
                 if txn.mode == TxnMode::Implicit
@@ -4519,16 +4592,53 @@ impl Engine {
                         Ok(r) => r,
                         Err(e) => return Ok(Err(e)),
                     };
-                    if let Err(e) = self.execute_stmt(
-                        requalified,
-                        arena,
-                        params,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                    )? {
+                    let result = if let Stmt::CreateView {
+                        name,
+                        or_replace,
+                        sql,
+                    } = requalified
+                    {
+                        let schema = name
+                            .schema
+                            .expect("CREATE SCHEMA requalification assigns a schema");
+                        let schema_path = match eval::quote_ident_str(schema, arena) {
+                            Ok(path) => path,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        let role = guc.current_role();
+                        let path = self
+                            .storage
+                            .compute_path(schema_path, role.as_str(), txn.txid);
+                        let old_path = self.storage.swap_path(path);
+                        let result = exec::create_view(
+                            &mut self.storage,
+                            &mut self.wal,
+                            txn,
+                            exec::CreateViewCommand {
+                                name,
+                                or_replace: *or_replace,
+                                sql,
+                                raw_path: schema_path,
+                            },
+                            arena,
+                            responder,
+                        );
+                        self.storage.swap_path(old_path);
+                        result
+                    } else {
+                        self.execute_stmt(
+                            requalified,
+                            arena,
+                            params,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                        )
+                    };
+                    let result = result?;
+                    if let Err(e) = result {
                         return Ok(Err(e));
                     }
                 }
@@ -5496,7 +5606,7 @@ fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), W
 /// element that already names that schema passes through; one naming another
 /// schema is PostgreSQL's 42P15.
 fn requalify_schema_element<'a>(
-    element: &'a Stmt<'a>,
+    element: &'a ast::CreateSchemaElement<'a>,
     schema: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
@@ -5516,11 +5626,11 @@ fn requalify_schema_element<'a>(
         }
     };
     let rewritten = match element {
-        Stmt::CreateTable(c) => Stmt::CreateTable(ast::CreateTable {
+        ast::CreateSchemaElement::Table(c) => Stmt::CreateTable(ast::CreateTable {
             name: requalify(c.name)?,
             ..*c
         }),
-        Stmt::CreateView {
+        ast::CreateSchemaElement::View {
             name,
             or_replace,
             sql,
@@ -5529,7 +5639,7 @@ fn requalify_schema_element<'a>(
             or_replace: *or_replace,
             sql,
         },
-        Stmt::CreateIndex {
+        ast::CreateSchemaElement::Index {
             name,
             table,
             columns,
@@ -5540,13 +5650,23 @@ fn requalify_schema_element<'a>(
             columns,
             unique: *unique,
         },
-        other => {
-            let _ = other;
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "unsupported CREATE SCHEMA element"
-            ));
-        }
+        ast::CreateSchemaElement::Sequence {
+            name,
+            if_not_exists,
+            options,
+        } => Stmt::CreateSequence {
+            name: requalify(*name)?,
+            if_not_exists: *if_not_exists,
+            options: *options,
+        },
+        ast::CreateSchemaElement::Domain(domain) => Stmt::CreateDomain(ast::CreateDomain {
+            name: requalify(domain.name)?,
+            ..*domain
+        }),
+        ast::CreateSchemaElement::Enum { name, labels } => Stmt::CreateEnum {
+            name: requalify(*name)?,
+            labels,
+        },
     };
     arena
         .alloc(rewritten)

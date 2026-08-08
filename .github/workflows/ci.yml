@@ -35,7 +35,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # Fail fast on any new silent accept-and-ignore of SQL/protocol
-      # semantics. See tools/check-noops.sh and BUGS.md B-019/B-020/B-021.
+      # semantics. See tools/check-noops.sh.
       - name: No-op guard
         run: zsh tools/check-noops.sh
 

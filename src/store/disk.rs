@@ -124,6 +124,7 @@ impl<S: BlockStore> DiskCache<S> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> DiskStats {
         self.stats
     }
@@ -200,6 +201,17 @@ pub(crate) enum DiskError {
     Io(&'static str, std::io::Error),
     Budget(BudgetError),
 }
+
+impl std::fmt::Display for DiskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(operation, error) => write!(formatter, "{operation}: {error}"),
+            Self::Budget(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DiskError {}
 
 impl<S: BlockStore> BlockStore for DiskCache<S> {
     fn put(
@@ -290,6 +302,7 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
         Ok(Some((len, block_type)))
     }
 
+    #[cfg(test)]
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         if self.index.get(id).is_some() {
             return Ok(true);

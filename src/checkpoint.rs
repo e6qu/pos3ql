@@ -222,6 +222,9 @@ pub(crate) struct Checkpointer {
     /// table generation each slot's slice captured, and which slots were
     /// sliced this sweep.
     sweeping: bool,
+    /// A manifest is durable but its bounded garbage sweep still needs a
+    /// retry. Its LSN is withheld until maintenance completes.
+    published_lsn_pending_maintenance: Option<u64>,
     sliced_generation: Vec<u64>,
     sliced_this_sweep: Vec<bool>,
     /// The slice writer (reset per table) and the merge writer, which holds
@@ -259,8 +262,8 @@ pub(crate) enum CheckpointStep {
 }
 
 /// Upper bounds reserved at startup so checkpoint-time bookkeeping never
-/// touches the allocator. A sweep that would exceed these logs and defers
-/// the remainder to the next checkpoint.
+/// touches the allocator. Exhausting one is a named checkpoint error; success
+/// must mean every requested maintenance operation completed.
 const MAX_CKPT_TABLES: usize = 1024;
 const MAX_SWEEP_KEYS: usize = 4096;
 /// Block identities the GC keep-set can hold across every live SST.
@@ -440,6 +443,10 @@ impl Checkpointer {
         self.merge_job.is_some()
             || self.merge_done.is_some()
             || self.merge_candidate(storage).is_some()
+    }
+
+    pub(crate) fn maintenance_pending(&self) -> bool {
+        self.published_lsn_pending_maintenance.is_some()
     }
 
     /// A schedule beat: scan a bounded stretch of one member, collecting
@@ -681,6 +688,7 @@ impl Checkpointer {
             ref_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
             doomed_scratch: Vec::with_capacity(MAX_SWEEP_KEYS),
             sweeping: false,
+            published_lsn_pending_maintenance: None,
             sliced_generation: vec![0; MAX_CKPT_TABLES],
             sliced_this_sweep: vec![false; MAX_CKPT_TABLES],
             slice_writer: SstWriter::new(),
@@ -1018,7 +1026,10 @@ impl Checkpointer {
                 .map_err(object_store_to_sql)?;
         }
         if overflow {
-            eprintln!("pos3ql: commit batches exceed one sweep; continuing next checkpoint");
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "commit-batch sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
+            ));
         }
         Ok(())
     }
@@ -2510,6 +2521,12 @@ impl Checkpointer {
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
+        if let Some(lsn) = self.published_lsn_pending_maintenance {
+            self.collect_garbage()?;
+            self.collect_block_garbage(storage)?;
+            self.published_lsn_pending_maintenance = None;
+            return Ok(CheckpointStep::Published { lsn });
+        }
         let pinned_full_list = storage.has_active_snapshots()
             && self.merge_done.is_none()
             && (0..storage.table_count()).any(|slot| {
@@ -2569,6 +2586,7 @@ impl Checkpointer {
         }
         let lsn = storage.lsn();
         self.publish(storage, lsn)?;
+        storage.clear_dirty_through(&self.sliced_generation);
         self.sweeping = false;
         Ok(CheckpointStep::Published { lsn })
     }
@@ -3653,25 +3671,13 @@ impl Checkpointer {
         // shadowing every local WAL record the lsn covers.
         self.sweeping = false;
 
-        // GC: delete any SST under sst/ not referenced by the new manifest,
-        // then any block not on a live SST's roster. Advisory: a failure
-        // leaves orphans for the next publish's sweep (mark-and-sweep is
-        // idempotent), never a failed checkpoint — the checkpoint's promise
-        // was kept at the CAS.
-        if let Err(e) = self.collect_garbage() {
-            eprintln!(
-                "pos3ql: post-checkpoint garbage sweep failed ({}): {}",
-                e.sqlstate,
-                e.message.as_str()
-            );
-        }
-        if let Err(e) = self.collect_block_garbage(storage) {
-            eprintln!(
-                "pos3ql: post-checkpoint block sweep failed ({}): {}",
-                e.sqlstate,
-                e.message.as_str()
-            );
-        }
+        // A successful checkpoint includes both publication and maintenance.
+        // Keep the LSN until bounded sweeps finish so the next beat resumes
+        // cleanup instead of falsely reporting completion.
+        self.published_lsn_pending_maintenance = Some(lsn);
+        self.collect_garbage()?;
+        self.collect_block_garbage(storage)?;
+        self.published_lsn_pending_maintenance = None;
         Ok(())
     }
 
@@ -3956,8 +3962,8 @@ impl Checkpointer {
     /// rosters of the SSTs the manifest just published (each roster is one
     /// block read, through the cache), plus the rosters themselves; anything
     /// else under the prefix is an orphan from a superseded checkpoint or an
-    /// interrupted write, and is deleted. Overflow defers to the next sweep
-    /// rather than deleting anything live.
+    /// interrupted write, and is deleted. An undersized keep-set is a loud
+    /// error rather than a successful checkpoint that silently retains debt.
     fn collect_block_garbage(&mut self, storage: &Storage) -> Result<(), SqlError> {
         self.roster_scratch.clear();
         self.sst_arena.reset();
@@ -3970,8 +3976,10 @@ impl Checkpointer {
         if self.merge_job.is_some() {
             for id in self.merge_writer.roster_so_far() {
                 if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
-                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
-                    return Ok(());
+                    return Err(sql_err!(
+                        SQLSTATE_IO,
+                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                    ));
                 }
                 self.roster_scratch.push(*id);
             }
@@ -3979,8 +3987,10 @@ impl Checkpointer {
         for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
             let h = prev.handle;
             if self.roster_scratch.len() + 1 > MAX_KEEP_BLOCKS {
-                eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
-                return Ok(());
+                return Err(sql_err!(
+                    SQLSTATE_IO,
+                    "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                ));
             }
             self.roster_scratch.push(h.roster);
             let n = self
@@ -3997,8 +4007,10 @@ impl Checkpointer {
                     ));
                 }
                 if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
-                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
-                    return Ok(());
+                    return Err(sql_err!(
+                        SQLSTATE_IO,
+                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                    ));
                 }
                 let mut id = [0u8; 32];
                 id.copy_from_slice(id_bytes);
@@ -4030,8 +4042,10 @@ impl Checkpointer {
                     )
                 })?;
                 if !complete {
-                    eprintln!("pos3ql: block keep-set full; skipping block GC this checkpoint");
-                    return Ok(());
+                    return Err(sql_err!(
+                        SQLSTATE_IO,
+                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                    ));
                 }
             }
         }
@@ -4061,7 +4075,10 @@ impl Checkpointer {
                 .map_err(object_store_to_sql)?;
         }
         if overflow {
-            eprintln!("pos3ql: block garbage exceeds one sweep; continuing next checkpoint");
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "block garbage sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
+            ));
         }
         Ok(())
     }
@@ -4091,7 +4108,10 @@ impl Checkpointer {
                 .map_err(object_store_to_sql)?;
         }
         if overflow {
-            eprintln!("pos3ql: sst garbage exceeds one sweep; continuing next checkpoint");
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "SST garbage sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
+            ));
         }
         Ok(())
     }

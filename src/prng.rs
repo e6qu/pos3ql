@@ -8,12 +8,6 @@
 //! reference implementation `pcg_basic.c` in imneme/pcg-c-basic at commit
 //! bc39cd76ac3d541e618606bcc6e1e5ba5e5e6aa3.
 
-// Reached by this module's own tests and by the simulator, but not yet by the
-// running server, so a --lib build sees it as dead while a --tests build does
-// not. `allow` rather than `expect` for exactly that reason: an `expect` here
-// would be unfulfilled in the test build and fail it.
-#![allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub(crate) struct Pcg32 {
     state: u64,
@@ -45,6 +39,7 @@ impl Pcg32 {
         xorshifted.rotate_right(rot)
     }
 
+    #[cfg(test)]
     pub(crate) fn next_u64(&mut self) -> u64 {
         (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
     }
@@ -63,6 +58,7 @@ impl Pcg32 {
     }
 
     /// Uniform value in `[low, high]` (inclusive).
+    #[cfg(test)]
     pub(crate) fn next_range_inclusive(&mut self, low: u32, high: u32) -> u32 {
         assert!(low <= high, "empty range: {low}..={high}");
         let span = high - low;
@@ -72,11 +68,7 @@ impl Pcg32 {
         low + self.next_bounded(span + 1)
     }
 
-    /// True with probability `numerator / denominator`.
-    pub(crate) fn chance(&mut self, numerator: u32, denominator: u32) -> bool {
-        self.next_bounded(denominator) < numerator
-    }
-
+    #[cfg(test)]
     pub(crate) fn fill_bytes(&mut self, dest: &mut [u8]) {
         for chunk in dest.chunks_mut(4) {
             let bytes = self.next_u32().to_le_bytes();

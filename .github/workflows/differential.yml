@@ -135,7 +135,7 @@ jobs:
           FUZZ_COUNT: "10000"
           FUZZ_SEED: "1"
           # Ratchet budget: allowed fuzz divergences before failing (see BUGS.md
-          # B-039). A ceiling, not an exact target — the residual divergences are
+          # A ceiling, not an exact target — the residual divergences are
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward zero.
           FUZZ_BUDGET: "0"

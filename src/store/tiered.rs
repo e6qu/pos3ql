@@ -33,14 +33,14 @@ impl TierSizing {
     fn ram(bytes: usize) -> Self {
         TierSizing {
             bytes,
-            units: BlockCache::<super::memory::MemoryBlockStore>::frames_for(bytes),
+            units: BlockCache::<super::object::OwnedObjectStore>::frames_for(bytes),
         }
     }
 
     fn disk(bytes: usize) -> Self {
         TierSizing {
             bytes,
-            units: DiskCache::<super::memory::MemoryBlockStore>::slots_for(bytes),
+            units: DiskCache::<super::object::OwnedObjectStore>::slots_for(bytes),
         }
     }
 }
@@ -160,10 +160,11 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    #[cfg(test)]
     fn contains(&mut self, id: &super::BlockId) -> Result<bool, super::StoreError> {
         match self {
-            Layer::Base(s) => s.contains(id),
-            Layer::Disk(d) => d.contains(id),
+            Layer::Base(store) => store.contains(id),
+            Layer::Disk(cache) => cache.contains(id),
         }
     }
 
@@ -307,10 +308,11 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
+    #[cfg(test)]
     fn contains(&mut self, id: &super::BlockId) -> Result<bool, super::StoreError> {
         match self {
-            TieredStore::WithRam(c) => c.contains(id),
-            TieredStore::WithoutRam(l) => l.contains(id),
+            TieredStore::WithRam(cache) => cache.contains(id),
+            TieredStore::WithoutRam(layer) => layer.contains(id),
         }
     }
 

@@ -3268,17 +3268,15 @@ fn array_from_subquery_and_array_to_string() {
         &mut t,
         "INSERT INTO t VALUES (10),(20),(30)",
     );
-    // Elements follow the table's physical (insertion) scan order, matching
-    // PostgreSQL. (ORDER BY inside a subquery is not yet honored — tracked
-    // separately — so it is deliberately not exercised here.)
+    // ARRAY preserves its subquery's requested order.
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut e,
             &mut b,
             &mut t,
-            "SELECT array(SELECT x FROM t)"
+            "SELECT array(SELECT x FROM t ORDER BY x DESC)"
         )),
-        ["{10,20,30}"]
+        ["{30,20,10}"]
     );
     // Empty subquery yields an empty array, not NULL.
     assert_eq!(
@@ -3677,6 +3675,24 @@ fn window_functions() {
             "200|200|-1"
         ],
         "lag/lead: {l:?}"
+    );
+    let filtered = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT dept, sal, sum(sal) FILTER (WHERE sal > 100) OVER (PARTITION BY dept) \
+         FROM s ORDER BY dept, sal, name",
+    ));
+    assert_eq!(
+        filtered,
+        [
+            "a|100|400",
+            "a|200|400",
+            "a|200|400",
+            "b|50|NULL",
+            "b|75|NULL"
+        ],
+        "filtered window aggregate: {filtered:?}"
     );
 }
 

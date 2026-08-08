@@ -3181,17 +3181,28 @@ pub(crate) fn decode_binary_param<'a>(
             if bytes.len() < 4 {
                 return Err("truncated binary inet/cidr parameter");
             }
-            let nb = bytes[3] as usize;
-            if (nb != 4 && nb != 16) || bytes.len() != 4 + nb {
+            let (family, address_bytes, max_bits) = match (bytes[0], bytes[3] as usize) {
+                (2, 4) => (4, 4, 32),
+                (3, 16) => (6, 16, 128),
+                (2 | 3, _) => return Err("binary inet/cidr address length does not match family"),
+                _ => return Err("invalid binary inet/cidr address family"),
+            };
+            if bytes.len() != 4 + address_bytes {
                 return Err("malformed binary inet/cidr parameter");
             }
+            if bytes[1] > max_bits {
+                return Err("binary inet/cidr mask exceeds address family width");
+            }
             let mut addr = [0u8; 16];
-            addr[..nb].copy_from_slice(&bytes[4..4 + nb]);
+            addr[..address_bytes].copy_from_slice(&bytes[4..4 + address_bytes]);
             let net = crate::sql::net::NetAddr {
-                family: if bytes[0] == 2 { 4 } else { 6 },
+                family,
                 bits: bytes[1],
                 addr,
             };
+            if oid == oids::CIDR && net != net.to_network() {
+                return Err("binary cidr parameter has host bits set");
+            }
             Ok(if oid == oids::CIDR {
                 Datum::Cidr(net)
             } else {
@@ -3420,6 +3431,36 @@ mod tests {
             decode_binary_param(crate::sql::types::oid::TIMETZ, &bytes, &arena)
                 .expect("timetz decodes"),
             Datum::Timetz(time, -west)
+        );
+    }
+
+    #[test]
+    fn binary_network_parameters_validate_their_wire_shape() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary network test", 16).expect("test arena");
+        let inet = [2, 24, 0, 4, 192, 0, 2, 9];
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::INET, &inet, &arena)
+                .expect("IPv4 inet decodes"),
+            Datum::Inet(crate::sql::net::NetAddr {
+                family: 4,
+                bits: 24,
+                addr: [192, 0, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            })
+        );
+        for malformed in [
+            &[4, 24, 0, 16, 0, 0, 0, 0][..],
+            &[2, 33, 0, 4, 192, 0, 2, 9][..],
+            &[2, 24, 0, 16, 192, 0, 2, 9][..],
+        ] {
+            assert!(
+                decode_binary_param(crate::sql::types::oid::INET, malformed, &arena).is_err(),
+                "malformed inet parameter must fail: {malformed:?}"
+            );
+        }
+        assert!(
+            decode_binary_param(crate::sql::types::oid::CIDR, &inet, &arena).is_err(),
+            "cidr parameters cannot carry host bits"
         );
     }
 

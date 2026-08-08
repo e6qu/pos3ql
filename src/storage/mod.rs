@@ -8291,8 +8291,7 @@ impl Storage {
             want[n_want].1 = columns.len();
             n_want += 1;
         }
-        #[allow(clippy::needless_range_loop)]
-        for w in 0..n_want {
+        for (w, (wanted_columns, wanted_count)) in want.iter().take(n_want).enumerate() {
             let slot = match self.value_indexes.as_mut().expect("pool present").acquire() {
                 Some(s) => s,
                 None => {
@@ -8306,12 +8305,13 @@ impl Storage {
             };
             self.tables[table_index].enforcers[w] = Some(Enforcer {
                 slot,
-                columns: want[w].0,
-                n_cols: want[w].1,
+                columns: *wanted_columns,
+                n_cols: *wanted_count,
                 durable: published[..n_published]
                     .iter()
                     .find(|(columns, n_columns, _)| {
-                        *n_columns == want[w].1 && columns[..*n_columns] == want[w].0[..want[w].1]
+                        *n_columns == *wanted_count
+                            && columns[..*n_columns] == wanted_columns[..*wanted_count]
                     })
                     .and_then(|(_, _, handle)| *handle),
             });

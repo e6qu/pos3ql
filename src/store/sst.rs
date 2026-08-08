@@ -455,6 +455,7 @@ impl SstWriter {
 
     /// Appends a deletion marker for `rowid`. Ordered with the rows, sized
     /// like an empty entry.
+    #[cfg(test)]
     pub(crate) fn append_tombstone(
         &mut self,
         store: &mut dyn BlockStore,
@@ -1369,6 +1370,7 @@ impl PaxLayout {
     /// Rebuilds one canonical row from the already-validated PAX value spans.
     /// The caller supplies the exact spans yielded by [`Self::advance_row_values`]
     /// for this row, so a merge cursor need not reassemble every row in a block.
+    #[cfg(test)]
     pub(crate) fn copy_row(
         &self,
         input: &[u8],
@@ -1611,11 +1613,13 @@ fn decode_pax_v2(
     Ok(written)
 }
 
+#[cfg(test)]
 pub(crate) struct PaxReadScratch<'a> {
     pub(crate) column: &'a mut [u8],
     pub(crate) range: &'a mut [u8],
 }
 
+#[cfg(test)]
 pub(crate) fn copy_pax_v2_row_demand(
     store: &mut dyn BlockStore,
     layout: &PaxLayout,
@@ -2002,6 +2006,7 @@ impl<'a> SstReader<'a> {
     /// filter rejects returns without the index or a data block being read at
     /// all. A key it admits reads the index and the one data block the key
     /// would be in — two blocks, as before, plus the filter.
+    #[cfg(test)]
     pub(crate) fn get(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2084,6 +2089,7 @@ impl<'a> SstReader<'a> {
     /// `len` bytes. The filter and index gate the read exactly as `get`
     /// does; this is the existence probe the row-map overlay answers point
     /// lookups with.
+    #[cfg(test)]
     pub(crate) fn probe(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2141,6 +2147,7 @@ impl<'a> SstReader<'a> {
     /// reads consecutive data blocks and emits their in-range rows until one
     /// runs past `hi`. So a range scan fetches the index plus only the data
     /// blocks the range actually covers, not the whole SST.
+    #[cfg(test)]
     pub(crate) fn scan(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2418,6 +2425,7 @@ fn root_leaf_containing(root: &[u8], leaves: usize, key: SstKey, versioned: bool
 /// either shape, fetching blocks through `store` into `buf` (clobbered).
 /// `None` past the end. This is how the storage overlay's member cursors
 /// walk an SST without holding its whole index resident.
+#[cfg(test)]
 pub(crate) fn locate_data_block(
     store: &mut dyn BlockStore,
     handle: &SstHandle,

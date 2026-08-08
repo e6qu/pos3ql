@@ -458,12 +458,7 @@ impl<'a> AggState<'a> {
         };
         self.star = *star;
         self.distinct = *distinct;
-        if *distinct && *star {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "DISTINCT is not implemented for count(*)"
-            ));
-        }
+        debug_assert!(!(*distinct && *star));
         // ORDER BY only affects string_agg (other aggregates are commutative,
         // so their result is identical regardless of input order).
         if !order_by.is_empty()

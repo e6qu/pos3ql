@@ -94,6 +94,7 @@ impl<S: BlockStore> BlockCache<S> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> CacheStats {
         self.stats
     }
@@ -234,10 +235,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         Ok(Some((len, block_type)))
     }
 
-    /// Presence in the cache proves presence in the store — a frame is only
-    /// filled from a block the store accepted or returned — so a hit answers
-    /// without a round trip. A miss has to ask, because the cache holds a
-    /// subset and not knowing a block is not knowing it is absent.
+    #[cfg(test)]
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         if self.index.get(id).is_some() {
             return Ok(true);

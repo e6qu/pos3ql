@@ -114,6 +114,7 @@ impl BlockStore for MemoryBlockStore {
         Ok((block.payload.len(), block.block_type))
     }
 
+    #[cfg(test)]
     fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
         Ok(self.index.get(id).is_some())
     }

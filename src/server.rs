@@ -12,7 +12,7 @@ use crate::mem::fixed_vec::FixedVec;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
-use crate::pg::conn::{After, AuthContext, Conn};
+use crate::pg::conn::{After, AuthContext, CancelRequest, Conn};
 use crate::sql::Engine;
 
 const LISTENER_TOKEN: u64 = u64::MAX;
@@ -45,7 +45,7 @@ pub struct Server {
     free: FixedVec<u32>,
     engine: Engine,
     /// Random key sent in BackendKeyData (16 bytes; protocol 3.0 gets the
-    /// first 4). Cancellation itself is not implemented yet.
+    /// first 4). A matching CancelRequest interrupts a parked statement.
     cancel_key: [u8; 16],
     next_conn_id: i32,
     /// Pre-rendered "too many connections" ErrorResponse for refusals.
@@ -448,18 +448,22 @@ impl Server {
             // Stale event for a slot that was already recycled.
             return;
         }
-        let after = if readable {
-            slot.conn.on_readable(
+        let (after, cancel_request) = if readable {
+            let after = slot.conn.on_readable(
                 &mut self.engine,
                 &self.cancel_key,
                 &self.auth,
                 self.tls_config.as_ref(),
-            )
+            );
+            (after, slot.conn.take_cancel_request())
         } else if writable {
-            slot.conn.on_writable()
+            (slot.conn.on_writable(), None)
         } else {
-            After::Continue
+            (After::Continue, None)
         };
+        if let Some(request) = cancel_request {
+            self.cancel(request);
+        }
         match after {
             After::Close => {
                 // A dropped connection releases its uncommitted work.
@@ -500,6 +504,17 @@ impl Server {
         // in the engine outbox; fan them out to every listening connection.
         if self.engine.has_notifications() {
             self.deliver_notifications();
+        }
+    }
+
+    fn cancel(&mut self, request: CancelRequest) {
+        if let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| request.matches(slot.conn.id(), &self.cancel_key))
+            && self.slots[index].conn.cancel_parked()
+        {
+            self.sync_write_interest(index);
         }
     }
 

@@ -2548,7 +2548,7 @@ impl Engine {
                     .oldest_replication_restart_lsn()
                     .unwrap_or(lsn)
                     .min(lsn);
-                let _ = ckpt.prune_commit_batches(retain_through);
+                ckpt.prune_commit_batches(retain_through)?;
             }
             self.wal.reset_after_checkpoint();
         }
@@ -2658,9 +2658,9 @@ impl Engine {
     }
 
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.ckpt
-            .as_ref()
-            .is_some_and(|c| c.sweep_active() || c.merge_work_pending(&self.storage))
+        self.ckpt.as_ref().is_some_and(|c| {
+            c.sweep_active() || c.maintenance_pending() || c.merge_work_pending(&self.storage)
+        })
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -2684,6 +2684,7 @@ impl Engine {
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
         let history_full = self.storage.history_pressure();
         if !(ckpt.sweep_active()
+            || ckpt.maintenance_pending()
             || ckpt.merge_work_pending(&self.storage)
             || heap_full
             || wal_full

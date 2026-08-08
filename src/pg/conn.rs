@@ -101,6 +101,40 @@ enum ReplicationMode {
     Logical,
 }
 
+/// A parsed cancellation target. PostgreSQL 3.0 uses a four-byte secret;
+/// protocol 3.2 carries the complete key from BackendKeyData.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CancelRequest {
+    pid: i32,
+    key: [u8; 16],
+    key_len: u8,
+}
+
+impl CancelRequest {
+    pub(crate) fn matches(self, pid: i32, server_key: &[u8; 16]) -> bool {
+        self.pid == pid
+            && match self.key_len {
+                4 => self.key[..4] == server_key[..4],
+                16 => self.key == *server_key,
+                _ => false,
+            }
+    }
+}
+
+fn parse_cancel_request(packet: &[u8]) -> Option<CancelRequest> {
+    let key_len = packet.len().checked_sub(12)?;
+    if !matches!(key_len, 4 | 16) {
+        return None;
+    }
+    let mut key = [0; 16];
+    key[..key_len].copy_from_slice(&packet[12..]);
+    Some(CancelRequest {
+        pid: i32::from_be_bytes(packet[8..12].try_into().ok()?),
+        key,
+        key_len: key_len as u8,
+    })
+}
+
 /// One active logical CopyBoth stream. All durable state remains in the slot;
 /// this holds only the connection-owned cursor and negotiated stream settings.
 struct ReplicationStream {
@@ -211,6 +245,7 @@ pub struct Conn {
     /// A TLS session staged by the SSLRequest handler, promoted to `tls` once
     /// the plaintext `S` acknowledgement has left the socket.
     pending_tls: Option<crate::pg::tls::ServerSession>,
+    cancel_request: Option<CancelRequest>,
 }
 
 impl Conn {
@@ -278,6 +313,7 @@ impl Conn {
             resume_statement: 0,
             tls: None,
             pending_tls: None,
+            cancel_request: None,
         })
     }
 
@@ -323,6 +359,7 @@ impl Conn {
         self.resume_statement = 0;
         self.tls = None;
         self.pending_tls = None;
+        self.cancel_request = None;
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
@@ -357,6 +394,33 @@ impl Conn {
 
     pub(crate) fn authenticated_role(&self) -> Option<u16> {
         self.authenticated_role
+    }
+
+    pub(crate) fn take_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.cancel_request.take()
+    }
+
+    pub(crate) fn cancel_parked(&mut self) -> bool {
+        if !self.parked {
+            return false;
+        }
+        let extended = self.recv.readable().first() != Some(&wire::FMSG_QUERY);
+        self.recv.clear();
+        self.finish_lock_wait();
+        if extended {
+            self.phase = Phase::SkipToSync;
+        }
+        let mut responder = Responder::new(&mut self.send);
+        let sent = responder.error(
+            sqlstate::QUERY_CANCELED,
+            "canceling statement due to user request",
+        );
+        let sent = if extended {
+            sent
+        } else {
+            sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+        };
+        sent.is_ok()
     }
 
     /// Appends an asynchronous NotificationResponse ('A': int32 PID, channel,
@@ -618,8 +682,7 @@ impl Conn {
                 Step::Continue
             }
             wire::REQUEST_CANCEL => {
-                // Query cancellation needs cross-connection signalling;
-                // the spec says just close if unsupported.
+                self.cancel_request = parse_cancel_request(&data[..len]);
                 Step::Close
             }
             version if version >> 16 == 3 => {
@@ -2461,7 +2524,7 @@ impl Conn {
         }
         let message = match self.replication {
             ReplicationMode::Physical => "physical replication is not supported",
-            ReplicationMode::Logical => "logical replication commands are not implemented yet",
+            ReplicationMode::Logical => "unsupported logical replication command",
             ReplicationMode::None => unreachable!("only replication connections reach this path"),
         };
         let mut responder = Responder::new(&mut self.send);
@@ -3015,7 +3078,7 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Float8(f64::from_be_bytes(b)))
         }
-        oids::TEXT | oids::VARCHAR | 0 => core::str::from_utf8(bytes)
+        oids::TEXT | oids::NAME | oids::VARCHAR | oids::BPCHAR | 0 => core::str::from_utf8(bytes)
             .map(Datum::Text)
             .map_err(|_| "invalid UTF-8 in binary text parameter"),
         oids::DATE => {
@@ -3038,6 +3101,17 @@ pub(crate) fn decode_binary_param<'a>(
         oids::TIME => {
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Time(i64::from_be_bytes(b)))
+        }
+        oids::TIMETZ => {
+            let b: [u8; 12] = bytes.try_into().map_err(|_| wrong)?;
+            let time = i64::from_be_bytes(b[..8].try_into().expect("fixed length"));
+            // PostgreSQL's binary `timetz` zone is seconds west of UTC;
+            // Datum stores seconds east to match SQL rendering and EXTRACT.
+            let west = i32::from_be_bytes(b[8..].try_into().expect("fixed length"));
+            let east = west
+                .checked_neg()
+                .ok_or("binary timetz offset out of range")?;
+            Ok(Datum::Timetz(time, east))
         }
         oids::INTERVAL => {
             // 8-byte microseconds, 4-byte days, 4-byte months (all big-endian).
@@ -3227,6 +3301,61 @@ fn ext_err(send: &mut FixedBuf, phase: &mut Phase, code: &str, message: &str) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn cancellation_keys_preserve_protocol_version_boundaries() {
+        let server_key = *b"0123456789abcdef";
+        let pid: i32 = 71;
+        let mut v30 = [0u8; 16];
+        v30[..4].copy_from_slice(&16i32.to_be_bytes());
+        v30[4..8].copy_from_slice(&wire::REQUEST_CANCEL.to_be_bytes());
+        v30[8..12].copy_from_slice(&pid.to_be_bytes());
+        v30[12..].copy_from_slice(&server_key[..4]);
+        let v30 = parse_cancel_request(&v30).expect("v3.0 request parses");
+        assert!(v30.matches(pid, &server_key));
+
+        let mut v32 = [0u8; 28];
+        v32[..4].copy_from_slice(&28i32.to_be_bytes());
+        v32[4..8].copy_from_slice(&wire::REQUEST_CANCEL.to_be_bytes());
+        v32[8..12].copy_from_slice(&pid.to_be_bytes());
+        v32[12..].copy_from_slice(&server_key);
+        let v32 = parse_cancel_request(&v32).expect("v3.2 request parses");
+        assert!(v32.matches(pid, &server_key));
+
+        let mut wrong_suffix = server_key;
+        wrong_suffix[15] ^= 1;
+        let mismatched_v32 = parse_cancel_request(&{
+            let mut packet = [0u8; 28];
+            packet[..4].copy_from_slice(&28i32.to_be_bytes());
+            packet[4..8].copy_from_slice(&wire::REQUEST_CANCEL.to_be_bytes());
+            packet[8..12].copy_from_slice(&pid.to_be_bytes());
+            packet[12..].copy_from_slice(&wrong_suffix);
+            packet
+        })
+        .expect("v3.2 request parses");
+        assert!(!mismatched_v32.matches(pid, &server_key));
+        assert!(parse_cancel_request(&[0; 17]).is_none());
+    }
+
+    #[test]
+    fn canceling_a_parked_statement_emits_query_canceled() {
+        let config = Config::default_dev();
+        let mut budget = Budget::new(64 << 20);
+        let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
+        connection.recv.append(b"Q\0\0\0\x05");
+        connection.park(false, 0);
+        assert!(connection.cancel_parked());
+        assert!(!connection.parked);
+        assert!(connection.recv.is_empty());
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(5)
+                .any(|bytes| bytes == b"57014"),
+            "cancellation must be reported as SQLSTATE 57014"
+        );
+    }
+
     fn num_str(bytes: &[u8]) -> String {
         let mut out = crate::util::StackStr::<96>::new();
         binary_numeric_to_str(bytes, &mut out).expect("decode");
@@ -3251,6 +3380,22 @@ mod tests {
         );
         // NaN -> sign 0xC000.
         assert_eq!(num_str(&[0, 0, 0, 0, 0xC0, 0, 0, 0]), "NaN");
+    }
+
+    #[test]
+    fn binary_timetz_uses_postgresqls_west_of_utc_offset() {
+        let time = 12 * 60 * 60 * 1_000_000i64;
+        let west = -2 * 60 * 60i32;
+        let mut bytes = [0u8; 12];
+        bytes[..8].copy_from_slice(&time.to_be_bytes());
+        bytes[8..].copy_from_slice(&west.to_be_bytes());
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary timetz test", 16).expect("test arena");
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::TIMETZ, &bytes, &arena)
+                .expect("timetz decodes"),
+            Datum::Timetz(time, -west)
+        );
     }
 
     #[test]

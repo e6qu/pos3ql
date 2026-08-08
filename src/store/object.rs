@@ -22,33 +22,6 @@ use super::{
     decode_packed_block, encode,
 };
 
-/// Blocks kept as objects under a key prefix.
-pub(crate) struct ObjectBlockStore<'c> {
-    client: &'c mut ObjectStore,
-    /// Prefix every block key sits under, e.g. `blocks/`. Kept short: it is
-    /// paid on every request line.
-    prefix: &'static str,
-    /// Scratch for building one block before it is written. A block store does
-    /// not allocate, so the buffer it needs to frame a block is reserved with
-    /// the store.
-    scratch: &'c mut [u8],
-}
-
-impl<'c> ObjectBlockStore<'c> {
-    /// `scratch` must hold a whole block — `HEADER_LEN + MAX_PAYLOAD`.
-    pub(crate) fn new(
-        client: &'c mut ObjectStore,
-        prefix: &'static str,
-        scratch: &'c mut [u8],
-    ) -> Self {
-        Self {
-            client,
-            prefix,
-            scratch,
-        }
-    }
-}
-
 /// `<prefix><64 hex chars>`, written into a caller-provided buffer so that
 /// naming a block costs nothing.
 fn key_of<'k>(prefix: &str, id: &BlockId, out: &'k mut [u8; 128]) -> &'k str {
@@ -607,20 +580,6 @@ impl BlockStore for OwnedObjectStore {
         Ok(None)
     }
 
-    fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
-        let mut key_buffer = [0u8; 128];
-        let key = key_of(self.prefix, id, &mut key_buffer);
-        self.stats.object_contains = self.stats.object_contains.saturating_add(1);
-        match self.slots[0].client.get(
-            key,
-            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
-        ) {
-            Ok(_) => Ok(true),
-            Err(ObjectError::Status { code: 404, .. }) => Ok(false),
-            Err(e) => Err(store_error(e)),
-        }
-    }
-
     fn io_stats(&self) -> BlockIoStats {
         self.stats
     }
@@ -661,64 +620,6 @@ impl BlockStore for OwnedObjectStore {
 
     fn issue_due_hedges(&mut self, now: Instant) {
         self.issue_due_hedges(now);
-    }
-}
-
-impl BlockStore for ObjectBlockStore<'_> {
-    fn put(
-        &mut self,
-        payload: &[u8],
-        block_type: BlockType,
-        lsn: u64,
-    ) -> Result<BlockId, StoreError> {
-        put_block(
-            self.client,
-            self.prefix,
-            self.scratch,
-            payload,
-            block_type,
-            lsn,
-        )
-    }
-
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        get_block(self.client, self.prefix, id, into)
-    }
-
-    fn get_packed(
-        &mut self,
-        container: &BlockId,
-        offset: usize,
-        length: usize,
-        expected: &BlockId,
-        into: &mut [u8],
-        _scratch: &mut [u8],
-    ) -> Result<(usize, BlockType), StoreError> {
-        get_packed_block(
-            self.client,
-            self.prefix,
-            container,
-            offset,
-            length,
-            expected,
-            into,
-        )
-    }
-
-    fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError> {
-        let mut key_buffer = [0u8; 128];
-        let key = key_of(self.prefix, id, &mut key_buffer);
-        // Only the header is fetched: presence is a property of the object, and
-        // dragging the payload across to learn it would make an existence check
-        // cost as much as a read.
-        match self.client.get(
-            key,
-            Some(ByteRange::new(0, HEADER_LEN as u64 - 1).expect("block header is nonempty")),
-        ) {
-            Ok(_) => Ok(true),
-            Err(ObjectError::Status { code: 404, .. }) => Ok(false),
-            Err(e) => Err(store_error(e)),
-        }
     }
 }
 

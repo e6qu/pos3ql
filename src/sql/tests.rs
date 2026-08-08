@@ -12539,6 +12539,11 @@ fn distinct_aggregates() {
         )),
         ["0"]
     );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT count(distinct *) FROM t"))
+            .contains("42601"),
+        "DISTINCT * is invalid syntax, not an unsupported aggregate"
+    );
     // avg(DISTINCT int) -> numeric with PG's 16-digit scale.
     assert_eq!(
         data_rows(&run_with(

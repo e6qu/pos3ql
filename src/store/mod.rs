@@ -18,14 +18,6 @@
 //! decoding borrows from one, so a block lives in whatever pool its owner
 //! reserved at startup.
 
-// The checkpoint and cold-start paths now run through this module (the SST
-// writer, the range-scan reader, the tiered stack over the object store);
-// what a --lib build still sees as dead is test/simulator infrastructure and
-// observability that production does not call directly (cache counters and
-// the memory/borrowed-object stores). `allow` rather than `expect`, as `prng`
-// has it: an `expect` would be unfulfilled in the --tests build and fail it.
-#![allow(dead_code)]
-
 macro_rules! delegate_async_block_reads {
     () => {
         fn enable_async_gets(&mut self) {
@@ -69,6 +61,7 @@ macro_rules! delegate_async_block_reads {
 mod bloom;
 mod cache;
 mod disk;
+#[cfg(test)]
 mod memory;
 mod object;
 mod sst;
@@ -256,6 +249,7 @@ pub(crate) fn encode(
 pub(crate) struct Block<'a> {
     pub(crate) id: BlockId,
     pub(crate) block_type: BlockType,
+    #[cfg(test)]
     pub(crate) lsn: u64,
     pub(crate) payload: &'a [u8],
 }
@@ -289,6 +283,7 @@ pub(crate) fn decode(bytes: &[u8], verify_identity: bool) -> Result<Block<'_>, B
     Ok(Block {
         id: BlockId(id),
         block_type,
+        #[cfg(test)]
         lsn: u64::from_le_bytes([
             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]),
@@ -319,6 +314,11 @@ pub(crate) trait BlockStore {
     /// mismatch is an error, never a shorter answer.
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError>;
 
+    #[cfg(test)]
+    fn contains(&mut self, _id: &BlockId) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
     /// Reads one independently framed logical block from an immutable packed
     /// container. The default is correct for in-memory stores; object-backed
     /// implementations override it with one ranged GET. `expected` is the
@@ -343,9 +343,6 @@ pub(crate) trait BlockStore {
         }
         decode_packed_block(&scratch[offset..offset + length], expected, into)
     }
-
-    /// Whether the block is present without reading it.
-    fn contains(&mut self, id: &BlockId) -> Result<bool, StoreError>;
 
     /// Enables non-blocking object reads for this stack. The server owns the
     /// resulting socket readiness registration.
@@ -471,7 +468,6 @@ pub(crate) struct BlockIoStats {
     /// Speculative reads refused because every fixed GET slot was owned.
     pub(crate) object_prefetch_saturated: u64,
     pub(crate) object_puts: u64,
-    pub(crate) object_contains: u64,
 }
 
 impl BlockIoStats {
@@ -504,7 +500,6 @@ impl BlockIoStats {
                 .object_prefetch_saturated
                 .saturating_sub(earlier.object_prefetch_saturated),
             object_puts: self.object_puts.saturating_sub(earlier.object_puts),
-            object_contains: self.object_contains.saturating_sub(earlier.object_contains),
         }
     }
 }

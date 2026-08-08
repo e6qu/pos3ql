@@ -33,6 +33,29 @@ const SQLSTATE_IO: &str = "58030";
 /// serialization_failure — manifest CAS lost to another writer.
 const SQLSTATE_CAS: &str = "40001";
 
+/// Identity of one immutable commit batch.  The LSN and checksum always
+/// travel together, so a recovered head cannot pair either with another
+/// batch's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitBatchId {
+    first_lsn: u64,
+    digest: u32,
+}
+
+impl CommitBatchId {
+    const EMPTY: Self = Self {
+        first_lsn: 0,
+        digest: 0,
+    };
+
+    fn from_bytes(first_lsn: u64, bytes: &[u8]) -> Self {
+        Self {
+            first_lsn,
+            digest: crate::wal::crc32c::crc32c(bytes),
+        }
+    }
+}
+
 /// A spill-list update awaiting the manifest publish.
 #[derive(Clone, Copy)]
 enum SlotInstall {
@@ -180,8 +203,7 @@ pub(crate) struct Checkpointer {
     /// CAS-published root of the immutable commit-batch chain.  A batch PUT
     /// alone is intentionally not recoverable until this pointer advances.
     commit_head_etag: Option<StackStr<80>>,
-    commit_head_first_lsn: u64,
-    commit_head_digest: u32,
+    commit_head: Option<CommitBatchId>,
     /// Per-slot SST from the last published manifest; clean tables reuse
     /// these handles (delta checkpoints). Capacity is reserved at startup so
     /// the post-freeze checkpoint path never allocates.
@@ -650,8 +672,7 @@ impl Checkpointer {
             manifest_etag: None,
             manifest_lsn: 0,
             commit_head_etag: None,
-            commit_head_first_lsn: 0,
-            commit_head_digest: 0,
+            commit_head: None,
             prev_ssts: Vec::with_capacity(MAX_CKPT_TABLES),
             referenced: Vec::with_capacity(MAX_CKPT_TABLES),
             prev_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
@@ -721,20 +742,27 @@ impl Checkpointer {
         first_lsn: u64,
         bytes: &[u8],
     ) -> Result<(), SqlError> {
-        let digest = crate::wal::crc32c::crc32c(bytes);
-        let key = stack_format!(72, "commits/{:020}-{:08x}.batch", first_lsn, digest);
+        let batch = CommitBatchId::from_bytes(first_lsn, bytes);
+        let key = stack_format!(
+            72,
+            "commits/{:020}-{:08x}.batch",
+            batch.first_lsn,
+            batch.digest
+        );
         self.put_immutable(key.as_str(), bytes)?;
-        let descriptor_key = stack_format!(72, "commits/{:020}-{:08x}.head", first_lsn, digest);
+        let descriptor_key = stack_format!(
+            72,
+            "commits/{:020}-{:08x}.head",
+            batch.first_lsn,
+            batch.digest
+        );
+        let previous = self.commit_head.unwrap_or(CommitBatchId::EMPTY);
         let mut descriptor = StackStr::<96>::new();
         use core::fmt::Write;
         write!(
             descriptor,
             "{}\nfirst {}\ndigest {:08x}\nprevious {} {:08x}\nend\n",
-            COMMIT_HEAD_HEADER,
-            first_lsn,
-            digest,
-            self.commit_head_first_lsn,
-            self.commit_head_digest
+            COMMIT_HEAD_HEADER, batch.first_lsn, batch.digest, previous.first_lsn, previous.digest
         )
         .expect("commit descriptor fits its fixed buffer");
         self.put_immutable(descriptor_key.as_str(), descriptor.as_str().as_bytes())?;
@@ -743,7 +771,7 @@ impl Checkpointer {
         write!(
             head,
             "{}\nwriter {:016x}\nfirst {}\ndigest {:08x}\nend\n",
-            COMMIT_HEAD_HEADER, self.writer_id, first_lsn, digest
+            COMMIT_HEAD_HEADER, self.writer_id, batch.first_lsn, batch.digest
         )
         .expect("commit head fits its fixed buffer");
         let precondition = match &self.commit_head_etag {
@@ -760,13 +788,9 @@ impl Checkpointer {
                     .client
                     .get(COMMIT_HEAD_KEY, None)
                     .map_err(object_store_to_sql)?;
-                let (writer, published_first_lsn, published_digest) =
-                    parse_commit_head(self.client.body_bytes())
-                        .map_err(|message| sql_err!(SQLSTATE_CAS, "{message}"))?;
-                if writer != self.writer_id
-                    || published_first_lsn != first_lsn
-                    || published_digest != digest
-                {
+                let (writer, published) = parse_commit_head(self.client.body_bytes())
+                    .map_err(|message| sql_err!(SQLSTATE_CAS, "{message}"))?;
+                if writer != self.writer_id || published != batch {
                     return Err(sql_err!(
                         SQLSTATE_CAS,
                         "commit-head compare-and-swap failed: another writer owns this bucket"
@@ -777,8 +801,7 @@ impl Checkpointer {
             Err(error) => return Err(object_store_to_sql(error)),
         };
         self.commit_head_etag = Some(etag);
-        self.commit_head_first_lsn = first_lsn;
-        self.commit_head_digest = digest;
+        self.commit_head = Some(batch);
         Ok(())
     }
 
@@ -816,32 +839,39 @@ impl Checkpointer {
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<(), CheckpointSetupError> {
         self.doomed_scratch.clear();
-        let mut first_lsn = self.commit_head_first_lsn;
-        let mut digest = self.commit_head_digest;
-        while first_lsn > floor {
+        let mut batch = self.commit_head;
+        while let Some(current) = batch.filter(|batch| batch.first_lsn > floor) {
             if self.doomed_scratch.len() == self.doomed_scratch.capacity() {
                 return Err(CheckpointSetupError::ObjectStore(format!(
                     "commit-head chain exceeds fixed limit {}",
                     self.doomed_scratch.capacity()
                 )));
             }
-            let descriptor_key =
-                crate::stack_format!(72, "commits/{:020}-{:08x}.head", first_lsn, digest);
+            let descriptor_key = crate::stack_format!(
+                72,
+                "commits/{:020}-{:08x}.head",
+                current.first_lsn,
+                current.digest
+            );
             self.client
                 .get(descriptor_key.as_str(), None)
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!("get commit head: {error}"))
                 })?;
-            let (previous_lsn, previous_digest) = parse_commit_descriptor(self.client.body_bytes())
+            let (described, previous) = parse_commit_descriptor(self.client.body_bytes())
                 .map_err(CheckpointSetupError::Corrupt)?;
+            if described != current {
+                return Err(CheckpointSetupError::Corrupt(
+                    "commit descriptor does not match its head",
+                ));
+            }
             self.doomed_scratch.push(crate::stack_format!(
                 64,
                 "commits/{:020}-{:08x}.batch",
-                first_lsn,
-                digest
+                current.first_lsn,
+                current.digest
             ));
-            first_lsn = previous_lsn;
-            digest = previous_digest;
+            batch = previous;
         }
         for index in (0..self.doomed_scratch.len()).rev() {
             let key = self.doomed_scratch[index];
@@ -995,10 +1025,9 @@ impl Checkpointer {
         match self.client.get(COMMIT_HEAD_KEY, None) {
             Ok(result) => {
                 self.commit_head_etag = Some(result.etag);
-                let (_, first_lsn, digest) = parse_commit_head(self.client.body_bytes())
+                let (_, batch) = parse_commit_head(self.client.body_bytes())
                     .map_err(CheckpointSetupError::Corrupt)?;
-                self.commit_head_first_lsn = first_lsn;
-                self.commit_head_digest = digest;
+                self.commit_head = Some(batch);
             }
             Err(error) if error.is_not_found() => {
                 let mut has_legacy_batches = false;
@@ -4185,7 +4214,7 @@ impl std::fmt::Display for CheckpointSetupError {
 
 impl std::error::Error for CheckpointSetupError {}
 
-fn parse_commit_head(bytes: &[u8]) -> Result<(u64, u64, u32), &'static str> {
+fn parse_commit_head(bytes: &[u8]) -> Result<(u64, CommitBatchId), &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "commit-head is not UTF-8")?;
     let mut lines = text.lines();
     if lines.next() != Some(COMMIT_HEAD_HEADER) {
@@ -4210,10 +4239,12 @@ fn parse_commit_head(bytes: &[u8]) -> Result<(u64, u64, u32), &'static str> {
     if lines.next() != Some("end") || lines.next().is_some() {
         return Err("bad commit-head terminator");
     }
-    Ok((writer, first_lsn, digest))
+    Ok((writer, CommitBatchId { first_lsn, digest }))
 }
 
-fn parse_commit_descriptor(bytes: &[u8]) -> Result<(u64, u32), &'static str> {
+fn parse_commit_descriptor(
+    bytes: &[u8],
+) -> Result<(CommitBatchId, Option<CommitBatchId>), &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "commit descriptor is not UTF-8")?;
     let mut lines = text.lines();
     if lines.next() != Some(COMMIT_HEAD_HEADER) {
@@ -4225,7 +4256,7 @@ fn parse_commit_descriptor(bytes: &[u8]) -> Result<(u64, u32), &'static str> {
         .and_then(|word| word.parse().ok())
         .filter(|first_lsn| *first_lsn != 0)
         .ok_or("bad commit descriptor first LSN")?;
-    let _digest = lines
+    let digest = lines
         .next()
         .and_then(|line| line.strip_prefix("digest "))
         .and_then(|word| u32::from_str_radix(word, 16).ok())
@@ -4241,10 +4272,18 @@ fn parse_commit_descriptor(bytes: &[u8]) -> Result<(u64, u32), &'static str> {
             ))
         })
         .ok_or("bad commit descriptor previous LSN")?;
-    if previous_lsn >= first_lsn || lines.next() != Some("end") || lines.next().is_some() {
+    if (previous_lsn != 0 && previous_lsn >= first_lsn)
+        || (previous_lsn == 0 && previous_digest != 0)
+        || lines.next() != Some("end")
+        || lines.next().is_some()
+    {
         return Err("bad commit descriptor chain");
     }
-    Ok((previous_lsn, previous_digest))
+    let previous = (previous_lsn != 0).then_some(CommitBatchId {
+        first_lsn: previous_lsn,
+        digest: previous_digest,
+    });
+    Ok((CommitBatchId { first_lsn, digest }, previous))
 }
 
 fn parse_field<T: core::str::FromStr>(
@@ -4709,5 +4748,30 @@ mod stored_dependency_tests {
             crate::wal::decode_record(&frame[16..]),
             Some(crate::wal::WalOp::Commit { transaction_id: 9 })
         ));
+    }
+
+    #[test]
+    fn commit_descriptor_binds_its_lsn_and_digest_together() {
+        let descriptor =
+            b"pos3ql-commit-head-v1\nfirst 42\ndigest 00aabbcc\nprevious 7 00112233\nend\n";
+        assert_eq!(
+            parse_commit_descriptor(descriptor).unwrap(),
+            (
+                CommitBatchId {
+                    first_lsn: 42,
+                    digest: 0x00aa_bbcc,
+                },
+                Some(CommitBatchId {
+                    first_lsn: 7,
+                    digest: 0x0011_2233,
+                }),
+            )
+        );
+        assert!(
+            parse_commit_descriptor(
+                b"pos3ql-commit-head-v1\nfirst 42\ndigest 00aabbcc\nprevious 0 00112233\nend\n"
+            )
+            .is_err()
+        );
     }
 }

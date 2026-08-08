@@ -16,20 +16,100 @@ use core::fmt;
 /// network order, a v4 address in `addr[0..4]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetAddr {
-    pub family: u8,
-    pub bits: u8,
-    pub addr: [u8; 16],
+    family: AddressFamily,
+    bits: u8,
+    addr: [u8; 16],
+}
+
+/// The two address widths PostgreSQL's network types admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressFamily {
+    V4,
+    V6,
+}
+
+impl AddressFamily {
+    const fn parse(value: u8) -> Option<Self> {
+        match value {
+            4 => Some(Self::V4),
+            6 => Some(Self::V6),
+            _ => None,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::V4 => 4,
+            Self::V6 => 6,
+        }
+    }
+
+    const fn addr_len(self) -> usize {
+        match self {
+            Self::V4 => 4,
+            Self::V6 => 16,
+        }
+    }
+
+    const fn max_bits(self) -> u8 {
+        match self {
+            Self::V4 => 32,
+            Self::V6 => 128,
+        }
+    }
 }
 
 impl NetAddr {
+    /// Builds a complete, valid network address. IPv4's unused trailing bytes
+    /// must be zero so every representation has one canonical shape.
+    pub fn new(family: u8, bits: u8, addr: [u8; 16]) -> Option<Self> {
+        let family = AddressFamily::parse(family)?;
+        if bits > family.max_bits()
+            || (family == AddressFamily::V4 && addr[family.addr_len()..].iter().any(|b| *b != 0))
+        {
+            return None;
+        }
+        Some(Self { family, bits, addr })
+    }
+
+    /// Builds a canonical network address for PostgreSQL's `cidr` type.
+    pub fn new_cidr(family: u8, bits: u8, addr: [u8; 16]) -> Option<Self> {
+        let value = Self::new(family, bits, addr)?;
+        (value == value.to_network()).then_some(value)
+    }
+
+    /// The all-zero IPv4 address with its full-width mask.
+    pub const fn zero_v4() -> Self {
+        Self {
+            family: AddressFamily::V4,
+            bits: 32,
+            addr: [0; 16],
+        }
+    }
+
+    /// The PostgreSQL address-family code: 4 for IPv4, 6 for IPv6.
+    pub const fn family(&self) -> u8 {
+        self.family.code()
+    }
+
+    /// The network mask length.
+    pub const fn bits(&self) -> u8 {
+        self.bits
+    }
+
+    /// Address bytes in network order; IPv4 uses the first four bytes only.
+    pub const fn addr(&self) -> &[u8; 16] {
+        &self.addr
+    }
+
     /// The number of address bytes this family uses (4 or 16).
     pub fn addr_len(&self) -> usize {
-        if self.family == 4 { 4 } else { 16 }
+        self.family.addr_len()
     }
 
     /// The maximum mask length for this family (32 or 128).
     pub fn max_bits(&self) -> u8 {
-        if self.family == 4 { 32 } else { 128 }
+        self.family.max_bits()
     }
 
     /// A copy with every host bit (right of the mask) cleared — the network
@@ -65,7 +145,7 @@ impl NetAddr {
     pub fn netmask(self) -> NetAddr {
         let mut addr = [0u8; 16];
         set_prefix_ones(&mut addr, self.bits, self.addr_len());
-        NetAddr {
+        Self {
             family: self.family,
             bits: self.max_bits(),
             addr,
@@ -81,7 +161,7 @@ impl NetAddr {
         for byte in addr[..len].iter_mut() {
             *byte = !*byte;
         }
-        NetAddr {
+        Self {
             family: self.family,
             bits: self.max_bits(),
             addr,
@@ -90,19 +170,22 @@ impl NetAddr {
 
     /// A copy with a new mask length; for a `cidr` the host bits beyond the new
     /// mask are cleared.
-    pub fn with_masklen(mut self, bits: u8, clear_host: bool) -> NetAddr {
+    pub fn with_masklen(mut self, bits: u8, clear_host: bool) -> Option<NetAddr> {
+        if bits > self.max_bits() {
+            return None;
+        }
         self.bits = bits;
         if clear_host {
             clear_host_bits(&mut self.addr, bits);
         }
-        self
+        Some(self)
     }
 
     /// Ordering key matching PostgreSQL's `network_cmp`: family, then address
     /// bytes, then mask length.
     pub fn cmp_key(&self) -> [u8; 18] {
         let mut key = [0u8; 18];
-        key[0] = self.family;
+        key[0] = self.family();
         key[1..17].copy_from_slice(&self.addr);
         key[17] = self.bits;
         key
@@ -283,7 +366,7 @@ pub fn parse_inet(s: &str) -> Option<NetAddr> {
         }
         None => max,
     };
-    Some(NetAddr { family, bits, addr })
+    NetAddr::new(family, bits, addr)
 }
 
 /// Parses a `cidr` value: like `inet`, but accepts abbreviated IPv4
@@ -332,7 +415,7 @@ pub fn parse_cidr(s: &str) -> Option<NetAddr> {
     if !host_bits_clear(&addr[..if family == 4 { 4 } else { 16 }], bits) {
         return None;
     }
-    Some(NetAddr { family, bits, addr })
+    NetAddr::new(family, bits, addr)
 }
 
 /// Parses a bare address (no mask) as either IPv4 (exactly four octets) or
@@ -351,7 +434,7 @@ fn parse_address(s: &str) -> Option<(u8, [u8; 16])> {
 /// Renders an address into `out`, appending `/bits` when `show_mask` is set or
 /// the mask is not the family default (matching `inet` vs `cidr` output).
 pub fn format_addr(net: &NetAddr, always_mask: bool, out: &mut impl fmt::Write) -> fmt::Result {
-    if net.family == 4 {
+    if net.family() == 4 {
         write!(
             out,
             "{}.{}.{}.{}",
@@ -494,7 +577,7 @@ fn set_prefix_ones(addr: &mut [u8; 16], bits: u8, len: usize) {
 /// all-zero octets (`10.1.0.0/16` → `10.1/16`); IPv6 uses the canonical
 /// compressed form with its mask.
 pub fn format_cidr_abbrev(net: &NetAddr, out: &mut impl fmt::Write) -> fmt::Result {
-    if net.family == 6 {
+    if net.family() == 6 {
         return format_addr(net, true, out);
     }
     let octets = usize::from(net.bits.div_ceil(8)).max(1);
@@ -607,6 +690,19 @@ mod tests {
         assert_eq!(cidr("2001:db8::/32"), "2001:db8::/32");
         // Host bits set to the right of the mask are rejected.
         assert!(parse_cidr("192.168.1.5/24").is_none());
+    }
+
+    #[test]
+    fn raw_network_parts_cannot_construct_an_invalid_address() {
+        let ipv4 = [192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(NetAddr::new(4, 32, ipv4).is_some());
+        assert!(NetAddr::new(5, 32, ipv4).is_none());
+        assert!(NetAddr::new(4, 33, ipv4).is_none());
+        assert!(NetAddr::new(6, 129, [0; 16]).is_none());
+        let mut noncanonical_ipv4 = ipv4;
+        noncanonical_ipv4[4] = 1;
+        assert!(NetAddr::new(4, 32, noncanonical_ipv4).is_none());
+        assert!(NetAddr::new_cidr(4, 24, ipv4).is_none());
     }
 
     #[test]

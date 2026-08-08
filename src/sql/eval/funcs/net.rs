@@ -70,7 +70,7 @@ pub(crate) fn dispatch<'a>(
                 if d.is_null() {
                     return Ok(Datum::Null);
                 }
-                Ok(Datum::Int4(i32::from(net_arg(d)?.family)))
+                Ok(Datum::Int4(i32::from(net_arg(d)?.family())))
             }
             "masklen" => {
                 want(1)?;
@@ -78,7 +78,7 @@ pub(crate) fn dispatch<'a>(
                 if d.is_null() {
                     return Ok(Datum::Null);
                 }
-                Ok(Datum::Int4(i32::from(net_arg(d)?.bits)))
+                Ok(Datum::Int4(i32::from(net_arg(d)?.bits())))
             }
             "host" => {
                 want(1)?;
@@ -154,11 +154,17 @@ pub(crate) fn dispatch<'a>(
                 match d {
                     Datum::Cidr(n) => {
                         check_masklen(bits, n.max_bits())?;
-                        Ok(Datum::Cidr(n.with_masklen(bits as u8, true)))
+                        Ok(Datum::Cidr(
+                            n.with_masklen(bits as u8, true)
+                                .expect("checked mask length"),
+                        ))
                     }
                     Datum::Inet(n) => {
                         check_masklen(bits, n.max_bits())?;
-                        Ok(Datum::Inet(n.with_masklen(bits as u8, false)))
+                        Ok(Datum::Inet(
+                            n.with_masklen(bits as u8, false)
+                                .expect("checked mask length"),
+                        ))
                     }
                     _ => Err(net_type_error(name)),
                 }
@@ -169,7 +175,7 @@ pub(crate) fn dispatch<'a>(
                 if a.is_null() || b.is_null() {
                     return Ok(Datum::Null);
                 }
-                Ok(Datum::Bool(net_arg(a)?.family == net_arg(b)?.family))
+                Ok(Datum::Bool(net_arg(a)?.family() == net_arg(b)?.family()))
             }
             "inet_merge" => {
                 want(2)?;

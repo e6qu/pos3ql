@@ -1464,17 +1464,17 @@ fn bits_prefix_eq(a: &[u8; 16], b: &[u8; 16], bits: u8) -> bool {
 /// Whether network `sup` contains address `sub` (same family, `sup` is the
 /// same size or larger, and they agree on `sup`'s masked prefix).
 fn net_contains(sup: &NetAddr, sub: &NetAddr) -> bool {
-    sup.family == sub.family
-        && sup.bits <= sub.bits
-        && bits_prefix_eq(&sup.addr, &sub.addr, sup.bits)
+    sup.family() == sub.family()
+        && sup.bits() <= sub.bits()
+        && bits_prefix_eq(sup.addr(), sub.addr(), sup.bits())
 }
 
 /// The network containment/overlap predicates (`<<`, `>>`, `<<=`, `>>=`, `&&`).
 fn network_relop(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> bool {
     use BinaryOp::*;
     match operator {
-        Shl => net_contains(r, l) && r.bits < l.bits,
-        Shr => net_contains(l, r) && l.bits < r.bits,
+        Shl => net_contains(r, l) && r.bits() < l.bits(),
+        Shr => net_contains(l, r) && l.bits() < r.bits(),
         NetContainedEq => net_contains(r, l),
         NetContainsEq => net_contains(l, r),
         Overlaps => net_contains(l, r) || net_contains(r, l),
@@ -1485,42 +1485,46 @@ fn network_relop(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> bool {
 /// `inet & inet` / `inet | inet`: bytewise over the address, result mask the
 /// larger of the two. Different families are an error.
 fn network_bitwise(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> Result<NetAddr, SqlError> {
-    if l.family != r.family {
+    if l.family() != r.family() {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "cannot AND/OR inet values of different sizes"
         ));
     }
-    let mut out = *l;
-    out.bits = l.bits.max(r.bits);
-    for i in 0..16 {
-        out.addr[i] = match operator {
-            BinaryOp::BitAnd => l.addr[i] & r.addr[i],
-            BinaryOp::BitOr => l.addr[i] | r.addr[i],
+    let mut addr = [0; 16];
+    for ((out, left), right) in addr.iter_mut().zip(l.addr()).zip(r.addr()) {
+        *out = match operator {
+            BinaryOp::BitAnd => *left & *right,
+            BinaryOp::BitOr => *left | *right,
             _ => unreachable!("non-bitwise operator routed to network_bitwise"),
         };
     }
-    Ok(out)
+    NetAddr::new(l.family(), l.bits().max(r.bits()), addr).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "network operator produced invalid address"
+        )
+    })
 }
 
 /// `~inet`: invert every address bit (over the family's byte width).
 fn network_not(n: &NetAddr) -> NetAddr {
-    let mut out = *n;
-    for byte in out.addr[..n.addr_len()].iter_mut() {
+    let mut addr = *n.addr();
+    for byte in addr[..n.addr_len()].iter_mut() {
         *byte = !*byte;
     }
-    out
+    NetAddr::new(n.family(), n.bits(), addr).expect("network complement preserves invariants")
 }
 
 /// Adds a signed delta to an address (big-endian over the family width),
 /// preserving the mask. `None` on overflow past the family's range.
 fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
     let len = n.addr_len();
-    let mut out = *n;
+    let mut addr = *n.addr();
     let magnitude = delta.unsigned_abs();
     if delta >= 0 {
         let mut carry = magnitude;
-        for byte in out.addr[..len].iter_mut().rev() {
+        for byte in addr[..len].iter_mut().rev() {
             let sum = u64::from(*byte) + (carry & 0xff);
             *byte = sum as u8;
             carry = (carry >> 8) + (sum >> 8);
@@ -1530,7 +1534,7 @@ fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
         }
     } else {
         let mut borrow = magnitude;
-        for byte in out.addr[..len].iter_mut().rev() {
+        for byte in addr[..len].iter_mut().rev() {
             let sub = i64::from(*byte) - (borrow & 0xff) as i64;
             if sub < 0 {
                 *byte = (sub + 256) as u8;
@@ -1544,13 +1548,13 @@ fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
             return None;
         }
     }
-    Some(out)
+    NetAddr::new(n.family(), n.bits(), addr)
 }
 
 /// `inet - inet`: the signed distance between two addresses as int8. Both must
 /// be the same family; a v6 distance beyond int8 overflows loudly.
 fn network_distance(l: &NetAddr, r: &NetAddr) -> Result<i64, SqlError> {
-    if l.family != r.family {
+    if l.family() != r.family() {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "cannot subtract inet values of different sizes"
@@ -1559,7 +1563,7 @@ fn network_distance(l: &NetAddr, r: &NetAddr) -> Result<i64, SqlError> {
     let len = l.addr_len();
     let mut result: i64 = 0;
     for i in 0..len {
-        let diff = i64::from(l.addr[i]) - i64::from(r.addr[i]);
+        let diff = i64::from(l.addr()[i]) - i64::from(r.addr()[i]);
         result = result
             .checked_mul(256)
             .and_then(|v| v.checked_add(diff))

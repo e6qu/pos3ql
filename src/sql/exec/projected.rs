@@ -328,9 +328,9 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         }
         Datum::Inet(net) | Datum::Cidr(net) => {
             out[0] = if matches!(v, Datum::Cidr(_)) { 25 } else { 24 };
-            out[1] = net.family;
-            out[2] = net.bits;
-            out[3..19].copy_from_slice(&net.addr);
+            out[1] = net.family();
+            out[2] = net.bits();
+            out[3..19].copy_from_slice(net.addr());
             19
         }
         Datum::Macaddr(b) => {
@@ -599,15 +599,28 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             12,
         ),
         24 | 25 => {
-            let net = crate::sql::net::NetAddr {
-                family: bytes[at],
-                bits: bytes[at + 1],
-                addr: bytes[at + 2..at + 18].try_into().unwrap(),
-            };
             let d = if tag == 25 {
-                Datum::Cidr(net)
+                Datum::Cidr(
+                    crate::sql::net::NetAddr::new_cidr(
+                        bytes[at],
+                        bytes[at + 1],
+                        bytes[at + 2..at + 18]
+                            .try_into()
+                            .expect("fixed network encoding"),
+                    )
+                    .expect("encoded cidr address is valid"),
+                )
             } else {
-                Datum::Inet(net)
+                Datum::Inet(
+                    crate::sql::net::NetAddr::new(
+                        bytes[at],
+                        bytes[at + 1],
+                        bytes[at + 2..at + 18]
+                            .try_into()
+                            .expect("fixed network encoding"),
+                    )
+                    .expect("encoded inet address is valid"),
+                )
             };
             (d, 18)
         }

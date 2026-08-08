@@ -11146,6 +11146,44 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
 }
 
 #[test]
+fn published_checkpoint_cleanup_retries_after_object_store_failure() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("post-publish-retry-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("sql-post-publish-retry-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 29);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .publish_commit_batch(1, b"checkpoint-covered")
+        .unwrap();
+    engine.post_publish_cleanup = Some(1);
+
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    assert!(!engine.maybe_checkpoint());
+    assert!(engine.checkpoint_work_pending());
+
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+    assert!(engine.maybe_checkpoint());
+    assert!(!engine.checkpoint_work_pending());
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_planning() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

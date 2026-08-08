@@ -119,6 +119,10 @@ pub struct Engine {
     storage: Storage,
     wal: Wal,
     ckpt: Option<Checkpointer>,
+    /// A published manifest whose local bookkeeping still needs to finish.
+    /// Keeping this state makes publication and its cleanup one retriable
+    /// completion protocol instead of reporting success after the manifest.
+    post_publish_cleanup: Option<u64>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -745,6 +749,7 @@ impl Engine {
             storage,
             wal,
             ckpt,
+            post_publish_cleanup: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
             wal_seg_buf: Vec::with_capacity(upload_buf),
@@ -2502,6 +2507,10 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        if self.post_publish_cleanup.is_some() {
+            self.finish_post_publish_cleanup()?;
+            return Ok(true);
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2524,7 +2533,8 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint? {
             Some(lsn) => {
-                self.after_publish(lsn)?;
+                self.post_publish_cleanup = Some(lsn);
+                self.finish_post_publish_cleanup()?;
                 Ok(true)
             }
             None => Ok(false),
@@ -2571,6 +2581,15 @@ impl Engine {
         // pressure sheds bytes: the overlay keeps the working set, the
         // bucket keeps the rows.
         self.storage.evict_entries();
+        Ok(())
+    }
+
+    fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
+        let lsn = self
+            .post_publish_cleanup
+            .expect("post-publication cleanup has its published LSN");
+        self.after_publish(lsn)?;
+        self.post_publish_cleanup = None;
         Ok(())
     }
 
@@ -2658,9 +2677,10 @@ impl Engine {
     }
 
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.ckpt.as_ref().is_some_and(|c| {
-            c.sweep_active() || c.maintenance_pending() || c.merge_work_pending(&self.storage)
-        })
+        self.post_publish_cleanup.is_some()
+            || self.ckpt.as_ref().is_some_and(|c| {
+                c.sweep_active() || c.maintenance_pending() || c.merge_work_pending(&self.storage)
+            })
     }
 
     /// One checkpoint beat: a trigger (heap or journal filling) starts a
@@ -2676,6 +2696,19 @@ impl Engine {
         // completes it. Checkpoint publication uses that client synchronously.
         if self.block_reads_pending() {
             return true;
+        }
+        if self.post_publish_cleanup.is_some() {
+            return match self.finish_post_publish_cleanup() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
+                        e.sqlstate,
+                        e.message.as_str()
+                    );
+                    false
+                }
+            };
         }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
@@ -2704,7 +2737,8 @@ impl Engine {
         ckpt.enable_async_block_reads();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
-                if let Err(e) = self.after_publish(lsn) {
+                self.post_publish_cleanup = Some(lsn);
+                if let Err(e) = self.finish_post_publish_cleanup() {
                     eprintln!(
                         "pos3ql: post-checkpoint bookkeeping failed ({}): {}",
                         e.sqlstate,

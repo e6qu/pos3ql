@@ -29,6 +29,12 @@ pub const MAX_LOCK_CLAUSES: usize = 8;
 pub const MAX_WINDOW_DEFS: usize = 16;
 /// Upper bound on warnings one statement's parse may raise.
 pub const MAX_PARSE_WARNINGS: usize = 8;
+type OrderLimit<'a> = (
+    &'a [OrderBy<'a>],
+    Option<&'a Expr<'a>>,
+    Option<&'a Expr<'a>>,
+    bool,
+);
 /// Upper bound on the number of grouping sets a single `GROUP BY` may expand to
 /// (after ROLLUP/CUBE expansion and cross-multiplication). Exceeding it is a
 /// loud error, never silent truncation.
@@ -1236,19 +1242,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Trailing ORDER BY / LIMIT / OFFSET (any may be absent).
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
-    fn order_limit(
-        &mut self,
-    ) -> Result<
-        (
-            &'a [OrderBy<'a>],
-            Option<&'a Expr<'a>>,
-            Option<&'a Expr<'a>>,
-            bool,
-        ),
-        ParseError,
-    > {
+    fn order_limit(&mut self) -> Result<OrderLimit<'a>, ParseError> {
         let mut order = [OrderBy {
             expression: &Expr::Null,
             descending: false,

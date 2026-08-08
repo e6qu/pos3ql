@@ -94,6 +94,18 @@ def row_description_type_oids(payload):
     return oids
 
 
+def row_description_formats(payload):
+    (count,) = struct.unpack("!h", payload[:2])
+    at = 2
+    formats = []
+    for _ in range(count):
+        end = payload.index(b"\x00", at)
+        at = end + 1
+        formats.append(struct.unpack("!h", payload[at + 16 : at + 18])[0])
+        at += 18
+    return formats
+
+
 def start_extended(s, text, max_rows=0):
     parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
     bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -226,6 +238,32 @@ def test_simple_query_and_empty():
     check("unknown message type: ErrorResponse", mtype == b"E")
     tail = s.recv(1)
     check("unknown message type: connection closed", tail == b"")
+    s.close()
+
+
+def test_binary_cursor_fetches_binary_rows():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    out = simple_query(
+        s,
+        "BEGIN; DECLARE binary_probe BINARY CURSOR FOR SELECT 42::int4 AS answer; "
+        "FETCH ALL FROM binary_probe; COMMIT",
+    )
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary cursor: FETCH describes binary int4",
+        description is not None
+        and row_description_type_oids(description) == [23]
+        and row_description_formats(description) == [1],
+        description,
+    )
+    check(
+        "binary cursor: FETCH returns network-order int4",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x00*",
+        row,
+    )
     s.close()
 
 

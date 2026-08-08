@@ -16,7 +16,7 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 1. **Object-native durability.** Complete: readable protocol batches publish immutable commit data and a CAS commit head before acknowledgement; checkpoints retain their replay boundary, clear only manifest-captured table generations, and retry post-publication cleanup until completion.
 2. **Object-store portability.** Complete: application configuration and transport use only the generic gateway contract; the deterministic simulator and integration gateway qualify that contract. No application provider adapter or provider-specific branch is permitted.
 3. **SQL and catalogs.** Close remaining language, type, privilege, collation, and introspection differences through strict PostgreSQL differential tests.
-4. **Wire and binary protocol.** Match PostgreSQL Bind, Result, COPY, cancellation, array/range/composite, and typmod bytes for every accepted type. Binary Bind resolves catalog types before decoding, including domains, enums, and their arrays; malformed structured values fail as a whole.
+4. **Wire and binary protocol.** Match PostgreSQL Bind, Result, COPY, cancellation, array/range/composite, and typmod bytes for every accepted type. Binary Bind resolves catalog types before decoding, including domains, enums, and their arrays; binary cursors retain binary result framing through FETCH; malformed structured values fail as a whole.
 5. **Logical replication.** Keep pgoutput, slot, and subscription work only where it preserves object-native performance; physical/binary-WAL replication remains deliberately unsupported.
 6. **Physical-demand execution.** Preserve needed-block/column proofs through joins, correlation, sorting, grouping, windows, and spill.
 

@@ -326,10 +326,11 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
-    /// DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
+    /// DECLARE name [BINARY] [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
     /// `sql` is the raw SELECT text, materialized at DECLARE.
     DeclareCursor {
         name: &'a str,
+        binary: bool,
         scroll: bool,
         hold: bool,
         sql: &'a str,

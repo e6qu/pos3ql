@@ -27,6 +27,11 @@ impl ResultFmt {
         n: 0,
     };
 
+    pub const ALL_BINARY: Self = Self {
+        codes: [true; MAX_RESULT_COLS],
+        n: 1,
+    };
+
     pub fn new(codes: [bool; MAX_RESULT_COLS], n: u16) -> Self {
         Self { codes, n }
     }
@@ -214,6 +219,24 @@ impl<'b> Responder<'b> {
             buffer,
             suppress_row_description: true,
             formats,
+            flush: FlushSink::None,
+            render: crate::sql::guc::RenderContext::default(),
+            discard_query_output: false,
+            suppress_command_complete: false,
+            discarded_rows: 0,
+            discard_serialize: ExplainSerialize::None,
+            serialized_bytes: 0,
+            serialization_micros: 0,
+        }
+    }
+
+    /// A SQL `DECLARE BINARY CURSOR` captures a complete binary result set
+    /// for later `FETCH` messages, which must retain its RowDescription.
+    pub fn for_binary_cursor(buffer: &'b mut FixedBuf) -> Self {
+        Self {
+            buffer,
+            suppress_row_description: false,
+            formats: ResultFmt::ALL_BINARY,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,

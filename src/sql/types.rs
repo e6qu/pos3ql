@@ -14,6 +14,7 @@ pub mod oid {
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
     pub const INT4: i32 = 23;
+    pub const OID: i32 = 26;
     pub const TEXT: i32 = 25;
     pub const NAME: i32 = 19;
     pub const FLOAT4: i32 = 700;
@@ -282,6 +283,15 @@ impl ColType {
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
             oid::INT4 => Some(Self::Int4),
+            oid::OID
+            | oid::REGPROC
+            | oid::REGPROCEDURE
+            | oid::REGOPER
+            | oid::REGOPERATOR
+            | oid::REGCLASS
+            | oid::REGTYPE
+            | oid::REGNAMESPACE
+            | oid::REGROLE => Some(Self::Int4),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
             oid::FLOAT8 => Some(Self::Float8),

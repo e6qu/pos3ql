@@ -144,9 +144,9 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 take = 16;
             }
             Datum::Inet(net) | Datum::Cidr(net) => {
-                rest[0] = net.family;
-                rest[1] = net.bits;
-                rest[2..18].copy_from_slice(&net.addr);
+                rest[0] = net.family();
+                rest[1] = net.bits();
+                rest[2..18].copy_from_slice(net.addr());
                 take = 18;
             }
             Datum::Macaddr(b) => {
@@ -479,15 +479,20 @@ pub(crate) fn decode<'a>(
             }
             ColType::Inet | ColType::Cidr => {
                 let b = bytes.get(at..at + 18).ok_or_else(corrupt)?;
-                let net = crate::sql::net::NetAddr {
-                    family: b[0],
-                    bits: b[1],
-                    addr: b[2..18].try_into().unwrap(),
-                };
                 out[i] = if matches!(schema[i], ColType::Cidr) {
-                    Datum::Cidr(net)
+                    Datum::Cidr(
+                        crate::sql::net::NetAddr::new_cidr(
+                            b[0],
+                            b[1],
+                            b[2..18].try_into().unwrap(),
+                        )
+                        .ok_or_else(corrupt)?,
+                    )
                 } else {
-                    Datum::Inet(net)
+                    Datum::Inet(
+                        crate::sql::net::NetAddr::new(b[0], b[1], b[2..18].try_into().unwrap())
+                            .ok_or_else(corrupt)?,
+                    )
                 };
                 at += 18;
             }

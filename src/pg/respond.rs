@@ -907,14 +907,14 @@ impl<'b> Responder<'b> {
                     // mask bits, is_cidr flag, address byte count, then the
                     // address bytes.
                     let nb = net.addr_len() as u8;
-                    let family = if net.family == 4 { 2u8 } else { 3u8 };
+                    let family = if net.family() == 4 { 2u8 } else { 3u8 };
                     let is_cidr = u8::from(matches!(v, Datum::Cidr(_)));
                     m.i32(4 + i32::from(nb));
                     m.u8(family);
-                    m.u8(net.bits);
+                    m.u8(net.bits());
                     m.u8(is_cidr);
                     m.u8(nb);
-                    m.bytes(&net.addr[..nb as usize]);
+                    m.bytes(&net.addr()[..nb as usize]);
                 }
                 Datum::Macaddr(b) => {
                     m.i32(6);

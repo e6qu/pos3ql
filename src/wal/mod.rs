@@ -3161,9 +3161,9 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             } else {
                 8
             };
-            out[1] = n.family;
-            out[2] = n.bits;
-            out[3..19].copy_from_slice(&n.addr);
+            out[1] = n.family();
+            out[2] = n.bits();
+            out[3..19].copy_from_slice(n.addr());
             19
         }
         Some(OwnedDatum::Macaddr(b)) => {
@@ -3261,15 +3261,18 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         8 | 9 => {
             let b = payload.get(*at..*at + 18)?;
             *at += 18;
-            let net = crate::sql::net::NetAddr {
-                family: b[0],
-                bits: b[1],
-                addr: b[2..18].try_into().unwrap(),
-            };
             Some(if tag == 9 {
-                OwnedDatum::Cidr(net)
+                OwnedDatum::Cidr(crate::sql::net::NetAddr::new_cidr(
+                    b[0],
+                    b[1],
+                    b[2..18].try_into().unwrap(),
+                )?)
             } else {
-                OwnedDatum::Inet(net)
+                OwnedDatum::Inet(crate::sql::net::NetAddr::new(
+                    b[0],
+                    b[1],
+                    b[2..18].try_into().unwrap(),
+                )?)
             })
         }
         10 => {

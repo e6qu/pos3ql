@@ -3195,18 +3195,16 @@ pub(crate) fn decode_binary_param<'a>(
             }
             let mut addr = [0u8; 16];
             addr[..address_bytes].copy_from_slice(&bytes[4..4 + address_bytes]);
-            let net = crate::sql::net::NetAddr {
-                family,
-                bits: bytes[1],
-                addr,
-            };
-            if oid == oids::CIDR && net != net.to_network() {
-                return Err("binary cidr parameter has host bits set");
-            }
             Ok(if oid == oids::CIDR {
-                Datum::Cidr(net)
+                Datum::Cidr(
+                    crate::sql::net::NetAddr::new_cidr(family, bytes[1], addr)
+                        .ok_or("binary cidr parameter has host bits set")?,
+                )
             } else {
-                Datum::Inet(net)
+                Datum::Inet(
+                    crate::sql::net::NetAddr::new(family, bytes[1], addr)
+                        .ok_or("malformed binary inet/cidr parameter")?,
+                )
             })
         }
         oids::MACADDR => {
@@ -3442,11 +3440,14 @@ mod tests {
         assert_eq!(
             decode_binary_param(crate::sql::types::oid::INET, &inet, &arena)
                 .expect("IPv4 inet decodes"),
-            Datum::Inet(crate::sql::net::NetAddr {
-                family: 4,
-                bits: 24,
-                addr: [192, 0, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            })
+            Datum::Inet(
+                crate::sql::net::NetAddr::new(
+                    4,
+                    24,
+                    [192, 0, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                )
+                .expect("valid IPv4 network value"),
+            )
         );
         for malformed in [
             &[4, 24, 0, 16, 0, 0, 0, 0][..],

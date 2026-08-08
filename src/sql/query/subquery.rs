@@ -1406,16 +1406,8 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         },
         ColType::Bit { varying } => Datum::Bit { bits: "", varying },
         ColType::Multirange(kind) => Datum::Multirange { text: "{}", kind },
-        ColType::Inet => Datum::Inet(crate::sql::net::NetAddr {
-            family: 4,
-            bits: 32,
-            addr: [0; 16],
-        }),
-        ColType::Cidr => Datum::Cidr(crate::sql::net::NetAddr {
-            family: 4,
-            bits: 32,
-            addr: [0; 16],
-        }),
+        ColType::Inet => Datum::Inet(crate::sql::net::NetAddr::zero_v4()),
+        ColType::Cidr => Datum::Cidr(crate::sql::net::NetAddr::zero_v4()),
         ColType::Macaddr => Datum::Macaddr([0; 6]),
         ColType::Macaddr8 => Datum::Macaddr8([0; 8]),
         // A witness carries only the type; the empty label is never compared or

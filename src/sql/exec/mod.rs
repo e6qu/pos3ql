@@ -13510,7 +13510,7 @@ fn alter_table_inner(
     // same rename, dropped column, or dropped identity.
     for sequence_slot in 0..storage.sequence_count() {
         let sequence = storage.sequence(sequence_slot);
-        if !sequence.live {
+        if !sequence.visible_to(txn.txid) {
             continue;
         }
         let owner = rebind(sequence.owner, false);

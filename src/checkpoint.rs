@@ -1,21 +1,4 @@
-//! Checkpointing: the durable home of the database is the bucket.
-//!
-//! A checkpoint writes every live table as a block-granular SST — sorted
-//! data blocks, a sparse index, a bloom filter and a roster, all
-//! content-addressed objects under `blocks/` — through the tiered cache
-//! stack (`block_cache_bytes` RAM frames over a `disk_cache_bytes` slot
-//! file), then publishes a `manifest` object naming each SST's root blocks
-//! via compare-and-swap (`If-Match` on the previous ETag, `If-None-Match: *`
-//! for the first). After the manifest lands, unreferenced blocks are swept
-//! (each SST enumerable by its one roster block), the WAL restarts, and the
-//! row heap is compacted. A node with an empty disk cold-starts by loading
-//! the manifest, scanning each SST block-wise through the same cache, and
-//! replaying whatever WAL tail is newer than the manifest's LSN. Manifests
-//! from before the block grid (whole-object `sst/` entries) still load; the
-//! next checkpoint rewrites them as block SSTs and sweeps the old objects.
-//!
-//! CAS on the manifest means a second writer pointed at the same bucket
-//! fails loudly instead of corrupting anything.
+//! Immutable SST publication and cold recovery through the manifest CAS.
 
 use crate::config::Config;
 use crate::mem::arena::Arena;
@@ -1845,13 +1828,21 @@ impl Checkpointer {
                             expression: crate::util::StackStr::from_str(&cexpr),
                         };
                     }
+                    let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
+                    {
+                        (true, true) => None,
+                        (false, false) => Some(crate::storage::UserTypeName {
+                            schema: sql_name(&base_domain_schema)?,
+                            name: sql_name(&base_domain)?,
+                        }),
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "domain parent identity is incomplete",
+                            ));
+                        }
+                    };
                     let spec = crate::storage::DomainSpec {
-                        base_domain: (!base_domain.is_empty())
-                            .then(|| sql_name(&base_domain))
-                            .transpose()?,
-                        base_domain_schema: (!base_domain_schema.is_empty())
-                            .then(|| sql_name(&base_domain_schema))
-                            .transpose()?,
+                        base_domain,
                         base,
                         base_type_mod,
                         not_null: not_null != 0,
@@ -2590,15 +2581,15 @@ impl Checkpointer {
                 &mut line,
                 d.base_domain
                     .as_ref()
-                    .map(|name| name.as_str())
+                    .map(|identity| identity.name.as_str())
                     .unwrap_or(""),
             );
             let _ = write!(line, " ");
             hex(
                 &mut line,
-                d.base_domain_schema
+                d.base_domain
                     .as_ref()
-                    .map(|schema| schema.as_str())
+                    .map(|identity| identity.schema.as_str())
                     .unwrap_or(""),
             );
             let _ = write!(line, " ");

@@ -3815,13 +3815,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     for (slot, d) in storage.live_domains() {
         let base_oid = match d.base_domain {
             Some(parent) => storage
-                .domain_slot(
-                    d.base_domain_schema
-                        .expect("parent domain identity carries its schema")
-                        .as_str(),
-                    parent.as_str(),
-                    0,
-                )
+                .domain_slot(parent.schema.as_str(), parent.name.as_str(), 0)
                 .map(domain_oid)
                 .expect("visible domain retains its parent identity"),
             None => d.base.oid(),

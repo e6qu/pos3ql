@@ -1,302 +1,53 @@
 # pos3ql
 
-A PostgreSQL-compatible database engine whose durable storage is a
-provider-neutral object store (AWS S3, MinIO, Google Cloud Storage, Azure Blob
-Storage, or an equivalent adapter), written in Rust with TigerBeetle-style
-engineering discipline.
+pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQL v3 simple and extended protocols are the compatibility boundary. Durable data lives in provider-neutral object storage; RAM and local disk are bounded caches.
 
-## Design pillars
+## Architecture
 
-- **PostgreSQL compatibility for real clients.** The wire protocol (v3,
-  simple *and* extended query) and the SQL dialect follow PostgreSQL so that
-  psql, JDBC, npgsql, psycopg, node-postgres, etc. work — including the
-  introspection queries drivers issue on connect.
-- **Object storage is the durable home.** Content-addressed, checksummed
-  block SSTs, WAL segments, and the CAS'd manifest live behind one semantic
-  object-store contract, and a node can cold-start from an empty disk. The
-  first transport speaks the S3-compatible API; native adapters or compatibility
-  gateways provide the same immutable-object, range-read, listing, deletion,
-  and conditional-root semantics for other providers without storage-engine
-  special cases. Committed histories are immutable SST entries keyed by
-  `(rowid, commit_lsn)`; repeatable-read snapshots therefore survive arbitrary
-  checkpoint churn and cache eviction, while snapshot-aware compaction retains
-  only versions a live reader can still observe. Reads go **RAM block
-  cache → local disk cache → ranged GET** (`block_cache_bytes` /
-  `disk_cache_bytes`), and under memory pressure committed row bytes spill to
-  the bucket and page back through the caches, so ingest is not bounded by
-  RAM *bytes* or total row count. With object storage enabled, synchronous WAL
-  upload is required, so acknowledged data is already in the durable tier
-  and local disk is disposable. Secondary-index key generations live in the
-  same provider-neutral block grid and manifest as row SSTs; bounded RAM value
-  maps and local disk frames only cache them. Equality/uniqueness probes avoid
-  object-scale row walks, range predicates scan encoded keys and recheck their
-  candidates against authoritative MVCC rows, and each dirty checkpoint
-  compacts stale entries by rebuilding the immutable generation.
-- **Static allocation.** All memory is acquired at startup, sized from
-  config. No heap allocation after init — enforced by a guarding global
-  allocator. Every pool and queue has a fixed limit; exhaustion is a loud
-  error, never growth.
-- **Deterministic core.** The replica is a sans-io state machine driven by an
-  event loop (kqueue/epoll). The same core runs under a deterministic
-  simulator with fault injection (VOPR-style), so cluster bugs reproduce from
-  a seed.
-- **1..N replicas.** Consensus is Viewstamped Replication (the protocol
-  TigerBeetle uses); a single node is a cluster of one. The production server
-  is single-node today and synchronously uploads WAL whenever object
-  storage is enabled; live quorum write-routing remains roadmap work.
+- PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including binary Bind, Result, and COPY for implemented types.
+- Durable state: checksummed WAL, immutable SST blocks, and a compare-and-swap manifest. A node can cold-start with an empty local disk.
+- Object storage: the engine depends only on immutable or conditional PUT, full/ranged GET, LIST, DELETE, and ETag compare-and-swap. The S3-compatible adapter works with S3 and MinIO; other providers require an adapter or gateway with the same contract.
+- Memory: all runtime memory is budgeted at startup. Pools and queues have fixed limits; exhaustion is an error.
+- Determinism: the core is event-driven and runs under deterministic fault simulation.
 
-## Compatibility boundary
+## Durability
 
-pos3ql targets PostgreSQL client compatibility, not a copy of PostgreSQL's
-storage engine. Text SQL and the v3 simple/extended wire protocol are the
-compatibility surface; COPY binary and binary Bind/Result encodings are exact
-for each implemented stored type, including arrays, ranges, multiranges, and
-anonymous records.
+| Mode | Acknowledgement | Survives local-disk loss |
+|---|---|---|
+| `object_store = off` | local WAL sync | no |
+| `object_store = on` | local WAL sync and object-store WAL upload | yes |
+| VSR (roadmap) | quorum ordering and object-store WAL upload | yes |
 
-The durable journal is pos3ql WAL: it is checksummed, ordered by LSN, and
-recovered from the provider-neutral object store. PostgreSQL physical XLOG is
-not a compatible target because its heap-page format would make the object
-store stop being the database. The PostgreSQL-facing WAL target is logical
-replication: first a `pgoutput` publisher, then a subscriber for migration.
-
-Every durable backend supplies the same six operations: immutable or
-conditional PUT, full/ranged GET, LIST, DELETE, and ETag compare-and-swap.
-The current production adapter is S3-compatible (including MinIO); GCS, Azure,
-and other providers must use an adapter or compatibility gateway that provides
-those semantics. Neither the storage engine nor SQL/WAL/recovery code may gain
-provider-specific behavior.
-
-## Dependency policy
-
-`std` + `libc` only (raw syscall bindings). No async runtime, no protocol or
-parser crates, no cloud SDKs. TLS is never hand-rolled: the one whitelisted
-exception is an **isolated rustls component** for HTTPS to the object store
-(`object_store_tls = on`, optional `object_store_tls_ca_file` for self-signed
-endpoints) — every
-rustls call runs inside a budgeted allocator scope (`tls_pool_bytes`) so the
-static-memory discipline holds everywhere else.
-
-The documented durable-storage settings use the `object_store*` prefix.
-Existing `s3*` settings remain strict compatibility aliases; configuring both
-names for one setting is an error rather than an override.
-`object_store_hedge_after_ms` configures a duplicate read deadline for a
-stalled block GET; zero disables hedging, and any duplicate uses only a spare
-startup-bounded GET slot.
+With object storage enabled, an acknowledgement waits for durable WAL in the bucket. Checkpoints publish immutable table state through a compare-and-swap manifest; recovery replays newer uploaded WAL. Local disk is never a durable special case in this mode.
 
 ## Status
 
-Working single-node database:
+The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, views, materialized views, indexes, sequences, domains, enums, SQL functions, CTEs, joins, windows, COPY, logical-replication publishing, and PostgreSQL catalog introspection used by common clients and dump/restore tools.
 
-- psql 18 and psycopg 3 connect and work — wire protocol 3.0 **and 3.2**,
-  simple and extended query protocol (including binary parameters and named
-  prepared statements).
-- SQL: DDL (CREATE/DROP TABLE, CREATE TABLE AS / SELECT ... INTO, CREATE/DROP VIEW,
-  CREATE/REFRESH/DROP MATERIALIZED VIEW, CREATE/ALTER/DROP SEQUENCE
-  (nextval/currval/lastval/setval), CREATE/DROP INDEX, COMMENT ON
-  TABLE/VIEW/MATERIALIZED VIEW/INDEX/SEQUENCE/COLUMN/SCHEMA/TYPE/DOMAIN
-  (including view columns and relation composite types), read back through
-  obj_description/col_description/pg_description),
-  INSERT/SELECT/UPDATE/DELETE/MERGE with WHERE / ORDER BY (PostgreSQL null
-  ordering) / LIMIT / OFFSET / FETCH FIRST ... WITH TIES, row-locking clauses
-  (`FOR UPDATE`/`SHARE`/`NO KEY UPDATE`/`KEY SHARE` with `OF`/`NOWAIT`/`SKIP
-  LOCKED`), all eight `LOCK TABLE` modes with `NOWAIT`, INSERT ... ON CONFLICT
-  (`DO NOTHING` / `DO UPDATE` upsert with column- or `ON CONSTRAINT`-inferred
-  arbiters, `excluded.*`, and RETURNING), joins (including
-  `LATERAL` subqueries and set-returning functions), GROUP BY and aggregates,
-  subqueries (correlated + EXISTS),
-  non-recursive and recursive CTEs (including data-modifying CTEs — ordinary,
-  recursive, and modifying entries chain left-to-right into a `SELECT`,
-  `INSERT`, `UPDATE`, `DELETE`, or `MERGE` main statement under PostgreSQL's
-  single-command snapshot), updatable views, constant and expression column DEFAULTs
-  (`DEFAULT now()` / `DEFAULT nextval(...)` evaluated per row), generated columns
-  (`GENERATED ALWAYS AS (expr) STORED`), identity columns
-  (`GENERATED ALWAYS/BY DEFAULT AS IDENTITY`), arbitrary-precision NUMERIC,
-  network address types (`inet`/`cidr`/`macaddr`/`macaddr8` with their operators
-  and functions), user-defined domains (`CREATE DOMAIN` with NOT NULL / DEFAULT /
-  CHECK, recursive domains, casts, generated arrays, and ALTER validation),
-  user-defined enum types (`CREATE TYPE ... AS ENUM` with arrays, ADD/RENAME
-  VALUE and RENAME TO, ordered by definition order and reflected in
-  `pg_type`/`pg_enum`), casts and
-  scalar functions, plan-time type analysis, `pg_catalog` / `information_schema`
-  introspection (including psql's detailed table/view/materialized-view/index/
-  sequence/domain/type displays and standard object listings), transactional
-  `SHOW` / `SET` / `SET LOCAL` / `RESET` /
-  `RESET ALL` and `current_setting(...)` / `set_config(...)` for session
-  settings (including savepoint rollback),
-  persistent `ANALYZE` table/column statistics exposed through `pg_class` and
-  `pg_stats` (including PostgreSQL's transactional column-statistics versus
-  in-place relation-estimate split), and storage-aware `EXPLAIN` /
-  `EXPLAIN ANALYZE` in text, JSON,
-  XML, and YAML (including cache/object `BUFFERS`, WAL, bounded planning
-  memory, and result-serialization measurements),
-  PostgreSQL lexical rules, and SQLSTATE-correct errors.
-- COPY FROM STDIN / TO STDOUT (including `COPY (query) TO STDOUT`) over both
-  the simple and extended query protocols, in
-  PostgreSQL's text, CSV, and binary formats —
-  psql `\copy` and pg_dump-style inline data streams work, with each type's
-  input and output functions, expression/sequence defaults, generated columns,
-  and full constraint enforcement. The binary format
-  is byte-exact against PostgreSQL for the whole type surface, composites
-  included (arrays, ranges, multiranges, bit strings, network addresses).
-- PostgreSQL dumps restore through both psql and pg_restore: PostgreSQL 18
-  plain SQL and ownerful custom archives cover schemas, enum/domain types,
-  generated and identity columns, owned sequence positions, constraints, btree
-  indexes, views and materialized views. CI runs parallel pg_restore, replaces
-  the populated catalog with `--clean --if-exists`, and verifies the result
-  again after restart.
-- PostgreSQL 18.4 pg_dump also runs in the other direction: it takes its real
-  REPEATABLE READ, READ ONLY snapshot with ACCESS SHARE locks, and the emitted
-  schema/data/view/identity dump restores into vanilla PostgreSQL with sequence
-  continuation intact.
-- Transactions: BEGIN/COMMIT/ROLLBACK with READ COMMITTED, REPEATABLE READ,
-  and SERIALIZABLE snapshots, READ ONLY enforcement, transactional DDL,
-  transaction-private fixed WAL staging, waitable row/table locks (including
-  automatic relation modes and savepoint-scoped release), NOWAIT / SKIP
-  LOCKED, and deadlock detection.
-- LISTEN / NOTIFY: `LISTEN`/`UNLISTEN`/`NOTIFY channel[, payload]` with
-  PostgreSQL's transactional delivery (fired at commit, dropped on rollback,
-  de-duplicated within a transaction) and asynchronous cross-connection
-  NotificationResponse delivery.
-- TLS: server-side TLS for client connections (`tls_on` with `tls_cert_file` /
-  `tls_key_file`) — `sslmode=require` negotiates TLS 1.3 via the isolated rustls
-  component; clients that do not request TLS still connect in the clear.
-- Durability: CRC-checksummed WAL with F_FULLFSYNC (kill -9 safe); CHECKPOINT
-  snapshots every table to the bucket behind a compare-and-swap manifest, a
-  node with an empty disk cold-starts entirely from it, and `wal_upload`
-  streams WAL segments to the bucket (synchronously and obligatorily with
-  object storage enabled). See
-  **Durability and write safety** below.
-- `tests/external/run.sh` runs the external conformance suite against real
-  MinIO (psql golden files, raw wire probes, psycopg driver suite, kill-9 and
-  cold-start durability scenarios, differential vs PostgreSQL 18).
+Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage/consensus simulation.
 
-Still to complete: the full PostgreSQL SQL/catalog/tooling surface,
-logical-replication protocol breadth and the subscriber migration path, VSR productionization, and
-the object-storage execution capstone (end-to-end late materialization through
-the remaining multi-table and deferred operators). PAX descriptors already name
-independent verified column ranges and feed bounded cold-scan vectors through the
-provider-neutral object-storage boundary. See [PLAN.md](PLAN.md) for
-the ordered plan and [BUGS.md](BUGS.md) for known divergences; the headline
-ones are summarized under **Limitations** below. [AGENTS.md](AGENTS.md) holds
-the standing directives, and [docs/terminology.md](docs/terminology.md) is the
-glossary and naming rules.
-
-## Durability and write safety
-
-A committed transaction is always made durable on **local disk** before the
-client is acknowledged: the WAL is CRC-checksummed and fsynced with
-`F_FULLFSYNC` (macOS) / `fdatasync` (Linux), so a process crash, `kill -9`, or
-power loss replays cleanly on restart (to the extent the disk honors the sync).
-That is the floor and it is not configurable.
-
-Durability *against loss of the local disk itself* is explicit by mode:
-
-| Mode | Commit latency | Survives process crash | Survives total local-disk loss |
-|------|----------------|------------------------|--------------------------------|
-| `object_store = off` (development/local-only mode) | local fsync | yes (WAL replay) | no |
-| `object_store = on` | local fsync **+ object-store round-trip** | yes | yes (RPO=0 — the batch is in the durable tier before the ack) |
-| Multi-replica VSR *(roadmap)* | quorum ordering **and object-store WAL durability before ack** | yes | yes; replica disks remain caches |
-
-`CHECKPOINT` snapshots every table to the bucket behind a compare-and-swap
-manifest; a node with a wiped disk cold-starts entirely from the last snapshot
-plus any newer uploaded WAL segments. With object storage on,
-`wal_upload = on` and `wal_upload_sync = on` are required, not optional
-performance postures: an acknowledged commit may never live only on a replica
-disk. VSR will add ordering, failover, and group-commit opportunity without
-changing that durable authority.
-
-## Limitations
-
-Known divergences from PostgreSQL and current constraints (details and IDs in
-[BUGS.md](BUGS.md)):
-
-- **Concurrency uses a single-threaded, waitable reactor.** READ COMMITTED
-  writers and row/table locking clauses park their protocol message, let other
-  sessions run, and re-evaluate after wakeup; a bounded wait graph detects
-  deadlocks. `lock_timeout` deadlines wake the same reactor and return 55P03
-  if the retained statement is still blocked. Ordinary SQL commands acquire
-  PostgreSQL's relation modes before wire output, and savepoint rollback
-  releases subtransaction row/table locks.
-  SERIALIZABLE uses pinned snapshots and relation-level predicate validation.
-  PostgreSQL's finer predicate/range dependency tracking remains to reduce
-  conservative serialization failures.
-- **Catalog concurrency is transaction-visible and waitable.** Tables, views,
-  materialized views, indexes, schemas, sequences, domains, and enums all
-  participate in transactional catalog MVCC and savepoint rollback. Same-name
-  CREATE/DROP and table/schema definition conflicts use the shared wait graph
-  and recheck the committed catalog after wakeup.
-- **Materializing operators use a `work_mem` analogue.** In durable mode,
-  top-level `ORDER BY`, `DISTINCT`, and `DISTINCT ON` spill into immutable
-  runs through the provider-neutral object-store block stack; RAM and local
-  disk only cache those blocks. Non-lateral derived tables, CTEs, and views
-  retain their rows in the same external runs, as do UNION/INTERSECT/EXCEPT
-  multisets and their INSERT/CTAS consumers. Scalar subqueries use a
-  cardinality-checking spool, `IN (subquery)` streams a run-backed membership
-  probe (including after a DML read phase), recursive CTE all/work tables and
-  lateral subqueries/functions are immutable runs, RIGHT/FULL join match
-  state is an external sorted map, `ARRAY(subquery)` results and
-  set-subquery forms carrying their own final ORDER BY/LIMIT spool through
-  the same run stack, and the grouped-aggregate group-key sort runs through
-  a provider-neutral external sort. Windows externalize partition-at-a-time:
-  the source rows external-sort by (PARTITION BY, ORDER BY, position),
-  partitions stream back one at a time through the shared arena, and each
-  row's window values ride one ordinal-stable win run that the projection
-  re-scan joins back by position before the final output sort. Only a single
-  window partition larger than the arena (`work_arena_bytes`, 64 MiB default)
-  still errors `54000`, never truncating a result.
-- **A checkpoint beat blocks for one table's write.** The auto-checkpoint is
-  sliced — one table's SSTs per beat, beats interleaved with statements and
-  driven on by the idle event loop, publishing only when no table changed
-  since its slice — so a checkpoint no longer stalls connections for its
-  whole duration, but a single very large table's slice still blocks while
-  it writes (per-block beats are the roadmap's Stage E). The explicit
-  `CHECKPOINT` statement and the cold-start load remain atomic. Each active
-  transaction stages catalog and row WAL privately; checkpoint publication
-  contains only committed storage, while commit assigns the stage fresh
-  commit-order LSNs above the published floor. Checkpoints therefore coexist
-  with rollback-capable DDL and read-only historical snapshots without a
-  global publication gate.
-- **The row map is an overlay, not an index.** `table_rows` bounds the
-  *working set* — pending changes plus rows not yet shed under pressure —
-  not the dataset: rows beyond it live only in the bucket's SSTs and are
-  read back through bloom-gated probes and merged walks. A single
-  transaction's touched rows must still fit the map, and with `object_store = off`
-  (no bucket) the map bound is the table bound.
-- **Historical rows do not make RAM authoritative.** A bounded resident
-  committed-history chain only stages versions until the next successful
-  manifest publication. Versioned SSTs in the provider-neutral object store
-  retain snapshots across long update/checkpoint churn; RAM and disk cache
-  loss changes latency, never visibility or durability.
-- **Value-index RAM is a bounded cache.** Primary/unique constraints and named
-  indexes share startup-sized `value → rowid` maps backed by immutable
-  key-only object generations. `value_index_rows` controls hot acceleration
-  coverage, not table size or correctness. Equality, composite uniqueness, and
-  range candidates remain correct after cache loss; authoritative MVCC row
-  rechecks make stale generation entries false positives only, and checkpoint
-  rebuilds compact them away. Chained immutable roster roots avoid a flat
-  generation-size ceiling; historical snapshots use the full MVCC row walk.
-- **Fixed capacities.** Connections, tables, columns, prepared statements,
-  transaction footprint, and every buffer are sized from config at startup;
-  exceeding any is a loud error, never silent growth. A query range table may
-  use the full 64-relation catalog envelope; its scratch is sized to the actual
-  FROM clause, so ordinary queries do not reserve that maximum.
-- **TLS is opt-in.** Object-store HTTPS is controlled by `object_store_tls`; PostgreSQL
-  wire TLS is enabled with `tls_on`, `tls_cert_file`, and `tls_key_file`.
-  Cleartext clients remain accepted when server TLS is configured.
+The completion work is physical-demand propagation through query execution, logical-replication interoperability and subscription, remaining PostgreSQL SQL/catalog/tooling coverage, and production VSR routing. See [PLAN.md](PLAN.md).
 
 ## Quick start
 
 ```sh
 docker run -d -p 19100:9000 -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
-docker exec <container> mc mb local/pos3ql   # after: mc alias set local ...
+docker exec <container> mc mb local/pos3ql
 cargo run --release -- --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U you
 ```
 
+## Project documents
+
+- [PLAN.md](PLAN.md) — completion roadmap
+- [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
+- [docs/terminology.md](docs/terminology.md) — naming and glossary
+- [AGENTS.md](AGENTS.md) — contribution rules
+
 ## References
 
-- PostgreSQL Frontend/Backend Protocol: https://www.postgresql.org/docs/current/protocol.html
-- Viewstamped Replication Revisited (Liskov & Cowling, 2012): https://pmg.csail.mit.edu/papers/vr-revisited.pdf
-- TigerBeetle safety/design docs: https://docs.tigerbeetle.com/concepts/safety/
-- AWS Signature Version 4: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
+- [PostgreSQL frontend/backend protocol](https://www.postgresql.org/docs/current/protocol.html)
+- [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)
+- [TigerBeetle safety and design](https://docs.tigerbeetle.com/concepts/safety/)
+- [AWS Signature Version 4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html)

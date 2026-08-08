@@ -6729,18 +6729,20 @@ fn build_domain_spec(
     ast_checks: &[crate::sql::ast::DomainCheck],
     arena: &Arena,
 ) -> Result<crate::storage::DomainSpec, SqlError> {
-    let (base_domain, base_domain_schema, base, inherited_default) =
+    let (base_domain, base, inherited_default) =
         if let Some(base) = ColType::from_sql_name(base_type) {
-            (None, None, base, None)
+            (None, base, None)
         } else if let Some(parent) = storage.find_domain(base_type, txid) {
             (
-                Some(parent.name),
-                Some(parent.schema),
+                Some(crate::storage::UserTypeName {
+                    schema: parent.schema,
+                    name: parent.name,
+                }),
                 parent.base,
                 parent.default_expr,
             )
         } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            (None, None, ColType::Enum(enum_slot as u16), None)
+            (None, ColType::Enum(enum_slot as u16), None)
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -6792,7 +6794,6 @@ fn build_domain_spec(
     }
     Ok(crate::storage::DomainSpec {
         base_domain,
-        base_domain_schema,
         base,
         base_type_mod,
         not_null,
@@ -7214,7 +7215,6 @@ pub fn alter_domain(
     let current = *storage.domain(slot);
     let mut spec = crate::storage::DomainSpec {
         base_domain: current.base_domain,
-        base_domain_schema: current.base_domain_schema,
         base: current.base,
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
@@ -7352,7 +7352,6 @@ pub fn alter_domain(
             slot,
             crate::storage::DomainSpec {
                 base_domain: current.base_domain,
-                base_domain_schema: current.base_domain_schema,
                 base: current.base,
                 base_type_mod: current.base_type_mod,
                 not_null: current.not_null,
@@ -7368,7 +7367,6 @@ pub fn alter_domain(
         // Restore the pre-ALTER definition on a journal failure.
         let restore = crate::storage::DomainSpec {
             base_domain: current.base_domain,
-            base_domain_schema: current.base_domain_schema,
             base: current.base,
             base_type_mod: current.base_type_mod,
             not_null: current.not_null,
@@ -7475,10 +7473,8 @@ fn domain_depends_on(storage: &Storage, mut slot: usize, target: usize, txid: u3
         let Some(parent) = storage.domain(slot).base_domain else {
             return false;
         };
-        let Some(parent_schema) = storage.domain(slot).base_domain_schema else {
-            return false;
-        };
-        let Some(parent_slot) = storage.domain_slot(parent_schema.as_str(), parent.as_str(), txid)
+        let Some(parent_slot) =
+            storage.domain_slot(parent.schema.as_str(), parent.name.as_str(), txid)
         else {
             return false;
         };

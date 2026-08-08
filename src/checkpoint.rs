@@ -1978,8 +1978,7 @@ impl Checkpointer {
                                 nulls_first,
                                 n_cols,
                                 unique: unique != 0,
-                                live: true,
-                                pending: None,
+                                ddl_state: crate::storage::CatalogDdlState::Present,
                             },
                             0,
                         )

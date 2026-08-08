@@ -1552,8 +1552,7 @@ pub struct DomainDef {
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    pub ddl_state: CatalogDdlState,
 }
 
 impl DomainDef {
@@ -1569,15 +1568,11 @@ impl DomainDef {
         default_expr: None,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
-        live: false,
-        pending: None,
+        ddl_state: CatalogDdlState::Absent,
     };
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(pending) if pending.txid == txid => pending.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 
     pub fn checks(&self) -> &[CheckConstraint] {
@@ -1633,8 +1628,7 @@ pub struct EnumDef {
     pub ownership: Ownership,
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
-    pub live: bool,
-    pub pending: Option<PendingDdl>,
+    pub ddl_state: CatalogDdlState,
 }
 
 impl EnumDef {
@@ -1645,15 +1639,11 @@ impl EnumDef {
         ownership: Ownership::BOOTSTRAP,
         members: [EnumMember::EMPTY; MAX_ENUM_LABELS],
         n_members: 0,
-        live: false,
-        pending: None,
+        ddl_state: CatalogDdlState::Absent,
     };
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 
     pub fn members(&self) -> &[EnumMember] {
@@ -1907,19 +1897,13 @@ pub struct IndexDef {
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub unique: bool,
-    pub live: bool,
-    /// An uncommitted CREATE/DROP owned by one transaction (catalog MVCC,
-    /// mirroring `Table::pending_ddl`).
-    pub pending: Option<PendingDdl>,
+    pub ddl_state: CatalogDdlState,
 }
 
 impl IndexDef {
     /// Whether `txid` sees this index exist.
     pub fn visible_to(&self, txid: u32) -> bool {
-        match self.pending {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.ddl_state.visible_to(txid)
     }
 }
 
@@ -3251,8 +3235,7 @@ impl Storage {
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
                     unique: false,
-                    live: false,
-                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
         }
@@ -3523,9 +3506,9 @@ impl Storage {
             }
             AccessClass::Sequence => self.sequences[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Schema => self.schemas[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Domain => self.domains[slot].live,
-            AccessClass::Enum => self.enums[slot].live,
-            AccessClass::Index => self.indexes[slot].live,
+            AccessClass::Domain => self.domains[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Enum => self.enums[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -8107,7 +8090,7 @@ impl Storage {
                 .iter()
                 .any(|unique| unique.columns() == columns)
             || self.indexes.iter().any(|index| {
-                index.live
+                index.ddl_state == CatalogDdlState::Present
                     && index.schema == definition.schema
                     && index.table == definition.name
                     && &index.columns[..index.n_cols] == columns
@@ -8289,8 +8272,9 @@ impl Storage {
         let table_schema = self.tables[table_index].def.schema;
         let table_name = self.tables[table_index].def.name;
         for index in self.indexes.iter().filter(|index| {
-            txid.map_or(index.live, |owner| index.visible_to(owner))
-                && index.schema == table_schema
+            txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                index.visible_to(owner)
+            }) && index.schema == table_schema
                 && index.table == table_name
         }) {
             let columns = &index.columns[..index.n_cols];
@@ -9781,7 +9765,10 @@ impl Storage {
     /// Committed domains carrying their slot indices, for the checkpoint and
     /// `pg_type`.
     pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
-        self.domains.iter().enumerate().filter(|(_, d)| d.live)
+        self.domains
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.ddl_state == CatalogDdlState::Present)
     }
 
     /// Whether any table column (in any table) is declared with this domain —
@@ -9812,16 +9799,15 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
             (d.schema.as_str() == schema.as_str() && d.name.as_str() == name.as_str())
-                .then_some(d.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(d.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .domains
             .iter()
-            .position(|d| !d.live && d.pending.is_none())
+            .position(|d| d.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9830,10 +9816,6 @@ impl Storage {
             ));
         };
         self.catalog_seq += 1;
-        let pending = (txid != 0).then_some(PendingDdl {
-            txid,
-            creating: true,
-        });
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Domain,
@@ -9851,8 +9833,11 @@ impl Storage {
             default_expr: spec.default_expr,
             checks: spec.checks,
             n_checks: spec.n_checks,
-            live: txid == 0,
-            pending,
+            ddl_state: if txid == 0 {
+                CatalogDdlState::Present
+            } else {
+                CatalogDdlState::PendingCreate { txid }
+            },
         };
         Ok(new)
     }
@@ -9910,9 +9895,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.domains.iter().find_map(|d| {
             (d.schema.as_str() == schema && d.name.as_str() == name)
-                .then_some(d.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(d.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -9922,45 +9906,27 @@ impl Storage {
             return Ok(None);
         };
         let d = &mut self.domains[i];
-        if matches!(d.pending, Some(p) if p.txid == txid && p.creating) {
-            d.live = false;
-            d.pending = None;
-        } else {
-            d.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        d.ddl_state = d.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_domain_create(&mut self, slot: usize) {
-        self.domains[slot].live = true;
-        self.domains[slot].pending = None;
+        self.domains[slot].ddl_state = self.domains[slot].ddl_state.commit_create();
     }
 
     pub fn commit_domain_drop(&mut self, slot: usize) {
         let (schema, name) = (self.domains[slot].schema, self.domains[slot].name);
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.domains[slot].live = false;
-        self.domains[slot].pending = None;
+        self.domains[slot].ddl_state = self.domains[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_domain_create(&mut self, slot: usize) {
-        self.domains[slot].live = false;
-        self.domains[slot].pending = None;
+        self.domains[slot].ddl_state = self.domains[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_domain_drop(&mut self, slot: usize, txid: u32) {
         let d = &mut self.domains[slot];
-        if d.live {
-            d.pending = None;
-        } else if matches!(d.pending, Some(p) if p.txid == txid) {
-            d.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        d.ddl_state = d.ddl_state.rollback_drop(txid);
     }
 
     // --- Enum types (CREATE TYPE ... AS ENUM) ---
@@ -10031,7 +9997,10 @@ impl Storage {
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
-        self.enums.iter().enumerate().filter(|(_, e)| e.live)
+        self.enums
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.ddl_state == CatalogDdlState::Present)
     }
 
     /// Whether any table column (in any table) is declared with this enum —
@@ -10065,16 +10034,15 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
             (e.schema.as_str() == schema.as_str() && e.name.as_str() == name.as_str())
-                .then_some(e.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(e.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let Some(new) = self
             .enums
             .iter()
-            .position(|e| !e.live && e.pending.is_none())
+            .position(|e| e.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10083,10 +10051,6 @@ impl Storage {
             ));
         };
         self.catalog_seq += 1;
-        let pending = (txid != 0).then_some(PendingDdl {
-            txid,
-            creating: true,
-        });
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Enum,
@@ -10099,8 +10063,11 @@ impl Storage {
             ownership,
             members: spec.members,
             n_members: spec.n_members,
-            live: txid == 0,
-            pending,
+            ddl_state: if txid == 0 {
+                CatalogDdlState::Present
+            } else {
+                CatalogDdlState::PendingCreate { txid }
+            },
         };
         Ok(new)
     }
@@ -10181,9 +10148,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.enums.iter().find_map(|e| {
             (e.schema.as_str() == schema && e.name.as_str() == name)
-                .then_some(e.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(e.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -10193,45 +10159,27 @@ impl Storage {
             return Ok(None);
         };
         let e = &mut self.enums[i];
-        if matches!(e.pending, Some(p) if p.txid == txid && p.creating) {
-            e.live = false;
-            e.pending = None;
-        } else {
-            e.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        e.ddl_state = e.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_enum_create(&mut self, slot: usize) {
-        self.enums[slot].live = true;
-        self.enums[slot].pending = None;
+        self.enums[slot].ddl_state = self.enums[slot].ddl_state.commit_create();
     }
 
     pub fn commit_enum_drop(&mut self, slot: usize) {
         let (schema, name) = (self.enums[slot].schema, self.enums[slot].name);
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.enums[slot].live = false;
-        self.enums[slot].pending = None;
+        self.enums[slot].ddl_state = self.enums[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_enum_create(&mut self, slot: usize) {
-        self.enums[slot].live = false;
-        self.enums[slot].pending = None;
+        self.enums[slot].ddl_state = self.enums[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_enum_drop(&mut self, slot: usize, txid: u32) {
         let e = &mut self.enums[slot];
-        if e.live {
-            e.pending = None;
-        } else if matches!(e.pending, Some(p) if p.txid == txid) {
-            e.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        e.ddl_state = e.ddl_state.rollback_drop(txid);
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other
@@ -10408,9 +10356,8 @@ impl Storage {
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
             (index.schema.as_str() == def.schema.as_str()
                 && index.name.as_str() == def.name.as_str())
-            .then_some(index.pending?)
-            .filter(|pending| pending.txid != txid)
-            .map(|pending| pending.txid)
+            .then_some(index.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
         }
@@ -10424,7 +10371,7 @@ impl Storage {
         let Some(i) = self
             .indexes
             .iter()
-            .position(|x| !x.live && x.pending.is_none())
+            .position(|x| x.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10439,11 +10386,7 @@ impl Storage {
         });
         self.indexes[i] = IndexDef {
             ownership,
-            live: false,
-            pending: Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
             ..def
         };
         Ok(i)
@@ -10470,10 +10413,9 @@ impl Storage {
         for x in self.indexes.iter_mut() {
             if x.schema.as_str() == schema
                 && x.table.as_str() == table
-                && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
+                && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
-                x.live = false;
-                x.pending = None;
+                x.ddl_state = x.ddl_state.commit_drop();
             }
         }
     }
@@ -10484,9 +10426,9 @@ impl Storage {
         for x in self.indexes.iter_mut() {
             if x.schema.as_str() == schema
                 && x.table.as_str() == table
-                && matches!(x.pending, Some(p) if p.txid == txid && !p.creating)
+                && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
-                x.pending = None;
+                x.ddl_state = x.ddl_state.rollback_drop(txid);
             }
         }
     }
@@ -10502,9 +10444,8 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
             (index.schema.as_str() == schema && index.name.as_str() == name)
-                .then_some(index.pending?)
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
+                .then_some(index.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
@@ -10521,21 +10462,12 @@ impl Storage {
     /// simply evaporates.
     fn pending_drop_index(&mut self, slot: usize, txid: u32) {
         let x = &mut self.indexes[slot];
-        if matches!(x.pending, Some(p) if p.txid == txid && p.creating) {
-            x.live = false;
-            x.pending = None;
-        } else {
-            x.pending = Some(PendingDdl {
-                txid,
-                creating: false,
-            });
-        }
+        x.ddl_state = x.ddl_state.drop_by(txid);
     }
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
     pub fn commit_index_create(&mut self, slot: usize) {
-        self.indexes[slot].live = true;
-        self.indexes[slot].pending = None;
+        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_create();
         if let Some(table) = self.index_table_slot(slot) {
             self.tables[table].mark_dirty();
         }
@@ -10545,8 +10477,7 @@ impl Storage {
     pub fn commit_index_drop(&mut self, slot: usize) {
         let (schema, name) = (self.indexes[slot].schema, self.indexes[slot].name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.indexes[slot].live = false;
-        self.indexes[slot].pending = None;
+        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
         if let Some(table) = self.index_table_slot(slot) {
             self.tables[table].mark_dirty();
         }
@@ -10562,22 +10493,14 @@ impl Storage {
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
     pub fn rollback_index_create(&mut self, slot: usize) {
-        self.indexes[slot].live = false;
-        self.indexes[slot].pending = None;
+        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.rollback_create();
     }
 
     /// Discards an uncommitted DROP INDEX (rollback); a same-transaction
     /// pending-create reverts to pending-create.
     pub fn rollback_index_drop(&mut self, slot: usize, txid: u32) {
         let x = &mut self.indexes[slot];
-        if x.live {
-            x.pending = None;
-        } else {
-            x.pending = Some(PendingDdl {
-                txid,
-                creating: true,
-            });
-        }
+        x.ddl_state = x.ddl_state.rollback_drop(txid);
     }
 
     /// Unique indexes visible to `txid` over the named table (for constraint
@@ -10613,14 +10536,16 @@ impl Storage {
 
     /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
-        self.indexes.iter().filter(|x| x.live)
+        self.indexes
+            .iter()
+            .filter(|x| x.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn live_indexes_with_slots(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
         self.indexes
             .iter()
             .enumerate()
-            .filter(|(_, index)| index.live)
+            .filter(|(_, index)| index.ddl_state == CatalogDdlState::Present)
     }
 
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
@@ -10632,7 +10557,7 @@ impl Storage {
         self.tables[index].def.schema = new_schema;
         self.tables[index].mark_dirty();
         for x in self.indexes.iter_mut() {
-            if x.live
+            if x.ddl_state == CatalogDdlState::Present
                 && x.schema.as_str() == old_schema.as_str()
                 && x.table.as_str() == name.as_str()
             {
@@ -10763,7 +10688,10 @@ impl Storage {
             );
         }
         for index_def in self.indexes.iter_mut() {
-            if !index_def.live || index_def.schema != old.schema || index_def.table != old.name {
+            if index_def.ddl_state != CatalogDdlState::Present
+                || index_def.schema != old.schema
+                || index_def.table != old.name
+            {
                 continue;
             }
             for column in &mut index_def.columns[..index_def.n_cols] {

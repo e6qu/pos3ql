@@ -621,8 +621,7 @@ fn copy_like_indexes(
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
                     unique: index.unique,
-                    live: true,
-                    pending: None,
+                    ddl_state: crate::storage::CatalogDdlState::Present,
                 },
                 txn.txid,
             )?;
@@ -8807,8 +8806,7 @@ pub fn create_index(
         nulls_first,
         n_cols,
         unique,
-        live: true,
-        pending: None,
+        ddl_state: crate::storage::CatalogDdlState::Present,
     };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.

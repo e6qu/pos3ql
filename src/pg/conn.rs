@@ -444,6 +444,12 @@ impl Conn {
                 after = After::Close;
             }
         }
+        if after != After::Close {
+            // Publication completed above, so checkpoint work can safely
+            // capture the committed state and keep the bounded local journal
+            // from filling under a sustained write stream.
+            engine.maybe_checkpoint();
+        }
         let flushed = self.flush();
         self.activate_pending_tls();
         match flushed {

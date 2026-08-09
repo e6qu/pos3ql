@@ -881,18 +881,18 @@ impl<'a> Parser<'a> {
 
     fn create_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.any_ident("publication name")?;
-        let (all_tables, tables) = if self.eat_ident("for")? {
+        let (all_tables, tables, schemas) = if self.eat_ident("for")? {
             if self.eat_ident("all")? {
                 self.expect_ident("tables")?;
-                (true, &[][..])
+                (true, &[][..], &[][..])
             } else {
-                self.expect_ident("table")?;
-                (false, self.publication_tables()?)
+                let (tables, schemas) = self.publication_targets()?;
+                (false, tables, schemas)
             }
         } else {
             // PostgreSQL permits an empty publication so tables can be added
             // transactionally later with ALTER PUBLICATION.
-            (false, &[][..])
+            (false, &[][..], &[][..])
         };
         let mut publish = PublicationOperations::ALL;
         if self.eat_ident("with")? {
@@ -907,6 +907,7 @@ impl<'a> Parser<'a> {
             name,
             all_tables,
             tables,
+            schemas,
             publish,
         })
     }
@@ -916,7 +917,13 @@ impl<'a> Parser<'a> {
     /// execution cannot accidentally turn ADD or DROP into replacement.
     pub(super) fn alter_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.any_ident("publication name")?;
-        let action = if self.eat_ident("set")? {
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterPublicationAction::SetOwner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterPublicationAction::Rename(self.any_ident("new publication name")?)
+        } else if self.eat_ident("set")? {
             if self.eat_op("(")? {
                 self.expect_ident("publish")?;
                 self.expect_op("=")?;
@@ -925,38 +932,80 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
                 AlterPublicationAction::SetOperations(publish)
             } else {
-                self.expect_ident("table")?;
-                AlterPublicationAction::SetTables(self.publication_tables()?)
+                let (tables, schemas) = self.publication_targets()?;
+                AlterPublicationAction::SetTargets { tables, schemas }
             }
         } else if self.eat_ident("add")? {
-            self.expect_ident("table")?;
-            AlterPublicationAction::AddTables(self.publication_tables()?)
+            let (tables, schemas) = self.publication_targets()?;
+            AlterPublicationAction::AddTargets { tables, schemas }
         } else if self.eat_ident("drop")? {
-            self.expect_ident("table")?;
-            AlterPublicationAction::DropTables(self.publication_tables()?)
+            let (tables, schemas) = self.publication_targets()?;
+            AlterPublicationAction::DropTargets { tables, schemas }
         } else {
             return Err(self.err_here("expected SET, ADD, or DROP after ALTER PUBLICATION"));
         };
         Ok(Stmt::AlterPublication { name, action })
     }
 
-    fn publication_tables(&mut self) -> Result<&'a [QualName<'a>], ParseError> {
-        let mut entries: [QualName; MAX_LIST] = [QualName {
+    fn publication_targets(&mut self) -> Result<(&'a [QualName<'a>], &'a [&'a str]), ParseError> {
+        let mut tables = [QualName {
             schema: None,
             name: "",
         }; MAX_LIST];
-        let mut count = 0;
+        let mut schemas = [""; MAX_LIST];
+        let mut table_count = 0;
+        let mut schema_count = 0;
         loop {
-            if count == MAX_LIST {
-                return Err(self.limit("publication tables", MAX_LIST));
+            if self.eat_ident("table")? {
+                loop {
+                    if table_count == MAX_LIST {
+                        return Err(self.limit("publication tables", MAX_LIST));
+                    }
+                    tables[table_count] = self.qual_name("table name")?;
+                    table_count += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                    if self.peeked == Tok::Ident("tables") {
+                        break;
+                    }
+                }
+            } else if self.eat_ident("tables")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                loop {
+                    if schema_count == MAX_LIST {
+                        return Err(self.limit("publication schemas", MAX_LIST));
+                    }
+                    schemas[schema_count] = if self.eat_ident("current_schema")? {
+                        self.expect_op("(")?;
+                        self.expect_op(")")?;
+                        "public"
+                    } else {
+                        self.any_ident("schema name")?
+                    };
+                    schema_count += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                    if self.peeked == Tok::Ident("table") || self.peeked == Tok::Ident("tables") {
+                        break;
+                    }
+                }
+            } else {
+                return Err(self.err_here("expected TABLE or TABLES IN SCHEMA in publication"));
             }
-            entries[count] = self.qual_name("table name")?;
-            count += 1;
+            if self.peeked == Tok::Ident("table") || self.peeked == Tok::Ident("tables") {
+                continue;
+            }
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&entries[..count])
+        Ok((
+            self.arena_slice(&tables[..table_count])?,
+            self.arena_slice(&schemas[..schema_count])?,
+        ))
     }
 
     fn publication_operations(&self, value: &'a str) -> Result<PublicationOperations, ParseError> {

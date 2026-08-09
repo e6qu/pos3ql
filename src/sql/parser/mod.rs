@@ -4418,10 +4418,12 @@ mod tests {
                 panic!("ALTER PUBLICATION did not parse")
             };
             assert_eq!(name, "changes");
-            let crate::sql::ast::AlterPublicationAction::AddTables(tables) = action else {
+            let crate::sql::ast::AlterPublicationAction::AddTargets { tables, schemas } = action
+            else {
                 panic!("membership action lost its operation")
             };
             assert_eq!(tables.len(), 2);
+            assert!(schemas.is_empty());
             assert_eq!(tables[0].schema, Some("public"));
             assert_eq!(tables[1].schema, Some("archive"));
         });
@@ -4433,11 +4435,74 @@ mod tests {
             let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap() else {
                 panic!("SET TABLE did not parse")
             };
-            let crate::sql::ast::AlterPublicationAction::SetTables(tables) = action else {
+            let crate::sql::ast::AlterPublicationAction::SetTargets { tables, schemas } = action
+            else {
                 panic!("SET TABLE parsed as another ALTER PUBLICATION action")
             };
             assert_eq!(tables, [QualName::bare("orders")]);
+            assert!(schemas.is_empty());
         });
+    }
+
+    #[test]
+    fn publication_schema_targets_are_typed_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "publication schema parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE PUBLICATION changes FOR TABLE public.orders, TABLES IN SCHEMA archive, current_schema()",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreatePublication {
+                tables, schemas, ..
+            }) = parser.next_stmt().unwrap()
+            else {
+                panic!("publication schema targets did not parse")
+            };
+            assert_eq!(
+                tables,
+                [QualName {
+                    schema: Some("public"),
+                    name: "orders"
+                }]
+            );
+            assert_eq!(schemas, ["archive", "public"]);
+        });
+    }
+
+    #[test]
+    fn publication_owner_change_is_typed_without_allocation() {
+        with_parser(
+            "ALTER PUBLICATION changes OWNER TO replication_owner",
+            |parser| {
+                let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("publication owner change did not parse")
+                };
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterPublicationAction::SetOwner("replication_owner")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn publication_rename_is_typed_without_allocation() {
+        with_parser(
+            "ALTER PUBLICATION changes RENAME TO renamed_changes",
+            |parser| {
+                let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("publication rename did not parse")
+                };
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterPublicationAction::Rename("renamed_changes")
+                );
+            },
+        );
     }
 
     #[test]

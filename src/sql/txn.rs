@@ -168,6 +168,14 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: crate::storage::PublicationAlteration,
     },
+    PublicationOwnerChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingOwnership>,
+    },
+    PublicationRenamed {
+        slot: u32,
+        prior: Option<crate::storage::PendingPublicationName>,
+    },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.

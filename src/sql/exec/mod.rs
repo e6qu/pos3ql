@@ -4991,6 +4991,9 @@ pub fn drop_schema(
         }
     }
     for &slot in &slots[..n_slots] {
+        if let Err(error) = remove_schema_from_publications(storage, wal, txn, slot as u8) {
+            return sql_fail(error);
+        }
         let name = storage.schema_def(slot).name;
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
@@ -5005,6 +5008,56 @@ pub fn drop_schema(
     sql_ok()
 }
 
+fn remove_schema_from_publications(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    schema_slot: u8,
+) -> Result<(), SqlError> {
+    while let Some((name, mut definition)) =
+        storage.publication_selecting_schema(schema_slot, txn.txid)
+    {
+        let index = definition.schemas[..definition.schema_count]
+            .iter()
+            .position(|member| *member == schema_slot)
+            .expect("selected schema");
+        definition
+            .schemas
+            .copy_within(index + 1..definition.schema_count, index);
+        definition.schema_count -= 1;
+        definition.schemas[definition.schema_count] = u8::MAX;
+        let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid)?;
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterPublication {
+                name: name.as_str(),
+                all_tables: definition.all_tables,
+                tables: definition.tables,
+                table_count: definition.table_count,
+                schemas: definition.schemas,
+                schema_count: definition.schema_count,
+                publish_insert: definition.publish_insert,
+                publish_update: definition.publish_update,
+                publish_delete: definition.publish_delete,
+                publish_truncate: definition.publish_truncate,
+            },
+        ) {
+            storage.rollback_publication_alter(slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_publication_alter(slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// CREATE PUBLICATION records a transaction-owned catalog entry and its
 /// complete initial selection before the commit record makes it visible.
 #[allow(clippy::too_many_arguments)]
@@ -5015,10 +5068,11 @@ pub fn create_publication(
     name: &str,
     all_tables: bool,
     tables: &[QualName],
+    schemas: &[&str],
     publish: crate::sql::ast::PublicationOperations,
     responder: &mut Responder,
 ) -> Outcome {
-    if all_tables && !tables.is_empty() {
+    if all_tables && (!tables.is_empty() || !schemas.is_empty()) {
         return sql_fail(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "FOR ALL TABLES cannot name tables"
@@ -5051,6 +5105,10 @@ pub fn create_publication(
         }
         members[index] = slot as u16;
     }
+    let schema_members = match publication_schemas(storage, txn.txid, schemas) {
+        Ok(schemas) => schemas,
+        Err(error) => return sql_fail(error),
+    };
     let name = match SqlName::parse(name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -5060,6 +5118,7 @@ pub fn create_publication(
             name,
             all_tables,
             tables: &members[..tables.len()],
+            schemas: &schema_members[..schemas.len()],
             publish_insert: publish.insert,
             publish_update: publish.update,
             publish_delete: publish.delete,
@@ -5068,15 +5127,19 @@ pub fn create_publication(
         txn.txid,
     ) {
         Ok(slot) => {
+            let owner = storage.publication_owner(slot, txn.txid);
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage(
                 txn.txid,
                 lsn,
                 &WalOp::CreatePublication {
                     name: name.as_str(),
+                    owner,
                     all_tables,
                     tables: members,
                     table_count: tables.len(),
+                    schemas: schema_members,
+                    schema_count: schemas.len(),
                     publish_insert: publish.insert,
                     publish_update: publish.update,
                     publish_delete: publish.delete,
@@ -5096,6 +5159,47 @@ pub fn create_publication(
         }
         Err(error) => sql_fail(error),
     }
+}
+
+fn publication_schemas(
+    storage: &Storage,
+    txid: u32,
+    schemas: &[&str],
+) -> Result<[u8; crate::storage::MAX_SCHEMAS], SqlError> {
+    let mut members = [u8::MAX; crate::storage::MAX_SCHEMAS];
+    if schemas.is_empty() {
+        return Ok(members);
+    }
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if txid != 0 && !storage.role(role).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to publish schemas"
+        ));
+    }
+    for (index, name) in schemas.iter().enumerate() {
+        let Some(slot) = storage.find_schema_visible(name, txid) else {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                name
+            ));
+        };
+        if members[..index].contains(&(slot as u8)) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "schema \"{}\" is listed more than once",
+                name
+            ));
+        }
+        members[index] = slot as u8;
+    }
+    Ok(members)
 }
 
 pub fn drop_publication(
@@ -5174,13 +5278,100 @@ pub fn alter_publication(
     }
     let mut definition = current;
     match action {
+        crate::sql::ast::AlterPublicationAction::Rename(new_name) => {
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.rename_publication(slot, new_name, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenamePublication {
+                    name,
+                    new_name: new_name.as_str(),
+                },
+            ) {
+                storage.rollback_publication_rename(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_publication_rename(slot, prior);
+                return sql_fail(error);
+            }
+            return Ok(Ok(responder.command_complete("ALTER PUBLICATION")?));
+        }
+        crate::sql::ast::AlterPublicationAction::SetOwner(role_name) => {
+            let role_name = resolve_role_name(role_name);
+            let Some(new_owner) = storage.find_role_visible(role_name.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    role_name.as_str()
+                ));
+            };
+            let Some(current_role) = storage.current_role_slot(txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                ));
+            };
+            let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+            if !superuser
+                && current_role != new_owner
+                && !storage.role_can_set(current_role, new_owner, txn.txid)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be able to SET ROLE \"{}\"",
+                    role_name.as_str()
+                ));
+            }
+            if !superuser
+                && (current.all_tables || current.schema_count != 0)
+                && !storage.role(new_owner).attributes_to(txn.txid).superuser
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "new owner of a schema or all-tables publication must be superuser"
+                ));
+            }
+            let prior = storage.set_publication_owner(slot, new_owner, txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetPublicationOwner {
+                    name,
+                    owner: new_owner as u16,
+                },
+            ) {
+                storage.restore_publication_owner_pending(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationOwnerChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_publication_owner_pending(slot, prior);
+                return sql_fail(error);
+            }
+            return Ok(Ok(responder.command_complete("ALTER PUBLICATION")?));
+        }
         crate::sql::ast::AlterPublicationAction::SetOperations(operations) => {
             definition.publish_insert = operations.insert;
             definition.publish_update = operations.update;
             definition.publish_delete = operations.delete;
             definition.publish_truncate = operations.truncate;
         }
-        crate::sql::ast::AlterPublicationAction::SetTables(tables) => {
+        crate::sql::ast::AlterPublicationAction::SetTargets { tables, schemas } => {
             if current.all_tables {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -5194,8 +5385,14 @@ pub fn alter_publication(
             };
             definition.tables = members;
             definition.table_count = count;
+            let schema_members = match publication_schemas(storage, txn.txid, schemas) {
+                Ok(schemas) => schemas,
+                Err(error) => return sql_fail(error),
+            };
+            definition.schemas = schema_members;
+            definition.schema_count = schemas.len();
         }
-        crate::sql::ast::AlterPublicationAction::AddTables(tables) => {
+        crate::sql::ast::AlterPublicationAction::AddTargets { tables, schemas } => {
             if current.all_tables {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -5225,8 +5422,29 @@ pub fn alter_publication(
                 definition.tables[definition.table_count] = *table;
                 definition.table_count += 1;
             }
+            let schema_members = match publication_schemas(storage, txn.txid, schemas) {
+                Ok(schemas) => schemas,
+                Err(error) => return sql_fail(error),
+            };
+            if definition.schema_count + schemas.len() > crate::storage::MAX_SCHEMAS {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many schemas in publication"
+                ));
+            }
+            for schema in &schema_members[..schemas.len()] {
+                if definition.schemas[..definition.schema_count].contains(schema) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "schema is already in publication \"{}\"",
+                        name
+                    ));
+                }
+                definition.schemas[definition.schema_count] = *schema;
+                definition.schema_count += 1;
+            }
         }
-        crate::sql::ast::AlterPublicationAction::DropTables(tables) => {
+        crate::sql::ast::AlterPublicationAction::DropTargets { tables, schemas } => {
             if current.all_tables {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -5255,6 +5473,27 @@ pub fn alter_publication(
                 definition.table_count -= 1;
                 definition.tables[definition.table_count] = u16::MAX;
             }
+            let schema_members = match publication_schemas(storage, txn.txid, schemas) {
+                Ok(schemas) => schemas,
+                Err(error) => return sql_fail(error),
+            };
+            for schema in &schema_members[..schemas.len()] {
+                let Some(index) = definition.schemas[..definition.schema_count]
+                    .iter()
+                    .position(|member| member == schema)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "schema is not part of publication \"{}\"",
+                        name
+                    ));
+                };
+                definition
+                    .schemas
+                    .copy_within(index + 1..definition.schema_count, index);
+                definition.schema_count -= 1;
+                definition.schemas[definition.schema_count] = u8::MAX;
+            }
         }
     }
     let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
@@ -5270,6 +5509,8 @@ pub fn alter_publication(
             all_tables: definition.all_tables,
             tables: definition.tables,
             table_count: definition.table_count,
+            schemas: definition.schemas,
+            schema_count: definition.schema_count,
             publish_insert: definition.publish_insert,
             publish_update: definition.publish_update,
             publish_delete: definition.publish_delete,

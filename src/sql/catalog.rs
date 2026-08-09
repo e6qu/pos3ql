@@ -253,19 +253,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_publication") => pg_publication(storage, txid, arena),
-        (false, "pg_publication_namespace") => finish(
-            def_of(
-                "pg_publication_namespace",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("pnpubid", ColType::Int4),
-                    ("pnnspid", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_publication_namespace") => pg_publication_namespace(storage, txid, arena),
         (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
         (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
         (false, "pg_subscription") => finish(
@@ -2452,8 +2440,10 @@ fn pg_publication<'a>(
             &[
                 Datum::Int4(6104),
                 Datum::Int4(publication_oid(slot)),
-                text(publication.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(publication.ownership.owner as usize)),
+                text(publication.name_for(txid).as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(
+                    publication.ownership.owner_to(txid) as usize
+                )),
                 Datum::Bool(definition.all_tables),
                 Datum::Bool(definition.publish_insert),
                 Datum::Bool(definition.publish_update),
@@ -2465,6 +2455,49 @@ fn pg_publication<'a>(
             arena,
         )?;
         count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_publication_namespace<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_publication_namespace",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("pnpubid", ColType::Int4),
+            ("pnnspid", ColType::Int4),
+        ],
+    );
+    let mut rows: [&[Datum]; crate::storage::MAX_SCHEMAS * 256] =
+        [&[]; crate::storage::MAX_SCHEMAS * 256];
+    let mut count = 0;
+    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+        let publication_definition = publication.definition_for(txid);
+        for schema_slot in &publication_definition.schemas[..publication_definition.schema_count] {
+            if count == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_publication_namespace exceeds {} rows",
+                    rows.len()
+                ));
+            }
+            let schema = storage.schema_def(*schema_slot as usize);
+            rows[count] = row(
+                &[
+                    Datum::Int4(6105),
+                    Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
+                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
     }
     finish(definition, &rows[..count], arena)
 }

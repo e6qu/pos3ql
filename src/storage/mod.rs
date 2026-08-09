@@ -1501,9 +1501,12 @@ impl ViewDef {
 pub struct PublicationDef {
     pub created_at: u64,
     pub name: SqlName,
+    pending_name: Option<PendingPublicationName>,
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
     pub table_count: usize,
+    pub schemas: [u8; MAX_SCHEMAS],
+    pub schema_count: usize,
     pub publish_insert: bool,
     pub publish_update: bool,
     pub publish_delete: bool,
@@ -1521,6 +1524,8 @@ pub(crate) struct PublicationDefinition {
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
     pub table_count: usize,
+    pub schemas: [u8; MAX_SCHEMAS],
+    pub schema_count: usize,
     pub publish_insert: bool,
     pub publish_update: bool,
     pub publish_delete: bool,
@@ -1531,6 +1536,12 @@ pub(crate) struct PublicationDefinition {
 pub(crate) struct PendingPublicationDefinition {
     pub txid: u32,
     pub definition: PublicationDefinition,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingPublicationName {
+    pub txid: u32,
+    pub name: SqlName,
 }
 
 /// The exact state an ALTER replaced.  Undo restores this value on both full
@@ -1549,6 +1560,7 @@ pub struct PublicationSpec<'a> {
     pub name: SqlName,
     pub all_tables: bool,
     pub tables: &'a [u16],
+    pub schemas: &'a [u8],
     pub publish_insert: bool,
     pub publish_update: bool,
     pub publish_delete: bool,
@@ -1593,6 +1605,8 @@ impl PublicationDef {
             all_tables: self.all_tables,
             tables: self.tables,
             table_count: self.table_count,
+            schemas: self.schemas,
+            schema_count: self.schema_count,
             publish_insert: self.publish_insert,
             publish_update: self.publish_update,
             publish_delete: self.publish_delete,
@@ -1600,10 +1614,18 @@ impl PublicationDef {
         }
     }
 
+    pub(crate) fn name_for(&self, txid: u32) -> SqlName {
+        self.pending_name
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+
     fn set_definition(&mut self, definition: PublicationDefinition) {
         self.all_tables = definition.all_tables;
         self.tables = definition.tables;
         self.table_count = definition.table_count;
+        self.schemas = definition.schemas;
+        self.schema_count = definition.schema_count;
         self.publish_insert = definition.publish_insert;
         self.publish_update = definition.publish_update;
         self.publish_delete = definition.publish_delete;
@@ -3193,9 +3215,12 @@ impl Storage {
                 .push(PublicationDef {
                     created_at: 0,
                     name: SqlName::parse("").expect("empty name fits"),
+                    pending_name: None,
                     all_tables: false,
                     tables: [u16::MAX; MAX_PUBLICATION_TABLES],
                     table_count: 0,
+                    schemas: [u8::MAX; MAX_SCHEMAS],
+                    schema_count: 0,
                     publish_insert: true,
                     publish_update: true,
                     publish_delete: true,
@@ -9127,9 +9152,125 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, publication)| {
-                (publication.visible_to(txid) && publication.name.as_str() == name)
+                (publication.visible_to(txid) && publication.name_for(txid).as_str() == name)
                     .then_some((slot, publication.definition_for(txid)))
             })
+    }
+
+    pub(crate) fn publication_owner(&self, slot: usize, txid: u32) -> u16 {
+        self.publications[slot].ownership.owner_to(txid)
+    }
+
+    pub(crate) fn restore_publication_owner(&mut self, slot: usize, owner: u16) {
+        self.publications[slot].ownership = Ownership {
+            owner,
+            pending: None,
+        };
+    }
+
+    pub(crate) fn set_publication_owner(
+        &mut self,
+        slot: usize,
+        owner: usize,
+        txid: u32,
+    ) -> Option<PendingOwnership> {
+        let ownership = &mut self.publications[slot].ownership;
+        let prior = ownership.pending;
+        ownership.pending = Some(PendingOwnership {
+            txid,
+            owner: owner as u16,
+        });
+        prior
+    }
+
+    pub(crate) fn restore_publication_owner_pending(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingOwnership>,
+    ) {
+        self.publications[slot].ownership.pending = prior;
+    }
+
+    pub(crate) fn rename_publication(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingPublicationName>, SqlError> {
+        if self
+            .publications
+            .iter()
+            .enumerate()
+            .any(|(other_slot, publication)| {
+                other_slot != slot
+                    && publication.visible_to(txid)
+                    && publication.name_for(txid) == name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "publication \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if let Some(blocker) =
+            self.publications
+                .iter()
+                .enumerate()
+                .find_map(|(other_slot, publication)| {
+                    (other_slot != slot)
+                        .then_some(publication.pending_name)
+                        .flatten()
+                        .filter(|pending| pending.name == name && pending.txid != txid)
+                        .map(|pending| pending.txid)
+                })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let publication = &mut self.publications[slot];
+        if let Some(pending) = publication.pending_name
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "publication \"{}\" is being renamed by another transaction",
+                publication.name.as_str()
+            ));
+        }
+        let prior = publication.pending_name;
+        publication.pending_name = Some(PendingPublicationName { txid, name });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_publication_rename(&mut self, slot: usize, txid: u32) {
+        let publication = &mut self.publications[slot];
+        if let Some(pending) = publication.pending_name
+            && pending.txid == txid
+        {
+            publication.name = pending.name;
+            publication.pending_name = None;
+        }
+    }
+
+    pub(crate) fn rollback_publication_rename(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingPublicationName>,
+    ) {
+        self.publications[slot].pending_name = prior;
+    }
+
+    pub(crate) fn publication_selecting_schema(
+        &self,
+        schema: u8,
+        txid: u32,
+    ) -> Option<(SqlName, PublicationDefinition)> {
+        self.publications.iter().find_map(|publication| {
+            let definition = publication.definition_for(txid);
+            (publication.visible_to(txid)
+                && definition.schemas[..definition.schema_count].contains(&schema))
+            .then_some((publication.name_for(txid), definition))
+        })
     }
 
     pub(crate) fn require_publication_owner(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -9347,23 +9488,36 @@ impl Storage {
                 MAX_PUBLICATION_TABLES
             ));
         }
+        if spec.schemas.len() > MAX_SCHEMAS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many schemas in publication (limit {})",
+                MAX_SCHEMAS
+            ));
+        }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.name == spec.name)
+            (publication.name_for(txid) == spec.name)
                 .then_some(publication.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
-        if self
-            .publications
-            .iter()
-            .any(|publication| publication.visible_to(txid) && publication.name == spec.name)
-        {
+        if self.publications.iter().any(|publication| {
+            publication.visible_to(txid) && publication.name_for(txid) == spec.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "publication \"{}\" already exists",
                 spec.name.as_str()
             ));
+        }
+        if let Some(blocker) = self.publications.iter().find_map(|publication| {
+            publication
+                .pending_name
+                .filter(|pending| pending.name == spec.name && pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
         let Some(slot) = self
             .publications
@@ -9378,13 +9532,18 @@ impl Storage {
         };
         let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
         members[..spec.tables.len()].copy_from_slice(spec.tables);
+        let mut schemas = [u8::MAX; MAX_SCHEMAS];
+        schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
         self.publications[slot] = PublicationDef {
             created_at: self.catalog_seq,
             name: spec.name,
+            pending_name: None,
             all_tables: spec.all_tables,
             tables: members,
             table_count: spec.tables.len(),
+            schemas,
+            schema_count: spec.schemas.len(),
             publish_insert: spec.publish_insert,
             publish_update: spec.publish_update,
             publish_delete: spec.publish_delete,
@@ -9405,7 +9564,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.visible_to(txid) && publication.name.as_str() == name
+            publication.visible_to(txid) && publication.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };

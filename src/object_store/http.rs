@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn chunked_bodies_decode() {
         // Two data chunks (with an extension on the first size line), a zero
-        // chunk, and a trailer — the shape MinIO/GCS actually send.
+        // chunk, and a trailer — the portable HTTP framing clients must accept.
         let (port, server) = mock_server(
             "HTTP/1.1 200 OK\r\netag: \"chunked\"\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: t\r\n\r\n",
             |_| {},

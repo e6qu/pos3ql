@@ -39,6 +39,11 @@ const MAX_CACHED: usize = 64;
 /// Installed zone names the startup catalog can hold.
 const MAX_CATALOG: usize = 1024;
 
+/// A cache entry returned only after a TZif zone has been parsed and retained.
+/// Its index is private so a caller cannot manufacture a stale zone state.
+#[derive(Clone, Copy, Debug)]
+pub struct TzifSlot(u16);
+
 /// One local-time type: offset east of UTC and its abbreviation.
 #[derive(Clone, Copy)]
 struct TypeInfo {
@@ -185,16 +190,16 @@ fn canonical_name(name: &str) -> Option<StackStr<48>> {
     })
 }
 
-/// Loads (or finds cached) the zone named `name`, returning its cache slot.
+/// Loads (or finds cached) the zone named `name`, returning its retained slot.
 /// `None` when the name is not an installed zone or its file fails to parse.
-pub fn load(name: &str) -> Option<u16> {
+pub fn load(name: &str) -> Option<TzifSlot> {
     let canonical = canonical_name(name)?;
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let cache = cache.as_mut()?;
         for i in 0..cache.n {
             if cache.names[i].as_str() == canonical.as_str() {
-                return Some(i as u16);
+                return Some(TzifSlot(i as u16));
             }
         }
         if cache.n == MAX_CACHED {
@@ -229,22 +234,22 @@ pub fn load(name: &str) -> Option<u16> {
         }
         cache.names[slot] = canonical;
         cache.n += 1;
-        Some(slot as u16)
+        Some(TzifSlot(slot as u16))
     })
 }
 
 /// The offset (seconds east) and abbreviation zone `slot` has at `utc`
-/// (microseconds since 2000). Falls back to UTC on a stale slot, which cannot
-/// occur while the cache never evicts.
-pub fn resolve(slot: u16, utc_micros: i64) -> (i32, StackStr<8>) {
+/// (microseconds since 2000).
+pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
     CACHE.with(|cache| {
         let cache = cache.borrow();
-        let Some(cache) = cache.as_ref() else {
-            return (0, utc_abbrev());
-        };
-        let Some(zone) = cache.zones.get(slot as usize) else {
-            return (0, utc_abbrev());
-        };
+        let cache = cache
+            .as_ref()
+            .expect("a TZif slot requires the initialized cache");
+        let zone = cache
+            .zones
+            .get(slot.0 as usize)
+            .expect("a TZif slot is retained for the server lifetime");
         let unix = utc_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
         let n = zone.n_transitions;
         if n == 0 || unix < zone.times[0] {
@@ -261,12 +266,6 @@ pub fn resolve(slot: u16, utc_micros: i64) -> (i32, StackStr<8>) {
         let t = zone.types[zone.type_after[i] as usize];
         (t.utoff, t.abbrev)
     })
-}
-
-fn utc_abbrev() -> StackStr<8> {
-    let mut s = StackStr::new();
-    let _ = write!(s, "UTC");
-    s
 }
 
 /// Parses a TZif file (RFC 8536): the version-1 block is skipped when a
@@ -412,7 +411,7 @@ mod tests {
         (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * 86_400_000_000 + h * 3_600_000_000
     }
 
-    fn load_or_skip(name: &str) -> Option<u16> {
+    fn load_or_skip(name: &str) -> Option<TzifSlot> {
         init_catalog();
         load(name)
     }

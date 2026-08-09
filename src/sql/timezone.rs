@@ -49,7 +49,7 @@ pub struct PosixZone {
 #[derive(Debug, Clone, Copy)]
 pub enum Timezone {
     Posix(PosixZone),
-    Tzif(u16),
+    Tzif(super::tzif::TzifSlot),
 }
 
 use core::cell::Cell;

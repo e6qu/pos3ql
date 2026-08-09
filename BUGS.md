@@ -1,6 +1,6 @@
 # Known bugs
 
-There are no known unresolved bugs. Last reviewed: 2026-08-09; object-store recovery, cancellation framing, garbage collection, binary cursor framing, catalog-aware decoding, binary record input, array/composite wire fidelity, network value construction, generated SQL, catalog metadata, ACL introspection, typed column-default execution, login verification states, and allocation-free publication parsing were audited.
+There are no known unresolved bugs. Last reviewed: 2026-08-09; object-store recovery, cancellation framing, garbage collection, binary cursor framing, catalog-aware decoding, binary record input, array/composite wire fidelity, network value construction, generated SQL, catalog metadata, ACL introspection, typed column-default execution, login verification states, allocation-free publication parsing, and retained TZif cache states were audited.
 
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 

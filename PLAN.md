@@ -32,7 +32,7 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 
 ## Current invariants
 
-- Catalog identity and DDL visibility are atomic typed states.
+- Catalog identity, DDL visibility, and retained TZif cache entries are atomic typed states.
 - Checksums, immutable blocks, and CAS manifests make cache loss recoverable.
 - Cancellation keys are parsed as protocol-versioned values: v3.0 uses four bytes and v3.2 uses the full issued key.
 - Network values are constructed only from a valid address family, mask, and canonical address bytes; `cidr` additionally requires host bits clear.

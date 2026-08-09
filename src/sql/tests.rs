@@ -1462,7 +1462,16 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .domain_slot("public", "binary_positive", 0)
             .unwrap() as u16,
     );
+    let transaction = TxnState::new(&mut budget, 64).unwrap();
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
+
+    let inferred = engine.infer_param_types(
+        "SELECT $1::record",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
     assert_eq!(
         engine
@@ -1477,6 +1486,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .unwrap()
             .to_string(),
         "7"
+    );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "wire text"
     );
     let invalid_enum = engine
         .decode_binary_parameter(enum_oid, b"missing", &arena, 0)
@@ -1567,6 +1583,46 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         )
         .unwrap_err();
     assert_eq!(wrong_element_oid.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    domain_array[8..12].copy_from_slice(&domain_oid.to_be_bytes());
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&4_i32.to_be_bytes());
+    for (field_oid, value) in [
+        (enum_oid, b"ready".as_slice()),
+        (domain_oid, &7_i32.to_be_bytes()),
+        (
+            crate::sql::types::oid::domain_array_oid(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_positive", 0)
+                    .unwrap() as u16,
+            ),
+            domain_array.as_slice(),
+        ),
+        (crate::sql::types::oid::UNKNOWN, b"wire text".as_slice()),
+    ] {
+        record.extend_from_slice(&field_oid.to_be_bytes());
+        record.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        record.extend_from_slice(value);
+    }
+    let record_value = engine
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .unwrap();
+    let Datum::Record(fields) = record_value else {
+        panic!("binary record must decode as a record")
+    };
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.value.to_string())
+            .collect::<Vec<_>>(),
+        ["ready", "7", "{3,5}", "wire text"]
+    );
+    record[25..29].copy_from_slice(&(-1_i32).to_be_bytes());
+    let invalid_record = engine
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_record.sqlstate, sqlstate::CHECK_VIOLATION);
     let missing_type = engine
         .decode_binary_parameter(crate::sql::types::oid::enum_oid(31), b"ready", &arena, 0)
         .unwrap_err();
@@ -14372,6 +14428,62 @@ fn copy_formats_and_unsupported() {
 }
 
 #[test]
+fn arrays_of_array_domains_preserve_the_domain_element_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN integer_vector AS integer[]; \
+         CREATE TABLE array_domain_values (values integer_vector[]); \
+         INSERT INTO array_domain_values VALUES (ARRAY[ARRAY[3, 4]::integer_vector]); \
+         SELECT values::text FROM array_domain_values",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{\"{3,4}\"}"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let slot = engine
+        .storage
+        .domain_slot("public", "integer_vector", 0)
+        .unwrap() as u16;
+    let domain_oid = crate::sql::types::oid::domain_oid(slot);
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&1_i32.to_be_bytes());
+    inner.extend_from_slice(&0_i32.to_be_bytes());
+    inner.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+    inner.extend_from_slice(&2_i32.to_be_bytes());
+    inner.extend_from_slice(&1_i32.to_be_bytes());
+    for value in [3_i32, 4_i32] {
+        inner.extend_from_slice(&4_i32.to_be_bytes());
+        inner.extend_from_slice(&value.to_be_bytes());
+    }
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&1_i32.to_be_bytes());
+    outer.extend_from_slice(&0_i32.to_be_bytes());
+    outer.extend_from_slice(&domain_oid.to_be_bytes());
+    outer.extend_from_slice(&1_i32.to_be_bytes());
+    outer.extend_from_slice(&1_i32.to_be_bytes());
+    outer.extend_from_slice(&(inner.len() as i32).to_be_bytes());
+    outer.extend_from_slice(&inner);
+    let arena = Arena::new(&mut budget, "nested domain binary", 1 << 18).unwrap();
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::domain_array_oid(slot),
+                &outer,
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{\"{3,4}\"}"
+    );
+}
+
+#[test]
 fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -14430,6 +14542,53 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
         String::from_utf8_lossy(&rejected).contains("428C9"),
         "COPY targeting a generated column must fail at setup"
     );
+}
+
+#[test]
+fn binary_copy_rows_reject_malformed_frames_without_panicking() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE binary_copy_frame (value integer)",
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "binary copy send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "binary copy sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY binary_copy_frame FROM STDIN (FORMAT binary)",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters binary streaming mode");
+    arena.reset();
+
+    for frame in [
+        &[0, 1, 0, 0, 0][..],            // truncated field length
+        &[0, 1, 255, 255, 255, 254][..], // field length below -1
+        &[0, 1, 0, 0, 0, 0, 0][..],      // trailing byte after an empty field
+    ] {
+        let error = engine
+            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, frame)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    }
 }
 
 #[test]

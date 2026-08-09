@@ -497,6 +497,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         super::exec::coerce_enum_value(value, slot as u16, self.storage, arena).map(Some)
     }
 
+    fn array_domain_element(&self, type_name: &str) -> Option<super::types::ArrElem> {
+        let slot = self.storage.resolve_domain_slot(type_name, self.txid)?;
+        let domain = self.storage.domain(slot);
+        matches!(domain.base, super::types::ColType::Array(_))
+            .then(|| super::types::ArrElem::domain(slot as u16, domain.base))?
+    }
+
     fn user_array_name<'a>(
         &self,
         element: super::types::ArrElem,

@@ -9310,7 +9310,9 @@ pub fn copy_row_binary(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let def = *storage.table_def(setup.table_index, txn.txid);
-    let count = i16::from_be_bytes([row[0], row[1]]);
+    let malformed = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid COPY binary row");
+    let mut reader = crate::pg::wire::MsgIn::new(row);
+    let count = reader.i16().map_err(|_| malformed())?;
     if count < 0 || count as usize != setup.n_targets {
         return Err(sql_err!(
             sqlstate::BAD_COPY_FILE_FORMAT,
@@ -9324,22 +9326,25 @@ pub fn copy_row_binary(
     let generated_exprs = parse_generated(&def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
-    let mut at = 2usize;
     for i in 0..setup.n_targets {
-        let flen = i32::from_be_bytes([row[at], row[at + 1], row[at + 2], row[at + 3]]);
-        at += 4;
+        let field_len = reader.i32().map_err(|_| malformed())?;
+        if field_len < -1 {
+            return Err(malformed());
+        }
         let col_index = setup.targets[i];
         let col = def.columns()[col_index];
-        values[col_index] = if flen == -1 {
+        values[col_index] = if field_len == -1 {
             Datum::Null
         } else {
-            let field = &row[at..at + flen as usize];
-            at += flen as usize;
+            let field = reader.take(field_len as usize).map_err(|_| malformed())?;
             let decoded =
                 decode_binary_field_with_catalog(col.ctype, field, arena, storage, txn.txid)?;
             coerce(decoded, &col, storage, arena)?
         };
         explicit[col_index] = true;
+    }
+    if !reader.done() {
+        return Err(malformed());
     }
     fill_omitted_defaults(
         storage,
@@ -9411,6 +9416,127 @@ pub(crate) fn decode_binary_field_with_catalog<'a>(
         arena,
         BinaryDecodeContext::Catalog { storage, txid },
     )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BinaryInputType {
+    Builtin(ColType),
+    Domain { slot: usize, base: ColType },
+    DomainArray(crate::sql::types::ArrElem),
+}
+
+pub(crate) fn resolve_binary_input_type(
+    storage: &Storage,
+    oid: i32,
+    txid: u32,
+) -> Result<BinaryInputType, SqlError> {
+    use crate::sql::types::oid as oids;
+
+    let unknown_type = || {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "binary parameter type OID {} does not exist",
+            oid
+        )
+    };
+    if oid == 0 || oid == oids::UNKNOWN {
+        return Ok(BinaryInputType::Builtin(ColType::Text));
+    }
+    let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
+    if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32).contains(&oid)
+    {
+        let domain = storage.domain(domain_slot);
+        if !domain.visible_to(txid) {
+            return Err(unknown_type());
+        }
+        return Ok(BinaryInputType::Domain {
+            slot: domain_slot,
+            base: domain.base,
+        });
+    }
+    let domain_array_slot = (oid - oids::FIRST_DOMAIN_ARRAY) as usize;
+    if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        let domain = storage.domain(domain_array_slot);
+        if !domain.visible_to(txid) {
+            return Err(unknown_type());
+        }
+        let element = crate::sql::types::ArrElem::domain(domain_array_slot as u16, domain.base)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "binary input of an array-valued domain is not supported"
+                )
+            })?;
+        return Ok(BinaryInputType::DomainArray(element));
+    }
+    let ctype = ColType::from_oid(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "binary format for parameter type OID {} is not implemented",
+            oid
+        )
+    })?;
+    match ctype {
+        ColType::Enum(slot) | ColType::Array(crate::sql::types::ArrElem::Enum(slot))
+            if slot as usize >= storage.enum_count()
+                || !storage.enum_def(slot as usize).visible_to(txid) =>
+        {
+            Err(unknown_type())
+        }
+        _ => Ok(BinaryInputType::Builtin(ctype)),
+    }
+}
+
+pub(crate) fn decode_binary_input<'a>(
+    storage: &Storage,
+    oid: i32,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    txid: u32,
+) -> Result<Datum<'a>, SqlError> {
+    match resolve_binary_input_type(storage, oid, txid)? {
+        BinaryInputType::Builtin(ctype) => {
+            decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid)
+        }
+        BinaryInputType::Domain { slot, base } => {
+            let value = decode_binary_field_with_catalog(base, bytes, arena, storage, txid)?;
+            coerce_domain_value(
+                storage,
+                slot,
+                value,
+                txid,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            )
+        }
+        BinaryInputType::DomainArray(element) => {
+            decode_binary_field_with_catalog(ColType::Array(element), bytes, arena, storage, txid)
+        }
+    }
+}
+
+pub(crate) fn coerce_binary_input_null<'a>(
+    storage: &Storage,
+    oid: i32,
+    arena: &'a Arena,
+    txid: u32,
+) -> Result<Datum<'a>, SqlError> {
+    if oid == 0 {
+        return Ok(Datum::Null);
+    }
+    match resolve_binary_input_type(storage, oid, txid)? {
+        BinaryInputType::Domain { slot, .. } => coerce_domain_value(
+            storage,
+            slot,
+            Datum::Null,
+            txid,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+        ),
+        BinaryInputType::Builtin(_) | BinaryInputType::DomainArray(_) => Ok(Datum::Null),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -9525,14 +9651,31 @@ fn decode_binary_record<'a>(
             Datum::Null
         } else {
             let bytes = reader.take(length as usize).map_err(|_| bad())?;
-            let field_type = ColType::from_oid(type_oid).ok_or_else(bad)?;
-            decode_binary_field_with_context(field_type, bytes, arena, context)?
+            decode_binary_field_by_oid(type_oid, bytes, arena, context)?
         };
     }
     if !reader.done() {
         return Err(bad());
     }
     Ok(Datum::Record(fields))
+}
+
+/// Decodes a record field whose PostgreSQL OID is carried in the record's
+/// binary body. Catalog-defined domain identities need their constraints
+/// applied here; treating their underlying type as the field type would make
+/// a malformed binary Bind bypass the domain boundary.
+fn decode_binary_field_by_oid<'a>(
+    oid: i32,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    context: BinaryDecodeContext<'_>,
+) -> Result<Datum<'a>, SqlError> {
+    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary record");
+    if let BinaryDecodeContext::Catalog { storage, txid } = context {
+        return decode_binary_input(storage, oid, bytes, arena, txid);
+    }
+    let ctype = ColType::from_oid(oid).ok_or_else(bad)?;
+    decode_binary_field_with_context(ctype, bytes, arena, context)
 }
 
 /// Decodes PostgreSQL's `int2vector` send format. It is an `int2` array on

@@ -551,6 +551,15 @@ def binary_array(element_oid, values):
     return body
 
 
+def binary_record(fields):
+    body = struct.pack("!i", len(fields))
+    for field_oid, value in fields:
+        body += struct.pack("!ii", field_oid, -1 if value is None else len(value))
+        if value is not None:
+            body += value
+    return body
+
+
 def extended_binary_parameter(s, text, oid, value):
     parse = frontend_message(
         b"P", b"\x00" + text.encode() + b"\x00" + struct.pack("!hi", 1, oid)
@@ -590,6 +599,7 @@ def test_catalog_aware_binary_bind_parameters():
         s,
         "CREATE TYPE wire_binary_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
+        "CREATE DOMAIN wire_binary_vector AS integer[]; "
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL",
     )
 
@@ -597,10 +607,13 @@ def test_catalog_aware_binary_bind_parameters():
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_positive'")))
     enum_array_oid = 160000 + enum_oid - 120000
     domain_array_oid = 150000 + domain_oid - 110000
+    vector_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_vector'")))
+    vector_array_oid = 150000 + vector_oid - 110000
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
     cases = [
+        ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
         (
@@ -617,6 +630,14 @@ def test_catalog_aware_binary_bind_parameters():
             domain_array_oid,
             binary_array(domain_oid, [struct.pack("!i", 3), struct.pack("!i", 5)]),
             "{3,5}",
+            None,
+        ),
+        (
+            "array-valued domain array",
+            "SELECT $1::wire_binary_vector[]",
+            vector_array_oid,
+            binary_array(vector_oid, [binary_array(23, [struct.pack("!i", 3), struct.pack("!i", 4)])]),
+            '{"{3,4}"}',
             None,
         ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),
@@ -652,6 +673,32 @@ def test_catalog_aware_binary_bind_parameters():
                 has_sqlstate(messages, state),
                 messages,
             )
+    record = binary_record(
+        [
+            (enum_oid, b"ready"),
+            (domain_oid, struct.pack("!i", 7)),
+            (domain_array_oid, binary_array(domain_oid, [struct.pack("!i", 3), struct.pack("!i", 5)])),
+            (705, b"wire text"),
+        ]
+    )
+    messages = extended_binary_parameter(s, "SELECT $1::record", 2249, record)
+    check(
+        "binary Bind record resolves nested catalog field types",
+        first_text_row(messages) == '(ready,7,"{3,5}","wire text")',
+        messages,
+    )
+    invalid_record = binary_record(
+        [
+            (enum_oid, b"ready"),
+            (domain_oid, struct.pack("!i", -1)),
+        ]
+    )
+    messages = extended_binary_parameter(s, "SELECT $1::record", 2249, invalid_record)
+    check(
+        "binary Bind record enforces nested domain constraints",
+        has_sqlstate(messages, "23514"),
+        messages,
+    )
     s.close()
 
 

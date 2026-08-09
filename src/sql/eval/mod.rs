@@ -497,6 +497,13 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
+    /// An array element identity for a domain whose base is itself an array.
+    /// This is distinct from PostgreSQL's ordinary multidimensional constructor:
+    /// `ARRAY[array_domain_value]` is an array of domain values, not one
+    /// flattened base array.
+    fn array_domain_element(&self, _type_name: &str) -> Option<crate::sql::types::ArrElem> {
+        None
+    }
     /// The SQL name of a user-defined array element identity, for
     /// `pg_typeof`. Built-in arrays do not consult the catalog.
     fn user_array_name<'a>(
@@ -1416,6 +1423,40 @@ pub fn eval_full<'a>(
                     element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
                 }
                 vals[i] = v;
+            }
+            let array_domain_type = items.first().and_then(|expression| {
+                let Expr::Cast { type_name, .. } = expression else {
+                    return None;
+                };
+                hooks.catalog.and_then(|catalog| {
+                    catalog
+                        .array_domain_element(type_name)
+                        .map(|element| (type_name, element))
+                })
+            });
+            if let Some((type_name, element)) = array_domain_type {
+                if vals[..items.len()]
+                    .iter()
+                    .any(|value| !value.is_null() && !matches!(value, Datum::Array { .. }))
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "ARRAY could not convert type to {}",
+                        element.array_name()
+                    ));
+                }
+                let catalog = hooks
+                    .catalog
+                    .expect("domain array identity requires catalog");
+                for value in vals.iter_mut().take(items.len()) {
+                    *value = catalog
+                        .cast_user_type(type_name, *value, arena)?
+                        .expect("domain array identity resolves a live domain");
+                }
+                return Ok(Datum::Array {
+                    element,
+                    raw: super::array::build(&vals[..items.len()], arena)?,
+                });
             }
             if let Some(Datum::Array { element, raw }) = vals.first().copied() {
                 let child = super::array::shape(raw).expect("array datum invariant");

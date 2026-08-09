@@ -3102,9 +3102,11 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Float8(f64::from_be_bytes(b)))
         }
-        oids::TEXT | oids::NAME | oids::VARCHAR | oids::BPCHAR | 0 => core::str::from_utf8(bytes)
-            .map(Datum::Text)
-            .map_err(|_| "invalid UTF-8 in binary text parameter"),
+        oids::TEXT | oids::NAME | oids::VARCHAR | oids::BPCHAR | oids::UNKNOWN | 0 => {
+            core::str::from_utf8(bytes)
+                .map(Datum::Text)
+                .map_err(|_| "invalid UTF-8 in binary text parameter")
+        }
         oids::DATE => {
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Date(i32::from_be_bytes(b)))

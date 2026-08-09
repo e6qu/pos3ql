@@ -11551,6 +11551,19 @@ fn publication_owner_changes_are_transactional_and_durable() {
             "publication_owner_changes"
         ]
     );
+    let renamed_then_altered = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER PUBLICATION publication_owner_changes RENAME TO publication_owner_changes_renamed; \
+         ALTER PUBLICATION publication_owner_changes_renamed SET (publish = 'insert'); \
+         ALTER PUBLICATION publication_owner_changes_renamed OWNER TO publication_second_owner; \
+         ROLLBACK",
+    );
+    assert!(
+        !String::from_utf8_lossy(&renamed_then_altered).contains("ERROR"),
+        "one transaction must be able to continue using its renamed identity: {}",
+        String::from_utf8_lossy(&renamed_then_altered)
+    );
     run_with(
         &mut engine,
         &mut budget,
@@ -11571,6 +11584,49 @@ fn publication_owner_changes_are_transactional_and_durable() {
         ["publication_second_owner"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn publication_rename_blocks_conflicting_catalog_changes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_rename_source (id integer); \
+         CREATE PUBLICATION publication_rename_guard FOR TABLE publication_rename_source",
+    );
+    let mut renamer = TxnState::new(&mut budget, 256).unwrap();
+    let mut contender = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut renamer, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut renamer,
+        "ALTER PUBLICATION publication_rename_guard RENAME TO publication_rename_guard_new",
+    );
+    run_txn(&mut engine, &mut budget, &mut contender, "BEGIN");
+    let blocked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut contender,
+        "ALTER PUBLICATION publication_rename_guard SET (publish = 'insert')",
+    );
+    assert!(
+        blocked.is_empty(),
+        "a concurrent change waits rather than using a publication's pre-rename identity: {blocked}"
+    );
+    run_txn(&mut engine, &mut budget, &mut renamer, "ROLLBACK");
+    let resumed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut contender,
+        "ALTER PUBLICATION publication_rename_guard SET (publish = 'insert')",
+    );
+    assert!(
+        resumed.contains("ALTER PUBLICATION"),
+        "the waiting change rechecks the rolled-back rename: {resumed}"
+    );
+    run_txn(&mut engine, &mut budget, &mut contender, "ROLLBACK");
 }
 
 #[test]

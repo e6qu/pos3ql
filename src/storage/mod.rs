@@ -9173,14 +9173,15 @@ impl Storage {
         slot: usize,
         owner: usize,
         txid: u32,
-    ) -> Option<PendingOwnership> {
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.ensure_publication_changeable(slot, txid)?;
         let ownership = &mut self.publications[slot].ownership;
         let prior = ownership.pending;
         ownership.pending = Some(PendingOwnership {
             txid,
             owner: owner as u16,
         });
-        prior
+        Ok(prior)
     }
 
     pub(crate) fn restore_publication_owner_pending(
@@ -9197,6 +9198,7 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingPublicationName>, SqlError> {
+        self.ensure_publication_changeable(slot, txid)?;
         if self
             .publications
             .iter()
@@ -9556,18 +9558,12 @@ impl Storage {
     }
 
     pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.name.as_str() == name)
-                .then_some(publication.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
         let Some(slot) = self.publications.iter().position(|publication| {
             publication.visible_to(txid) && publication.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
+        self.ensure_publication_changeable(slot, txid)?;
         let publication = &mut self.publications[slot];
         publication.ddl_state = publication.ddl_state.drop_by(txid);
         Ok(Some(slot))
@@ -9603,7 +9599,7 @@ impl Storage {
             ));
         }
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.visible_to(txid) && publication.name.as_str() == name
+            publication.visible_to(txid) && publication.name_for(txid).as_str() == name
         }) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -9611,16 +9607,8 @@ impl Storage {
                 name
             ));
         };
+        self.ensure_publication_changeable(slot, txid)?;
         let publication = &mut self.publications[slot];
-        if let Some(pending) = publication.pending_definition
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "publication \"{}\" is being altered by another transaction",
-                name
-            ));
-        }
         if matches!(publication.ddl_state, CatalogDdlState::PendingCreate { txid: owner } if owner == txid)
         {
             let prior = publication.definition();
@@ -9630,6 +9618,21 @@ impl Storage {
         let prior = publication.pending_definition;
         publication.pending_definition = Some(PendingPublicationDefinition { txid, definition });
         Ok((slot, PublicationAlteration::Committed(prior)))
+    }
+
+    fn ensure_publication_changeable(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let publication = &self.publications[slot];
+        let blocker = publication
+            .ddl_state
+            .pending_txid()
+            .or_else(|| publication.pending_definition.map(|pending| pending.txid))
+            .or_else(|| publication.pending_name.map(|pending| pending.txid))
+            .or_else(|| publication.ownership.pending.map(|pending| pending.txid))
+            .filter(|owner| *owner != txid);
+        if let Some(blocker) = blocker {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, publication.name.as_str()));
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_publication_alter(&mut self, slot: usize, txid: u32) {

@@ -5343,7 +5343,10 @@ pub fn alter_publication(
                     "new owner of a schema or all-tables publication must be superuser"
                 ));
             }
-            let prior = storage.set_publication_owner(slot, new_owner, txn.txid);
+            let prior = match storage.set_publication_owner(slot, new_owner, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage(
                 txn.txid,

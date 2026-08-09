@@ -5463,18 +5463,14 @@ fn info_column_row<'a>(
             } else {
                 Datum::Null
             },
-            if identity {
-                text(
-                    if identity_cycle.expect("identity has a sequence") {
-                        "YES"
-                    } else {
-                        "NO"
-                    },
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
+            text(
+                if identity_cycle == Some(true) {
+                    "YES"
+                } else {
+                    "NO"
+                },
+                arena,
+            )?,
             text(if generated { "ALWAYS" } else { "NEVER" }, arena)?,
             generated_expression,
             text(if updatable { "YES" } else { "NO" }, arena)?,

@@ -2447,13 +2447,13 @@ fn information_schema_columns_exposes_complete_column_metadata() {
              ORDER BY ordinal_position",
         )),
         [
-            "code|12|NULL|NULL|NULL|NULL|character varying|NULL|pg_catalog|varchar|NO|NULL|NULL|NULL|NULL|NEVER|1|YES",
-            "amount|NULL|9|10|3|NULL|numeric|NULL|pg_catalog|numeric|NO|NULL|NULL|NULL|NULL|NEVER|2|YES",
-            "occurred|NULL|NULL|NULL|NULL|2|timestamp without time zone|NULL|pg_catalog|timestamp|NO|NULL|NULL|NULL|NULL|NEVER|3|YES",
-            "generated|NULL|32|2|0|NULL|integer|NULL|pg_catalog|int4|NO|NULL|NULL|NULL|NULL|ALWAYS|4|YES",
+            "code|12|NULL|NULL|NULL|NULL|character varying|NULL|pg_catalog|varchar|NO|NULL|NULL|NULL|NO|NEVER|1|YES",
+            "amount|NULL|9|10|3|NULL|numeric|NULL|pg_catalog|numeric|NO|NULL|NULL|NULL|NO|NEVER|2|YES",
+            "occurred|NULL|NULL|NULL|NULL|2|timestamp without time zone|NULL|pg_catalog|timestamp|NO|NULL|NULL|NULL|NO|NEVER|3|YES",
+            "generated|NULL|32|2|0|NULL|integer|NULL|pg_catalog|int4|NO|NULL|NULL|NULL|NO|ALWAYS|4|YES",
             "identity|NULL|64|2|0|NULL|bigint|NULL|pg_catalog|int8|YES|BY DEFAULT|9223372036854775807|1|NO|NEVER|5|YES",
-            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|public|information_schema_column_domain|NO|NULL|NULL|NULL|NULL|NEVER|6|YES",
-            "enum_value|NULL|NULL|NULL|NULL|NULL|USER-DEFINED|NULL|public|information_schema_column_enum|NO|NULL|NULL|NULL|NULL|NEVER|7|YES",
+            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|public|information_schema_column_domain|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
+            "enum_value|NULL|NULL|NULL|NULL|NULL|USER-DEFINED|NULL|public|information_schema_column_enum|NO|NULL|NULL|NULL|NO|NEVER|7|YES",
         ]
     );
     run_with(

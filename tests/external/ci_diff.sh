@@ -63,6 +63,13 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 PY="$VENV/bin/python"
 
+if "$PY" "$EXT/result_diff.py" >/dev/null; then
+  ok "differential result comparator"
+else
+  bad "differential result comparator"
+  exit 1
+fi
+
 # --- start pos3ql (object storage off: this suite is pure SQL semantics) ----
 cargo build --release -q || { echo "build failed"; exit 1; }
 cat > "$WORK/p3.conf" <<EOF

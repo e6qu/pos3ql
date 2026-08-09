@@ -25,6 +25,8 @@ import argparse
 import random
 import sys
 
+from result_diff import has_outer_order_by, rows_key
+
 try:
     import psycopg
 except ImportError:
@@ -61,6 +63,7 @@ SCHEMA = [
     " d date,"
     " ts timestamptz,"
     " ai int[])",
+    "CREATE TABLE fz_right (id int NOT NULL, category text, weight int)",
 ]
 
 ROWS = [
@@ -70,6 +73,13 @@ ROWS = [
     "(4, 2147483647, 1, 3.0, 'pear', true, DATE '1999-12-31', TIMESTAMPTZ '1999-12-31 23:59:59+00', ARRAY[5,6])",
     "(5, 0, -4, 0.0, '',     false, DATE '2000-01-01', TIMESTAMPTZ '2000-01-01 00:00:00+00', ARRAY[7])",
     "(6, 42, 42, 2.5, 'Apple',true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 06:00:00+00', ARRAY[8,9])",
+]
+
+RIGHT_ROWS = [
+    "(1, 'one', 10)",
+    "(2, 'two', NULL)",
+    "(4, 'four', -4)",
+    "(6, 'six', 42)",
 ]
 
 INT_COLS = ["a", "b", "id"]
@@ -257,6 +267,44 @@ class Gen:
             return f"SELECT array_agg(ai ORDER BY id) FROM fz WHERE {where}"
         return f"SELECT ARRAY(SELECT ai FROM fz WHERE {where} ORDER BY id)"
 
+    def join_statement(self):
+        if self.maybe():
+            join = "INNER JOIN"
+            items = "left_table.id, left_table.a, right_table.category, right_table.weight"
+        else:
+            join = "LEFT JOIN"
+            items = "left_table.id, left_table.a, right_table.category, right_table.weight"
+        return (
+            f"SELECT {items} FROM fz AS left_table {join} fz_right AS right_table "
+            "ON left_table.id = right_table.id ORDER BY left_table.id"
+        )
+
+    def correlated_subquery_statement(self):
+        if self.maybe():
+            subquery = (
+                "(SELECT count(*) FROM fz AS inner_table "
+                "WHERE inner_table.a < outer_table.a)"
+            )
+        else:
+            subquery = (
+                "EXISTS (SELECT 1 FROM fz_right AS inner_table "
+                "WHERE inner_table.id = outer_table.id AND inner_table.weight > 0)"
+            )
+        return f"SELECT outer_table.id, {subquery} FROM fz AS outer_table ORDER BY outer_table.id"
+
+    def window_statement(self):
+        return (
+            "SELECT id, sum(coalesce(a, 0)) OVER "
+            "(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+            "FROM fz ORDER BY id"
+        )
+
+    def array_scalar_statement(self):
+        return (
+            "SELECT id, cardinality(ai), array_length(ai, 1), ai[1], ai || ARRAY[10] "
+            "FROM fz ORDER BY id"
+        )
+
     def order_by(self, tiebreak=True):
         # Always end with the unique `id` so ordering is total; LIMIT without
         # a total order is unspecified in SQL and its row set would differ by
@@ -274,8 +322,17 @@ class Gen:
 
     def statement(self):
         """A random SELECT: plain projection or an aggregate/GROUP BY."""
-        if self.maybe(0.08):
+        r = self.rng.random()
+        if r < 0.08:
             return self.array_statement()
+        if r < 0.14:
+            return self.join_statement()
+        if r < 0.19:
+            return self.correlated_subquery_statement()
+        if r < 0.23:
+            return self.window_statement()
+        if r < 0.28:
+            return self.array_scalar_statement()
         if self.maybe(0.3):
             # Aggregate / GROUP BY form.
             grp = self.choice(ALL_COLS)
@@ -326,33 +383,6 @@ def run_one(cur, sql):
         return ("decode_error", str(e)[:80])
 
 
-def _cell(c):
-    """Stringify a result cell so result sets compare structurally across
-    engines; floats are rounded to absorb the last-ULP differences."""
-    if isinstance(c, float):
-        return "f:%.9g" % c
-    if isinstance(c, bool):
-        return "b:%d" % c
-    # psycopg returns raw bytes for text columns under a SQL_ASCII server and str
-    # under UTF8; decode losslessly (latin1 is a 1:1 map) so the comparison keys
-    # the value, not the server's encoding.
-    if isinstance(c, (bytes, bytearray, memoryview)):
-        return "s:" + bytes(c).decode("latin1")
-    return "s:" + str(c)
-
-
-def key(rows):
-    if rows is None:
-        return None
-    out = []
-    for r in rows:
-        # Uniformly stringify (floats rounded first) so mixed-type columns
-        # across rows still sort and compare deterministically.
-        out.append(tuple(_cell(c) for c in r))
-    out.sort()
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pg", type=int, required=True)
@@ -365,10 +395,14 @@ def main():
                     help="fail when generated PostgreSQL-valid statements are unsupported")
     args = ap.parse_args()
 
+    # This generator deliberately produces unbounded unique SQL. Automatic
+    # client-side prepare would consume the server's bounded named-statement
+    # pool instead of measuring SQL semantics; prepared protocol behavior has
+    # dedicated wire and driver differentials.
     pg = psycopg.connect(host=args.host, port=args.pg, user="postgres",
-                         autocommit=True, sslmode="disable").cursor()
+                         autocommit=True, sslmode="disable", prepare_threshold=None).cursor()
     p3 = psycopg.connect(host=args.host, port=args.p3, user="postgres",
-                         autocommit=True, sslmode="disable").cursor()
+                         autocommit=True, sslmode="disable", prepare_threshold=None).cursor()
 
     # Pin the session time zone so timestamptz rendering is deterministic and
     # identical on both engines — otherwise the reference server's default zone
@@ -389,10 +423,13 @@ def main():
                                  f"  SQL: {stmt}\n")
                 sys.exit(2)
 
-    values = "INSERT INTO fz VALUES " + ", ".join(ROWS)
+    values = [
+        "INSERT INTO fz VALUES " + ", ".join(ROWS),
+        "INSERT INTO fz_right VALUES " + ", ".join(RIGHT_ROWS),
+    ]
     for engine, cur in (("PostgreSQL", pg), ("pos3ql", p3)):
         setup(engine, cur, SCHEMA)
-        setup(engine, cur, [values])
+        setup(engine, cur, values)
 
     rng = random.Random(args.seed)
     gen = Gen(rng)
@@ -409,7 +446,7 @@ def main():
         pg_res = run_one(pg, sql)
         p3_res = run_one(p3, sql)
 
-        verdict = classify(pg_res, p3_res)
+        verdict = classify(pg_res, p3_res, sql)
         if verdict == "match":
             stats["match"] += 1
         elif verdict == "unsupported":
@@ -450,7 +487,7 @@ def main():
     sys.exit(1 if stats["divergence"] > 0 or unsupported_over_budget else 0)
 
 
-def classify(pg_res, p3_res):
+def classify(pg_res, p3_res, sql):
     if pg_res[0] == "decode_error" or p3_res[0] == "decode_error":
         return "divergence"
     if pg_res[0] == "err" and p3_res[0] == "err":
@@ -461,7 +498,8 @@ def classify(pg_res, p3_res):
         return "unsupported" if is_unsupported(p3_res) else "divergence"
     if pg_res[0] == "err" and p3_res[0] == "ok":
         return "divergence"
-    return "match" if key(pg_res[1]) == key(p3_res[1]) else "divergence"
+    ordered = has_outer_order_by(sql)
+    return "match" if rows_key(pg_res[1], ordered) == rows_key(p3_res[1], ordered) else "divergence"
 
 
 def summarize(res):

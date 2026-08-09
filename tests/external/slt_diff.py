@@ -24,6 +24,8 @@ Usage:
 import argparse
 import sys
 
+from result_diff import rows_key
+
 try:
     import psycopg
 except ImportError:
@@ -154,34 +156,6 @@ def run_one(cur, sql):
         return ("err", state, msg.strip().replace("\n", " ")[:90])
 
 
-def _cell(c):
-    """Stringify a result cell so result sets compare structurally across
-    engines; floats are rounded to absorb the last-ULP differences."""
-    if isinstance(c, float):
-        return "f:%.9g" % c
-    if isinstance(c, bool):
-        return "b:%d" % c
-    # psycopg hands back raw bytes for text columns when the server encoding is
-    # SQL_ASCII (it will not guess a decoding); a UTF8 server yields str for the
-    # identical data. Decode losslessly so the comparison keys the value, not the
-    # server's encoding. latin1 is a total 1:1 map, so real bytea compares by
-    # content on both engines too.
-    if isinstance(c, (bytes, bytearray, memoryview)):
-        return "s:" + bytes(c).decode("latin1")
-    return "s:" + str(c)
-
-
-def normalize_rows(rows):
-    """Order-insensitive, type-loose comparison key for a result set."""
-    if rows is None:
-        return None
-    out = []
-    for r in rows:
-        out.append(tuple(_cell(c) for c in r))
-    out.sort()
-    return out
-
-
 def table_names(sql):
     """Best-effort: names created by a CREATE TABLE, for pre-file cleanup."""
     low = sql.lower()
@@ -275,7 +249,12 @@ def process_file(path, pg, p3, limit, divergences, max_print, unsupp_hist,
             continue
 
         # Both ok: compare result sets.
-        if normalize_rows(pg_res[1]) == normalize_rows(p3_res[1]):
+        # SQLLogicTest often orders by a non-unique expression. PostgreSQL
+        # intentionally leaves the order of tied rows unspecified, so a
+        # cross-engine differential can compare only its guaranteed row set.
+        # The generated suite always appends a unique key and checks ordered
+        # output exactly.
+        if rows_key(pg_res[1], ordered=False) == rows_key(p3_res[1], ordered=False):
             stats["match"] += 1
         else:
             stats["divergence"] += 1

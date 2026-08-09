@@ -5928,6 +5928,11 @@ fn info_schemata<'a>(
         &[
             ("catalog_name", ColType::Text),
             ("schema_name", ColType::Text),
+            ("schema_owner", ColType::Text),
+            ("default_character_set_catalog", ColType::Text),
+            ("default_character_set_schema", ColType::Text),
+            ("default_character_set_name", ColType::Text),
+            ("sql_path", ColType::Text),
         ],
     );
     let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
@@ -5943,18 +5948,44 @@ fn info_schemata<'a>(
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
+                text(
+                    storage
+                        .role_name(schema.ownership.owner_to(txid) as usize, txid)
+                        .as_str(),
+                    arena,
+                )?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
             ],
             arena,
         )?;
         n += 1;
     }
     out[n] = row(
-        &[text("postgres", arena)?, text("pg_catalog", arena)?],
+        &[
+            text("postgres", arena)?,
+            text("pg_catalog", arena)?,
+            text("postgres", arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+        ],
         arena,
     )?;
     n += 1;
     out[n] = row(
-        &[text("postgres", arena)?, text("information_schema", arena)?],
+        &[
+            text("postgres", arena)?,
+            text("information_schema", arena)?,
+            text("postgres", arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+        ],
         arena,
     )?;
     n += 1;

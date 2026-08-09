@@ -2384,6 +2384,18 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
             &mut engine,
             &mut budget,
             &mut owner,
+            "SELECT schema_owner, default_character_set_catalog, \
+                    default_character_set_schema, default_character_set_name, sql_path \
+             FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["postgres|NULL|NULL|NULL|NULL"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
             "SELECT nspname FROM pg_namespace WHERE nspname = 'pending_view_schema'; \
              SELECT typname FROM pg_type WHERE typname = 'pending_view_column_catalog'; \
              SELECT has_schema_privilege(oid, 'USAGE') FROM pg_namespace \

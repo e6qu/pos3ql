@@ -10,8 +10,8 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterTypeAction, CreateDomain, CreateSchemaElement, DomainCheck,
-    PublicationOperations, RoleOptions,
+    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateSchemaElement,
+    DomainCheck, PublicationOperations, RoleOptions,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -881,28 +881,18 @@ impl<'a> Parser<'a> {
 
     fn create_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.any_ident("publication name")?;
-        self.expect_ident("for")?;
-        let (all_tables, tables) = if self.eat_ident("all")? {
-            self.expect_ident("tables")?;
-            (true, &[][..])
-        } else {
-            self.expect_ident("table")?;
-            let mut entries: [QualName; MAX_LIST] = [QualName {
-                schema: None,
-                name: "",
-            }; MAX_LIST];
-            let mut count = 0;
-            loop {
-                if count == MAX_LIST {
-                    return Err(self.limit("publication tables", MAX_LIST));
-                }
-                entries[count] = self.qual_name("table name")?;
-                count += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
+        let (all_tables, tables) = if self.eat_ident("for")? {
+            if self.eat_ident("all")? {
+                self.expect_ident("tables")?;
+                (true, &[][..])
+            } else {
+                self.expect_ident("table")?;
+                (false, self.publication_tables()?)
             }
-            (false, self.arena_slice(&entries[..count])?)
+        } else {
+            // PostgreSQL permits an empty publication so tables can be added
+            // transactionally later with ALTER PUBLICATION.
+            (false, &[][..])
         };
         let mut publish = PublicationOperations::ALL;
         if self.eat_ident("with")? {
@@ -910,25 +900,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("publish")?;
             self.expect_op("=")?;
             let value = self.str_literal("publication publish option")?;
-            publish = PublicationOperations {
-                insert: false,
-                update: false,
-                delete: false,
-                truncate: false,
-            };
-            for operation in value.split(',').map(str::trim) {
-                if operation.eq_ignore_ascii_case("insert") {
-                    publish.insert = true;
-                } else if operation.eq_ignore_ascii_case("update") {
-                    publish.update = true;
-                } else if operation.eq_ignore_ascii_case("delete") {
-                    publish.delete = true;
-                } else if operation.eq_ignore_ascii_case("truncate") {
-                    publish.truncate = true;
-                } else {
-                    return Err(self.err_here("invalid publication publish operation"));
-                }
-            }
+            publish = self.publication_operations(value)?;
             self.expect_op(")")?;
         }
         Ok(Stmt::CreatePublication {
@@ -937,6 +909,77 @@ impl<'a> Parser<'a> {
             tables,
             publish,
         })
+    }
+
+    /// `ALTER PUBLICATION name { SET (publish = ...) | { ADD | SET | DROP }
+    /// TABLE table [, ...] }`.  The AST retains the operation distinction so
+    /// execution cannot accidentally turn ADD or DROP into replacement.
+    pub(super) fn alter_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("publication name")?;
+        let action = if self.eat_ident("set")? {
+            if self.eat_op("(")? {
+                self.expect_ident("publish")?;
+                self.expect_op("=")?;
+                let value = self.str_literal("publication publish option")?;
+                let publish = self.publication_operations(value)?;
+                self.expect_op(")")?;
+                AlterPublicationAction::SetOperations(publish)
+            } else {
+                self.expect_ident("table")?;
+                AlterPublicationAction::SetTables(self.publication_tables()?)
+            }
+        } else if self.eat_ident("add")? {
+            self.expect_ident("table")?;
+            AlterPublicationAction::AddTables(self.publication_tables()?)
+        } else if self.eat_ident("drop")? {
+            self.expect_ident("table")?;
+            AlterPublicationAction::DropTables(self.publication_tables()?)
+        } else {
+            return Err(self.err_here("expected SET, ADD, or DROP after ALTER PUBLICATION"));
+        };
+        Ok(Stmt::AlterPublication { name, action })
+    }
+
+    fn publication_tables(&mut self) -> Result<&'a [QualName<'a>], ParseError> {
+        let mut entries: [QualName; MAX_LIST] = [QualName {
+            schema: None,
+            name: "",
+        }; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == MAX_LIST {
+                return Err(self.limit("publication tables", MAX_LIST));
+            }
+            entries[count] = self.qual_name("table name")?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&entries[..count])
+    }
+
+    fn publication_operations(&self, value: &'a str) -> Result<PublicationOperations, ParseError> {
+        let mut publish = PublicationOperations {
+            insert: false,
+            update: false,
+            delete: false,
+            truncate: false,
+        };
+        for operation in value.split(',').map(str::trim) {
+            if operation.eq_ignore_ascii_case("insert") {
+                publish.insert = true;
+            } else if operation.eq_ignore_ascii_case("update") {
+                publish.update = true;
+            } else if operation.eq_ignore_ascii_case("delete") {
+                publish.delete = true;
+            } else if operation.eq_ignore_ascii_case("truncate") {
+                publish.truncate = true;
+            } else {
+                return Err(self.err_here("invalid publication publish operation"));
+            }
+        }
+        Ok(publish)
     }
 
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).

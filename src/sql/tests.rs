@@ -11255,6 +11255,112 @@ fn publications_are_transactional_and_catalog_visible() {
 }
 
 #[test]
+fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
+    let config = test_config("publication-alter-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_first (id int); \
+         CREATE TABLE publication_second (id int); \
+         CREATE PUBLICATION publication_changes FOR TABLE publication_first",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             ALTER PUBLICATION publication_changes ADD TABLE publication_second; \
+             ALTER PUBLICATION publication_changes SET (publish = 'insert, delete'); \
+             SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication \
+             WHERE pubname = 'publication_changes'; \
+             SELECT count(*) FROM pg_publication_rel WHERE prpubid = \
+                 (SELECT oid FROM pg_publication WHERE pubname = 'publication_changes'); \
+             ROLLBACK; \
+             SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication \
+             WHERE pubname = 'publication_changes'; \
+             SELECT count(*) FROM pg_publication_rel WHERE prpubid = \
+                 (SELECT oid FROM pg_publication WHERE pubname = 'publication_changes')",
+        )),
+        ["t|f|t|f", "2", "t|t|t|t", "1"],
+        "the altering transaction sees its staged definition, rollback restores the committed definition"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_changes ADD TABLE publication_second; \
+         ALTER PUBLICATION publication_changes DROP TABLE publication_first; \
+         ALTER PUBLICATION publication_changes SET (publish = 'update, truncate')",
+    );
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 28);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication \
+             WHERE pubname = 'publication_changes'; \
+             SELECT count(*) FROM pg_publication_rel WHERE prpubid = \
+                 (SELECT oid FROM pg_publication WHERE pubname = 'publication_changes')",
+        )),
+        ["f|t|f|t", "1"],
+        "the absolute post-ALTER definition survives WAL replay"
+    );
+}
+
+#[test]
+fn publication_membership_and_lifetime_require_the_right_owner() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE publication_owner; \
+         CREATE ROLE publication_other; \
+         GRANT CREATE ON SCHEMA public TO publication_owner; \
+         CREATE TABLE other_publication_table (id integer)",
+    );
+    let mut owner_guc = GucState::new();
+    owner_guc.set_session_user("publication_owner");
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE owner_publication_table (id integer); \
+         CREATE PUBLICATION owner_publication FOR TABLE owner_publication_table",
+        1 << 18,
+        &mut owner_guc,
+    );
+    let mut other_guc = GucState::new();
+    other_guc.set_session_user("publication_other");
+    let not_owner = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION owner_publication SET (publish = 'insert'); \
+         DROP PUBLICATION owner_publication",
+        1 << 18,
+        &mut other_guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&not_owner).contains("must be owner of publication"),
+        "{}",
+        String::from_utf8_lossy(&not_owner)
+    );
+    let not_table_owner = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION owner_publication ADD TABLE other_publication_table",
+        1 << 18,
+        &mut owner_guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&not_table_owner).contains("must be owner of table"),
+        "{}",
+        String::from_utf8_lossy(&not_table_owner)
+    );
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(

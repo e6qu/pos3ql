@@ -172,6 +172,12 @@ pub enum Stmt<'a> {
         tables: &'a [QualName<'a>],
         publish: PublicationOperations,
     },
+    /// ALTER PUBLICATION name SET (publish = ...) or change its explicit
+    /// relation membership.
+    AlterPublication {
+        name: &'a str,
+        action: AlterPublicationAction<'a>,
+    },
     /// DROP PUBLICATION [IF EXISTS] name [, ...].
     DropPublication {
         names: &'a [&'a str],
@@ -443,6 +449,17 @@ pub struct PublicationOperations {
     pub update: bool,
     pub delete: bool,
     pub truncate: bool,
+}
+
+/// The validated state change requested by `ALTER PUBLICATION`.  Membership
+/// actions carry relations, never a textual clause that execution could
+/// partially reinterpret.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlterPublicationAction<'a> {
+    SetOperations(PublicationOperations),
+    SetTables(&'a [QualName<'a>]),
+    AddTables(&'a [QualName<'a>]),
+    DropTables(&'a [QualName<'a>]),
 }
 
 impl PublicationOperations {

@@ -5005,9 +5005,8 @@ pub fn drop_schema(
     sql_ok()
 }
 
-/// CREATE [OR REPLACE] VIEW: stores the view's SELECT text durably (journaled
-/// and checkpointed) and registers it. View DDL is applied immediately, not
-/// rolled back with the surrounding transaction (see BUGS.md).
+/// CREATE PUBLICATION records a transaction-owned catalog entry and its
+/// complete initial selection before the commit record makes it visible.
 #[allow(clippy::too_many_arguments)]
 pub fn create_publication(
     storage: &mut Storage,
@@ -5036,6 +5035,13 @@ pub fn create_publication(
                 table.name
             ));
         };
+        if let Err(error) = storage.require_owner(
+            storage.table_access_object(slot, txn.txid),
+            txn.txid,
+            "table",
+        ) {
+            return sql_fail(error);
+        }
         if members[..index].contains(&(slot as u16)) {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -5101,6 +5107,24 @@ pub fn drop_publication(
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
+        let Some((slot, _)) = storage.publication_definition(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "publication \"{}\" does not exist, skipping", name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                name
+            ));
+        };
+        if let Err(error) = storage.require_publication_owner(slot, txn.txid) {
+            return sql_fail(error);
+        }
         match storage.drop_publication(name, txn.txid) {
             Ok(Some(slot)) => {
                 let lsn = storage.bump_lsn();
@@ -5115,21 +5139,183 @@ pub fn drop_publication(
                     return sql_fail(error);
                 }
             }
-            Ok(None) if if_exists => responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "publication \"{}\" does not exist, skipping", name).as_str(),
-            )?,
             Ok(None) => {
                 return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "publication \"{}\" does not exist",
-                    name
+                    sqlstate::INTERNAL_ERROR,
+                    "publication disappeared before DROP PUBLICATION completed"
                 ));
             }
             Err(error) => return sql_fail(error),
         }
     }
     Ok(Ok(responder.command_complete("DROP PUBLICATION")?))
+}
+
+/// Applies one fully parsed publication definition change.  The storage layer
+/// stages it by transaction id; WAL carries the complete resulting definition
+/// so recovery has no dependence on the prior catalog image.
+pub fn alter_publication(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    name: &str,
+    action: crate::sql::ast::AlterPublicationAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((slot, current)) = storage.publication_definition(name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "publication \"{}\" does not exist",
+            name
+        ));
+    };
+    if let Err(error) = storage.require_publication_owner(slot, txn.txid) {
+        return sql_fail(error);
+    }
+    let mut definition = current;
+    match action {
+        crate::sql::ast::AlterPublicationAction::SetOperations(operations) => {
+            definition.publish_insert = operations.insert;
+            definition.publish_update = operations.update;
+            definition.publish_delete = operations.delete;
+            definition.publish_truncate = operations.truncate;
+        }
+        crate::sql::ast::AlterPublicationAction::SetTables(tables) => {
+            if current.all_tables {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "publication \"{}\" is defined as FOR ALL TABLES",
+                    name
+                ));
+            }
+            let (members, count) = match publication_members(storage, txn.txid, tables) {
+                Ok(members) => members,
+                Err(error) => return sql_fail(error),
+            };
+            definition.tables = members;
+            definition.table_count = count;
+        }
+        crate::sql::ast::AlterPublicationAction::AddTables(tables) => {
+            if current.all_tables {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "publication \"{}\" is defined as FOR ALL TABLES",
+                    name
+                ));
+            }
+            let (members, count) = match publication_members(storage, txn.txid, tables) {
+                Ok(members) => members,
+                Err(error) => return sql_fail(error),
+            };
+            if definition.table_count + count > crate::storage::MAX_PUBLICATION_TABLES {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many tables in publication (limit {})",
+                    crate::storage::MAX_PUBLICATION_TABLES
+                ));
+            }
+            for table in &members[..count] {
+                if definition.tables[..definition.table_count].contains(table) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "relation is already in publication \"{}\"",
+                        name
+                    ));
+                }
+                definition.tables[definition.table_count] = *table;
+                definition.table_count += 1;
+            }
+        }
+        crate::sql::ast::AlterPublicationAction::DropTables(tables) => {
+            if current.all_tables {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "publication \"{}\" is defined as FOR ALL TABLES",
+                    name
+                ));
+            }
+            let (members, count) = match publication_members(storage, txn.txid, tables) {
+                Ok(members) => members,
+                Err(error) => return sql_fail(error),
+            };
+            for table in &members[..count] {
+                let Some(index) = definition.tables[..definition.table_count]
+                    .iter()
+                    .position(|member| member == table)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "relation is not part of publication \"{}\"",
+                        name
+                    ));
+                };
+                definition
+                    .tables
+                    .copy_within(index + 1..definition.table_count, index);
+                definition.table_count -= 1;
+                definition.tables[definition.table_count] = u16::MAX;
+            }
+        }
+    }
+    let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
+        Ok(result) => result,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::AlterPublication {
+            name,
+            all_tables: definition.all_tables,
+            tables: definition.tables,
+            table_count: definition.table_count,
+            publish_insert: definition.publish_insert,
+            publish_update: definition.publish_update,
+            publish_delete: definition.publish_delete,
+            publish_truncate: definition.publish_truncate,
+        },
+    ) {
+        storage.rollback_publication_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_publication_alter(slot, prior);
+        return sql_fail(error);
+    }
+    Ok(Ok(responder.command_complete("ALTER PUBLICATION")?))
+}
+
+fn publication_members(
+    storage: &Storage,
+    txid: u32,
+    tables: &[QualName],
+) -> Result<([u16; crate::storage::MAX_PUBLICATION_TABLES], usize), SqlError> {
+    let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+    for (index, table) in tables.iter().enumerate() {
+        let Some(crate::storage::ResolvedRelation::Table(slot)) =
+            storage.resolve_relation(table.schema, table.name, txid)
+        else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"{}\" does not exist",
+                table.name
+            ));
+        };
+        storage.require_owner(storage.table_access_object(slot, txid), txid, "table")?;
+        if members[..index].contains(&(slot as u16)) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "relation \"{}\" is listed more than once",
+                table.name
+            ));
+        }
+        members[index] = slot as u16;
+    }
+    Ok((members, tables.len()))
 }
 
 /// The user-supplied portion of CREATE VIEW, grouped to keep execution's

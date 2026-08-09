@@ -86,6 +86,7 @@ const KIND_REWRITE_TABLE: u8 = 33;
 const KIND_SET_DEFAULT_ACL: u8 = 34;
 const KIND_CREATE_PUBLICATION: u8 = 35;
 const KIND_DROP_PUBLICATION: u8 = 36;
+const KIND_ALTER_PUBLICATION: u8 = 42;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -93,7 +94,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_TRUNCATE;
+const LAST_KIND: u8 = KIND_ALTER_PUBLICATION;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -348,6 +349,18 @@ pub(crate) enum WalOp<'a> {
     },
     DropPublication {
         name: &'a str,
+    },
+    /// The complete post-ALTER definition.  Replay never derives a new
+    /// publication from a possibly different predecessor.
+    AlterPublication {
+        name: &'a str,
+        all_tables: bool,
+        tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
+        table_count: usize,
+        publish_insert: bool,
+        publish_update: bool,
+        publish_delete: bool,
+        publish_truncate: bool,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1169,6 +1182,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
+        WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1309,6 +1323,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name, table_count, ..
         } => 1 + name.len() + 1 + 1 + table_count * 2,
         WalOp::DropPublication { name } => 1 + name.len(),
+        WalOp::AlterPublication {
+            name, table_count, ..
+        } => 1 + name.len() + 1 + 1 + table_count * 2,
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -1648,6 +1665,27 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropPublication { name } => name_bytes(buffer, name),
+        WalOp::AlterPublication {
+            name,
+            all_tables,
+            tables,
+            table_count,
+            publish_insert,
+            publish_update,
+            publish_delete,
+            publish_truncate,
+        } => {
+            let flags = u8::from(*all_tables)
+                | (u8::from(*publish_insert) << 1)
+                | (u8::from(*publish_update) << 2)
+                | (u8::from(*publish_delete) << 3)
+                | (u8::from(*publish_truncate) << 4);
+            let mut ok = name_bytes(buffer, name) && buffer.append(&[flags, *table_count as u8]);
+            for table in &tables[..*table_count] {
+                ok = ok && buffer.append(&table.to_le_bytes());
+            }
+            ok
+        }
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
@@ -2523,6 +2561,31 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_PUBLICATION => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
+        }
+        KIND_ALTER_PUBLICATION => {
+            let name = take_name(&mut at)?;
+            let flags = *payload.get(at)?;
+            at += 1;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            if count > crate::storage::MAX_PUBLICATION_TABLES {
+                return None;
+            }
+            let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+            for table in &mut tables[..count] {
+                *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+            }
+            (at == payload.len()).then_some(WalOp::AlterPublication {
+                name,
+                all_tables: flags & 1 != 0,
+                tables,
+                table_count: count,
+                publish_insert: flags & 2 != 0,
+                publish_update: flags & 4 != 0,
+                publish_delete: flags & 8 != 0,
+                publish_truncate: flags & 16 != 0,
+            })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
         KIND_COMMIT => {
@@ -3554,12 +3617,29 @@ mod tests {
             .unwrap();
             wal.append_committed(12, &WalOp::DropReplicationSlot { name: "changes" })
                 .unwrap();
+            let mut publication_tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+            publication_tables[0] = 3;
+            publication_tables[1] = 7;
+            wal.append_committed(
+                13,
+                &WalOp::AlterPublication {
+                    name: "changes",
+                    all_tables: false,
+                    tables: publication_tables,
+                    table_count: 2,
+                    publish_insert: true,
+                    publish_update: false,
+                    publish_delete: true,
+                    publish_truncate: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 12);
+        assert_eq!(seen.len(), 13);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -3608,10 +3688,17 @@ mod tests {
         );
         assert!(seen[10].contains("AdvanceReplicationSlot"), "{}", seen[10]);
         assert!(seen[11].contains("DropReplicationSlot"), "{}", seen[11]);
-        assert_eq!(wal.last_lsn(), 12);
+        assert!(
+            seen[12].contains("AlterPublication")
+                && seen[12].contains("table_count: 2")
+                && seen[12].contains("publish_update: false"),
+            "publication alter: {}",
+            seen[12]
+        );
+        assert_eq!(wal.last_lsn(), 13);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            13,
+            14,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

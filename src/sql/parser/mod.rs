@@ -2751,6 +2751,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
             return self.alter_role();
         }
+        if self.eat_ident("publication")? {
+            return self.alter_publication();
+        }
         if self.eat_ident("schema")? {
             let name = QualName {
                 schema: None,
@@ -4381,6 +4384,59 @@ mod tests {
             assert!(all_tables);
             assert!(publish.insert && publish.update && publish.delete);
             assert!(!publish.truncate);
+        });
+    }
+
+    #[test]
+    fn empty_publication_parse_without_heap_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "empty publication parser", 1 << 18).unwrap();
+        let mut parser = Parser::new("CREATE PUBLICATION changes", &arena).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreatePublication {
+                all_tables, tables, ..
+            }) = parser.next_stmt().unwrap()
+            else {
+                panic!("empty CREATE PUBLICATION did not parse")
+            };
+            assert!(!all_tables);
+            assert!(tables.is_empty());
+        });
+    }
+
+    #[test]
+    fn alter_publication_is_a_typed_operation_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "alter publication parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "ALTER PUBLICATION changes ADD TABLE public.orders, archive.orders",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::AlterPublication { name, action }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER PUBLICATION did not parse")
+            };
+            assert_eq!(name, "changes");
+            let crate::sql::ast::AlterPublicationAction::AddTables(tables) = action else {
+                panic!("membership action lost its operation")
+            };
+            assert_eq!(tables.len(), 2);
+            assert_eq!(tables[0].schema, Some("public"));
+            assert_eq!(tables[1].schema, Some("archive"));
+        });
+    }
+
+    #[test]
+    fn alter_publication_set_table_does_not_consume_the_set_keyword_twice() {
+        with_parser("ALTER PUBLICATION changes SET TABLE orders", |parser| {
+            let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap() else {
+                panic!("SET TABLE did not parse")
+            };
+            let crate::sql::ast::AlterPublicationAction::SetTables(tables) = action else {
+                panic!("SET TABLE parsed as another ALTER PUBLICATION action")
+            };
+            assert_eq!(tables, [QualName::bare("orders")]);
         });
     }
 

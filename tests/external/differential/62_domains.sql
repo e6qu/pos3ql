@@ -47,6 +47,19 @@ INSERT INTO dom_t VALUES (5, 'a@b.com', -3);
 SELECT typname, typtype, typbasetype, typnotnull, typdefault
   FROM pg_type WHERE typname IN ('dom_pos', 'dom_email', 'dom_def') ORDER BY typname;
 
+-- The SQL-standard domain views must expose the same typed definition and
+-- named checks as pg_type/pg_constraint, including base-type modifiers.
+SELECT domain_name, data_type, character_maximum_length, numeric_precision,
+       numeric_precision_radix, numeric_scale, udt_schema, udt_name,
+       dtd_identifier
+  FROM information_schema.domains
+ WHERE domain_name IN ('dom_pos', 'dom_email', 'dom_def')
+ ORDER BY domain_name;
+SELECT constraint_name, domain_name, is_deferrable, initially_deferred
+  FROM information_schema.domain_constraints
+ WHERE domain_name IN ('dom_pos', 'dom_email', 'dom_def')
+ ORDER BY domain_name, constraint_name;
+
 -- ALTER DOMAIN: add / drop a CHECK, set / drop a default, set / drop NOT NULL.
 BEGIN;
 ALTER DOMAIN dom_def SET DEFAULT 77;

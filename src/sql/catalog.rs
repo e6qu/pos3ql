@@ -68,6 +68,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "role_table_grants"
                 | "sequences"
                 | "usage_privileges"
+                | "domains"
+                | "domain_constraints"
         ),
         Some(_) => false,
         None => matches!(
@@ -934,6 +936,8 @@ pub fn synthesize<'a>(
         (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
         (true, "sequences") => info_sequences(storage, txid, arena),
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
+        (true, "domains") => info_domains(storage, txid, arena),
+        (true, "domain_constraints") => info_domain_constraints(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -6347,6 +6351,190 @@ fn info_referential_constraints<'a>(
         }
     }
     finish(definition, &output[..count], arena)
+}
+
+fn info_domains<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domains",
+        &[
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("data_type", ColType::Text),
+            ("character_maximum_length", ColType::Int4),
+            ("character_octet_length", ColType::Int4),
+            ("character_set_catalog", ColType::Text),
+            ("character_set_schema", ColType::Text),
+            ("character_set_name", ColType::Text),
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("numeric_precision", ColType::Int4),
+            ("numeric_precision_radix", ColType::Int4),
+            ("numeric_scale", ColType::Int4),
+            ("datetime_precision", ColType::Int4),
+            ("interval_type", ColType::Text),
+            ("interval_precision", ColType::Int4),
+            ("domain_default", ColType::Text),
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("scope_catalog", ColType::Text),
+            ("scope_schema", ColType::Text),
+            ("scope_name", ColType::Text),
+            ("maximum_cardinality", ColType::Int4),
+            ("dtd_identifier", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
+        let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
+            information_schema_scalar_metadata(domain.base, type_mod);
+        let (data_type, udt_schema, udt_name) = match domain.base_domain {
+            Some(parent) => (
+                "USER-DEFINED",
+                parent.schema,
+                StackStr::<64>::from_str(parent.name.as_str()),
+            ),
+            None => (
+                domain.base.name(),
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::<64>::from_str(domain.base.catalog_name()),
+            ),
+        };
+        let default = match domain.default_expr {
+            Some(value) => text(value.as_str(), arena)?,
+            None => Datum::Null,
+        };
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(domain.schema.as_str(), arena)?,
+                text(domain.name.as_str(), arena)?,
+                text(data_type, arena)?,
+                character_length.map_or(Datum::Null, Datum::Int4),
+                character_length.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                numeric_precision.map_or(Datum::Null, Datum::Int4),
+                numeric_radix.map_or(Datum::Null, Datum::Int4),
+                numeric_scale.map_or(Datum::Null, Datum::Int4),
+                datetime_precision.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                default,
+                text("postgres", arena)?,
+                text(udt_schema.as_str(), arena)?,
+                text(udt_name.as_str(), arena)?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                text("1", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_domain_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domain_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("is_deferrable", ColType::Text),
+            ("initially_deferred", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::storage::MAX_DOMAINS * crate::storage::MAX_DOMAIN_CHECKS;
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        for check in domain.checks() {
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(check.name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(domain.name.as_str(), arena)?,
+                    text("NO", arena)?,
+                    text("NO", arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+type InformationSchemaScalarMetadata = (
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+);
+
+fn information_schema_scalar_metadata(
+    ctype: ColType,
+    type_mod: TypeMod,
+) -> InformationSchemaScalarMetadata {
+    match type_mod {
+        TypeMod::Length(length) if matches!(ctype, ColType::Varchar | ColType::Bpchar) => {
+            (Some(length as i32), None, None, None, None)
+        }
+        TypeMod::NumericPS { precision, scale } => (
+            None,
+            Some(precision as i32),
+            Some(10),
+            Some(scale as i32),
+            None,
+        ),
+        TypeMod::TemporalPrecision(precision) => (None, None, None, None, Some(precision as i32)),
+        TypeMod::IntervalMod { precision, .. } => {
+            (None, None, None, None, precision.map(i32::from))
+        }
+        _ => match ctype {
+            ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
+            ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
+            ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
+            ColType::Float4 => (None, Some(24), Some(2), None, None),
+            ColType::Float8 => (None, Some(53), Some(2), None, None),
+            _ => (None, None, None, None, None),
+        },
+    }
 }
 
 fn info_schemata<'a>(

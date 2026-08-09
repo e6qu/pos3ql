@@ -2477,6 +2477,54 @@ fn information_schema_columns_exposes_complete_column_metadata() {
 }
 
 #[test]
+fn information_schema_domains_and_constraints_are_transaction_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE DOMAIN information_schema_domain AS varchar(7) \
+           CONSTRAINT information_schema_domain_check CHECK (VALUE <> '')",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT domain_name, data_type, character_maximum_length, udt_schema, \
+                    udt_name, dtd_identifier FROM information_schema.domains \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["information_schema_domain|character varying|7|pg_catalog|varchar|1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, domain_name, is_deferrable, initially_deferred \
+             FROM information_schema.domain_constraints \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["information_schema_domain_check|information_schema_domain|NO|NO"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.domains \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
 fn catalog_index_relations_are_not_silently_capped() {
     let mut config = test_config("catalog_index_relations_are_not_silently_capped");
     config.max_tables = 17;

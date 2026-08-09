@@ -31,6 +31,19 @@ SELECT array_ndims('{{1,2},{3,4}}'::int[]), array_length('{{1,2},{3,4}}'::int[],
 SELECT array_dims('[2:3][4:5]={{1,2},{3,4}}'::int[]), array_lower('[2:3][4:5]={{1,2},{3,4}}'::int[], 1), array_upper('[2:3][4:5]={{1,2},{3,4}}'::int[], 2);
 SELECT ('[2:3][4:5]={{1,2},{3,4}}'::int[])[3][5], ('[2:3][4:5]={{1,2},{3,4}}'::int[])[2:2];
 SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8]);
+
+-- array_agg(array) appends a leading dimension; arrays cannot be represented
+-- as independent array elements.
+SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) AS agg_array(a);
+SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) AS array_subquery(a));
+SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[1]::int[])) AS array_empty(a) WHERE false);
+SELECT array_agg(a) FROM (VALUES ('[2:3]={1,2}'::int[]), ('[2:3]={3,4}'::int[])) AS agg_bounds(a);
+SELECT array_agg(NULL);
+SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3])) AS agg_mismatch(a);
+SELECT array_agg(a) FROM (VALUES (ARRAY[]::int[])) AS agg_empty(a);
+SELECT array_agg(a) FROM (VALUES (NULL::int[])) AS agg_null(a);
+SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[]::int[])) AS subquery_empty(a));
+SELECT ARRAY(SELECT a FROM (VALUES (NULL::int[])) AS subquery_null(a));
 SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]];
 SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]] = '{{1,2},{3,4}}'::int[];
 

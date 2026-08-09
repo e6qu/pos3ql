@@ -12,6 +12,7 @@
 #   SLT_UNSUPPORTED_BUDGET     maximum unsupported blocks per shard (ratchet)
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
 #   FUZZ_BUDGET                allowed fuzz divergences before failing (ratchet; default 0)
+#   FUZZ_UNSUPPORTED_BUDGET    allowed unsupported generated statements (default 0)
 #   RUN_FAST / RUN_SLT / RUN_FUZZ
 #                              select deterministic, sqllogictest, and fuzz phases
 #
@@ -35,6 +36,7 @@ SLT_UNSUPPORTED_BUDGET=${SLT_UNSUPPORTED_BUDGET:-0}
 FUZZ_COUNT=${FUZZ_COUNT:-20000}
 FUZZ_SEED=${FUZZ_SEED:-1}
 FUZZ_BUDGET=${FUZZ_BUDGET:-0}
+FUZZ_UNSUPPORTED_BUDGET=${FUZZ_UNSUPPORTED_BUDGET:-0}
 # Sharding, so each CI job fits a wall-clock cap while total coverage is
 # preserved: the sqllogictest replay splits each file's query blocks across
 # SLT_QUERY_SHARDS shards (this run does shard SLT_QUERY_SHARD, 0-based) — every
@@ -402,17 +404,23 @@ if [[ "$RUN_FUZZ" == 1 ]]; then
   restart_p3_fresh || exit 1
 
   # --- generative differential fuzzer (gated by a ratchet budget) ----------
-  echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, budget=$FUZZ_BUDGET) ==="
+  echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, divergence budget=$FUZZ_BUDGET, unsupported budget=$FUZZ_UNSUPPORTED_BUDGET) ==="
   "$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
+    --max-unsupported "$FUZZ_UNSUPPORTED_BUDGET" \
     > "$WORK/fuzz.out" 2>&1 || true
   DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
   DIV=${DIV:-unknown}
+  UNSUP=$(grep -oE 'unsupported=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)
+  UNSUP=${UNSUP:-unknown}
   grep '^TOTAL' "$WORK/fuzz.out"
-  if [[ ! "$DIV" =~ ^[0-9]+$ ]]; then
-    # No divergence count means the fuzzer crashed before finishing — show why.
-    bad "fuzzer produced no divergence count (crashed)"; tail -40 "$WORK/fuzz.out"
+  if [[ ! "$DIV" =~ ^[0-9]+$ || ! "$UNSUP" =~ ^[0-9]+$ ]]; then
+    # No complete summary means the fuzzer crashed before finishing.
+    bad "fuzzer produced no complete result"; tail -40 "$WORK/fuzz.out"
+  elif (( UNSUP > FUZZ_UNSUPPORTED_BUDGET )); then
+    bad "fuzzer has unsupported statements ($UNSUP > $FUZZ_UNSUPPORTED_BUDGET)"
+    grep -A3 '^unsupported breakdown:' "$WORK/fuzz.out" | head -60
   elif (( DIV <= FUZZ_BUDGET )); then
-    ok "fuzzer within budget ($DIV <= $FUZZ_BUDGET)"
+    ok "fuzzer within budgets (divergence $DIV <= $FUZZ_BUDGET, unsupported $UNSUP <= $FUZZ_UNSUPPORTED_BUDGET)"
   else
     bad "fuzzer over budget ($DIV > $FUZZ_BUDGET)"; grep -A3 DIVERGENCE "$WORK/fuzz.out" | head -60
   fi

@@ -163,7 +163,7 @@ fn invalid_shape() -> SqlError {
     )
 }
 
-/// Serializes a one-dimensional array with PostgreSQL's default lower bound.
+/// Serializes a rank-one array with PostgreSQL's default lower bound.
 pub fn build<'a>(items: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
     build_shaped(items, Shape::one(items.len())?, arena)
 }
@@ -204,6 +204,58 @@ pub fn build_shaped<'a>(
         at += length;
     }
     Ok(out)
+}
+
+/// Combines array values into one array with a new leading dimension.
+/// PostgreSQL has no array-of-array value: every member must have the same
+/// element identity and shape.
+pub fn stack<'a>(members: &[Datum<'a>], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let Some(Datum::Array { element, raw }) = members.iter().find(|member| !member.is_null())
+    else {
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "cannot accumulate null arrays"
+        ));
+    };
+    let child = shape(raw).expect("array datum invariant");
+    if child.dimension_count() == 0 {
+        return Err(sql_err!(
+            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+            "cannot accumulate empty arrays"
+        ));
+    }
+    let result_shape = child.with_first(members.len(), 1)?;
+    let flattened = arena
+        .alloc_slice_with(result_shape.element_count(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut at = 0usize;
+    for member in members {
+        let Datum::Array {
+            element: member_element,
+            raw: member_raw,
+        } = *member
+        else {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "cannot accumulate null arrays"
+            ));
+        };
+        let member_shape = shape(member_raw).expect("array datum invariant");
+        if member_element != *element || member_shape != child {
+            return Err(sql_err!(
+                sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                "cannot accumulate arrays of different dimensionality"
+            ));
+        }
+        for index in 0..child.element_count() {
+            flattened[at] = get(member_raw, member_element, index).expect("array datum invariant");
+            at += 1;
+        }
+    }
+    Ok(Datum::Array {
+        element: *element,
+        raw: build_shaped(flattened, result_shape, arena)?,
+    })
 }
 
 /// Returns the self-describing shape only when the entire blob is valid.

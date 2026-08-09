@@ -19,6 +19,8 @@ PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
 PSQL="$PGBIN/psql"
 PG_PORT=${POS3QL_DIFF_PG_PORT:-15498}
 P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
+FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
+FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
 
 PASS=0
 FAIL=0
@@ -185,6 +187,17 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   fi
 else
   print -- "SKIP: sqllogictest replay (need a psycopg venv at \$POS3QL_VENV and vendor/)"
+fi
+
+if (( FUZZ_COUNT > 0 )); then
+  print -- "\n=== generated SQL differential (PostgreSQL is the oracle) ==="
+  if "$SLT_VENV/bin/python" "$EXT/fuzz_diff.py" --pg $PG_PORT --p3 $P3_PORT \
+      --count $FUZZ_COUNT --seed $FUZZ_SEED --max-unsupported 0 > "$WORK/fuzz.out" 2>&1; then
+    ok "generated SQL differential ($(grep '^TOTAL' "$WORK/fuzz.out"))"
+  else
+    bad "generated SQL differential"
+    cat "$WORK/fuzz.out"
+  fi
 fi
 
 print -- "\npassed: $PASS  failed: $FAIL"

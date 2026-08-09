@@ -19,6 +19,7 @@ once, so a reported seed reproduces the exact sequence.
 
 Usage:
   fuzz_diff.py --pg PORT --p3 PORT [--count N] [--seed S] [--max-print K]
+               [--max-unsupported N]
 """
 import argparse
 import random
@@ -58,16 +59,17 @@ SCHEMA = [
     " s text,"
     " flag bool,"
     " d date,"
-    " ts timestamptz)",
+    " ts timestamptz,"
+    " ai int[])",
 ]
 
 ROWS = [
-    "(1, 10, 3, 1.5, 'apple', true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 00:00:00+00')",
-    "(2, -7, 0, -2.25,'banana',false, DATE '2021-06-15', TIMESTAMPTZ '2021-06-15 12:30:00+00')",
-    "(3, NULL, 5, NULL, NULL,  NULL,  NULL,               NULL)",
-    "(4, 2147483647, 1, 3.0, 'pear', true, DATE '1999-12-31', TIMESTAMPTZ '1999-12-31 23:59:59+00')",
-    "(5, 0, -4, 0.0, '',     false, DATE '2000-01-01', TIMESTAMPTZ '2000-01-01 00:00:00+00')",
-    "(6, 42, 42, 2.5, 'Apple',true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 06:00:00+00')",
+    "(1, 10, 3, 1.5, 'apple', true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 00:00:00+00', ARRAY[1,2])",
+    "(2, -7, 0, -2.25,'banana',false, DATE '2021-06-15', TIMESTAMPTZ '2021-06-15 12:30:00+00', ARRAY[3,4])",
+    "(3, NULL, 5, NULL, NULL,  NULL,  NULL,               NULL, NULL)",
+    "(4, 2147483647, 1, 3.0, 'pear', true, DATE '1999-12-31', TIMESTAMPTZ '1999-12-31 23:59:59+00', ARRAY[5,6])",
+    "(5, 0, -4, 0.0, '',     false, DATE '2000-01-01', TIMESTAMPTZ '2000-01-01 00:00:00+00', ARRAY[7])",
+    "(6, 42, 42, 2.5, 'Apple',true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 06:00:00+00', ARRAY[8,9])",
 ]
 
 INT_COLS = ["a", "b", "id"]
@@ -241,6 +243,20 @@ class Gen:
         col = self.choice(NUM_COLS if fn in ("sum", "avg") else ALL_COLS)
         return f"{fn}({col})"
 
+    def array_statement(self):
+        """Exercise higher-rank array aggregation. The fixture has compatible,
+        NULL, and mismatched members, so both results and accumulation errors
+        remain differential targets."""
+        where = self.choice([
+            "id IN (1, 2, 4, 6)",
+            "id IN (1, 5)",
+            "id = 3",
+            "id < 3",
+        ])
+        if self.maybe(0.5):
+            return f"SELECT array_agg(ai ORDER BY id) FROM fz WHERE {where}"
+        return f"SELECT ARRAY(SELECT ai FROM fz WHERE {where} ORDER BY id)"
+
     def order_by(self, tiebreak=True):
         # Always end with the unique `id` so ordering is total; LIMIT without
         # a total order is unspecified in SQL and its row set would differ by
@@ -258,6 +274,8 @@ class Gen:
 
     def statement(self):
         """A random SELECT: plain projection or an aggregate/GROUP BY."""
+        if self.maybe(0.08):
+            return self.array_statement()
         if self.maybe(0.3):
             # Aggregate / GROUP BY form.
             grp = self.choice(ALL_COLS)
@@ -343,6 +361,8 @@ def main():
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-print", type=int, default=25)
+    ap.add_argument("--max-unsupported", type=int,
+                    help="fail when generated PostgreSQL-valid statements are unsupported")
     args = ap.parse_args()
 
     pg = psycopg.connect(host=args.host, port=args.pg, user="postgres",
@@ -422,7 +442,12 @@ def main():
     print(f"\nTOTAL: {args.count} statements (seed {args.seed})  "
           f"match={stats['match']}  unsupported={stats['unsupported']}  "
           f"divergence={stats['divergence']}")
-    sys.exit(1 if stats["divergence"] > 0 else 0)
+    unsupported_over_budget = (args.max_unsupported is not None
+                                and stats["unsupported"] > args.max_unsupported)
+    if unsupported_over_budget:
+        print(f"unsupported budget exceeded: {stats['unsupported']} > "
+              f"{args.max_unsupported}")
+    sys.exit(1 if stats["divergence"] > 0 or unsupported_over_budget else 0)
 
 
 def classify(pg_res, p3_res):

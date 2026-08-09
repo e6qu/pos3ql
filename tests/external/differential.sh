@@ -41,6 +41,13 @@ trap cleanup EXIT
 
 print -- "=== reference: $("$PGBIN/postgres" --version) ==="
 
+if python3 "$EXT/result_diff.py" >/dev/null; then
+  ok "differential result comparator"
+else
+  bad "differential result comparator"
+  exit 1
+fi
+
 # Real PostgreSQL, hermetic cluster.
 "$PGBIN/initdb" -D "$WORK/pgdata" -U postgres -A trust --encoding=UTF8 --lc-collate=C --lc-ctype=C >/dev/null 2>&1 || { bad initdb; exit 1; }
 SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)

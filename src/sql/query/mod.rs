@@ -3867,7 +3867,7 @@ pub fn describe_select_items<'q>(
                 column += scope.map_or(0, |scope| record_star_width(base, scope));
             }
             SelectItem::Expr { expression, .. } => {
-                if let Some(oid) = array_subquery_result_type(expression, storage, txid, arena)? {
+                if let Some(oid) = subquery_result_type(expression, storage, txid, arena)? {
                     out[column] = ColDesc::new(out[column].name, oid, -1);
                 }
                 column += 1;
@@ -3877,14 +3877,16 @@ pub fn describe_select_items<'q>(
     Ok(count)
 }
 
-fn array_subquery_result_type(
+fn subquery_result_type(
     expression: &Expr<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
 ) -> Result<Option<i32>, SqlError> {
-    let Expr::ArraySubquery(select) = expression else {
-        return Ok(None);
+    let (select, array) = match expression {
+        Expr::Subquery(select) => (select, false),
+        Expr::ArraySubquery(select) => (select, true),
+        _ => return Ok(None),
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let count = match &select.from {
@@ -3908,6 +3910,9 @@ fn array_subquery_result_type(
         ));
     }
     let element_oid = columns[0].type_oid;
+    if !array {
+        return Ok(Some(element_oid));
+    }
     let array_oid = match super::exec::coltype_of_oid(element_oid) {
         Some(ColType::Array(_)) => Some(element_oid),
         Some(scalar) => {

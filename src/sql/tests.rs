@@ -3293,6 +3293,29 @@ fn describe_array_subquery_uses_the_array_type() {
 }
 
 #[test]
+fn describe_correlated_scalar_subquery_uses_its_projection_type() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE describe_outer (id int)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE describe_inner (outer_id int)",
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT describe_outer.id, (SELECT count(*) FROM describe_inner WHERE outer_id = describe_outer.id) FROM describe_outer",
+        )),
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::INT8]
+    );
+}
+
+#[test]
 fn json_and_jsonb_types() {
     // Output/normalization/operators verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();

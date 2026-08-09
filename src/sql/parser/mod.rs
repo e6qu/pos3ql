@@ -4428,6 +4428,19 @@ mod tests {
     }
 
     #[test]
+    fn alter_publication_set_table_does_not_consume_the_set_keyword_twice() {
+        with_parser("ALTER PUBLICATION changes SET TABLE orders", |parser| {
+            let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap() else {
+                panic!("SET TABLE did not parse")
+            };
+            let crate::sql::ast::AlterPublicationAction::SetTables(tables) = action else {
+                panic!("SET TABLE parsed as another ALTER PUBLICATION action")
+            };
+            assert_eq!(tables, [QualName::bare("orders")]);
+        });
+    }
+
+    #[test]
     fn grouping_sets_expansion() {
         // Plain GROUP BY: no explicit sets, all columns implied.
         with_parser("SELECT a FROM t GROUP BY a, b", |p| {

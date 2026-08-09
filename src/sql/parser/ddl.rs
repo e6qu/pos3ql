@@ -916,23 +916,21 @@ impl<'a> Parser<'a> {
     /// execution cannot accidentally turn ADD or DROP into replacement.
     pub(super) fn alter_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.any_ident("publication name")?;
-        if self.eat_ident("set")? && self.eat_op("(")? {
-            self.expect_ident("publish")?;
-            self.expect_op("=")?;
-            let value = self.str_literal("publication publish option")?;
-            let publish = self.publication_operations(value)?;
-            self.expect_op(")")?;
-            return Ok(Stmt::AlterPublication {
-                name,
-                action: AlterPublicationAction::SetOperations(publish),
-            });
-        }
-        let action = if self.eat_ident("add")? {
+        let action = if self.eat_ident("set")? {
+            if self.eat_op("(")? {
+                self.expect_ident("publish")?;
+                self.expect_op("=")?;
+                let value = self.str_literal("publication publish option")?;
+                let publish = self.publication_operations(value)?;
+                self.expect_op(")")?;
+                AlterPublicationAction::SetOperations(publish)
+            } else {
+                self.expect_ident("table")?;
+                AlterPublicationAction::SetTables(self.publication_tables()?)
+            }
+        } else if self.eat_ident("add")? {
             self.expect_ident("table")?;
             AlterPublicationAction::AddTables(self.publication_tables()?)
-        } else if self.eat_ident("set")? {
-            self.expect_ident("table")?;
-            AlterPublicationAction::SetTables(self.publication_tables()?)
         } else if self.eat_ident("drop")? {
             self.expect_ident("table")?;
             AlterPublicationAction::DropTables(self.publication_tables()?)

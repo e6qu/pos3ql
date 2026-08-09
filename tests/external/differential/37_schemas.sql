@@ -171,10 +171,63 @@ SELECT current_schemas(true);
 CREATE TABLE cat_first(a int);
 SELECT schemaname FROM pg_tables WHERE tablename = 'cat_first';
 
+-- The bytewise collations accepted by the executor are visible to clients.
+SELECT collname, collprovider, collcollate, collctype, collisdeterministic, collencoding
+FROM pg_collation
+WHERE collname IN ('default', 'C', 'POSIX', 'ucs_basic')
+ORDER BY collname;
+
+CREATE SCHEMA catalog_meta;
+SET search_path = catalog_meta, pg_catalog;
+CREATE TABLE constraint_parent (id integer PRIMARY KEY);
+CREATE TABLE constraint_child (
+  id integer,
+  value integer,
+  parent_id integer,
+  CONSTRAINT constraint_child_primary PRIMARY KEY (id),
+  CONSTRAINT constraint_child_unique UNIQUE (value),
+  CONSTRAINT constraint_child_check CHECK (value > 0),
+  CONSTRAINT constraint_child_foreign FOREIGN KEY (parent_id) REFERENCES constraint_parent (id)
+);
+SELECT constraint_name, constraint_type, is_deferrable, initially_deferred, enforced, nulls_distinct
+FROM information_schema.table_constraints
+WHERE table_name = 'constraint_child'
+ORDER BY constraint_name;
+SELECT constraint_name, column_name, ordinal_position, position_in_unique_constraint
+FROM information_schema.key_column_usage
+WHERE table_name = 'constraint_child'
+ORDER BY constraint_name, ordinal_position;
+SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule
+FROM information_schema.referential_constraints
+WHERE constraint_name = 'constraint_child_foreign';
+SELECT constraint_name, table_name, column_name
+FROM information_schema.constraint_column_usage
+WHERE constraint_name LIKE 'constraint_child_%'
+ORDER BY constraint_name, table_name, column_name;
+CREATE TABLE position_parent (
+  first_column integer,
+  second_column integer,
+  CONSTRAINT position_parent_key UNIQUE (first_column, second_column)
+);
+CREATE TABLE position_child (
+  first_column integer,
+  second_column integer,
+  CONSTRAINT position_child_foreign FOREIGN KEY (first_column, second_column)
+    REFERENCES position_parent (second_column, first_column)
+);
+SELECT column_name, ordinal_position, position_in_unique_constraint
+FROM information_schema.key_column_usage
+WHERE constraint_name = 'position_child_foreign'
+ORDER BY ordinal_position;
+SELECT table_name, column_name
+FROM information_schema.constraint_column_usage
+WHERE constraint_name = 'position_child_foreign'
+ORDER BY column_name;
+
 -- Cleanup, restoring the default path for later corpora.
 SET search_path = "$user", public;
-DROP SCHEMA s1, sb, sc, sd, txs CASCADE;
-DROP SCHEMA s1, sb, sc, txs CASCADE;
+DROP SCHEMA s1, sb, sc, sd, txs, catalog_meta CASCADE;
+DROP SCHEMA s1, sb, sc, txs, catalog_meta CASCADE;
 DROP SCHEMA IF EXISTS sd CASCADE;
 DROP TABLE public.t, public.taken;
 DROP SCHEMA pg_reserved_test;

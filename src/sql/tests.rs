@@ -10787,7 +10787,6 @@ fn psql_catalog_listing_contracts() {
         "SELECT count(*) FROM pg_foreign_server s JOIN pg_foreign_data_wrapper f ON f.oid=s.srvfdw",
         "SELECT count(*) FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid=s.setdatabase",
         "SELECT count(*) FROM pg_parameter_acl",
-        "SELECT count(*) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace",
     ] {
         let output = run_with(&mut engine, &mut budget, query);
         assert_eq!(
@@ -10797,6 +10796,145 @@ fn psql_catalog_listing_contracts() {
             String::from_utf8_lossy(&output)
         );
     }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT collname, collprovider FROM pg_collation ORDER BY collname",
+        )),
+        ["C|c", "POSIX|c", "default|d", "ucs_basic|b"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE constraint_parent (id integer PRIMARY KEY);
+         CREATE TABLE constraint_child (
+           id integer,
+           value integer,
+           parent_id integer,
+           CONSTRAINT constraint_child_primary PRIMARY KEY (id),
+           CONSTRAINT constraint_child_unique UNIQUE (value),
+           CONSTRAINT constraint_child_check CHECK (value > 0),
+           CONSTRAINT constraint_child_foreign FOREIGN KEY (parent_id)
+             REFERENCES constraint_parent (id)
+         )",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT constraint_name, constraint_type
+             FROM information_schema.table_constraints
+             WHERE table_name = 'constraint_child'
+             ORDER BY constraint_name",
+        )),
+        [
+            "constraint_child_check|CHECK",
+            "constraint_child_foreign|FOREIGN KEY",
+            "constraint_child_id_not_null|CHECK",
+            "constraint_child_primary|PRIMARY KEY",
+            "constraint_child_unique|UNIQUE",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT constraint_name, nulls_distinct
+             FROM information_schema.table_constraints
+             WHERE table_name = 'constraint_child'
+             ORDER BY constraint_name",
+        )),
+        [
+            "constraint_child_check|NULL",
+            "constraint_child_foreign|NULL",
+            "constraint_child_id_not_null|NULL",
+            "constraint_child_primary|NULL",
+            "constraint_child_unique|YES",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT constraint_name, column_name, ordinal_position, position_in_unique_constraint
+             FROM information_schema.key_column_usage
+             WHERE table_name = 'constraint_child'
+             ORDER BY constraint_name, ordinal_position",
+        )),
+        [
+            "constraint_child_foreign|parent_id|1|1",
+            "constraint_child_primary|id|1|NULL",
+            "constraint_child_unique|value|1|NULL",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule
+             FROM information_schema.referential_constraints
+             WHERE constraint_name = 'constraint_child_foreign'",
+        )),
+        ["constraint_child_foreign|constraint_parent_pkey|NONE|NO ACTION|NO ACTION"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT constraint_name, table_name, column_name
+             FROM information_schema.constraint_column_usage
+             WHERE constraint_name LIKE 'constraint_child_%'
+             ORDER BY constraint_name, table_name, column_name",
+        )),
+        [
+            "constraint_child_check|constraint_child|value",
+            "constraint_child_foreign|constraint_parent|id",
+            "constraint_child_id_not_null|constraint_child|id",
+            "constraint_child_primary|constraint_child|id",
+            "constraint_child_unique|constraint_child|value",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE position_parent (
+           first_column integer,
+           second_column integer,
+           CONSTRAINT position_parent_key UNIQUE (first_column, second_column)
+         );
+         CREATE TABLE position_child (
+           first_column integer,
+           second_column integer,
+           CONSTRAINT position_child_foreign FOREIGN KEY (first_column, second_column)
+             REFERENCES position_parent (second_column, first_column)
+         )",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT column_name, ordinal_position, position_in_unique_constraint
+             FROM information_schema.key_column_usage
+             WHERE constraint_name = 'position_child_foreign'
+             ORDER BY ordinal_position",
+        )),
+        ["first_column|1|2", "second_column|2|1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT table_name, column_name
+             FROM information_schema.constraint_column_usage
+             WHERE constraint_name = 'position_child_foreign'
+             ORDER BY column_name",
+        )),
+        [
+            "position_parent|first_column",
+            "position_parent|second_column"
+        ]
+    );
 }
 
 #[test]

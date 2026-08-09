@@ -148,6 +148,7 @@ pub use projected::{
 };
 
 mod ddl;
+pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
 mod constraints;
@@ -1489,7 +1490,8 @@ pub fn create_schema(
         None
     };
     if name.starts_with("pg_") {
-        let mut detail = crate::util::StackStr::<512>::new();
+        let mut detail =
+            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
         let _ = core::fmt::Write::write_str(
             &mut detail,
             "The prefix \"pg_\" is reserved for system schemas.",
@@ -4612,7 +4614,8 @@ pub fn drop_schema(
     };
     if n_objects > 0 && !cascade {
         let first = slots[0];
-        let mut detail = crate::util::StackStr::<512>::new();
+        let mut detail =
+            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
         for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
             let mut line = crate::util::StackStr::<192>::new();
             describe(storage, o, &mut line);
@@ -4659,7 +4662,8 @@ pub fn drop_schema(
             stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
         )?;
     } else if n_objects > 1 {
-        let mut detail = crate::util::StackStr::<512>::new();
+        let mut detail =
+            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
         for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
             let mut line = crate::util::StackStr::<192>::new();
             describe(storage, o, &mut line);
@@ -7984,7 +7988,8 @@ fn report_stored_query_dependents(
         let _ = write!(out, "materialized view ");
         write_name(out, &matview.schema, &matview.name);
     };
-    let mut detail = crate::util::StackStr::<512>::new();
+    let mut detail =
+        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut written = 0usize;
     for depth in 1..=MAX_DEPENDENT_STORED_QUERIES as u8 {
         for slot in 0..storage.view_count() {

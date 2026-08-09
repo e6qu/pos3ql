@@ -12,7 +12,7 @@ use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::eval::{SqlError, sqlstate};
-use super::types::{ColType, Datum};
+use super::types::{ColType, Datum, TypeMod};
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
@@ -5080,8 +5080,45 @@ fn info_columns<'a>(
             ("table_name", ColType::Text),
             ("column_name", ColType::Text),
             ("ordinal_position", ColType::Int4),
+            ("column_default", ColType::Text),
             ("is_nullable", ColType::Text),
             ("data_type", ColType::Text),
+            ("character_maximum_length", ColType::Int4),
+            ("character_octet_length", ColType::Int4),
+            ("numeric_precision", ColType::Int4),
+            ("numeric_precision_radix", ColType::Int4),
+            ("numeric_scale", ColType::Int4),
+            ("datetime_precision", ColType::Int4),
+            ("interval_type", ColType::Text),
+            ("interval_precision", ColType::Int4),
+            ("character_set_catalog", ColType::Text),
+            ("character_set_schema", ColType::Text),
+            ("character_set_name", ColType::Text),
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("scope_catalog", ColType::Text),
+            ("scope_schema", ColType::Text),
+            ("scope_name", ColType::Text),
+            ("maximum_cardinality", ColType::Int4),
+            ("dtd_identifier", ColType::Text),
+            ("is_self_referencing", ColType::Text),
+            ("is_identity", ColType::Text),
+            ("identity_generation", ColType::Text),
+            ("identity_start", ColType::Text),
+            ("identity_increment", ColType::Text),
+            ("identity_maximum", ColType::Text),
+            ("identity_minimum", ColType::Text),
+            ("identity_cycle", ColType::Text),
+            ("is_generated", ColType::Text),
+            ("generation_expression", ColType::Text),
+            ("is_updatable", ColType::Text),
         ],
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
@@ -5098,21 +5135,17 @@ fn info_columns<'a>(
                     "information_schema.columns exceeds static capacity"
                 ));
             }
-            out[n] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(
-                        arena
-                            .alloc_str(table.schema.as_str())
-                            .map_err(|_| crate::sql::eval::arena_full())?,
-                        arena,
-                    )?,
-                    text(table.name.as_str(), arena)?,
-                    text(c.name.as_str(), arena)?,
-                    Datum::Int4(i as i32 + 1),
-                    text(if c.not_null { "NO" } else { "YES" }, arena)?,
-                    text(c.ctype.name(), arena)?,
-                ],
+            out[n] = info_column_row(
+                storage,
+                txid,
+                InformationSchemaColumnSource {
+                    schema: table.schema.as_str(),
+                    table: table.name.as_str(),
+                    name: c.name.as_str(),
+                    position: i + 1,
+                    column: c,
+                    updatable: true,
+                },
                 arena,
             )?;
             n += 1;
@@ -5131,17 +5164,32 @@ fn info_columns<'a>(
                     "information_schema.columns exceeds static capacity"
                 ));
             }
-            let data_type = information_schema_data_type(storage, column.type_oid)?;
-            out[n] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(view.schema.as_str(), arena)?,
-                    text(view.name.as_str(), arena)?,
-                    text(column.name, arena)?,
-                    Datum::Int4(index as i32 + 1),
-                    text("YES", arena)?,
-                    text(data_type.as_str(), arena)?,
-                ],
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
+            let column_meta = ColumnMeta {
+                name: SqlName::EMPTY,
+                ctype,
+                type_mod: column.type_mod,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type,
+            };
+            out[n] = info_column_row(
+                storage,
+                txid,
+                InformationSchemaColumnSource {
+                    schema: view.schema.as_str(),
+                    table: view.name.as_str(),
+                    name: column.name,
+                    position: index + 1,
+                    column: &column_meta,
+                    updatable: false,
+                },
                 arena,
             )?;
             n += 1;
@@ -5150,17 +5198,306 @@ fn info_columns<'a>(
     finish(def, &out[..n], arena)
 }
 
+fn view_column_catalog_type(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<(ColType, Option<crate::storage::UserTypeName>), SqlError> {
+    use crate::sql::types::oid as type_oid;
+    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        let definition = storage.domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid);
+        return Ok((
+            definition.base,
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
+    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+        .contains(&oid)
+    {
+        let definition = storage.enum_for((oid - type_oid::FIRST_ENUM) as usize, txid);
+        return Ok((
+            ColType::Enum((oid - type_oid::FIRST_ENUM) as u16),
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
+    super::exec::coltype_of_oid(oid)
+        .map(|ctype| (ctype, None))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column has unsupported type oid {}",
+                oid
+            )
+        })
+}
+
+/// The type-dependent portion of `information_schema.columns`.  `TypeMod`
+/// keeps the several PostgreSQL wire encodings from leaking into catalog code.
+struct InformationSchemaColumnSource<'a> {
+    schema: &'a str,
+    table: &'a str,
+    name: &'a str,
+    position: usize,
+    column: &'a ColumnMeta,
+    updatable: bool,
+}
+
+fn info_column_row<'a>(
+    storage: &Storage,
+    txid: u32,
+    source: InformationSchemaColumnSource<'_>,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    use crate::sql::types::oid;
+    let InformationSchemaColumnSource {
+        schema,
+        table,
+        name,
+        position,
+        column,
+        updatable,
+    } = source;
+    let declared_oid = catalog_column_type_oid(storage, column, txid)?;
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&declared_oid);
+    let domain =
+        is_domain.then(|| storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid));
+    let type_mod = TypeMod::decode(column.ctype, column.type_mod);
+    let data_type = information_schema_data_type(storage, txid, declared_oid)?;
+    let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
+        match type_mod {
+            TypeMod::Length(length)
+                if matches!(column.ctype, ColType::Varchar | ColType::Bpchar) =>
+            {
+                (Some(length as i32), None, None, None, None)
+            }
+            TypeMod::NumericPS { precision, scale } => (
+                None,
+                Some(precision as i32),
+                Some(10),
+                Some(scale as i32),
+                None,
+            ),
+            TypeMod::TemporalPrecision(precision) => {
+                (None, None, None, None, Some(precision as i32))
+            }
+            TypeMod::IntervalMod { precision, .. } => {
+                (None, None, None, None, precision.map(i32::from))
+            }
+            _ => match column.ctype {
+                ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
+                ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
+                ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
+                ColType::Float4 => (None, Some(24), Some(2), None, None),
+                ColType::Float8 => (None, Some(53), Some(2), None, None),
+                _ => (None, None, None, None, None),
+            },
+        };
+    let user_type = column.user_type;
+    let (udt_schema, udt_name) = if let Some(identity) = user_type {
+        let mut type_name = StackStr::<64>::new();
+        if matches!(column.ctype, ColType::Array(_)) {
+            use core::fmt::Write as _;
+            let _ = write!(type_name, "_{}", identity.name.as_str());
+        } else {
+            use core::fmt::Write as _;
+            let _ = write!(type_name, "{}", identity.name.as_str());
+        }
+        (identity.schema, type_name)
+    } else {
+        (
+            SqlName::parse("pg_catalog").expect("catalog schema fits"),
+            StackStr::from_str(column.ctype.catalog_name()),
+        )
+    };
+    let default = (!column.default.is_generated())
+        .then(|| column.default.expression())
+        .flatten();
+    let generated = column.default.is_generated();
+    let generated_expression = generated.then(|| column.default.expression()).flatten();
+    let nullable = !column.not_null && !domain.is_some_and(|definition| definition.not_null);
+    let identity = column.is_identity;
+    let identity_sequence = identity
+        .then(|| {
+            (0..storage.sequence_count())
+                .map(|slot| storage.sequence_for(slot, txid))
+                .find(|sequence| {
+                    sequence.generator_for.is_some_and(|owner| {
+                        owner.table_schema.as_str() == schema
+                            && owner.table.as_str() == table
+                            && owner.column.as_str() == name
+                    })
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "identity column \"{}.{}.{}\" has no generator sequence",
+                        schema,
+                        table,
+                        name
+                    )
+                })
+        })
+        .transpose()?;
+    let identity_start = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.start_value));
+    let identity_increment = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.increment));
+    let identity_maximum = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.max_value));
+    let identity_minimum = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.min_value));
+    let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
+    let default_datum = match default {
+        Some(value) => text(value.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let domain_catalog = match domain {
+        Some(_) => text("postgres", arena)?,
+        None => Datum::Null,
+    };
+    let domain_schema = match domain {
+        Some(value) => text(value.schema.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let domain_name = match domain {
+        Some(value) => text(value.name.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let generated_expression = match generated_expression {
+        Some(value) => text(value.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    row(
+        &[
+            text("postgres", arena)?,
+            text(schema, arena)?,
+            text(table, arena)?,
+            text(name, arena)?,
+            Datum::Int4(position as i32),
+            default_datum,
+            text(if nullable { "YES" } else { "NO" }, arena)?,
+            text(data_type.as_str(), arena)?,
+            character_length.map_or(Datum::Null, Datum::Int4),
+            character_length.map_or(Datum::Null, Datum::Int4),
+            numeric_precision.map_or(Datum::Null, Datum::Int4),
+            numeric_radix.map_or(Datum::Null, Datum::Int4),
+            numeric_scale.map_or(Datum::Null, Datum::Int4),
+            datetime_precision.map_or(Datum::Null, Datum::Int4),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            domain_catalog,
+            domain_schema,
+            domain_name,
+            text("postgres", arena)?,
+            text(udt_schema.as_str(), arena)?,
+            text(udt_name.as_str(), arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            text(stack_format!(32, "{}", position).as_str(), arena)?,
+            text("NO", arena)?,
+            text(if identity { "YES" } else { "NO" }, arena)?,
+            if identity {
+                text(
+                    if column.identity_always {
+                        "ALWAYS"
+                    } else {
+                        "BY DEFAULT"
+                    },
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_start.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_increment
+                        .expect("identity has a sequence")
+                        .as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_maximum.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_minimum.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    if identity_cycle.expect("identity has a sequence") {
+                        "YES"
+                    } else {
+                        "NO"
+                    },
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            text(if generated { "ALWAYS" } else { "NEVER" }, arena)?,
+            generated_expression,
+            text(if updatable { "YES" } else { "NO" }, arena)?,
+        ],
+        arena,
+    )
+}
+
 /// The SQL-standard `data_type` spelling is intentionally less specific than
 /// PostgreSQL's OID. Domains report their base type, enums report
 /// `USER-DEFINED`, and arrays report `ARRAY`.
-fn information_schema_data_type(storage: &Storage, oid: i32) -> Result<StackStr<64>, SqlError> {
+fn information_schema_data_type(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<StackStr<64>, SqlError> {
     use crate::sql::types::oid as type_oid;
     if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
         .contains(&oid)
     {
         return Ok(StackStr::from_str(
             storage
-                .domain((oid - type_oid::FIRST_DOMAIN) as usize)
+                .domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid)
                 .base
                 .name(),
         ));

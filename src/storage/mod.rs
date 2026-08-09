@@ -1536,6 +1536,22 @@ pub(crate) struct ReplicationSlotDef {
     pub live: bool,
 }
 
+/// A validated slot acknowledgement, ready to become durable.
+///
+/// Constructing this proof checks the live slot and its monotonic cursor before
+/// WAL is written; only this module can then apply it to the recorded slot.
+pub(crate) struct ReplicationSlotAdvance {
+    slot: usize,
+    name: SqlName,
+    confirmed_flush_lsn: u64,
+}
+
+impl ReplicationSlotAdvance {
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -9138,31 +9154,44 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn advance_replication_slot(
-        &mut self,
+    pub(crate) fn prepare_replication_slot_advance(
+        &self,
         name: &str,
         confirmed_flush_lsn: u64,
-    ) -> Result<(), SqlError> {
-        let Some(slot) = self
+    ) -> Result<ReplicationSlotAdvance, SqlError> {
+        let (index, slot) = self
             .replication_slots
-            .iter_mut()
-            .find(|slot| slot.live && slot.name.as_str() == name)
-        else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "replication slot \"{}\" does not exist",
-                name
-            ));
-        };
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.live && slot.name.as_str() == name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    name
+                )
+            })?;
         if confirmed_flush_lsn < slot.confirmed_flush_lsn {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "replication slot confirmed LSN cannot move backwards"
             ));
         }
-        slot.confirmed_flush_lsn = confirmed_flush_lsn;
-        slot.restart_lsn = confirmed_flush_lsn;
-        Ok(())
+        Ok(ReplicationSlotAdvance {
+            slot: index,
+            name: slot.name,
+            confirmed_flush_lsn,
+        })
+    }
+
+    pub(crate) fn apply_replication_slot_advance(&mut self, advance: ReplicationSlotAdvance) {
+        let slot = self
+            .replication_slots
+            .get_mut(advance.slot)
+            .filter(|slot| slot.live && slot.name == advance.name)
+            .expect("validated replication slot must remain live until its WAL commit");
+        slot.confirmed_flush_lsn = advance.confirmed_flush_lsn;
+        slot.restart_lsn = advance.confirmed_flush_lsn;
     }
 
     pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
@@ -11555,7 +11584,10 @@ mod tests {
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
-        storage.advance_replication_slot("changes", 47).unwrap();
+        let advance = storage
+            .prepare_replication_slot_advance("changes", 47)
+            .unwrap();
+        storage.apply_replication_slot_advance(advance);
         let slot = storage.replication_slot("changes").unwrap();
         assert_eq!(slot.restart_lsn, 47);
         assert_eq!(slot.confirmed_flush_lsn, 47);

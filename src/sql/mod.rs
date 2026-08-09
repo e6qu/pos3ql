@@ -485,7 +485,7 @@ fn emit_replication_relation(
 fn emit_pending_truncates(
     storage: &Storage,
     publication_names: &[SqlName],
-    proto_version: u8,
+    proto_version: crate::pg::pgoutput::ProtocolVersion,
     end_lsn: u64,
     command_id: u32,
     truncates: &mut [PendingTruncate],
@@ -514,7 +514,7 @@ fn emit_pending_truncates(
             relation_count += 1;
         }
         if relation_count != 0 {
-            if proto_version < 2 {
+            if proto_version < crate::pg::pgoutput::ProtocolVersion::V2 {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "pgoutput proto_version '2' is required for TRUNCATE"
@@ -914,6 +914,9 @@ impl Engine {
         name: &str,
         confirmed_flush_lsn: u64,
     ) -> Result<(), SqlError> {
+        let advance = self
+            .storage
+            .prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
         self.next_txid = self.next_txid.wrapping_add(1).max(1);
         let transaction_id = self.next_txid;
         let lsn =
@@ -924,7 +927,7 @@ impl Engine {
             transaction_id,
             lsn,
             &WalOp::AdvanceReplicationSlot {
-                name,
+                name: advance.name(),
                 confirmed_flush_lsn,
             },
         )?;
@@ -936,8 +939,7 @@ impl Engine {
             }
         };
         self.wal.commit();
-        self.storage
-            .advance_replication_slot(name, confirmed_flush_lsn)?;
+        self.storage.apply_replication_slot_advance(advance);
         self.storage.set_lsn(commit_lsn);
         Ok(())
     }
@@ -950,7 +952,7 @@ impl Engine {
         floor: u64,
         publication_names: &[SqlName],
         binary: bool,
-        proto_version: u8,
+        proto_version: crate::pg::pgoutput::ProtocolVersion,
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<(u64, bool)>, SqlError> {
@@ -5720,7 +5722,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::AdvanceReplicationSlot {
             name,
             confirmed_flush_lsn,
-        } => storage.advance_replication_slot(name, confirmed_flush_lsn)?,
+        } => {
+            let advance = storage.prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
+            storage.apply_replication_slot_advance(advance);
+        }
         WalOp::CreateTable(def) => {
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema

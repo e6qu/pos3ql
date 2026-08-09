@@ -165,7 +165,7 @@ struct ReplicationStream {
     slot: SqlName,
     /// pgoutput defaults to text; binary tuples require explicit negotiation.
     binary: bool,
-    proto_version: u8,
+    proto_version: super::pgoutput::ProtocolVersion,
     /// Durable slot confirmation, advanced only by a valid standby flush.
     cursor_lsn: u64,
     /// Connection-local send cursor. Reconnect starts again at `cursor_lsn`,
@@ -2511,9 +2511,10 @@ impl Conn {
                     proto_version,
                 }) => {
                     self.replication_publications.clear();
-                    if let Err(error) =
-                        parse_publication_names(publication, &mut self.replication_publications)
-                    {
+                    if let Err(error) = parse_pgoutput_publication_names(
+                        publication,
+                        &mut self.replication_publications,
+                    ) {
                         let mut responder = Responder::new(&mut self.send);
                         let _ = responder
                             .error(error.sqlstate, error.message.as_str())
@@ -2681,7 +2682,7 @@ enum LogicalReplicationCommand<'a> {
         publication: &'a str,
         requested_lsn: u64,
         binary: bool,
-        proto_version: u8,
+        proto_version: super::pgoutput::ProtocolVersion,
     },
 }
 
@@ -2820,7 +2821,9 @@ fn parse_lsn(value: &str) -> Option<u64> {
 /// Parses pgoutput's parenthesized option list without accepting ignored
 /// keys. Values are SQL-style single-quoted strings; the bounded publication
 /// name is copied only after every option has been validated.
-fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
+fn parse_pgoutput_options(
+    input: &str,
+) -> Result<(&str, bool, super::pgoutput::ProtocolVersion), SqlError> {
     let mut input = input.trim();
     let Some(body) = input.strip_prefix('(') else {
         return Err(sql_err!(
@@ -2858,20 +2861,8 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
         if let Some(rest) = input.strip_prefix('=') {
             input = rest.trim_start();
         }
-        let Some(rest) = input.strip_prefix('\'') else {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "pgoutput option values must be quoted"
-            ));
-        };
-        let Some(end) = rest.find('\'') else {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "unterminated pgoutput option value"
-            ));
-        };
-        let value = &rest[..end];
-        input = rest[end + 1..].trim_start();
+        let (value, rest) = take_pgoutput_option_value(input)?;
+        input = rest.trim_start();
         if let Some(rest) = input.strip_prefix(',') {
             input = rest;
         } else if !input.starts_with(')') {
@@ -2912,6 +2903,24 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
                 }
             };
             saw_binary = true;
+        } else if key.eq_ignore_ascii_case("messages") {
+            require_pgoutput_disabled_option("messages", value)?;
+        } else if key.eq_ignore_ascii_case("two_phase") {
+            require_pgoutput_disabled_option("two_phase", value)?;
+        } else if key.eq_ignore_ascii_case("streaming") {
+            if !value.eq_ignore_ascii_case("off") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "pgoutput streaming must be 'off'"
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("origin") {
+            if !value.eq_ignore_ascii_case("none") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "pgoutput origin must be 'none'"
+                ));
+            }
         } else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2920,16 +2929,14 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
             ));
         }
     }
-    let proto_version = match proto_version {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => {
-            return Err(sql_err!(
+    let proto_version = proto_version
+        .and_then(super::pgoutput::ProtocolVersion::parse)
+        .ok_or_else(|| {
+            sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "pgoutput requires proto_version '1' or '2'"
-            ));
-        }
-    };
+                "pgoutput requires proto_version '1', '2', '3', or '4'"
+            )
+        })?;
     let publication = publication.ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -2951,9 +2958,68 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, bool, u8), SqlError> {
     Ok((publication, binary, proto_version))
 }
 
+fn require_pgoutput_disabled_option(option: &str, value: &str) -> Result<(), SqlError> {
+    if value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
+        || value == "0"
+    {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "pgoutput {} must be disabled",
+        option
+    ))
+}
+
+/// Takes a standard SQL single-quoted option value. The returned text retains
+/// doubled apostrophes so the publication-name parser can decode them without
+/// allocating a second command buffer.
+fn take_pgoutput_option_value(input: &str) -> Result<(&str, &str), SqlError> {
+    let Some(value) = input.strip_prefix('\'') else {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "pgoutput option values must be quoted"
+        ));
+    };
+    let mut at = 0;
+    while at < value.len() {
+        let Some(quote) = value[at..].find('\'') else {
+            break;
+        };
+        let quote = at + quote;
+        if value[quote + 1..].starts_with('\'') {
+            at = quote + 2;
+            continue;
+        }
+        return Ok((&value[..quote], &value[quote + 1..]));
+    }
+    Err(sql_err!(
+        sqlstate::SYNTAX_ERROR,
+        "unterminated pgoutput option value"
+    ))
+}
+
+#[cfg(test)]
 fn parse_publication_names(
     input: &str,
     publications: &mut FixedVec<SqlName>,
+) -> Result<(), SqlError> {
+    parse_publication_names_impl(input, publications, false)
+}
+
+fn parse_pgoutput_publication_names(
+    input: &str,
+    publications: &mut FixedVec<SqlName>,
+) -> Result<(), SqlError> {
+    parse_publication_names_impl(input, publications, true)
+}
+
+fn parse_publication_names_impl(
+    input: &str,
+    publications: &mut FixedVec<SqlName>,
+    sql_quoted: bool,
 ) -> Result<(), SqlError> {
     use core::fmt::Write;
 
@@ -2983,6 +3049,14 @@ fn parse_publication_names(
                     ));
                 };
                 quoted = &quoted[character.len_utf8()..];
+                if sql_quoted
+                    && character == '\''
+                    && let Some(rest) = quoted.strip_prefix('\'')
+                {
+                    quoted = rest;
+                    let _ = name.write_char('\'');
+                    continue;
+                }
                 if character == '"' {
                     if let Some(rest) = quoted.strip_prefix('"') {
                         quoted = rest;
@@ -3681,7 +3755,7 @@ mod tests {
         assert_eq!(publication, "changes_pub");
         assert_eq!(requested_lsn, 0);
         assert!(!binary);
-        assert_eq!(proto_version, 1);
+        assert_eq!(proto_version, crate::pg::pgoutput::ProtocolVersion::V1);
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'true', proto_version '1')",
         )
@@ -3697,7 +3771,20 @@ mod tests {
         let LogicalReplicationCommand::Start { proto_version, .. } = command else {
             panic!("expected START_REPLICATION")
         };
-        assert_eq!(proto_version, 2);
+        assert_eq!(proto_version, crate::pg::pgoutput::ProtocolVersion::V2);
+        for (value, expected) in [
+            ("3", crate::pg::pgoutput::ProtocolVersion::V3),
+            ("4", crate::pg::pgoutput::ProtocolVersion::V4),
+        ] {
+            let input = format!(
+                "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '{value}', publication_names 'changes_pub', messages 'FALSE', streaming 'off', two_phase '0', origin 'none')"
+            );
+            let command = parse_logical_replication_command(&input).unwrap();
+            let LogicalReplicationCommand::Start { proto_version, .. } = command else {
+                panic!("expected START_REPLICATION")
+            };
+            assert_eq!(proto_version, expected);
+        }
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 1/2 (proto_version '1', publication_names 'changes_pub')",
         )
@@ -3714,6 +3801,17 @@ mod tests {
             panic!("expected START_REPLICATION")
         };
         assert_eq!(publication, "changes_pub,other_pub");
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names '\"O''Brien\"')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { publication, .. } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        let mut budget = Budget::new(core::mem::size_of::<SqlName>());
+        let mut publications = FixedVec::new(&mut budget, "test publications", 1).unwrap();
+        parse_pgoutput_publication_names(publication, &mut publications).unwrap();
+        assert_eq!(publications.as_slice()[0].as_str(), "O'Brien");
         assert!(
             parse_logical_replication_command(
                 "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1')"
@@ -3721,8 +3819,10 @@ mod tests {
             .is_err()
         );
         for input in [
-            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '3', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '5', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', streaming 'true')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '3', publication_names 'changes_pub', two_phase 'true')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '4', publication_names 'changes_pub', origin 'any')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/not-lsn (proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub,')",

@@ -3803,7 +3803,15 @@ impl Engine {
                         Err(error) => return Ok(Err(error)),
                     };
                 exec::delete(
-                    storage, txn, scratch, delete, arena, params, responder, capture,
+                    storage,
+                    txn,
+                    scratch,
+                    delete,
+                    arena,
+                    params,
+                    guc.seq_session(),
+                    responder,
+                    capture,
                 )
             }
             _ => Ok(Err(sql_err!(

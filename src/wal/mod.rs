@@ -14,9 +14,10 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnMeta, ColumnStatistics, DependencyClass, FkAction, ForeignKey,
-    MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics, OwnedDatum,
-    RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
+    CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
+    ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics,
+    OwnedDatum, RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics,
+    UniqueKey,
 };
 
 use crc32c::crc32c;
@@ -1208,9 +1209,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2;
             for c in def.columns() {
-                n += 1 + c.name.as_str().len() + 2 + 4 + encoded_default_len(&c.default_value);
+                let default_value = c.default.constant().copied();
+                n += 1 + c.name.as_str().len() + 2 + 4 + encoded_default_len(&default_value);
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
-                n += 2 + c.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
+                n += 2 + c
+                    .default
+                    .expression()
+                    .map(|e| e.as_str().len())
+                    .unwrap_or(0);
                 // auto_increment_step (i64).
                 n += 8;
                 // User-defined column: name, then a format marker and schema.
@@ -1486,14 +1492,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.is_generated) << 4)
+                    | (u8::from(c.default.is_generated()) << 4)
                     | (u8::from(c.is_identity) << 5)
                     | (u8::from(c.identity_always) << 6)
                     | (u8::from(c.user_type.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
-                ok &= append_default(buffer, &c.default_value);
-                let de = c.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
+                let default_value = c.default.constant().copied();
+                ok &= append_default(buffer, &default_value);
+                let de = c.default.expression().map_or("", |e| e.as_str());
                 ok &= buffer.append(&(de.len() as u16).to_le_bytes());
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
@@ -2143,9 +2150,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     unique: false,
                     primary: false,
                     auto_increment: false,
-                    default_value: None,
-                    default_expr: None,
-                    is_generated: false,
+                    default: ColumnDefault::NONE,
                     is_identity: false,
                     identity_always: false,
                     auto_increment_step: 1,
@@ -2187,6 +2192,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 } else {
                     None
                 };
+                let default =
+                    ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
@@ -2195,9 +2202,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
-                    default_value,
-                    default_expr,
-                    is_generated: meta[1] & 16 != 0,
+                    default,
                     is_identity: meta[1] & 32 != 0,
                     identity_always: meta[1] & 64 != 0,
                     auto_increment_step,
@@ -3347,9 +3352,7 @@ mod tests {
                 unique: false,
                 primary: false,
                 auto_increment: false,
-                default_value: None,
-                default_expr: None,
-                is_generated: false,
+                default: ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
@@ -3366,9 +3369,7 @@ mod tests {
             unique: true,
             primary: true,
             auto_increment: false,
-            default_value: None,
-            default_expr: None,
-            is_generated: false,
+            default: ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
@@ -3382,9 +3383,10 @@ mod tests {
             unique: false,
             primary: false,
             auto_increment: false,
-            default_value: Some(OwnedDatum::Int4(7)),
-            default_expr: None,
-            is_generated: false,
+            default: ColumnDefault::Constant {
+                value: OwnedDatum::Int4(7),
+                expression: crate::util::StackStr::from_str("7"),
+            },
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,

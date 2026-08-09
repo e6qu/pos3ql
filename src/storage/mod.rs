@@ -142,6 +142,66 @@ pub enum OwnedDatum {
 
 pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
 
+/// The complete default state of one column.
+///
+/// A constant retains its parsed value as an execution cache and its source as
+/// catalog identity. Keeping the alternatives together prevents a column from
+/// being both generated and defaulted, or from carrying a value without the
+/// expression that describes it.
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnDefault {
+    None,
+    Constant {
+        value: OwnedDatum,
+        expression: StackStr<DEFAULT_EXPR_MAX>,
+    },
+    /// A pre-source journal entry. New DDL never constructs this variant;
+    /// keeping it explicit lets recovery preserve an older durable default
+    /// without admitting incomplete state into new catalog writes.
+    LegacyConstant(OwnedDatum),
+    Expression(StackStr<DEFAULT_EXPR_MAX>),
+    Generated(StackStr<DEFAULT_EXPR_MAX>),
+}
+
+impl ColumnDefault {
+    pub const NONE: Self = Self::None;
+
+    pub const fn expression(&self) -> Option<&StackStr<DEFAULT_EXPR_MAX>> {
+        match self {
+            Self::None | Self::LegacyConstant(_) => None,
+            Self::Constant { expression, .. }
+            | Self::Expression(expression)
+            | Self::Generated(expression) => Some(expression),
+        }
+    }
+
+    pub const fn constant(&self) -> Option<&OwnedDatum> {
+        match self {
+            Self::Constant { value, .. } | Self::LegacyConstant(value) => Some(value),
+            Self::None | Self::Expression(_) | Self::Generated(_) => None,
+        }
+    }
+
+    pub const fn is_generated(self) -> bool {
+        matches!(self, Self::Generated(_))
+    }
+
+    pub const fn from_parts(
+        value: Option<OwnedDatum>,
+        expression: Option<StackStr<DEFAULT_EXPR_MAX>>,
+        generated: bool,
+    ) -> Option<Self> {
+        match (value, expression, generated) {
+            (None, None, false) => Some(Self::None),
+            (Some(value), Some(expression), false) => Some(Self::Constant { value, expression }),
+            (Some(value), None, false) => Some(Self::LegacyConstant(value)),
+            (None, Some(expression), false) => Some(Self::Expression(expression)),
+            (None, Some(expression), true) => Some(Self::Generated(expression)),
+            _ => None,
+        }
+    }
+}
+
 impl OwnedDatum {
     pub fn from_datum(d: &crate::sql::types::Datum) -> Result<Self, SqlError> {
         use crate::sql::types::Datum;
@@ -305,20 +365,9 @@ pub struct ColumnMeta {
     /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
     /// column's current maximum.
     pub auto_increment: bool,
-    /// A DEFAULT that folds to a constant (a literal-only expression), stored as
-    /// its owned value for a fast insert. Non-constant defaults live in
-    /// `default_expr` instead; the two are mutually exclusive.
-    pub default_value: Option<OwnedDatum>,
-    /// Either a non-constant DEFAULT — anything with a function call (`now()`,
-    /// `nextval(...)`, `gen_random_uuid()`, …) — or, when `is_generated`, the
-    /// `GENERATED ALWAYS AS (expr) STORED` expression. Kept as raw source text
-    /// and re-parsed + evaluated per row (against the row's other columns, for a
-    /// generated column). Also the source for `pg_get_expr` / `\d`.
-    pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
-    /// When set, `default_expr` is a `STORED` generation expression (attgenerated
-    /// `'s'`), computed from the row rather than defaulted — the two never
-    /// coexist on one column.
-    pub is_generated: bool,
+    /// DEFAULT or `GENERATED ALWAYS AS (...) STORED`, including its source for
+    /// catalog rendering and replay.
+    pub default: ColumnDefault,
     /// A `GENERATED ... AS IDENTITY` column (also `auto_increment`): distinguishes
     /// it from a bare `serial` for `pg_attribute.attidentity`.
     pub is_identity: bool,
@@ -409,9 +458,7 @@ impl ColumnMeta {
         unique: false,
         primary: false,
         auto_increment: false,
-        default_value: None,
-        default_expr: None,
-        is_generated: false,
+        default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
@@ -3012,9 +3059,7 @@ impl Storage {
                             unique: false,
                             primary: false,
                             auto_increment: false,
-                            default_value: None,
-                            default_expr: None,
-                            is_generated: false,
+                            default: ColumnDefault::NONE,
                             is_identity: false,
                             identity_always: false,
                             auto_increment_step: 1,
@@ -11232,9 +11277,7 @@ mod tests {
                 unique: false,
                 primary: false,
                 auto_increment: false,
-                default_value: None,
-                default_expr: None,
-                is_generated: false,
+                default: ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
@@ -11252,9 +11295,7 @@ mod tests {
                 unique: false,
                 primary: false,
                 auto_increment: false,
-                default_value: None,
-                default_expr: None,
-                is_generated: false,
+                default: ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
                 auto_increment_step: 1,
@@ -11521,5 +11562,26 @@ mod tests {
         assert_eq!(storage.oldest_replication_restart_lsn(), Some(47));
         storage.drop_replication_slot("changes").unwrap();
         assert!(storage.replication_slot("changes").is_none());
+    }
+
+    #[test]
+    fn column_default_encodes_one_execution_state() {
+        let expression = StackStr::from_str("7");
+        assert!(matches!(
+            ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), false),
+            Some(ColumnDefault::Constant { .. })
+        ));
+        assert!(matches!(
+            ColumnDefault::from_parts(None, Some(expression), false),
+            Some(ColumnDefault::Expression(_))
+        ));
+        assert!(matches!(
+            ColumnDefault::from_parts(None, Some(expression), true),
+            Some(ColumnDefault::Generated(_))
+        ));
+        assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, true).is_none());
+        assert!(
+            ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), true).is_none()
+        );
     }
 }

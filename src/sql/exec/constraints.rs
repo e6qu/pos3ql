@@ -538,25 +538,23 @@ pub(crate) fn parse_checks<'a>(
     Ok(out)
 }
 
-/// A column's DEFAULT source, re-parsed once per statement (indexed by column).
-/// Folded scalar defaults may also have a parsed source for catalog fidelity;
-/// execution still takes their `default_value` fast path.
+/// A column's DEFAULT source, re-parsed once per statement and indexed by
+/// column. Folded constants retain their inline execution cache.
 pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 
 /// Re-parses every stored DEFAULT expression once per statement.
-/// Generated columns (whose `default_expr` is a generation expression) are
-/// excluded — they are computed from the row by [`parse_generated`], not
-/// defaulted.
+/// Generated columns are excluded — they are computed from the row by
+/// [`parse_generated`], not defaulted.
 pub(crate) fn parse_defaults<'a>(
     def: &'a TableDef,
     arena: &'a Arena,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
     for (i, c) in def.columns().iter().enumerate() {
-        if c.is_generated {
+        if c.default.is_generated() {
             continue;
         }
-        if let Some(text) = &c.default_expr {
+        if let Some(text) = c.default.expression() {
             out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
         }
     }
@@ -572,8 +570,8 @@ pub(crate) fn parse_generated<'a>(
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
     for (i, c) in def.columns().iter().enumerate() {
-        if c.is_generated {
-            let text = c.default_expr.as_ref().expect("generated column has expr");
+        if c.default.is_generated() {
+            let text = c.default.expression().expect("generated column has expr");
             out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
         }
     }
@@ -762,6 +760,7 @@ pub(crate) fn apply_fk_parent_actions(
     new_parent: Option<&[Datum]>,
     arena: &Arena,
     params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
     depth: u32,
 ) -> Result<(), SqlError> {
     if depth == 0 {
@@ -898,6 +897,7 @@ pub(crate) fn apply_fk_parent_actions(
 
             let child_schema = cdef.schema.as_str();
             let child_name = cdef.name.as_str();
+            let defaults = parse_defaults(&cdef, arena)?;
             for &(rowid, old_bytes) in matches.iter() {
                 let mut crow = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(old_bytes, cschema, &mut crow)?;
@@ -913,6 +913,7 @@ pub(crate) fn apply_fk_parent_actions(
                         None,
                         arena,
                         params,
+                        seq_session,
                         depth - 1,
                     )?;
                     let prior = storage.write_pending(
@@ -937,11 +938,46 @@ pub(crate) fn apply_fk_parent_actions(
                             new_parent.expect("delete-cascade handled above")[pc as usize]
                         }
                         StorageFkAction::SetNull => Datum::Null,
-                        StorageFkAction::SetDefault => cdef.columns()[cc as usize]
-                            .default_value
-                            .as_ref()
-                            .map(|d| d.as_datum())
-                            .unwrap_or(Datum::Null),
+                        StorageFkAction::SetDefault => match &cdef.columns()[cc as usize].default {
+                            crate::storage::ColumnDefault::None => Datum::Null,
+                            crate::storage::ColumnDefault::Constant { value, .. }
+                            | crate::storage::ColumnDefault::LegacyConstant(value) => {
+                                value.as_datum()
+                            }
+                            crate::storage::ColumnDefault::Expression(_) => {
+                                let expression = defaults[cc as usize].ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "stored column default did not parse"
+                                    )
+                                })?;
+                                let sequence = crate::sql::sequence::SeqEval::new(
+                                    storage,
+                                    seq_session,
+                                    txn.txid,
+                                );
+                                let catalog = crate::sql::query::storage_catalog(storage, txn.txid);
+                                let hooks = crate::sql::eval::EvalHooks {
+                                    catalog: Some(&catalog),
+                                    sequences: Some(&sequence),
+                                    ..crate::sql::eval::NO_HOOKS
+                                };
+                                let value = crate::sql::eval::eval_full(
+                                    expression,
+                                    arena,
+                                    params,
+                                    &crate::sql::eval::NoColumns,
+                                    &hooks,
+                                )?;
+                                super::coerce(value, &cdef.columns()[cc as usize], storage, arena)?
+                            }
+                            crate::storage::ColumnDefault::Generated(_) => {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "generated column cannot be a foreign-key SET DEFAULT target"
+                                ));
+                            }
+                        },
                         StorageFkAction::NoAction | StorageFkAction::Restrict => {
                             unreachable!("blocking actions handled above")
                         }
@@ -972,6 +1008,7 @@ pub(crate) fn apply_fk_parent_actions(
                     Some(new_child),
                     arena,
                     params,
+                    seq_session,
                     depth - 1,
                 )?;
                 let len = rowenc::encoded_len(new_child);

@@ -44,6 +44,12 @@ SELECT typname, typtype, typbasetype, typnotnull, typdefault
 
 -- ALTER DOMAIN: add / drop a CHECK, set / drop a default, set / drop NOT NULL.
 ALTER DOMAIN dom_def SET DEFAULT 99;
+-- Persistent schemas reject record and its array pseudo-type at the DDL
+-- boundary; domains use PostgreSQL's distinct base-type diagnostic.
+CREATE TABLE invalid_record_column (value record);
+CREATE TABLE invalid_record_array_column (value record[]);
+CREATE DOMAIN invalid_record_domain AS record;
+CREATE DOMAIN invalid_record_array_domain AS record[];
 CREATE TABLE dom_t2 (x dom_def);
 INSERT INTO dom_t2 DEFAULT VALUES;
 SELECT x FROM dom_t2;

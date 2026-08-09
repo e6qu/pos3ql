@@ -426,11 +426,8 @@ fn build_def_with_likes(
             let source = like_source(storage, like, txid)?;
             for column in source.columns() {
                 let mut copied = *column;
-                if !like.defaults {
-                    copied.default_value = None;
-                    if !copied.is_generated {
-                        copied.default_expr = None;
-                    }
+                if !like.defaults && !copied.default.is_generated() {
+                    copied.default = crate::storage::ColumnDefault::NONE;
                 }
                 if !like.indexes {
                     copied.unique = false;
@@ -441,9 +438,8 @@ fn build_def_with_likes(
                 }
                 // Without INCLUDING GENERATED a generated column is copied as a
                 // plain column (its generation expression is dropped).
-                if !like.generated && copied.is_generated {
-                    copied.is_generated = false;
-                    copied.default_expr = None;
+                if !like.generated && copied.default.is_generated() {
+                    copied.default = crate::storage::ColumnDefault::NONE;
                 }
                 push_column(&mut def, &mut n, copied)?;
             }
@@ -5651,9 +5647,7 @@ pub fn create_table_as(
             unique: false,
             primary: false,
             auto_increment: false,
-            default_value: None,
-            default_expr: None,
-            is_generated: false,
+            default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
@@ -6755,6 +6749,13 @@ fn build_domain_spec(
     ast_checks: &[crate::sql::ast::DomainCheck],
     arena: &Arena,
 ) -> Result<crate::storage::DomainSpec, SqlError> {
+    if matches!(base_type, "record" | "record[]") {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "\"{}\" is not a valid base type for a domain",
+            base_type
+        ));
+    }
     let (base_domain, base, inherited_default) =
         if let Some(base) = ColType::from_sql_name(base_type) {
             (None, base, None)
@@ -9175,7 +9176,7 @@ pub fn copy_begin(
     }
     if !statement.to {
         for &target in &targets[..n_targets] {
-            if def.columns()[target].is_generated {
+            if def.columns()[target].default.is_generated() {
                 return Err(sql_err!(
                     sqlstate::GENERATED_ALWAYS,
                     "cannot insert a non-DEFAULT value into column \"{}\"",
@@ -9466,7 +9467,7 @@ pub(crate) fn resolve_binary_input_type(
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "binary input of an array-valued domain is not supported"
+                    "binary input of a record-valued domain is not supported"
                 )
             })?;
         return Ok(BinaryInputType::DomainArray(element));
@@ -10476,7 +10477,7 @@ where
         if explicit[index] {
             continue;
         }
-        if let Some(default) = &column.default_value {
+        if let Some(default) = column.default.constant() {
             values[index] = default.as_datum();
         } else if let Some(expression) = defaults[index] {
             let value = super::eval::eval_full(
@@ -10538,7 +10539,7 @@ fn reject_identity_write(def: &TableDef, column: usize) -> SqlError {
 /// Rejects an explicit non-`DEFAULT` value written to a generated column (428C9),
 /// the error PostgreSQL raises for `INSERT`/`UPDATE` on such a column.
 fn reject_generated_write(def: &TableDef, column: usize) -> Result<(), SqlError> {
-    if def.columns()[column].is_generated {
+    if def.columns()[column].default.is_generated() {
         return Err(sql_err!(
             sqlstate::GENERATED_ALWAYS,
             "cannot insert a non-DEFAULT value into column \"{}\"",
@@ -11100,7 +11101,7 @@ fn merge_insert(
             if explicit[i] {
                 continue;
             }
-            if let Some(d) = &col.default_value {
+            if let Some(d) = col.default.constant() {
                 row[i] = d.as_datum();
             } else if let Some(expr) = defaults[i] {
                 let v = super::eval::eval_full(
@@ -11345,7 +11346,7 @@ pub fn insert(
                     if explicit[i] {
                         continue;
                     }
-                    if let Some(d) = &col.default_value {
+                    if let Some(d) = col.default.constant() {
                         values[i] = d.as_datum();
                     } else if let Some(expr) = default_exprs[i] {
                         let v = match super::eval::eval_full(
@@ -11552,7 +11553,7 @@ pub fn insert(
                 if explicit[i] {
                     continue;
                 }
-                if let Some(d) = &col.default_value {
+                if let Some(d) = col.default.constant() {
                     values[i] = d.as_datum();
                 } else if let Some(expr) = default_exprs[i] {
                     let v = match super::eval::eval_full(
@@ -11863,7 +11864,9 @@ pub fn update(
     }
     // A generated column can only be updated to DEFAULT (which recomputes it).
     for (a, (_, expression)) in statement.assignments.iter().enumerate() {
-        if def.columns()[targets[a]].is_generated && !matches!(expression, Expr::DefaultMarker) {
+        if def.columns()[targets[a]].default.is_generated()
+            && !matches!(expression, Expr::DefaultMarker)
+        {
             return sql_fail(sql_err!(
                 sqlstate::GENERATED_ALWAYS,
                 "column \"{}\" can only be updated to DEFAULT",
@@ -12030,7 +12033,7 @@ pub fn update(
                         for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                             // A generated target's `= DEFAULT` is a no-op here; it
                             // is recomputed from the finished row below.
-                            if def.columns()[targets[a]].is_generated {
+                            if def.columns()[targets[a]].default.is_generated() {
                                 continue;
                             }
                             let v = eval(expression, arena, params, &combined)?;
@@ -12059,7 +12062,7 @@ pub fn update(
                     ..super::eval::NO_HOOKS
                 };
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
-                    if def.columns()[targets[a]].is_generated {
+                    if def.columns()[targets[a]].default.is_generated() {
                         continue; // recomputed from the finished row below
                     }
                     let v =
@@ -12167,6 +12170,7 @@ pub fn update(
                     Some(&new_row[..def.n_columns]),
                     arena,
                     params,
+                    seq_session,
                     MAX_FK_CASCADE_DEPTH,
                 )
             {
@@ -12209,6 +12213,7 @@ pub fn delete(
     statement: &Delete,
     arena: &Arena,
     params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
@@ -12357,6 +12362,7 @@ pub fn delete(
                     None,
                     arena,
                     params,
+                    seq_session,
                     MAX_FK_CASCADE_DEPTH,
                 )
             {
@@ -13094,7 +13100,10 @@ fn alter_table_inner(
                 };
                 // NOT NULL without a default over a non-empty table is a
                 // constraint violation, as in PostgreSQL.
-                if meta.default_value.is_none() && meta.not_null && has_rows {
+                if matches!(meta.default, crate::storage::ColumnDefault::None)
+                    && meta.not_null
+                    && has_rows
+                {
                     return sql_fail(sql_err!(
                         sqlstate::NOT_NULL_VIOLATION,
                         "column \"{}\" of relation \"{}\" contains null values",
@@ -13150,7 +13159,7 @@ fn alter_table_inner(
                 let type_mod = new_def.columns[i].type_mod;
                 // A literal-only default folds to a constant; a call-bearing one
                 // is stored as text and evaluated per row — CREATE TABLE's path.
-                let (default_value, default_expr) = match ddl::resolve_default(
+                let default = match ddl::resolve_default(
                     Some(value),
                     Some(value_text),
                     ctype,
@@ -13162,15 +13171,13 @@ fn alter_table_inner(
                     Ok(d) => d,
                     Err(e) => return sql_fail(e),
                 };
-                new_def.columns[i].default_value = default_value;
-                new_def.columns[i].default_expr = default_expr;
+                new_def.columns[i].default = default;
             }
             AlterAction::DropDefault { column } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
-                new_def.columns[i].default_value = None;
-                new_def.columns[i].default_expr = None;
+                new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
                 // Dropping a serial column's default detaches its auto-increment.
                 new_def.columns[i].auto_increment = false;
             }
@@ -13340,12 +13347,23 @@ fn alter_table_inner(
                         retyped_any = true;
                     }
                     ColSource::FillDefault(fi) => {
-                        if let Some(od) = new_def.columns[fi].default_value.as_ref() {
+                        if let Some(od) = new_def.columns[fi].default.constant().copied() {
                             match cast_to(od.as_datum(), target, arena)
                                 .and_then(|v| apply_typmod(v, target, *type_mod, arena))
                                 .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
                             {
-                                Ok(od) => new_def.columns[fi].default_value = Some(od),
+                                Ok(value) => {
+                                    let expression = new_def.columns[fi]
+                                        .default
+                                        .expression()
+                                        .copied()
+                                        .expect("constant default has source");
+                                    new_def.columns[fi].default =
+                                        crate::storage::ColumnDefault::Constant {
+                                            value,
+                                            expression,
+                                        };
+                                }
                                 Err(e) => return sql_fail(e),
                             }
                         }
@@ -13556,7 +13574,7 @@ fn alter_table_inner(
                             }
                         }
                         ColSource::FillDefault(fi) => {
-                            if let Some(d) = new_def.columns[fi].default_value.as_ref() {
+                            if let Some(d) = new_def.columns[fi].default.constant() {
                                 d.as_datum()
                             } else if let Some(expr) = new_defaults[fi] {
                                 // Evaluate the non-constant default for this row

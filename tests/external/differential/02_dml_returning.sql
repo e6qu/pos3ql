@@ -54,6 +54,21 @@ SELECT * FROM ch ORDER BY id;
 DELETE FROM pa WHERE id = 99;
 SELECT * FROM ch ORDER BY id;
 DROP TABLE ch; DROP TABLE pa;
+-- Expression defaults are evaluated by each SET DEFAULT action, not replaced
+-- with NULL when they cannot use the inline scalar cache.
+CREATE SEQUENCE fk_default_sequence START WITH 100;
+CREATE TABLE pa (id bigint PRIMARY KEY);
+CREATE TABLE ch (
+  id int PRIMARY KEY,
+  pid bigint DEFAULT nextval('fk_default_sequence')
+      REFERENCES pa(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT
+);
+INSERT INTO pa VALUES (1), (100), (101);
+INSERT INTO ch VALUES (1, 1);
+DELETE FROM pa WHERE id = 1;
+UPDATE pa SET id = 2 WHERE id = 100;
+SELECT pid FROM ch;
+DROP TABLE ch; DROP TABLE pa; DROP SEQUENCE fk_default_sequence;
 -- SET NULL against NOT NULL child column
 CREATE TABLE pa (id int PRIMARY KEY);
 CREATE TABLE ch (id int PRIMARY KEY, pid int NOT NULL REFERENCES pa(id) ON DELETE SET NULL);

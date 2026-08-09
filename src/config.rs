@@ -17,7 +17,8 @@ pub struct Config {
     pub max_connections: u32,
     /// Authentication: trust | password | scram-sha-256.
     pub auth: String,
-    /// Shared password for password/scram auth (all users).
+    /// Initial `postgres` role credential for password/scram authentication.
+    /// Other LOGIN roles authenticate only with their stored role credential.
     pub password: String,
     /// Per-connection receive buffer (wire protocol messages are bounded
     /// by this).

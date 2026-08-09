@@ -88,7 +88,7 @@ CREATE OPERATOR CLASS	missing	-
 CREATE OPERATOR FAMILY	missing	-
 CREATE POLICY	missing	-
 CREATE PROCEDURE	missing	-
-CREATE PUBLICATION	missing	-
+CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	missing	-
 CREATE SCHEMA	partial	37_schemas.sql
@@ -136,7 +136,7 @@ DROP OPERATOR FAMILY	missing	-
 DROP OWNED	complete	83_roles_acl.sql
 DROP POLICY	missing	-
 DROP PROCEDURE	missing	-
-DROP PUBLICATION	missing	-
+DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql
 DROP ROUTINE	missing	-
 DROP RULE	missing	-

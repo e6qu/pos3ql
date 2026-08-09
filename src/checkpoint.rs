@@ -12,7 +12,9 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef};
+use crate::storage::{
+    ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef,
+};
 use crate::store::{
     BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
     TieredStore, ValueIndexHandle, ValueIndexWriter,
@@ -1198,6 +1200,14 @@ impl Checkpointer {
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
+                    let default = ColumnDefault::from_parts(
+                        default_from_hex(default_hex)?,
+                        default_expr,
+                        not_null & 16 != 0,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid column default state",
+                    ))?;
                     def.columns[*seen] = ColumnMeta {
                         name: sql_name(name)?,
                         user_type,
@@ -1208,9 +1218,7 @@ impl Checkpointer {
                         unique: not_null & 2 != 0,
                         primary: not_null & 4 != 0,
                         auto_increment: not_null & 8 != 0,
-                        default_value: default_from_hex(default_hex)?,
-                        default_expr,
-                        is_generated: not_null & 16 != 0,
+                        default,
                         is_identity: not_null & 32 != 0,
                         identity_always: not_null & 64 != 0,
                         auto_increment_step,
@@ -2849,11 +2857,12 @@ impl Checkpointer {
             }
             for c in table.def.columns() {
                 use core::fmt::Write as _;
-                let default_hex = default_to_hex(&c.default_value);
+                let default_value = c.default.constant().copied();
+                let default_hex = default_to_hex(&default_value);
                 // Non-constant DEFAULT text, hex-encoded (`0` sentinel = none),
                 // placed before the name (which may itself contain spaces).
                 let mut dexpr_hex = StackStr::<{ 2 * crate::storage::DEFAULT_EXPR_MAX + 1 }>::new();
-                match &c.default_expr {
+                match c.default.expression() {
                     Some(e) => {
                         for b in e.as_str().as_bytes() {
                             let _ = write!(dexpr_hex, "{b:02x}");
@@ -2867,7 +2876,7 @@ impl Checkpointer {
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.is_generated) << 4)
+                    | (u8::from(c.default.is_generated()) << 4)
                     | (u8::from(c.is_identity) << 5)
                     | (u8::from(c.identity_always) << 6);
                 // The user-defined type name, hex-encoded (`0` = ordinary base type),
@@ -4709,9 +4718,7 @@ fn empty_column() -> ColumnMeta {
         unique: false,
         primary: false,
         auto_increment: false,
-        default_value: None,
-        default_expr: None,
-        is_generated: false,
+        default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,

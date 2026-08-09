@@ -2272,9 +2272,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             unique: false,
             primary: false,
             auto_increment: false,
-            default_value: None,
-            default_expr: None,
-            is_generated: false,
+            default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
             auto_increment_step: 1,
@@ -3501,7 +3499,7 @@ fn pg_attribute<'a>(
                     Datum::Bool(c.not_null),
                     Datum::Int4(i32::from(c.ctype.typlen())),
                     Datum::Int4(c.type_mod),
-                    Datum::Bool(c.default_value.is_some() || c.default_expr.is_some()),
+                    Datum::Bool(!matches!(c.default, crate::storage::ColumnDefault::None)),
                     Datum::Int4(0), // attcollation: default (0)
                     text(
                         if c.is_identity && c.identity_always {
@@ -3513,7 +3511,7 @@ fn pg_attribute<'a>(
                         },
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
-                    text(if c.is_generated { "s" } else { "" }, arena)?, // attgenerated
+                    text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
                     // Fixed-width values are plain; variable-width values use
                     // PostgreSQL's ordinary extended storage policy.
                     text(if c.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
@@ -3650,7 +3648,7 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) = &c.default_expr else {
+            let Some(text_expr) = c.default.expression() else {
                 continue;
             };
             if n == out.len() {

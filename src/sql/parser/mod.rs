@@ -4361,6 +4361,30 @@ mod tests {
     }
 
     #[test]
+    fn publication_options_parse_without_heap_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE PUBLICATION changes FOR ALL TABLES WITH (publish = 'INSERT, Update, delete')",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreatePublication {
+                all_tables,
+                publish,
+                ..
+            }) = parser.next_stmt().unwrap()
+            else {
+                panic!("publication statement did not parse")
+            };
+            assert!(all_tables);
+            assert!(publish.insert && publish.update && publish.delete);
+            assert!(!publish.truncate);
+        });
+    }
+
+    #[test]
     fn grouping_sets_expansion() {
         // Plain GROUP BY: no explicit sets, all columns implied.
         with_parser("SELECT a FROM t GROUP BY a, b", |p| {

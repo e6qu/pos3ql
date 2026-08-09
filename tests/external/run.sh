@@ -135,7 +135,7 @@ wal_upload_sync = on
 sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
-table_rows = 32768
+table_rows = 8192
 # A full scan of spilled rows stages them in the statement work arena (the
 # streaming read path is a later stage); size it for the spilled dataset.
 work_arena_bytes = 192MiB

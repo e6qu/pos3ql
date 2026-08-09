@@ -917,12 +917,16 @@ impl<'a> Parser<'a> {
                 truncate: false,
             };
             for operation in value.split(',').map(str::trim) {
-                match operation.to_ascii_lowercase().as_str() {
-                    "insert" => publish.insert = true,
-                    "update" => publish.update = true,
-                    "delete" => publish.delete = true,
-                    "truncate" => publish.truncate = true,
-                    _ => return Err(self.err_here("invalid publication publish operation")),
+                if operation.eq_ignore_ascii_case("insert") {
+                    publish.insert = true;
+                } else if operation.eq_ignore_ascii_case("update") {
+                    publish.update = true;
+                } else if operation.eq_ignore_ascii_case("delete") {
+                    publish.delete = true;
+                } else if operation.eq_ignore_ascii_case("truncate") {
+                    publish.truncate = true;
+                } else {
+                    return Err(self.err_here("invalid publication publish operation"));
                 }
             }
             self.expect_op(")")?;

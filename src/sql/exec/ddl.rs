@@ -6,8 +6,8 @@ use crate::sql::eval::{EvalHooks, NoColumns, SqlError, cast_to, eval_full, sqlst
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnMeta, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, OwnedDatum, SqlName,
-    Storage, TableDef, UniqueKey,
+    CheckConstraint, ColumnDefault, ColumnMeta, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS,
+    OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -53,13 +53,11 @@ pub(super) fn build_def(
 /// column (or itself) — PostgreSQL's `check_nested_generated` rule (42P17).
 pub(super) fn validate_generated_refs(def: &TableDef, arena: &Arena) -> Result<(), SqlError> {
     for c in def.columns() {
-        if !c.is_generated {
+        if !c.default.is_generated() {
             continue;
         }
-        let text = c
-            .default_expr
-            .as_ref()
-            .expect("generated column has expr text");
+        let default = c.default.expression();
+        let text = default.as_ref().expect("generated column has expr text");
         let expression = crate::sql::parser::parse_expr(text.as_str(), arena)?;
         let mut offending: Option<SqlError> = None;
         expression.for_each_column(&mut |name| {
@@ -67,7 +65,7 @@ pub(super) fn validate_generated_refs(def: &TableDef, arena: &Arena) -> Result<(
                 return;
             }
             if let Some(referenced) = def.columns().iter().find(|col| col.name.as_str() == name)
-                && referenced.is_generated
+                && referenced.default.is_generated()
             {
                 offending = Some(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
@@ -92,9 +90,7 @@ fn empty_meta() -> ColumnMeta {
         unique: false,
         primary: false,
         auto_increment: false,
-        default_value: None,
-        default_expr: None,
-        is_generated: false,
+        default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
         auto_increment_step: 1,
@@ -110,6 +106,14 @@ pub(super) fn build_column(
     txid: u32,
     arena: &Arena,
 ) -> Result<ColumnMeta, SqlError> {
+    if matches!(c.type_name, "record" | "record[]") {
+        return Err(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "column \"{}\" has pseudo-type {}",
+            c.name,
+            c.type_name
+        ));
+    }
     // A base type resolves statically; an unknown name falls back to the
     // domain catalog (base type + identity) then the enum catalog (its own
     // `ColType::Enum` plus its durable identity, so the column's
@@ -195,9 +199,7 @@ pub(super) fn build_column(
     if let Some(identity) = user_type {
         storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
     }
-    // A GENERATED column stores its expression in `default_expr` with the
-    // `is_generated` flag; it cannot also carry a DEFAULT.
-    let (default_value, default_expr, is_generated) = if let Some(gtext) = c.generated_text {
+    let default = if let Some(gtext) = c.generated_text {
         if c.default.is_some() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -205,9 +207,9 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        (None, Some(resolve_generated(gtext, arena)?), true)
+        ColumnDefault::Generated(resolve_generated(gtext, arena)?)
     } else {
-        let (dv, de) = resolve_default(
+        let column_default = resolve_default(
             c.default,
             c.default_text,
             ctype,
@@ -218,10 +220,12 @@ pub(super) fn build_column(
         )?;
         // A domain-typed column with no column-level DEFAULT inherits the
         // domain's DEFAULT (baked in at creation, re-evaluated per insert).
-        if dv.is_none() && de.is_none() {
-            (None, domain_default, false)
+        if matches!(column_default, ColumnDefault::None) {
+            domain_default
+                .map(ColumnDefault::Expression)
+                .unwrap_or(ColumnDefault::None)
         } else {
-            (dv, de, false)
+            column_default
         }
     };
     // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
@@ -234,7 +238,7 @@ pub(super) fn build_column(
     );
     let (is_identity, identity_always, auto_increment_step) = match c.identity {
         Some(spec) => {
-            if is_generated {
+            if default.is_generated() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "column \"{}\" cannot be both an identity and a generated column",
@@ -254,9 +258,7 @@ pub(super) fn build_column(
         unique: c.unique,
         primary: c.primary,
         auto_increment,
-        default_value,
-        default_expr,
-        is_generated,
+        default,
         is_identity,
         identity_always,
         auto_increment_step,
@@ -297,10 +299,7 @@ pub(super) fn resolve_generated(
     Ok(stored)
 }
 
-/// Resolves a column DEFAULT into its raw source text plus, when it fits the
-/// fixed inline representation, a folded scalar cache (`default_value`) for the
-/// fast insert path. Arena-backed values and call-bearing expressions retain
-/// only the source and are evaluated per inserted row.
+/// Resolves a column DEFAULT into one complete catalog state.
 pub(super) fn resolve_default(
     default: Option<&Expr>,
     default_text: Option<&str>,
@@ -309,15 +308,9 @@ pub(super) fn resolve_default(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
-) -> Result<
-    (
-        Option<OwnedDatum>,
-        Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>,
-    ),
-    SqlError,
-> {
+) -> Result<ColumnDefault, SqlError> {
     let Some(expression) = default else {
-        return Ok((None, None));
+        return Ok(ColumnDefault::None);
     };
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
@@ -368,14 +361,14 @@ pub(super) fn resolve_default(
                 | crate::sql::types::Datum::Uuid(_)
                 | crate::sql::types::Datum::Bytea(_)
         ) {
-            return Ok((None, Some(store_default_text(default_text)?)));
+            return Ok(ColumnDefault::Expression(store_default_text(default_text)?));
         }
-        return Ok((
-            Some(OwnedDatum::from_datum(&v)?),
-            Some(store_default_text(default_text)?),
-        ));
+        return Ok(ColumnDefault::Constant {
+            value: OwnedDatum::from_datum(&v)?,
+            expression: store_default_text(default_text)?,
+        });
     }
-    Ok((None, Some(store_default_text(default_text)?)))
+    Ok(ColumnDefault::Expression(store_default_text(default_text)?))
 }
 
 fn store_default_text(

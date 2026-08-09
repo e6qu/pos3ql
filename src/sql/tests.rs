@@ -4863,6 +4863,33 @@ fn expression_defaults() {
 }
 
 #[test]
+fn foreign_key_set_default_evaluates_expression_per_action() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE fk_default_sequence START WITH 100;
+         CREATE TABLE fk_default_parent (id bigint PRIMARY KEY);
+         CREATE TABLE fk_default_child (
+             id int PRIMARY KEY,
+             parent_id bigint DEFAULT nextval('fk_default_sequence')
+                 REFERENCES fk_default_parent(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT
+         );
+         INSERT INTO fk_default_parent VALUES (1), (100), (101);
+         INSERT INTO fk_default_child VALUES (1, 1);
+         DELETE FROM fk_default_parent WHERE id = 1;
+         UPDATE fk_default_parent SET id = 2 WHERE id = 100;
+         SELECT parent_id FROM fk_default_child;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["101"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn expression_default_survives_restart() {
     let config = test_config("default_expr_restart");
     {
@@ -8314,6 +8341,32 @@ fn domains_enforce_and_report() {
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE TABLE bad (a nope)"))
             .contains("42704")
     );
+    for (domain, name) in [
+        ("invalid_record_domain", "record"),
+        ("invalid_record_array_domain", "record[]"),
+    ] {
+        let statement = format!("CREATE DOMAIN {domain} AS {name}");
+        let record_domain_bytes = run_with(&mut e, &mut b, &statement);
+        let record_domain = String::from_utf8_lossy(&record_domain_bytes);
+        assert!(record_domain.contains("42804"), "{record_domain}");
+        assert!(
+            record_domain.contains(&format!("\"{name}\" is not a valid base type for a domain")),
+            "{record_domain}"
+        );
+    }
+    for (table, name) in [
+        ("invalid_record_column", "record"),
+        ("invalid_record_array_column", "record[]"),
+    ] {
+        let statement = format!("CREATE TABLE {table} (value {name})");
+        let output_bytes = run_with(&mut e, &mut b, &statement);
+        let output = String::from_utf8_lossy(&output_bytes);
+        assert!(output.contains("42P16"), "{output}");
+        assert!(
+            output.contains(&format!("column \"value\" has pseudo-type {name}")),
+            "{output}"
+        );
+    }
 
     // Explicit casts run the same base coercion + constraint path as columns.
     let bytes = run_with(&mut e, &mut b, "SELECT 5::posint, pg_typeof(5::posint)");

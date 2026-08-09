@@ -1796,7 +1796,16 @@ pub struct EnumDef {
     pub ownership: Ownership,
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
+    pub(crate) pending_definition: Option<PendingEnumDefinition>,
     pub ddl_state: CatalogDdlState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingEnumDefinition {
+    pub txid: u32,
+    pub name: SqlName,
+    pub members: [EnumMember; MAX_ENUM_LABELS],
+    pub n_members: usize,
 }
 
 impl EnumDef {
@@ -1807,6 +1816,7 @@ impl EnumDef {
         ownership: Ownership::BOOTSTRAP,
         members: [EnumMember::EMPTY; MAX_ENUM_LABELS],
         n_members: 0,
+        pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
 
@@ -1824,6 +1834,18 @@ impl EnumDef {
             .iter()
             .find(|m| m.label.as_str() == label)
             .map(|m| m.sort)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> Self {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(*self, |pending| Self {
+                name: pending.name,
+                members: pending.members,
+                n_members: pending.n_members,
+                pending_definition: None,
+                ..*self
+            })
     }
 }
 
@@ -3656,7 +3678,7 @@ impl Storage {
                 (definition.schema, definition.name)
             }
             AccessClass::Enum => {
-                let definition = &self.enums[slot];
+                let definition = self.enum_for(slot, txid);
                 (definition.schema, definition.name)
             }
             AccessClass::Index => {
@@ -10293,6 +10315,30 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
+        if let Some(blocker) = self.enums.iter().find_map(|e| {
+            (e.schema == schema
+                && (e.name == name
+                    || e.pending_definition
+                        .is_some_and(|pending| pending.name == name)))
+            .then(|| {
+                e.pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| e.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.enums.iter().any(|e| {
+            e.visible_to(txid) && e.schema == schema && e.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
         let Some(new) = self
             .domains
             .iter()
@@ -10429,7 +10475,9 @@ impl Storage {
     fn find_enum_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
             return self.enums.iter().position(|e| {
-                e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+                e.visible_to(txid)
+                    && e.schema.as_str() == schema
+                    && e.definition_for(txid).name.as_str() == name
             });
         }
         for entry in self.path.entries() {
@@ -10438,7 +10486,7 @@ impl Storage {
                 if let Some(i) = self.enums.iter().position(|e| {
                     e.visible_to(txid)
                         && e.schema.as_str() == schema.as_str()
-                        && e.name.as_str() == name
+                        && e.definition_for(txid).name.as_str() == name
                 }) {
                     return Some(i);
                 }
@@ -10462,25 +10510,27 @@ impl Storage {
     pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<&EnumDef> {
         self.enums
             .iter()
-            .find(|e| e.visible_to(txid) && e.name.as_str() == name)
+            .find(|e| e.visible_to(txid) && e.definition_for(txid).name.as_str() == name)
     }
 
     /// The slot of an enum named `name` (any schema) visible to `txid`.
     pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
         self.enums
             .iter()
-            .position(|e| e.visible_to(txid) && e.name.as_str() == name)
+            .position(|e| e.visible_to(txid) && e.definition_for(txid).name.as_str() == name)
     }
 
     /// The enum named `(schema, name)` visible to `txid`, by slot.
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
-            e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+            e.visible_to(txid)
+                && e.schema.as_str() == schema
+                && e.definition_for(txid).name.as_str() == name
         })
     }
 
-    pub fn enum_def(&self, slot: usize) -> &EnumDef {
-        &self.enums[slot]
+    pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDef {
+        self.enums[slot].definition_for(txid)
     }
 
     pub(crate) fn enum_count(&self) -> usize {
@@ -10526,11 +10576,47 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            (e.schema.as_str() == schema.as_str() && e.name.as_str() == name.as_str())
-                .then_some(e.ddl_state.pending_txid()?)
+            let same_name = e.schema == schema
+                && (e.name == name
+                    || e.pending_definition
+                        .is_some_and(|pending| pending.name == name));
+            same_name
+                .then(|| {
+                    e.pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| e.ddl_state.pending_txid())
+                })
+                .flatten()
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.enums.iter().any(|e| {
+            e.visible_to(txid) && e.schema == schema && e.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if let Some(blocker) = self.domains.iter().find_map(|d| {
+            (d.schema == schema && d.name == name)
+                .then_some(d.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self
+            .domains
+            .iter()
+            .any(|d| d.visible_to(txid) && d.schema == schema && d.name == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
         }
         let Some(new) = self
             .enums
@@ -10556,6 +10642,7 @@ impl Storage {
             ownership,
             members: spec.members,
             n_members: spec.n_members,
+            pending_definition: None,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
             } else {
@@ -10565,17 +10652,103 @@ impl Storage {
         Ok(new)
     }
 
-    /// Replaces a live enum's members in place (ALTER TYPE ... ADD VALUE).
-    pub fn alter_enum(&mut self, slot: usize, spec: EnumSpec) {
-        let e = &mut self.enums[slot];
-        e.members = spec.members;
-        e.n_members = spec.n_members;
+    pub(crate) fn stage_enum_alter(
+        &mut self,
+        slot: usize,
+        definition: EnumDef,
+        txid: u32,
+    ) -> Result<Option<PendingEnumDefinition>, SqlError> {
+        let schema = self.enums[slot].schema;
+        if let Some(blocker) = self
+            .enums
+            .iter()
+            .enumerate()
+            .find_map(|(other_slot, other)| {
+                (other_slot != slot
+                    && other.schema == schema
+                    && (other.name == definition.name
+                        || other
+                            .pending_definition
+                            .is_some_and(|pending| pending.name == definition.name)))
+                .then(|| {
+                    other
+                        .pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| other.ddl_state.pending_txid())
+                })
+                .flatten()
+                .filter(|&owner| owner != txid)
+            })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if let Some(blocker) = self.domains.iter().find_map(|domain| {
+            (domain.schema == schema && domain.name == definition.name)
+                .then_some(domain.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if self.enums.iter().enumerate().any(|(other_slot, other)| {
+            other_slot != slot
+                && other.visible_to(txid)
+                && other.schema == schema
+                && other.definition_for(txid).name == definition.name
+        }) || self.domains.iter().any(|domain| {
+            domain.visible_to(txid) && domain.schema == schema && domain.name == definition.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let enumeration = &mut self.enums[slot];
+        if let Some(pending) = enumeration.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "type \"{}\" is being altered by another transaction",
+                enumeration.name.as_str()
+            ));
+        }
+        let prior = enumeration.pending_definition;
+        enumeration.pending_definition = Some(PendingEnumDefinition {
+            txid,
+            name: definition.name,
+            members: definition.members,
+            n_members: definition.n_members,
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
+        if self.enums[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .is_some()
+        {
+            let definition = self.enums[slot].definition_for(txid);
+            if definition.name != self.enums[slot].name {
+                self.rename_enum_references(slot, definition.name);
+            }
+            self.enums[slot] = definition;
+        }
+    }
+
+    pub(crate) fn rollback_enum_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingEnumDefinition>,
+    ) {
+        self.enums[slot].pending_definition = prior;
     }
 
     /// Renames an enum and every persisted reference to its type name. Runtime
     /// slots and value sort keys stay stable; comments are name-keyed and move
     /// with the type just as PostgreSQL keeps the same `pg_type` OID.
-    pub fn rename_enum(&mut self, slot: usize, new_name: SqlName) {
+    fn rename_enum_references(&mut self, slot: usize, new_name: SqlName) {
         let old_name = self.enums[slot].name;
         let schema = self.enums[slot].schema;
         self.enums[slot].name = new_name;
@@ -10614,25 +10787,6 @@ impl Storage {
         self.rename_stored_query_dependency(DependencyClass::Enum, slot, schema, new_name);
     }
 
-    pub fn restore_enum(&mut self, slot: usize, prior: EnumDef) {
-        if self.enums[slot].name != prior.name {
-            self.rename_enum(slot, prior.name);
-        }
-        self.enums[slot] = prior;
-    }
-
-    pub fn undo_enum_value_add(&mut self, slot: usize, prior_count: usize) {
-        let definition = &mut self.enums[slot];
-        for member in definition.members[prior_count..definition.n_members].iter_mut() {
-            *member = EnumMember::EMPTY;
-        }
-        definition.n_members = prior_count;
-    }
-
-    pub fn restore_enum_value_name(&mut self, slot: usize, index: usize, prior: SqlName) {
-        self.enums[slot].members[index].label = prior;
-    }
-
     pub fn drop_enum(
         &mut self,
         schema: &str,
@@ -10640,14 +10794,25 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            (e.schema.as_str() == schema && e.name.as_str() == name)
-                .then_some(e.ddl_state.pending_txid()?)
+            let same_name = e.schema.as_str() == schema
+                && (e.name.as_str() == name
+                    || e.pending_definition
+                        .is_some_and(|pending| pending.name.as_str() == name));
+            same_name
+                .then(|| {
+                    e.pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| e.ddl_state.pending_txid())
+                })
+                .flatten()
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.enums.iter().position(|e| {
-            e.visible_to(txid) && e.schema.as_str() == schema && e.name.as_str() == name
+            e.visible_to(txid)
+                && e.schema.as_str() == schema
+                && e.definition_for(txid).name.as_str() == name
         }) else {
             return Ok(None);
         };

@@ -425,7 +425,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let def = self.storage.enum_def(slot as usize);
+        let def = self.storage.enum_for(slot as usize, self.txid);
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -437,7 +437,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn enum_label_sort(&self, slot: u16, label: &str) -> Option<f64> {
-        let def = self.storage.enum_def(slot as usize);
+        let def = self.storage.enum_for(slot as usize, self.txid);
         if !def.visible_to(self.txid) {
             return None;
         }
@@ -462,6 +462,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                     value,
                     super::types::ArrElem::Enum(slot as u16),
                     self.storage,
+                    self.txid,
                     arena,
                 )
                 .map(Some);
@@ -475,8 +476,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                         element_name
                     ));
                 };
-                return super::exec::coerce_user_type_array(value, element, self.storage, arena)
-                    .map(Some);
+                return super::exec::coerce_user_type_array(
+                    value,
+                    element,
+                    self.storage,
+                    self.txid,
+                    arena,
+                )
+                .map(Some);
             }
             return Ok(None);
         }
@@ -494,7 +501,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
             return Ok(None);
         };
-        super::exec::coerce_enum_value(value, slot as u16, self.storage, arena).map(Some)
+        super::exec::coerce_enum_value(value, slot as u16, self.storage, self.txid, arena).map(Some)
     }
 
     fn array_domain_element(&self, type_name: &str) -> Option<super::types::ArrElem> {
@@ -511,17 +518,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     ) -> Result<Option<&'a str>, SqlError> {
         let name = match element {
             super::types::ArrElem::Enum(slot) => {
-                let def = self.storage.enum_def(slot as usize);
-                def.visible_to(self.txid).then_some(def.name.as_str())
+                let definition = self.storage.enum_for(slot as usize, self.txid);
+                definition.visible_to(self.txid).then_some(definition.name)
             }
             super::types::ArrElem::Domain { slot, .. } => {
                 let def = self.storage.domain(slot as usize);
-                def.visible_to(self.txid).then_some(def.name.as_str())
+                def.visible_to(self.txid).then_some(def.name)
             }
             _ => None,
         };
         let Some(name) = name else { return Ok(None) };
-        let rendered = crate::stack_format!(128, "{}[]", name);
+        let rendered = crate::stack_format!(128, "{}[]", name.as_str());
         Ok(Some(
             arena
                 .alloc_str(rendered.as_str())

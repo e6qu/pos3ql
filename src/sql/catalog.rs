@@ -873,7 +873,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_enum") => pg_enum(storage, arena),
+        (false, "pg_enum") => pg_enum(storage, txid, arena),
         (false, "pg_range") => finish(
             def_of(
                 "pg_range",
@@ -1898,7 +1898,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_ENUM) as usize;
-        let definition = storage.enum_def(slot);
+        let definition = storage.enum_for(slot, txid);
         (
             definition.schema,
             definition.name,
@@ -1911,7 +1911,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_ENUM_ARRAY) as usize;
-        let definition = storage.enum_def(slot);
+        let definition = storage.enum_for(slot, txid);
         (
             definition.schema,
             definition.name,
@@ -3766,7 +3766,7 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(definition, &output, arena)
 }
 
-fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_enum",
         &[
@@ -3779,7 +3779,11 @@ fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, Sq
     const MAX_ROWS: usize = crate::storage::MAX_ENUMS * crate::storage::MAX_ENUM_LABELS;
     let mut out: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     let mut n = 0;
-    for (slot, e) in storage.live_enums() {
+    for slot in 0..storage.enum_count() {
+        let e = storage.enum_for(slot, txid);
+        if !e.visible_to(txid) {
+            continue;
+        }
         let typid = crate::sql::types::oid::enum_oid(slot as u16);
         for (i, m) in e.members().iter().enumerate() {
             out[n] = row(
@@ -4002,7 +4006,11 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         n += 1;
     }
     // User-defined enum types: typtype 'e', typcategory 'E', no base type.
-    for (slot, e) in storage.live_enums() {
+    for slot in 0..storage.enum_count() {
+        let e = storage.enum_for(slot, txid);
+        if !e.visible_to(txid) {
+            continue;
+        }
         let enum_oid = crate::sql::types::oid::enum_oid(slot as u16);
         let array_oid = crate::sql::types::oid::enum_array_oid(slot as u16);
         out[n] = row(

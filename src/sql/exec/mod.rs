@@ -1059,7 +1059,7 @@ fn handle_conflict<'a>(
                 ));
             };
             let v = eval_full(expression, arena, params, &context, &hooks)?;
-            new_values[target] = coerce(v, &def.columns()[target], storage, arena)?;
+            new_values[target] = coerce(v, &def.columns()[target], storage, txn.txid, arena)?;
         }
         check_not_null(def, &new_values)?;
         enforce_row_constraints(
@@ -4290,8 +4290,11 @@ pub fn drop_schema(
         }
     }
     for enumeration in 0..storage.enum_count() {
-        if storage.enum_def(enumeration).visible_to(txn.txid)
-            && in_listed(storage, storage.enum_def(enumeration).schema.as_str())
+        if storage.enum_for(enumeration, txn.txid).visible_to(txn.txid)
+            && in_listed(
+                storage,
+                storage.enum_for(enumeration, txn.txid).schema.as_str(),
+            )
             && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
         {
             return sql_fail(e);
@@ -4311,7 +4314,10 @@ pub fn drop_schema(
             });
             let enum_in_schema = match domain.base {
                 ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                    in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                    in_listed(
+                        storage,
+                        storage.enum_for(slot as usize, txn.txid).schema.as_str(),
+                    )
                 }
                 _ => false,
             };
@@ -4354,7 +4360,10 @@ pub fn drop_schema(
                     });
                     let base_enum_in_schema = match storage.domain(domain_slot).base {
                         ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                            in_listed(storage, storage.enum_def(slot as usize).schema.as_str())
+                            in_listed(
+                                storage,
+                                storage.enum_for(slot as usize, txn.txid).schema.as_str(),
+                            )
                         }
                         _ => false,
                     };
@@ -4391,7 +4400,10 @@ pub fn drop_schema(
                                     | ColType::Array(super::types::ArrElem::Enum(slot)) => {
                                         in_listed(
                                             storage,
-                                            storage.enum_def(slot as usize).schema.as_str(),
+                                            storage
+                                                .enum_for(slot as usize, txn.txid)
+                                                .schema
+                                                .as_str(),
                                         )
                                     }
                                     _ => false,
@@ -4549,7 +4561,7 @@ pub fn drop_schema(
                 )
             }
             SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_def(*enumeration);
+                let enumeration = storage.enum_for(*enumeration, txn.txid);
                 (
                     schema_rank(storage, enumeration.schema.as_str()),
                     enumeration.created_at,
@@ -4616,7 +4628,7 @@ pub fn drop_schema(
                 write_rel(out, &domain.schema, &domain.name);
             }
             SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_def(*enumeration);
+                let enumeration = storage.enum_for(*enumeration, txn.txid);
                 let _ = write!(out, "type ");
                 write_rel(out, &enumeration.schema, &enumeration.name);
             }
@@ -4638,27 +4650,23 @@ pub fn drop_schema(
         for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
             let mut line = crate::util::StackStr::<192>::new();
             describe(storage, o, &mut line);
+            let schema = match o {
+                SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
+                SchemaObject::View(v) => storage.view(*v).schema,
+                SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
+                SchemaObject::Sequence(sequence) => storage.sequence(*sequence).schema,
+                SchemaObject::Domain(domain) => storage.domain(*domain).schema,
+                SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
+                SchemaObject::InboundFk { table, fk_index } => {
+                    storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema
+                }
+            };
             let _ = write!(
                 detail,
                 "{}{} depends on schema {}",
                 if i > 0 { "\n" } else { "" },
                 line.as_str(),
-                // PostgreSQL's report names the schema each object hangs off;
-                // for a multi-schema drop each line names its own.
-                match o {
-                    SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema.as_str(),
-                    SchemaObject::View(v) => storage.view(*v).schema.as_str(),
-                    SchemaObject::Matview { table, .. } =>
-                        storage.table_def(*table, txn.txid).schema.as_str(),
-                    SchemaObject::Sequence(sequence) => storage.sequence(*sequence).schema.as_str(),
-                    SchemaObject::Domain(domain) => storage.domain(*domain).schema.as_str(),
-                    SchemaObject::Enum(enumeration) =>
-                        storage.enum_def(*enumeration).schema.as_str(),
-                    SchemaObject::InboundFk { table, fk_index } =>
-                        storage.table_def(*table, txn.txid).fkeys[*fk_index]
-                            .parent_schema
-                            .as_str(),
-                }
+                schema.as_str(),
             );
         }
         let mut hint = crate::util::StackStr::<128>::new();
@@ -4898,7 +4906,7 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_def(*enumeration);
+                let enumeration = storage.enum_for(*enumeration, txn.txid);
                 let (schema, name) = (enumeration.schema, enumeration.name);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage(
@@ -5925,7 +5933,7 @@ pub fn comment(
                     type_name
                 ));
             } else if let Some(slot) = enum_slot {
-                let definition = storage.enum_def(slot);
+                let definition = storage.enum_for(slot, txn.txid);
                 (definition.schema, definition.name)
             } else if let Some((schema, _)) = composite {
                 let stored = match SqlName::parse(bare_name) {
@@ -6176,7 +6184,7 @@ pub fn create_table_as(
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
                 let v = decode_projected_pub(bytes, i);
-                match coerce(v, &def.columns()[i], storage, arena) {
+                match coerce(v, &def.columns()[i], storage, txn.txid, arena) {
                     Ok(v) => *slot = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -6294,7 +6302,7 @@ fn materialized_column_type(
     let ctype = coltype_of_oid(type_oid)?;
     let user_type = match ctype {
         ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot)) => {
-            let enumeration = storage.enum_def(slot as usize);
+            let enumeration = storage.enum_for(slot as usize, txid);
             if !enumeration.visible_to(txid) {
                 return None;
             }
@@ -6445,7 +6453,7 @@ pub fn refresh_materialized_view(
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
             let v = decode_projected_pub(bytes, i);
-            match coerce(v, &def.columns()[i], storage, arena) {
+            match coerce(v, &def.columns()[i], storage, txn.txid, arena) {
                 Ok(v) => *slot_v = v,
                 Err(e) => return sql_fail(e),
             }
@@ -7211,7 +7219,7 @@ fn build_domain_spec(
         if let Some(parent) = storage.find_domain(base_type, txid) {
             storage.require_type_usage(parent.schema.as_str(), parent.name.as_str(), txid)?;
         } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            let enumeration = storage.enum_def(enum_slot);
+            let enumeration = storage.enum_for(enum_slot, txid);
             storage.require_type_usage(
                 enumeration.schema.as_str(),
                 enumeration.name.as_str(),
@@ -7975,7 +7983,11 @@ pub fn create_enum(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
+    if let Err(e) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+    ) {
         storage.rollback_enum_create(slot);
         return sql_fail(e);
     }
@@ -8039,7 +8051,7 @@ pub fn drop_enum(
             return sql_fail(error);
         }
         let (schema, ename) = {
-            let e = storage.enum_def(slot);
+            let e = storage.enum_for(slot, txn.txid);
             (e.schema, e.name)
         };
         while let Some((table_schema, table, _)) = enum_column_in_use(storage, slot, txn.txid) {
@@ -8680,7 +8692,7 @@ pub fn alter_type(
             before,
             after,
         } => {
-            let current = *storage.enum_def(slot);
+            let current = storage.enum_for(slot, txn.txid);
             if current.sort_of(label).is_some() {
                 if *if_not_exists {
                     responder.notice(
@@ -8712,37 +8724,35 @@ pub fn alter_type(
                 Ok(n) => n,
                 Err(e) => return sql_fail(e),
             };
-            let mut spec = crate::storage::EnumSpec {
-                members: current.members,
-                n_members: current.n_members,
-            };
-            spec.members[spec.n_members] = crate::storage::EnumMember {
+            let mut altered = current;
+            altered.members[altered.n_members] = crate::storage::EnumMember {
                 label: new_label,
                 sort,
             };
-            spec.n_members += 1;
-            storage.alter_enum(slot, spec);
+            altered.n_members += 1;
+            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
-                storage.alter_enum(
-                    slot,
-                    crate::storage::EnumSpec {
-                        members: current.members,
-                        n_members: current.n_members,
-                    },
-                );
+            if let Err(e) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+            ) {
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumValueAdded {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
                 slot: slot as u32,
-                prior_count: current.n_members as u8,
+                prior,
             }) {
-                storage.restore_enum(slot, current);
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
         }
         A::RenameTo(new_name) => {
-            let current = *storage.enum_def(slot);
+            let current = storage.enum_for(slot, txn.txid);
             if current.name.as_str() == *new_name {
                 responder.command_complete("ALTER TYPE")?;
                 return sql_ok();
@@ -8764,7 +8774,12 @@ pub fn alter_type(
                 Ok(name) => name,
                 Err(e) => return sql_fail(e),
             };
-            storage.rename_enum(slot, renamed);
+            let mut altered = current;
+            altered.name = renamed;
+            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(
                 txn.txid,
@@ -8775,19 +8790,19 @@ pub fn alter_type(
                     new_name,
                 },
             ) {
-                storage.restore_enum(slot, current);
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumRenamed {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
                 slot: slot as u32,
-                prior: current.name,
+                prior,
             }) {
-                storage.restore_enum(slot, current);
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
         }
         A::RenameValue { from, to } => {
-            let current = *storage.enum_def(slot);
+            let current = storage.enum_for(slot, txn.txid);
             let Some(member_index) = current
                 .members()
                 .iter()
@@ -8810,29 +8825,32 @@ pub fn alter_type(
                 Ok(label) => label,
                 Err(e) => return sql_fail(e),
             };
-            let mut spec = crate::storage::EnumSpec {
-                members: current.members,
-                n_members: current.n_members,
+            let mut altered = current;
+            altered.members[member_index].label = renamed;
+            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
             };
-            spec.members[member_index].label = renamed;
-            storage.alter_enum(slot, spec);
             if let Err(e) =
                 rewrite_enum_label(storage, txn, slot as u16, from, renamed.as_str(), arena)
             {
-                storage.restore_enum(slot, current);
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateEnum(*storage.enum_def(slot))) {
-                storage.restore_enum(slot, current);
+            if let Err(e) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+            ) {
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumValueRenamed {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
                 slot: slot as u32,
-                index: member_index as u8,
-                prior: current.members[member_index].label,
+                prior,
             }) {
-                storage.restore_enum(slot, current);
+                storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
         }
@@ -9645,7 +9663,7 @@ pub fn copy_row(
         let col = &def.columns()[col_index];
         values[col_index] = match field {
             None => Datum::Null,
-            Some(text) => coerce(Datum::Text(text), col, storage, arena)?,
+            Some(text) => coerce(Datum::Text(text), col, storage, txn.txid, arena)?,
         };
         explicit[col_index] = true;
     }
@@ -9668,7 +9686,14 @@ pub fn copy_row(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
+    compute_generated(
+        &def,
+        &generated_exprs,
+        &mut values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -9735,7 +9760,7 @@ pub fn copy_row_binary(
             let field = reader.take(field_len as usize).map_err(|_| malformed())?;
             let decoded =
                 decode_binary_field_with_catalog(col.ctype, field, arena, storage, txn.txid)?;
-            coerce(decoded, &col, storage, arena)?
+            coerce(decoded, &col, storage, txn.txid, arena)?
         };
         explicit[col_index] = true;
     }
@@ -9761,7 +9786,14 @@ pub fn copy_row_binary(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(&def, &generated_exprs, &mut values, storage, arena)?;
+    compute_generated(
+        &def,
+        &generated_exprs,
+        &mut values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -9877,7 +9909,7 @@ pub(crate) fn resolve_binary_input_type(
     match ctype {
         ColType::Enum(slot) | ColType::Array(crate::sql::types::ArrElem::Enum(slot))
             if slot as usize >= storage.enum_count()
-                || !storage.enum_def(slot as usize).visible_to(txid) =>
+                || !storage.enum_for(slot as usize, txid).visible_to(txid) =>
         {
             Err(unknown_type())
         }
@@ -10001,13 +10033,13 @@ fn decode_binary_field_with_context<'a>(
         ColType::Record => decode_binary_record(bytes, arena, context),
         ColType::Enum(slot) => {
             let label = core::str::from_utf8(bytes).map_err(|_| bad())?;
-            let BinaryDecodeContext::Catalog { storage, .. } = context else {
+            let BinaryDecodeContext::Catalog { storage, txid } = context else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "binary input of a user-defined enum requires catalog context"
                 ));
             };
-            coerce_enum_value(Datum::Text(label), slot, storage, arena)
+            coerce_enum_value(Datum::Text(label), slot, storage, txid, arena)
         }
     }
 }
@@ -10825,6 +10857,7 @@ fn compute_generated<'a>(
     generated: &constraints::ParsedDefaults<'a>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
     storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     if !generated.iter().any(|g| g.is_some()) {
@@ -10838,7 +10871,7 @@ fn compute_generated<'a>(
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
             let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
-            values[i] = coerce(v, &def.columns()[i], storage, arena)?;
+            values[i] = coerce(v, &def.columns()[i], storage, txid, arena)?;
         }
     }
     Ok(())
@@ -10882,7 +10915,7 @@ where
                 &NoColumns,
                 &hooks,
             )?;
-            values[index] = coerce(value, column, storage, arena)?;
+            values[index] = coerce(value, column, storage, txid, arena)?;
         }
     }
     Ok(())
@@ -11285,14 +11318,19 @@ pub fn merge(
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
                             };
-                            match coerce(v, &def.columns()[ci], storage, arena) {
+                            match coerce(v, &def.columns()[ci], storage, txn.txid, arena) {
                                 Ok(v) => new_values[ci] = v,
                                 Err(e) => return sql_fail(e),
                             }
                         }
-                        if let Err(e) =
-                            compute_generated(&def, &generated, &mut new_values, storage, arena)
-                        {
+                        if let Err(e) = compute_generated(
+                            &def,
+                            &generated,
+                            &mut new_values,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
                             return sql_fail(e);
                         }
                         if let Err(e) = check_not_null(&def, &new_values) {
@@ -11479,7 +11517,7 @@ fn merge_insert(
         for (i, expression) in values.iter().enumerate() {
             reject_generated_write(def, targets[i])?;
             let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
-            row[targets[i]] = coerce(v, &def.columns()[targets[i]], storage, arena)?;
+            row[targets[i]] = coerce(v, &def.columns()[targets[i]], storage, txn.txid, arena)?;
             explicit[targets[i]] = true;
         }
     }
@@ -11506,7 +11544,7 @@ fn merge_insert(
                     &NoColumns,
                     &hooks,
                 )?;
-                row[i] = coerce(v, col, storage, arena)?;
+                row[i] = coerce(v, col, storage, txn.txid, arena)?;
             }
         }
     }
@@ -11520,7 +11558,7 @@ fn merge_insert(
         txn.txid,
     )?;
     let mut row_arr = row;
-    compute_generated(def, generated, &mut row_arr, storage, arena)?;
+    compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -11720,7 +11758,7 @@ pub fn insert(
                 }
                 let v = decode_projected_pub(bytes, i);
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, storage, arena) {
+                match coerce(v, col, storage, txn.txid, arena) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -11754,7 +11792,7 @@ pub fn insert(
                             Ok(v) => v,
                             Err(e) => return sql_fail(e),
                         };
-                        match coerce(v, col, storage, arena) {
+                        match coerce(v, col, storage, txn.txid, arena) {
                             Ok(v) => values[i] = v,
                             Err(e) => return sql_fail(e),
                         }
@@ -11772,7 +11810,14 @@ pub fn insert(
             ) {
                 return sql_fail(e);
             }
-            if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, storage, arena) {
+            if let Err(e) = compute_generated(
+                &def,
+                &generated_exprs,
+                &mut values,
+                storage,
+                txn.txid,
+                arena,
+            ) {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &values) {
@@ -11938,7 +11983,7 @@ pub fn insert(
                     Err(e) => return sql_fail(e),
                 };
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, storage, arena) {
+                match coerce(v, col, storage, txn.txid, arena) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -11961,7 +12006,7 @@ pub fn insert(
                         Ok(v) => v,
                         Err(e) => return sql_fail(e),
                     };
-                    match coerce(v, col, storage, arena) {
+                    match coerce(v, col, storage, txn.txid, arena) {
                         Ok(v) => values[i] = v,
                         Err(e) => return sql_fail(e),
                     }
@@ -11980,7 +12025,14 @@ pub fn insert(
             return sql_fail(e);
         }
         // Generated columns are computed last, from the now-filled row.
-        if let Err(e) = compute_generated(&def, &generated_exprs, &mut values, storage, arena) {
+        if let Err(e) = compute_generated(
+            &def,
+            &generated_exprs,
+            &mut values,
+            storage,
+            txn.txid,
+            arena,
+        ) {
             return sql_fail(e);
         }
         if let Err(e) = check_not_null(&def, &values) {
@@ -12433,7 +12485,7 @@ pub fn update(
                             }
                             let v = eval(expression, arena, params, &combined)?;
                             new_values[targets[a]] =
-                                coerce(v, &def.columns()[targets[a]], storage, arena)?;
+                                coerce(v, &def.columns()[targets[a]], storage, txn.txid, arena)?;
                         }
                         Ok(())
                     },
@@ -12466,7 +12518,7 @@ pub fn update(
                             Err(e) => return sql_fail(e),
                         };
                     let col = &def.columns()[targets[a]];
-                    match coerce(v, col, storage, arena) {
+                    match coerce(v, col, storage, txn.txid, arena) {
                         Ok(v) => new_values[targets[a]] = v,
                         Err(e) => return sql_fail(e),
                     }
@@ -12474,9 +12526,14 @@ pub fn update(
             }
             // Every generated column is recomputed from the updated row (a change
             // to any dependency must flow through).
-            if let Err(e) =
-                compute_generated(&def, &generated_exprs, &mut new_values, storage, arena)
-            {
+            if let Err(e) = compute_generated(
+                &def,
+                &generated_exprs,
+                &mut new_values,
+                storage,
+                txn.txid,
+                arena,
+            ) {
                 return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &new_values) {
@@ -13996,7 +14053,7 @@ fn alter_table_inner(
                                     Ok(v) => v,
                                     Err(e) => return sql_fail(e),
                                 };
-                                match coerce(v, &new_def.columns[fi], storage, arena) {
+                                match coerce(v, &new_def.columns[fi], storage, txn.txid, arena) {
                                     Ok(v) => v,
                                     Err(e) => return sql_fail(e),
                                 }
@@ -14007,7 +14064,7 @@ fn alter_table_inner(
                     };
                 }
                 if let Err(e) =
-                    compute_generated(&new_def, &new_generated, &mut out, storage, arena)
+                    compute_generated(&new_def, &new_generated, &mut out, storage, txn.txid, arena)
                 {
                     return sql_fail(e);
                 }
@@ -14679,18 +14736,19 @@ fn coerce<'a>(
     v: Datum<'a>,
     col: &ColumnMeta,
     storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     // An enum column resolves a text (or already-typed enum) value to a member
     // of its type, validating the label against the catalog (22P02 otherwise).
     if let ColType::Enum(slot) = col.ctype {
-        return coerce_enum_value(v, slot, storage, arena);
+        return coerce_enum_value(v, slot, storage, txid, arena);
     }
     if let ColType::Array(
         element @ (crate::sql::types::ArrElem::Enum(_) | crate::sql::types::ArrElem::Domain { .. }),
     ) = col.ctype
     {
-        return coerce_user_type_array(v, element, storage, arena);
+        return coerce_user_type_array(v, element, storage, txid, arena);
     }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their
@@ -14717,6 +14775,7 @@ pub(crate) fn coerce_user_type_array<'a>(
     value: Datum<'a>,
     target: crate::sql::types::ArrElem,
     storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let (source, raw) = match value {
@@ -14745,13 +14804,13 @@ pub(crate) fn coerce_user_type_array<'a>(
         let value = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
         *item = match target {
             crate::sql::types::ArrElem::Enum(slot) => {
-                coerce_enum_value(value, slot, storage, arena)?
+                coerce_enum_value(value, slot, storage, txid, arena)?
             }
             crate::sql::types::ArrElem::Domain { slot, .. } => constraints::coerce_domain_value(
                 storage,
                 slot as usize,
                 value,
-                u32::MAX,
+                txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
             )?,
@@ -14771,12 +14830,13 @@ pub(crate) fn coerce_enum_value<'a>(
     v: Datum<'a>,
     slot: u16,
     storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     if v.is_null() {
         return Ok(Datum::Null);
     }
-    let def = storage.enum_def(slot as usize);
+    let def = storage.enum_for(slot as usize, txid);
     let label = match v {
         Datum::Enum { label, .. } | Datum::Text(label) => label,
         Datum::Bpchar(s) => s.trim_end_matches(' '),

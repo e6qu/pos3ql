@@ -1837,20 +1837,25 @@ fn rewrite_stored_type_name<'a>(
     }) else {
         return Ok(type_name);
     };
+    let (schema, name) = match dependency.class {
+        crate::storage::DependencyClass::Domain => {
+            let definition = context
+                .storage
+                .domain_for(dependency.slot as usize, context.txid);
+            (definition.schema, definition.name)
+        }
+        crate::storage::DependencyClass::Enum => {
+            let definition = context
+                .storage
+                .enum_for(dependency.slot as usize, context.txid);
+            (definition.schema, definition.name)
+        }
+        _ => unreachable!("stored type-name rewriting records only type dependencies"),
+    };
     let rendered = if array {
-        crate::stack_format!(
-            192,
-            "{}.{}[]",
-            dependency.schema.as_str(),
-            dependency.name.as_str()
-        )
+        crate::stack_format!(192, "{}.{}[]", schema.as_str(), name.as_str())
     } else {
-        crate::stack_format!(
-            192,
-            "{}.{}",
-            dependency.schema.as_str(),
-            dependency.name.as_str()
-        )
+        crate::stack_format!(192, "{}.{}", schema.as_str(), name.as_str())
     };
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }

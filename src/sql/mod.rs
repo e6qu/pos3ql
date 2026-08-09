@@ -1994,9 +1994,9 @@ impl Engine {
                     );
                 }
                 DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
-                DdlUndo::EnumValueAdded { .. }
-                | DdlUndo::EnumValueRenamed { .. }
-                | DdlUndo::EnumRenamed { .. } => {}
+                DdlUndo::EnumAltered { slot, .. } => {
+                    self.storage.commit_enum_alter(*slot as usize, txn.txid)
+                }
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_create(slot);
@@ -2166,15 +2166,8 @@ impl Engine {
             DdlUndo::EnumDropped(slot) => {
                 self.storage.rollback_enum_drop(slot as usize, txid);
             }
-            DdlUndo::EnumValueAdded { slot, prior_count } => self
-                .storage
-                .undo_enum_value_add(slot as usize, prior_count as usize),
-            DdlUndo::EnumValueRenamed { slot, index, prior } => {
-                self.storage
-                    .restore_enum_value_name(slot as usize, index as usize, prior);
-            }
-            DdlUndo::EnumRenamed { slot, prior } => {
-                self.storage.rename_enum(slot as usize, prior);
+            DdlUndo::EnumAltered { slot, prior } => {
+                self.storage.rollback_enum_alter(slot as usize, prior);
             }
             DdlUndo::IndexCreated(slot) => {
                 let slot = slot as usize;
@@ -6095,7 +6088,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 n_members: def.n_members,
             };
             if let Some(slot) = storage.enum_slot(def.schema.as_str(), def.name.as_str(), 0) {
-                storage.alter_enum(slot, spec);
+                let mut definition = storage.enum_for(slot, 0);
+                definition.members = spec.members;
+                definition.n_members = spec.n_members;
+                storage.stage_enum_alter(slot, definition, 0)?;
+                storage.commit_enum_alter(slot, 0);
             } else {
                 storage.create_enum(def.schema, def.name, spec, 0)?;
             }
@@ -6117,7 +6114,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     old_name
                 )
             })?;
-            storage.rename_enum(slot, crate::storage::SqlName::parse(new_name)?);
+            let mut definition = storage.enum_for(slot, 0);
+            definition.name = crate::storage::SqlName::parse(new_name)?;
+            storage.stage_enum_alter(slot, definition, 0)?;
+            storage.commit_enum_alter(slot, 0);
         }
         WalOp::Comment {
             class,

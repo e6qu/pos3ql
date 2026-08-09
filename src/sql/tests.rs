@@ -5999,7 +5999,7 @@ fn value_index_matches_uniqueness_oracle() {
 #[test]
 fn named_single_column_key_retains_name() {
     let config = test_config("named-single-key");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // An explicit name on a single-column UNIQUE is kept: the violation names it
     // and DROP CONSTRAINT finds it.
@@ -8626,6 +8626,86 @@ fn domain_alterations_are_private_until_commit() {
         "SELECT 8::staged_domain",
     );
     assert!(after_rollback.contains("SELECT 1"), "{after_rollback}");
+}
+
+#[test]
+fn enum_definitions_are_private_until_commit() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE staged_mood AS ENUM ('sad', 'ok')",
+    );
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TYPE staged_mood ADD VALUE 'happy'",
+    );
+    let owner_catalog = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT enumlabel FROM pg_enum WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'staged_mood') ORDER BY enumsortorder",
+    );
+    assert!(owner_catalog.contains("happy"), "{owner_catalog}");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT 'happy'::staged_mood",
+        )
+        .contains("22P02")
+    );
+    assert!(!run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT enumlabel FROM pg_enum WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'staged_mood') ORDER BY enumsortorder",
+    )
+    .contains("happy"));
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TYPE staged_mood RENAME TO staged_feeling",
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT typname FROM pg_type WHERE typname = 'staged_feeling'",
+        )
+        .contains("staged_feeling")
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT typname FROM pg_type WHERE typname = 'staged_mood'",
+        )
+        .contains("staged_mood")
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT typname FROM pg_type WHERE typname = 'staged_feeling'",
+        )
+        .contains("staged_feeling")
+    );
 }
 
 #[test]

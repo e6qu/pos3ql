@@ -3021,6 +3021,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 ownership: crate::storage::Ownership::BOOTSTRAP,
                 members,
                 n_members,
+                pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
         }

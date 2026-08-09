@@ -143,7 +143,7 @@ pub(super) fn build_column(
                         None,
                     )
                 } else if let Some(slot) = storage.resolve_enum_slot(element_name, txid) {
-                    let definition = storage.enum_def(slot);
+                    let definition = storage.enum_for(slot, txid);
                     (
                         ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16)),
                         -1,
@@ -173,7 +173,7 @@ pub(super) fn build_column(
                     ),
                     None => match storage.resolve_enum_slot(c.type_name, txid) {
                         Some(slot) => {
-                            let definition = storage.enum_def(slot);
+                            let definition = storage.enum_for(slot, txid);
                             (
                                 ColType::Enum(slot as u16),
                                 -1,
@@ -333,11 +333,11 @@ pub(super) fn resolve_default(
             &hooks,
         )?;
         let v = match ctype {
-            ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, arena)?,
+            ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, txid, arena)?,
             ColType::Array(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(v, element, storage, arena)?,
+            ) => super::coerce_user_type_array(v, element, storage, txid, arena)?,
             _ => cast_to(v, ctype, arena)?,
         };
         let v = apply_typmod(v, ctype, type_mod, arena)?;

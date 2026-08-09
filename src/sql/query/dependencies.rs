@@ -385,7 +385,7 @@ fn collect_type(
             );
         }
         if let Some(slot) = storage.enum_slot(schema, name, txid) {
-            let definition = storage.enum_def(slot);
+            let definition = storage.enum_for(slot, txid);
             return record(
                 DependencyClass::Enum,
                 slot,
@@ -413,7 +413,7 @@ fn collect_type(
                     );
                 }
                 if let Some(slot) = storage.enum_slot(schema.as_str(), bare, txid) {
-                    let definition = storage.enum_def(slot);
+                    let definition = storage.enum_for(slot, txid);
                     return record(
                         DependencyClass::Enum,
                         slot,

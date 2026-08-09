@@ -197,18 +197,10 @@ pub(crate) enum DdlUndo {
     EnumCreated(u32),
     /// DROP TYPE (enum) at this slot — undo by reviving it.
     EnumDropped(u32),
-    /// ALTER TYPE appended an enum member.
-    EnumValueAdded { slot: u32, prior_count: u8 },
-    /// ALTER TYPE renamed one enum label.
-    EnumValueRenamed {
+    /// ALTER TYPE staged a definition visible only to its transaction.
+    EnumAltered {
         slot: u32,
-        index: u8,
-        prior: crate::storage::SqlName,
-    },
-    /// ALTER TYPE renamed the type itself.
-    EnumRenamed {
-        slot: u32,
-        prior: crate::storage::SqlName,
+        prior: Option<crate::storage::PendingEnumDefinition>,
     },
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),

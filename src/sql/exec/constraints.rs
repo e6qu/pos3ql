@@ -969,7 +969,13 @@ pub(crate) fn apply_fk_parent_actions(
                                     &crate::sql::eval::NoColumns,
                                     &hooks,
                                 )?;
-                                super::coerce(value, &cdef.columns()[cc as usize], storage, arena)?
+                                super::coerce(
+                                    value,
+                                    &cdef.columns()[cc as usize],
+                                    storage,
+                                    txn.txid,
+                                    arena,
+                                )?
                             }
                             crate::storage::ColumnDefault::Generated(_) => {
                                 return Err(sql_err!(

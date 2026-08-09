@@ -4133,6 +4133,24 @@ impl Storage {
         }
     }
 
+    /// Whether a role's grants are visible through the current effective role.
+    /// PostgreSQL information-schema privilege views expose grants held or
+    /// issued by enabled roles, not every catalog ACL entry.
+    pub(crate) fn role_is_enabled(&self, role: u16, txid: u32) -> bool {
+        if role == PUBLIC_ROLE {
+            return true;
+        }
+        let Some(current) = self.current_role_slot(txid) else {
+            return false;
+        };
+        if self.role(current).attributes_to(txid).superuser {
+            return true;
+        }
+        let mut roles = [false; MAX_ROLES];
+        self.inherited_roles(current, txid, &mut roles);
+        roles.get(role as usize).copied().unwrap_or(false)
+    }
+
     pub(crate) fn has_object_privilege(
         &self,
         object: AccessObject,
@@ -8929,6 +8947,14 @@ impl Storage {
             .filter(|(_, view)| view.ddl_state == CatalogDdlState::Present)
     }
 
+    /// Views visible to `txid`, including the transaction's own DDL.
+    pub(crate) fn views_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &ViewDef)> {
+        self.views
+            .iter()
+            .enumerate()
+            .filter(move |(_, view)| view.visible_to(txid))
+    }
+
     pub(crate) fn view(&self, slot: usize) -> &ViewDef {
         &self.views[slot]
     }
@@ -9244,6 +9270,17 @@ impl Storage {
             .filter(|(_, matview)| matview.ddl_state == CatalogDdlState::Present)
     }
 
+    /// Materialized views visible to `txid`, including the transaction's own DDL.
+    pub(crate) fn matviews_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &MatviewDef)> {
+        self.matviews
+            .iter()
+            .enumerate()
+            .filter(move |(_, matview)| matview.visible_to(txid))
+    }
+
     pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
         &self.matviews[slot]
     }
@@ -9383,6 +9420,16 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, sequence)| sequence.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn sequences_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &SequenceDef)> {
+        self.sequences
+            .iter()
+            .enumerate()
+            .filter(move |(_, sequence)| sequence.visible_to(txid))
     }
 
     pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {

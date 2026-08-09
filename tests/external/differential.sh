@@ -57,7 +57,7 @@ listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = ${POS3QL_DIFF_OBJECT_STORE:-off}
 max_tables = 64
-table_rows = 65536
+table_rows = 8192
 max_value_indexes = 64
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 ${POS3QL_EXTRA_CONF:-}

@@ -38,13 +38,8 @@ pub const MAX_BIND_PARAMS: usize = 32;
 /// liveness signal; this fixed cadence is independent of client activity.
 const REPLICATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
-fn reject_role_login(
-    mode: AuthMode,
-    role: crate::sql::RoleLogin,
-    bootstrap_fallback: bool,
-) -> bool {
-    let missing_verifier =
-        !matches!(mode, AuthMode::Trust) && role.password.is_none() && !bootstrap_fallback;
+fn reject_role_login(mode: AuthMode, role: crate::sql::RoleLogin, verifier: LoginVerifier) -> bool {
+    let missing_verifier = !matches!(mode, AuthMode::Trust) && !verifier.is_available();
     !role.can_login || !role.valid || missing_verifier
 }
 
@@ -99,6 +94,35 @@ enum ReplicationMode {
     None,
     Physical,
     Logical,
+}
+
+/// The credential selected during startup. A configured password is solely
+/// the initial `postgres` role's credential; every other login must carry its
+/// own stored verifier. Keeping that choice as data prevents a missing role
+/// password from becoming an accidental alternate authentication path.
+#[derive(Clone, Copy, Debug)]
+enum LoginVerifier {
+    Rejected,
+    Bootstrap,
+    Role(crate::storage::RolePassword),
+}
+
+impl LoginVerifier {
+    const fn is_available(self) -> bool {
+        !matches!(self, Self::Rejected)
+    }
+}
+
+fn login_verifier_for(
+    session_user: &str,
+    role: crate::sql::RoleLogin,
+    bootstrap_configured: bool,
+) -> LoginVerifier {
+    match role.password {
+        Some(password) => LoginVerifier::Role(password),
+        None if session_user == "postgres" && bootstrap_configured => LoginVerifier::Bootstrap,
+        None => LoginVerifier::Rejected,
+    }
 }
 
 /// A parsed cancellation target. PostgreSQL 3.0 uses a four-byte secret;
@@ -206,7 +230,7 @@ pub struct Conn {
     pub guc: GucState,
     scram: ScramFlow,
     role_scram: Option<ScramServer>,
-    auth_role_password: Option<crate::storage::RolePassword>,
+    login_verifier: LoginVerifier,
     auth_login: Option<crate::sql::RoleLogin>,
     authenticated_role: Option<u16>,
     auth_password: StackStr<256>,
@@ -287,7 +311,7 @@ impl Conn {
             guc: GucState::new(),
             scram: ScramFlow::new(),
             role_scram: None,
-            auth_role_password: None,
+            login_verifier: LoginVerifier::Rejected,
             auth_login: None,
             authenticated_role: None,
             auth_password: StackStr::new(),
@@ -339,7 +363,7 @@ impl Conn {
         self.guc = GucState::new();
         self.scram = ScramFlow::new();
         self.role_scram = None;
-        self.auth_role_password = None;
+        self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
         self.authenticated_role = None;
         self.auth_password = StackStr::new();
@@ -790,24 +814,23 @@ impl Conn {
         self.auth_password = StackStr::new();
         self.auth_reject = false;
         self.role_scram = None;
-        self.auth_role_password = None;
+        self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
         let session_user = self.guc.session_user();
         if let Some(role) = engine.role_login(session_user.as_str()) {
             self.auth_login = Some(role);
-            let bootstrap_fallback =
-                session_user.as_str() == "postgres" && !auth.password.is_empty();
-            self.auth_reject = reject_role_login(auth.mode, role, bootstrap_fallback)
+            self.login_verifier =
+                login_verifier_for(session_user.as_str(), role, !auth.password.is_empty());
+            self.auth_reject = reject_role_login(auth.mode, role, self.login_verifier)
                 || reject_replication_login(self.replication, role);
-            if let Some(password) = role.password {
-                self.auth_role_password = Some(password);
+            if let LoginVerifier::Role(password) = self.login_verifier {
                 self.role_scram = Some(ScramServer {
                     salt: password.salt,
                     stored_key: password.stored_key,
                     server_key: password.server_key,
                     iterations: password.iterations,
                 });
-            } else if bootstrap_fallback {
+            } else if matches!(self.login_verifier, LoginVerifier::Bootstrap) {
                 self.auth_password = StackStr::from_str(&auth.password);
             }
         } else {
@@ -948,7 +971,7 @@ impl Conn {
                 };
                 // Fixed-pattern comparison over both strings.
                 let expected = self.auth_password.as_str();
-                let ok = if let Some(verifier) = self.auth_role_password {
+                let ok = if let LoginVerifier::Role(verifier) = self.login_verifier {
                     let candidate = ScramServer::derive(pass, verifier.salt, verifier.iterations);
                     candidate
                         .stored_key
@@ -971,7 +994,11 @@ impl Conn {
                 }
             }
             Phase::AwaitSaslInit => {
-                let Some(server) = self.role_scram.as_ref().or(auth.scram.as_ref()) else {
+                let server = match self.login_verifier {
+                    LoginVerifier::Role(_) => self.role_scram.as_ref(),
+                    LoginVerifier::Bootstrap | LoginVerifier::Rejected => auth.scram.as_ref(),
+                };
+                let Some(server) = server else {
                     return Step::Close;
                 };
                 let mut m = MsgIn::new(payload);
@@ -1005,7 +1032,11 @@ impl Conn {
                 }
             }
             Phase::AwaitSaslFinal => {
-                let Some(server) = self.role_scram.as_ref().or(auth.scram.as_ref()) else {
+                let server = match self.login_verifier {
+                    LoginVerifier::Role(_) => self.role_scram.as_ref(),
+                    LoginVerifier::Bootstrap | LoginVerifier::Rejected => auth.scram.as_ref(),
+                };
+                let Some(server) = server else {
                     return Step::Close;
                 };
                 let Ok(client_final) = core::str::from_utf8(payload) else {
@@ -3506,7 +3537,7 @@ mod tests {
     }
 
     #[test]
-    fn trust_authentication_does_not_require_a_password_verifier() {
+    fn login_verifier_makes_bootstrap_and_role_credentials_disjoint() {
         let login = crate::sql::RoleLogin {
             slot: 0,
             can_login: true,
@@ -3516,10 +3547,53 @@ mod tests {
             connection_limit: -1,
             password: None,
         };
-        assert!(!reject_role_login(AuthMode::Trust, login, false));
-        assert!(reject_role_login(AuthMode::Password, login, false));
-        assert!(reject_role_login(AuthMode::ScramSha256, login, false));
-        assert!(!reject_role_login(AuthMode::Password, login, true));
+        assert!(!reject_role_login(
+            AuthMode::Trust,
+            login,
+            LoginVerifier::Rejected
+        ));
+        assert!(reject_role_login(
+            AuthMode::Password,
+            login,
+            LoginVerifier::Rejected
+        ));
+        assert!(reject_role_login(
+            AuthMode::ScramSha256,
+            login,
+            LoginVerifier::Rejected
+        ));
+        assert!(!reject_role_login(
+            AuthMode::Password,
+            login,
+            LoginVerifier::Bootstrap
+        ));
+        assert!(matches!(
+            login_verifier_for("postgres", login, true),
+            LoginVerifier::Bootstrap
+        ));
+        assert!(matches!(
+            login_verifier_for("application", login, true),
+            LoginVerifier::Rejected
+        ));
+        let role_verifier = crate::storage::RolePassword {
+            salt: [7; 16],
+            stored_key: [8; 32],
+            server_key: [9; 32],
+            iterations: 4096,
+        };
+        assert!(!reject_role_login(
+            AuthMode::ScramSha256,
+            login,
+            LoginVerifier::Role(role_verifier)
+        ));
+        let role_login = crate::sql::RoleLogin {
+            password: Some(role_verifier),
+            ..login
+        };
+        assert!(matches!(
+            login_verifier_for("postgres", role_login, true),
+            LoginVerifier::Role(_)
+        ));
     }
 
     #[test]

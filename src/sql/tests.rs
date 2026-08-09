@@ -8709,6 +8709,118 @@ fn enum_definitions_are_private_until_commit() {
 }
 
 #[test]
+fn sequence_alterations_are_private_until_commit() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE SEQUENCE staged_sequence");
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER SEQUENCE staged_sequence INCREMENT BY 7 RESTART WITH 40",
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT increment_by FROM pg_sequences WHERE sequencename = 'staged_sequence'",
+        )
+        .contains('7')
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'staged_sequence'::regclass",
+        )
+        .contains('7')
+    );
+    let staged_values = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT nextval('staged_sequence'), nextval('staged_sequence')",
+    );
+    assert!(
+        staged_values.contains("40") && staged_values.contains("47"),
+        "{staged_values}"
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT increment_by FROM pg_sequences WHERE sequencename = 'staged_sequence'",
+        )
+        .contains('1')
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT nextval('staged_sequence')",
+        )
+        .contains('1')
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER SEQUENCE staged_sequence INCREMENT BY 7 RESTART WITH 40",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SAVEPOINT preserved_sequence",
+    );
+    let initial = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT nextval('staged_sequence')",
+    );
+    assert!(initial.contains("40"), "{initial}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER SEQUENCE staged_sequence INCREMENT BY 11 RESTART WITH 80",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ROLLBACK TO SAVEPOINT preserved_sequence",
+    );
+    let restored = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT nextval('staged_sequence')",
+    );
+    assert!(restored.contains("47"), "{restored}");
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT nextval('staged_sequence')",
+        )
+        .contains("54")
+    );
+}
+
+#[test]
 fn domains_survive_restart() {
     let config = test_config("domain-durable");
     {
@@ -10014,6 +10126,37 @@ fn current_setting_reads_gucs() {
             "SELECT current_setting('no_such_xyz', true) IS NULL"
         )),
         ["t"]
+    );
+}
+
+#[test]
+fn altered_sequence_definition_and_value_survive_restart() {
+    let config = test_config("sequence_alter_restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SEQUENCE s START 10 INCREMENT 1; \
+             BEGIN; ALTER SEQUENCE s INCREMENT BY 3 RESTART WITH 50; \
+             SELECT nextval('s'); COMMIT",
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
+        ["53"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT increment_by FROM pg_sequences WHERE sequencename = 's'"
+        )),
+        ["3"]
     );
 }
 
@@ -13806,16 +13949,16 @@ fn distinct_aggregates() {
         )),
         ["15.0000000000000000"]
     );
-    // Empty ordered/distinct aggregate buffers never acquire arena storage.
-    // They still return PostgreSQL's NULL result without constructing a slice
-    // from the sentinel pointer.
+    // Empty aggregate buffers never acquire arena storage; every aggregate
+    // variant still returns PostgreSQL's NULL result.
     assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT array_agg(x ORDER BY x), array_agg(distinct x) FROM t WHERE false"
+            "SELECT array_agg(x), array_agg(x ORDER BY x), array_agg(distinct x), \
+             json_agg(x) FROM t WHERE false"
         )),
-        ["NULL|NULL"]
+        ["NULL|NULL|NULL|NULL"]
     );
     // DISTINCT outside an aggregate is rejected loudly.
     assert!(

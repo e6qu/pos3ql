@@ -458,7 +458,7 @@ fn collect_sequence(
         })
     };
     if let Some(slot) = slot {
-        let sequence = storage.sequence(slot);
+        let sequence = storage.sequence_for(slot, txid);
         dependencies.push(StoredQueryDependency {
             class: DependencyClass::Sequence,
             slot: slot as u16,

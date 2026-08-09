@@ -1578,14 +1578,13 @@ impl Engine {
         // deliberately non-transactional: a `nextval` in a rolled-back
         // transaction still consumes its number, matching PostgreSQL's gaps.
         for i in 0..self.storage.sequence_count() {
-            let seq = self.storage.sequence(i);
-            if !seq.visible_to(txn.txid) || !seq.dirty.get() {
+            let seq = self.storage.sequence_for(i, txn.txid);
+            if !seq.visible_to(txn.txid) || !self.storage.sequence_value_dirty_for(i, txn.txid) {
                 continue;
             }
             let schema = seq.schema;
             let name = seq.name;
-            let last = seq.last_value.get();
-            let is_called = seq.is_called.get();
+            let (last, is_called) = self.storage.sequence_value_for(i, txn.txid);
             let lsn = self.storage.lsn() + 1;
             if let Err(e) = self.wal.stage(
                 txn.txid,
@@ -1846,7 +1845,7 @@ impl Engine {
         for i in 0..self.storage.sequence_count() {
             let sequence = self.storage.sequence(i);
             if sequence.visible_to(txn.txid) {
-                sequence.dirty.set(false);
+                self.storage.clear_sequence_value_dirty(i, txn.txid);
             }
         }
         for slot in 0..self.storage.table_count() {
@@ -1969,6 +1968,9 @@ impl Engine {
                     );
                 }
                 DdlUndo::SequenceDropped(slot) => self.storage.commit_sequence_drop(*slot as usize),
+                DdlUndo::SequenceAltered { slot, .. } => {
+                    self.storage.commit_sequence_alter(*slot as usize, txn.txid)
+                }
                 DdlUndo::DomainCreated(slot) => {
                     self.storage.commit_domain_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2155,6 +2157,9 @@ impl Engine {
             DdlUndo::SequenceDropped(slot) => {
                 self.storage.rollback_sequence_drop(slot as usize, txid);
             }
+            DdlUndo::SequenceAltered { slot, prior } => {
+                self.storage.rollback_sequence_alter(slot as usize, prior);
+            }
             DdlUndo::DomainCreated(slot) => self.storage.rollback_domain_create(slot as usize),
             DdlUndo::DomainDropped(slot) => {
                 self.storage.rollback_domain_drop(slot as usize, txid);
@@ -2191,15 +2196,9 @@ impl Engine {
                 table.serial_last[column as usize] = prior;
                 table.serial_dirty = true;
             }
-            DdlUndo::OwnedSequenceReset {
-                sequence,
-                prior,
-                prior_called,
-            } => {
-                let sequence = self.storage.sequence(sequence as usize);
-                sequence.last_value.set(prior);
-                sequence.is_called.set(prior_called);
-                sequence.dirty.set(true);
+            DdlUndo::OwnedSequenceReset { sequence, prior } => {
+                self.storage
+                    .restore_sequence_value(sequence as usize, prior);
             }
             DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
             DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize, txid),
@@ -6030,7 +6029,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // An ALTER replays as CreateSequence: if the sequence already exists,
             // redefine it in place; otherwise create it.
             if let Some(slot) = storage.sequence_slot(schema, name, 0) {
-                storage.alter_sequence(slot, spec, None, owner, generator_for);
+                storage.stage_sequence_alter(slot, spec, owner, generator_for, None, 0)?;
+                storage.commit_sequence_alter(slot, 0);
             } else {
                 let slot = storage.create_sequence(
                     crate::storage::SqlName::parse(schema)?,

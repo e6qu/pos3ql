@@ -53,8 +53,10 @@ impl<'a> SeqEval<'a> {
             None => (None, name),
         };
         if let Some(slot) = self.storage.sequence_on_path(qualifier, base, self.txid) {
-            self.storage
-                .require_schema_usage(self.storage.sequence(slot).schema.as_str(), self.txid)?;
+            self.storage.require_schema_usage(
+                self.storage.sequence_for(slot, self.txid).schema.as_str(),
+                self.txid,
+            )?;
             return Ok(slot);
         }
         // Match PostgreSQL's phrasing: a relation of another kind is a type
@@ -106,7 +108,7 @@ impl<'a> SeqEval<'a> {
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied for sequence {}",
-            self.storage.sequence(slot).name.as_str()
+            self.storage.sequence_for(slot, self.txid).name.as_str()
         ))
     }
 }
@@ -115,11 +117,11 @@ impl SequenceAccess for SeqEval<'_> {
     fn nextval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;
-        let seq = self.storage.sequence(slot);
+        let seq = self.storage.sequence_for(slot, self.txid);
         if self.dry {
-            return Ok(seq.last_value.get());
+            return Ok(self.storage.sequence_value_for(slot, self.txid).0);
         }
-        let value = seq.next_value()?;
+        let value = self.storage.next_sequence_value(slot, self.txid)?;
         self.session.record_nextval(slot, seq.created_at, value);
         Ok(value)
     }
@@ -127,7 +129,7 @@ impl SequenceAccess for SeqEval<'_> {
     fn currval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
-        let seq = self.storage.sequence(slot);
+        let seq = self.storage.sequence_for(slot, self.txid);
         match self.session.currval(slot, seq.created_at) {
             Some(v) => Ok(v),
             None => Err(sql_err!(
@@ -150,14 +152,16 @@ impl SequenceAccess for SeqEval<'_> {
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
-        let seq = self.storage.sequence(slot);
+        let seq = self.storage.sequence_for(slot, self.txid);
         if self.dry {
             // Validate the range (so the error surfaces in the counting pass too)
             // without moving the generator.
-            seq.check_setval(value)?;
+            self.storage.check_sequence_value(slot, self.txid, value)?;
             return Ok(value);
         }
-        let result = seq.set_value(value, is_called)?;
+        let result = self
+            .storage
+            .set_sequence_value(slot, self.txid, value, is_called)?;
         self.session.record_setval(slot, seq.created_at, value);
         Ok(result)
     }

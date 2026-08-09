@@ -691,11 +691,11 @@ fn next_auto_value<'x>(
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied for sequence {}",
-                storage.sequence(slot).name.as_str()
+                storage.sequence_for(slot, txid).name.as_str()
             ));
         }
-        let sequence = storage.sequence(slot);
-        let next = sequence.next_value()?;
+        let sequence = storage.sequence_for(slot, txid);
+        let next = storage.next_sequence_value(slot, txid)?;
         seq_session.record_nextval(slot, sequence.created_at, next);
         return match ctype {
             ColType::Int8 => Ok(Datum::Int8(next)),
@@ -1379,7 +1379,7 @@ pub fn drop_table(
                 // Owned serial/identity sequences are internal dependencies:
                 // dropping their table drops them in the same transaction.
                 for sequence_index in 0..storage.sequence_count() {
-                    let sequence = storage.sequence(sequence_index);
+                    let sequence = storage.sequence_for(sequence_index, txn.txid);
                     if !sequence.visible_to(txn.txid)
                         || !matches!(
                             sequence.owner,
@@ -3849,7 +3849,8 @@ fn resolve_privilege_objects(
                         schema
                     ));
                 }
-                for (slot, sequence) in storage.sequences_with_slots() {
+                for slot in 0..storage.sequence_count() {
+                    let sequence = storage.sequence_for(slot, txid);
                     if sequence.visible_to(txid) && sequence.schema.as_str() == schema {
                         add_privilege_object(
                             objects,
@@ -4266,9 +4267,10 @@ pub fn drop_schema(
         }
     }
     for sequence in 0..storage.sequence_count() {
-        if storage.sequence(sequence).visible_to(txn.txid)
-            && in_listed(storage, storage.sequence(sequence).schema.as_str())
-            && storage.sequence(sequence).owner.is_none()
+        let sequence_definition = storage.sequence_for(sequence, txn.txid);
+        if sequence_definition.visible_to(txn.txid)
+            && in_listed(storage, sequence_definition.schema.as_str())
+            && sequence_definition.owner.is_none()
             && let Err(e) = push(SchemaObject::Sequence(sequence), &mut n_objects)
         {
             return sql_fail(e);
@@ -4545,7 +4547,7 @@ pub fn drop_schema(
                 )
             }
             SchemaObject::Sequence(sequence) => {
-                let sequence = storage.sequence(*sequence);
+                let sequence = storage.sequence_for(*sequence, txn.txid);
                 (
                     schema_rank(storage, sequence.schema.as_str()),
                     sequence.created_at,
@@ -4618,7 +4620,7 @@ pub fn drop_schema(
                 write_rel(out, &def.schema, &def.name);
             }
             SchemaObject::Sequence(sequence) => {
-                let sequence = storage.sequence(*sequence);
+                let sequence = storage.sequence_for(*sequence, txn.txid);
                 let _ = write!(out, "sequence ");
                 write_rel(out, &sequence.schema, &sequence.name);
             }
@@ -4654,7 +4656,9 @@ pub fn drop_schema(
                 SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
                 SchemaObject::View(v) => storage.view(*v).schema,
                 SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
-                SchemaObject::Sequence(sequence) => storage.sequence(*sequence).schema,
+                SchemaObject::Sequence(sequence) => {
+                    storage.sequence_for(*sequence, txn.txid).schema
+                }
                 SchemaObject::Domain(domain) => storage.domain(*domain).schema,
                 SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
                 SchemaObject::InboundFk { table, fk_index } => {
@@ -4717,7 +4721,7 @@ pub fn drop_schema(
         .map(|table| {
             (0..storage.sequence_count())
                 .filter(|sequence_slot| {
-                    let sequence = storage.sequence(*sequence_slot);
+                    let sequence = storage.sequence_for(*sequence_slot, txn.txid);
                     sequence.visible_to(txn.txid)
                         && matches!(
                             sequence.owner,
@@ -4854,7 +4858,7 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::Sequence(sequence) => {
-                let sequence = storage.sequence(*sequence);
+                let sequence = storage.sequence_for(*sequence, txn.txid);
                 let (schema, name) = (sequence.schema, sequence.name);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage(
@@ -4944,7 +4948,7 @@ pub fn drop_schema(
                 }
                 let def = *storage.table_def(*t, txn.txid);
                 for sequence_slot in 0..storage.sequence_count() {
-                    let sequence = storage.sequence(sequence_slot);
+                    let sequence = storage.sequence_for(sequence_slot, txn.txid);
                     if !sequence.visible_to(txn.txid)
                         || !matches!(
                             sequence.owner,
@@ -6897,23 +6901,20 @@ pub fn alter_sequence(
     ) {
         return sql_fail(error);
     }
-    let base = {
-        let s = storage.sequence(slot);
-        SeqSpec {
-            data_type: s.data_type,
-            increment: s.increment,
-            min_value: s.min_value,
-            max_value: s.max_value,
-            start_value: s.start_value,
-            cache: s.cache,
-            cycle: s.cycle,
-        }
+    let prior = storage.sequence_for(slot, txn.txid);
+    let base = SeqSpec {
+        data_type: prior.data_type,
+        increment: prior.increment,
+        min_value: prior.min_value,
+        max_value: prior.max_value,
+        start_value: prior.start_value,
+        cache: prior.cache,
+        cycle: prior.cycle,
     };
     let (spec, restart) = match resolve_seq_spec(options, Some(base)) {
         Ok(v) => v,
         Err(e) => return sql_fail(e),
     };
-    let prior = storage.sequence(slot);
     if options.owned_by.is_some()
         && let Some(generator) = prior.generator_for
         && let Some(table_slot) = storage.find_visible(
@@ -6935,7 +6936,7 @@ pub fn alter_sequence(
         None => prior.owner,
         Some(None) => None,
         Some(Some(requested)) => {
-            let sequence_schema = storage.sequence(slot).schema;
+            let sequence_schema = prior.schema;
             match resolve_sequence_owner(storage, requested, sequence_schema.as_str(), txn.txid) {
                 Ok(owner) => Some(owner),
                 Err(error) => return sql_fail(error),
@@ -6943,9 +6944,13 @@ pub fn alter_sequence(
         }
     };
     let generator_for = prior.generator_for;
-    storage.alter_sequence(slot, spec, restart, owner, generator_for);
+    let prior_definition =
+        match storage.stage_sequence_alter(slot, spec, owner, generator_for, restart, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
     let (schema, sname) = {
-        let s = storage.sequence(slot);
+        let s = storage.sequence_for(slot, txn.txid);
         (s.schema, s.name)
     };
     // The redefinition journals as a CreateSequence (absolute parameters).
@@ -6967,26 +6972,15 @@ pub fn alter_sequence(
             generator_for,
         },
     ) {
+        storage.rollback_sequence_alter(slot, prior_definition);
         return sql_fail(e);
     }
-    // A RESTART changed value state; journal the absolute advance too.
-    if restart.is_some() {
-        let s = storage.sequence(slot);
-        let (last, is_called) = (s.last_value.get(), s.is_called.get());
-        s.dirty.set(false);
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SequenceAdvance {
-                schema: schema.as_str(),
-                name: sname.as_str(),
-                last,
-                is_called,
-            },
-        ) {
-            return sql_fail(e);
-        }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
+        slot: slot as u32,
+        prior: prior_definition,
+    }) {
+        storage.rollback_sequence_alter(slot, prior_definition);
+        return sql_fail(error);
     }
     responder.command_complete("ALTER SEQUENCE")?;
     sql_ok()
@@ -7027,7 +7021,7 @@ pub fn drop_sequence(
             return sql_fail(error);
         }
         let (schema, sname) = {
-            let s = storage.sequence(slot);
+            let s = storage.sequence_for(slot, txn.txid);
             if let Some(owner) = s.owner {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -13008,19 +13002,17 @@ pub fn truncate(
                     def.columns()[c].name.as_str(),
                     txn.txid,
                 ) {
-                    let sequence = storage.sequence(sequence_slot);
+                    let start_value = storage.sequence_for(sequence_slot, txn.txid).start_value;
+                    let prior = storage.reset_sequence_value(sequence_slot, txn.txid, start_value);
                     if let Err(error) =
                         txn.record_ddl(crate::sql::txn::DdlUndo::OwnedSequenceReset {
                             sequence: sequence_slot as u32,
-                            prior: sequence.last_value.get(),
-                            prior_called: sequence.is_called.get(),
+                            prior,
                         })
                     {
+                        storage.restore_sequence_value(sequence_slot, prior);
                         return sql_fail(error);
                     }
-                    sequence.last_value.set(sequence.start_value);
-                    sequence.is_called.set(false);
-                    sequence.dirty.set(true);
                     continue;
                 }
                 let prior = storage.table(table_index).serial_last[c];
@@ -13392,7 +13384,7 @@ fn alter_table_inner(
             ));
         }
         for sequence_slot in 0..storage.sequence_count() {
-            let sequence = storage.sequence(sequence_slot);
+            let sequence = storage.sequence_for(sequence_slot, txn.txid);
             if !matches!(
                 sequence.owner,
                 Some(owner) if owner.table_schema == def.schema && owner.table == def.name
@@ -13581,7 +13573,7 @@ fn alter_table_inner(
                 };
                 for slot in 0..storage.sequence_count() {
                     if matches!(
-                        storage.sequence(slot).owner,
+                        storage.sequence_for(slot, txn.txid).owner,
                         Some(owner)
                             if owner.table_schema == def.schema
                                 && owner.table == def.name
@@ -13715,7 +13707,7 @@ fn alter_table_inner(
                     original_column.as_str(),
                     txn.txid,
                 ) && matches!(
-                    storage.sequence(slot).owner,
+                    storage.sequence_for(slot, txn.txid).owner,
                     Some(owner)
                         if owner.table_schema == def.schema
                             && owner.table == def.name
@@ -14246,7 +14238,7 @@ fn alter_table_inner(
         }
     }
     for &sequence_slot in &owned_sequences_to_drop[..n_owned_sequences_to_drop] {
-        let sequence = storage.sequence(sequence_slot);
+        let sequence = storage.sequence_for(sequence_slot, txn.txid);
         let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
@@ -14296,7 +14288,7 @@ fn alter_table_inner(
     // every changed ownership/generator edge absolutely so replay observes the
     // same rename, dropped column, or dropped identity.
     for sequence_slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence(sequence_slot);
+        let sequence = storage.sequence_for(sequence_slot, txn.txid);
         if !sequence.visible_to(txn.txid) {
             continue;
         }

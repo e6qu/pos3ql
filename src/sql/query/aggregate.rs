@@ -1420,6 +1420,9 @@ impl<'a> AggState<'a> {
             }
             Ok(&vals[..unique])
         } else {
+            if self.vals_len == 0 {
+                return Ok(&[]);
+            }
             Ok(unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) })
         }
     }

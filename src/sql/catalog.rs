@@ -1510,7 +1510,7 @@ pub fn relname_text<'a>(
         }
     }
     for slot in 0..storage.sequence_count() {
-        let seq = storage.sequence(slot);
+        let seq = storage.sequence_for(slot, txid);
         if !seq.visible_to(txid) {
             continue;
         }
@@ -1566,7 +1566,7 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         return Some(info.oid);
     }
     for slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence(slot);
+        let sequence = storage.sequence_for(slot, txid);
         if sequence.visible_to(txid)
             && sequence.name.as_str() == relation
             && schema.is_none_or(|schema| sequence.schema.as_str() == schema)
@@ -2803,7 +2803,11 @@ fn pg_class<'a>(
     }
     // Sequences are relations of kind 'S', each with its own OID range so
     // psql's `\d`/`\dm` and pg_get_serial_sequence-style joins resolve.
-    for (slot, seq) in storage.sequences_visible_to(txid) {
+    for slot in 0..storage.sequence_count() {
+        let seq = storage.sequence_for(slot, txid);
+        if !seq.visible_to(txid) {
+            continue;
+        }
         if n == out.len() {
             break;
         }
@@ -3289,7 +3293,11 @@ fn pg_depend<'a>(
     // Sequence ownership is how pg_dump distinguishes serial/identity
     // generators from independent sequences and orders them with the owning
     // column.
-    for (sequence_slot, sequence) in storage.sequences_visible_to(txid) {
+    for sequence_slot in 0..storage.sequence_count() {
+        let sequence = storage.sequence_for(sequence_slot, txid);
+        if !sequence.visible_to(txid) {
+            continue;
+        }
         let Some(owner) = sequence.owner else {
             continue;
         };
@@ -4756,14 +4764,19 @@ fn pg_sequences<'a>(
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (slot, seq) in storage.sequences_visible_to(txid) {
+    for slot in 0..storage.sequence_count() {
+        let seq = storage.sequence_for(slot, txid);
+        if !seq.visible_to(txid) {
+            continue;
+        }
         if n == out.len() {
             break;
         }
         // last_value is NULL until the sequence has been advanced at least once,
         // exactly as PostgreSQL reports it.
-        let last_value = if seq.is_called.get() {
-            Datum::Int8(seq.last_value.get())
+        let (sequence_last_value, sequence_is_called) = storage.sequence_value_for(slot, txid);
+        let last_value = if sequence_is_called {
+            Datum::Int8(sequence_last_value)
         } else {
             Datum::Null
         };
@@ -4814,7 +4827,11 @@ fn pg_sequence<'a>(
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (slot, seq) in storage.sequences_visible_to(txid) {
+    for slot in 0..storage.sequence_count() {
+        let seq = storage.sequence_for(slot, txid);
+        if !seq.visible_to(txid) {
+            continue;
+        }
         if n == out.len() {
             break;
         }
@@ -5402,7 +5419,11 @@ fn info_sequences<'a>(
     );
     let mut output: [&[Datum]; 256] = [&[]; 256];
     let mut count = 0usize;
-    for (_, sequence) in storage.sequences_visible_to(txid) {
+    for slot in 0..storage.sequence_count() {
+        let sequence = storage.sequence_for(slot, txid);
+        if !sequence.visible_to(txid) {
+            continue;
+        }
         if count == output.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5540,7 +5561,10 @@ fn info_usage_privileges<'a>(
         }
         Ok(())
     };
-    for (slot, _) in storage.sequences_visible_to(txid) {
+    for slot in 0..storage.sequence_count() {
+        if !storage.sequence_for(slot, txid).visible_to(txid) {
+            continue;
+        }
         append_object(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Sequence,

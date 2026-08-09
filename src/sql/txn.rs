@@ -185,6 +185,10 @@ pub(crate) enum DdlUndo {
     SequenceCreated(u32),
     /// DROP SEQUENCE at this slot — undo by reviving it.
     SequenceDropped(u32),
+    SequenceAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingSequenceDefinition>,
+    },
     /// CREATE DOMAIN at this slot — undo by dropping it.
     DomainCreated(u32),
     /// DROP DOMAIN at this slot — undo by reviving it.
@@ -215,8 +219,7 @@ pub(crate) enum DdlUndo {
     /// transactional exception PostgreSQL defines.
     OwnedSequenceReset {
         sequence: u32,
-        prior: i64,
-        prior_called: bool,
+        prior: crate::storage::SequenceValueState,
     },
     /// CREATE SCHEMA at this slot — undo by dropping it.
     SchemaCreated(u32),

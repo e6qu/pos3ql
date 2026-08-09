@@ -55,7 +55,16 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
     match qualifier {
         Some("pg_catalog") => true,
-        Some("information_schema") => matches!(name, "tables" | "columns" | "schemata"),
+        Some("information_schema") => matches!(
+            name,
+            "tables"
+                | "columns"
+                | "schemata"
+                | "table_constraints"
+                | "key_column_usage"
+                | "constraint_column_usage"
+                | "referential_constraints"
+        ),
         Some(_) => false,
         None => matches!(
             name,
@@ -925,6 +934,10 @@ pub fn synthesize<'a>(
         (true, "tables") => info_tables(storage, txid, arena),
         (true, "columns") => info_columns(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, arena),
+        (true, "table_constraints") => info_table_constraints(storage, txid, arena),
+        (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
+        (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
+        (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -3080,12 +3093,7 @@ fn pg_constraint<'a>(
                     "pg_constraint result exceeds static capacity"
                 ));
             }
-            let constraint_name = stack_format!(
-                128,
-                "{}_{}_not_null",
-                table.name.as_str(),
-                column.name.as_str()
-            );
+            let constraint_name = not_null_constraint_name(table, column);
             out[n] = row(
                 &[
                     Datum::Int4(
@@ -3656,26 +3664,48 @@ fn pg_attrdef<'a>(
 }
 
 fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    finish(
-        def_of(
-            "pg_collation",
+    let definition = def_of(
+        "pg_collation",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("collname", ColType::Text),
+            ("collnamespace", ColType::Int4),
+            ("collowner", ColType::Int4),
+            ("collcollate", ColType::Text),
+            ("collctype", ColType::Text),
+            ("colliculocale", ColType::Text),
+            ("collprovider", ColType::Bpchar),
+            ("collisdeterministic", ColType::Bool),
+            ("collencoding", ColType::Int4),
+        ],
+    );
+    let rows = [
+        (100, "default", "", "", "d", -1),
+        (950, "C", "C", "C", "c", -1),
+        (951, "POSIX", "POSIX", "POSIX", "c", -1),
+        (12_340, "ucs_basic", "", "", "b", 6),
+    ];
+    let mut output: [&[Datum]; 4] = [&[]; 4];
+    for (index, (oid, name, collate, ctype, provider, encoding)) in rows.iter().enumerate() {
+        output[index] = row(
             &[
-                ("tableoid", ColType::Int4),
-                ("oid", ColType::Int4),
-                ("collname", ColType::Text),
-                ("collnamespace", ColType::Int4),
-                ("collowner", ColType::Int4),
-                ("collcollate", ColType::Text),
-                ("collctype", ColType::Text),
-                ("colliculocale", ColType::Text),
-                ("collprovider", ColType::Bpchar),
-                ("collisdeterministic", ColType::Bool),
-                ("collencoding", ColType::Int4),
+                Datum::Int4(*oid),
+                Datum::Int4(*oid),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                text(collate, arena)?,
+                text(ctype, arena)?,
+                Datum::Null,
+                Datum::Bpchar(provider),
+                Datum::Bool(true),
+                Datum::Int4(*encoding),
             ],
-        ),
-        &[],
-        arena,
-    )
+            arena,
+        )?;
+    }
+    finish(definition, &output, arena)
 }
 
 fn pg_enum<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -4849,6 +4879,478 @@ fn info_columns<'a>(
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn info_table_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "table_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("constraint_type", ColType::Text),
+            ("is_deferrable", ColType::Text),
+            ("initially_deferred", ColType::Text),
+            ("enforced", ColType::Text),
+            ("nulls_distinct", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
+        * (crate::storage::MAX_COLUMNS * 2
+            + crate::storage::MAX_UNIQUES
+            + crate::storage::MAX_CHECKS
+            + crate::storage::MAX_FKEYS);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    let mut append = |name: &str,
+                      kind: &str,
+                      nulls_distinct: Option<&str>,
+                      table: &TableDef|
+     -> Result<(), SqlError> {
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table_constraints exceeds static capacity"
+            ));
+        }
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(table.schema.as_str(), arena)?,
+                text(name, arena)?,
+                text("postgres", arena)?,
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(kind, arena)?,
+                text("NO", arena)?,
+                text("NO", arena)?,
+                text("YES", arena)?,
+                nulls_distinct.map_or(Ok(Datum::Null), |value| text(value, arena))?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for column in table.columns() {
+            if column.primary {
+                let name = inline_primary_constraint_name(table);
+                append(name.as_str(), "PRIMARY KEY", None, table)?;
+            } else if column.unique {
+                let name = inline_unique_constraint_name(table, column);
+                append(name.as_str(), "UNIQUE", Some("YES"), table)?;
+            }
+            if column.not_null {
+                let name = not_null_constraint_name(table, column);
+                append(name.as_str(), "CHECK", None, table)?;
+            }
+        }
+        for unique in table.uniques() {
+            append(
+                unique.name.as_str(),
+                if unique.is_primary {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+                (!unique.is_primary).then_some("YES"),
+                table,
+            )?;
+        }
+        for check in table.checks() {
+            append(check.name.as_str(), "CHECK", None, table)?;
+        }
+        for foreign_key in table.fkeys() {
+            append(foreign_key.name.as_str(), "FOREIGN KEY", None, table)?;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn inline_primary_constraint_name(table: &TableDef) -> StackStr<128> {
+    stack_format!(128, "{}_pkey", table.name.as_str())
+}
+
+fn inline_unique_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<128> {
+    stack_format!(128, "{}_{}_key", table.name.as_str(), column.name.as_str())
+}
+
+fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<128> {
+    stack_format!(
+        128,
+        "{}_{}_not_null",
+        table.name.as_str(),
+        column.name.as_str()
+    )
+}
+
+struct KeyConstraint {
+    name: StackStr<128>,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    count: usize,
+}
+
+impl KeyConstraint {
+    fn columns(&self) -> &[u16] {
+        &self.columns[..self.count]
+    }
+}
+
+fn matching_key_constraint(table: &TableDef, columns: &[u16]) -> Option<KeyConstraint> {
+    if columns.len() == 1 {
+        let column = &table.columns()[columns[0] as usize];
+        if column.primary || column.unique {
+            return Some(KeyConstraint {
+                name: if column.primary {
+                    inline_primary_constraint_name(table)
+                } else {
+                    inline_unique_constraint_name(table, column)
+                },
+                columns: [columns[0]; crate::storage::MAX_INDEX_COLS],
+                count: 1,
+            });
+        }
+    }
+    table.uniques().iter().find_map(|key| {
+        (key.n_cols == columns.len()
+            && columns.iter().all(|column| key.columns().contains(column))
+            && key.columns().iter().all(|column| columns.contains(column)))
+        .then(|| KeyConstraint {
+            name: stack_format!(128, "{}", key.name.as_str()),
+            columns: key.columns,
+            count: key.n_cols,
+        })
+    })
+}
+
+fn require_parent_key(
+    storage: &Storage,
+    txid: u32,
+    foreign_key: &crate::storage::ForeignKey,
+) -> Result<(TableDef, KeyConstraint), SqlError> {
+    let parent_slot = storage
+        .find_visible(
+            foreign_key.parent_schema.as_str(),
+            foreign_key.parent.as_str(),
+            txid,
+        )
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign key \"{}\" has no visible referenced table",
+                foreign_key.name.as_str()
+            )
+        })?;
+    let parent = *storage.table_def(parent_slot, txid);
+    let key = matching_key_constraint(&parent, foreign_key.parent_cols()).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "foreign key \"{}\" has no referenced key",
+            foreign_key.name.as_str()
+        )
+    })?;
+    Ok((parent, key))
+}
+
+fn info_key_column_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "key_column_usage",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("column_name", ColType::Text),
+            ("ordinal_position", ColType::Int4),
+            ("position_in_unique_constraint", ColType::Int4),
+        ],
+    );
+    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
+        * (crate::storage::MAX_COLUMNS
+            + crate::storage::MAX_UNIQUES * crate::storage::MAX_INDEX_COLS
+            + crate::storage::MAX_FKEYS * crate::storage::MAX_INDEX_COLS);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    let mut append = |table: &TableDef,
+                      name: &str,
+                      column: u16,
+                      position: usize,
+                      parent_position: Option<usize>|
+     -> Result<(), SqlError> {
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "key_column_usage exceeds static capacity"
+            ));
+        }
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(table.schema.as_str(), arena)?,
+                text(name, arena)?,
+                text("postgres", arena)?,
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(table.columns()[column as usize].name.as_str(), arena)?,
+                Datum::Int4(position as i32),
+                parent_position.map_or(Datum::Null, |value| Datum::Int4(value as i32)),
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for (column_index, column) in table.columns().iter().enumerate() {
+            if column.primary || column.unique {
+                let name = if column.primary {
+                    inline_primary_constraint_name(table)
+                } else {
+                    inline_unique_constraint_name(table, column)
+                };
+                append(table, name.as_str(), column_index as u16, 1, None)?;
+            }
+        }
+        for key in table.uniques() {
+            for (position, &column) in key.columns().iter().enumerate() {
+                append(table, key.name.as_str(), column, position + 1, None)?;
+            }
+        }
+        for foreign_key in table.fkeys() {
+            let (_, parent_key) = require_parent_key(storage, txid, foreign_key)?;
+            for (position, (&column, &parent_column)) in foreign_key
+                .columns()
+                .iter()
+                .zip(foreign_key.parent_cols())
+                .enumerate()
+            {
+                let parent_position = parent_key
+                    .columns()
+                    .iter()
+                    .position(|candidate| *candidate == parent_column)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "foreign key \"{}\" does not map to its referenced key",
+                            foreign_key.name.as_str()
+                        )
+                    })?;
+                append(
+                    table,
+                    foreign_key.name.as_str(),
+                    column,
+                    position + 1,
+                    Some(parent_position + 1),
+                )?;
+            }
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_constraint_column_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "constraint_column_usage",
+        &[
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("column_name", ColType::Text),
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+        ],
+    );
+    let mut total = 0usize;
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        total += table
+            .columns()
+            .iter()
+            .filter(|column| column.primary || column.unique)
+            .count();
+        total += table
+            .columns()
+            .iter()
+            .filter(|column| column.not_null)
+            .count();
+        total += table.uniques().iter().map(|key| key.n_cols).sum::<usize>();
+        total += table
+            .fkeys()
+            .iter()
+            .map(|key| key.n_parent_cols)
+            .sum::<usize>();
+        for check in table.checks() {
+            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+            total += crate::sql::exec::check_referenced_columns(expression, table)?.count_ones()
+                as usize;
+        }
+    }
+    let output = arena
+        .alloc_slice_with(total, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    let mut append = |referenced_table: &TableDef,
+                      constraint_table: &TableDef,
+                      referenced_column: u16,
+                      constraint_name: &str|
+     -> Result<(), SqlError> {
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(referenced_table.schema.as_str(), arena)?,
+                text(referenced_table.name.as_str(), arena)?,
+                text(
+                    referenced_table.columns()[referenced_column as usize]
+                        .name
+                        .as_str(),
+                    arena,
+                )?,
+                text("postgres", arena)?,
+                text(constraint_table.schema.as_str(), arena)?,
+                text(constraint_name, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for (column_index, column) in table.columns().iter().enumerate() {
+            if column.primary || column.unique {
+                let name = if column.primary {
+                    inline_primary_constraint_name(table)
+                } else {
+                    inline_unique_constraint_name(table, column)
+                };
+                append(table, table, column_index as u16, name.as_str())?;
+            }
+            if column.not_null {
+                let name = not_null_constraint_name(table, column);
+                append(table, table, column_index as u16, name.as_str())?;
+            }
+        }
+        for key in table.uniques() {
+            for &column in key.columns() {
+                append(table, table, column, key.name.as_str())?;
+            }
+        }
+        for check in table.checks() {
+            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+            let columns = crate::sql::exec::check_referenced_columns(expression, table)?;
+            for (index, _) in table.columns().iter().enumerate() {
+                if columns & (1u64 << index) != 0 {
+                    append(table, table, index as u16, check.name.as_str())?;
+                }
+            }
+        }
+        for foreign_key in table.fkeys() {
+            let (parent, _) = require_parent_key(storage, txid, foreign_key)?;
+            for &column in foreign_key.parent_cols() {
+                append(&parent, table, column, foreign_key.name.as_str())?;
+            }
+        }
+    }
+    debug_assert_eq!(count, output.len());
+    finish(definition, output, arena)
+}
+
+fn fk_action_name(action: crate::storage::FkAction) -> &'static str {
+    match action {
+        crate::storage::FkAction::NoAction => "NO ACTION",
+        crate::storage::FkAction::Restrict => "RESTRICT",
+        crate::storage::FkAction::Cascade => "CASCADE",
+        crate::storage::FkAction::SetNull => "SET NULL",
+        crate::storage::FkAction::SetDefault => "SET DEFAULT",
+    }
+}
+
+fn info_referential_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "referential_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("unique_constraint_catalog", ColType::Text),
+            ("unique_constraint_schema", ColType::Text),
+            ("unique_constraint_name", ColType::Text),
+            ("match_option", ColType::Text),
+            ("update_rule", ColType::Text),
+            ("delete_rule", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES * crate::storage::MAX_FKEYS;
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for foreign_key in table.fkeys() {
+            if count == output.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "referential_constraints exceeds static capacity"
+                ));
+            }
+            let (parent, parent_key) = require_parent_key(storage, txid, foreign_key)?;
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(table.schema.as_str(), arena)?,
+                    text(foreign_key.name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(parent.schema.as_str(), arena)?,
+                    text(parent_key.name.as_str(), arena)?,
+                    text("NONE", arena)?,
+                    text(fk_action_name(foreign_key.on_update), arena)?,
+                    text(fk_action_name(foreign_key.on_delete), arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

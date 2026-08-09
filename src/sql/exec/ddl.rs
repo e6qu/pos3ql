@@ -441,6 +441,12 @@ pub(super) fn resolve_cols(
 /// into `cols` (bit `i` = column `i`), so the caller can name the constraint
 /// the way PostgreSQL does — `<table>_<column>_check` when the predicate
 /// references exactly one column, `<table>_check` otherwise.
+pub(crate) fn check_referenced_columns(expression: &Expr, def: &TableDef) -> Result<u64, SqlError> {
+    let mut columns = 0;
+    validate_check_refs(expression, def, &mut columns)?;
+    Ok(columns)
+}
+
 fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Result<(), SqlError> {
     match expression {
         Expr::SchemaColumn { table, .. } => {
@@ -615,8 +621,7 @@ pub(super) fn attach_constraints(
                 expression,
                 text,
             } => {
-                let mut referenced_cols = 0u64;
-                validate_check_refs(expression, def, &mut referenced_cols)?;
+                let referenced_cols = check_referenced_columns(expression, def)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,

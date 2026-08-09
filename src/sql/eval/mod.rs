@@ -39,9 +39,11 @@ pub use operators::{compare_datums, hash_key};
 /// here, and the wire responder consumes them with the next diagnostic it
 /// writes. The engine is single-threaded per process; the responder clears
 /// the slot on every emission, so a stale detail cannot outlive its error.
+pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
+
 #[derive(Clone, Copy)]
 pub struct Diagnostic {
-    pub detail: StackStr<512>,
+    pub detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
     pub hint: Option<StackStr<128>>,
 }
 
@@ -50,7 +52,10 @@ std::thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-pub fn stash_diagnostic(detail: StackStr<512>, hint: Option<StackStr<128>>) {
+pub fn stash_diagnostic(
+    detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
+    hint: Option<StackStr<128>>,
+) {
     PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
 }
 

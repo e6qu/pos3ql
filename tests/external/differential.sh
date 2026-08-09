@@ -76,13 +76,18 @@ for i in {1..50}; do
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
+P3_READY=0
 for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  if "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
+    P3_READY=1
+    break
+  fi
   sleep 0.1
 done
 # The probe succeeding proves *a* server answered — make sure it is ours.
-if ! kill -0 "$P3_PID" 2>/dev/null; then
-  bad "pos3ql under test exited at startup (see $WORK/p3.log)"
+if [[ $P3_READY -ne 1 ]] || ! kill -0 "$P3_PID" 2>/dev/null; then
+  bad "pos3ql did not accept connections at startup (see $WORK/p3.log)"
+  tail -20 "$WORK/p3.log"
   exit 1
 fi
 

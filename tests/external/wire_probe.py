@@ -599,6 +599,7 @@ def test_catalog_aware_binary_bind_parameters():
         s,
         "CREATE TYPE wire_binary_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
+        "CREATE DOMAIN wire_binary_vector AS integer[]; "
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL",
     )
 
@@ -606,6 +607,8 @@ def test_catalog_aware_binary_bind_parameters():
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_positive'")))
     enum_array_oid = 160000 + enum_oid - 120000
     domain_array_oid = 150000 + domain_oid - 110000
+    vector_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_vector'")))
+    vector_array_oid = 150000 + vector_oid - 110000
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
@@ -627,6 +630,14 @@ def test_catalog_aware_binary_bind_parameters():
             domain_array_oid,
             binary_array(domain_oid, [struct.pack("!i", 3), struct.pack("!i", 5)]),
             "{3,5}",
+            None,
+        ),
+        (
+            "array-valued domain array",
+            "SELECT $1::wire_binary_vector[]",
+            vector_array_oid,
+            binary_array(vector_oid, [binary_array(23, [struct.pack("!i", 3), struct.pack("!i", 4)])]),
+            '{"{3,4}"}',
             None,
         ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),

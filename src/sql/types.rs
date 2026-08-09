@@ -231,6 +231,7 @@ impl ColType {
             "cidr" => Self::Cidr,
             "macaddr" => Self::Macaddr,
             "macaddr8" => Self::Macaddr8,
+            "record" => Self::Record,
             _ => return None,
         })
     }
@@ -316,6 +317,7 @@ impl ColType {
             oid::CIDR => Some(Self::Cidr),
             oid::MACADDR => Some(Self::Macaddr),
             oid::MACADDR8 => Some(Self::Macaddr8),
+            oid::RECORD => Some(Self::Record),
             _ => None,
         };
         if scalar.is_some() {
@@ -967,11 +969,9 @@ impl ArrElem {
         })
     }
 
-    /// Rebuilds a domain-array element identity from the domain catalog. A
-    /// domain over an array would be a multidimensional array element and is
-    /// deliberately rejected by the caller.
+    /// Rebuilds a domain-array element identity from the domain catalog.
     pub fn domain(slot: u16, base: ColType) -> Option<Self> {
-        if matches!(base, ColType::Array(_) | ColType::Record) {
+        if matches!(base, ColType::Record) {
             return None;
         }
         let enum_slot = match base {
@@ -1854,6 +1854,7 @@ mod tests {
     fn type_names_map() {
         assert_eq!(ColType::from_sql_name("integer"), Some(ColType::Int4));
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
+        assert_eq!(ColType::from_sql_name("record"), Some(ColType::Record));
         assert_eq!(ColType::from_sql_name("geometry"), None);
     }
 
@@ -1888,6 +1889,7 @@ mod tests {
             ColType::Cidr,
             ColType::Macaddr,
             ColType::Macaddr8,
+            ColType::Record,
         ];
         for k in [
             RangeKind::Int4,
@@ -1938,7 +1940,6 @@ mod tests {
         }
         // An OID this engine does not model is None, never a wrong type.
         assert_eq!(ColType::from_oid(0), None);
-        assert_eq!(ColType::from_oid(2249), None); // record
     }
 }
 

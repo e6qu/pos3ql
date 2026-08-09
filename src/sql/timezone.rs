@@ -151,202 +151,12 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+#[cfg(test)]
 const H: i32 = 3600;
 
-fn build(std_off: i32, dst_off: i32, std_ab: &str, dst_ab: &str, dst: Option<Dst>) -> Timezone {
-    let mut s = StackStr::new();
-    let _ = write!(s, "{std_ab}");
-    let mut d = StackStr::new();
-    let _ = write!(d, "{dst_ab}");
-    Timezone::Posix(PosixZone {
-        std_off,
-        dst_off,
-        std_abbrev: s,
-        dst_abbrev: d,
-        dst,
-    })
-}
-
-/// US rule (2007+): spring 2nd Sunday March 02:00 std, fall 1st Sunday
-/// November 02:00 dst.
-fn us() -> Dst {
-    Dst {
-        start: Trans {
-            month: 3,
-            week: 2,
-            dow: 0,
-            seconds: 2 * 3600,
-        },
-        end: Trans {
-            month: 11,
-            week: 1,
-            dow: 0,
-            seconds: 2 * 3600,
-        },
-    }
-}
-
-/// EU rule: last Sunday March, last Sunday October, both at 01:00 UTC. The
-/// local wall-clock time depends on the zone's standard offset.
-fn eu(std_off_hours: i32) -> Dst {
-    let start_local = (1 + std_off_hours) * 3600; // 01:00 UTC in std local time
-    let end_local = (1 + std_off_hours + 1) * 3600; // 01:00 UTC in dst local time
-    Dst {
-        start: Trans {
-            month: 3,
-            week: 5,
-            dow: 0,
-            seconds: start_local as i64,
-        },
-        end: Trans {
-            month: 10,
-            week: 5,
-            dow: 0,
-            seconds: end_local as i64,
-        },
-    }
-}
-
-/// Australian rule: spring 1st Sunday October 02:00 std, fall 1st Sunday
-/// April 03:00 dst (southern hemisphere — DST spans the new year).
-fn au() -> Dst {
-    Dst {
-        start: Trans {
-            month: 10,
-            week: 1,
-            dow: 0,
-            seconds: 2 * 3600,
-        },
-        end: Trans {
-            month: 4,
-            week: 1,
-            dow: 0,
-            seconds: 3 * 3600,
-        },
-    }
-}
-
-/// New Zealand rule: last Sunday September 02:00 std, 1st Sunday April 03:00 dst.
-fn nz() -> Dst {
-    Dst {
-        start: Trans {
-            month: 9,
-            week: 5,
-            dow: 0,
-            seconds: 2 * 3600,
-        },
-        end: Trans {
-            month: 4,
-            week: 1,
-            dow: 0,
-            seconds: 3 * 3600,
-        },
-    }
-}
-
-/// Looks up an IANA zone name (case-insensitive): the system's TZif database
-/// first (full history), then the embedded rule set for hosts without one.
+/// Looks up an IANA zone name (case-insensitive) from TZif history.
 pub fn lookup(name: &str) -> Option<Timezone> {
-    if let Some(slot) = super::tzif::load(name) {
-        return Some(Timezone::Tzif(slot));
-    }
-    lookup_embedded(name)
-}
-
-/// The embedded present-rule set: exact for current rules, no history.
-fn lookup_embedded(name: &str) -> Option<Timezone> {
-    let n = name;
-    let eq = |a: &str| n.eq_ignore_ascii_case(a);
-    // North America
-    if eq("America/New_York") || eq("US/Eastern") {
-        return Some(build(-5 * H, -4 * H, "EST", "EDT", Some(us())));
-    }
-    if eq("America/Chicago") || eq("US/Central") {
-        return Some(build(-6 * H, -5 * H, "CST", "CDT", Some(us())));
-    }
-    if eq("America/Denver") || eq("US/Mountain") {
-        return Some(build(-7 * H, -6 * H, "MST", "MDT", Some(us())));
-    }
-    if eq("America/Los_Angeles") || eq("US/Pacific") {
-        return Some(build(-8 * H, -7 * H, "PST", "PDT", Some(us())));
-    }
-    if eq("America/Phoenix") || eq("US/Arizona") {
-        return Some(build(-7 * H, -7 * H, "MST", "MST", None));
-    }
-    if eq("America/Anchorage") || eq("US/Alaska") {
-        return Some(build(-9 * H, -8 * H, "AKST", "AKDT", Some(us())));
-    }
-    if eq("America/Halifax") {
-        return Some(build(-4 * H, -3 * H, "AST", "ADT", Some(us())));
-    }
-    if eq("America/Sao_Paulo") {
-        return Some(build(-3 * H, -3 * H, "-03", "-03", None));
-    }
-    if eq("America/Toronto") {
-        return Some(build(-5 * H, -4 * H, "EST", "EDT", Some(us())));
-    }
-    // Western Europe (CET/CEST, +1)
-    if eq("Europe/Paris")
-        || eq("Europe/Berlin")
-        || eq("Europe/Madrid")
-        || eq("Europe/Rome")
-        || eq("Europe/Amsterdam")
-        || eq("Europe/Brussels")
-        || eq("Europe/Zurich")
-        || eq("Europe/Warsaw")
-        || eq("Europe/Prague")
-        || eq("Europe/Stockholm")
-        || eq("Europe/Vienna")
-        || eq("Europe/Budapest")
-        || eq("Europe/Oslo")
-        || eq("Europe/Copenhagen")
-    {
-        return Some(build(H, 2 * H, "CET", "CEST", Some(eu(1))));
-    }
-    if eq("Europe/London") || eq("Europe/Dublin") || eq("Europe/Lisbon") {
-        return Some(build(0, H, "GMT", "BST", Some(eu(0))));
-    }
-    // Eastern Europe (EET/EEST, +2)
-    if eq("Europe/Bucharest")
-        || eq("Europe/Athens")
-        || eq("Europe/Helsinki")
-        || eq("Europe/Kyiv")
-        || eq("Europe/Kiev")
-        || eq("Europe/Riga")
-        || eq("Europe/Sofia")
-    {
-        return Some(build(2 * H, 3 * H, "EET", "EEST", Some(eu(2))));
-    }
-    if eq("Europe/Moscow") {
-        return Some(build(3 * H, 3 * H, "MSK", "MSK", None));
-    }
-    // Asia (mostly no DST)
-    if eq("Asia/Kolkata") || eq("Asia/Calcutta") {
-        return Some(build(5 * H + 1800, 5 * H + 1800, "IST", "IST", None));
-    }
-    if eq("Asia/Tokyo") {
-        return Some(build(9 * H, 9 * H, "JST", "JST", None));
-    }
-    if eq("Asia/Shanghai") || eq("Asia/Hong_Kong") || eq("Asia/Singapore") {
-        return Some(build(8 * H, 8 * H, "CST", "CST", None));
-    }
-    if eq("Asia/Dubai") {
-        return Some(build(4 * H, 4 * H, "+04", "+04", None));
-    }
-    if eq("Asia/Seoul") {
-        return Some(build(9 * H, 9 * H, "KST", "KST", None));
-    }
-    // Oceania
-    if eq("Australia/Sydney") || eq("Australia/Melbourne") {
-        return Some(build(10 * H, 11 * H, "AEST", "AEDT", Some(au())));
-    }
-    if eq("Australia/Brisbane") {
-        return Some(build(10 * H, 10 * H, "AEST", "AEST", None));
-    }
-    if eq("Pacific/Auckland") {
-        return Some(build(12 * H, 13 * H, "NZST", "NZDT", Some(nz())));
-    }
-    None
+    super::tzif::load(name).map(Timezone::Tzif)
 }
 
 /// Parses a POSIX `TZ` string (the TZif footer form): `std offset [dst
@@ -502,9 +312,14 @@ mod tests {
         (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * DAY_US + h * 3_600_000_000
     }
 
+    fn zone(name: &str) -> Timezone {
+        super::super::tzif::init_catalog();
+        lookup(name).expect("installed TZif zone")
+    }
+
     #[test]
     fn new_york_dst_transitions() {
-        let ny = lookup("America/New_York").unwrap();
+        let ny = zone("America/New_York");
         // January: standard time, -5.
         assert_eq!(ny.resolve(ts(2021, 1, 15, 12)).0, -5 * H);
         // July: daylight time, -4.
@@ -517,11 +332,11 @@ mod tests {
 
     #[test]
     fn europe_and_southern_hemisphere() {
-        let bucharest = lookup("Europe/Bucharest").unwrap();
+        let bucharest = zone("Europe/Bucharest");
         assert_eq!(bucharest.resolve(ts(2021, 1, 1, 12)).0, 2 * H); // EET
         assert_eq!(bucharest.resolve(ts(2021, 7, 1, 12)).0, 3 * H); // EEST
         // Sydney: DST in the southern summer (January), standard in July.
-        let sydney = lookup("Australia/Sydney").unwrap();
+        let sydney = zone("Australia/Sydney");
         assert_eq!(sydney.resolve(ts(2021, 1, 15, 3)).0, 11 * H); // AEDT
         assert_eq!(sydney.resolve(ts(2021, 7, 15, 3)).0, 10 * H); // AEST
     }
@@ -529,7 +344,7 @@ mod tests {
     #[test]
     fn fixed_zones() {
         assert_eq!(Timezone::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
-        let kolkata = lookup("Asia/Kolkata").unwrap();
+        let kolkata = zone("Asia/Kolkata");
         assert_eq!(kolkata.resolve(ts(2021, 7, 1, 0)).0, 5 * H + 1800);
     }
 }

@@ -34,6 +34,7 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 
 - Catalog identity, DDL visibility, and retained TZif cache entries are atomic typed states.
 - A slot acknowledgement is validated before its WAL record can be committed; pgoutput versions are parser-validated protocol states.
+- Named time zones resolve only from retained TZif history; unavailable historical data is not approximated.
 - Checksums, immutable blocks, and CAS manifests make cache loss recoverable.
 - Cancellation keys are parsed as protocol-versioned values: v3.0 uses four bytes and v3.2 uses the full issued key.
 - Network values are constructed only from a valid address family, mask, and canonical address bytes; `cidr` additionally requires host bits clear.

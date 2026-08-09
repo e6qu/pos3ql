@@ -252,7 +252,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_publication") => pg_publication(storage, arena),
+        (false, "pg_publication") => pg_publication(storage, txid, arena),
         (false, "pg_publication_namespace") => finish(
             def_of(
                 "pg_publication_namespace",
@@ -266,7 +266,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_publication_rel") => pg_publication_rel(storage, arena),
+        (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
         (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
         (false, "pg_subscription") => finish(
             def_of(
@@ -2423,7 +2423,11 @@ fn publication_oid(slot: usize) -> i32 {
     FIRST_USER_OID + 80_000 + slot as i32
 }
 
-fn pg_publication<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_publication<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_publication",
         &[
@@ -2442,18 +2446,19 @@ fn pg_publication<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<
     );
     let mut rows: [&[Datum]; 256] = [&[]; 256];
     let mut count = 0;
-    for (slot, publication) in storage.publications_with_slots() {
+    for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
+        let definition = publication.definition_for(txid);
         rows[count] = row(
             &[
                 Datum::Int4(6104),
                 Datum::Int4(publication_oid(slot)),
                 text(publication.name.as_str(), arena)?,
                 Datum::Int4(Storage::role_oid(publication.ownership.owner as usize)),
-                Datum::Bool(publication.all_tables),
-                Datum::Bool(publication.publish_insert),
-                Datum::Bool(publication.publish_update),
-                Datum::Bool(publication.publish_delete),
-                Datum::Bool(publication.publish_truncate),
+                Datum::Bool(definition.all_tables),
+                Datum::Bool(definition.publish_insert),
+                Datum::Bool(definition.publish_update),
+                Datum::Bool(definition.publish_delete),
+                Datum::Bool(definition.publish_truncate),
                 Datum::Bool(false),
                 text("n", arena)?,
             ],
@@ -2464,7 +2469,11 @@ fn pg_publication<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<
     finish(definition, &rows[..count], arena)
 }
 
-fn pg_publication_rel<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_publication_rel<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_publication_rel",
         &[
@@ -2478,11 +2487,12 @@ fn pg_publication_rel<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTa
     );
     let mut rows: [&[Datum]; 256] = [&[]; 256];
     let mut count = 0;
-    for (publication_slot, publication) in storage.publications_with_slots() {
-        if publication.all_tables {
+    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+        let definition = publication.definition_for(txid);
+        if definition.all_tables {
             continue;
         }
-        for table_slot in &publication.tables[..publication.table_count] {
+        for table_slot in &definition.tables[..definition.table_count] {
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,

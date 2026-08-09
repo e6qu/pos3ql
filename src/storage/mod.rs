@@ -23,8 +23,10 @@ use crate::util::StackStr;
 
 pub(crate) use rowenc::MAX_COLUMNS;
 
-/// Maximum explicit relation membership entries in one publication.
-pub(crate) const MAX_PUBLICATION_TABLES: usize = 256;
+/// Maximum explicit relation membership entries in one publication.  WAL
+/// encodes this count in one byte, so the capacity derives from that boundary
+/// instead of permitting an unencodable 256th member.
+pub(crate) const MAX_PUBLICATION_TABLES: usize = u8::MAX as usize;
 
 /// Rows handed from the durable merge cursor to the executor. The fixed batch
 /// boundary lets one resident SST block feed a bounded scan step rather than
@@ -1506,8 +1508,37 @@ pub struct PublicationDef {
     pub publish_update: bool,
     pub publish_delete: bool,
     pub publish_truncate: bool,
+    pending_definition: Option<PendingPublicationDefinition>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
+}
+
+/// The mutable portion of a publication definition.  It is separate from the
+/// catalog identity so an ALTER can remain private to its transaction until
+/// the same commit boundary that makes its WAL record durable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublicationDefinition {
+    pub all_tables: bool,
+    pub tables: [u16; MAX_PUBLICATION_TABLES],
+    pub table_count: usize,
+    pub publish_insert: bool,
+    pub publish_update: bool,
+    pub publish_delete: bool,
+    pub publish_truncate: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingPublicationDefinition {
+    pub txid: u32,
+    pub definition: PublicationDefinition,
+}
+
+/// The exact state an ALTER replaced.  Undo restores this value on both full
+/// and savepoint rollback, which keeps nested ALTERs transactionally ordered.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PublicationAlteration {
+    Committed(Option<PendingPublicationDefinition>),
+    Created(PublicationDefinition),
 }
 
 /// The immutable definition supplied when a publication enters the catalog.
@@ -1555,6 +1586,34 @@ impl ReplicationSlotAdvance {
 impl PublicationDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition(&self) -> PublicationDefinition {
+        PublicationDefinition {
+            all_tables: self.all_tables,
+            tables: self.tables,
+            table_count: self.table_count,
+            publish_insert: self.publish_insert,
+            publish_update: self.publish_update,
+            publish_delete: self.publish_delete,
+            publish_truncate: self.publish_truncate,
+        }
+    }
+
+    fn set_definition(&mut self, definition: PublicationDefinition) {
+        self.all_tables = definition.all_tables;
+        self.tables = definition.tables;
+        self.table_count = definition.table_count;
+        self.publish_insert = definition.publish_insert;
+        self.publish_update = definition.publish_update;
+        self.publish_delete = definition.publish_delete;
+        self.publish_truncate = definition.publish_truncate;
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> PublicationDefinition {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or_else(|| self.definition(), |pending| pending.definition)
     }
 }
 
@@ -3141,6 +3200,7 @@ impl Storage {
                     publish_update: true,
                     publish_delete: true,
                     publish_truncate: true,
+                    pending_definition: None,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -9042,10 +9102,58 @@ impl Storage {
             .filter(|(_, publication)| publication.ddl_state == CatalogDdlState::Present)
     }
 
+    pub(crate) fn publications_with_slots_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &PublicationDef)> {
+        self.publications
+            .iter()
+            .enumerate()
+            .filter(move |(_, publication)| publication.visible_to(txid))
+    }
+
     /// Committed publication lookup for replication protocol setup.
     pub(crate) fn publication(&self, name: &str) -> Option<&PublicationDef> {
         self.live_publications()
             .find(|publication| publication.name.as_str() == name)
+    }
+
+    pub(crate) fn publication_definition(
+        &self,
+        name: &str,
+        txid: u32,
+    ) -> Option<(usize, PublicationDefinition)> {
+        self.publications
+            .iter()
+            .enumerate()
+            .find_map(|(slot, publication)| {
+                (publication.visible_to(txid) && publication.name.as_str() == name)
+                    .then_some((slot, publication.definition_for(txid)))
+            })
+    }
+
+    pub(crate) fn require_publication_owner(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let owner = self.publications[slot].ownership.owner_to(txid) as usize;
+        if self.role(role).attributes_to(txid).superuser
+            || owner == role
+            || self.role_can_set(role, owner, txid)
+        {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of publication {}",
+            self.publications[slot].name.as_str()
+        ))
     }
 
     pub(crate) fn create_replication_slot(
@@ -9281,6 +9389,7 @@ impl Storage {
             publish_update: spec.publish_update,
             publish_delete: spec.publish_delete,
             publish_truncate: spec.publish_truncate,
+            pending_definition: None,
             ownership: self.initial_ownership(txid),
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -9308,8 +9417,79 @@ impl Storage {
     pub fn commit_publication_create(&mut self, slot: usize) {
         self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_create();
     }
+    pub(crate) fn commit_publication_owner(&mut self, slot: usize, txid: u32) {
+        let ownership = &mut self.publications[slot].ownership;
+        if let Some(pending) = ownership.pending
+            && pending.txid == txid
+        {
+            ownership.owner = pending.owner;
+            ownership.pending = None;
+        }
+    }
     pub fn commit_publication_drop(&mut self, slot: usize) {
         self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn alter_publication(
+        &mut self,
+        name: &str,
+        definition: PublicationDefinition,
+        txid: u32,
+    ) -> Result<(usize, PublicationAlteration), SqlError> {
+        if definition.table_count > MAX_PUBLICATION_TABLES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many tables in publication (limit {})",
+                MAX_PUBLICATION_TABLES
+            ));
+        }
+        let Some(slot) = self.publications.iter().position(|publication| {
+            publication.visible_to(txid) && publication.name.as_str() == name
+        }) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                name
+            ));
+        };
+        let publication = &mut self.publications[slot];
+        if let Some(pending) = publication.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "publication \"{}\" is being altered by another transaction",
+                name
+            ));
+        }
+        if matches!(publication.ddl_state, CatalogDdlState::PendingCreate { txid: owner } if owner == txid)
+        {
+            let prior = publication.definition();
+            publication.set_definition(definition);
+            return Ok((slot, PublicationAlteration::Created(prior)));
+        }
+        let prior = publication.pending_definition;
+        publication.pending_definition = Some(PendingPublicationDefinition { txid, definition });
+        Ok((slot, PublicationAlteration::Committed(prior)))
+    }
+
+    pub(crate) fn commit_publication_alter(&mut self, slot: usize, txid: u32) {
+        let publication = &mut self.publications[slot];
+        if let Some(pending) = publication
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            publication.set_definition(pending.definition);
+            publication.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn rollback_publication_alter(&mut self, slot: usize, prior: PublicationAlteration) {
+        let publication = &mut self.publications[slot];
+        match prior {
+            PublicationAlteration::Committed(prior) => publication.pending_definition = prior,
+            PublicationAlteration::Created(prior) => publication.set_definition(prior),
+        }
     }
     pub fn rollback_publication_create(&mut self, slot: usize) {
         self.publications[slot].ddl_state = self.publications[slot].ddl_state.rollback_create();

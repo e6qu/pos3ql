@@ -163,6 +163,11 @@ pub(crate) enum DdlUndo {
     PublicationCreated(u32),
     /// DROP PUBLICATION at this slot.
     PublicationDropped(u32),
+    /// ALTER PUBLICATION staged a definition visible only to this transaction.
+    PublicationAltered {
+        slot: u32,
+        prior: crate::storage::PublicationAlteration,
+    },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.

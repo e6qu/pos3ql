@@ -36,7 +36,7 @@ ALTER OPERATOR CLASS	missing	-
 ALTER OPERATOR FAMILY	missing	-
 ALTER POLICY	missing	-
 ALTER PROCEDURE	missing	-
-ALTER PUBLICATION	missing	-
+ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
 ALTER ROUTINE	missing	-
 ALTER RULE	missing	-

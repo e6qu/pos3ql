@@ -1696,7 +1696,14 @@ pub struct DomainDef {
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
+    pub(crate) pending_definition: Option<PendingDomainDefinition>,
     pub ddl_state: CatalogDdlState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingDomainDefinition {
+    pub txid: u32,
+    pub spec: DomainSpec,
 }
 
 impl DomainDef {
@@ -1712,6 +1719,7 @@ impl DomainDef {
         default_expr: None,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
+        pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
 
@@ -1722,11 +1730,27 @@ impl DomainDef {
     pub fn checks(&self) -> &[CheckConstraint] {
         &self.checks[..self.n_checks]
     }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> Self {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(*self, |pending| Self {
+                base_domain: pending.spec.base_domain,
+                base: pending.spec.base,
+                base_type_mod: pending.spec.base_type_mod,
+                not_null: pending.spec.not_null,
+                default_expr: pending.spec.default_expr,
+                checks: pending.spec.checks,
+                n_checks: pending.spec.n_checks,
+                pending_definition: None,
+                ..*self
+            })
+    }
 }
 
 /// The validated parameters of a `CREATE DOMAIN` / `ALTER DOMAIN`, computed by
 /// the executor and handed to storage (apart from the `live`/`pending` state).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DomainSpec {
     pub base_domain: Option<UserTypeName>,
     pub base: ColType,
@@ -10298,6 +10322,7 @@ impl Storage {
             default_expr: spec.default_expr,
             checks: spec.checks,
             n_checks: spec.n_checks,
+            pending_definition: None,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
             } else {
@@ -10307,49 +10332,52 @@ impl Storage {
         Ok(new)
     }
 
-    /// Replaces a live domain's spec in place (ALTER DOMAIN).
-    pub fn alter_domain(&mut self, slot: usize, spec: DomainSpec) {
-        let d = &mut self.domains[slot];
-        d.base_domain = spec.base_domain;
-        d.base = spec.base;
-        d.base_type_mod = spec.base_type_mod;
-        d.not_null = spec.not_null;
-        d.default_expr = spec.default_expr;
-        d.checks = spec.checks;
-        d.n_checks = spec.n_checks;
+    pub(crate) fn domain_for(&self, slot: usize, txid: u32) -> DomainDef {
+        self.domains[slot].definition_for(txid)
+    }
+
+    pub(crate) fn stage_domain_alter(
+        &mut self,
+        slot: usize,
+        spec: DomainSpec,
+        txid: u32,
+    ) -> Result<Option<PendingDomainDefinition>, SqlError> {
+        let domain = &mut self.domains[slot];
+        if let Some(pending) = domain.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "domain \"{}\" is being altered by another transaction",
+                domain.name.as_str()
+            ));
+        }
+        let prior = domain.pending_definition;
+        domain.pending_definition = Some(PendingDomainDefinition { txid, spec });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_domain_alter(&mut self, slot: usize, txid: u32) {
+        if self.domains[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .is_some()
+        {
+            let definition = self.domains[slot].definition_for(txid);
+            self.domains[slot] = definition;
+        }
+    }
+
+    pub(crate) fn rollback_domain_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingDomainDefinition>,
+    ) {
+        self.domains[slot].pending_definition = prior;
     }
 
     pub fn restore_domain(&mut self, slot: usize, prior: DomainDef) {
         self.domains[slot] = prior;
-    }
-
-    pub fn restore_domain_nullability(&mut self, slot: usize, prior: bool) {
-        self.domains[slot].not_null = prior;
-    }
-
-    pub fn restore_domain_default(
-        &mut self,
-        slot: usize,
-        prior: Option<StackStr<DEFAULT_EXPR_MAX>>,
-    ) {
-        self.domains[slot].default_expr = prior;
-    }
-
-    pub fn undo_domain_check_add(&mut self, slot: usize, prior_count: usize) {
-        let domain = &mut self.domains[slot];
-        for check in domain.checks[prior_count..domain.n_checks].iter_mut() {
-            *check = CheckConstraint::EMPTY;
-        }
-        domain.n_checks = prior_count;
-    }
-
-    pub fn restore_domain_check(&mut self, slot: usize, index: usize, prior: CheckConstraint) {
-        let domain = &mut self.domains[slot];
-        for position in (index..domain.n_checks).rev() {
-            domain.checks[position + 1] = domain.checks[position];
-        }
-        domain.checks[index] = prior;
-        domain.n_checks += 1;
     }
 
     pub fn drop_domain(

@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::rc::Rc;
 
 use crate::config::Config;
@@ -615,11 +616,57 @@ fn parse_outcome(mut bytes: &[u8]) -> Outcome {
     outcome
 }
 
-fn env_or(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VoprConfiguration {
+    seed0: u64,
+    seeds: NonZeroU64,
+    steps: NonZeroU64,
+}
+
+impl VoprConfiguration {
+    fn from_environment() -> Result<Self, String> {
+        let seed0 = environment_value("POS3QL_STORAGE_VOPR_SEED0")?;
+        let seeds = environment_value("POS3QL_STORAGE_VOPR_SEEDS")?;
+        let steps = environment_value("POS3QL_STORAGE_VOPR_STEPS")?;
+        Self::parse(seed0.as_deref(), seeds.as_deref(), steps.as_deref())
+    }
+
+    fn parse(
+        seed0: Option<&str>,
+        seeds: Option<&str>,
+        steps: Option<&str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            seed0: parse_environment_u64("POS3QL_STORAGE_VOPR_SEED0", seed0, 0x705e3)?,
+            seeds: parse_environment_nonzero_u64("POS3QL_STORAGE_VOPR_SEEDS", seeds, 4)?,
+            steps: parse_environment_nonzero_u64("POS3QL_STORAGE_VOPR_STEPS", steps, 120)?,
+        })
+    }
+}
+
+fn environment_value(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid Unicode")),
+    }
+}
+
+fn parse_environment_u64(name: &str, value: Option<&str>, default: u64) -> Result<u64, String> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("{name} must be an unsigned integer, got {value:?}"))
+    })
+}
+
+fn parse_environment_nonzero_u64(
+    name: &str,
+    value: Option<&str>,
+    default: u64,
+) -> Result<NonZeroU64, String> {
+    let parsed = parse_environment_u64(name, value, default)?;
+    NonZeroU64::new(parsed).ok_or_else(|| format!("{name} must be positive"))
 }
 
 #[test]
@@ -630,7 +677,7 @@ fn storage_vopr() {
         // frames. Keep the test envelope explicit: four MiB matches the
         // deepest ordinary engine recovery tests while still detecting growth.
         .stack_size(4_194_304)
-        .spawn(run_storage_vopr)
+        .spawn(|| run_storage_vopr().expect("parse storage VOPR configuration"))
         .expect("spawn storage VOPR with constrained stack")
         .join();
     if let Err(panic) = result {
@@ -638,14 +685,12 @@ fn storage_vopr() {
     }
 }
 
-fn run_storage_vopr() {
-    let seed0 = env_or("POS3QL_STORAGE_VOPR_SEED0", 0x705e3);
-    let seeds = env_or("POS3QL_STORAGE_VOPR_SEEDS", 4);
-    let steps = env_or("POS3QL_STORAGE_VOPR_STEPS", 120);
+fn run_storage_vopr() -> Result<(), String> {
+    let configuration = VoprConfiguration::from_environment()?;
     const MAX_WORKERS: usize = 4;
-    let workers = usize::try_from(seeds)
-        .unwrap_or(usize::MAX)
-        .min(MAX_WORKERS);
+    let requested_workers = usize::try_from(configuration.seeds.get())
+        .map_err(|_| "POS3QL_STORAGE_VOPR_SEEDS exceeds this platform's worker range")?;
+    let workers = requested_workers.min(MAX_WORKERS);
     let mut handles = Vec::with_capacity(workers);
     for worker in 0..workers {
         let worker = worker as u64;
@@ -654,9 +699,12 @@ fn run_storage_vopr() {
                 .name(format!("storage-vopr-worker-{worker}"))
                 .stack_size(4_194_304)
                 .spawn(move || {
-                    for seed in (seed0 + worker..seed0 + seeds).step_by(workers) {
+                    for seed in (configuration.seed0 + worker
+                        ..configuration.seed0 + configuration.seeds.get())
+                        .step_by(workers)
+                    {
                         let mut world = World::new(seed);
-                        for _ in 0..steps {
+                        for _ in 0..configuration.steps.get() {
                             world.step();
                         }
                         world.cold_start();
@@ -676,4 +724,20 @@ fn run_storage_vopr() {
             std::panic::resume_unwind(panic);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn storage_vopr_configuration_rejects_invalid_values() {
+    assert_eq!(
+        VoprConfiguration::parse(None, None, None),
+        Ok(VoprConfiguration {
+            seed0: 0x705e3,
+            seeds: NonZeroU64::new(4).unwrap(),
+            steps: NonZeroU64::new(120).unwrap(),
+        })
+    );
+    assert!(VoprConfiguration::parse(Some("bad"), None, None).is_err());
+    assert!(VoprConfiguration::parse(None, Some("0"), None).is_err());
+    assert!(VoprConfiguration::parse(None, None, Some("0")).is_err());
 }

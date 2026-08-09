@@ -948,8 +948,52 @@ fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
 }
 
+const PG_DATABASE_OWNER_OID: i32 = 6_171;
+const PREDEFINED_ROLES: &[(i32, &str)] = &[(PG_DATABASE_OWNER_OID, "pg_database_owner")];
+
+pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
+    PREDEFINED_ROLES
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
+}
+
+#[derive(Clone, Copy)]
+enum CatalogOwner {
+    Role(usize),
+    DatabaseOwner,
+}
+
+fn catalog_owner(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    txid: u32,
+) -> CatalogOwner {
+    if matches!(object.class, crate::storage::AccessClass::Schema) && object.slot == 0 {
+        CatalogOwner::DatabaseOwner
+    } else {
+        CatalogOwner::Role(storage.object_owner(object, txid))
+    }
+}
+
+fn catalog_owner_oid(owner: CatalogOwner) -> i32 {
+    match owner {
+        CatalogOwner::Role(slot) => Storage::role_oid(slot),
+        CatalogOwner::DatabaseOwner => PG_DATABASE_OWNER_OID,
+    }
+}
+
+fn catalog_owner_name(storage: &Storage, owner: CatalogOwner, txid: u32) -> SqlName {
+    match owner {
+        CatalogOwner::Role(slot) => storage.role_name(slot, txid),
+        CatalogOwner::DatabaseOwner => {
+            SqlName::parse("pg_database_owner").expect("built-in role fits")
+        }
+    }
+}
+
 fn owner_oid(storage: &Storage, class: crate::storage::AccessClass, slot: usize, txid: u32) -> i32 {
-    Storage::role_oid(storage.object_owner(
+    catalog_owner_oid(catalog_owner(
+        storage,
         crate::storage::AccessObject {
             class,
             slot: slot as u16,
@@ -965,14 +1009,22 @@ fn owner_name<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let role = storage.object_owner(
-        crate::storage::AccessObject {
-            class,
-            slot: slot as u16,
-        },
-        txid,
-    );
-    text(storage.role_name(role, txid).as_str(), arena)
+    text(
+        catalog_owner_name(
+            storage,
+            catalog_owner(
+                storage,
+                crate::storage::AccessObject {
+                    class,
+                    slot: slot as u16,
+                },
+                txid,
+            ),
+            txid,
+        )
+        .as_str(),
+        arena,
+    )
 }
 
 fn acl<'a>(
@@ -1004,7 +1056,7 @@ fn acl<'a>(
         return Ok(Datum::Null);
     }
     let mut values = [Datum::Null; crate::storage::MAX_ACL_ENTRIES + 1];
-    let owner_name = storage.role_name(owner, txid);
+    let owner_name = catalog_owner_name(storage, catalog_owner(storage, object, txid), txid);
     let all = match object.class {
         crate::storage::AccessClass::Table
         | crate::storage::AccessClass::View
@@ -1087,15 +1139,20 @@ fn acl<'a>(
         let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
             .then(|| storage.role_name(grantee as usize, txid));
         let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
-        let grantor = storage.role_name(grantor as usize, txid);
+        let grantor_name = if matches!(
+            catalog_owner(storage, object, txid),
+            CatalogOwner::DatabaseOwner
+        ) && grantor == owner as u16
+        {
+            None
+        } else {
+            Some(storage.role_name(grantor as usize, txid))
+        };
+        let grantor = grantor_name
+            .as_ref()
+            .map_or("pg_database_owner", |name| name.as_str());
         let mut rendered = StackStr::<256>::new();
-        render(
-            grantee,
-            grantor.as_str(),
-            privileges,
-            grant_options,
-            &mut rendered,
-        );
+        render(grantee, grantor, privileges, grant_options, &mut rendered);
         values[count] = Datum::Text(
             arena
                 .alloc_str(rendered.as_str())
@@ -4465,8 +4522,28 @@ fn pg_roles<'a>(
             ("rolbypassrls", ColType::Bool),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
+        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
     let mut count = 0usize;
+    for &(oid, name) in PREDEFINED_ROLES {
+        output[count] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(-1),
+                Datum::Null,
+                Datum::Bool(false),
+                Datum::Bool(false),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {
@@ -4572,8 +4649,29 @@ fn pg_authid<'a>(
             ("rolvaliduntil", ColType::Timestamptz),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
+        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
     let mut count = 0usize;
+    for &(oid, name) in PREDEFINED_ROLES {
+        output[count] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(-1),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {
@@ -5938,7 +6036,7 @@ fn info_schemata<'a>(
     let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
         [&[]; 2 + crate::storage::MAX_SCHEMAS];
     let mut n = 0;
-    for (_, schema) in storage.visible_schemas(txid) {
+    for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[
                 text("postgres", arena)?,
@@ -5949,9 +6047,19 @@ fn info_schemata<'a>(
                     arena,
                 )?,
                 text(
-                    storage
-                        .role_name(schema.ownership.owner_to(txid) as usize, txid)
-                        .as_str(),
+                    catalog_owner_name(
+                        storage,
+                        catalog_owner(
+                            storage,
+                            crate::storage::AccessObject {
+                                class: crate::storage::AccessClass::Schema,
+                                slot: slot as u16,
+                            },
+                            txid,
+                        ),
+                        txid,
+                    )
+                    .as_str(),
                     arena,
                 )?,
                 Datum::Null,

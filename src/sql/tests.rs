@@ -11500,7 +11500,7 @@ fn psql_catalog_listing_contracts() {
             &mut budget,
             "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
                     rolcanlogin, rolconnlimit, rolreplication, rolbypassrls
-             FROM pg_roles"
+             FROM pg_roles WHERE rolname = 'postgres'"
         )),
         ["postgres|t|t|t|t|t|-1|t|t"]
     );
@@ -12192,9 +12192,20 @@ fn pg_dump_bootstrap_surface() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1"
+            "SELECT oid, rolname FROM pg_catalog.pg_roles WHERE rolname = 'postgres'"
         )),
         ["10|postgres"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nspowner, pg_get_userbyid(nspowner) FROM pg_namespace \
+             WHERE nspname = 'public'; \
+             SELECT rolname, rolcanlogin FROM pg_roles \
+             WHERE rolname = 'pg_database_owner'"
+        )),
+        ["6171|pg_database_owner", "pg_database_owner|f"]
     );
     assert_eq!(
         data_rows(&run_with(

@@ -161,6 +161,10 @@ SELECT schema_name, schema_owner, default_character_set_catalog,
 FROM information_schema.schemata
 WHERE schema_name IN ('public', 'sb', 'sc')
 ORDER BY schema_name;
+SELECT namespace.nspowner, role.rolname, role.rolcanlogin
+FROM pg_namespace namespace
+JOIN pg_roles role ON role.oid = namespace.nspowner
+WHERE namespace.nspname = 'public';
 
 -- Search-path canonicalization for SHOW.
 SET search_path = PUBLIC;

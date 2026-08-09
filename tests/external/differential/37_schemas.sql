@@ -156,6 +156,11 @@ SELECT nspname FROM pg_namespace WHERE nspname IN ('public', 's1', 'sb', 'sc', '
 SELECT schemaname, tablename FROM pg_tables WHERE schemaname IN ('sb', 'sc', 'txs') ORDER BY schemaname, tablename;
 SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('sb', 'sc') ORDER BY table_schema, table_name;
 SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('public', 'sb', 'sc') ORDER BY schema_name;
+SELECT schema_name, schema_owner, default_character_set_catalog,
+       default_character_set_schema, default_character_set_name, sql_path
+FROM information_schema.schemata
+WHERE schema_name IN ('public', 'sb', 'sc')
+ORDER BY schema_name;
 
 -- Search-path canonicalization for SHOW.
 SET search_path = PUBLIC;

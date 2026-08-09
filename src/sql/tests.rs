@@ -2280,6 +2280,219 @@ fn transactional_alter_table_versions_shape_and_rows() {
 }
 
 #[test]
+fn information_schema_columns_describes_views_from_their_bound_row_type() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN view_column_domain AS integer CHECK (VALUE > 0); \
+         CREATE TYPE view_column_enum AS ENUM ('ready'); \
+         CREATE VIEW view_column_catalog AS \
+           SELECT 1::view_column_domain AS domain_value, \
+                  'ready'::view_column_enum AS enum_value, \
+                  ARRAY[1] AS array_value",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT column_name, ordinal_position, is_nullable, data_type \
+             FROM information_schema.columns \
+             WHERE table_name = 'view_column_catalog' \
+             ORDER BY ordinal_position",
+        )),
+        [
+            "domain_value|1|YES|integer",
+            "enum_value|2|YES|USER-DEFINED",
+            "array_value|3|YES|ARRAY",
+        ]
+    );
+
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE SCHEMA pending_view_schema",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE pending_view_schema.pending_view_source (value integer); \
+         CREATE VIEW pending_view_schema.pending_view_column_catalog AS \
+           SELECT value FROM pending_view_schema.pending_view_source",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["value"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT table_type FROM information_schema.tables \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["VIEW"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["pending_view_schema"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT nspname FROM pg_namespace WHERE nspname = 'pending_view_schema'; \
+             SELECT typname FROM pg_type WHERE typname = 'pending_view_column_catalog'; \
+             SELECT has_schema_privilege(oid, 'USAGE') FROM pg_namespace \
+              WHERE nspname = 'pending_view_schema'",
+        )),
+        ["pending_view_schema", "pending_view_column_catalog", "t"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn catalog_index_relations_are_not_silently_capped() {
+    let mut config = test_config("catalog_index_relations_are_not_silently_capped");
+    config.max_tables = 17;
+    config.max_value_indexes = 17 * 16;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::new();
+    for table in 0..17 {
+        if table > 0 {
+            definition.push_str("; ");
+        }
+        definition.push_str(&format!("CREATE TABLE catalog_index_{table} ("));
+        for column in 0..16 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!("column_{column} integer UNIQUE"));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_index; \
+             SELECT count(*) FROM pg_class WHERE relkind = 'i'; \
+             SELECT count(*) FROM pg_indexes; \
+             SELECT count(*) FROM pg_attribute attribute \
+              JOIN pg_class relation ON relation.oid = attribute.attrelid \
+              WHERE relation.relkind = 'i'",
+            1 << 21,
+        )),
+        ["272", "272", "272", "272"]
+    );
+}
+
+#[test]
+fn catalog_foreign_keys_are_not_silently_capped() {
+    let mut config = test_config("catalog_foreign_keys_are_not_silently_capped");
+    config.max_tables = 34;
+    config.max_value_indexes = 8;
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::from("CREATE TABLE catalog_parent (");
+    for column in 0..8 {
+        if column > 0 {
+            definition.push_str(", ");
+        }
+        definition.push_str(&format!("column_{column} integer UNIQUE"));
+    }
+    definition.push(')');
+    for table in 0..33 {
+        definition.push_str(&format!("; CREATE TABLE catalog_child_{table} ("));
+        for column in 0..8 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!(
+                "column_{column} integer REFERENCES catalog_parent(column_{column})"
+            ));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'f'",
+            1 << 21,
+        )),
+        ["264"]
+    );
+}
+
+#[test]
 fn transactional_alter_table_savepoint_and_rename_visibility() {
     let (mut engine, mut budget) = test_engine();
     let mut owner = TxnState::new(&mut budget, 256).unwrap();

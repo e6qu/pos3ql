@@ -6,6 +6,15 @@ DROP TABLE IF EXISTS base;
 CREATE TABLE base (id int, v int);
 INSERT INTO base VALUES (1, 10), (2, 20), (3, 30);
 
+-- information_schema.columns derives ordinary-view output under the view's
+-- captured creation path, just like pg_attribute and Describe.
+CREATE VIEW catalog_view AS SELECT id, v::text AS rendered FROM base;
+SELECT column_name, ordinal_position, is_nullable, data_type
+FROM information_schema.columns
+WHERE table_name = 'catalog_view'
+ORDER BY ordinal_position;
+DROP VIEW catalog_view;
+
 -- A materialized view captures the query's rows at creation time.
 CREATE MATERIALIZED VIEW mv AS SELECT id, v * 2 AS dbl FROM base WHERE v > 15;
 SELECT * FROM mv ORDER BY id;

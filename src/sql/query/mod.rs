@@ -197,7 +197,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn schema_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let Some(name) = super::catalog::schema_name_by_oid(self.storage, oid) else {
+        let Some(name) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
         Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))

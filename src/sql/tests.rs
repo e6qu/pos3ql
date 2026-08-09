@@ -10935,6 +10935,149 @@ fn psql_catalog_listing_contracts() {
             "position_parent|second_column"
         ]
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_table_reader;
+         CREATE TABLE catalog_table_privileges (id integer);
+         GRANT SELECT ON catalog_table_privileges TO catalog_table_reader WITH GRANT OPTION;
+         GRANT UPDATE ON catalog_table_privileges TO catalog_table_reader;
+         GRANT INSERT ON catalog_table_privileges TO PUBLIC",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantor, grantee, privilege_type, is_grantable, with_hierarchy
+             FROM information_schema.table_privileges
+             WHERE table_name = 'catalog_table_privileges' AND grantee <> 'postgres'
+             ORDER BY grantee, privilege_type",
+        )),
+        [
+            "postgres|PUBLIC|INSERT|NO|NO",
+            "postgres|catalog_table_reader|SELECT|YES|YES",
+            "postgres|catalog_table_reader|UPDATE|NO|NO",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, privilege_type
+             FROM information_schema.role_table_grants
+             WHERE table_name = 'catalog_table_privileges' AND grantee <> 'postgres'
+             ORDER BY grantee, privilege_type",
+        )),
+        ["catalog_table_reader|SELECT", "catalog_table_reader|UPDATE"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_acl_owner;
+         GRANT CREATE ON SCHEMA public TO catalog_acl_owner;
+         SET ROLE catalog_acl_owner;
+         CREATE TABLE catalog_owner_table (id integer);
+         RESET ROLE;
+         GRANT SELECT ON catalog_owner_table TO catalog_table_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantor FROM information_schema.table_privileges
+             WHERE table_name = 'catalog_owner_table' AND grantee = 'catalog_table_reader'",
+        )),
+        ["catalog_acl_owner"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE catalog_table_reader;
+             REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
+        ))
+        .contains("42501")
+    );
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM information_schema.table_privileges
+             WHERE table_name = 'catalog_owner_table' AND grantee = 'catalog_table_reader'",
+        )),
+        ["0"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE catalog_sequence_metadata AS smallint START 7 INCREMENT 3 MINVALUE 1 MAXVALUE 99 CYCLE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT data_type, numeric_precision, numeric_precision_radix, numeric_scale,
+                    start_value, minimum_value, maximum_value, increment, cycle_option
+             FROM information_schema.sequences
+             WHERE sequence_name = 'catalog_sequence_metadata'",
+        )),
+        ["smallint|16|2|0|7|1|99|3|YES"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN;
+             CREATE SEQUENCE catalog_transient_sequence;
+             SELECT count(*) FROM information_schema.sequences WHERE sequence_name = 'catalog_transient_sequence';
+             ROLLBACK;
+             SELECT count(*) FROM information_schema.sequences WHERE sequence_name = 'catalog_transient_sequence'",
+        )),
+        ["1", "0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN;
+             CREATE VIEW catalog_transient_view AS SELECT 1 AS id;
+             SELECT count(*) FROM information_schema.table_privileges
+             WHERE table_name = 'catalog_transient_view';
+             SELECT count(*) FROM pg_class WHERE relname = 'catalog_transient_view';
+             ROLLBACK;
+             SELECT count(*) FROM information_schema.table_privileges
+             WHERE table_name = 'catalog_transient_view'",
+        )),
+        ["7", "1", "0"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT USAGE ON SEQUENCE catalog_sequence_metadata TO catalog_table_reader;
+         CREATE DOMAIN catalog_usage_domain AS integer;
+         REVOKE USAGE ON TYPE catalog_usage_domain FROM PUBLIC;
+         GRANT USAGE ON TYPE catalog_usage_domain TO catalog_table_reader WITH GRANT OPTION",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT object_type, object_name, grantee, is_grantable
+             FROM information_schema.usage_privileges
+             WHERE grantee = 'catalog_table_reader'
+             ORDER BY object_type, object_name",
+        )),
+        [
+            "DOMAIN|catalog_usage_domain|catalog_table_reader|YES",
+            "SEQUENCE|catalog_sequence_metadata|catalog_table_reader|NO",
+        ]
+    );
 }
 
 #[test]

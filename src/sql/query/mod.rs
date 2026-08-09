@@ -413,7 +413,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn view_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::view_def_text(self.storage, oid, arena)
+        super::catalog::view_def_text(self.storage, self.txid, oid, arena)
     }
 
     fn relation_size(&self, oid: i32) -> Result<Option<i64>, SqlError> {

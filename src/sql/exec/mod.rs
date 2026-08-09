@@ -3917,6 +3917,7 @@ pub fn grant_privileges(
                 name.as_str()
             ));
         }
+        let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
             let grantee = if name.eq_ignore_ascii_case("public") {
                 PUBLIC_ROLE
@@ -3931,7 +3932,7 @@ pub fn grant_privileges(
                 slot as u16
             };
             let (old_privileges, old_options) =
-                storage.acl_from(*object, grantee, grantor as u16, txn.txid);
+                storage.acl_from(*object, grantee, acl_grantor as u16, txn.txid);
             let new_options = if grant_option {
                 old_options.union(requested)
             } else {
@@ -3940,7 +3941,7 @@ pub fn grant_privileges(
             let (slot, prior) = match storage.change_acl(
                 *object,
                 grantee,
-                grantor as u16,
+                acl_grantor as u16,
                 old_privileges.union(requested),
                 new_options,
                 txn.txid,
@@ -3994,6 +3995,15 @@ pub fn revoke_privileges(
             Ok(mask) => mask,
             Err(error) => return sql_fail(error),
         };
+        if !storage.has_object_grant_option(*object, grantor, requested, txn.txid) {
+            let (_, name) = storage.access_object_name(*object);
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for relation {}",
+                name.as_str()
+            ));
+        }
+        let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
             let grantee = if name.eq_ignore_ascii_case("public") {
                 PUBLIC_ROLE
@@ -4008,7 +4018,7 @@ pub fn revoke_privileges(
                 slot as u16
             };
             let (old_privileges, old_options) =
-                storage.acl_from(*object, grantee, grantor as u16, txn.txid);
+                storage.acl_from(*object, grantee, acl_grantor as u16, txn.txid);
             let removed_options = crate::storage::PrivilegeSet(old_options.0 & requested.0);
             if grantee != PUBLIC_ROLE && removed_options.0 != 0 {
                 let mut dependent = [0usize; crate::storage::MAX_ACL_ENTRIES];
@@ -4096,7 +4106,7 @@ pub fn revoke_privileges(
             let (slot, prior) = match storage.change_acl(
                 *object,
                 grantee,
-                grantor as u16,
+                acl_grantor as u16,
                 new_privileges,
                 old_options.without(requested),
                 txn.txid,
@@ -4115,6 +4125,19 @@ pub fn revoke_privileges(
     }
     responder.command_complete("REVOKE")?;
     sql_ok()
+}
+
+fn acl_grantor(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    current: usize,
+    txid: u32,
+) -> usize {
+    if storage.role(current).attributes_to(txid).superuser {
+        storage.object_owner(object, txid)
+    } else {
+        current
+    }
 }
 
 /// One object a DROP SCHEMA sweeps up, for dependency reports and the

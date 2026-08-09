@@ -64,6 +64,10 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "key_column_usage"
                 | "constraint_column_usage"
                 | "referential_constraints"
+                | "table_privileges"
+                | "role_table_grants"
+                | "sequences"
+                | "usage_privileges"
         ),
         Some(_) => false,
         None => matches!(
@@ -896,7 +900,7 @@ pub fn synthesize<'a>(
         ),
         (false, "pg_matviews") => pg_matviews(storage, txid, arena),
         (false, "pg_sequences") => pg_sequences(storage, txid, arena),
-        (false, "pg_sequence") => pg_sequence(storage, arena),
+        (false, "pg_sequence") => pg_sequence(storage, txid, arena),
         (false, "pg_database") => finish(
             def_of(
                 "pg_database",
@@ -938,6 +942,10 @@ pub fn synthesize<'a>(
         (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
         (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
         (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
+        (true, "table_privileges") => info_table_privileges(storage, txid, arena),
+        (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
+        (true, "sequences") => info_sequences(storage, txid, arena),
+        (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -1590,6 +1598,7 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
 /// Stored SELECT text for `pg_get_viewdef`, by relation OID.
 pub fn view_def_text<'a>(
     storage: &Storage,
+    txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
@@ -1607,7 +1616,7 @@ pub fn view_def_text<'a>(
             .map(Some)
             .map_err(|_| arena_full());
     }
-    for (slot, view) in storage.views_with_slots() {
+    for (slot, view) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
                 .alloc_str_display(format_args!("{};", view.sql.as_str()))
@@ -1629,7 +1638,7 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         return table_size(storage, txid, slot).map(Some);
     }
     if storage
-        .views_with_slots()
+        .views_visible_to(txid)
         .any(|(slot, _)| view_oid(slot) == oid)
     {
         return Ok(Some(0));
@@ -2749,7 +2758,7 @@ fn pg_class<'a>(
     }
     // Sequences are relations of kind 'S', each with its own OID range so
     // psql's `\d`/`\dm` and pg_get_serial_sequence-style joins resolve.
-    for (slot, seq) in storage.sequences_with_slots() {
+    for (slot, seq) in storage.sequences_visible_to(txid) {
         if n == out.len() {
             break;
         }
@@ -2806,7 +2815,7 @@ fn pg_class<'a>(
     // Plain views are pg_class relations too (relkind 'v'). Their column count
     // is derived under the creator's captured search path, the same binding
     // rule used when the view executes.
-    for (slot, view) in storage.views_with_slots() {
+    for (slot, view) in storage.views_visible_to(txid) {
         if n == out.len() {
             break;
         }
@@ -3231,7 +3240,7 @@ fn pg_depend<'a>(
     // Sequence ownership is how pg_dump distinguishes serial/identity
     // generators from independent sequences and orders them with the owning
     // column.
-    for (sequence_slot, sequence) in storage.sequences_with_slots() {
+    for (sequence_slot, sequence) in storage.sequences_visible_to(txid) {
         let Some(owner) = sequence.owner else {
             continue;
         };
@@ -3276,7 +3285,7 @@ fn pg_depend<'a>(
             crate::sql::types::oid::enum_oid(dependency.slot),
         )),
     };
-    for (view_slot, _) in storage.views_with_slots() {
+    for (view_slot, _) in storage.views_visible_to(txid) {
         for dependency in storage.view_dependencies(view_slot).entries() {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
@@ -3290,7 +3299,7 @@ fn pg_depend<'a>(
             )?;
         }
     }
-    for (materialized_slot, materialized_view) in storage.matviews_with_slots() {
+    for (materialized_slot, materialized_view) in storage.matviews_visible_to(txid) {
         let Some(table_slot) = storage.find_visible(
             materialized_view.schema.as_str(),
             materialized_view.name.as_str(),
@@ -3565,7 +3574,7 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    for (slot, view) in storage.views_with_slots() {
+    for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let count = describe_view(storage, view, arena, &mut columns)?;
         for (attribute, column) in columns[..count].iter().enumerate() {
@@ -4072,7 +4081,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         n += 1;
     }
-    for (slot, view) in storage.views_with_slots() {
+    for (slot, view) in storage.views_visible_to(txid) {
         if n == out.len() {
             break;
         }
@@ -4686,7 +4695,7 @@ fn pg_sequences<'a>(
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (slot, seq) in storage.sequences_with_slots() {
+    for (slot, seq) in storage.sequences_visible_to(txid) {
         if n == out.len() {
             break;
         }
@@ -4724,7 +4733,11 @@ fn pg_sequences<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_sequence<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_sequence<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_sequence",
         &[
@@ -4740,7 +4753,7 @@ fn pg_sequence<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
     );
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
-    for (slot, seq) in storage.sequences_with_slots() {
+    for (slot, seq) in storage.sequences_visible_to(txid) {
         if n == out.len() {
             break;
         }
@@ -5286,6 +5299,351 @@ fn info_constraint_column_usage<'a>(
     }
     debug_assert_eq!(count, output.len());
     finish(definition, output, arena)
+}
+
+fn info_table_privileges<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_relation_privileges(storage, txid, arena, "table_privileges", true)
+}
+
+fn info_role_table_grants<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_relation_privileges(storage, txid, arena, "role_table_grants", false)
+}
+
+fn info_sequences<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "sequences",
+        &[
+            ("sequence_catalog", ColType::Text),
+            ("sequence_schema", ColType::Text),
+            ("sequence_name", ColType::Text),
+            ("data_type", ColType::Text),
+            ("numeric_precision", ColType::Int4),
+            ("numeric_precision_radix", ColType::Int4),
+            ("numeric_scale", ColType::Int4),
+            ("start_value", ColType::Text),
+            ("minimum_value", ColType::Text),
+            ("maximum_value", ColType::Text),
+            ("increment", ColType::Text),
+            ("cycle_option", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0usize;
+    for (_, sequence) in storage.sequences_visible_to(txid) {
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "information_schema.sequences exceeds static capacity"
+            ));
+        }
+        let precision = match sequence.data_type {
+            crate::storage::SeqType::Smallint => 16,
+            crate::storage::SeqType::Integer => 32,
+            crate::storage::SeqType::Bigint => 64,
+        };
+        let start = stack_format!(32, "{}", sequence.start_value);
+        let minimum = stack_format!(32, "{}", sequence.min_value);
+        let maximum = stack_format!(32, "{}", sequence.max_value);
+        let increment = stack_format!(32, "{}", sequence.increment);
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(sequence.schema.as_str(), arena)?,
+                text(sequence.name.as_str(), arena)?,
+                text(sequence.data_type.sql_name(), arena)?,
+                Datum::Int4(precision),
+                Datum::Int4(2),
+                Datum::Int4(0),
+                text(start.as_str(), arena)?,
+                text(minimum.as_str(), arena)?,
+                text(maximum.as_str(), arena)?,
+                text(increment.as_str(), arena)?,
+                text(if sequence.cycle { "YES" } else { "NO" }, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_usage_privileges<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "usage_privileges",
+        &[
+            ("grantor", ColType::Text),
+            ("grantee", ColType::Text),
+            ("object_catalog", ColType::Text),
+            ("object_schema", ColType::Text),
+            ("object_name", ColType::Text),
+            ("object_type", ColType::Text),
+            ("privilege_type", ColType::Text),
+            ("is_grantable", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = 512 + crate::storage::MAX_ACL_ENTRIES;
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0usize;
+    let mut append = |object: crate::storage::AccessObject,
+                      object_type: &str,
+                      grantor: u16,
+                      grantee: u16,
+                      grantable: bool|
+     -> Result<(), SqlError> {
+        if !storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid) {
+            return Ok(());
+        }
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "usage_privileges exceeds static capacity"
+            ));
+        }
+        let (schema, name) = storage.access_object_name_to(object, txid);
+        let grantor_name = storage.role_name(grantor as usize, txid);
+        let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
+            SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
+        } else {
+            storage.role_name(grantee as usize, txid)
+        };
+        output[count] = row(
+            &[
+                text(grantor_name.as_str(), arena)?,
+                text(grantee_name.as_str(), arena)?,
+                text("postgres", arena)?,
+                text(schema.as_str(), arena)?,
+                text(name.as_str(), arena)?,
+                text(object_type, arena)?,
+                text("USAGE", arena)?,
+                text(if grantable { "YES" } else { "NO" }, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    let mut append_object = |object: crate::storage::AccessObject,
+                             object_type: &str,
+                             public_default: bool|
+     -> Result<(), SqlError> {
+        let owner = storage.object_owner(object, txid) as u16;
+        append(object, object_type, owner, owner, true)?;
+        let public_defined = storage.acl_entries().any(|(slot, entry)| {
+            entry.object == object
+                && storage.acl_identity(slot, txid).0 == crate::storage::PUBLIC_ROLE
+        });
+        if public_default && !public_defined {
+            append(
+                object,
+                object_type,
+                owner,
+                crate::storage::PUBLIC_ROLE,
+                false,
+            )?;
+        }
+        for (slot, entry) in storage.acl_entries() {
+            if entry.object != object {
+                continue;
+            }
+            let (privileges, options) = storage.acl_state(slot, txid);
+            if !privileges.contains(crate::storage::PrivilegeSet::USAGE) {
+                continue;
+            }
+            let (grantee, grantor) = storage.acl_identity(slot, txid);
+            if grantee == owner && grantor == owner {
+                continue;
+            }
+            append(
+                object,
+                object_type,
+                grantor,
+                grantee,
+                options.contains(crate::storage::PrivilegeSet::USAGE),
+            )?;
+        }
+        Ok(())
+    };
+    for (slot, _) in storage.sequences_visible_to(txid) {
+        append_object(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: slot as u16,
+            },
+            "SEQUENCE",
+            false,
+        )?;
+    }
+    for slot in 0..storage.domain_count() {
+        if !storage.domain(slot).visible_to(txid) {
+            continue;
+        }
+        append_object(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Domain,
+                slot: slot as u16,
+            },
+            "DOMAIN",
+            true,
+        )?;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_relation_privileges<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    relation_name: &str,
+    include_public: bool,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        relation_name,
+        &[
+            ("grantor", ColType::Text),
+            ("grantee", ColType::Text),
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("privilege_type", ColType::Text),
+            ("is_grantable", ColType::Text),
+            ("with_hierarchy", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = 8 * (512 + crate::storage::MAX_ACL_ENTRIES);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0usize;
+    let mut append = |object: crate::storage::AccessObject,
+                      grantor: u16,
+                      grantee: u16,
+                      privilege_mask: crate::storage::PrivilegeSet,
+                      grant_options: crate::storage::PrivilegeSet|
+     -> Result<(), SqlError> {
+        if !include_public && grantee == crate::storage::PUBLIC_ROLE {
+            return Ok(());
+        }
+        if !storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid) {
+            return Ok(());
+        }
+        let (schema, name) = storage.access_object_name_to(object, txid);
+        let privilege_names = [
+            (crate::storage::PrivilegeSet::SELECT, "SELECT"),
+            (crate::storage::PrivilegeSet::INSERT, "INSERT"),
+            (crate::storage::PrivilegeSet::UPDATE, "UPDATE"),
+            (crate::storage::PrivilegeSet::DELETE, "DELETE"),
+            (crate::storage::PrivilegeSet::TRUNCATE, "TRUNCATE"),
+            (crate::storage::PrivilegeSet::REFERENCES, "REFERENCES"),
+            (crate::storage::PrivilegeSet::TRIGGER, "TRIGGER"),
+        ];
+        for (privilege, privilege_name) in privilege_names {
+            if !privilege_mask.contains(privilege) {
+                continue;
+            }
+            if count == output.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table_privileges exceeds static capacity"
+                ));
+            }
+            let grantor_name = storage.role_name(grantor as usize, txid);
+            let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
+                SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
+            } else {
+                storage.role_name(grantee as usize, txid)
+            };
+            output[count] = row(
+                &[
+                    text(grantor_name.as_str(), arena)?,
+                    text(grantee_name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(schema.as_str(), arena)?,
+                    text(name.as_str(), arena)?,
+                    text(privilege_name, arena)?,
+                    text(
+                        if grant_options.contains(privilege) {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        arena,
+                    )?,
+                    text(
+                        if privilege == crate::storage::PrivilegeSet::SELECT {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        arena,
+                    )?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+        Ok(())
+    };
+    let mut append_object = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
+        let owner = storage.object_owner(object, txid) as u16;
+        append(
+            object,
+            owner,
+            owner,
+            crate::storage::PrivilegeSet::TABLE_ALL,
+            crate::storage::PrivilegeSet::TABLE_ALL,
+        )?;
+        for (slot, entry) in storage.acl_entries() {
+            if entry.object != object {
+                continue;
+            }
+            let (privileges, options) = storage.acl_state(slot, txid);
+            if privileges.0 == 0 {
+                continue;
+            }
+            let (grantee, grantor) = storage.acl_identity(slot, txid);
+            if grantee == owner && grantor == owner {
+                continue;
+            }
+            append(object, grantor, grantee, privileges, options)?;
+        }
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        let (class, object_slot) =
+            match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
+                Some(matview) => (crate::storage::AccessClass::MaterializedView, matview),
+                None => (crate::storage::AccessClass::Table, slot),
+            };
+        append_object(crate::storage::AccessObject {
+            class,
+            slot: object_slot as u16,
+        })?;
+    }
+    for (slot, _) in storage.views_visible_to(txid) {
+        append_object(crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: slot as u16,
+        })?;
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn fk_action_name(action: crate::storage::FkAction) -> &'static str {

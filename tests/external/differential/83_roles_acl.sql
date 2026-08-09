@@ -18,6 +18,22 @@ RESET ROLE;
 
 GRANT SELECT ON acl_exposed TO acl_reader;
 GRANT USAGE ON SEQUENCE acl_sequence TO acl_reader;
+SELECT grantor, grantee, table_name, privilege_type, is_grantable, with_hierarchy
+FROM information_schema.table_privileges
+WHERE table_name = 'acl_exposed'
+ORDER BY grantor, grantee, privilege_type;
+SELECT grantor, grantee, table_name, privilege_type, is_grantable, with_hierarchy
+FROM information_schema.role_table_grants
+WHERE table_name = 'acl_exposed'
+ORDER BY grantor, grantee, privilege_type;
+SELECT data_type, numeric_precision, numeric_precision_radix, numeric_scale,
+       start_value, minimum_value, maximum_value, increment, cycle_option
+FROM information_schema.sequences
+WHERE sequence_name = 'acl_sequence';
+SELECT grantor, grantee, object_type, object_name, privilege_type, is_grantable
+FROM information_schema.usage_privileges
+WHERE object_name = 'acl_sequence'
+ORDER BY grantor, grantee;
 SELECT has_table_privilege('acl_reader', 'acl_exposed', 'SELECT'),
        has_table_privilege('acl_reader', 'acl_private', 'SELECT'),
        has_sequence_privilege('acl_reader', 'acl_sequence', 'USAGE'),

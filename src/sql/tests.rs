@@ -94,18 +94,19 @@ fn prepare_cold_pax_fixture(config: &Config) {
             &mut engine,
             &mut budget,
             &definition,
-            1 << 20,
+            1 << 16,
         ))
         .contains("ERROR")
     );
-    for start in 1..=300 {
+    for start in (1..=300).step_by(5) {
         let inserted = run_with_arena_bytes(
             &mut engine,
             &mut budget,
             &format!(
-                "INSERT INTO wide_pax SELECT {selected} FROM generate_series({start}, {start}) AS g(i)"
+                "INSERT INTO wide_pax SELECT {selected} FROM generate_series({start}, {}) AS g(i)",
+                start + 4
             ),
-            1 << 20,
+            2 << 20,
         );
         assert!(
             !String::from_utf8_lossy(&inserted).contains("ERROR"),
@@ -119,18 +120,19 @@ fn prepare_cold_pax_fixture(config: &Config) {
             &mut engine,
             &mut budget,
             &right_definition,
-            1 << 20,
+            1 << 16,
         ))
         .contains("ERROR")
     );
-    for start in 1..=300 {
+    for start in (1..=300).step_by(5) {
         let inserted = run_with_arena_bytes(
             &mut engine,
             &mut budget,
             &format!(
-                "INSERT INTO wide_pax_right SELECT {selected} FROM generate_series({start}, {start}) AS g(i)"
+                "INSERT INTO wide_pax_right SELECT {selected} FROM generate_series({start}, {}) AS g(i)",
+                start + 4
             ),
-            1 << 20,
+            2 << 20,
         );
         assert!(
             !String::from_utf8_lossy(&inserted).contains("ERROR"),
@@ -144,7 +146,7 @@ fn prepare_cold_pax_fixture(config: &Config) {
             &mut engine,
             &mut budget,
             &third_definition,
-            1 << 20,
+            1 << 16,
         ))
         .contains("ERROR")
     );
@@ -154,7 +156,7 @@ fn prepare_cold_pax_fixture(config: &Config) {
         &format!(
             "INSERT INTO wide_pax_third SELECT {selected} FROM generate_series(287, 287) AS g(i)"
         ),
-        1 << 20,
+        1 << 16,
     );
     assert!(
         !String::from_utf8_lossy(&inserted).contains("ERROR"),

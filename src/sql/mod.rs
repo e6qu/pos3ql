@@ -678,6 +678,7 @@ impl Engine {
     /// Builds storage, loads the latest checkpoint from object storage
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
+        crate::sql::tzif::init_catalog();
         let mut storage = Storage::new(config, budget)?;
         let mut ckpt = if config.object_store_on {
             Some(Checkpointer::new(config, budget)?)

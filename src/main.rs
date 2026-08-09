@@ -52,9 +52,6 @@ fn run() -> Result<(), String> {
     let mut server =
         Server::new(&config, &mut budget).map_err(|e| format!("startup failed: {e}"))?;
 
-    // The IANA zone-name catalog walks /usr/share/zoneinfo, which allocates —
-    // it must happen on this side of the freeze. Zone files themselves load
-    // on demand into fixed pools.
     // The TLS pool covers the object-store client and, when server TLS is on,
     // up to max_connections concurrent server-side sessions.
     let tls_budget = config.tls_pool_bytes
@@ -64,7 +61,6 @@ fn run() -> Result<(), String> {
             0
         };
     mem::guard::set_tls_budget(tls_budget as u64);
-    pos3ql::sql::tzif::init_catalog();
     pos3ql::sql::exec::init_record_shapes();
 
     mem::guard::freeze();

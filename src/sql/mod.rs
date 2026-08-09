@@ -3532,11 +3532,12 @@ impl Engine {
                             txn.txid,
                             arena,
                         ) {
-                            Ok(scope) => query::describe_scope_items(
+                            Ok(scope) => query::describe_select_items(
                                 s.items,
-                                &scope,
+                                Some(&scope),
                                 &self.storage,
                                 txn.txid,
+                                arena,
                                 &mut columns,
                             ),
                             Err(e) => {
@@ -3545,11 +3546,12 @@ impl Engine {
                             }
                         }
                     }
-                    None => query::describe_catalog_items(
+                    None => query::describe_select_items(
                         s.items,
                         None,
                         &self.storage,
                         txn.txid,
+                        arena,
                         &mut columns,
                     ),
                 };

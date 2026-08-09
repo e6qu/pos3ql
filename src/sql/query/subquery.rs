@@ -1930,6 +1930,22 @@ fn build_array_scalar<'a>(
     witness: &Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if matches!(witness, Datum::Array { .. })
+        || values
+            .iter()
+            .any(|value| matches!(value, Datum::Array { .. }))
+    {
+        if values.is_empty() {
+            let Datum::Array { element, .. } = *witness else {
+                unreachable!("an empty array subquery carries its array witness");
+            };
+            return Ok(Datum::Array {
+                element,
+                raw: crate::sql::array::EMPTY,
+            });
+        }
+        return crate::sql::array::stack(values, arena);
+    }
     let element = crate::sql::types::ArrElem::from_datum(witness)
         .or_else(|| {
             values

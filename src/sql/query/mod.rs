@@ -688,11 +688,14 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     Ok(Some((ptrs, values)))
 }
 
-/// A scalar (or ARRAY) subquery's output type is known only from its
-/// pre-evaluated datum — static inference cannot reach into storage, so the
-/// describe pass types it UNKNOWN (rendered text). The same holds for a bare
-/// `$n` parameter, whose type arrives with its bound value. Where a select
-/// item is one of these, override the described column type from the value.
+fn array_subquery_column_type(witness: Datum) -> Option<ColType> {
+    match super::exec::coltype_of_oid(witness.type_oid())? {
+        ColType::Array(element) => Some(ColType::Array(element)),
+        scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
+    }
+}
+
+/// Values established before RowDescription refine otherwise unknown columns.
 #[allow(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn patch_subquery_column_types<'a>(
     items: &'a [SelectItem<'a>],
@@ -732,8 +735,13 @@ fn patch_subquery_column_types<'a>(
                     {
                         Some((_, v, w)) => {
                             let typed = if v.is_null() { w } else { v };
+                            let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
+                                array_subquery_column_type(*typed)
+                            } else {
+                                super::exec::coltype_of_oid(typed.type_oid())
+                            };
                             if !typed.is_null()
-                                && let Some(ct) = super::exec::coltype_of_oid(typed.type_oid())
+                                && let Some(ct) = ct
                             {
                                 columns[slot] = ColDesc::of_type(columns[slot].name, ct);
                             }
@@ -741,7 +749,7 @@ fn patch_subquery_column_types<'a>(
                         // A correlated subquery has no pre-evaluated value;
                         // infer its column type from the inner select's item.
                         None => {
-                            if let Expr::Subquery(sub) = &**expression
+                            if let Expr::Subquery(sub) | Expr::ArraySubquery(sub) = &**expression
                                 && let Some(SelectItem::Expr {
                                     expression: inner, ..
                                 }) = sub.items.first()
@@ -750,9 +758,13 @@ fn patch_subquery_column_types<'a>(
                                     QueryScope::resolve_schema(storage, f, txid, arena).ok()
                                 });
                                 let witness = subquery_witness(inner, inner_scope.as_ref());
+                                let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
+                                    array_subquery_column_type(witness)
+                                } else {
+                                    super::exec::coltype_of_oid(witness.type_oid())
+                                };
                                 if !witness.is_null()
-                                    && let Some(ct) =
-                                        super::exec::coltype_of_oid(witness.type_oid())
+                                    && let Some(ct) = ct
                                 {
                                     columns[slot] = ColDesc::of_type(columns[slot].name, ct);
                                 }
@@ -3810,6 +3822,109 @@ pub fn describe_catalog_items<'q>(
         }
     }
     Ok(count)
+}
+
+/// Describes a SELECT using the catalog and statement arena available to the
+/// protocol Describe path.
+pub fn describe_select_items<'q>(
+    items: &[SelectItem<'q>],
+    scope: Option<&QueryScope<'q>>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
+    let count = match scope {
+        Some(scope) => describe_scope_items(items, scope, storage, txid, out)?,
+        None => describe_catalog_items(items, None, storage, txid, out)?,
+    };
+    let mut column = 0;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => column += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(table) => {
+                if let Some(scope) = scope
+                    && let Ok(table) = scope.table_index(table)
+                {
+                    column += scope.defs[table].expect("resolved").n_columns;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                column += scope.map_or(0, |scope| record_star_width(base, scope));
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(oid) = array_subquery_result_type(expression, storage, txid, arena)? {
+                    out[column] = ColDesc::new(out[column].name, oid, -1);
+                }
+                column += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn array_subquery_result_type(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<i32>, SqlError> {
+    let Expr::ArraySubquery(select) = expression else {
+        return Ok(None);
+    };
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = match &select.from {
+        Some(from) => {
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            describe_select_items(
+                select.items,
+                Some(&scope),
+                storage,
+                txid,
+                arena,
+                &mut columns,
+            )?
+        }
+        None => describe_select_items(select.items, None, storage, txid, arena, &mut columns)?,
+    };
+    if count != 1 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subquery must return only one column"
+        ));
+    }
+    let element_oid = columns[0].type_oid;
+    let array_oid = match super::exec::coltype_of_oid(element_oid) {
+        Some(ColType::Array(_)) => Some(element_oid),
+        Some(scalar) => {
+            super::types::ArrElem::from_coltype(scalar).map(|element| element.array_oid())
+        }
+        None if (super::types::oid::FIRST_DOMAIN
+            ..super::types::oid::FIRST_DOMAIN + u16::MAX as i32 + 1)
+            .contains(&element_oid) =>
+        {
+            Some(super::types::oid::domain_array_oid(
+                (element_oid - super::types::oid::FIRST_DOMAIN) as u16,
+            ))
+        }
+        None if (super::types::oid::FIRST_ENUM
+            ..super::types::oid::FIRST_ENUM + u16::MAX as i32 + 1)
+            .contains(&element_oid) =>
+        {
+            Some(super::types::oid::enum_array_oid(
+                (element_oid - super::types::oid::FIRST_ENUM) as u16,
+            ))
+        }
+        None => None,
+    };
+    array_oid
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "ARRAY subquery result type is not supported"
+            )
+        })
+        .map(Some)
 }
 
 fn user_type_cast_description<'q>(

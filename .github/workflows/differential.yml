@@ -136,7 +136,10 @@ jobs:
           # The fuzzer runs alone on its own shard and keeps all 10k generated
           # statements. Ignored on the other shards (RUN_FUZZ=0).
           FUZZ_COUNT: "10000"
-          FUZZ_SEED: "1"
+          FUZZ_SEED: "3"
+          # Generated PostgreSQL-valid statements must execute, not be silently
+          # classified as unsupported by the differential harness.
+          FUZZ_UNSUPPORTED_BUDGET: "0"
           # Ratchet budget: allowed fuzz divergences before failing (see BUGS.md
           # A ceiling, not an exact target — the residual divergences are
           # PostgreSQL-implementation-specific (unspecified within-row operand

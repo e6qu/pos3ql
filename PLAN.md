@@ -25,7 +25,7 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 One large PR is open at a time; it is merged and `main` is refreshed before the next begins.
 
 1. **Arrays and composites.** Complete: canonical rectangular array shapes retain bounds through SQL, storage, Bind, Result, and COPY; anonymous records have matching binary receive/send codecs.
-2. **SQL semantics.** Close remaining PostgreSQL differences through strict differential tests.
+2. **SQL semantics.** In progress: generated PostgreSQL-valid SQL has no unsupported budget; array aggregation, ARRAY subqueries, bounds, and extended-protocol result types share one rectangular-shape model. Close the remaining differences through strict differential tests.
 3. **DDL and catalogs.** Finish privileges, collation, introspection, and client-tool compatibility.
 4. **Wire and bulk data.** Close accepted-type Bind, Result, COPY, typmod, portal, and driver behavior.
 5. **Replication and physical demand.** Complete object-native logical replication and demand propagation through every executor path.

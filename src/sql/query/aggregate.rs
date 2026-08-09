@@ -189,6 +189,7 @@ pub(crate) struct AggState<'a> {
     // a varchar value arrives as a text datum, and only the static type can
     // say the result is character varying[].
     elem_hint: Option<crate::sql::types::ArrElem>,
+    array_input: bool,
     ord_spec: &'a [crate::sql::ast::OrderBy<'a>],
     ord: *mut &'a [u8],
     ord_len: usize,
@@ -370,6 +371,7 @@ impl Default for AggState<'_> {
             str_cap: 0,
             ordered: false,
             elem_hint: None,
+            array_input: false,
             ord_spec: &[],
             ord: core::ptr::null_mut(),
             ord_len: 0,
@@ -543,9 +545,14 @@ impl<'a> AggState<'a> {
             }
             // array_agg/json_agg keep NULL elements, unlike string_agg.
             let value = eval_full(args[0], arena, params, row, hooks)?;
-            if matches!(self.kind, AggKind::ArrayAgg) && self.elem_hint.is_none() {
-                self.elem_hint = crate::sql::eval::static_type_pub(args[0], row)
-                    .and_then(crate::sql::types::ArrElem::from_coltype);
+            if matches!(self.kind, AggKind::ArrayAgg) {
+                match crate::sql::eval::static_type_pub(args[0], row) {
+                    Some(crate::sql::types::ColType::Array(_)) => self.array_input = true,
+                    Some(ctype) if self.elem_hint.is_none() => {
+                        self.elem_hint = crate::sql::types::ArrElem::from_coltype(ctype);
+                    }
+                    _ => {}
+                }
             }
             if self.ordered {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
@@ -1308,19 +1315,22 @@ impl<'a> AggState<'a> {
         if values.is_empty() {
             return Ok(Datum::Null);
         }
-        // No default here. Falling back to int4 for an element type arrays
-        // cannot yet carry relabelled the values rather than failing, so
-        // `array_agg` over a time or a uuid came back as meaningless integers.
+        if self.array_input
+            || values
+                .iter()
+                .any(|value| matches!(value, Datum::Array { .. }))
+        {
+            return crate::sql::array::stack(values, arena);
+        }
         let from_values = values
             .iter()
             .find_map(crate::sql::types::ArrElem::from_datum);
-        let Some(element) = self.elem_hint.or(from_values) else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "array_agg over {} is not supported yet",
-                crate::sql::eval::type_name_of_pub(&values[0])
-            ));
-        };
+        let element = self.elem_hint.or(from_values).ok_or_else(|| {
+            sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "function array_agg(unknown) is not unique"
+            )
+        })?;
         let raw = crate::sql::array::build(values, arena)?;
         Ok(Datum::Array { element, raw })
     }

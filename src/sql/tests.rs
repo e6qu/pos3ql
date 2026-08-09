@@ -191,6 +191,20 @@ fn run_with_guc(
     buffer.readable().to_vec()
 }
 
+fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "describe send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "describe sql", 1 << 18).unwrap();
+    let transaction = TxnState::new(budget, 1024).unwrap();
+    let mut responder =
+        Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
+    assert!(
+        engine
+            .describe(sql_text, &arena, &transaction, &mut responder)
+            .unwrap()
+    );
+    buffer.readable().to_vec()
+}
+
 /// Stages one implicit transaction through the same executor entry point as a
 /// connection, deliberately leaving publication to the caller's flush
 /// boundary.
@@ -3098,6 +3112,50 @@ fn array_type() {
     assert!(
         run("SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8])")
             .contains("[4:5][8:10]={{7,7,7},{7,7,7}}")
+    );
+    // `array_agg(anyarray)` adds a leading dimension; NULL, empty, and
+    // mismatched members are distinct PostgreSQL errors.
+    assert!(
+        run("SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) AS v(a)")
+            .contains("{{1,2},{3,4}}")
+    );
+    assert!(
+        run("SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) AS v(a))")
+            .contains("{{1,2},{3,4}}")
+    );
+    assert!(
+        run("SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[1]::int[])) AS v(a) WHERE false)")
+            .contains("{}")
+    );
+    assert!(
+        run("SELECT array_agg(a) FROM (VALUES ('[2:3]={1,2}'::int[]), ('[2:3]={3,4}'::int[])) AS v(a)")
+            .contains("[1:2][2:3]={{1,2},{3,4}}")
+    );
+    assert!(run("SELECT array_agg(NULL)").contains("42725"));
+    assert!(run("SELECT array_agg(NULL::text)").contains("{NULL}"));
+    assert!(
+        run("SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3])) AS v(a)").contains("2202E")
+    );
+    assert!(run("SELECT array_agg(a) FROM (VALUES (NULL::int[])) AS v(a)").contains("22004"));
+    assert!(run("SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[]::int[])) AS v(a))").contains("2202E"));
+    assert!(run("SELECT ARRAY(SELECT a FROM (VALUES (NULL::int[])) AS v(a))").contains("22004"));
+}
+
+#[test]
+fn describe_array_subquery_uses_the_array_type() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE describe_arrays (values int[])",
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ARRAY(SELECT values FROM describe_arrays)",
+        )),
+        [crate::sql::types::ArrElem::Int4.array_oid()]
     );
 }
 

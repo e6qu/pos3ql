@@ -48,7 +48,7 @@ pub(crate) fn coerce_domain_value<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<Datum<'a>, SqlError> {
-    let domain = storage.domain(slot);
+    let domain = storage.domain_for(slot, txid);
     let value = if let Some(parent_name) = domain.base_domain {
         let parent = storage
             .domain_slot(parent_name.schema.as_str(), parent_name.name.as_str(), txid)
@@ -65,7 +65,7 @@ pub(crate) fn coerce_domain_value<'a>(
         crate::sql::eval::cast_to(value, domain.base, arena)?
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(domain, value, arena, params)?;
+    validate_domain_value(&domain, value, arena, params)?;
     Ok(value)
 }
 

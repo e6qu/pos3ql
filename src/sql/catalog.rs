@@ -2117,7 +2117,11 @@ pub fn constraint_def_text<'a>(
             )?));
         }
     }
-    for (slot, domain) in storage.live_domains() {
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
         for (check_index, check) in domain.checks().iter().enumerate() {
             let check_oid = FIRST_DOMAIN_CHECK_OID
                 + slot as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
@@ -3183,7 +3187,11 @@ fn pg_constraint<'a>(
         }
     }
     // Domain CHECK constraints are attached to `contypid`, not a table.
-    for (slot, domain) in storage.live_domains() {
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
         for (check_index, check) in domain.checks().iter().enumerate() {
             if n == out.len() {
                 break;
@@ -3892,10 +3900,14 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     }
     let mut n = types.len();
     // User-defined domains: typtype 'd', with their base type and constraints.
-    for (slot, d) in storage.live_domains() {
+    for slot in 0..storage.domain_count() {
+        let d = storage.domain_for(slot, txid);
+        if !d.visible_to(txid) {
+            continue;
+        }
         let base_oid = match d.base_domain {
             Some(parent) => storage
-                .domain_slot(parent.schema.as_str(), parent.name.as_str(), 0)
+                .domain_slot(parent.schema.as_str(), parent.name.as_str(), txid)
                 .map(domain_oid)
                 .expect("visible domain retains its parent identity"),
             None => d.base.oid(),

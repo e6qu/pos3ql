@@ -8363,6 +8363,17 @@ fn domains_enforce_and_report() {
     run_with(
         &mut e,
         &mut b,
+        "CREATE TYPE shared_type_name AS ENUM ('one')",
+    );
+    let duplicate_name = run_with(&mut e, &mut b, "CREATE DOMAIN shared_type_name AS integer");
+    assert!(
+        String::from_utf8_lossy(&duplicate_name).contains("42710"),
+        "domains and enums share PostgreSQL's type namespace: {}",
+        String::from_utf8_lossy(&duplicate_name)
+    );
+    run_with(
+        &mut e,
+        &mut b,
         "CREATE DOMAIN posint AS int CHECK (VALUE > 0)",
     );
     run_with(
@@ -8549,6 +8560,70 @@ fn domains_enforce_and_report() {
          SELECT 0::posint",
     );
     assert!(String::from_utf8_lossy(&bytes).contains("23514"));
+}
+
+#[test]
+fn domain_alterations_are_private_until_commit() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN staged_domain AS integer",
+    );
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER DOMAIN staged_domain ADD CHECK (VALUE < 5)",
+    );
+    let owner_catalog = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT conname FROM pg_constraint WHERE conname = 'staged_domain_check'",
+    );
+    assert!(
+        owner_catalog.contains("staged_domain_check"),
+        "{owner_catalog}"
+    );
+    let owner_value = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT 8::staged_domain",
+    );
+    assert!(owner_value.contains("23514"), "{owner_value}");
+    let observer_value = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT 8::staged_domain",
+    );
+    assert!(
+        observer_value.contains("SELECT 1") && observer_value.contains('8'),
+        "another session must retain the committed domain definition: {observer_value}"
+    );
+    let observer_catalog = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT conname FROM pg_constraint WHERE conname = 'staged_domain_check'",
+    );
+    assert!(
+        !observer_catalog.contains("staged_domain_check"),
+        "another session must not see the staged constraint: {observer_catalog}"
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    let after_rollback = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut observer,
+        "SELECT 8::staged_domain",
+    );
+    assert!(after_rollback.contains("SELECT 1"), "{after_rollback}");
 }
 
 #[test]

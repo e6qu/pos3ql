@@ -2987,6 +2987,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 default_expr,
                 checks,
                 n_checks,
+                pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
         }

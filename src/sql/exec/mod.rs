@@ -7300,6 +7300,9 @@ pub fn create_domain(
     if storage
         .domain_slot(schema.as_str(), d.name.name, txn.txid)
         .is_some()
+        || storage
+            .enum_slot(schema.as_str(), d.name.name, txn.txid)
+            .is_some()
     {
         return sql_fail(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
@@ -7669,7 +7672,7 @@ pub fn alter_domain(
         return sql_fail(error);
     }
     // Start from the current definition and apply the action.
-    let current = *storage.domain(slot);
+    let current = storage.domain_for(slot, txn.txid);
     let mut spec = crate::storage::DomainSpec {
         base_domain: current.base_domain,
         base: current.base,
@@ -7680,23 +7683,14 @@ pub fn alter_domain(
         n_checks: current.n_checks,
     };
     let revalidate;
-    let undo;
     match action {
         A::SetNotNull => {
             spec.not_null = true;
             revalidate = true;
-            undo = super::txn::DdlUndo::DomainNullabilityAltered {
-                slot: slot as u32,
-                prior: current.not_null,
-            };
         }
         A::DropNotNull => {
             spec.not_null = false;
             revalidate = false;
-            undo = super::txn::DdlUndo::DomainNullabilityAltered {
-                slot: slot as u32,
-                prior: current.not_null,
-            };
         }
         A::SetDefault(text) => {
             revalidate = false;
@@ -7707,18 +7701,10 @@ pub fn alter_domain(
                 Ok(t) => spec.default_expr = Some(t),
                 Err(e) => return sql_fail(e),
             }
-            undo = super::txn::DdlUndo::DomainDefaultAltered {
-                slot: slot as u32,
-                prior: current.default_expr,
-            };
         }
         A::DropDefault => {
             revalidate = false;
             spec.default_expr = None;
-            undo = super::txn::DdlUndo::DomainDefaultAltered {
-                slot: slot as u32,
-                prior: current.default_expr,
-            };
         }
         A::AddCheck(check) => {
             revalidate = true;
@@ -7755,10 +7741,6 @@ pub fn alter_domain(
                 expression,
             };
             spec.n_checks += 1;
-            undo = super::txn::DdlUndo::DomainCheckAdded {
-                slot: slot as u32,
-                prior_count: current.n_checks as u8,
-            };
         }
         A::DropConstraint {
             name: cname,
@@ -7790,52 +7772,35 @@ pub fn alter_domain(
                     name.name
                 ));
             };
-            let prior = spec.checks[pos];
             for i in pos..spec.n_checks - 1 {
                 spec.checks[i] = spec.checks[i + 1];
             }
             spec.n_checks -= 1;
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
-            undo = super::txn::DdlUndo::DomainCheckDropped {
-                slot: slot as u32,
-                index: pos as u8,
-                prior,
-            };
         }
     }
-    storage.alter_domain(slot, spec);
+    let prior = match storage.stage_domain_alter(slot, spec, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
     if revalidate && let Err(e) = validate_domain_rows(storage, slot, txn.txid, arena) {
-        storage.alter_domain(
-            slot,
-            crate::storage::DomainSpec {
-                base_domain: current.base_domain,
-                base: current.base,
-                base_type_mod: current.base_type_mod,
-                not_null: current.not_null,
-                default_expr: current.default_expr,
-                checks: current.checks,
-                n_checks: current.n_checks,
-            },
-        );
+        storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
-        // Restore the pre-ALTER definition on a journal failure.
-        let restore = crate::storage::DomainSpec {
-            base_domain: current.base_domain,
-            base: current.base,
-            base_type_mod: current.base_type_mod,
-            not_null: current.not_null,
-            default_expr: current.default_expr,
-            checks: current.checks,
-            n_checks: current.n_checks,
-        };
-        storage.alter_domain(slot, restore);
+    if let Err(e) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateDomain(storage.domain_for(slot, txn.txid)),
+    ) {
+        storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(undo) {
-        storage.restore_domain(slot, current);
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
     }
     responder.command_complete("ALTER DOMAIN")?;

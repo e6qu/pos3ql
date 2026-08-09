@@ -26,13 +26,13 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 
 1. **Arrays and composites.** Complete: canonical rectangular array shapes retain bounds through SQL, storage, Bind, Result, and COPY; anonymous records have matching binary receive/send codecs.
 2. **SQL semantics.** In progress: generated PostgreSQL-valid SQL has no unsupported budget; array aggregation, ARRAY subqueries, bounds, and extended-protocol result types share one rectangular-shape model. Close the remaining differences through strict differential tests.
-3. **DDL and catalogs.** In progress: bytewise collations; typed constraint metadata; ACL-derived relation and usage grants; and sequence metadata match PostgreSQL. Column defaults are one typed state across DDL, WAL, checkpoints, catalog rendering, and referential actions; expression defaults run for every `SET DEFAULT` action. Login verification has explicit bootstrap, stored-role, and rejection states. Finish domains and remaining client-tool introspection.
+3. **DDL and catalogs.** In progress: bytewise collations; typed constraint metadata; ACL-derived relation and usage grants; and sequence metadata match PostgreSQL. Column defaults and domain definitions are committed-plus-pending typed state across DDL, WAL, checkpoints, and catalog rendering. Login verification has explicit bootstrap, stored-role, and rejection states. Finish remaining client-tool introspection.
 4. **Wire and bulk data.** In progress: typed binary record input shares catalog resolution with Bind and preserves nested domain constraints. Close accepted-type Result, COPY, typmod, portal, and driver behavior.
 5. **Replication and physical demand.** In progress: publication creation, ownership, renaming, and transactional table/schema selection retain one committed definition plus typed pending state; pgoutput v1–v4, slot acknowledgement, and raw-wire probes cover the stream boundary. Snapshot export is rejected explicitly rather than returning a false snapshot. Complete object-native logical replication and demand propagation through every executor path.
 
 ## Current invariants
 
-- Catalog identity, DDL visibility, and retained TZif cache entries are atomic typed states.
+- Catalog identity, DDL visibility, domain definitions, and retained TZif cache entries are atomic typed states.
 - A slot acknowledgement is validated before its WAL record can be committed; pgoutput versions are parser-validated protocol states.
 - Publication identity, membership, schema selectors, operations, and ownership are durable typed states; catalog reads see their own staged state, while replication sees only committed selection.
 - Engine startup initializes named-zone TZif history before allocation freezes; unavailable historical data is not approximated.

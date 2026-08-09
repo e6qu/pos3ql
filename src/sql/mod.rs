@@ -1980,10 +1980,9 @@ impl Engine {
                     );
                 }
                 DdlUndo::DomainDropped(slot) => self.storage.commit_domain_drop(*slot as usize),
-                DdlUndo::DomainNullabilityAltered { .. }
-                | DdlUndo::DomainDefaultAltered { .. }
-                | DdlUndo::DomainCheckAdded { .. }
-                | DdlUndo::DomainCheckDropped { .. } => {}
+                DdlUndo::DomainAltered { slot, .. } => {
+                    self.storage.commit_domain_alter(*slot as usize, txn.txid)
+                }
                 DdlUndo::EnumCreated(slot) => {
                     self.storage.commit_enum_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2160,18 +2159,8 @@ impl Engine {
             DdlUndo::DomainDropped(slot) => {
                 self.storage.rollback_domain_drop(slot as usize, txid);
             }
-            DdlUndo::DomainNullabilityAltered { slot, prior } => self
-                .storage
-                .restore_domain_nullability(slot as usize, prior),
-            DdlUndo::DomainDefaultAltered { slot, prior } => {
-                self.storage.restore_domain_default(slot as usize, prior);
-            }
-            DdlUndo::DomainCheckAdded { slot, prior_count } => self
-                .storage
-                .undo_domain_check_add(slot as usize, prior_count as usize),
-            DdlUndo::DomainCheckDropped { slot, index, prior } => {
-                self.storage
-                    .restore_domain_check(slot as usize, index as usize, prior);
+            DdlUndo::DomainAltered { slot, prior } => {
+                self.storage.rollback_domain_alter(slot as usize, prior)
             }
             DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
             DdlUndo::EnumDropped(slot) => {
@@ -6087,7 +6076,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 n_checks: def.n_checks,
             };
             if let Some(slot) = storage.domain_slot(def.schema.as_str(), def.name.as_str(), 0) {
-                storage.alter_domain(slot, spec);
+                storage.stage_domain_alter(slot, spec, 0)?;
+                storage.commit_domain_alter(slot, 0);
             } else {
                 storage.create_domain(def.schema, def.name, spec, 0)?;
             }

@@ -12,6 +12,11 @@ DROP DOMAIN IF EXISTS dom_small;
 DROP DOMAIN IF EXISTS dom_pos;
 DROP DOMAIN IF EXISTS dom_email;
 DROP DOMAIN IF EXISTS dom_def;
+DROP TYPE IF EXISTS dom_shared_name;
+
+CREATE TYPE dom_shared_name AS ENUM ('one');
+CREATE DOMAIN dom_shared_name AS int;
+DROP TYPE dom_shared_name;
 
 CREATE DOMAIN dom_pos AS int CONSTRAINT gt0 CHECK (VALUE > 0) CONSTRAINT lt100 CHECK (VALUE < 100);
 CREATE DOMAIN dom_email AS text NOT NULL CHECK (VALUE LIKE '%@%');
@@ -43,6 +48,11 @@ SELECT typname, typtype, typbasetype, typnotnull, typdefault
   FROM pg_type WHERE typname IN ('dom_pos', 'dom_email', 'dom_def') ORDER BY typname;
 
 -- ALTER DOMAIN: add / drop a CHECK, set / drop a default, set / drop NOT NULL.
+BEGIN;
+ALTER DOMAIN dom_def SET DEFAULT 77;
+SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
+ROLLBACK;
+SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
 ALTER DOMAIN dom_def SET DEFAULT 99;
 -- Persistent schemas reject record and its array pseudo-type at the DDL
 -- boundary; domains use PostgreSQL's distinct base-type diagnostic.

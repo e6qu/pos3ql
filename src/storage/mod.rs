@@ -1911,12 +1911,10 @@ impl SeqType {
 }
 
 /// A named sequence generator. Its *existence* (`live`/`pending`) is
-/// transactional catalog state, mirroring [`ViewDef`]; its *value* state
-/// (`last_value`/`is_called`/`dirty`) is deliberately **not** — a `nextval`
-/// advance survives `ROLLBACK`, exactly as PostgreSQL leaves gaps. Those three
-/// fields are [`Cell`]s so `nextval`/`setval` can advance the generator through
-/// a shared `&Storage` borrow (the pure expression evaluator never holds
-/// `&mut`), allocation-free.
+/// transactional catalog state, mirroring [`ViewDef`]. Ordinary value advances
+/// survive `ROLLBACK`, while a staged definition owns a private value image
+/// until commit. The cells let the allocation-free expression evaluator update
+/// either image through a shared `&Storage` borrow.
 #[derive(Clone)]
 pub struct SequenceDef {
     pub created_at: u64,
@@ -1948,7 +1946,35 @@ pub struct SequenceDef {
     /// `SequenceAdvance` and clears it, regardless of whether the surrounding
     /// transaction committed (advances are non-transactional).
     pub dirty: Cell<bool>,
+    pub(crate) pending_definition: Option<PendingSequenceDefinition>,
+    pending_last_value: Cell<i64>,
+    pending_is_called: Cell<bool>,
+    pending_dirty: Cell<bool>,
     ddl_state: CatalogDdlState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingSequenceDefinition {
+    pub txid: u32,
+    pub spec: SeqSpec,
+    pub owner: Option<SequenceOwner>,
+    pub generator_for: Option<SequenceOwner>,
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SequenceValueState {
+    Committed {
+        last_value: i64,
+        is_called: bool,
+        dirty: bool,
+    },
+    Pending {
+        last_value: i64,
+        is_called: bool,
+        dirty: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1983,7 +2009,7 @@ fn rebind_sequence_column(
 /// The tunable parameters of a sequence, computed and validated by the executor
 /// from the CREATE/ALTER options, then handed to storage. Kept apart from the
 /// live value state ([`SequenceDef`]'s `Cell` fields).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SeqSpec {
     pub data_type: SeqType,
     pub increment: i64,
@@ -1999,17 +2025,49 @@ impl SequenceDef {
         self.ddl_state.visible_to(txid)
     }
 
+    pub(crate) fn definition_for(&self, txid: u32) -> Self {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or_else(
+                || self.clone(),
+                |pending| Self {
+                    data_type: pending.spec.data_type,
+                    increment: pending.spec.increment,
+                    min_value: pending.spec.min_value,
+                    max_value: pending.spec.max_value,
+                    start_value: pending.spec.start_value,
+                    cache: pending.spec.cache,
+                    cycle: pending.spec.cycle,
+                    owner: pending.owner,
+                    generator_for: pending.generator_for,
+                    pending_definition: None,
+                    ..self.clone()
+                },
+            )
+    }
+
     /// Advances the generator and returns the next value, or the 2200H overflow
     /// error when a non-cycling sequence runs off its bound. Mutates value state
     /// through the `Cell` fields (a `&Storage` borrow is all the caller holds).
     pub fn next_value(&self) -> Result<i64, SqlError> {
-        if !self.is_called.get() {
+        self.next_value_with(&self.last_value, &self.is_called, Some(&self.dirty))
+    }
+
+    fn next_value_with(
+        &self,
+        last_value: &Cell<i64>,
+        is_called: &Cell<bool>,
+        dirty: Option<&Cell<bool>>,
+    ) -> Result<i64, SqlError> {
+        if !is_called.get() {
             // First call after CREATE/RESTART yields the start value unchanged.
-            self.is_called.set(true);
-            self.dirty.set(true);
-            return Ok(self.last_value.get());
+            is_called.set(true);
+            if let Some(dirty) = dirty {
+                dirty.set(true);
+            }
+            return Ok(last_value.get());
         }
-        let current = self.last_value.get();
+        let current = last_value.get();
         let next = current.checked_add(self.increment);
         let value = if self.increment > 0 {
             match next {
@@ -2038,8 +2096,10 @@ impl SequenceDef {
                 }
             }
         };
-        self.last_value.set(value);
-        self.dirty.set(true);
+        last_value.set(value);
+        if let Some(dirty) = dirty {
+            dirty.set(true);
+        }
         Ok(value)
     }
 
@@ -2066,6 +2126,23 @@ impl SequenceDef {
         self.last_value.set(value);
         self.is_called.set(is_called);
         self.dirty.set(true);
+        Ok(value)
+    }
+
+    fn set_value_with(
+        &self,
+        value: i64,
+        is_called: bool,
+        last_value: &Cell<i64>,
+        called: &Cell<bool>,
+        dirty: Option<&Cell<bool>>,
+    ) -> Result<i64, SqlError> {
+        self.check_setval(value)?;
+        last_value.set(value);
+        called.set(is_called);
+        if let Some(dirty) = dirty {
+            dirty.set(true);
+        }
         Ok(value)
     }
 }
@@ -3327,6 +3404,10 @@ impl Storage {
                     last_value: Cell::new(1),
                     is_called: Cell::new(false),
                     dirty: Cell::new(false),
+                    pending_definition: None,
+                    pending_last_value: Cell::new(1),
+                    pending_is_called: Cell::new(false),
+                    pending_dirty: Cell::new(false),
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to MAX_SEQUENCES");
@@ -9884,16 +9965,6 @@ impl Storage {
             .filter(|(_, sequence)| sequence.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn sequences_visible_to(
-        &self,
-        txid: u32,
-    ) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences
-            .iter()
-            .enumerate()
-            .filter(move |(_, sequence)| sequence.visible_to(txid))
-    }
-
     pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {
         &self.sequences[slot]
     }
@@ -10018,35 +10089,253 @@ impl Storage {
             last_value: Cell::new(spec.start_value),
             is_called: Cell::new(false),
             dirty: Cell::new(false),
+            pending_definition: None,
+            pending_last_value: Cell::new(spec.start_value),
+            pending_is_called: Cell::new(false),
+            pending_dirty: Cell::new(false),
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(new)
     }
 
-    /// Replaces a live sequence's parameters in place (ALTER SEQUENCE). Value
-    /// state (last_value/is_called) is untouched unless `restart` is given.
-    pub fn alter_sequence(
+    pub(crate) fn sequence_for(&self, slot: usize, txid: u32) -> SequenceDef {
+        self.sequences[slot].definition_for(txid)
+    }
+
+    pub(crate) fn stage_sequence_alter(
         &mut self,
         slot: usize,
         spec: SeqSpec,
-        restart: Option<i64>,
         owner: Option<SequenceOwner>,
         generator_for: Option<SequenceOwner>,
+        restart: Option<i64>,
+        txid: u32,
+    ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
+        let sequence = &mut self.sequences[slot];
+        if let Some(pending) = sequence.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "sequence \"{}\" is being altered by another transaction",
+                sequence.name.as_str()
+            ));
+        }
+        let prior = sequence
+            .pending_definition
+            .map(|pending| PendingSequenceDefinition {
+                last_value: if pending.txid == txid {
+                    sequence.pending_last_value.get()
+                } else {
+                    pending.last_value
+                },
+                is_called: if pending.txid == txid {
+                    sequence.pending_is_called.get()
+                } else {
+                    pending.is_called
+                },
+                ..pending
+            });
+        let (last_value, is_called) = if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            (
+                sequence.pending_last_value.get(),
+                sequence.pending_is_called.get(),
+            )
+        } else {
+            (sequence.last_value.get(), sequence.is_called.get())
+        };
+        let (last_value, is_called) =
+            restart.map_or((last_value, is_called), |value| (value, false));
+        sequence.pending_definition = Some(PendingSequenceDefinition {
+            txid,
+            spec,
+            owner,
+            generator_for,
+            last_value,
+            is_called,
+        });
+        sequence.pending_last_value.set(last_value);
+        sequence.pending_is_called.set(is_called);
+        sequence.pending_dirty.set(restart.is_some());
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_sequence_alter(&mut self, slot: usize, txid: u32) {
+        if self.sequences[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .is_some()
+        {
+            let last_value = self.sequences[slot].pending_last_value.get();
+            let is_called = self.sequences[slot].pending_is_called.get();
+            let definition = self.sequences[slot].definition_for(txid);
+            self.sequences[slot] = definition;
+            self.sequences[slot].last_value.set(last_value);
+            self.sequences[slot].is_called.set(is_called);
+            self.sequences[slot].dirty.set(false);
+            self.sequences[slot].pending_dirty.set(false);
+        }
+    }
+
+    pub(crate) fn rollback_sequence_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingSequenceDefinition>,
     ) {
-        let s = &mut self.sequences[slot];
-        s.data_type = spec.data_type;
-        s.increment = spec.increment;
-        s.min_value = spec.min_value;
-        s.max_value = spec.max_value;
-        s.start_value = spec.start_value;
-        s.cache = spec.cache;
-        s.cycle = spec.cycle;
-        s.owner = owner;
-        s.generator_for = generator_for;
-        if let Some(r) = restart {
-            s.last_value.set(r);
-            s.is_called.set(false);
-            s.dirty.set(true);
+        self.sequences[slot].pending_definition = prior;
+        if let Some(prior) = prior {
+            self.sequences[slot]
+                .pending_last_value
+                .set(prior.last_value);
+            self.sequences[slot].pending_is_called.set(prior.is_called);
+            self.sequences[slot].pending_dirty.set(false);
+        } else {
+            self.sequences[slot].pending_dirty.set(false);
+        }
+    }
+
+    pub(crate) fn next_sequence_value(&self, slot: usize, txid: u32) -> Result<i64, SqlError> {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            let definition = sequence.definition_for(txid);
+            return definition.next_value_with(
+                &sequence.pending_last_value,
+                &sequence.pending_is_called,
+                Some(&sequence.pending_dirty),
+            );
+        }
+        sequence.next_value()
+    }
+
+    pub(crate) fn set_sequence_value(
+        &self,
+        slot: usize,
+        txid: u32,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError> {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            let definition = sequence.definition_for(txid);
+            return definition.set_value_with(
+                value,
+                is_called,
+                &sequence.pending_last_value,
+                &sequence.pending_is_called,
+                Some(&sequence.pending_dirty),
+            );
+        }
+        sequence.set_value(value, is_called)
+    }
+
+    pub(crate) fn check_sequence_value(
+        &self,
+        slot: usize,
+        txid: u32,
+        value: i64,
+    ) -> Result<(), SqlError> {
+        self.sequence_for(slot, txid).check_setval(value)
+    }
+
+    pub(crate) fn sequence_value_for(&self, slot: usize, txid: u32) -> (i64, bool) {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            return (
+                sequence.pending_last_value.get(),
+                sequence.pending_is_called.get(),
+            );
+        }
+        (sequence.last_value.get(), sequence.is_called.get())
+    }
+
+    pub(crate) fn sequence_value_dirty_for(&self, slot: usize, txid: u32) -> bool {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            return sequence.pending_dirty.get();
+        }
+        sequence.dirty.get()
+    }
+
+    pub(crate) fn clear_sequence_value_dirty(&self, slot: usize, txid: u32) {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            sequence.pending_dirty.set(false);
+        } else {
+            sequence.dirty.set(false);
+        }
+    }
+
+    pub(crate) fn reset_sequence_value(
+        &self,
+        slot: usize,
+        txid: u32,
+        value: i64,
+    ) -> SequenceValueState {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            let prior = SequenceValueState::Pending {
+                last_value: sequence.pending_last_value.get(),
+                is_called: sequence.pending_is_called.get(),
+                dirty: sequence.pending_dirty.get(),
+            };
+            sequence.pending_last_value.set(value);
+            sequence.pending_is_called.set(false);
+            sequence.pending_dirty.set(true);
+            return prior;
+        }
+        let prior = SequenceValueState::Committed {
+            last_value: sequence.last_value.get(),
+            is_called: sequence.is_called.get(),
+            dirty: sequence.dirty.get(),
+        };
+        sequence.last_value.set(value);
+        sequence.is_called.set(false);
+        sequence.dirty.set(true);
+        prior
+    }
+
+    pub(crate) fn restore_sequence_value(&self, slot: usize, prior: SequenceValueState) {
+        let sequence = &self.sequences[slot];
+        match prior {
+            SequenceValueState::Committed {
+                last_value,
+                is_called,
+                dirty,
+            } => {
+                sequence.last_value.set(last_value);
+                sequence.is_called.set(is_called);
+                sequence.dirty.set(dirty);
+            }
+            SequenceValueState::Pending {
+                last_value,
+                is_called,
+                dirty,
+            } => {
+                sequence.pending_last_value.set(last_value);
+                sequence.pending_is_called.set(is_called);
+                sequence.pending_dirty.set(dirty);
+            }
         }
     }
 

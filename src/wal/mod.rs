@@ -87,6 +87,8 @@ const KIND_SET_DEFAULT_ACL: u8 = 34;
 const KIND_CREATE_PUBLICATION: u8 = 35;
 const KIND_DROP_PUBLICATION: u8 = 36;
 const KIND_ALTER_PUBLICATION: u8 = 42;
+const KIND_SET_PUBLICATION_OWNER: u8 = 43;
+const KIND_RENAME_PUBLICATION: u8 = 44;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -94,7 +96,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_PUBLICATION;
+const LAST_KIND: u8 = KIND_RENAME_PUBLICATION;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -339,9 +341,12 @@ pub(crate) enum WalOp<'a> {
     },
     CreatePublication {
         name: &'a str,
+        owner: u16,
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
+        schemas: [u8; crate::storage::MAX_SCHEMAS],
+        schema_count: usize,
         publish_insert: bool,
         publish_update: bool,
         publish_delete: bool,
@@ -357,10 +362,20 @@ pub(crate) enum WalOp<'a> {
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
+        schemas: [u8; crate::storage::MAX_SCHEMAS],
+        schema_count: usize,
         publish_insert: bool,
         publish_update: bool,
         publish_delete: bool,
         publish_truncate: bool,
+    },
+    SetPublicationOwner {
+        name: &'a str,
+        owner: u16,
+    },
+    RenamePublication {
+        name: &'a str,
+        new_name: &'a str,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1183,6 +1198,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
         WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION,
+        WalOp::SetPublicationOwner { .. } => KIND_SET_PUBLICATION_OWNER,
+        WalOp::RenamePublication { .. } => KIND_RENAME_PUBLICATION,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1320,12 +1337,20 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreatePublication {
-            name, table_count, ..
-        } => 1 + name.len() + 1 + 1 + table_count * 2,
+            name,
+            table_count,
+            schema_count,
+            ..
+        } => 1 + name.len() + 2 + 1 + 1 + 1 + table_count * 2 + schema_count,
         WalOp::DropPublication { name } => 1 + name.len(),
         WalOp::AlterPublication {
-            name, table_count, ..
-        } => 1 + name.len() + 1 + 1 + table_count * 2,
+            name,
+            table_count,
+            schema_count,
+            ..
+        } => 1 + name.len() + 1 + 1 + 1 + table_count * 2 + schema_count,
+        WalOp::SetPublicationOwner { name, .. } => 1 + name.len() + 2,
+        WalOp::RenamePublication { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -1645,6 +1670,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::CreatePublication {
             name,
+            owner,
             all_tables,
             tables,
             table_count,
@@ -1652,16 +1678,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publish_update,
             publish_delete,
             publish_truncate,
+            schemas,
+            schema_count,
         } => {
             let flags = u8::from(*all_tables)
                 | (u8::from(*publish_insert) << 1)
                 | (u8::from(*publish_update) << 2)
                 | (u8::from(*publish_delete) << 3)
                 | (u8::from(*publish_truncate) << 4);
-            let mut ok = name_bytes(buffer, name) && buffer.append(&[flags, *table_count as u8]);
+            let mut ok = name_bytes(buffer, name)
+                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
             }
+            ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
         }
         WalOp::DropPublication { name } => name_bytes(buffer, name),
@@ -1670,6 +1701,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             all_tables,
             tables,
             table_count,
+            schemas,
+            schema_count,
             publish_insert,
             publish_update,
             publish_delete,
@@ -1680,11 +1713,19 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u8::from(*publish_update) << 2)
                 | (u8::from(*publish_delete) << 3)
                 | (u8::from(*publish_truncate) << 4);
-            let mut ok = name_bytes(buffer, name) && buffer.append(&[flags, *table_count as u8]);
+            let mut ok = name_bytes(buffer, name)
+                && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
             }
+            ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
+        }
+        WalOp::SetPublicationOwner { name, owner } => {
+            name_bytes(buffer, name) && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::RenamePublication { name, new_name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
@@ -2535,11 +2576,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_CREATE_PUBLICATION => {
             let name = take_name(&mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
             let flags = *payload.get(at)?;
             at += 1;
             let count = *payload.get(at)? as usize;
             at += 1;
+            let schema_count = *payload.get(at)? as usize;
+            at += 1;
             if count > crate::storage::MAX_PUBLICATION_TABLES {
+                return None;
+            }
+            if schema_count > crate::storage::MAX_SCHEMAS {
                 return None;
             }
             let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
@@ -2547,11 +2595,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
+            let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+            schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
+            at += schema_count;
             (at == payload.len()).then_some(WalOp::CreatePublication {
                 name,
+                owner,
                 all_tables: flags & 1 != 0,
                 tables,
                 table_count: count,
+                schemas,
+                schema_count,
                 publish_insert: flags & 2 != 0,
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
@@ -2568,7 +2622,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let count = *payload.get(at)? as usize;
             at += 1;
+            let schema_count = *payload.get(at)? as usize;
+            at += 1;
             if count > crate::storage::MAX_PUBLICATION_TABLES {
+                return None;
+            }
+            if schema_count > crate::storage::MAX_SCHEMAS {
                 return None;
             }
             let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
@@ -2576,16 +2635,32 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
+            let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+            schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
+            at += schema_count;
             (at == payload.len()).then_some(WalOp::AlterPublication {
                 name,
                 all_tables: flags & 1 != 0,
                 tables,
                 table_count: count,
+                schemas,
+                schema_count,
                 publish_insert: flags & 2 != 0,
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
             })
+        }
+        KIND_SET_PUBLICATION_OWNER => {
+            let name = take_name(&mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::SetPublicationOwner { name, owner })
+        }
+        KIND_RENAME_PUBLICATION => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenamePublication { name, new_name })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
         KIND_COMMIT => {
@@ -3622,15 +3697,50 @@ mod tests {
             publication_tables[1] = 7;
             wal.append_committed(
                 13,
+                &WalOp::CreatePublication {
+                    name: "changes",
+                    owner: 7,
+                    all_tables: false,
+                    tables: publication_tables,
+                    table_count: 2,
+                    schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
+                    schema_count: 0,
+                    publish_insert: true,
+                    publish_update: true,
+                    publish_delete: true,
+                    publish_truncate: true,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                14,
                 &WalOp::AlterPublication {
                     name: "changes",
                     all_tables: false,
                     tables: publication_tables,
                     table_count: 2,
+                    schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
+                    schema_count: 0,
                     publish_insert: true,
                     publish_update: false,
                     publish_delete: true,
                     publish_truncate: false,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                15,
+                &WalOp::SetPublicationOwner {
+                    name: "changes",
+                    owner: 9,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                16,
+                &WalOp::RenamePublication {
+                    name: "changes",
+                    new_name: "renamed_changes",
                 },
             )
             .unwrap();
@@ -3639,7 +3749,7 @@ mod tests {
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 13);
+        assert_eq!(seen.len(), 16);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -3689,16 +3799,23 @@ mod tests {
         assert!(seen[10].contains("AdvanceReplicationSlot"), "{}", seen[10]);
         assert!(seen[11].contains("DropReplicationSlot"), "{}", seen[11]);
         assert!(
-            seen[12].contains("AlterPublication")
-                && seen[12].contains("table_count: 2")
-                && seen[12].contains("publish_update: false"),
-            "publication alter: {}",
+            seen[12].contains("CreatePublication") && seen[12].contains("owner: 7"),
+            "publication creation: {}",
             seen[12]
         );
-        assert_eq!(wal.last_lsn(), 13);
+        assert!(
+            seen[13].contains("AlterPublication")
+                && seen[14].contains("SetPublicationOwner")
+                && seen[15].contains("RenamePublication")
+                && seen[13].contains("table_count: 2")
+                && seen[13].contains("publish_update: false"),
+            "publication alter: {}",
+            seen[13]
+        );
+        assert_eq!(wal.last_lsn(), 16);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            14,
+            17,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

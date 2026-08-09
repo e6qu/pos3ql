@@ -566,8 +566,14 @@ fn publication_selects(
                 name.as_str()
             )
         })?;
+        let table_schema = storage.table_def(table_slot, 0).schema;
         let member = publication.all_tables
-            || publication.tables[..publication.table_count].contains(&(table_slot as u16));
+            || publication.tables[..publication.table_count].contains(&(table_slot as u16))
+            || storage
+                .find_schema(table_schema.as_str())
+                .is_some_and(|slot| {
+                    publication.schemas[..publication.schema_count].contains(&(slot as u8))
+                });
         let publishes = match operation {
             PublicationOperation::Insert => publication.publish_insert,
             PublicationOperation::Update => publication.publish_update,
@@ -1935,6 +1941,12 @@ impl Engine {
                 DdlUndo::PublicationAltered { slot, .. } => self
                     .storage
                     .commit_publication_alter(*slot as usize, txn.txid),
+                DdlUndo::PublicationOwnerChanged { slot, .. } => self
+                    .storage
+                    .commit_publication_owner(*slot as usize, txn.txid),
+                DdlUndo::PublicationRenamed { slot, .. } => self
+                    .storage
+                    .commit_publication_rename(*slot as usize, txn.txid),
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2128,6 +2140,12 @@ impl Engine {
             DdlUndo::PublicationAltered { slot, prior } => self
                 .storage
                 .rollback_publication_alter(slot as usize, prior),
+            DdlUndo::PublicationOwnerChanged { slot, prior } => self
+                .storage
+                .restore_publication_owner_pending(slot as usize, prior),
+            DdlUndo::PublicationRenamed { slot, prior } => self
+                .storage
+                .rollback_publication_rename(slot as usize, prior),
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
                 self.storage.rollback_matview_drop(slot as usize, txid);
@@ -4379,6 +4397,7 @@ impl Engine {
                 name,
                 all_tables,
                 tables,
+                schemas,
                 publish,
             } => exec::create_publication(
                 &mut self.storage,
@@ -4387,6 +4406,7 @@ impl Engine {
                 name,
                 *all_tables,
                 tables,
+                schemas,
                 *publish,
                 responder,
             ),
@@ -5882,9 +5902,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::CreatePublication {
             name,
+            owner,
             all_tables,
             tables,
             table_count,
+            schemas,
+            schema_count,
             publish_insert,
             publish_update,
             publish_delete,
@@ -5895,6 +5918,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name: crate::storage::SqlName::parse(name)?,
                     all_tables,
                     tables: &tables[..table_count],
+                    schemas: &schemas[..schema_count],
                     publish_insert,
                     publish_update,
                     publish_delete,
@@ -5902,6 +5926,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
+            storage.restore_publication_owner(slot, owner);
             storage.commit_publication_create(slot);
         }
         WalOp::DropPublication { name } => {
@@ -5914,6 +5939,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_count,
+            schemas,
+            schema_count,
             publish_insert,
             publish_update,
             publish_delete,
@@ -5923,6 +5950,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 all_tables,
                 tables,
                 table_count,
+                schemas,
+                schema_count,
                 publish_insert,
                 publish_update,
                 publish_delete,
@@ -5930,6 +5959,27 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             let (slot, _) = storage.alter_publication(name, definition, 0)?;
             storage.commit_publication_alter(slot, 0);
+        }
+        WalOp::SetPublicationOwner { name, owner } => {
+            let (slot, _) = storage.publication_definition(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal owner change for unknown publication \"{}\"",
+                    name
+                )
+            })?;
+            storage.restore_publication_owner(slot, owner);
+        }
+        WalOp::RenamePublication { name, new_name } => {
+            let (slot, _) = storage.publication_definition(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal rename for unknown publication \"{}\"",
+                    name
+                )
+            })?;
+            storage.rename_publication(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
+            storage.commit_publication_rename(slot, 0);
         }
         WalOp::CreateMatview {
             schema,

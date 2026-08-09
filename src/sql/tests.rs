@@ -403,7 +403,7 @@ fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
 #[test]
 fn role_catalog_replays_from_wal() {
     let config = test_config("role-wal-replay");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -1697,6 +1697,17 @@ fn logical_replication_selects_a_quoted_publication_name() {
 }
 
 #[test]
+fn logical_replication_selects_schema_publications() {
+    std::thread::Builder::new()
+        .name("logical-schema-publication".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_selects_schema_publications_on_sized_stack)
+        .expect("logical schema publication test thread starts")
+        .join()
+        .expect("logical schema publication test thread completes");
+}
+
+#[test]
 fn logical_replication_declares_user_types_before_relations() {
     std::thread::Builder::new()
         .name("logical-replication-types".into())
@@ -1832,6 +1843,49 @@ fn logical_replication_selects_a_quoted_publication_name_on_sized_stack() {
         .expect("quoted publication transaction is retained");
     assert!(emitted);
     assert!(send.readable().windows(1).any(|bytes| bytes == b"I"));
+}
+
+fn logical_replication_selects_schema_publications_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE SCHEMA replication_archive; \
+         CREATE TABLE replication_archive.events (id integer); \
+         CREATE TABLE public_events (id integer); \
+         CREATE PUBLICATION archive_changes FOR TABLES IN SCHEMA replication_archive",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO replication_archive.events VALUES (1); INSERT INTO public_events VALUES (2)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("archive_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("schema-selected transaction is retained");
+    assert!(emitted);
+    assert_eq!(
+        send.readable()
+            .windows(1)
+            .filter(|bytes| *bytes == b"I")
+            .count(),
+        1
+    );
 }
 
 fn logical_replication_declares_user_types_before_relations_on_sized_stack() {
@@ -11294,7 +11348,7 @@ fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
          ALTER PUBLICATION publication_changes SET (publish = 'update, truncate')",
     );
     drop(engine);
-    let mut replay_budget = Budget::new(1 << 28);
+    let mut replay_budget = Budget::new(1 << 30);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -11308,6 +11362,71 @@ fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
         ["f|t|f|t", "1"],
         "the absolute post-ALTER definition survives WAL replay"
     );
+}
+
+#[test]
+fn publication_schema_selection_is_transactional_catalog_accurate_and_replayable() {
+    let mut config = test_config("publication-schema-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("publication-schema-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA publication_archive; \
+         CREATE TABLE publication_archive.events (id integer); \
+         CREATE PUBLICATION publication_schema_changes FOR TABLES IN SCHEMA publication_archive",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_publication_namespace publication_namespace \
+             JOIN pg_publication publication ON publication.oid = publication_namespace.pnpubid \
+             WHERE publication.pubname = 'publication_schema_changes'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER PUBLICATION publication_schema_changes DROP TABLES IN SCHEMA publication_archive; \
+             SELECT count(*) FROM pg_publication_namespace; ROLLBACK; \
+             SELECT count(*) FROM pg_publication_namespace",
+        )),
+        ["0", "1"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA publication_archive CASCADE; CREATE SCHEMA publication_archive",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_publication_namespace",
+        )),
+        ["0"],
+        "dropping a selected schema removes its durable selector before the slot can be reused"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_publication_namespace",
+        )),
+        ["0"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]
@@ -11358,6 +11477,156 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         "{}",
         String::from_utf8_lossy(&not_table_owner)
     );
+}
+
+#[test]
+fn publication_owner_changes_are_transactional_and_durable() {
+    let mut config = test_config("publication-owner-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("publication-owner-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE publication_first_owner; \
+         CREATE ROLE publication_second_owner; \
+         GRANT CREATE ON SCHEMA public TO publication_first_owner",
+    );
+    let mut first_owner = GucState::new();
+    first_owner.set_session_user("publication_first_owner");
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_owner_source (id integer); \
+         CREATE PUBLICATION publication_owner_changes FOR TABLE publication_owner_source",
+        1 << 18,
+        &mut first_owner,
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER PUBLICATION publication_owner_changes OWNER TO publication_second_owner; \
+             SELECT role.rolname FROM pg_publication publication \
+             JOIN pg_roles role ON role.oid = publication.pubowner \
+             WHERE publication.pubname = 'publication_owner_changes'; \
+             ROLLBACK; \
+             SELECT role.rolname FROM pg_publication publication \
+             JOIN pg_roles role ON role.oid = publication.pubowner \
+             WHERE publication.pubname = 'publication_owner_changes'",
+        )),
+        ["publication_second_owner", "publication_first_owner"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_owner_changes OWNER TO publication_second_owner",
+    );
+    let mut second_owner = GucState::new();
+    second_owner.set_session_user("publication_second_owner");
+    let altered = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_owner_changes SET (publish = 'insert')",
+        1 << 18,
+        &mut second_owner,
+    );
+    assert!(
+        !String::from_utf8_lossy(&altered).contains("ERROR"),
+        "new owner must immediately control publication: {}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER PUBLICATION publication_owner_changes RENAME TO publication_owner_changes_renamed; \
+             SELECT pubname FROM pg_publication; ROLLBACK; SELECT pubname FROM pg_publication",
+        )),
+        [
+            "publication_owner_changes_renamed",
+            "publication_owner_changes"
+        ]
+    );
+    let renamed_then_altered = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER PUBLICATION publication_owner_changes RENAME TO publication_owner_changes_renamed; \
+         ALTER PUBLICATION publication_owner_changes_renamed SET (publish = 'insert'); \
+         ALTER PUBLICATION publication_owner_changes_renamed OWNER TO publication_second_owner; \
+         ROLLBACK",
+    );
+    assert!(
+        !String::from_utf8_lossy(&renamed_then_altered).contains("ERROR"),
+        "one transaction must be able to continue using its renamed identity: {}",
+        String::from_utf8_lossy(&renamed_then_altered)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_owner_changes RENAME TO publication_owner_changes_renamed",
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT role.rolname FROM pg_publication publication \
+             JOIN pg_roles role ON role.oid = publication.pubowner \
+             WHERE publication.pubname = 'publication_owner_changes_renamed'",
+        )),
+        ["publication_second_owner"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn publication_rename_blocks_conflicting_catalog_changes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_rename_source (id integer); \
+         CREATE PUBLICATION publication_rename_guard FOR TABLE publication_rename_source",
+    );
+    let mut renamer = TxnState::new(&mut budget, 256).unwrap();
+    let mut contender = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut renamer, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut renamer,
+        "ALTER PUBLICATION publication_rename_guard RENAME TO publication_rename_guard_new",
+    );
+    run_txn(&mut engine, &mut budget, &mut contender, "BEGIN");
+    let blocked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut contender,
+        "ALTER PUBLICATION publication_rename_guard SET (publish = 'insert')",
+    );
+    assert!(
+        blocked.is_empty(),
+        "a concurrent change waits rather than using a publication's pre-rename identity: {blocked}"
+    );
+    run_txn(&mut engine, &mut budget, &mut renamer, "ROLLBACK");
+    let resumed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut contender,
+        "ALTER PUBLICATION publication_rename_guard SET (publish = 'insert')",
+    );
+    assert!(
+        resumed.contains("ALTER PUBLICATION"),
+        "the waiting change rechecks the rolled-back rename: {resumed}"
+    );
+    run_txn(&mut engine, &mut budget, &mut contender, "ROLLBACK");
 }
 
 #[test]

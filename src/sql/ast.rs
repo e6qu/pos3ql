@@ -170,6 +170,7 @@ pub enum Stmt<'a> {
         name: &'a str,
         all_tables: bool,
         tables: &'a [QualName<'a>],
+        schemas: &'a [&'a str],
         publish: PublicationOperations,
     },
     /// ALTER PUBLICATION name SET (publish = ...) or change its explicit
@@ -457,9 +458,20 @@ pub struct PublicationOperations {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterPublicationAction<'a> {
     SetOperations(PublicationOperations),
-    SetTables(&'a [QualName<'a>]),
-    AddTables(&'a [QualName<'a>]),
-    DropTables(&'a [QualName<'a>]),
+    SetOwner(&'a str),
+    Rename(&'a str),
+    SetTargets {
+        tables: &'a [QualName<'a>],
+        schemas: &'a [&'a str],
+    },
+    AddTargets {
+        tables: &'a [QualName<'a>],
+        schemas: &'a [&'a str],
+    },
+    DropTargets {
+        tables: &'a [QualName<'a>],
+        schemas: &'a [&'a str],
+    },
 }
 
 impl PublicationOperations {

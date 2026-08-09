@@ -3228,14 +3228,21 @@ impl Checkpointer {
             for table in &publication.tables[..publication.table_count] {
                 let _ = write!(members, " {table}");
             }
+            let mut schemas = StackStr::<128>::new();
+            for schema in &publication.schemas[..publication.schema_count] {
+                let _ = write!(schemas, " {schema}");
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "pub {} {} {}{}",
+                    "pub {} {} {} {} {}{}{}",
                     name.as_str(),
+                    publication.ownership.owner,
                     flags,
                     publication.table_count,
-                    members.as_str()
+                    publication.schema_count,
+                    members.as_str(),
+                    schemas.as_str()
                 ),
             )?;
         }
@@ -4468,16 +4475,27 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         .next()
         .ok_or(CheckpointSetupError::Corrupt("pub name"))
         .and_then(decode_hex_name)?;
+    let owner: u16 = parse_field(words.next(), "pub owner")?;
     let flags: u8 = parse_field(words.next(), "pub flags")?;
     let count: usize = parse_field(words.next(), "pub table count")?;
+    let schema_count: usize = parse_field(words.next(), "pub schema count")?;
     if count > crate::storage::MAX_PUBLICATION_TABLES {
         return Err(CheckpointSetupError::Corrupt(
             "pub table count exceeds limit",
         ));
     }
+    if schema_count > crate::storage::MAX_SCHEMAS {
+        return Err(CheckpointSetupError::Corrupt(
+            "pub schema count exceeds limit",
+        ));
+    }
     let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     for table in &mut tables[..count] {
         *table = parse_field(words.next(), "pub table")?;
+    }
+    let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+    for schema in &mut schemas[..schema_count] {
+        *schema = parse_field(words.next(), "pub schema")?;
     }
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt("trailing pub fields"));
@@ -4488,6 +4506,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 name: sql_name(&name)?,
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],
+                schemas: &schemas[..schema_count],
                 publish_insert: flags & 2 != 0,
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
@@ -4501,6 +4520,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 error.message.as_str()
             ))
         })?;
+    storage.restore_publication_owner(slot, owner);
     storage.commit_publication_create(slot);
     Ok(())
 }

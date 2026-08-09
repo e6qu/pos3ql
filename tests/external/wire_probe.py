@@ -312,7 +312,10 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     stream = connect()
     stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
     drain_startup(stream)
-    simple_query(stream, "CREATE_REPLICATION_SLOT wire_replication_slot LOGICAL pgoutput")
+    simple_query(
+        stream,
+        "CREATE_REPLICATION_SLOT wire_replication_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+    )
     stream.sendall(
         frontend_message(
             b"Q",
@@ -384,7 +387,10 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
         drain_startup(stream)
         slot = f"wire_replication_v{proto_version}"
-        simple_query(stream, f"CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput")
+        simple_query(
+            stream,
+            f"CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+        )
         stream.sendall(
             frontend_message(
                 b"Q",

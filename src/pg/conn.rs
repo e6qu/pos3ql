@@ -2779,10 +2779,19 @@ fn parse_logical_replication_command(
             "only LOGICAL pgoutput replication slots are supported"
         ));
     }
-    if take_replication_word(&mut input).is_some() {
+    let snapshot = take_replication_word(&mut input);
+    if snapshot.is_none() {
         return Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "trailing CREATE_REPLICATION_SLOT input"
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "logical slot snapshot export is not supported; specify NOEXPORT_SNAPSHOT"
+        ));
+    }
+    if !snapshot.is_some_and(|value| value.eq_ignore_ascii_case("noexport_snapshot"))
+        || take_replication_word(&mut input).is_some()
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "only NOEXPORT_SNAPSHOT logical replication slots are supported"
         ));
     }
     Ok(LogicalReplicationCommand::CreateSlot {
@@ -3704,9 +3713,10 @@ mod tests {
 
     #[test]
     fn logical_slot_creation_command_is_strict_and_pgoutput_only() {
-        let command =
-            parse_logical_replication_command("CREATE_REPLICATION_SLOT changes LOGICAL pgoutput;")
-                .unwrap();
+        let command = parse_logical_replication_command(
+            "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput NOEXPORT_SNAPSHOT;",
+        )
+        .unwrap();
         let LogicalReplicationCommand::CreateSlot { name } = command else {
             panic!("expected CREATE_REPLICATION_SLOT")
         };
@@ -3726,6 +3736,10 @@ mod tests {
         );
         assert!(
             parse_logical_replication_command("CREATE_REPLICATION_SLOT bad/name LOGICAL pgoutput")
+                .is_err()
+        );
+        assert!(
+            parse_logical_replication_command("CREATE_REPLICATION_SLOT changes LOGICAL pgoutput")
                 .is_err()
         );
         let dropped = parse_logical_replication_command("DROP_REPLICATION_SLOT changes").unwrap();

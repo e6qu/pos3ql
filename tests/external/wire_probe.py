@@ -312,7 +312,10 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     stream = connect()
     stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
     drain_startup(stream)
-    simple_query(stream, "CREATE_REPLICATION_SLOT wire_replication_slot LOGICAL pgoutput")
+    simple_query(
+        stream,
+        "CREATE_REPLICATION_SLOT wire_replication_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+    )
     stream.sendall(
         frontend_message(
             b"Q",
@@ -376,6 +379,35 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     )
 
     stream.close()
+
+    # Versions 3 and 4 add optional in-progress / two-phase capabilities, but
+    # retain the ordinary committed-transaction message flow negotiated here.
+    for proto_version in (3, 4):
+        stream = connect()
+        stream.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+        drain_startup(stream)
+        slot = f"wire_replication_v{proto_version}"
+        simple_query(
+            stream,
+            f"CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+        )
+        stream.sendall(
+            frontend_message(
+                b"Q",
+                (
+                    f"START_REPLICATION SLOT {slot} LOGICAL 0/0 "
+                    f"(proto_version '{proto_version}', publication_names 'wire_replication_pub')"
+                ).encode()
+                + b"\x00",
+            )
+        )
+        kind, payload = read_message(stream)
+        check(
+            f"pgoutput protocol v{proto_version} enters CopyBoth",
+            kind == b"W",
+            (kind, payload),
+        )
+        stream.close()
     setup.close()
 
 

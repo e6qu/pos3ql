@@ -1743,7 +1743,7 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
             floor,
             &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1782,7 +1782,7 @@ fn logical_replication_unions_multiple_publications_on_sized_stack() {
                 crate::storage::SqlName::parse("right_changes").unwrap(),
             ],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1824,7 +1824,7 @@ fn logical_replication_selects_a_quoted_publication_name_on_sized_stack() {
             floor,
             &[crate::storage::SqlName::parse("sales, west").unwrap()],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1861,7 +1861,7 @@ fn logical_replication_declares_user_types_before_relations_on_sized_stack() {
             floor,
             &[crate::storage::SqlName::parse("typed_changes").unwrap()],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1908,7 +1908,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
             floor,
             &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1916,6 +1916,27 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
         .expect("slot acknowledgement transaction is retained");
     assert!(!emitted);
     assert!(send.is_empty());
+}
+
+#[test]
+fn rejected_slot_acknowledgement_does_not_reach_wal() {
+    let (mut engine, _) = test_engine();
+    let floor = engine
+        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .unwrap();
+    let durable_lsn = engine.replication_identity().1;
+
+    let error = engine
+        .advance_replication_slot("changes", floor - 1)
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
+    assert_eq!(engine.replication_identity().1, durable_lsn);
+
+    let error = engine
+        .advance_replication_slot("missing", floor)
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::UNDEFINED_OBJECT);
+    assert_eq!(engine.replication_identity().1, durable_lsn);
 }
 
 fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack() {
@@ -1938,7 +1959,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
             floor,
             &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
-            2,
+            crate::pg::pgoutput::ProtocolVersion::V2,
             &mut scratch,
             &mut Responder::new(&mut send),
         )
@@ -1960,7 +1981,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
             floor,
             &[crate::storage::SqlName::parse("changes").unwrap()],
             false,
-            1,
+            crate::pg::pgoutput::ProtocolVersion::V1,
             &mut v1_scratch,
             &mut Responder::new(&mut v1_send),
         )

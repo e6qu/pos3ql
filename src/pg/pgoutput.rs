@@ -9,6 +9,30 @@ use super::wire::MsgOut;
 use crate::sql::types::Datum;
 use crate::storage::ColumnMeta;
 
+/// A pgoutput protocol version accepted by PostgreSQL 18.
+///
+/// The value crosses the wire only after this parser boundary, so downstream
+/// encoders cannot accidentally receive an unsupported version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ProtocolVersion(u8);
+
+impl ProtocolVersion {
+    pub(crate) const V1: Self = Self(1);
+    pub(crate) const V2: Self = Self(2);
+    pub(crate) const V3: Self = Self(3);
+    pub(crate) const V4: Self = Self(4);
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "1" => Some(Self::V1),
+            "2" => Some(Self::V2),
+            "3" => Some(Self::V3),
+            "4" => Some(Self::V4),
+            _ => None,
+        }
+    }
+}
+
 /// Emits one replication `XLogData` envelope around a pgoutput message.
 pub fn xlog_data(
     message: &mut MsgOut,

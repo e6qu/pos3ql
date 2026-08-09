@@ -968,7 +968,6 @@ mod tests {
         c.object_store_endpoint = format!("127.0.0.1:{port}");
         c.object_store_namespace = "testnamespace".to_string();
         c.object_store_token = "test-token".to_string();
-        c.object_store_namespace = "testnamespace".to_string();
         c.object_store_head_bytes = 8192;
         c.object_store_response_bytes = 65536;
         c
@@ -1130,7 +1129,7 @@ mod tests {
     #[test]
     fn chunked_bodies_decode() {
         // Two data chunks (with an extension on the first size line), a zero
-        // chunk, and a trailer — the shape MinIO/GCS actually send.
+        // chunk, and a trailer — the portable HTTP framing clients must accept.
         let (port, server) = mock_server(
             "HTTP/1.1 200 OK\r\netag: \"chunked\"\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: t\r\n\r\n",
             |_| {},
@@ -1230,10 +1229,7 @@ mod tests {
 
     #[test]
     fn token_is_a_header_safe_startup_state() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut config = test_config(port);
+        let mut config = test_config(1);
         config.object_store_token = "good\r\nbad".to_string();
         let mut budget = Budget::new(1 << 20);
         assert!(matches!(
@@ -1244,10 +1240,7 @@ mod tests {
 
     #[test]
     fn namespace_is_a_nonempty_gateway_path_state() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut config = test_config(port);
+        let mut config = test_config(1);
         config.object_store_namespace.clear();
         let mut budget = Budget::new(1 << 20);
         assert!(matches!(

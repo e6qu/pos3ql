@@ -6035,14 +6035,14 @@ pub fn alter_routine(
                 role.as_str()
             ));
         }
-        if !superuser {
-            if let Err(error) = storage.require_schema_create_as(
+        if !superuser
+            && let Err(error) = storage.require_schema_create_as(
                 routine.schema_for(txn.txid).as_str(),
                 new_owner,
                 txn.txid,
-            ) {
-                return sql_fail(error);
-            }
+            )
+        {
+            return sql_fail(error);
         }
         let old_owner = storage.object_owner(object, txn.txid) as u16;
         let prior = storage.set_object_owner(object, new_owner, txn.txid);

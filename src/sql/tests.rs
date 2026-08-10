@@ -516,7 +516,7 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
 #[test]
 fn object_ownership_and_acl_enforce_and_replay() {
     let config = test_config("object-acl-wal-replay");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -563,7 +563,7 @@ fn object_ownership_and_acl_enforce_and_replay() {
     assert_eq!(data_rows(&output), ["app_reader"]);
     drop(engine);
 
-    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted_budget = Budget::new(1 << 29);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -706,7 +706,7 @@ fn create_role_membership_clauses_match_grant_role_state() {
 #[test]
 fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
     let config = test_config("role-view-acl-replay");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -767,7 +767,7 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
     );
     drop(engine);
 
-    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted_budget = Budget::new(1 << 29);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -5640,6 +5640,126 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let missing = run_with(&mut engine, &mut budget, "SELECT answer()");
     assert!(String::from_utf8_lossy(&missing).contains("42883"));
+}
+
+#[test]
+fn typed_routine_owner_changes_preserve_kind_and_overload_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE routine_lifecycle_owner;
+         GRANT CREATE ON SCHEMA public TO routine_lifecycle_owner;
+         CREATE FUNCTION routine_lifecycle(integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
+         CREATE PROCEDURE routine_lifecycle(text) LANGUAGE SQL AS 'SELECT 1';
+         ALTER FUNCTION routine_lifecycle(integer) OWNER TO routine_lifecycle_owner;
+         ALTER PROCEDURE routine_lifecycle(text) OWNER TO routine_lifecycle_owner;
+         ALTER ROUTINE routine_lifecycle(integer) OWNER TO postgres;
+         SELECT proname, prokind, pg_get_userbyid(proowner)
+           FROM pg_proc
+          WHERE proname = 'routine_lifecycle'
+          ORDER BY prokind;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "routine_lifecycle|f|postgres",
+            "routine_lifecycle|p|routine_lifecycle_owner"
+        ]
+    );
+    let mismatch = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_lifecycle(text) OWNER TO postgres",
+    );
+    assert!(String::from_utf8_lossy(&mismatch).contains("42883"));
+}
+
+#[test]
+fn routine_identity_changes_are_typed_transactional_and_durable() {
+    let mut config = test_config("routine-identity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-identity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA routine_target;
+         CREATE FUNCTION routine_lifecycle(integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1';
+         CREATE PROCEDURE routine_lifecycle(text) LANGUAGE SQL AS 'SELECT 1'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER ROUTINE routine_lifecycle(integer) RENAME TO routine_renamed;
+         ALTER PROCEDURE routine_lifecycle(text) SET SCHEMA routine_target;
+         SELECT proname, nspname FROM pg_proc JOIN pg_namespace ON pronamespace = pg_namespace.oid
+          WHERE proname IN ('routine_lifecycle', 'routine_renamed') ORDER BY proname, nspname;
+         ROLLBACK;
+         SELECT proname, nspname FROM pg_proc JOIN pg_namespace ON pronamespace = pg_namespace.oid
+          WHERE proname = 'routine_lifecycle' ORDER BY nspname;
+         ALTER FUNCTION routine_lifecycle(integer) RENAME TO routine_renamed;
+         ALTER PROCEDURE routine_lifecycle(text) SET SCHEMA routine_target;
+         SELECT routine_renamed(1);",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "routine_lifecycle|routine_target",
+            "routine_renamed|public",
+            "routine_lifecycle|public",
+            "routine_lifecycle|public",
+            "1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(String::from_utf8_lossy(&output).contains("ALTER ROUTINE"));
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT proname, nspname FROM pg_proc JOIN pg_namespace ON pronamespace = pg_namespace.oid
+         WHERE proname IN ('routine_lifecycle', 'routine_renamed') ORDER BY proname, nspname",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["routine_lifecycle|routine_target", "routine_renamed|public"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(restarted.checkpoint().unwrap());
+    drop(restarted);
+
+    let mut checkpoint_budget = Budget::new(1 << 29);
+    let mut checkpoint_restarted = Engine::new(&config, &mut checkpoint_budget).unwrap();
+    let output = run_with(
+        &mut checkpoint_restarted,
+        &mut checkpoint_budget,
+        "SELECT proname, nspname FROM pg_proc JOIN pg_namespace ON pronamespace = pg_namespace.oid
+         WHERE proname IN ('routine_lifecycle', 'routine_renamed') ORDER BY proname, nspname;
+         DROP ROUTINE routine_target.routine_lifecycle(text), routine_renamed(integer);
+         SELECT count(*) FROM pg_proc WHERE proname IN ('routine_lifecycle', 'routine_renamed');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "routine_lifecycle|routine_target",
+            "routine_renamed|public",
+            "0",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]

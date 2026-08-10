@@ -91,6 +91,7 @@ const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
 const KIND_DROP_ROUTINE: u8 = 46;
+const KIND_ALTER_ROUTINE_IDENTITY: u8 = 47;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -98,7 +99,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_ROUTINE;
+const LAST_KIND: u8 = KIND_ALTER_ROUTINE_IDENTITY;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -504,6 +505,13 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         argument_type_codes: &'a [u8],
+    },
+    AlterRoutineIdentity {
+        schema: &'a str,
+        name: &'a str,
+        argument_type_codes: &'a [u8],
+        new_schema: &'a str,
+        new_name: &'a str,
     },
     /// A `nextval`/`setval`/`RESTART` advance: the absolute value state, so
     /// replay is idempotent. Advances are non-transactional (they survive
@@ -1239,6 +1247,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
         WalOp::CreateRoutine(_) => KIND_CREATE_ROUTINE,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
+        WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
@@ -1507,6 +1516,23 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             argument_type_codes,
         } => 1 + name.len() + 1 + schema.len() + 1 + argument_type_codes.len(),
+        WalOp::AlterRoutineIdentity {
+            schema,
+            name,
+            argument_type_codes,
+            new_schema,
+            new_name,
+        } => {
+            1 + name.len()
+                + 1
+                + schema.len()
+                + 1
+                + argument_type_codes.len()
+                + 1
+                + new_schema.len()
+                + 1
+                + new_name.len()
+        }
         WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
         WalOp::Comment {
             schema, name, text, ..
@@ -1994,6 +2020,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && argument_type_codes.len() <= u8::MAX as usize
                 && buffer.append(&[argument_type_codes.len() as u8])
                 && buffer.append(argument_type_codes)
+        }
+        WalOp::AlterRoutineIdentity {
+            schema,
+            name,
+            argument_type_codes,
+            new_schema,
+            new_name,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && argument_type_codes.len() <= u8::MAX as usize
+                && buffer.append(&[argument_type_codes.len() as u8])
+                && buffer.append(argument_type_codes)
+                && name_bytes(buffer, new_schema)
+                && name_bytes(buffer, new_name)
         }
         WalOp::SequenceAdvance {
             schema,
@@ -3200,6 +3241,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
+                pending_identity: None,
                 arguments,
                 argument_count,
                 kind,
@@ -3225,6 +3267,23 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 argument_type_codes,
+            })
+        }
+        KIND_ALTER_ROUTINE_IDENTITY => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            let argument_type_codes = payload.get(at..at + count)?;
+            at += count;
+            let new_schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::AlterRoutineIdentity {
+                schema,
+                name,
+                argument_type_codes,
+                new_schema,
+                new_name,
             })
         }
         KIND_CREATE_SCHEMA => {
@@ -4043,12 +4102,23 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                17,
+                &WalOp::AlterRoutineIdentity {
+                    schema: "public",
+                    name: "routine",
+                    argument_type_codes: &[23],
+                    new_schema: "other",
+                    new_name: "renamed_routine",
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 16);
+        assert_eq!(seen.len(), 17);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -4111,10 +4181,15 @@ mod tests {
             "publication alter: {}",
             seen[13]
         );
-        assert_eq!(wal.last_lsn(), 16);
+        assert!(
+            seen[16].contains("AlterRoutineIdentity") && seen[16].contains("renamed_routine"),
+            "routine identity: {}",
+            seen[16]
+        );
+        assert_eq!(wal.last_lsn(), 17);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            17,
+            18,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

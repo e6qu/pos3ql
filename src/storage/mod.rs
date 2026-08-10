@@ -1817,6 +1817,7 @@ pub(crate) struct RoutineDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    pub(crate) pending_identity: Option<PendingRoutineIdentity>,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
     pub kind: RoutineKind,
@@ -1830,6 +1831,7 @@ impl RoutineDef {
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
+        pending_identity: None,
         arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         argument_count: 0,
         kind: RoutineKind::Function {
@@ -1847,6 +1849,25 @@ impl RoutineDef {
     pub(crate) fn arguments(&self) -> &[RoutineArgumentDef] {
         &self.arguments[..self.argument_count]
     }
+
+    pub(crate) fn schema_for(&self, txid: u32) -> SqlName {
+        self.pending_identity
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.schema, |pending| pending.schema)
+    }
+
+    pub(crate) fn name_for(&self, txid: u32) -> SqlName {
+        self.pending_identity
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingRoutineIdentity {
+    pub txid: u32,
+    pub schema: SqlName,
+    pub name: SqlName,
 }
 pub(crate) const MAX_DOMAIN_CHECKS: usize = 4;
 
@@ -3922,8 +3943,8 @@ impl Storage {
             }),
             AccessClass::Routine => self.routines.iter().position(|routine| {
                 routine.visible_to(txid)
-                    && routine.schema.as_str() == schema
-                    && routine.name.as_str() == name
+                    && routine.schema_for(txid).as_str() == schema
+                    && routine.name_for(txid).as_str() == name
             }),
         }?;
         u16::try_from(slot)
@@ -4857,7 +4878,7 @@ impl Storage {
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of function {}",
-            routine.name.as_str()
+            routine.name_for(txid).as_str()
         ))
     }
 
@@ -11592,8 +11613,8 @@ impl Storage {
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
                 && routine.kind.function_result().is_some()
-                && routine.schema.as_str() == schema
-                && routine.name.as_str() == name
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name
                 && routine.argument_count == argument_types.len()
                 && routine
                     .arguments()
@@ -11613,8 +11634,8 @@ impl Storage {
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
                 && matches!(routine.kind, RoutineKind::Procedure)
-                && routine.schema.as_str() == schema
-                && routine.name.as_str() == name
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name
                 && routine.argument_count == argument_types.len()
                 && routine
                     .arguments()
@@ -11633,8 +11654,8 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
-                && routine.schema.as_str() == schema
-                && routine.name.as_str() == name
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name
                 && routine.argument_count == argument_types.len()
                 && routine
                     .arguments()
@@ -11642,6 +11663,85 @@ impl Storage {
                     .zip(argument_types)
                     .all(|(argument, ctype)| argument.ctype == *ctype)
         })
+    }
+
+    pub(crate) fn alter_routine_identity(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingRoutineIdentity>, SqlError> {
+        let routine = self.routines[slot];
+        if let Some(pending) = routine.pending_identity
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, routine.name.as_str()));
+        }
+        if self.routines.iter().enumerate().any(|(other, candidate)| {
+            other != slot
+                && candidate.visible_to(txid)
+                && candidate.schema_for(txid) == schema
+                && candidate.name_for(txid) == name
+                && candidate.argument_count == routine.argument_count
+                && candidate
+                    .arguments()
+                    .iter()
+                    .zip(routine.arguments())
+                    .all(|(left, right)| left.ctype == right.ctype)
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "routine \"{}\" already exists with same argument types",
+                name.as_str()
+            ));
+        }
+        if let Some(blocker) = self
+            .routines
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then_some(candidate.pending_identity)
+                    .flatten()
+                    .filter(|pending| {
+                        pending.txid != txid
+                            && pending.schema == schema
+                            && pending.name == name
+                            && candidate.argument_count == routine.argument_count
+                            && candidate
+                                .arguments()
+                                .iter()
+                                .zip(routine.arguments())
+                                .all(|(left, right)| left.ctype == right.ctype)
+                    })
+                    .map(|pending| pending.txid)
+            })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let prior = self.routines[slot].pending_identity;
+        self.routines[slot].pending_identity = Some(PendingRoutineIdentity { txid, schema, name });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_routine_identity(&mut self, slot: usize, txid: u32) {
+        let routine = &mut self.routines[slot];
+        if let Some(pending) = routine.pending_identity
+            && pending.txid == txid
+        {
+            routine.schema = pending.schema;
+            routine.name = pending.name;
+            routine.pending_identity = None;
+        }
+    }
+
+    pub(crate) fn restore_routine_identity(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingRoutineIdentity>,
+    ) {
+        self.routines[slot].pending_identity = prior;
     }
 
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
@@ -11667,8 +11767,8 @@ impl Storage {
         } = spec;
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
-            (routine.schema == schema
-                && routine.name == name
+            (routine.schema_for(txid) == schema
+                && routine.name_for(txid) == name
                 && routine.argument_count == argument_count
                 && routine.arguments()[..argument_count]
                     .iter()
@@ -11681,8 +11781,8 @@ impl Storage {
         }
         if self.routines.iter().any(|routine| {
             routine.visible_to(txid)
-                && routine.schema == schema
-                && routine.name == name
+                && routine.schema_for(txid) == schema
+                && routine.name_for(txid) == name
                 && routine.argument_count == argument_count
                 && routine.arguments()[..argument_count]
                     .iter()
@@ -11724,6 +11824,7 @@ impl Storage {
             created_at,
             schema,
             name,
+            pending_identity: None,
             arguments,
             argument_count,
             kind,

@@ -308,8 +308,10 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
         | Stmt::CreateRoutine(_)
+        | Stmt::AlterRoutine { .. }
         | Stmt::DropFunction { .. }
         | Stmt::DropProcedure { .. }
+        | Stmt::DropRoutine { .. }
         | Stmt::DropView { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
@@ -1947,6 +1949,9 @@ impl Engine {
                     self.storage.commit_routine_create(*slot as usize, txn.txid)
                 }
                 DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
+                DdlUndo::RoutineIdentityAltered { slot, .. } => self
+                    .storage
+                    .commit_routine_identity(*slot as usize, txn.txid),
                 DdlUndo::PublicationCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_publication_create(slot);
@@ -2150,6 +2155,9 @@ impl Engine {
             DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
             DdlUndo::RoutineDropped(slot) => {
                 self.storage.rollback_routine_drop(slot as usize, txid)
+            }
+            DdlUndo::RoutineIdentityAltered { slot, prior } => {
+                self.storage.restore_routine_identity(slot as usize, prior)
             }
             DdlUndo::ViewDropped(slot) => {
                 self.storage.rollback_view_drop(slot as usize, txid);
@@ -4497,6 +4505,19 @@ impl Engine {
             Stmt::Call { name, arguments } => self.execute_call(
                 *name, arguments, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
+            Stmt::AlterRoutine {
+                kind,
+                routine,
+                action,
+            } => exec::alter_routine(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *kind,
+                routine,
+                *action,
+                responder,
+            ),
             Stmt::DropFunction {
                 functions,
                 if_exists,
@@ -4509,7 +4530,7 @@ impl Engine {
                     routines: functions,
                     if_exists: *if_exists,
                     cascade: *cascade,
-                    procedure: false,
+                    kind: crate::sql::ast::RoutineTargetKind::Function,
                 },
                 responder,
             ),
@@ -4525,7 +4546,23 @@ impl Engine {
                     routines: procedures,
                     if_exists: *if_exists,
                     cascade: *cascade,
-                    procedure: true,
+                    kind: crate::sql::ast::RoutineTargetKind::Procedure,
+                },
+                responder,
+            ),
+            Stmt::DropRoutine {
+                routines,
+                if_exists,
+                cascade,
+            } => exec::drop_routine(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::DropRoutineCommand {
+                    routines,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                    kind: crate::sql::ast::RoutineTargetKind::Either,
                 },
                 responder,
             ),
@@ -6287,6 +6324,52 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.drop_routine(slot, 0);
                 storage.commit_routine_drop(slot);
             }
+        }
+        WalOp::AlterRoutineIdentity {
+            schema,
+            name,
+            argument_type_codes,
+            new_schema,
+            new_name,
+        } => {
+            let mut argument_types =
+                [crate::sql::types::ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if argument_type_codes.len() > argument_types.len() {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "journal routine has too many arguments"
+                ));
+            }
+            for (index, code) in argument_type_codes.iter().enumerate() {
+                argument_types[index] =
+                    crate::sql::types::ColType::from_code(*code).ok_or_else(|| {
+                        sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                            "journal routine has invalid argument type"
+                        )
+                    })?;
+            }
+            let slot = storage
+                .routine_slot_by_signature(
+                    schema,
+                    name,
+                    &argument_types[..argument_type_codes.len()],
+                    0,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        crate::sql::eval::sqlstate::UNDEFINED_FUNCTION,
+                        "journal identity change for unknown routine \"{}\"",
+                        name
+                    )
+                })?;
+            storage.alter_routine_identity(
+                slot,
+                crate::storage::SqlName::parse(new_schema)?,
+                crate::storage::SqlName::parse(new_name)?,
+                0,
+            )?;
+            storage.commit_routine_identity(slot, 0);
         }
         WalOp::CreateEnum(def) => {
             // An ALTER ... ADD VALUE replays as a redefinition: redefine in

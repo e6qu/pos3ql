@@ -177,6 +177,19 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    DropRoutine {
+        routines: &'a [RoutineIdentity<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// The shared routine forms retain the written target kind; that makes a
+    /// function/procedure mismatch an explicit error rather than a name-only
+    /// lookup.
+    AlterRoutine {
+        kind: RoutineTargetKind,
+        routine: RoutineIdentity<'a>,
+        action: AlterRoutineAction<'a>,
+    },
     /// DROP VIEW [IF EXISTS] name.
     DropView {
         names: &'a [QualName<'a>],
@@ -574,6 +587,16 @@ pub enum RoutineTargetKind {
     Function,
     Procedure,
     Either,
+}
+
+impl RoutineTargetKind {
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+            Self::Either => "routine",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1174,13 @@ pub struct CreateRoutine<'a> {
 pub enum RoutineCreateKind<'a> {
     Function { result_type: &'a str },
     Procedure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterRoutineAction<'a> {
+    SetOwner(&'a str),
+    Rename(&'a str),
+    SetSchema(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

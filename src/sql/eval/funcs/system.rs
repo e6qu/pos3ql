@@ -4,8 +4,8 @@
 //! (`current_database`/`current_catalog`,
 //! `current_schema`/`current_schemas`, `current_user`/`session_user`/`user`,
 //! `pg_get_userbyid`), visibility and privilege predicates, the
-//! catalog-definition reconstructors (`pg_get_indexdef`/`pg_get_constraintdef`
-//! and the not-reconstructed `pg_get_expr`/`pg_get_viewdef`/… → NULL),
+//! catalog-definition reconstructors (`pg_get_indexdef`/`pg_get_constraintdef`,
+//! `pg_get_expr`, and `pg_get_viewdef`),
 //! partitioning identity (`pg_partition_ancestors`/`_root`/`_tree`),
 //! `format_type`, `pg_encoding_to_char`, and `pg_typeof`.
 

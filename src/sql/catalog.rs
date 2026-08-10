@@ -74,6 +74,13 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "column_domain_usage"
                 | "column_udt_usage"
                 | "domain_udt_usage"
+                | "collations"
+                | "collation_character_set_applicability"
+                | "applicable_roles"
+                | "administrable_role_authorizations"
+                | "enabled_roles"
+                | "column_privileges"
+                | "role_column_grants"
         ),
         Some(_) => false,
         None => matches!(
@@ -946,6 +953,17 @@ pub fn synthesize<'a>(
         (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
         (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
         (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
+        (true, "collations") => info_collations(arena),
+        (true, "collation_character_set_applicability") => {
+            info_collation_character_set_applicability(arena)
+        }
+        (true, "applicable_roles") => info_applicable_roles(storage, txid, arena, false),
+        (true, "administrable_role_authorizations") => {
+            info_applicable_roles(storage, txid, arena, true)
+        }
+        (true, "enabled_roles") => info_enabled_roles(storage, txid, arena),
+        (true, "column_privileges") => info_column_privileges(storage, txid, arena, true),
+        (true, "role_column_grants") => info_column_privileges(storage, txid, arena, false),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -6296,6 +6314,274 @@ fn info_relation_privileges<'a>(
     finish(definition, &output[..count], arena)
 }
 
+fn column_privilege_count(
+    storage: &Storage,
+    txid: u32,
+    object: crate::storage::AccessObject,
+    include_public: bool,
+) -> usize {
+    let visible_privileges = [
+        crate::storage::PrivilegeSet::SELECT,
+        crate::storage::PrivilegeSet::INSERT,
+        crate::storage::PrivilegeSet::UPDATE,
+        crate::storage::PrivilegeSet::REFERENCES,
+    ];
+    let owner = storage.object_owner(object, txid) as u16;
+    let mut count = storage.role_is_enabled(owner, txid) as usize * visible_privileges.len();
+    for (slot, entry) in storage.acl_entries() {
+        if entry.object != object {
+            continue;
+        }
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
+            || (!storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid))
+            || (grantee == owner && grantor == owner)
+        {
+            continue;
+        }
+        let (privileges, _) = storage.acl_state(slot, txid);
+        count += visible_privileges
+            .iter()
+            .filter(|privilege| privileges.contains(**privilege))
+            .count();
+    }
+    count
+}
+
+fn info_column_privileges<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    include_public: bool,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        if include_public {
+            "column_privileges"
+        } else {
+            "role_column_grants"
+        },
+        &[
+            ("grantor", ColType::Text),
+            ("grantee", ColType::Text),
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("column_name", ColType::Text),
+            ("privilege_type", ColType::Text),
+            ("is_grantable", ColType::Text),
+        ],
+    );
+    let mut output_count = 0usize;
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        let object = crate::storage::AccessObject {
+            class: match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
+                Some(_) => crate::storage::AccessClass::MaterializedView,
+                None => crate::storage::AccessClass::Table,
+            },
+            slot: storage
+                .matview_slot(table.schema.as_str(), table.name.as_str(), txid)
+                .unwrap_or(slot) as u16,
+        };
+        output_count = output_count
+            .checked_add(
+                table
+                    .columns()
+                    .len()
+                    .checked_mul(column_privilege_count(
+                        storage,
+                        txid,
+                        object,
+                        include_public,
+                    ))
+                    .ok_or_else(|| {
+                        catalog_capacity_exceeded("information_schema.column_privileges")
+                    })?,
+            )
+            .ok_or_else(|| catalog_capacity_exceeded("information_schema.column_privileges"))?;
+    }
+    for (view_slot, view) in storage.views_visible_to(txid) {
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let column_count = describe_view(storage, txid, view, arena, &mut columns)?;
+        output_count = output_count
+            .checked_add(
+                column_count
+                    .checked_mul(column_privilege_count(
+                        storage,
+                        txid,
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::View,
+                            slot: view_slot as u16,
+                        },
+                        include_public,
+                    ))
+                    .ok_or_else(|| {
+                        catalog_capacity_exceeded("information_schema.column_privileges")
+                    })?,
+            )
+            .ok_or_else(|| catalog_capacity_exceeded("information_schema.column_privileges"))?;
+    }
+    let output = arena
+        .alloc_slice_with(output_count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut append = |schema: &str,
+                      table: &str,
+                      column: &str,
+                      grantor: u16,
+                      grantee: u16,
+                      privileges: crate::storage::PrivilegeSet,
+                      grant_options: crate::storage::PrivilegeSet|
+     -> Result<(), SqlError> {
+        if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
+            || (!storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid))
+        {
+            return Ok(());
+        }
+        let grantor_name = storage.role_name(grantor as usize, txid);
+        let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
+            SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
+        } else {
+            storage.role_name(grantee as usize, txid)
+        };
+        for (privilege, privilege_name) in [
+            (crate::storage::PrivilegeSet::SELECT, "SELECT"),
+            (crate::storage::PrivilegeSet::INSERT, "INSERT"),
+            (crate::storage::PrivilegeSet::UPDATE, "UPDATE"),
+            (crate::storage::PrivilegeSet::REFERENCES, "REFERENCES"),
+        ] {
+            if !privileges.contains(privilege) {
+                continue;
+            }
+            debug_assert!(count < output.len());
+            output[count] = row(
+                &[
+                    text(grantor_name.as_str(), arena)?,
+                    text(grantee_name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(schema, arena)?,
+                    text(table, arena)?,
+                    text(column, arena)?,
+                    text(privilege_name, arena)?,
+                    text(
+                        if grant_options.contains(privilege) {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        arena,
+                    )?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+        Ok(())
+    };
+    let mut append_relation = |object: crate::storage::AccessObject,
+                               schema: &str,
+                               table: &str,
+                               columns: &[ColumnMeta]|
+     -> Result<(), SqlError> {
+        let owner = storage.object_owner(object, txid) as u16;
+        for column in columns {
+            append(
+                schema,
+                table,
+                column.name.as_str(),
+                owner,
+                owner,
+                crate::storage::PrivilegeSet::SELECT
+                    .union(crate::storage::PrivilegeSet::INSERT)
+                    .union(crate::storage::PrivilegeSet::UPDATE)
+                    .union(crate::storage::PrivilegeSet::REFERENCES),
+                crate::storage::PrivilegeSet::SELECT
+                    .union(crate::storage::PrivilegeSet::INSERT)
+                    .union(crate::storage::PrivilegeSet::UPDATE)
+                    .union(crate::storage::PrivilegeSet::REFERENCES),
+            )?;
+            for (slot, entry) in storage.acl_entries() {
+                if entry.object != object {
+                    continue;
+                }
+                let (grantee, grantor) = storage.acl_identity(slot, txid);
+                if grantee == owner && grantor == owner {
+                    continue;
+                }
+                let (privileges, grant_options) = storage.acl_state(slot, txid);
+                append(
+                    schema,
+                    table,
+                    column.name.as_str(),
+                    grantor,
+                    grantee,
+                    privileges,
+                    grant_options,
+                )?;
+            }
+        }
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        let object = match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
+            Some(matview_slot) => crate::storage::AccessObject {
+                class: crate::storage::AccessClass::MaterializedView,
+                slot: matview_slot as u16,
+            },
+            None => crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Table,
+                slot: slot as u16,
+            },
+        };
+        append_relation(
+            object,
+            table.schema.as_str(),
+            table.name.as_str(),
+            table.columns(),
+        )?;
+    }
+    for (slot, view) in storage.views_visible_to(txid) {
+        let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let description_count = describe_view(storage, txid, view, arena, &mut descriptions)?;
+        let mut columns = [ColumnMeta::EMPTY; super::exec::MAX_PROJ];
+        for (index, description) in descriptions[..description_count].iter().enumerate() {
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, description.type_oid)?;
+            columns[index] = ColumnMeta {
+                name: SqlName::parse(description.name)?,
+                ctype,
+                type_mod: description.type_mod,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type,
+            };
+        }
+        append_relation(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: slot as u16,
+            },
+            view.schema.as_str(),
+            view.name.as_str(),
+            &columns[..description_count],
+        )?;
+    }
+    debug_assert_eq!(count, output.len());
+    finish(definition, output, arena)
+}
+
 fn fk_action_name(action: crate::storage::FkAction) -> &'static str {
     match action {
         crate::storage::FkAction::NoAction => "NO ACTION",
@@ -6952,6 +7238,147 @@ fn info_schemata<'a>(
     )?;
     n += 1;
     finish(def, &out[..n], arena)
+}
+
+fn info_collations<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "collations",
+        &[
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("pad_attribute", ColType::Text),
+        ],
+    );
+    let names = ["default", "C", "POSIX", "ucs_basic"];
+    let mut output: [&[Datum]; 4] = [&[]; 4];
+    for (index, name) in names.iter().enumerate() {
+        output[index] = row(
+            &[
+                text("postgres", arena)?,
+                text("pg_catalog", arena)?,
+                text(name, arena)?,
+                text("NO PAD", arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &output, arena)
+}
+
+fn info_collation_character_set_applicability<'a>(
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "collation_character_set_applicability",
+        &[
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("character_set_catalog", ColType::Text),
+            ("character_set_schema", ColType::Text),
+            ("character_set_name", ColType::Text),
+        ],
+    );
+    let names = ["default", "C", "POSIX", "ucs_basic"];
+    let mut output: [&[Datum]; 4] = [&[]; 4];
+    for (index, name) in names.iter().enumerate() {
+        output[index] = row(
+            &[
+                text("postgres", arena)?,
+                text("pg_catalog", arena)?,
+                text(name, arena)?,
+                Datum::Null,
+                Datum::Null,
+                text("UTF8", arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &output, arena)
+}
+
+fn info_enabled_roles<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("enabled_roles", &[("role_name", ColType::Text)]);
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut count = 0;
+    for slot in 0..storage.role_count() {
+        if !storage.role(slot).visible_to(txid) || !storage.role_is_enabled(slot as u16, txid) {
+            continue;
+        }
+        output[count] = row(
+            &[text(storage.role_name(slot, txid).as_str(), arena)?],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_applicable_roles<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    administrators_only: bool,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        if administrators_only {
+            "administrable_role_authorizations"
+        } else {
+            "applicable_roles"
+        },
+        &[
+            ("grantee", ColType::Text),
+            ("role_name", ColType::Text),
+            ("is_grantable", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_ROLE_MEMBERSHIPS + 1] =
+        [&[]; crate::storage::MAX_ROLE_MEMBERSHIPS + 1];
+    let mut count = 0;
+    let mut append = |grantee: &str, role: &str, admin: bool| -> Result<(), SqlError> {
+        if administrators_only && !admin {
+            return Ok(());
+        }
+        if count == output.len() {
+            return Err(catalog_capacity_exceeded(
+                "information_schema.applicable_roles",
+            ));
+        }
+        output[count] = row(
+            &[
+                text(grantee, arena)?,
+                text(role, arena)?,
+                text(if admin { "YES" } else { "NO" }, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.role_membership_count() {
+        let membership = storage.role_membership(slot);
+        if !membership.visible_to(txid) || !storage.role_is_enabled(membership.member, txid) {
+            continue;
+        }
+        append(
+            storage.role_name(membership.member as usize, txid).as_str(),
+            storage.role_name(membership.role as usize, txid).as_str(),
+            membership.options_to(txid).admin,
+        )?;
+    }
+    if storage.role_count() > 0 && storage.role_is_enabled(0, txid) {
+        append(
+            storage.role_name(0, txid).as_str(),
+            "pg_database_owner",
+            false,
+        )?;
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn arena_full() -> SqlError {

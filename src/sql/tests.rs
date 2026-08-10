@@ -2670,6 +2670,141 @@ fn information_schema_column_udt_usage_is_not_silently_capped() {
 }
 
 #[test]
+fn information_schema_roles_collations_and_column_privileges_match_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE information_schema_parent; \
+         CREATE ROLE information_schema_member; \
+         GRANT information_schema_parent TO information_schema_member WITH ADMIN OPTION; \
+         CREATE ROLE information_schema_reader; \
+         CREATE TABLE information_schema_privileges (first integer, second text); \
+         GRANT SELECT ON information_schema_privileges TO information_schema_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT collation_name, pad_attribute FROM information_schema.collations \
+             WHERE collation_name IN ('C', 'POSIX', 'ucs_basic') ORDER BY collation_name",
+        )),
+        ["C|NO PAD", "POSIX|NO PAD", "ucs_basic|NO PAD"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT character_set_name FROM information_schema.collation_character_set_applicability \
+             WHERE collation_name = 'C'",
+        )),
+        ["UTF8"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, role_name, is_grantable \
+             FROM information_schema.applicable_roles \
+             WHERE role_name = 'information_schema_parent'",
+        )),
+        ["information_schema_member|information_schema_parent|YES"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, role_name FROM information_schema.administrable_role_authorizations \
+             WHERE role_name = 'information_schema_parent'",
+        )),
+        ["information_schema_member|information_schema_parent"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT role_name FROM information_schema.enabled_roles \
+             WHERE role_name IN ('information_schema_parent', 'information_schema_member') \
+             ORDER BY role_name",
+        )),
+        ["information_schema_member", "information_schema_parent"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, column_name, privilege_type, is_grantable \
+             FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_privileges' \
+               AND grantee = 'information_schema_reader' \
+             ORDER BY column_name, privilege_type",
+        )),
+        [
+            "information_schema_reader|first|SELECT|NO",
+            "information_schema_reader|second|SELECT|NO",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, column_name, privilege_type \
+             FROM information_schema.role_column_grants \
+             WHERE table_name = 'information_schema_privileges' \
+               AND grantee = 'information_schema_reader' \
+             ORDER BY column_name, privilege_type",
+        )),
+        [
+            "information_schema_reader|first|SELECT",
+            "information_schema_reader|second|SELECT",
+        ]
+    );
+}
+
+#[test]
+fn information_schema_column_privileges_follow_transactional_acl_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE information_schema_private_reader",
+    );
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE information_schema_private_privileges (value integer); \
+         GRANT SELECT ON information_schema_private_privileges \
+           TO information_schema_private_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT count(*) FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_private_privileges' \
+               AND grantee = 'information_schema_private_reader'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_private_privileges'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
 fn catalog_index_relations_are_not_silently_capped() {
     let mut config = test_config("catalog_index_relations_are_not_silently_capped");
     config.max_tables = 17;

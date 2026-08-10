@@ -2382,11 +2382,10 @@ pub(crate) enum AccessClass {
     Domain = 5,
     Enum = 6,
     Index = 7,
+    Routine = 8,
 }
 
-/// Object classes addressable by ALTER DEFAULT PRIVILEGES. Functions are
-/// retained even before user-defined function DDL exists: PostgreSQL stores
-/// their default ACL independently of any current function object.
+/// Object classes addressable by ALTER DEFAULT PRIVILEGES.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum DefaultPrivilegeClass {
@@ -2439,6 +2438,7 @@ impl AccessClass {
             5 => Self::Domain,
             6 => Self::Enum,
             7 => Self::Index,
+            8 => Self::Routine,
             _ => return None,
         })
     }
@@ -3797,6 +3797,7 @@ impl Storage {
             AccessClass::Domain => &self.domains[slot].ownership,
             AccessClass::Enum => &self.enums[slot].ownership,
             AccessClass::Index => &self.indexes[slot].ownership,
+            AccessClass::Routine => &self.routines[slot].ownership,
         }
     }
 
@@ -3811,6 +3812,7 @@ impl Storage {
             AccessClass::Domain => &mut self.domains[slot].ownership,
             AccessClass::Enum => &mut self.enums[slot].ownership,
             AccessClass::Index => &mut self.indexes[slot].ownership,
+            AccessClass::Routine => &mut self.routines[slot].ownership,
         }
     }
 
@@ -3876,6 +3878,11 @@ impl Storage {
                     && index.schema.as_str() == schema
                     && index.name.as_str() == name
             }),
+            AccessClass::Routine => self.routines.iter().position(|routine| {
+                routine.visible_to(txid)
+                    && routine.schema.as_str() == schema
+                    && routine.name.as_str() == name
+            }),
         }?;
         u16::try_from(slot)
             .ok()
@@ -3922,6 +3929,10 @@ impl Storage {
                 let definition = &self.indexes[slot];
                 (definition.schema, definition.name)
             }
+            AccessClass::Routine => {
+                let definition = &self.routines[slot];
+                (definition.schema, definition.name)
+            }
         }
     }
 
@@ -3938,6 +3949,7 @@ impl Storage {
             AccessClass::Domain => self.domains[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Enum => self.enums[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -3952,6 +3964,7 @@ impl Storage {
             AccessClass::Domain => self.domains[slot].visible_to(txid),
             AccessClass::Enum => self.enums[slot].visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
+            AccessClass::Routine => self.routines[slot].visible_to(txid),
         }
     }
 
@@ -3965,6 +3978,7 @@ impl Storage {
             AccessClass::Domain => self.domains.len(),
             AccessClass::Enum => self.enums.len(),
             AccessClass::Index => self.indexes.len(),
+            AccessClass::Routine => self.routines.len(),
         }
     }
 
@@ -3994,6 +4008,7 @@ impl Storage {
             (AccessClass::Domain, self.domains.len()),
             (AccessClass::Enum, self.enums.len()),
             (AccessClass::Index, self.indexes.len()),
+            (AccessClass::Routine, self.routines.len()),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -4507,8 +4522,10 @@ impl Storage {
                     })
                     && entry.grantee == PUBLIC_ROLE
                     && entry.grantor == 0)
-                || (matches!(entry.object.class, AccessClass::Domain | AccessClass::Enum)
-                    && entry.object.slot != u16::MAX
+                || (matches!(
+                    entry.object.class,
+                    AccessClass::Domain | AccessClass::Enum | AccessClass::Routine
+                ) && entry.object.slot != u16::MAX
                     && entry.grantee == PUBLIC_ROLE)
         })
     }
@@ -4597,13 +4614,12 @@ impl Storage {
             let (_, grantee, _, _, _) = Self::acl_visible(entry, txid);
             entry.object == object && grantee == PUBLIC_ROLE && entry.object.slot != u16::MAX
         });
-        let mut effective = if matches!(object.class, AccessClass::Domain | AccessClass::Enum)
-            && !public_acl_defined
-        {
-            // PostgreSQL's acldefault() grants USAGE on newly created types to
-            // PUBLIC. Absence means that default; an explicit zero ACL entry
-            // is the durable tombstone created by REVOKE.
-            PrivilegeSet::USAGE
+        let mut effective = if !public_acl_defined {
+            match object.class {
+                AccessClass::Domain | AccessClass::Enum => PrivilegeSet::USAGE,
+                AccessClass::Routine => PrivilegeSet::EXECUTE,
+                _ => PrivilegeSet::NONE,
+            }
         } else {
             self.acl_to(object, PUBLIC_ROLE, txid).0
         };
@@ -4800,6 +4816,27 @@ impl Storage {
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of function {}",
             routine.name.as_str()
+        ))
+    }
+
+    pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = Self::routine_access_object(slot);
+        if self.has_object_privilege(object, role, PrivilegeSet::EXECUTE, txid) {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for function {}",
+            self.routine(slot).name.as_str()
         ))
     }
 
@@ -11477,12 +11514,12 @@ impl Storage {
             .position(|routine| routine.visible_to(txid) && routine_oid(routine) == oid)
     }
 
-    pub(crate) fn routine_for_call(
+    pub(crate) fn routine_slot_for_call(
         &self,
         name: &str,
         arguments: &[crate::sql::types::Datum<'_>],
         txid: u32,
-    ) -> Option<&RoutineDef> {
+    ) -> Option<usize> {
         let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
         if arguments.len() > argument_types.len() {
             return None;
@@ -11490,7 +11527,7 @@ impl Storage {
         for (slot, argument) in arguments.iter().enumerate() {
             argument_types[slot] = crate::sql::exec::coltype_of_oid_pub(argument.type_oid())?;
         }
-        self.routine_for_call_types(name, &argument_types[..arguments.len()], txid)
+        self.routine_slot_for_call_types(name, &argument_types[..arguments.len()], txid)
     }
 
     pub(crate) fn routine_for_call_types(
@@ -11499,8 +11536,18 @@ impl Storage {
         argument_types: &[ColType],
         txid: u32,
     ) -> Option<&RoutineDef> {
+        self.routine_slot_for_call_types(name, argument_types, txid)
+            .map(|slot| &self.routines[slot])
+    }
+
+    pub(crate) fn routine_slot_for_call_types(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<usize> {
         let (schema, name) = name.split_once('.').unwrap_or(("public", name));
-        self.routines.iter().find(|routine| {
+        self.routines.iter().position(|routine| {
             routine.visible_to(txid)
                 && routine.schema.as_str() == schema
                 && routine.name.as_str() == name
@@ -11531,6 +11578,13 @@ impl Storage {
                     .zip(argument_types)
                     .all(|(argument, ctype)| argument.ctype == *ctype)
         })
+    }
+
+    pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
+        AccessObject {
+            class: AccessClass::Routine,
+            slot: slot as u16,
+        }
     }
 
     pub(crate) fn create_routine(
@@ -11588,6 +11642,7 @@ impl Storage {
                 self.routines.len()
             ));
         };
+        self.clear_object_acl_entries(Self::routine_access_object(slot));
         let (created_at, ownership) = match identity {
             RoutineIdentity::Allocate => {
                 self.catalog_seq += 1;
@@ -11636,6 +11691,7 @@ impl Storage {
 
     pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
+        self.clear_object_acl_entries(Self::routine_access_object(slot));
     }
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {

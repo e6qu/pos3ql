@@ -1220,6 +1220,7 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          CREATE SCHEMA owned_space AUTHORIZATION owned_source;
          SET ROLE owned_source;
          CREATE TABLE public.owned_table (id int);
+         CREATE FUNCTION public.owned_routine() RETURNS integer LANGUAGE SQL AS 'SELECT 9';
          CREATE TYPE public.owned_type AS ENUM ('ready');
          REVOKE USAGE ON TYPE public.owned_type FROM PUBLIC;
          RESET ROLE;",
@@ -1232,6 +1233,7 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          SELECT tableowner FROM pg_tables WHERE tablename = 'owned_table';
          SELECT nspname, pg_get_userbyid(nspowner)
            FROM pg_namespace WHERE nspname = 'owned_space';
+         SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'owned_routine';
          SELECT relacl::text FROM pg_class WHERE relname = 'owned_table';
          SELECT typacl::text FROM pg_type WHERE typname = 'owned_type';
          DROP OWNED BY owned_source;
@@ -1239,7 +1241,8 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          SELECT count(*) FROM pg_default_acl;
          DROP OWNED BY owned_target CASCADE;
          DROP ROLE owned_target;
-         SELECT count(*) FROM pg_tables WHERE tablename = 'owned_table';",
+         SELECT count(*) FROM pg_tables WHERE tablename = 'owned_table';
+         SELECT count(*) FROM pg_proc WHERE proname = 'owned_routine';",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -1251,8 +1254,10 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
         [
             "owned_target",
             "owned_space|owned_target",
+            "owned_target",
             "{owned_target=arwdDxtm/owned_target}",
             "{owned_target=U/owned_target}",
+            "0",
             "0",
             "0",
         ],
@@ -5635,6 +5640,168 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let missing = run_with(&mut engine, &mut budget, "SELECT answer()");
     assert!(String::from_utf8_lossy(&missing).contains("42883"));
+}
+
+#[test]
+fn routine_acls_are_signature_typed_enforced_and_durable() {
+    let config = test_config("routine_acls");
+    {
+        let mut budget = Budget::new(1 << 28);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE routine_acl_owner;
+             CREATE ROLE routine_acl_reader;
+             CREATE ROLE routine_acl_other;
+             GRANT CREATE ON SCHEMA public TO routine_acl_owner;
+             SET ROLE routine_acl_owner;
+             ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+             ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO routine_acl_reader;
+             CREATE FUNCTION protected_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
+             CREATE FUNCTION protected_answer(integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
+             RESET ROLE;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let denied = run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE routine_acl_other; SELECT protected_answer(); RESET ROLE;",
+        );
+        assert!(
+            String::from_utf8_lossy(&denied).contains("42501"),
+            "{}",
+            String::from_utf8_lossy(&denied)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SET ROLE routine_acl_reader;
+                 SELECT protected_answer(), protected_answer(41),
+                        has_function_privilege('protected_answer()', 'EXECUTE');
+                 RESET ROLE;",
+            )),
+            ["42|42|t"]
+        );
+        let granted = run_with(
+            &mut engine,
+            &mut budget,
+            "GRANT EXECUTE ON FUNCTION protected_answer() TO routine_acl_other;
+             SET ROLE routine_acl_other;
+             SELECT protected_answer(), has_function_privilege('protected_answer()', 'EXECUTE');
+             RESET ROLE;",
+        );
+        assert_eq!(data_rows(&granted), ["42|t"]);
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT grantor, grantee, routine_name, privilege_type, is_grantable
+                   FROM information_schema.routine_privileges
+                  WHERE routine_name = 'protected_answer' AND grantee = 'routine_acl_other';",
+            )),
+            ["routine_acl_owner|routine_acl_other|protected_answer|EXECUTE|NO"]
+        );
+        let preserved = run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE routine_acl_owner;
+             CREATE OR REPLACE FUNCTION protected_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 43';
+             RESET ROLE;
+             SET ROLE routine_acl_other;
+             SELECT protected_answer();
+             RESET ROLE;
+             SELECT proacl::text FROM pg_proc
+              WHERE proname = 'protected_answer' AND pronargs = 0;",
+        );
+        assert_eq!(
+            data_rows(&preserved),
+            [
+                "43",
+                "{routine_acl_owner=X/routine_acl_owner,routine_acl_reader=X/routine_acl_owner,routine_acl_other=X/routine_acl_owner}"
+            ],
+            "{}",
+            String::from_utf8_lossy(&preserved)
+        );
+        let all_functions = run_with(
+            &mut engine,
+            &mut budget,
+            "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM routine_acl_reader;
+             SELECT has_function_privilege('routine_acl_reader', 'protected_answer()', 'EXECUTE'),
+                    has_function_privilege('routine_acl_reader', 'protected_answer(integer)', 'EXECUTE');",
+        );
+        assert_eq!(data_rows(&all_functions), ["f|f"]);
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE routine_acl_other; SELECT protected_answer(); RESET ROLE;",
+        )),
+        ["43"]
+    );
+}
+
+#[test]
+fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("routine-acl-checkpoint-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("routine-acl-checkpoint-{}-{sequence}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE checkpoint_owner;
+             CREATE ROLE checkpoint_reader;
+             GRANT CREATE ON SCHEMA public TO checkpoint_owner;
+             SET ROLE checkpoint_owner;
+             ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+             CREATE FUNCTION checkpoint_overload() RETURNS integer LANGUAGE SQL AS 'SELECT 7';
+             CREATE FUNCTION checkpoint_overload(integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
+             RESET ROLE;
+             GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE checkpoint_reader;
+             SELECT checkpoint_overload();
+             RESET ROLE;
+             SELECT has_function_privilege('checkpoint_reader', 'checkpoint_overload(integer)', 'EXECUTE');",
+        )),
+        ["7", "f"]
+    );
 }
 
 #[test]

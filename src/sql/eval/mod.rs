@@ -460,6 +460,14 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    fn has_function_privilege(
+        &self,
+        _role: Option<&str>,
+        _function: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     fn has_database_privilege(
         &self,
         _role: Option<&str>,

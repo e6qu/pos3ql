@@ -1603,6 +1603,39 @@ fn rewrite_object_acl_owner(
     Ok(())
 }
 
+fn preserve_object_acl(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    old_object: crate::storage::AccessObject,
+    new_object: crate::storage::AccessObject,
+) -> Result<(), SqlError> {
+    let acl_count = storage.acl_entries().count();
+    for acl_slot in 0..acl_count {
+        let entry = *storage.acl_entry(acl_slot);
+        if entry.object != old_object {
+            continue;
+        }
+        let (grantee, grantor) = storage.acl_identity(acl_slot, txn.txid);
+        let (privileges, grant_options) = storage.acl_state(acl_slot, txn.txid);
+        let (changed, prior) = storage.change_acl(
+            new_object,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+            txn.txid,
+        )?;
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+            slot: changed as u32,
+            prior,
+        }) {
+            storage.restore_acl_pending(changed, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub fn alter_owner(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -2751,6 +2784,7 @@ fn privilege_mask(
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
         AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
+        AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
     };
     let mut result = PrivilegeSet::NONE;
     for privilege in privileges {
@@ -3010,6 +3044,7 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Schema => DefaultPrivilegeClass::Schema,
         AccessClass::Domain | AccessClass::Enum => DefaultPrivilegeClass::Type,
         AccessClass::Index => return Ok(()),
+        AccessClass::Routine => DefaultPrivilegeClass::Function,
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -3165,6 +3200,7 @@ pub fn reassign_owned(
         AccessClass::Domain,
         AccessClass::Enum,
         AccessClass::Index,
+        AccessClass::Routine,
     ];
     let mut changes = 0usize;
     for class in classes {
@@ -3691,6 +3727,37 @@ pub fn drop_owned(
         }
     }
 
+    for slot in (0..storage.access_class_slots(AccessClass::Routine)).rev() {
+        let object = Storage::routine_access_object(slot);
+        if !storage.access_object_visible_to(object, txn.txid)
+            || !owned_roles.contains(&(storage.object_owner(object, txn.txid) as u16))
+        {
+            continue;
+        }
+        let routine = *storage.routine(slot);
+        let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            type_codes[index] = argument.ctype.code();
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRoutine {
+                schema: routine.schema.as_str(),
+                name: routine.name.as_str(),
+                argument_type_codes: &type_codes[..routine.argument_count],
+            },
+        ) {
+            return sql_fail(error);
+        }
+        storage.drop_routine(slot, txn.txid);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
+            storage.rollback_routine_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+
     if !cascade {
         for (slot, selected) in schemas
             .iter()
@@ -3761,153 +3828,73 @@ fn resolve_privilege_objects(
     txid: u32,
     objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::PrivilegeObjectKind;
+    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
-    for name in target.names {
-        match target.kind {
-            PrivilegeObjectKind::Table => {
-                let object = match storage.resolve_relation(name.schema, name.name, txid) {
-                    Some(crate::storage::ResolvedRelation::Table(slot)) => {
-                        let definition = storage.table_def(slot, txid);
-                        match storage.matview_slot(
-                            definition.schema.as_str(),
-                            definition.name.as_str(),
-                            txid,
-                        ) {
-                            Some(matview) => AccessObject {
-                                class: AccessClass::MaterializedView,
-                                slot: matview as u16,
-                            },
-                            None => AccessObject {
-                                class: AccessClass::Table,
-                                slot: slot as u16,
-                            },
-                        }
-                    }
-                    Some(crate::storage::ResolvedRelation::View(slot)) => AccessObject {
-                        class: AccessClass::View,
-                        slot: slot as u16,
-                    },
-                    _ => return Err(undefined_qual(name)),
-                };
-                add_privilege_object(objects, &mut count, object)?;
-            }
-            PrivilegeObjectKind::Sequence => {
-                let Some(slot) = resolve_sequence(storage, name, txid)? else {
-                    return Err(undefined_kind("sequence", name.name));
-                };
-                add_privilege_object(
-                    objects,
-                    &mut count,
-                    AccessObject {
-                        class: AccessClass::Sequence,
-                        slot: slot as u16,
-                    },
-                )?;
-            }
-            PrivilegeObjectKind::Schema => {
-                let Some(slot) = storage.find_schema_visible(name.name, txid) else {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_SCHEMA_NAME,
-                        "schema \"{}\" does not exist",
-                        name.name
-                    ));
-                };
-                add_privilege_object(
-                    objects,
-                    &mut count,
-                    AccessObject {
-                        class: AccessClass::Schema,
-                        slot: slot as u16,
-                    },
-                )?;
-            }
-            PrivilegeObjectKind::Type => {
-                let domain = match name.schema {
-                    Some(schema) => storage.domain_slot(schema, name.name, txid),
-                    None => storage.resolve_domain_slot(name.name, txid),
-                };
-                let enumeration = match name.schema {
-                    Some(schema) => storage.enum_slot(schema, name.name, txid),
-                    None => storage.resolve_enum_slot(name.name, txid),
-                };
-                let object = domain
-                    .map(|slot| AccessObject {
-                        class: AccessClass::Domain,
-                        slot: slot as u16,
-                    })
-                    .or_else(|| {
-                        enumeration.map(|slot| AccessObject {
-                            class: AccessClass::Enum,
-                            slot: slot as u16,
-                        })
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
+    match target {
+        PrivilegeTarget::Functions(functions) => {
+            for identity in functions {
+                let schema = identity.name.schema.unwrap_or("public");
+                let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+                for (index, type_name) in identity.argument_types.iter().enumerate() {
+                    let Some(ctype) = ColType::from_sql_name(type_name) else {
+                        return Err(sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
                             "type \"{}\" does not exist",
-                            name.name
-                        )
-                    })?;
-                add_privilege_object(objects, &mut count, object)?;
-            }
-            PrivilegeObjectKind::AllTablesInSchema => {
-                let schema = name.name;
-                if storage.find_schema_visible(schema, txid).is_none() {
+                            type_name
+                        ));
+                    };
+                    argument_types[index] = ctype;
+                }
+                let Some(slot) = storage.routine_slot_by_signature(
+                    schema,
+                    identity.name.name,
+                    &argument_types[..identity.argument_types.len()],
+                    txid,
+                ) else {
                     return Err(sql_err!(
-                        sqlstate::INVALID_SCHEMA_NAME,
-                        "schema \"{}\" does not exist",
-                        schema
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function \"{}\" does not exist",
+                        identity.name.name
                     ));
-                }
-                for slot in 0..storage.table_count() {
-                    if !storage.table(slot).visible_to(txid) {
-                        continue;
-                    }
-                    let definition = storage.table_def(slot, txid);
-                    if definition.schema.as_str() != schema {
-                        continue;
-                    }
-                    let object = storage
-                        .matview_slot(schema, definition.name.as_str(), txid)
-                        .map_or(
-                            AccessObject {
-                                class: AccessClass::Table,
-                                slot: slot as u16,
-                            },
-                            |matview| AccessObject {
-                                class: AccessClass::MaterializedView,
-                                slot: matview as u16,
-                            },
-                        );
-                    add_privilege_object(objects, &mut count, object)?;
-                }
-                for (slot, view) in storage.views_with_slots() {
-                    if view.visible_to(txid) && view.schema.as_str() == schema {
-                        add_privilege_object(
-                            objects,
-                            &mut count,
-                            AccessObject {
+                };
+                add_privilege_object(objects, &mut count, Storage::routine_access_object(slot))?;
+            }
+        }
+        PrivilegeTarget::Objects { kind, names } => {
+            for name in names {
+                match kind {
+                    PrivilegeObjectKind::Table => {
+                        let object = match storage.resolve_relation(name.schema, name.name, txid) {
+                            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                                let definition = storage.table_def(slot, txid);
+                                match storage.matview_slot(
+                                    definition.schema.as_str(),
+                                    definition.name.as_str(),
+                                    txid,
+                                ) {
+                                    Some(matview) => AccessObject {
+                                        class: AccessClass::MaterializedView,
+                                        slot: matview as u16,
+                                    },
+                                    None => AccessObject {
+                                        class: AccessClass::Table,
+                                        slot: slot as u16,
+                                    },
+                                }
+                            }
+                            Some(crate::storage::ResolvedRelation::View(slot)) => AccessObject {
                                 class: AccessClass::View,
                                 slot: slot as u16,
                             },
-                        )?;
+                            _ => return Err(undefined_qual(name)),
+                        };
+                        add_privilege_object(objects, &mut count, object)?;
                     }
-                }
-            }
-            PrivilegeObjectKind::AllSequencesInSchema => {
-                let schema = name.name;
-                if storage.find_schema_visible(schema, txid).is_none() {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_SCHEMA_NAME,
-                        "schema \"{}\" does not exist",
-                        schema
-                    ));
-                }
-                for slot in 0..storage.sequence_count() {
-                    let sequence = storage.sequence_for(slot, txid);
-                    if sequence.visible_to(txid) && sequence.schema.as_str() == schema {
+                    PrivilegeObjectKind::Sequence => {
+                        let Some(slot) = resolve_sequence(storage, name, txid)? else {
+                            return Err(undefined_kind("sequence", name.name));
+                        };
                         add_privilege_object(
                             objects,
                             &mut count,
@@ -3916,6 +3903,139 @@ fn resolve_privilege_objects(
                                 slot: slot as u16,
                             },
                         )?;
+                    }
+                    PrivilegeObjectKind::Schema => {
+                        let Some(slot) = storage.find_schema_visible(name.name, txid) else {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_SCHEMA_NAME,
+                                "schema \"{}\" does not exist",
+                                name.name
+                            ));
+                        };
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::Schema,
+                                slot: slot as u16,
+                            },
+                        )?;
+                    }
+                    PrivilegeObjectKind::Type => {
+                        let domain = match name.schema {
+                            Some(schema) => storage.domain_slot(schema, name.name, txid),
+                            None => storage.resolve_domain_slot(name.name, txid),
+                        };
+                        let enumeration = match name.schema {
+                            Some(schema) => storage.enum_slot(schema, name.name, txid),
+                            None => storage.resolve_enum_slot(name.name, txid),
+                        };
+                        let object = domain
+                            .map(|slot| AccessObject {
+                                class: AccessClass::Domain,
+                                slot: slot as u16,
+                            })
+                            .or_else(|| {
+                                enumeration.map(|slot| AccessObject {
+                                    class: AccessClass::Enum,
+                                    slot: slot as u16,
+                                })
+                            })
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "type \"{}\" does not exist",
+                                    name.name
+                                )
+                            })?;
+                        add_privilege_object(objects, &mut count, object)?;
+                    }
+                    PrivilegeObjectKind::AllTablesInSchema => {
+                        let schema = name.name;
+                        if storage.find_schema_visible(schema, txid).is_none() {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_SCHEMA_NAME,
+                                "schema \"{}\" does not exist",
+                                schema
+                            ));
+                        }
+                        for slot in 0..storage.table_count() {
+                            if !storage.table(slot).visible_to(txid) {
+                                continue;
+                            }
+                            let definition = storage.table_def(slot, txid);
+                            if definition.schema.as_str() != schema {
+                                continue;
+                            }
+                            let object = storage
+                                .matview_slot(schema, definition.name.as_str(), txid)
+                                .map_or(
+                                    AccessObject {
+                                        class: AccessClass::Table,
+                                        slot: slot as u16,
+                                    },
+                                    |matview| AccessObject {
+                                        class: AccessClass::MaterializedView,
+                                        slot: matview as u16,
+                                    },
+                                );
+                            add_privilege_object(objects, &mut count, object)?;
+                        }
+                        for (slot, view) in storage.views_with_slots() {
+                            if view.visible_to(txid) && view.schema.as_str() == schema {
+                                add_privilege_object(
+                                    objects,
+                                    &mut count,
+                                    AccessObject {
+                                        class: AccessClass::View,
+                                        slot: slot as u16,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                    PrivilegeObjectKind::AllSequencesInSchema => {
+                        let schema = name.name;
+                        if storage.find_schema_visible(schema, txid).is_none() {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_SCHEMA_NAME,
+                                "schema \"{}\" does not exist",
+                                schema
+                            ));
+                        }
+                        for slot in 0..storage.sequence_count() {
+                            let sequence = storage.sequence_for(slot, txid);
+                            if sequence.visible_to(txid) && sequence.schema.as_str() == schema {
+                                add_privilege_object(
+                                    objects,
+                                    &mut count,
+                                    AccessObject {
+                                        class: AccessClass::Sequence,
+                                        slot: slot as u16,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                    PrivilegeObjectKind::AllFunctionsInSchema => {
+                        let schema = name.name;
+                        if storage.find_schema_visible(schema, txid).is_none() {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_SCHEMA_NAME,
+                                "schema \"{}\" does not exist",
+                                schema
+                            ));
+                        }
+                        for slot in 0..storage.routine_count() {
+                            let routine = storage.routine(slot);
+                            if routine.visible_to(txid) && routine.schema.as_str() == schema {
+                                add_privilege_object(
+                                    objects,
+                                    &mut count,
+                                    Storage::routine_access_object(slot),
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -5774,6 +5894,15 @@ pub fn create_function(
         storage.rollback_routine_drop(replaced_slot, txn.txid);
         return sql_fail(error);
     }
+    let new_object = Storage::routine_access_object(slot);
+    if let Some(replaced_slot) = replaced {
+        let old_object = Storage::routine_access_object(replaced_slot);
+        if let Err(error) = preserve_object_acl(storage, txn, old_object, new_object) {
+            return sql_fail(error);
+        }
+    } else if let Err(error) = apply_default_privileges_to_new_object(storage, txn, new_object) {
+        return sql_fail(error);
+    }
     responder.command_complete("CREATE FUNCTION")?;
     sql_ok()
 }
@@ -5954,32 +6083,8 @@ pub fn create_view(
                 };
                 let owner = storage.object_owner(old_object, txn.txid);
                 storage.set_object_owner(new_object, owner, txn.txid);
-                let acl_count = storage.acl_entries().count();
-                for acl_slot in 0..acl_count {
-                    let entry = *storage.acl_entry(acl_slot);
-                    if entry.object != old_object {
-                        continue;
-                    }
-                    let (grantee, grantor) = storage.acl_identity(acl_slot, txn.txid);
-                    let (privileges, grant_options) = storage.acl_state(acl_slot, txn.txid);
-                    let (changed, prior) = match storage.change_acl(
-                        new_object,
-                        grantee,
-                        grantor,
-                        privileges,
-                        grant_options,
-                        txn.txid,
-                    ) {
-                        Ok(change) => change,
-                        Err(error) => return sql_fail(error),
-                    };
-                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-                        slot: changed as u32,
-                        prior,
-                    }) {
-                        storage.restore_acl_pending(changed, prior);
-                        return sql_fail(error);
-                    }
+                if let Err(error) = preserve_object_acl(storage, txn, old_object, new_object) {
+                    return sql_fail(error);
                 }
             } else if let Err(error) =
                 apply_default_privileges_to_new_object(storage, txn, new_object)

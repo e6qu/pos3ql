@@ -541,12 +541,18 @@ pub enum PrivilegeObjectKind {
     Type,
     AllTablesInSchema,
     AllSequencesInSchema,
+    AllFunctionsInSchema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrivilegeTarget<'a> {
-    pub kind: PrivilegeObjectKind,
-    pub names: &'a [QualName<'a>],
+pub enum PrivilegeTarget<'a> {
+    Objects {
+        kind: PrivilegeObjectKind,
+        names: &'a [QualName<'a>],
+    },
+    /// Function privilege targets include argument types. A function name is
+    /// not an identity because overloads may share it.
+    Functions(&'a [RoutineIdentity<'a>]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

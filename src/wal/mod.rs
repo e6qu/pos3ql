@@ -552,12 +552,16 @@ pub(crate) enum WalOp<'a> {
     },
     SetObjectOwner {
         class: u8,
+        /// Stable identity for overloaded routines; zero for name-unique classes.
+        object_oid: i32,
         schema: &'a str,
         name: &'a str,
         owner: &'a str,
     },
     SetObjectAcl {
         class: u8,
+        /// Stable identity for overloaded routines; zero for name-unique classes.
+        object_oid: i32,
         schema: &'a str,
         name: &'a str,
         grantee: &'a str,
@@ -1523,18 +1527,39 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
         WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
         WalOp::SetObjectOwner {
+            class,
             schema,
             name,
             owner,
             ..
-        } => 1 + 1 + schema.len() + 1 + name.len() + 1 + owner.len(),
+        } => {
+            1 + usize::from(*class == crate::storage::AccessClass::Routine as u8) * 4
+                + 1
+                + schema.len()
+                + 1
+                + name.len()
+                + 1
+                + owner.len()
+        }
         WalOp::SetObjectAcl {
+            class,
             schema,
             name,
             grantee,
             grantor,
             ..
-        } => 1 + 1 + schema.len() + 1 + name.len() + 1 + grantee.len() + 1 + grantor.len() + 4,
+        } => {
+            1 + usize::from(*class == crate::storage::AccessClass::Routine as u8) * 4
+                + 1
+                + schema.len()
+                + 1
+                + name.len()
+                + 1
+                + grantee.len()
+                + 1
+                + grantor.len()
+                + 4
+        }
         WalOp::SetDefaultAcl {
             owner,
             schema,
@@ -2037,17 +2062,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::SetObjectOwner {
             class,
+            object_oid,
             schema,
             name,
             owner,
         } => {
             buffer.append(&[*class])
+                && (*class != crate::storage::AccessClass::Routine as u8
+                    || buffer.append(&object_oid.to_le_bytes()))
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, owner)
         }
         WalOp::SetObjectAcl {
             class,
+            object_oid,
             schema,
             name,
             grantee,
@@ -2056,6 +2085,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             grant_options,
         } => {
             buffer.append(&[*class])
+                && (*class != crate::storage::AccessClass::Routine as u8
+                    || buffer.append(&object_oid.to_le_bytes()))
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, grantee)
@@ -3304,11 +3335,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = *payload.get(at)?;
             at += 1;
             crate::storage::AccessClass::from_u8(class)?;
+            let object_oid = if class == crate::storage::AccessClass::Routine as u8 {
+                let object_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                object_oid
+            } else {
+                0
+            };
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let owner = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::SetObjectOwner {
                 class,
+                object_oid,
                 schema,
                 name,
                 owner,
@@ -3318,6 +3357,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = *payload.get(at)?;
             at += 1;
             crate::storage::AccessClass::from_u8(class)?;
+            let object_oid = if class == crate::storage::AccessClass::Routine as u8 {
+                let object_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                object_oid
+            } else {
+                0
+            };
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let grantee = take_name(&mut at)?;
@@ -3328,6 +3374,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             (at == payload.len()).then_some(WalOp::SetObjectAcl {
                 class,
+                object_oid,
                 schema,
                 name,
                 grantee,
@@ -3634,6 +3681,76 @@ mod tests {
             "WalOp grew to {} bytes",
             core::mem::size_of::<WalOp<'static>>()
         );
+    }
+
+    #[test]
+    fn object_acl_codec_keeps_routine_identity_and_decodes_legacy_records() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "routine acl wal", 1024).unwrap();
+        append_record(
+            &mut buffer,
+            9,
+            &WalOp::SetObjectAcl {
+                class: crate::storage::AccessClass::Routine as u8,
+                object_oid: 16_401,
+                schema: "public",
+                name: "answer",
+                grantee: "PUBLIC",
+                grantor: "postgres",
+                privileges: crate::storage::PrivilegeSet::EXECUTE,
+                grant_options: crate::storage::PrivilegeSet::NONE,
+            },
+        )
+        .unwrap();
+        let WalOp::SetObjectAcl { object_oid, .. } =
+            decode_record(&buffer.readable()[16..]).unwrap()
+        else {
+            panic!("expected object ACL WAL operation");
+        };
+        assert_eq!(object_oid, 16_401);
+
+        let legacy_acl = [
+            crate::storage::AccessClass::Table as u8,
+            6,
+            b'p',
+            b'u',
+            b'b',
+            b'l',
+            b'i',
+            b'c',
+            1,
+            b't',
+            6,
+            b'P',
+            b'U',
+            b'B',
+            b'L',
+            b'I',
+            b'C',
+            8,
+            b'p',
+            b'o',
+            b's',
+            b't',
+            b'g',
+            b'r',
+            b'e',
+            b's',
+            1,
+            0,
+            0,
+            0,
+        ];
+        let WalOp::SetObjectAcl {
+            object_oid,
+            schema,
+            name,
+            ..
+        } = decode_op(KIND_SET_OBJECT_ACL, &legacy_acl).unwrap()
+        else {
+            panic!("expected legacy object ACL WAL operation");
+        };
+        assert_eq!((object_oid, schema, name), (0, "public", "t"));
     }
 
     fn test_config(dir: &str) -> Config {

@@ -1492,6 +1492,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "own class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid own class"))?;
+                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                        parse_field(words.next(), "own routine oid")?
+                    } else {
+                        0
+                    };
                     let schema = decode_hex_name(
                         words
                             .next()
@@ -1510,9 +1515,14 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed own record"));
                     }
-                    let object = storage
-                        .resolve_access_object(class, &schema, &name, 0)
-                        .ok_or(CheckpointSetupError::Corrupt("own target does not exist"))?;
+                    let object = (if class == crate::storage::AccessClass::Routine {
+                        storage
+                            .routine_slot_by_oid(object_oid, 0)
+                            .map(crate::storage::Storage::routine_access_object)
+                    } else {
+                        storage.resolve_access_object(class, &schema, &name, 0)
+                    })
+                    .ok_or(CheckpointSetupError::Corrupt("own target does not exist"))?;
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt("own role does not exist"))?;
@@ -1523,6 +1533,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "acl class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid acl class"))?;
+                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                        parse_field(words.next(), "acl routine oid")?
+                    } else {
+                        0
+                    };
                     let decode = |word: Option<&str>, missing: &'static str| {
                         word.ok_or(CheckpointSetupError::Corrupt(missing))
                             .and_then(decode_hex_name)
@@ -1539,9 +1554,14 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid acl record"));
                     }
-                    let object = storage
-                        .resolve_access_object(class, &schema, &name, 0)
-                        .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
+                    let object = (if class == crate::storage::AccessClass::Routine {
+                        storage
+                            .routine_slot_by_oid(object_oid, 0)
+                            .map(crate::storage::Storage::routine_access_object)
+                    } else {
+                        storage.resolve_access_object(class, &schema, &name, 0)
+                    })
+                    .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
                     let grantee = if grantee == "PUBLIC" {
                         crate::storage::PUBLIC_ROLE
                     } else {
@@ -1878,6 +1898,87 @@ impl Checkpointer {
                 Some("rslot") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_replication_slot(storage, line)?;
+                }
+                Some("rtn") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at: u64 = parse_field(words.next(), "routine created_at")?;
+                    let owner = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("routine owner missing"))?,
+                    )?;
+                    let result_code: u8 = parse_field(words.next(), "routine result type")?;
+                    let result = ColType::from_code(result_code)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid routine result type"))?;
+                    let argument_count: usize =
+                        parse_field(words.next(), "routine argument count")?;
+                    if argument_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                        return Err(CheckpointSetupError::Corrupt("too many routine arguments"));
+                    }
+                    let schema =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine schema missing"),
+                        )?)?)?;
+                    let name = sql_name(&decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("routine name missing"))?,
+                    )?)?;
+                    let body = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::from_str(
+                        &decode_hex_name(
+                            words
+                                .next()
+                                .ok_or(CheckpointSetupError::Corrupt("routine body missing"))?,
+                        )?,
+                    );
+                    if body.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt("routine body too long"));
+                    }
+                    let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY;
+                        crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    for argument in &mut arguments[..argument_count] {
+                        argument.name = sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine argument name missing"),
+                        )?)?)?;
+                        let type_code: u8 = parse_field(words.next(), "routine argument type")?;
+                        argument.ctype = ColType::from_code(type_code).ok_or(
+                            CheckpointSetupError::Corrupt("invalid routine argument type"),
+                        )?;
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("malformed routine record"));
+                    }
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "routine owner does not exist",
+                        ))?;
+                    let slot = storage
+                        .create_routine(
+                            crate::storage::RoutineSpec {
+                                identity: crate::storage::RoutineIdentity::Preserve {
+                                    created_at,
+                                    ownership: crate::storage::Ownership {
+                                        owner: owner as u16,
+                                        pending: None,
+                                    },
+                                },
+                                schema,
+                                name,
+                                arguments,
+                                argument_count,
+                                result,
+                                body,
+                            },
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest routine rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_routine_create(slot, 0);
                 }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
@@ -3372,6 +3473,61 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for slot in 0..storage.routine_count() {
+            let routine = storage.routine(slot);
+            if !routine.visible_to(0) {
+                continue;
+            }
+            use core::fmt::Write;
+            let mut owner = StackStr::<130>::new();
+            let mut schema = StackStr::<130>::new();
+            let mut name = StackStr::<130>::new();
+            let mut body = StackStr::<{ 2 * crate::storage::ROUTINE_SQL_MAX }>::new();
+            for byte in storage
+                .role(routine.ownership.owner_to(0) as usize)
+                .name
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(owner, "{byte:02x}");
+            }
+            for byte in routine.schema.as_str().as_bytes() {
+                let _ = write!(schema, "{byte:02x}");
+            }
+            for byte in routine.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            for byte in routine.body.as_str().as_bytes() {
+                let _ = write!(body, "{byte:02x}");
+            }
+            let mut arguments = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 132 }>::new();
+            for argument in routine.arguments() {
+                let mut argument_name = StackStr::<130>::new();
+                for byte in argument.name.as_str().as_bytes() {
+                    let _ = write!(argument_name, "{byte:02x}");
+                }
+                let _ = write!(
+                    arguments,
+                    " {} {}",
+                    argument_name.as_str(),
+                    argument.ctype.code()
+                );
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rtn {} {} {} {} {} {} {}{}",
+                    routine.created_at,
+                    owner.as_str(),
+                    routine.result.code(),
+                    routine.argument_count,
+                    schema.as_str(),
+                    name.as_str(),
+                    body.as_str(),
+                    arguments.as_str(),
+                ),
+            )?;
+        }
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
         for comment in storage.live_comments() {
@@ -3460,16 +3616,30 @@ impl Checkpointer {
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(owner_hex, "{byte:02x}");
             }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "own {} {} {} {}",
-                    object.class as u8,
-                    schema_hex.as_str(),
-                    name_hex.as_str(),
-                    owner_hex.as_str()
-                ),
-            )
+            if object.class == crate::storage::AccessClass::Routine {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "own {} {} {} {} {}",
+                        object.class as u8,
+                        crate::storage::routine_oid(storage.routine(object.slot as usize)),
+                        schema_hex.as_str(),
+                        name_hex.as_str(),
+                        owner_hex.as_str()
+                    ),
+                )
+            } else {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "own {} {} {} {}",
+                        object.class as u8,
+                        schema_hex.as_str(),
+                        name_hex.as_str(),
+                        owner_hex.as_str()
+                    ),
+                )
+            }
         };
         for slot in 0..storage.table_count() {
             if storage.table(slot).live {
@@ -3521,6 +3691,11 @@ impl Checkpointer {
                 slot: slot as u16,
             })?;
         }
+        for slot in 0..storage.routine_count() {
+            if storage.routine(slot).visible_to(0) {
+                write_owner(crate::storage::Storage::routine_access_object(slot))?;
+            }
+        }
         for (_, acl) in storage.live_acls() {
             if !storage.access_object_is_live(acl.object) {
                 continue;
@@ -3549,19 +3724,36 @@ impl Checkpointer {
             for byte in grantor.as_str().as_bytes() {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "acl {} {} {} {} {} {} {}",
-                    acl.object.class as u8,
-                    schema_hex.as_str(),
-                    name_hex.as_str(),
-                    grantee_hex.as_str(),
-                    grantor_hex.as_str(),
-                    acl.privileges.0,
-                    acl.grant_options.0
-                ),
-            )?;
+            if acl.object.class == crate::storage::AccessClass::Routine {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "acl {} {} {} {} {} {} {} {}",
+                        acl.object.class as u8,
+                        crate::storage::routine_oid(storage.routine(acl.object.slot as usize)),
+                        schema_hex.as_str(),
+                        name_hex.as_str(),
+                        grantee_hex.as_str(),
+                        grantor_hex.as_str(),
+                        acl.privileges.0,
+                        acl.grant_options.0
+                    ),
+                )?;
+            } else {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "acl {} {} {} {} {} {} {}",
+                        acl.object.class as u8,
+                        schema_hex.as_str(),
+                        name_hex.as_str(),
+                        grantee_hex.as_str(),
+                        grantor_hex.as_str(),
+                        acl.privileges.0,
+                        acl.grant_options.0
+                    ),
+                )?;
+            }
         }
         for (_, acl) in storage.live_default_acls() {
             use core::fmt::Write;

@@ -285,6 +285,7 @@ pub(crate) fn dispatch<'a>(
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
+            | "has_function_privilege"
             | "has_database_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
@@ -524,6 +525,7 @@ pub(crate) fn dispatch<'a>(
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
+            | "has_function_privilege"
             | "has_database_privilege" => {
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -587,6 +589,9 @@ pub(crate) fn dispatch<'a>(
                     }
                     "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
                     "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
+                    "has_function_privilege" => {
+                        cat.has_function_privilege(role, object, privilege)?
+                    }
                     "has_database_privilege" => cat.has_database_privilege(role, privilege)?,
                     _ => unreachable!(),
                 };

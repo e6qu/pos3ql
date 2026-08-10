@@ -1701,6 +1701,11 @@ impl Engine {
                 lsn,
                 &WalOp::SetObjectOwner {
                     class: object.class as u8,
+                    object_oid: if object.class == crate::storage::AccessClass::Routine {
+                        crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                    } else {
+                        0
+                    },
                     schema: schema.as_str(),
                     name: name.as_str(),
                     owner: owner_name.as_str(),
@@ -1755,6 +1760,11 @@ impl Engine {
                 lsn,
                 &WalOp::SetObjectAcl {
                     class: object.class as u8,
+                    object_oid: if object.class == crate::storage::AccessClass::Routine {
+                        crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                    } else {
+                        0
+                    },
                     schema: schema.as_str(),
                     name: name.as_str(),
                     grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
@@ -6293,6 +6303,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SetObjectOwner {
             class,
+            object_oid,
             schema,
             name,
             owner,
@@ -6304,15 +6315,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     class
                 )
             })?;
-            let object = storage
-                .resolve_access_object(class, schema, name, 0)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "WAL ownership target \"{}\" does not exist",
-                        name
-                    )
-                })?;
+            let object = (if class == crate::storage::AccessClass::Routine {
+                storage
+                    .routine_slot_by_oid(object_oid, 0)
+                    .map(Storage::routine_access_object)
+            } else {
+                storage.resolve_access_object(class, schema, name, 0)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL ownership target \"{}\" does not exist",
+                    name
+                )
+            })?;
             let owner = storage.find_role(owner).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -6349,6 +6365,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SetObjectAcl {
             class,
+            object_oid,
             schema,
             name,
             grantee,
@@ -6363,7 +6380,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     class
                 )
             })?;
-            let Some(object) = storage.resolve_access_object(class, schema, name, 0) else {
+            let object = if class == crate::storage::AccessClass::Routine {
+                storage
+                    .routine_slot_by_oid(object_oid, 0)
+                    .map(Storage::routine_access_object)
+            } else {
+                storage.resolve_access_object(class, schema, name, 0)
+            };
+            let Some(object) = object else {
                 if privileges.0 == 0 {
                     storage.set_lsn(lsn);
                     return Ok(());

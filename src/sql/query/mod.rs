@@ -172,9 +172,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         arguments: &[Datum<'a>],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        let Some(routine) = self.storage.routine_for_call(name, arguments, self.txid) else {
+        let Some(slot) = self
+            .storage
+            .routine_slot_for_call(name, arguments, self.txid)
+        else {
             return Ok(None);
         };
+        self.storage.require_routine_execute(slot, self.txid)?;
+        let routine = self.storage.routine(slot);
         let body = routine.body.as_str().trim();
         let expression = body
             .strip_prefix("SELECT ")
@@ -416,6 +421,65 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             privileges,
             crate::storage::PrivilegeSet::NONE,
             crate::storage::PrivilegeSet::TYPE_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_function_privilege(
+        &self,
+        role: Option<&str>,
+        function: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let function = function.trim();
+        let (written_name, written_arguments) = match function.strip_suffix(')') {
+            Some(prefix) => prefix.rsplit_once('(').unwrap_or((function, "")),
+            None => (function, ""),
+        };
+        let (schema, name) = split_catalog_name(written_name.trim());
+        let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let written_arguments = written_arguments.trim();
+        let argument_count = if written_arguments.is_empty() {
+            0
+        } else {
+            let mut count = 0usize;
+            for type_name in written_arguments.split(',') {
+                if count == argument_types.len() {
+                    return Ok(None);
+                }
+                let Some(ctype) = ColType::from_sql_name(type_name.trim()) else {
+                    return Ok(None);
+                };
+                argument_types[count] = ctype;
+                count += 1;
+            }
+            count
+        };
+        let Some(slot) = self.storage.routine_slot_by_signature(
+            schema.unwrap_or("public"),
+            name,
+            &argument_types[..argument_count],
+            self.txid,
+        ) else {
+            return Ok(None);
+        };
+        let object = crate::storage::Storage::routine_access_object(slot);
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::FUNCTION_ALL,
             |privilege| {
                 self.storage
                     .has_object_privilege(object, role, privilege, self.txid)

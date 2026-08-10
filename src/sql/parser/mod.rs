@@ -2637,9 +2637,53 @@ impl<'a> Parser<'a> {
                 self.expect_ident("in")?;
                 self.expect_ident("schema")?;
                 PrivilegeObjectKind::AllSequencesInSchema
+            } else if self.eat_ident("functions")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllFunctionsInSchema
             } else {
-                return Err(self.unexpected("expected TABLES or SEQUENCES after ALL"));
+                return Err(self.unexpected("expected TABLES, SEQUENCES, or FUNCTIONS after ALL"));
             }
+        } else if self.eat_ident("function")? {
+            let mut functions = [crate::sql::ast::RoutineIdentity {
+                name: QualName::bare(""),
+                argument_types: &[],
+            }; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == functions.len() {
+                    return Err(self.limit("function privilege targets", functions.len()));
+                }
+                let name = self.qual_name("function name")?;
+                self.expect_op("(")?;
+                let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut argument_count = 0usize;
+                if !self.eat_op(")")? {
+                    loop {
+                        if argument_count == argument_types.len() {
+                            return Err(self.limit("function arguments", argument_types.len()));
+                        }
+                        argument_types[argument_count] =
+                            self.any_ident("function argument type")?;
+                        argument_count += 1;
+                        if self.eat_op(")")? {
+                            break;
+                        }
+                        self.expect_op(",")?;
+                    }
+                }
+                functions[count] = crate::sql::ast::RoutineIdentity {
+                    name,
+                    argument_types: self.arena_slice(&argument_types[..argument_count])?,
+                };
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            return Ok(PrivilegeTarget::Functions(
+                self.arena_slice(&functions[..count])?,
+            ));
         } else if self.eat_ident("table")? {
             PrivilegeObjectKind::Table
         } else if self.eat_ident("sequence")? {
@@ -2663,6 +2707,7 @@ impl<'a> Parser<'a> {
                 PrivilegeObjectKind::Schema
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
+                    | PrivilegeObjectKind::AllFunctionsInSchema
             ) {
                 QualName::bare(self.col_ident("schema name")?)
             } else {
@@ -2673,7 +2718,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(PrivilegeTarget {
+        Ok(PrivilegeTarget::Objects {
             kind,
             names: self.arena_slice(&names[..count])?,
         })

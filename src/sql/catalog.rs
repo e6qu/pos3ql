@@ -1986,7 +1986,12 @@ pub fn function_def_text<'a>(
     let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
     write!(
         definition,
-        "CREATE OR REPLACE FUNCTION {}.{}(",
+        "CREATE OR REPLACE {} {}.{}(",
+        if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
+            "PROCEDURE"
+        } else {
+            "FUNCTION"
+        },
         routine.schema.as_str(),
         routine.name.as_str()
     )
@@ -2001,11 +2006,12 @@ pub fn function_def_text<'a>(
         }
         write!(definition, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
     }
-    write!(
-        definition,
-        ") RETURNS {} LANGUAGE sql AS '",
-        routine.result.name()
-    )
+    match routine.kind {
+        crate::storage::RoutineKind::Function { result } => {
+            write!(definition, ") RETURNS {} LANGUAGE sql AS '", result.name())
+        }
+        crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql AS '"),
+    }
     .map_err(|_| super::eval::arena_full())?;
     for character in routine.body.as_str().chars() {
         write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
@@ -4350,8 +4356,14 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(routine.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, routine.schema.as_str())),
                 Datum::Int4(routine.argument_count as i32),
-                Datum::Int4(routine.result.oid()),
-                Datum::Bpchar("f"),
+                Datum::Int4(
+                    routine
+                        .kind
+                        .function_result()
+                        .map(ColType::oid)
+                        .unwrap_or(2278),
+                ),
+                Datum::Bpchar(routine.kind.catalog_kind()),
                 text(argument_types.as_str(), arena)?,
                 Datum::Bpchar("v"),
                 Datum::Bpchar("u"),
@@ -5662,8 +5674,18 @@ fn info_routines<'a>(
                 text("postgres", arena)?,
                 text(routine.schema.as_str(), arena)?,
                 text(routine.name.as_str(), arena)?,
-                text("FUNCTION", arena)?,
-                text(routine.result.name(), arena)?,
+                text(
+                    if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
+                        "PROCEDURE"
+                    } else {
+                        "FUNCTION"
+                    },
+                    arena,
+                )?,
+                match routine.kind.function_result() {
+                    Some(result) => text(result.name(), arena)?,
+                    None => Datum::Null,
+                },
                 text("SQL", arena)?,
                 text(routine.body.as_str(), arena)?,
             ],

@@ -158,11 +158,22 @@ pub enum Stmt<'a> {
         or_replace: bool,
         sql: &'a str,
     },
-    /// `CREATE FUNCTION` retains a parsed signature and body spelling.  The
-    /// executor resolves every type before the definition reaches storage.
-    CreateFunction(CreateFunction<'a>),
+    /// A SQL routine retains its parsed invocation contract and body spelling.
+    /// The executor resolves every type before the definition reaches storage.
+    CreateRoutine(CreateRoutine<'a>),
+    /// `CALL procedure(args)`: unlike a scalar expression call, this can run a
+    /// complete SQL statement body and therefore has its own statement node.
+    Call {
+        name: QualName<'a>,
+        arguments: &'a [&'a Expr<'a>],
+    },
     DropFunction {
         functions: &'a [RoutineIdentity<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropProcedure {
+        procedures: &'a [RoutineIdentity<'a>],
         if_exists: bool,
         cascade: bool,
     },
@@ -550,9 +561,19 @@ pub enum PrivilegeTarget<'a> {
         kind: PrivilegeObjectKind,
         names: &'a [QualName<'a>],
     },
-    /// Function privilege targets include argument types. A function name is
-    /// not an identity because overloads may share it.
-    Functions(&'a [RoutineIdentity<'a>]),
+    /// Routine targets include argument types and the syntactic kind. A name
+    /// alone cannot identify an overload or distinguish a procedure.
+    Routines {
+        kind: RoutineTargetKind,
+        identities: &'a [RoutineIdentity<'a>],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineTargetKind {
+    Function,
+    Procedure,
+    Either,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1118,12 +1139,18 @@ pub struct RoutineArgument<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CreateFunction<'a> {
+pub struct CreateRoutine<'a> {
     pub name: QualName<'a>,
     pub or_replace: bool,
     pub arguments: &'a [RoutineArgument<'a>],
-    pub result_type: &'a str,
+    pub kind: RoutineCreateKind<'a>,
     pub body: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineCreateKind<'a> {
+    Function { result_type: &'a str },
+    Procedure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

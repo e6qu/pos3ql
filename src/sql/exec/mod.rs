@@ -20,7 +20,7 @@ use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
 
 use super::ast::{
-    AlterAction, AlterTable, CreateFunction, CreateTable, Delete, DropTable, Expr, Insert,
+    AlterAction, AlterTable, CreateRoutine, CreateTable, Delete, DropTable, Expr, Insert,
     LikeClause, Overriding, QualName, SelectItem, Update,
 };
 use super::eval::{
@@ -3828,12 +3828,12 @@ fn resolve_privilege_objects(
     txid: u32,
     objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
+    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
     match target {
-        PrivilegeTarget::Functions(functions) => {
-            for identity in functions {
+        PrivilegeTarget::Routines { kind, identities } => {
+            for identity in identities {
                 let schema = identity.name.schema.unwrap_or("public");
                 let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
                 for (index, type_name) in identity.argument_types.iter().enumerate() {
@@ -3858,6 +3858,26 @@ fn resolve_privilege_objects(
                         identity.name.name
                     ));
                 };
+                let actual = storage.routine(slot).kind;
+                let accepted = match kind {
+                    RoutineTargetKind::Function => actual.function_result().is_some(),
+                    RoutineTargetKind::Procedure => {
+                        matches!(actual, crate::storage::RoutineKind::Procedure)
+                    }
+                    RoutineTargetKind::Either => true,
+                };
+                if !accepted {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "{} \"{}\" does not exist",
+                        match kind {
+                            RoutineTargetKind::Function => "function",
+                            RoutineTargetKind::Procedure => "procedure",
+                            RoutineTargetKind::Either => "routine",
+                        },
+                        identity.name.name
+                    ));
+                }
                 add_privilege_object(objects, &mut count, Storage::routine_access_object(slot))?;
             }
         }
@@ -5759,34 +5779,37 @@ pub struct CreateViewCommand<'a> {
     pub raw_path: &'a str,
 }
 
-pub fn create_function(
+pub fn create_routine(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    function: &CreateFunction<'_>,
+    routine: &CreateRoutine<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let schema = match storage.creation_schema(function.name.schema, function.name.name, txn.txid) {
+    let schema = match storage.creation_schema(routine.name.schema, routine.name.name, txn.txid) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
-    let name = match SqlName::parse(function.name.name) {
+    let name = match SqlName::parse(routine.name.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let result = match ColType::from_sql_name(function.result_type) {
-        Some(result) => result,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                function.result_type
-            ));
+    let kind = match routine.kind {
+        super::ast::RoutineCreateKind::Function { result_type } => {
+            let Some(result) = ColType::from_sql_name(result_type) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    result_type
+                ));
+            };
+            crate::storage::RoutineKind::Function { result }
         }
+        super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
     let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
-    for (slot, argument) in function.arguments.iter().enumerate() {
+    for (slot, argument) in routine.arguments.iter().enumerate() {
         let argument_name = match SqlName::parse(argument.name) {
             Ok(name) => name,
             Err(error) => return sql_fail(error),
@@ -5807,17 +5830,17 @@ pub fn create_function(
         };
     }
     let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-    for (slot, argument) in arguments[..function.arguments.len()].iter().enumerate() {
+    for (slot, argument) in arguments[..routine.arguments.len()].iter().enumerate() {
         argument_types[slot] = argument.ctype;
     }
     let replaced = storage.routine_slot_by_signature(
         schema.as_str(),
         name.as_str(),
-        &argument_types[..function.arguments.len()],
+        &argument_types[..routine.arguments.len()],
         txn.txid,
     );
     if let Some(replaced_slot) = replaced {
-        if !function.or_replace {
+        if !routine.or_replace {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
                 "function \"{}\" already exists with same argument types",
@@ -5829,21 +5852,35 @@ pub fn create_function(
         }
         storage.drop_routine(replaced_slot, txn.txid);
     }
-    let expression = function
-        .body
-        .trim()
-        .strip_prefix("SELECT ")
-        .or_else(|| function.body.trim().strip_prefix("select "));
-    let Some(expression) = expression else {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "SQL routine body must be a scalar SELECT expression"
-        ));
-    };
-    if let Err(error) = super::parser::parse_expr(expression, arena) {
-        return sql_fail(error);
+    match kind {
+        crate::storage::RoutineKind::Function { .. } => {
+            let expression = routine
+                .body
+                .trim()
+                .strip_prefix("SELECT ")
+                .or_else(|| routine.body.trim().strip_prefix("select "));
+            let Some(expression) = expression else {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL function body must be a scalar SELECT expression"
+                ));
+            };
+            if let Err(error) = super::parser::parse_expr(expression, arena) {
+                return sql_fail(error);
+            }
+        }
+        crate::storage::RoutineKind::Procedure => {
+            let parsed = super::parser::Parser::new(routine.body, arena)
+                .and_then(|mut parser| parser.next_stmt());
+            if !matches!(parsed, Ok(Some(_))) {
+                return sql_fail(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "invalid SQL procedure body"
+                ));
+            }
+        }
     }
-    let body = StackStr::<ROUTINE_SQL_MAX>::from_str(function.body);
+    let body = StackStr::<ROUTINE_SQL_MAX>::from_str(routine.body);
     if body.is_truncated() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5862,8 +5899,8 @@ pub fn create_function(
             schema,
             name,
             arguments,
-            argument_count: function.arguments.len(),
-            result,
+            argument_count: routine.arguments.len(),
+            kind,
             body,
         },
         txn.txid,
@@ -5903,20 +5940,34 @@ pub fn create_function(
     } else if let Err(error) = apply_default_privileges_to_new_object(storage, txn, new_object) {
         return sql_fail(error);
     }
-    responder.command_complete("CREATE FUNCTION")?;
+    responder.command_complete(match kind {
+        crate::storage::RoutineKind::Function { .. } => "CREATE FUNCTION",
+        crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
+    })?;
     sql_ok()
 }
 
-pub fn drop_function(
+pub struct DropRoutineCommand<'a> {
+    pub routines: &'a [super::ast::RoutineIdentity<'a>],
+    pub if_exists: bool,
+    pub cascade: bool,
+    pub procedure: bool,
+}
+
+pub fn drop_routine(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    functions: &[super::ast::RoutineIdentity<'_>],
-    if_exists: bool,
-    _cascade: bool,
+    command: DropRoutineCommand<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    for identity in functions {
+    let DropRoutineCommand {
+        routines,
+        if_exists,
+        cascade: _,
+        procedure,
+    } = command;
+    for identity in routines {
         let schema = identity.name.schema.unwrap_or("public");
         let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
         if identity.argument_types.len() > argument_types.len() {
@@ -5950,6 +6001,21 @@ pub fn drop_function(
                 identity.name.name
             ));
         };
+        if matches!(
+            storage.routine(slot).kind,
+            crate::storage::RoutineKind::Procedure
+        ) != procedure
+        {
+            if if_exists {
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{} \"{}\" does not exist",
+                if procedure { "procedure" } else { "function" },
+                identity.name.name
+            ));
+        }
         if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
             return sql_fail(error);
         }
@@ -5976,7 +6042,11 @@ pub fn drop_function(
             return sql_fail(error);
         }
     }
-    responder.command_complete("DROP FUNCTION")?;
+    responder.command_complete(if procedure {
+        "DROP PROCEDURE"
+    } else {
+        "DROP FUNCTION"
+    })?;
     sql_ok()
 }
 

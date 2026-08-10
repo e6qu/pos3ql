@@ -59,7 +59,7 @@ ALTER USER MAPPING	missing	-
 ALTER VIEW	partial	76_stored_dependencies.sql
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
-CALL	missing	-
+CALL	partial	89_sql_procedures.sql
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
 CLUSTER	missing	-
@@ -87,7 +87,7 @@ CREATE OPERATOR	missing	-
 CREATE OPERATOR CLASS	missing	-
 CREATE OPERATOR FAMILY	missing	-
 CREATE POLICY	missing	-
-CREATE PROCEDURE	missing	-
+CREATE PROCEDURE	partial	89_sql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	missing	-
@@ -135,7 +135,7 @@ DROP OPERATOR CLASS	missing	-
 DROP OPERATOR FAMILY	missing	-
 DROP OWNED	complete	83_roles_acl.sql
 DROP POLICY	missing	-
-DROP PROCEDURE	missing	-
+DROP PROCEDURE	partial	89_sql_procedures.sql
 DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql
 DROP ROUTINE	missing	-

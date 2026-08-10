@@ -779,6 +779,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("update") => self.update(),
             Tok::Ident("delete") => self.delete(),
             Tok::Ident("merge") => self.merge(),
+            Tok::Ident("call") => self.call_procedure(),
             Tok::Ident("comment") => self.comment(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("lock") => self.lock_table(),
@@ -1025,6 +1026,31 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.unexpected("expected a statement")),
         }
+    }
+
+    fn call_procedure(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.advance()?;
+        let name = self.qual_name("procedure name")?;
+        self.expect_op("(")?;
+        let mut arguments = [&Expr::Null; MAX_LIST];
+        let mut count = 0;
+        if !self.eat_op(")")? {
+            loop {
+                if count == arguments.len() {
+                    return Err(self.limit("procedure arguments", arguments.len()));
+                }
+                arguments[count] = self.expression(0)?;
+                count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        Ok(Stmt::Call {
+            name,
+            arguments: self.arena_slice(&arguments[..count])?,
+        })
     }
 
     /// A comma-separated projection list (used by SELECT and RETURNING).
@@ -2627,7 +2653,7 @@ impl<'a> Parser<'a> {
     }
 
     fn privilege_target(&mut self) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
-        use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
+        use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
         let kind = if self.eat_ident("all")? {
             if self.eat_ident("tables")? {
                 self.expect_ident("in")?;
@@ -2645,45 +2671,11 @@ impl<'a> Parser<'a> {
                 return Err(self.unexpected("expected TABLES, SEQUENCES, or FUNCTIONS after ALL"));
             }
         } else if self.eat_ident("function")? {
-            let mut functions = [crate::sql::ast::RoutineIdentity {
-                name: QualName::bare(""),
-                argument_types: &[],
-            }; MAX_LIST];
-            let mut count = 0usize;
-            loop {
-                if count == functions.len() {
-                    return Err(self.limit("function privilege targets", functions.len()));
-                }
-                let name = self.qual_name("function name")?;
-                self.expect_op("(")?;
-                let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                let mut argument_count = 0usize;
-                if !self.eat_op(")")? {
-                    loop {
-                        if argument_count == argument_types.len() {
-                            return Err(self.limit("function arguments", argument_types.len()));
-                        }
-                        argument_types[argument_count] =
-                            self.any_ident("function argument type")?;
-                        argument_count += 1;
-                        if self.eat_op(")")? {
-                            break;
-                        }
-                        self.expect_op(",")?;
-                    }
-                }
-                functions[count] = crate::sql::ast::RoutineIdentity {
-                    name,
-                    argument_types: self.arena_slice(&argument_types[..argument_count])?,
-                };
-                count += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            return Ok(PrivilegeTarget::Functions(
-                self.arena_slice(&functions[..count])?,
-            ));
+            return self.routine_privilege_target(RoutineTargetKind::Function);
+        } else if self.eat_ident("procedure")? {
+            return self.routine_privilege_target(RoutineTargetKind::Procedure);
+        } else if self.eat_ident("routine")? {
+            return self.routine_privilege_target(RoutineTargetKind::Either);
         } else if self.eat_ident("table")? {
             PrivilegeObjectKind::Table
         } else if self.eat_ident("sequence")? {
@@ -2721,6 +2713,52 @@ impl<'a> Parser<'a> {
         Ok(PrivilegeTarget::Objects {
             kind,
             names: self.arena_slice(&names[..count])?,
+        })
+    }
+
+    fn routine_privilege_target(
+        &mut self,
+        kind: crate::sql::ast::RoutineTargetKind,
+    ) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
+        use crate::sql::ast::{PrivilegeTarget, RoutineIdentity};
+        let mut identities = [RoutineIdentity {
+            name: QualName::bare(""),
+            argument_types: &[],
+        }; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == identities.len() {
+                return Err(self.limit("routine privilege targets", identities.len()));
+            }
+            let name = self.qual_name("routine name")?;
+            self.expect_op("(")?;
+            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_count = 0usize;
+            if !self.eat_op(")")? {
+                loop {
+                    if argument_count == argument_types.len() {
+                        return Err(self.limit("routine arguments", argument_types.len()));
+                    }
+                    argument_types[argument_count] = self.any_ident("routine argument type")?;
+                    argument_count += 1;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+            }
+            identities[count] = RoutineIdentity {
+                name,
+                argument_types: self.arena_slice(&argument_types[..argument_count])?,
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(PrivilegeTarget::Routines {
+            kind,
+            identities: self.arena_slice(&identities[..count])?,
         })
     }
 

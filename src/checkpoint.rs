@@ -1945,9 +1945,20 @@ impl Checkpointer {
                             CheckpointSetupError::Corrupt("invalid routine argument type"),
                         )?;
                     }
-                    if words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt("malformed routine record"));
-                    }
+                    let kind = match words.next() {
+                        None => crate::storage::RoutineKind::Function { result },
+                        Some(code) => {
+                            let code: u8 = parse_field(Some(code), "routine kind")?;
+                            let kind = crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
+                            if words.next().is_some() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "malformed routine record",
+                                ));
+                            }
+                            kind
+                        }
+                    };
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt(
@@ -1967,7 +1978,7 @@ impl Checkpointer {
                                 name,
                                 arguments,
                                 argument_count,
-                                result,
+                                kind,
                                 body,
                             },
                             0,
@@ -3516,15 +3527,20 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{}",
+                    "rtn {} {} {} {} {} {} {}{} {}",
                     routine.created_at,
                     owner.as_str(),
-                    routine.result.code(),
+                    routine
+                        .kind
+                        .function_result()
+                        .unwrap_or(ColType::Text)
+                        .code(),
                     routine.argument_count,
                     schema.as_str(),
                     name.as_str(),
                     body.as_str(),
                     arguments.as_str(),
+                    routine.kind.wire_code(),
                 ),
             )?;
         }

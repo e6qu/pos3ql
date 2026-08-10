@@ -14,7 +14,7 @@ use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
     ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, ROUTINE_SQL_MAX, RoutineArgumentDef,
-    RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+    RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -5733,6 +5733,12 @@ pub fn create_function(
     }
     let slot = match storage.create_routine(
         RoutineSpec {
+            identity: replaced
+                .map(|slot| RoutineIdentity::Preserve {
+                    created_at: storage.routine(slot).created_at,
+                    ownership: storage.routine(slot).ownership,
+                })
+                .unwrap_or(RoutineIdentity::Allocate),
             schema,
             name,
             arguments,

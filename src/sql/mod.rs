@@ -1931,7 +1931,9 @@ impl Engine {
                     );
                 }
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
-                DdlUndo::RoutineCreated(slot) => self.storage.commit_routine_create(*slot as usize),
+                DdlUndo::RoutineCreated(slot) => {
+                    self.storage.commit_routine_create(*slot as usize, txn.txid)
+                }
                 DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
                 DdlUndo::PublicationCreated(slot) => {
                     let slot = *slot as usize;

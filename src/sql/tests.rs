@@ -5572,13 +5572,28 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             ["42"],
             "a second transaction must retain the committed routine definition"
         );
-        execute!("ROLLBACK");
-        assert_eq!(data_rows(&execute!("SELECT answer()")), ["42"]);
+        execute!("COMMIT");
+        assert_eq!(data_rows(&execute!("SELECT answer()")), ["43"]);
         assert_eq!(
             data_rows(&execute!(
                 "SELECT oid FROM pg_proc WHERE proname = 'answer'"
             )),
             [oid.to_string()]
+        );
+
+        execute!("CREATE ROLE routine_owner");
+        execute!("GRANT CREATE ON SCHEMA public TO routine_owner");
+        execute!("SET ROLE routine_owner");
+        execute!("CREATE FUNCTION owned_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 41'");
+        execute!("RESET ROLE");
+        execute!(
+            "CREATE OR REPLACE FUNCTION owned_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 44'"
+        );
+        assert_eq!(
+            data_rows(&execute!(
+                "SELECT pg_get_userbyid(proowner), owned_answer() FROM pg_proc WHERE proname = 'owned_answer'"
+            )),
+            ["routine_owner|44"]
         );
 
         execute!("BEGIN");
@@ -5587,7 +5602,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         let missing = execute!("SELECT answer()");
         assert!(String::from_utf8_lossy(&missing).contains("42883"));
         execute!("ROLLBACK TO SAVEPOINT routine_drop");
-        assert_eq!(data_rows(&execute!("SELECT answer()")), ["42"]);
+        assert_eq!(data_rows(&execute!("SELECT answer()")), ["43"]);
         execute!("COMMIT");
         engine.commit_wal().unwrap();
     }
@@ -5595,7 +5610,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(&mut engine, &mut budget, "SELECT answer()")),
-        ["42"]
+        ["43"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -5604,6 +5619,14 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "SELECT oid FROM pg_proc WHERE proname = 'answer'",
         )),
         [answer_oid.to_string()]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'owned_answer'",
+        )),
+        ["routine_owner"]
     );
     run_with(&mut engine, &mut budget, "DROP FUNCTION answer()");
     engine.commit_wal().unwrap();

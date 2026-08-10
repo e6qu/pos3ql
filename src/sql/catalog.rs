@@ -4348,7 +4348,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(argument_types.as_str(), arena)?,
                 Datum::Bpchar("v"),
                 Datum::Bpchar("u"),
-                Datum::Int4(routine.ownership.owner_to(txid) as i32 + 10),
+                Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Int4(14),

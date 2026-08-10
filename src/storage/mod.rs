@@ -1742,12 +1742,24 @@ pub(crate) struct RoutineArgumentDef {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RoutineSpec {
+    pub identity: RoutineIdentity,
     pub schema: SqlName,
     pub name: SqlName,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
     pub result: ColType,
     pub body: StackStr<ROUTINE_SQL_MAX>,
+}
+
+/// The catalog identity of a routine definition. Replacement retains every
+/// catalog-owned field; a new definition receives them once.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RoutineIdentity {
+    Allocate,
+    Preserve {
+        created_at: u64,
+        ownership: Ownership,
+    },
 }
 
 impl RoutineArgumentDef {
@@ -2335,6 +2347,17 @@ impl Ownership {
         match self.pending {
             Some(pending) if pending.txid == txid => pending.owner,
             _ => self.owner,
+        }
+    }
+
+    /// A committed WAL image has no transaction-private ownership overlay.
+    pub const fn committed(self) -> Self {
+        Self {
+            owner: match self.pending {
+                Some(pending) => pending.owner,
+                None => self.owner,
+            },
+            pending: None,
         }
     }
 }
@@ -11516,6 +11539,7 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let RoutineSpec {
+            identity,
             schema,
             name,
             arguments,
@@ -11564,23 +11588,42 @@ impl Storage {
                 self.routines.len()
             ));
         };
-        self.catalog_seq += 1;
+        let (created_at, ownership) = match identity {
+            RoutineIdentity::Allocate => {
+                self.catalog_seq += 1;
+                (self.catalog_seq, self.initial_ownership(txid))
+            }
+            RoutineIdentity::Preserve {
+                created_at,
+                ownership,
+            } => {
+                self.catalog_seq = self.catalog_seq.max(created_at);
+                (created_at, ownership)
+            }
+        };
         self.routines[slot] = RoutineDef {
-            created_at: self.catalog_seq,
+            created_at,
             schema,
             name,
             arguments,
             argument_count,
             result,
             body,
-            ownership: self.initial_ownership(txid),
+            ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(slot)
     }
 
-    pub(crate) fn commit_routine_create(&mut self, slot: usize) {
+    pub(crate) fn commit_routine_create(&mut self, slot: usize, txid: u32) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_create();
+        let ownership = &mut self.routines[slot].ownership;
+        if let Some(pending) = ownership.pending
+            && pending.txid == txid
+        {
+            ownership.owner = pending.owner;
+            ownership.pending = None;
+        }
     }
 
     pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
@@ -11599,7 +11642,11 @@ impl Storage {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_drop(txid);
     }
 
-    pub(crate) fn replay_create_routine(&mut self, definition: RoutineDef) -> Result<(), SqlError> {
+    pub(crate) fn replay_create_routine(
+        &mut self,
+        mut definition: RoutineDef,
+    ) -> Result<(), SqlError> {
+        definition.ownership = definition.ownership.committed();
         let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in definition.arguments().iter().enumerate() {
             argument_types[slot] = argument.ctype;
@@ -11615,6 +11662,10 @@ impl Storage {
         }
         let slot = self.create_routine(
             RoutineSpec {
+                identity: RoutineIdentity::Preserve {
+                    created_at: definition.created_at,
+                    ownership: definition.ownership,
+                },
                 schema: definition.schema,
                 name: definition.name,
                 arguments: definition.arguments,
@@ -11624,10 +11675,7 @@ impl Storage {
             },
             0,
         )?;
-        self.routines[slot].created_at = definition.created_at;
-        self.routines[slot].ownership = definition.ownership;
-        self.catalog_seq = self.catalog_seq.max(definition.created_at);
-        self.commit_routine_create(slot);
+        self.commit_routine_create(slot, 0);
         Ok(())
     }
 

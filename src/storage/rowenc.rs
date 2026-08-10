@@ -242,7 +242,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
     let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
     let fixed = match column {
         ColType::Bool => Some(1),
-        ColType::Int2 | ColType::Int4 | ColType::Date => Some(4),
+        ColType::Int2 | ColType::Int4 | ColType::Oid | ColType::Date => Some(4),
         ColType::Int8
         | ColType::Float4
         | ColType::Float8
@@ -331,7 +331,7 @@ pub(crate) fn decode<'a>(
                 out[i] = Datum::Bool(b[0] != 0);
                 at += 1;
             }
-            ColType::Int4 | ColType::Int2 => {
+            ColType::Int4 | ColType::Int2 | ColType::Oid => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let x = i32::from_le_bytes(b.try_into().unwrap());
                 // The 4-byte layout is historical; the schema narrows. A

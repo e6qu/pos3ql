@@ -166,6 +166,28 @@ pub(super) fn storage_catalog(storage: &Storage, txid: u32) -> StorageCatalog<'_
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_> {
+    fn relation_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::relation_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+    }
+
+    fn type_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::type_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+    }
+
+    fn function_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::function_oid_is_visible(oid).then_some(true)
+    }
+
+    fn collation_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::collation_oid_is_visible(oid).then_some(true)
+    }
+
+    fn relation_is_publishable(&self, oid: i32) -> Option<bool> {
+        super::catalog::relation_oid_is_visible(self.storage, self.txid, oid).then_some(
+            super::catalog::relation_oid_is_publishable(self.storage, self.txid, oid),
+        )
+    }
+
     fn index_def<'a>(
         &self,
         oid: i32,

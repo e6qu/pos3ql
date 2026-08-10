@@ -61,7 +61,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Text(s) => Datum::Bool(parse_bool(s)?),
             _ => return Err(cast_unsupported(&v, "boolean")),
         },
-        ColType::Int4 => {
+        ColType::Int4 | ColType::Oid => {
             if let Datum::Bit { bits, .. } = v {
                 // bit -> integer: the bits are the low bits of the result
                 // (two's complement), so a full 32-bit string round-trips.

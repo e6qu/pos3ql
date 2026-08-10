@@ -18,6 +18,24 @@ use crate::stack_format;
 
 use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate};
 
+/// A catalog OID accepted by identity predicates.  Keeping conversion at the
+/// boundary prevents a wide integer from wrapping into an unrelated object.
+#[derive(Clone, Copy)]
+struct CatalogOid(i32);
+
+impl<'a> TryFrom<Datum<'a>> for CatalogOid {
+    type Error = ();
+
+    fn try_from(value: Datum<'a>) -> Result<Self, Self::Error> {
+        let oid = match value {
+            Datum::Int4(oid) => oid,
+            Datum::Int8(oid) => i32::try_from(oid).map_err(|_| ())?,
+            _ => return Err(()),
+        };
+        Ok(Self(oid))
+    }
+}
+
 fn privilege_role_name<'a>(
     value: Datum<'a>,
     catalog: &dyn super::super::CatalogAccess,
@@ -277,7 +295,6 @@ pub(crate) fn dispatch<'a>(
             | "pg_database_size"
             | "pg_tablespace_location"
             | "pg_tablespace_size"
-            | "pg_get_functiondef"
             | "col_description"
             | "obj_description"
             | "shobj_description"
@@ -578,7 +595,32 @@ pub(crate) fn dispatch<'a>(
             | "pg_type_is_visible"
             | "pg_function_is_visible"
             | "pg_collation_is_visible"
-            | "pg_relation_is_publishable" => Ok(Datum::Bool(true)),
+            | "pg_relation_is_publishable" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Int8(value) if i32::try_from(value).is_err() => {
+                        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range"));
+                    }
+                    value => match CatalogOid::try_from(value) {
+                        Ok(oid) => oid,
+                        Err(()) => return Ok(Datum::Null),
+                    },
+                };
+                Ok(match name {
+                    "pg_table_is_visible" => cat.relation_is_visible(oid.0),
+                    "pg_type_is_visible" => cat.type_is_visible(oid.0),
+                    "pg_function_is_visible" => cat.function_is_visible(oid.0),
+                    "pg_collation_is_visible" => cat.collation_is_visible(oid.0),
+                    "pg_relation_is_publishable" => cat.relation_is_publishable(oid.0),
+                    _ => unreachable!(),
+                }
+                .map(Datum::Bool)
+                .unwrap_or(Datum::Null))
+            }
             "pg_get_indexdef" => {
                 // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
                 // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
@@ -749,7 +791,7 @@ pub(crate) fn dispatch<'a>(
                     _ => Ok(Datum::Null),
                 }
             }
-            "pg_get_functiondef" | "shobj_description" | "pg_get_statisticsobjdef_columns" => {
+            "shobj_description" | "pg_get_statisticsobjdef_columns" => {
                 // Definitions/comments we do not reconstruct render as empty/NULL,
                 // as PostgreSQL does for an absent comment.
                 Ok(Datum::Null)

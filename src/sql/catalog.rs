@@ -70,6 +70,10 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "usage_privileges"
                 | "domains"
                 | "domain_constraints"
+                | "check_constraints"
+                | "column_domain_usage"
+                | "column_udt_usage"
+                | "domain_udt_usage"
         ),
         Some(_) => false,
         None => matches!(
@@ -938,6 +942,10 @@ pub fn synthesize<'a>(
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         (true, "domains") => info_domains(storage, txid, arena),
         (true, "domain_constraints") => info_domain_constraints(storage, txid, arena),
+        (true, "check_constraints") => info_check_constraints(storage, txid, arena),
+        (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
+        (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
+        (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -6512,6 +6520,303 @@ fn info_domain_constraints<'a>(
             )?;
             count += 1;
         }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_check_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "check_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("check_clause", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
+        * (crate::storage::MAX_CHECKS + MAX_COLUMNS)
+        + crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    let mut append = |schema: &str, name: &str, clause: &str| -> Result<(), SqlError> {
+        if count == output.len() {
+            return Err(catalog_capacity_exceeded(
+                "information_schema.check_constraints",
+            ));
+        }
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(schema, arena)?,
+                text(name, arena)?,
+                text(clause, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for check in table.checks() {
+            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            append(table.schema.as_str(), check.name.as_str(), clause.as_str())?;
+        }
+        for column in table.columns() {
+            if column.not_null {
+                let name = not_null_constraint_name(table, column);
+                let clause = stack_format!(256, "{} IS NOT NULL", column.name.as_str());
+                append(table.schema.as_str(), name.as_str(), clause.as_str())?;
+            }
+        }
+    }
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        for check in domain.checks() {
+            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
+        }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            append(domain.schema.as_str(), name.as_str(), "VALUE IS NOT NULL")?;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+#[derive(Clone, Copy)]
+enum InformationSchemaTypeUsage {
+    Domain,
+    UnderlyingType,
+}
+
+fn info_column_domain_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_column_type_usage(storage, txid, arena, InformationSchemaTypeUsage::Domain)
+}
+
+fn info_column_udt_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_column_type_usage(
+        storage,
+        txid,
+        arena,
+        InformationSchemaTypeUsage::UnderlyingType,
+    )
+}
+
+fn info_column_type_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    usage: InformationSchemaTypeUsage,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        match usage {
+            InformationSchemaTypeUsage::Domain => "column_domain_usage",
+            InformationSchemaTypeUsage::UnderlyingType => "column_udt_usage",
+        },
+        match usage {
+            InformationSchemaTypeUsage::Domain => &[
+                ("domain_catalog", ColType::Text),
+                ("domain_schema", ColType::Text),
+                ("domain_name", ColType::Text),
+                ("table_catalog", ColType::Text),
+                ("table_schema", ColType::Text),
+                ("table_name", ColType::Text),
+                ("column_name", ColType::Text),
+            ],
+            InformationSchemaTypeUsage::UnderlyingType => &[
+                ("udt_catalog", ColType::Text),
+                ("udt_schema", ColType::Text),
+                ("udt_name", ColType::Text),
+                ("table_catalog", ColType::Text),
+                ("table_schema", ColType::Text),
+                ("table_name", ColType::Text),
+                ("column_name", ColType::Text),
+            ],
+        },
+    );
+    let mut output: [&[Datum]; 1024] = [&[]; 1024];
+    let mut count = 0;
+    let mut append =
+        |schema: &str, table: &str, column: &str, metadata: &ColumnMeta| -> Result<(), SqlError> {
+            let declared_oid = catalog_column_type_oid(storage, metadata, txid)?;
+            let identity =
+                information_schema_usage_type(storage, txid, metadata, declared_oid, usage)?;
+            let Some((type_schema, type_name)) = identity else {
+                return Ok(());
+            };
+            if count == output.len() {
+                return Err(catalog_capacity_exceeded(
+                    "information_schema column type usage",
+                ));
+            }
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(type_schema.as_str(), arena)?,
+                    text(type_name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(schema, arena)?,
+                    text(table, arena)?,
+                    text(column, arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+            Ok(())
+        };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for column in table.columns() {
+            append(
+                table.schema.as_str(),
+                table.name.as_str(),
+                column.name.as_str(),
+                column,
+            )?;
+        }
+    }
+    for (_, view) in storage.views_visible_to(txid) {
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let column_count = describe_view(storage, txid, view, arena, &mut columns)?;
+        for column in &columns[..column_count] {
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
+            let metadata = ColumnMeta {
+                name: SqlName::EMPTY,
+                ctype,
+                type_mod: column.type_mod,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type,
+            };
+            append(
+                view.schema.as_str(),
+                view.name.as_str(),
+                column.name,
+                &metadata,
+            )?;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn information_schema_usage_type(
+    storage: &Storage,
+    txid: u32,
+    column: &ColumnMeta,
+    declared_oid: i32,
+    usage: InformationSchemaTypeUsage,
+) -> Result<Option<(SqlName, StackStr<64>)>, SqlError> {
+    use crate::sql::types::oid;
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&declared_oid);
+    match usage {
+        InformationSchemaTypeUsage::Domain => Ok(is_domain.then(|| {
+            let domain = storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid);
+            (domain.schema, StackStr::from_str(domain.name.as_str()))
+        })),
+        InformationSchemaTypeUsage::UnderlyingType if is_domain => {
+            let domain = storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid);
+            Ok(Some(match domain.base_domain {
+                Some(parent) => (parent.schema, StackStr::from_str(parent.name.as_str())),
+                None => (
+                    SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                    StackStr::from_str(domain.base.catalog_name()),
+                ),
+            }))
+        }
+        InformationSchemaTypeUsage::UnderlyingType => Ok(Some(match column.user_type {
+            Some(identity) => {
+                let mut name = StackStr::<64>::new();
+                if matches!(column.ctype, ColType::Array(_)) {
+                    use core::fmt::Write as _;
+                    let _ = write!(name, "_{}", identity.name.as_str());
+                } else {
+                    name = StackStr::from_str(identity.name.as_str());
+                }
+                (identity.schema, name)
+            }
+            None => (
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::from_str(column.ctype.catalog_name()),
+            ),
+        })),
+    }
+}
+
+fn info_domain_udt_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domain_udt_usage",
+        &[
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let (udt_schema, udt_name) = match domain.base_domain {
+            Some(parent) => (
+                parent.schema,
+                StackStr::<64>::from_str(parent.name.as_str()),
+            ),
+            None => (
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::<64>::from_str(domain.base.catalog_name()),
+            ),
+        };
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(udt_schema.as_str(), arena)?,
+                text(udt_name.as_str(), arena)?,
+                text("postgres", arena)?,
+                text(domain.schema.as_str(), arena)?,
+                text(domain.name.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
     }
     finish(definition, &output[..count], arena)
 }

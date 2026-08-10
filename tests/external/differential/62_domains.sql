@@ -59,6 +59,22 @@ SELECT constraint_name, domain_name, is_deferrable, initially_deferred
   FROM information_schema.domain_constraints
  WHERE domain_name IN ('dom_pos', 'dom_email', 'dom_def')
  ORDER BY domain_name, constraint_name;
+SELECT constraint_name, check_clause
+  FROM information_schema.check_constraints
+ WHERE constraint_name IN ('gt0', 'lt100', 'dom_email_not_null')
+ ORDER BY constraint_name;
+SELECT domain_name, table_name, column_name
+  FROM information_schema.column_domain_usage
+ WHERE table_name = 'dom_t'
+ ORDER BY column_name;
+SELECT udt_schema, udt_name, table_name, column_name
+  FROM information_schema.column_udt_usage
+ WHERE table_name = 'dom_t'
+ ORDER BY column_name;
+SELECT udt_schema, udt_name, domain_name
+  FROM information_schema.domain_udt_usage
+ WHERE domain_name IN ('dom_pos', 'dom_email', 'dom_def')
+ ORDER BY domain_name;
 
 -- ALTER DOMAIN: add / drop a CHECK, set / drop a default, set / drop NOT NULL.
 BEGIN;

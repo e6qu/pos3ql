@@ -2536,6 +2536,101 @@ fn information_schema_domains_and_constraints_are_transaction_visible() {
 }
 
 #[test]
+fn information_schema_constraint_and_type_usage_are_transaction_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE DOMAIN information_schema_usage_base AS integer \
+           CONSTRAINT information_schema_usage_base_check CHECK (VALUE > 0); \
+         CREATE DOMAIN information_schema_usage_child AS information_schema_usage_base; \
+         CREATE TYPE information_schema_usage_enum AS ENUM ('ready'); \
+         CREATE TABLE information_schema_usage_table (\
+           domain_value information_schema_usage_base, \
+           child_value information_schema_usage_child, \
+           enum_value information_schema_usage_enum, \
+           required integer NOT NULL CONSTRAINT information_schema_usage_required_check CHECK (required > 0))",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, check_clause \
+             FROM information_schema.check_constraints \
+             WHERE constraint_name IN ('information_schema_usage_base_check', \
+               'information_schema_usage_required_check', \
+               'information_schema_usage_table_required_not_null') \
+             ORDER BY constraint_name",
+        )),
+        [
+            "information_schema_usage_base_check|(VALUE > 0)",
+            "information_schema_usage_required_check|(required > 0)",
+            "information_schema_usage_table_required_not_null|required IS NOT NULL",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT domain_name, column_name FROM information_schema.column_domain_usage \
+             WHERE table_name = 'information_schema_usage_table' ORDER BY column_name",
+        )),
+        [
+            "information_schema_usage_child|child_value",
+            "information_schema_usage_base|domain_value",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT udt_schema, udt_name, column_name \
+             FROM information_schema.column_udt_usage \
+             WHERE table_name = 'information_schema_usage_table' ORDER BY column_name",
+        )),
+        [
+            "public|information_schema_usage_base|child_value",
+            "pg_catalog|int4|domain_value",
+            "public|information_schema_usage_enum|enum_value",
+            "pg_catalog|int4|required",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT udt_schema, udt_name, domain_name \
+             FROM information_schema.domain_udt_usage \
+             WHERE domain_name IN ('information_schema_usage_base', \
+               'information_schema_usage_child') ORDER BY domain_name",
+        )),
+        [
+            "pg_catalog|int4|information_schema_usage_base",
+            "public|information_schema_usage_base|information_schema_usage_child",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.check_constraints \
+             WHERE constraint_name = 'information_schema_usage_base_check'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
 fn catalog_index_relations_are_not_silently_capped() {
     let mut config = test_config("catalog_index_relations_are_not_silently_capped");
     config.max_tables = 17;

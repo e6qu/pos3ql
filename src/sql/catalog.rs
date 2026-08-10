@@ -6471,7 +6471,7 @@ fn info_domain_constraints<'a>(
             ("initially_deferred", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = crate::storage::MAX_DOMAINS * crate::storage::MAX_DOMAIN_CHECKS;
+    const MAX_ROWS: usize = crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
     let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     let mut count = 0;
     for slot in 0..storage.domain_count() {
@@ -6485,6 +6485,23 @@ fn info_domain_constraints<'a>(
                     text("postgres", arena)?,
                     text(domain.schema.as_str(), arena)?,
                     text(check.name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(domain.name.as_str(), arena)?,
+                    text("NO", arena)?,
+                    text("NO", arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(name.as_str(), arena)?,
                     text("postgres", arena)?,
                     text(domain.schema.as_str(), arena)?,
                     text(domain.name.as_str(), arena)?,

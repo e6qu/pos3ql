@@ -2487,7 +2487,8 @@ fn information_schema_domains_and_constraints_are_transaction_visible() {
         &mut budget,
         &mut owner,
         "CREATE DOMAIN information_schema_domain AS varchar(7) \
-           CONSTRAINT information_schema_domain_check CHECK (VALUE <> '')",
+           CONSTRAINT information_schema_domain_check CHECK (VALUE <> ''); \
+         CREATE DOMAIN information_schema_not_null_domain AS integer NOT NULL",
     );
     assert_eq!(
         data_rows(&run_with_txn_bytes(
@@ -2510,6 +2511,16 @@ fn information_schema_domains_and_constraints_are_transaction_visible() {
              WHERE domain_name = 'information_schema_domain'",
         )),
         ["information_schema_domain_check|information_schema_domain|NO|NO"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, domain_name FROM information_schema.domain_constraints \
+             WHERE domain_name = 'information_schema_not_null_domain'",
+        )),
+        ["information_schema_not_null_domain_not_null|information_schema_not_null_domain"]
     );
     assert_eq!(
         data_rows(&run_with_txn_bytes(

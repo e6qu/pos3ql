@@ -2280,6 +2280,484 @@ fn transactional_alter_table_versions_shape_and_rows() {
 }
 
 #[test]
+fn information_schema_columns_describes_views_from_their_bound_row_type() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN view_column_domain AS integer CHECK (VALUE > 0); \
+         CREATE TYPE view_column_enum AS ENUM ('ready'); \
+         CREATE VIEW view_column_catalog AS \
+           SELECT 1::view_column_domain AS domain_value, \
+                  'ready'::view_column_enum AS enum_value, \
+                  ARRAY[1] AS array_value",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT column_name, ordinal_position, is_nullable, data_type \
+             FROM information_schema.columns \
+             WHERE table_name = 'view_column_catalog' \
+             ORDER BY ordinal_position",
+        )),
+        [
+            "domain_value|1|YES|integer",
+            "enum_value|2|YES|USER-DEFINED",
+            "array_value|3|YES|ARRAY",
+        ]
+    );
+
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE SCHEMA pending_view_schema",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE pending_view_schema.pending_view_source (value integer); \
+         CREATE VIEW pending_view_schema.pending_view_column_catalog AS \
+           SELECT value FROM pending_view_schema.pending_view_source",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["value"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT table_type FROM information_schema.tables \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["VIEW"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = 'pending_view_schema' \
+               AND table_name = 'pending_view_column_catalog'",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["pending_view_schema"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT schema_owner, default_character_set_catalog, \
+                    default_character_set_schema, default_character_set_name, sql_path \
+             FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["postgres|NULL|NULL|NULL|NULL"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT nspname FROM pg_namespace WHERE nspname = 'pending_view_schema'; \
+             SELECT typname FROM pg_type WHERE typname = 'pending_view_column_catalog'; \
+             SELECT has_schema_privilege(oid, 'USAGE') FROM pg_namespace \
+              WHERE nspname = 'pending_view_schema'",
+        )),
+        ["pending_view_schema", "pending_view_column_catalog", "t"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.schemata \
+             WHERE schema_name = 'pending_view_schema'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn information_schema_columns_exposes_complete_column_metadata() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN information_schema_column_domain AS varchar(7); \
+         CREATE TYPE information_schema_column_enum AS ENUM ('ready'); \
+         CREATE TABLE information_schema_column_metadata (\
+           code varchar(12) NOT NULL DEFAULT 'new', \
+           amount numeric(9,3), \
+           occurred timestamp(2), \
+           generated integer GENERATED ALWAYS AS (amount::integer + 1) STORED, \
+           identity bigint GENERATED BY DEFAULT AS IDENTITY, \
+           domain_value information_schema_column_domain, \
+           enum_value information_schema_column_enum)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT column_name, character_maximum_length, numeric_precision, \
+                    numeric_precision_radix, numeric_scale, datetime_precision, \
+                    data_type, domain_name, udt_schema, udt_name, is_identity, \
+                    identity_generation, identity_maximum, identity_minimum, \
+                    identity_cycle, is_generated, dtd_identifier, is_updatable \
+             FROM information_schema.columns \
+             WHERE table_name = 'information_schema_column_metadata' \
+             ORDER BY ordinal_position",
+        )),
+        [
+            "code|12|NULL|NULL|NULL|NULL|character varying|NULL|pg_catalog|varchar|NO|NULL|NULL|NULL|NO|NEVER|1|YES",
+            "amount|NULL|9|10|3|NULL|numeric|NULL|pg_catalog|numeric|NO|NULL|NULL|NULL|NO|NEVER|2|YES",
+            "occurred|NULL|NULL|NULL|NULL|2|timestamp without time zone|NULL|pg_catalog|timestamp|NO|NULL|NULL|NULL|NO|NEVER|3|YES",
+            "generated|NULL|32|2|0|NULL|integer|NULL|pg_catalog|int4|NO|NULL|NULL|NULL|NO|ALWAYS|4|YES",
+            "identity|NULL|64|2|0|NULL|bigint|NULL|pg_catalog|int8|YES|BY DEFAULT|9223372036854775807|1|NO|NEVER|5|YES",
+            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|public|information_schema_column_domain|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
+            "enum_value|NULL|NULL|NULL|NULL|NULL|USER-DEFINED|NULL|public|information_schema_column_enum|NO|NULL|NULL|NULL|NO|NEVER|7|YES",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE information_schema_identity_options (\
+           value integer GENERATED BY DEFAULT AS IDENTITY \
+             (START WITH 7 INCREMENT BY 3 MINVALUE 4 MAXVALUE 40 CYCLE))",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT identity_start, identity_increment, identity_maximum, \
+                    identity_minimum, identity_cycle \
+             FROM information_schema.columns \
+             WHERE table_name = 'information_schema_identity_options'",
+        )),
+        ["7|3|40|4|YES"]
+    );
+}
+
+#[test]
+fn information_schema_domains_and_constraints_are_transaction_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE DOMAIN information_schema_domain AS varchar(7) \
+           CONSTRAINT information_schema_domain_check CHECK (VALUE <> ''); \
+         CREATE DOMAIN information_schema_not_null_domain AS integer NOT NULL",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT domain_name, data_type, character_maximum_length, udt_schema, \
+                    udt_name, dtd_identifier FROM information_schema.domains \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["information_schema_domain|character varying|7|pg_catalog|varchar|1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, domain_name, is_deferrable, initially_deferred \
+             FROM information_schema.domain_constraints \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["information_schema_domain_check|information_schema_domain|NO|NO"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, domain_name FROM information_schema.domain_constraints \
+             WHERE domain_name = 'information_schema_not_null_domain'",
+        )),
+        ["information_schema_not_null_domain_not_null|information_schema_not_null_domain"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.domains \
+             WHERE domain_name = 'information_schema_domain'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn information_schema_constraint_and_type_usage_are_transaction_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE DOMAIN information_schema_usage_base AS integer \
+           CONSTRAINT information_schema_usage_base_check CHECK (VALUE > 0); \
+         CREATE DOMAIN information_schema_usage_child AS information_schema_usage_base; \
+         CREATE TYPE information_schema_usage_enum AS ENUM ('ready'); \
+         CREATE TABLE information_schema_usage_table (\
+           domain_value information_schema_usage_base, \
+           child_value information_schema_usage_child, \
+           enum_value information_schema_usage_enum, \
+           required integer NOT NULL CONSTRAINT information_schema_usage_required_check CHECK (required > 0))",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT constraint_name, check_clause \
+             FROM information_schema.check_constraints \
+             WHERE constraint_name IN ('information_schema_usage_base_check', \
+               'information_schema_usage_required_check', \
+               'information_schema_usage_table_required_not_null') \
+             ORDER BY constraint_name",
+        )),
+        [
+            "information_schema_usage_base_check|(VALUE > 0)",
+            "information_schema_usage_required_check|(required > 0)",
+            "information_schema_usage_table_required_not_null|required IS NOT NULL",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT domain_name, column_name FROM information_schema.column_domain_usage \
+             WHERE table_name = 'information_schema_usage_table' ORDER BY column_name",
+        )),
+        [
+            "information_schema_usage_child|child_value",
+            "information_schema_usage_base|domain_value",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT udt_schema, udt_name, column_name \
+             FROM information_schema.column_udt_usage \
+             WHERE table_name = 'information_schema_usage_table' ORDER BY column_name",
+        )),
+        [
+            "public|information_schema_usage_base|child_value",
+            "pg_catalog|int4|domain_value",
+            "public|information_schema_usage_enum|enum_value",
+            "pg_catalog|int4|required",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT udt_schema, udt_name, domain_name \
+             FROM information_schema.domain_udt_usage \
+             WHERE domain_name IN ('information_schema_usage_base', \
+               'information_schema_usage_child') ORDER BY domain_name",
+        )),
+        [
+            "pg_catalog|int4|information_schema_usage_base",
+            "public|information_schema_usage_base|information_schema_usage_child",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.check_constraints \
+             WHERE constraint_name = 'information_schema_usage_base_check'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn information_schema_column_udt_usage_is_not_silently_capped() {
+    let mut config = test_config("information_schema_column_udt_usage_is_not_silently_capped");
+    config.max_tables = 17;
+    config.max_value_indexes = 17 * 64;
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::new();
+    for table in 0..17 {
+        if table > 0 {
+            definition.push_str("; ");
+        }
+        definition.push_str(&format!("CREATE TABLE information_schema_usage_{table} ("));
+        for column in 0..64 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!("column_{column} integer"));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM information_schema.column_udt_usage",
+            1 << 21,
+        )),
+        ["1088"]
+    );
+}
+
+#[test]
+fn catalog_index_relations_are_not_silently_capped() {
+    let mut config = test_config("catalog_index_relations_are_not_silently_capped");
+    config.max_tables = 17;
+    config.max_value_indexes = 17 * 16;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::new();
+    for table in 0..17 {
+        if table > 0 {
+            definition.push_str("; ");
+        }
+        definition.push_str(&format!("CREATE TABLE catalog_index_{table} ("));
+        for column in 0..16 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!("column_{column} integer UNIQUE"));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_index; \
+             SELECT count(*) FROM pg_class WHERE relkind = 'i'; \
+             SELECT count(*) FROM pg_indexes; \
+             SELECT count(*) FROM pg_attribute attribute \
+              JOIN pg_class relation ON relation.oid = attribute.attrelid \
+              WHERE relation.relkind = 'i'",
+            1 << 21,
+        )),
+        ["272", "272", "272", "272"]
+    );
+}
+
+#[test]
+fn catalog_foreign_keys_are_not_silently_capped() {
+    let mut config = test_config("catalog_foreign_keys_are_not_silently_capped");
+    config.max_tables = 34;
+    config.max_value_indexes = 8;
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::from("CREATE TABLE catalog_parent (");
+    for column in 0..8 {
+        if column > 0 {
+            definition.push_str(", ");
+        }
+        definition.push_str(&format!("column_{column} integer UNIQUE"));
+    }
+    definition.push(')');
+    for table in 0..33 {
+        definition.push_str(&format!("; CREATE TABLE catalog_child_{table} ("));
+        for column in 0..8 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!(
+                "column_{column} integer REFERENCES catalog_parent(column_{column})"
+            ));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'f'",
+            1 << 21,
+        )),
+        ["264"]
+    );
+}
+
+#[test]
 fn transactional_alter_table_savepoint_and_rename_visibility() {
     let (mut engine, mut budget) = test_engine();
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
@@ -11275,7 +11753,7 @@ fn psql_catalog_listing_contracts() {
             &mut budget,
             "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
                     rolcanlogin, rolconnlimit, rolreplication, rolbypassrls
-             FROM pg_roles"
+             FROM pg_roles WHERE rolname = 'postgres'"
         )),
         ["postgres|t|t|t|t|t|-1|t|t"]
     );
@@ -11967,9 +12445,20 @@ fn pg_dump_bootstrap_surface() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1"
+            "SELECT oid, rolname FROM pg_catalog.pg_roles WHERE rolname = 'postgres'"
         )),
         ["10|postgres"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nspowner, pg_get_userbyid(nspowner) FROM pg_namespace \
+             WHERE nspname = 'public'; \
+             SELECT rolname, rolcanlogin FROM pg_roles \
+             WHERE rolname = 'pg_database_owner'"
+        )),
+        ["6171|pg_database_owner", "pg_database_owner|f"]
     );
     assert_eq!(
         data_rows(&run_with(

@@ -186,18 +186,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn role_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let Some(slot) = self.storage.role_slot_by_oid(oid, self.txid) else {
-            return Ok(None);
-        };
-        Ok(Some(
-            arena
-                .alloc_str(self.storage.role_name(slot, self.txid).as_str())
-                .map_err(|_| arena_full())?,
-        ))
+        if let Some(slot) = self.storage.role_slot_by_oid(oid, self.txid) {
+            let name = self.storage.role_name(slot, self.txid);
+            Ok(Some(
+                arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+            ))
+        } else if let Some(name) = super::catalog::predefined_role_name(oid) {
+            Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn schema_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let Some(name) = super::catalog::schema_name_by_oid(self.storage, oid) else {
+        let Some(name) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
         Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))

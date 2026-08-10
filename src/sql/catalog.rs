@@ -12,7 +12,7 @@ use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::eval::{SqlError, sqlstate};
-use super::types::{ColType, Datum};
+use super::types::{ColType, Datum, TypeMod};
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
@@ -68,6 +68,12 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "role_table_grants"
                 | "sequences"
                 | "usage_privileges"
+                | "domains"
+                | "domain_constraints"
+                | "check_constraints"
+                | "column_domain_usage"
+                | "column_udt_usage"
+                | "domain_udt_usage"
         ),
         Some(_) => false,
         None => matches!(
@@ -925,7 +931,7 @@ pub fn synthesize<'a>(
         (false, "pg_views") => pg_views(storage, txid, arena),
         (true, "tables") => info_tables(storage, txid, arena),
         (true, "columns") => info_columns(storage, txid, arena),
-        (true, "schemata") => info_schemata(storage, arena),
+        (true, "schemata") => info_schemata(storage, txid, arena),
         (true, "table_constraints") => info_table_constraints(storage, txid, arena),
         (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
         (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
@@ -934,6 +940,12 @@ pub fn synthesize<'a>(
         (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
         (true, "sequences") => info_sequences(storage, txid, arena),
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
+        (true, "domains") => info_domains(storage, txid, arena),
+        (true, "domain_constraints") => info_domain_constraints(storage, txid, arena),
+        (true, "check_constraints") => info_check_constraints(storage, txid, arena),
+        (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
+        (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
+        (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -948,8 +960,52 @@ fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
 }
 
+const PG_DATABASE_OWNER_OID: i32 = 6_171;
+const PREDEFINED_ROLES: &[(i32, &str)] = &[(PG_DATABASE_OWNER_OID, "pg_database_owner")];
+
+pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
+    PREDEFINED_ROLES
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
+}
+
+#[derive(Clone, Copy)]
+enum CatalogOwner {
+    Role(usize),
+    DatabaseOwner,
+}
+
+fn catalog_owner(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    txid: u32,
+) -> CatalogOwner {
+    if matches!(object.class, crate::storage::AccessClass::Schema) && object.slot == 0 {
+        CatalogOwner::DatabaseOwner
+    } else {
+        CatalogOwner::Role(storage.object_owner(object, txid))
+    }
+}
+
+fn catalog_owner_oid(owner: CatalogOwner) -> i32 {
+    match owner {
+        CatalogOwner::Role(slot) => Storage::role_oid(slot),
+        CatalogOwner::DatabaseOwner => PG_DATABASE_OWNER_OID,
+    }
+}
+
+fn catalog_owner_name(storage: &Storage, owner: CatalogOwner, txid: u32) -> SqlName {
+    match owner {
+        CatalogOwner::Role(slot) => storage.role_name(slot, txid),
+        CatalogOwner::DatabaseOwner => {
+            SqlName::parse("pg_database_owner").expect("built-in role fits")
+        }
+    }
+}
+
 fn owner_oid(storage: &Storage, class: crate::storage::AccessClass, slot: usize, txid: u32) -> i32 {
-    Storage::role_oid(storage.object_owner(
+    catalog_owner_oid(catalog_owner(
+        storage,
         crate::storage::AccessObject {
             class,
             slot: slot as u16,
@@ -965,14 +1021,22 @@ fn owner_name<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let role = storage.object_owner(
-        crate::storage::AccessObject {
-            class,
-            slot: slot as u16,
-        },
-        txid,
-    );
-    text(storage.role_name(role, txid).as_str(), arena)
+    text(
+        catalog_owner_name(
+            storage,
+            catalog_owner(
+                storage,
+                crate::storage::AccessObject {
+                    class,
+                    slot: slot as u16,
+                },
+                txid,
+            ),
+            txid,
+        )
+        .as_str(),
+        arena,
+    )
 }
 
 fn acl<'a>(
@@ -1004,7 +1068,7 @@ fn acl<'a>(
         return Ok(Datum::Null);
     }
     let mut values = [Datum::Null; crate::storage::MAX_ACL_ENTRIES + 1];
-    let owner_name = storage.role_name(owner, txid);
+    let owner_name = catalog_owner_name(storage, catalog_owner(storage, object, txid), txid);
     let all = match object.class {
         crate::storage::AccessClass::Table
         | crate::storage::AccessClass::View
@@ -1087,15 +1151,20 @@ fn acl<'a>(
         let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
             .then(|| storage.role_name(grantee as usize, txid));
         let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
-        let grantor = storage.role_name(grantor as usize, txid);
+        let grantor_name = if matches!(
+            catalog_owner(storage, object, txid),
+            CatalogOwner::DatabaseOwner
+        ) && grantor == owner as u16
+        {
+            None
+        } else {
+            Some(storage.role_name(grantor as usize, txid))
+        };
+        let grantor = grantor_name
+            .as_ref()
+            .map_or("pg_database_owner", |name| name.as_str());
         let mut rendered = StackStr::<256>::new();
-        render(
-            grantee,
-            grantor.as_str(),
-            privileges,
-            grant_options,
-            &mut rendered,
-        );
+        render(grantee, grantor, privileges, grant_options, &mut rendered);
         values[count] = Datum::Text(
             arena
                 .alloc_str(rendered.as_str())
@@ -1265,12 +1334,12 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
     }
 }
 
-pub(crate) fn schema_name_by_oid(storage: &Storage, oid: i32) -> Option<&str> {
+pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
     match oid {
         PUBLIC_NS_OID => Some("public"),
         PG_CATALOG_NS_OID => Some("pg_catalog"),
         _ => storage
-            .live_schemas()
+            .visible_schemas(txid)
             .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
             .map(|(_, schema)| schema.name.as_str()),
     }
@@ -1341,24 +1410,11 @@ struct IdxInfo {
     is_unique: bool,
 }
 
-const MAX_SYNTH_INDEXES: usize = 256;
-
 /// Enumerates every index relation psql `\d` would show: a single-column PK or
 /// UNIQUE (from column flags), a multi-column PK/UNIQUE (from `uniques`), and
 /// explicit `CREATE INDEX`es. OIDs are assigned by table slot + position so the
 /// same index resolves identically here and in `pg_get_indexdef`.
-fn collect_indexes(
-    storage: &Storage,
-    txid: u32,
-    out: &mut [Option<IdxInfo>; MAX_SYNTH_INDEXES],
-) -> usize {
-    let mut n = 0;
-    let mut push = |info: IdxInfo, n: &mut usize| {
-        if *n < MAX_SYNTH_INDEXES {
-            out[*n] = Some(info);
-            *n += 1;
-        }
-    };
+fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
     for slot in 0..storage.table_count() {
         if !storage.table(slot).visible_to(txid) {
             continue;
@@ -1394,64 +1450,113 @@ fn collect_indexes(
         for (ci, col) in def.columns().iter().enumerate() {
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
-                push(
-                    mk(
-                        &[ci as u16],
-                        [false; crate::storage::MAX_INDEX_COLS],
-                        [false; crate::storage::MAX_INDEX_COLS],
-                        true,
-                        true,
-                        name,
-                    ),
-                    &mut n,
-                );
+                visit(mk(
+                    &[ci as u16],
+                    [false; crate::storage::MAX_INDEX_COLS],
+                    [false; crate::storage::MAX_INDEX_COLS],
+                    true,
+                    true,
+                    name,
+                ));
             } else if col.unique {
                 let name = stack_str_64(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
-                push(
-                    mk(
-                        &[ci as u16],
-                        [false; crate::storage::MAX_INDEX_COLS],
-                        [false; crate::storage::MAX_INDEX_COLS],
-                        false,
-                        true,
-                        name,
-                    ),
-                    &mut n,
-                );
+                visit(mk(
+                    &[ci as u16],
+                    [false; crate::storage::MAX_INDEX_COLS],
+                    [false; crate::storage::MAX_INDEX_COLS],
+                    false,
+                    true,
+                    name,
+                ));
             }
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
-            push(
-                mk(
-                    uk.columns(),
-                    [false; crate::storage::MAX_INDEX_COLS],
-                    [false; crate::storage::MAX_INDEX_COLS],
-                    uk.is_primary,
-                    true,
-                    stack_str_64(uk.name.as_str()),
-                ),
-                &mut n,
-            );
+            visit(mk(
+                uk.columns(),
+                [false; crate::storage::MAX_INDEX_COLS],
+                [false; crate::storage::MAX_INDEX_COLS],
+                uk.is_primary,
+                true,
+                stack_str_64(uk.name.as_str()),
+            ));
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
-            push(
-                mk(
-                    &index.columns[..index.n_cols],
-                    index.descending,
-                    index.nulls_first,
-                    false,
-                    index.unique,
-                    stack_str_64(index.name.as_str()),
-                ),
-                &mut n,
-            );
+            visit(mk(
+                &index.columns[..index.n_cols],
+                index.descending,
+                index.nulls_first,
+                false,
+                index.unique,
+                stack_str_64(index.name.as_str()),
+            ));
         }
     }
-    n
+}
+
+fn empty_index() -> IdxInfo {
+    IdxInfo {
+        oid: 0,
+        table_oid: 0,
+        table_slot: 0,
+        name: StackStr::new(),
+        columns: [0; crate::storage::MAX_INDEX_COLS],
+        descending: [false; crate::storage::MAX_INDEX_COLS],
+        nulls_first: [false; crate::storage::MAX_INDEX_COLS],
+        n_cols: 0,
+        is_primary: false,
+        is_unique: false,
+    }
+}
+
+/// Materializes every visible index in the statement arena. This is sized from
+/// the actual catalog, rather than a separate arbitrary limit, so an accepted
+/// startup table/index capacity cannot silently disappear from introspection.
+fn collect_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [IdxInfo], SqlError> {
+    let mut count = 0usize;
+    visit_indexes(storage, txid, |_| count += 1);
+    let indexes = arena
+        .alloc_slice_with(count, |_| empty_index())
+        .map_err(|_| arena_full())?;
+    let mut next = 0usize;
+    visit_indexes(storage, txid, |index| {
+        indexes[next] = index;
+        next += 1;
+    });
+    Ok(indexes)
+}
+
+fn index_oid_by_name(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<i32> {
+    let mut found = None;
+    visit_indexes(storage, txid, |index| {
+        if found.is_none()
+            && index.name.as_str() == name
+            && schema.is_none_or(|schema| {
+                storage.table_def(index.table_slot, txid).schema.as_str() == schema
+            })
+        {
+            found = Some(index.oid);
+        }
+    });
+    found
+}
+
+fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
+    let mut found = false;
+    visit_indexes(storage, txid, |index| found |= index.oid == oid);
+    found
 }
 
 fn stack_str_64(s: &str) -> StackStr<64> {
@@ -1499,9 +1604,8 @@ pub fn relname_text<'a>(
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
-    let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, txid, &mut indices);
-    for info in indices[..n].iter().flatten() {
+    let indices = collect_indexes(storage, txid, arena)?;
+    for info in indices {
         if info.oid == oid {
             let bytes = arena
                 .alloc_slice_copy(info.name.as_str().as_bytes())
@@ -1556,14 +1660,8 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
             return Some(table_oid(storage, slot));
         }
     }
-    let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, txid, &mut indices);
-    if let Some(info) = indices[..n]
-        .iter()
-        .flatten()
-        .find(|info| info.name.as_str() == relation)
-    {
-        return Some(info.oid);
+    if let Some(oid) = index_oid_by_name(storage, txid, schema, relation) {
+        return Some(oid);
     }
     for slot in 0..storage.sequence_count() {
         let sequence = storage.sequence_for(slot, txid);
@@ -1590,12 +1688,16 @@ pub fn view_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if !table.visible_to(txid) {
+            continue;
+        }
         if table_oid(storage, slot) != oid {
             continue;
         }
         let Some(view) =
-            storage.find_matview(table.def.schema.as_str(), table.def.name.as_str(), 0)
+            storage.find_matview(table.def.schema.as_str(), table.def.name.as_str(), txid)
         else {
             return Ok(None);
         };
@@ -1619,7 +1721,10 @@ pub fn view_def_text<'a>(
 /// and indexes have no physical row store in pos3ql, so their exact size is
 /// zero; tables and materialized views share the table row store.
 pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i64>, SqlError> {
-    for (slot, _) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
         if table_oid(storage, slot) != oid {
             continue;
         }
@@ -1631,13 +1736,7 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
     {
         return Ok(Some(0));
     }
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, txid, &mut indexes);
-    if indexes[..count]
-        .iter()
-        .flatten()
-        .any(|index| index.oid == oid)
-    {
+    if has_index_oid(storage, txid, oid) {
         return Ok(Some(0));
     }
     Ok(None)
@@ -1645,7 +1744,10 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
 
 pub fn database_size(storage: &Storage, txid: u32) -> Result<i64, SqlError> {
     let mut total = 0i64;
-    for (slot, _) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
         total = total
             .checked_add(table_size(storage, txid, slot)?)
             .ok_or_else(|| {
@@ -1699,7 +1801,7 @@ fn pg_description<'a>(
     let mut n = 0;
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_description"));
         }
         let (objoid, classoid) = match class {
             crate::storage::CommentClass::Relation => {
@@ -1755,16 +1857,7 @@ fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Op
             return Some(view_oid(slot));
         }
     }
-    let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, txid, &mut indices);
-    indices[..n]
-        .iter()
-        .flatten()
-        .find(|info| {
-            info.name.as_str() == name
-                && storage.table_def(info.table_slot, txid).schema.as_str() == schema
-        })
-        .map(|info| info.oid)
+    index_oid_by_name(storage, txid, Some(schema), name)
 }
 
 /// Resolves a modeled built-in SQL type to its real catalog name and OID.
@@ -2015,12 +2108,7 @@ const FIRST_NOT_NULL_OID: i32 = 450_000;
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be
 /// rendered), matching that a dropped parent leaves no referential row.
-fn collect_fkeys(
-    storage: &Storage,
-    txid: u32,
-    out: &mut [Option<FkInfo>; MAX_SYNTH_INDEXES],
-) -> usize {
-    let mut n = 0;
+fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
     for slot in 0..storage.table_count() {
         if !storage.table(slot).visible_to(txid) {
             continue;
@@ -2033,10 +2121,7 @@ fn collect_fkeys(
             else {
                 continue;
             };
-            if n == MAX_SYNTH_INDEXES {
-                break;
-            }
-            out[n] = Some(FkInfo {
+            visit(FkInfo {
                 oid: FIRST_FK_OID + slot as i32 * MAX_INDEXES_PER_TABLE + i as i32,
                 conrelid,
                 confrelid: table_oid(storage, pslot),
@@ -2044,10 +2129,37 @@ fn collect_fkeys(
                 fk_index: i,
                 name: stack_str_64(fk.name.as_str()),
             });
-            n += 1;
         }
     }
-    n
+}
+
+fn empty_foreign_key() -> FkInfo {
+    FkInfo {
+        oid: 0,
+        conrelid: 0,
+        confrelid: 0,
+        child_slot: 0,
+        fk_index: 0,
+        name: StackStr::new(),
+    }
+}
+
+fn collect_fkeys<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [FkInfo], SqlError> {
+    let mut count = 0usize;
+    visit_fkeys(storage, txid, |_| count += 1);
+    let foreign_keys = arena
+        .alloc_slice_with(count, |_| empty_foreign_key())
+        .map_err(|_| arena_full())?;
+    let mut next = 0usize;
+    visit_fkeys(storage, txid, |foreign_key| {
+        foreign_keys[next] = foreign_key;
+        next += 1;
+    });
+    Ok(foreign_keys)
 }
 
 /// The `FOREIGN KEY (...) REFERENCES parent(...)` definition psql prints from
@@ -2058,9 +2170,8 @@ pub fn constraint_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let mut fks = [None; MAX_SYNTH_INDEXES];
-    let n = collect_fkeys(storage, txid, &mut fks);
-    for info in fks[..n].iter().flatten() {
+    let fks = collect_fkeys(storage, txid, arena)?;
+    for info in fks {
         if info.oid != oid {
             continue;
         }
@@ -2139,9 +2250,8 @@ pub fn constraint_def_text<'a>(
             )?));
         }
     }
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, txid, &mut indexes);
-    for info in indexes[..count].iter().flatten() {
+    let indexes = collect_indexes(storage, txid, arena)?;
+    for info in indexes {
         if oid != info.oid + 500_000 || (!info.is_primary && !info.is_unique) {
             continue;
         }
@@ -2194,9 +2304,8 @@ pub fn index_def_text<'a>(
     col: usize,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let mut indices = [None; MAX_SYNTH_INDEXES];
-    let n = collect_indexes(storage, txid, &mut indices);
-    for info in indices[..n].iter().flatten() {
+    let indices = collect_indexes(storage, txid, arena)?;
+    for info in indices {
         if info.oid != oid {
             continue;
         }
@@ -2300,6 +2409,14 @@ fn row<'a>(vals: &[Datum<'a>], arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlE
         .map_err(|_| arena_full())
 }
 
+fn catalog_capacity_exceeded(relation: &str) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "{} exceeds static catalog capacity",
+        relation
+    )
+}
+
 fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     arena
         .alloc_str(s)
@@ -2309,13 +2426,14 @@ fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
 
 fn describe_view<'a>(
     storage: &'a Storage,
+    txid: u32,
     view: &'a crate::storage::ViewDef,
     arena: &'a Arena,
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), 0);
-    super::query::describe_query_under(view.sql.as_str(), storage, 0, path, arena, out)
+    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    super::query::describe_query_under(view.sql.as_str(), storage, txid, path, arena, out)
 }
 
 fn pg_stats<'a>(
@@ -2649,10 +2767,8 @@ fn pg_class<'a>(
             ("relispopulated", ColType::Bool),
         ],
     );
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, txid, &mut indexes);
-    let mut foreign_keys = [None; MAX_SYNTH_INDEXES];
-    let n_foreign_keys = collect_fkeys(storage, txid, &mut foreign_keys);
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     for slot in 0..storage.table_count() {
@@ -2662,17 +2778,13 @@ fn pg_class<'a>(
         }
         let table_def = storage.table_def(slot, txid);
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_class"));
         }
         let toid = table_oid(storage, slot);
-        let has_index = indexes[..n_idx]
-            .iter()
-            .flatten()
-            .any(|i| i.table_oid == toid);
+        let has_index = indexes.iter().any(|i| i.table_oid == toid);
         let has_triggers = !table_def.fkeys().is_empty()
-            || foreign_keys[..n_foreign_keys]
+            || foreign_keys
                 .iter()
-                .flatten()
                 .any(|foreign_key| foreign_key.confrelid == toid);
         let n_checks = table_def.n_checks as i32;
         let statistics = storage.table_statistics(slot, txid);
@@ -2752,9 +2864,9 @@ fn pg_class<'a>(
     }
     // Each index is itself a relation (relkind 'i'), so psql's `\d` join
     // (pg_index i JOIN pg_class c2 ON i.indexrelid = c2.oid) finds its name.
-    for info in indexes[..n_idx].iter().flatten() {
+    for info in indexes {
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_class"));
         }
         out[n] = row(
             &[
@@ -2809,7 +2921,7 @@ fn pg_class<'a>(
             continue;
         }
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_class"));
         }
         out[n] = row(
             &[
@@ -2866,10 +2978,10 @@ fn pg_class<'a>(
     // rule used when the view executes.
     for (slot, view) in storage.views_visible_to(txid) {
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_class"));
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let n_columns = describe_view(storage, view, arena, &mut columns)?;
+        let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
         out[n] = row(
             &[
                 Datum::Int4(view_oid(slot)),
@@ -2964,13 +3076,12 @@ fn pg_constraint<'a>(
             ("conbin", ColType::Text),
         ],
     );
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, txid, &mut indexes);
+    let indexes = collect_indexes(storage, txid, arena)?;
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
-    for info in indexes[..n_idx].iter().flatten() {
+    for info in indexes {
         let contype = if info.is_primary {
             "p"
         } else if info.is_unique {
@@ -2979,7 +3090,7 @@ fn pg_constraint<'a>(
             continue;
         };
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_constraint"));
         }
         out[n] = row(
             &[
@@ -3022,18 +3133,16 @@ fn pg_constraint<'a>(
     // Foreign-key constraints (contype 'f'): conrelid on the child, confrelid on
     // the referenced parent, so psql's "Foreign-key constraints" (child) and
     // "Referenced by" (parent) sections both resolve.
-    let mut fks = [None; MAX_SYNTH_INDEXES];
-    let n_fk = collect_fkeys(storage, txid, &mut fks);
-    for info in fks[..n_fk].iter().flatten() {
+    let fks = collect_fkeys(storage, txid, arena)?;
+    for info in fks {
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_constraint"));
         }
         let fk = &storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
         // conindid points at the parent's unique/PK index backing the referenced
         // columns, which JDBC joins to for foreign-key metadata.
-        let conindid = indexes[..n_idx]
+        let conindid = indexes
             .iter()
-            .flatten()
             .find(|ix| {
                 ix.table_oid == info.confrelid
                     && ix.n_cols == fk.n_parent_cols
@@ -3088,7 +3197,7 @@ fn pg_constraint<'a>(
         }
         for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_constraint"));
             }
             out[n] = row(
                 &[
@@ -3198,7 +3307,7 @@ fn pg_constraint<'a>(
         }
         for (check_index, check) in domain.checks().iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_constraint"));
             }
             out[n] = row(
                 &[
@@ -3440,11 +3549,12 @@ fn pg_index<'a>(
             ("indclass", ColType::Array(super::types::ArrElem::Int4)),
         ],
     );
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let n_idx = collect_indexes(storage, txid, &mut indexes);
-    let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let out = arena
+        .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
-    for info in indexes[..n_idx].iter().flatten() {
+    for info in indexes {
         // indkey is the 1-based attribute numbers as an int2vector-like array;
         // indoption is one flag per column (0 = default ascending).
         let zeros = [0u16; crate::storage::MAX_INDEX_COLS];
@@ -3547,7 +3657,7 @@ fn pg_attribute<'a>(
         }
         for (i, c) in storage.table_def(slot, txid).columns().iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_attribute"));
             }
             out[n] = row(
                 &[
@@ -3591,13 +3701,12 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    let mut indexes = [None; MAX_SYNTH_INDEXES];
-    let index_count = collect_indexes(storage, txid, &mut indexes);
-    for info in indexes[..index_count].iter().flatten() {
+    let indexes = collect_indexes(storage, txid, arena)?;
+    for info in indexes {
         let table = storage.table_def(info.table_slot, txid);
         for (attribute, &column_index) in info.columns[..info.n_cols].iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_attribute"));
             }
             let column = &table.columns()[column_index as usize];
             out[n] = row(
@@ -3633,10 +3742,10 @@ fn pg_attribute<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, view, arena, &mut columns)?;
+        let count = describe_view(storage, txid, view, arena, &mut columns)?;
         for (attribute, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_attribute"));
             }
             let ctype = super::exec::coltype_of_oid(column.type_oid).ok_or_else(|| {
                 sql_err!(
@@ -3711,7 +3820,7 @@ fn pg_attrdef<'a>(
                 continue;
             };
             if n == out.len() {
-                break;
+                return Err(catalog_capacity_exceeded("pg_attrdef"));
             }
             out[n] = row(
                 &[
@@ -4104,9 +4213,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         n += 1;
     }
     // Every table, materialized view and plain view owns a composite row type.
-    for (slot, table) in storage.live_tables() {
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if !table.visible_to(txid) {
+            continue;
+        }
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_type"));
         }
         out[n] = row(
             &[
@@ -4152,7 +4265,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     }
     for (slot, view) in storage.views_visible_to(txid) {
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_type"));
         }
         out[n] = row(
             &[
@@ -4218,7 +4331,7 @@ fn pg_namespace<'a>(
         arena,
     )?;
     let mut n = 1;
-    for (slot, schema) in storage.live_schemas() {
+    for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
@@ -4270,11 +4383,12 @@ fn pg_indexes<'a>(
             ("indexdef", ColType::Text),
         ],
     );
-    let mut indices = [None; MAX_SYNTH_INDEXES];
-    let count = collect_indexes(storage, txid, &mut indices);
-    let mut out: [&[Datum]; MAX_SYNTH_INDEXES] = [&[]; MAX_SYNTH_INDEXES];
+    let indices = collect_indexes(storage, txid, arena)?;
+    let out = arena
+        .alloc_slice_with(indices.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
-    for info in indices[..count].iter().flatten() {
+    for info in indices {
         let table_def = storage.table_def(info.table_slot, txid);
         let mut indexdef = StackStr::<896>::new();
         {
@@ -4330,9 +4444,6 @@ fn pg_indexes<'a>(
             arena,
         )?;
         n += 1;
-        if n == out.len() {
-            break;
-        }
     }
     finish(def, &out[..n], arena)
 }
@@ -4358,7 +4469,10 @@ fn pg_tables<'a>(
         }
         let table = storage.table_def(slot, txid);
         if n == out.len() {
-            break;
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "information_schema.tables exceeds static capacity"
+            ));
         }
         out[n] = row(
             &[
@@ -4420,8 +4534,28 @@ fn pg_roles<'a>(
             ("rolbypassrls", ColType::Bool),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
+        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
     let mut count = 0usize;
+    for &(oid, name) in PREDEFINED_ROLES {
+        output[count] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(-1),
+                Datum::Null,
+                Datum::Bool(false),
+                Datum::Bool(false),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {
@@ -4527,8 +4661,29 @@ fn pg_authid<'a>(
             ("rolvaliduntil", ColType::Timestamptz),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
+        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
     let mut count = 0usize;
+    for &(oid, name) in PREDEFINED_ROLES {
+        output[count] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(-1),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {
@@ -4770,7 +4925,7 @@ fn pg_sequences<'a>(
             continue;
         }
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_sequences"));
         }
         // last_value is NULL until the sequence has been advanced at least once,
         // exactly as PostgreSQL reports it.
@@ -4833,7 +4988,7 @@ fn pg_sequence<'a>(
             continue;
         }
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("pg_sequence"));
         }
         out[n] = row(
             &[
@@ -4875,7 +5030,7 @@ fn info_tables<'a>(
         }
         let table = storage.table_def(slot, txid);
         if n == out.len() {
-            break;
+            return Err(catalog_capacity_exceeded("information_schema.tables"));
         }
         out[n] = row(
             &[
@@ -4893,9 +5048,12 @@ fn info_tables<'a>(
         )?;
         n += 1;
     }
-    for view in storage.live_views() {
+    for (_, view) in storage.views_visible_to(txid) {
         if n == out.len() {
-            break;
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "information_schema.tables exceeds static capacity"
+            ));
         }
         out[n] = row(
             &[
@@ -4934,8 +5092,45 @@ fn info_columns<'a>(
             ("table_name", ColType::Text),
             ("column_name", ColType::Text),
             ("ordinal_position", ColType::Int4),
+            ("column_default", ColType::Text),
             ("is_nullable", ColType::Text),
             ("data_type", ColType::Text),
+            ("character_maximum_length", ColType::Int4),
+            ("character_octet_length", ColType::Int4),
+            ("numeric_precision", ColType::Int4),
+            ("numeric_precision_radix", ColType::Int4),
+            ("numeric_scale", ColType::Int4),
+            ("datetime_precision", ColType::Int4),
+            ("interval_type", ColType::Text),
+            ("interval_precision", ColType::Int4),
+            ("character_set_catalog", ColType::Text),
+            ("character_set_schema", ColType::Text),
+            ("character_set_name", ColType::Text),
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("scope_catalog", ColType::Text),
+            ("scope_schema", ColType::Text),
+            ("scope_name", ColType::Text),
+            ("maximum_cardinality", ColType::Int4),
+            ("dtd_identifier", ColType::Text),
+            ("is_self_referencing", ColType::Text),
+            ("is_identity", ColType::Text),
+            ("identity_generation", ColType::Text),
+            ("identity_start", ColType::Text),
+            ("identity_increment", ColType::Text),
+            ("identity_maximum", ColType::Text),
+            ("identity_minimum", ColType::Text),
+            ("identity_cycle", ColType::Text),
+            ("is_generated", ColType::Text),
+            ("generation_expression", ColType::Text),
+            ("is_updatable", ColType::Text),
         ],
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
@@ -4947,29 +5142,399 @@ fn info_columns<'a>(
         let table = storage.table_def(slot, txid);
         for (i, c) in table.columns().iter().enumerate() {
             if n == out.len() {
-                break;
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "information_schema.columns exceeds static capacity"
+                ));
             }
-            out[n] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(
-                        arena
-                            .alloc_str(table.schema.as_str())
-                            .map_err(|_| crate::sql::eval::arena_full())?,
-                        arena,
-                    )?,
-                    text(table.name.as_str(), arena)?,
-                    text(c.name.as_str(), arena)?,
-                    Datum::Int4(i as i32 + 1),
-                    text(if c.not_null { "NO" } else { "YES" }, arena)?,
-                    text(c.ctype.name(), arena)?,
-                ],
+            out[n] = info_column_row(
+                storage,
+                txid,
+                InformationSchemaColumnSource {
+                    schema: table.schema.as_str(),
+                    table: table.name.as_str(),
+                    name: c.name.as_str(),
+                    position: i + 1,
+                    column: c,
+                    updatable: true,
+                },
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    // A view's row type is derived from its SELECT under the path captured at
+    // CREATE VIEW time. Reusing that resolver keeps information_schema,
+    // pg_attribute, Describe, and execution on one source of truth.
+    for (_, view) in storage.views_visible_to(txid) {
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let count = describe_view(storage, txid, view, arena, &mut columns)?;
+        for (index, column) in columns[..count].iter().enumerate() {
+            if n == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "information_schema.columns exceeds static capacity"
+                ));
+            }
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
+            let column_meta = ColumnMeta {
+                name: SqlName::EMPTY,
+                ctype,
+                type_mod: column.type_mod,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type,
+            };
+            out[n] = info_column_row(
+                storage,
+                txid,
+                InformationSchemaColumnSource {
+                    schema: view.schema.as_str(),
+                    table: view.name.as_str(),
+                    name: column.name,
+                    position: index + 1,
+                    column: &column_meta,
+                    updatable: false,
+                },
                 arena,
             )?;
             n += 1;
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn view_column_catalog_type(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<(ColType, Option<crate::storage::UserTypeName>), SqlError> {
+    use crate::sql::types::oid as type_oid;
+    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        let definition = storage.domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid);
+        return Ok((
+            definition.base,
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
+    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+        .contains(&oid)
+    {
+        let definition = storage.enum_for((oid - type_oid::FIRST_ENUM) as usize, txid);
+        return Ok((
+            ColType::Enum((oid - type_oid::FIRST_ENUM) as u16),
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
+    super::exec::coltype_of_oid(oid)
+        .map(|ctype| (ctype, None))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column has unsupported type oid {}",
+                oid
+            )
+        })
+}
+
+/// The type-dependent portion of `information_schema.columns`.  `TypeMod`
+/// keeps the several PostgreSQL wire encodings from leaking into catalog code.
+struct InformationSchemaColumnSource<'a> {
+    schema: &'a str,
+    table: &'a str,
+    name: &'a str,
+    position: usize,
+    column: &'a ColumnMeta,
+    updatable: bool,
+}
+
+fn info_column_row<'a>(
+    storage: &Storage,
+    txid: u32,
+    source: InformationSchemaColumnSource<'_>,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    use crate::sql::types::oid;
+    let InformationSchemaColumnSource {
+        schema,
+        table,
+        name,
+        position,
+        column,
+        updatable,
+    } = source;
+    let declared_oid = catalog_column_type_oid(storage, column, txid)?;
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&declared_oid);
+    let domain =
+        is_domain.then(|| storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid));
+    let type_mod = TypeMod::decode(column.ctype, column.type_mod);
+    let data_type = information_schema_data_type(storage, txid, declared_oid)?;
+    let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
+        match type_mod {
+            TypeMod::Length(length)
+                if matches!(column.ctype, ColType::Varchar | ColType::Bpchar) =>
+            {
+                (Some(length as i32), None, None, None, None)
+            }
+            TypeMod::NumericPS { precision, scale } => (
+                None,
+                Some(precision as i32),
+                Some(10),
+                Some(scale as i32),
+                None,
+            ),
+            TypeMod::TemporalPrecision(precision) => {
+                (None, None, None, None, Some(precision as i32))
+            }
+            TypeMod::IntervalMod { precision, .. } => {
+                (None, None, None, None, precision.map(i32::from))
+            }
+            _ => match column.ctype {
+                ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
+                ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
+                ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
+                ColType::Float4 => (None, Some(24), Some(2), None, None),
+                ColType::Float8 => (None, Some(53), Some(2), None, None),
+                _ => (None, None, None, None, None),
+            },
+        };
+    let user_type = column.user_type;
+    let (udt_schema, udt_name) = if let Some(identity) = user_type {
+        let mut type_name = StackStr::<64>::new();
+        if matches!(column.ctype, ColType::Array(_)) {
+            use core::fmt::Write as _;
+            let _ = write!(type_name, "_{}", identity.name.as_str());
+        } else {
+            use core::fmt::Write as _;
+            let _ = write!(type_name, "{}", identity.name.as_str());
+        }
+        (identity.schema, type_name)
+    } else {
+        (
+            SqlName::parse("pg_catalog").expect("catalog schema fits"),
+            StackStr::from_str(column.ctype.catalog_name()),
+        )
+    };
+    let default = (!column.default.is_generated())
+        .then(|| column.default.expression())
+        .flatten();
+    let generated = column.default.is_generated();
+    let generated_expression = generated.then(|| column.default.expression()).flatten();
+    let nullable = !column.not_null && !domain.is_some_and(|definition| definition.not_null);
+    let identity = column.is_identity;
+    let identity_sequence = identity
+        .then(|| {
+            (0..storage.sequence_count())
+                .map(|slot| storage.sequence_for(slot, txid))
+                .find(|sequence| {
+                    sequence.generator_for.is_some_and(|owner| {
+                        owner.table_schema.as_str() == schema
+                            && owner.table.as_str() == table
+                            && owner.column.as_str() == name
+                    })
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "identity column \"{}.{}.{}\" has no generator sequence",
+                        schema,
+                        table,
+                        name
+                    )
+                })
+        })
+        .transpose()?;
+    let identity_start = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.start_value));
+    let identity_increment = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.increment));
+    let identity_maximum = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.max_value));
+    let identity_minimum = identity_sequence
+        .as_ref()
+        .map(|sequence| stack_format!(32, "{}", sequence.min_value));
+    let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
+    let default_datum = match default {
+        Some(value) => text(value.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let domain_catalog = match domain {
+        Some(_) => text("postgres", arena)?,
+        None => Datum::Null,
+    };
+    let domain_schema = match domain {
+        Some(value) => text(value.schema.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let domain_name = match domain {
+        Some(value) => text(value.name.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    let generated_expression = match generated_expression {
+        Some(value) => text(value.as_str(), arena)?,
+        None => Datum::Null,
+    };
+    row(
+        &[
+            text("postgres", arena)?,
+            text(schema, arena)?,
+            text(table, arena)?,
+            text(name, arena)?,
+            Datum::Int4(position as i32),
+            default_datum,
+            text(if nullable { "YES" } else { "NO" }, arena)?,
+            text(data_type.as_str(), arena)?,
+            character_length.map_or(Datum::Null, Datum::Int4),
+            character_length.map_or(Datum::Null, Datum::Int4),
+            numeric_precision.map_or(Datum::Null, Datum::Int4),
+            numeric_radix.map_or(Datum::Null, Datum::Int4),
+            numeric_scale.map_or(Datum::Null, Datum::Int4),
+            datetime_precision.map_or(Datum::Null, Datum::Int4),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            domain_catalog,
+            domain_schema,
+            domain_name,
+            text("postgres", arena)?,
+            text(udt_schema.as_str(), arena)?,
+            text(udt_name.as_str(), arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            text(stack_format!(32, "{}", position).as_str(), arena)?,
+            text("NO", arena)?,
+            text(if identity { "YES" } else { "NO" }, arena)?,
+            if identity {
+                text(
+                    if column.identity_always {
+                        "ALWAYS"
+                    } else {
+                        "BY DEFAULT"
+                    },
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_start.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_increment
+                        .expect("identity has a sequence")
+                        .as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_maximum.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            if identity {
+                text(
+                    identity_minimum.expect("identity has a sequence").as_str(),
+                    arena,
+                )?
+            } else {
+                Datum::Null
+            },
+            text(
+                if identity_cycle == Some(true) {
+                    "YES"
+                } else {
+                    "NO"
+                },
+                arena,
+            )?,
+            text(if generated { "ALWAYS" } else { "NEVER" }, arena)?,
+            generated_expression,
+            text(if updatable { "YES" } else { "NO" }, arena)?,
+        ],
+        arena,
+    )
+}
+
+/// The SQL-standard `data_type` spelling is intentionally less specific than
+/// PostgreSQL's OID. Domains report their base type, enums report
+/// `USER-DEFINED`, and arrays report `ARRAY`.
+fn information_schema_data_type(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<StackStr<64>, SqlError> {
+    use crate::sql::types::oid as type_oid;
+    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+    {
+        return Ok(StackStr::from_str(
+            storage
+                .domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid)
+                .base
+                .name(),
+        ));
+    }
+    if (type_oid::FIRST_DOMAIN_ARRAY
+        ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+        .contains(&oid)
+        || (type_oid::FIRST_ENUM_ARRAY
+            ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
+            .contains(&oid)
+    {
+        return Ok(StackStr::from_str("ARRAY"));
+    }
+    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+        .contains(&oid)
+    {
+        return Ok(StackStr::from_str("USER-DEFINED"));
+    }
+    if let Some(ctype) = super::exec::coltype_of_oid(oid) {
+        if matches!(ctype, ColType::Array(_)) {
+            return Ok(StackStr::from_str("ARRAY"));
+        }
+        return Ok(StackStr::from_str(ctype.name()));
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "information_schema.columns cannot describe type oid {}",
+        oid
+    ))
 }
 
 fn info_table_constraints<'a>(
@@ -5796,18 +6361,536 @@ fn info_referential_constraints<'a>(
     finish(definition, &output[..count], arena)
 }
 
-fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn info_domains<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domains",
+        &[
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("data_type", ColType::Text),
+            ("character_maximum_length", ColType::Int4),
+            ("character_octet_length", ColType::Int4),
+            ("character_set_catalog", ColType::Text),
+            ("character_set_schema", ColType::Text),
+            ("character_set_name", ColType::Text),
+            ("collation_catalog", ColType::Text),
+            ("collation_schema", ColType::Text),
+            ("collation_name", ColType::Text),
+            ("numeric_precision", ColType::Int4),
+            ("numeric_precision_radix", ColType::Int4),
+            ("numeric_scale", ColType::Int4),
+            ("datetime_precision", ColType::Int4),
+            ("interval_type", ColType::Text),
+            ("interval_precision", ColType::Int4),
+            ("domain_default", ColType::Text),
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("scope_catalog", ColType::Text),
+            ("scope_schema", ColType::Text),
+            ("scope_name", ColType::Text),
+            ("maximum_cardinality", ColType::Int4),
+            ("dtd_identifier", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
+        let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
+            information_schema_scalar_metadata(domain.base, type_mod);
+        let (data_type, udt_schema, udt_name) = match domain.base_domain {
+            Some(parent) => (
+                "USER-DEFINED",
+                parent.schema,
+                StackStr::<64>::from_str(parent.name.as_str()),
+            ),
+            None => (
+                domain.base.name(),
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::<64>::from_str(domain.base.catalog_name()),
+            ),
+        };
+        let default = match domain.default_expr {
+            Some(value) => text(value.as_str(), arena)?,
+            None => Datum::Null,
+        };
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(domain.schema.as_str(), arena)?,
+                text(domain.name.as_str(), arena)?,
+                text(data_type, arena)?,
+                character_length.map_or(Datum::Null, Datum::Int4),
+                character_length.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                numeric_precision.map_or(Datum::Null, Datum::Int4),
+                numeric_radix.map_or(Datum::Null, Datum::Int4),
+                numeric_scale.map_or(Datum::Null, Datum::Int4),
+                datetime_precision.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                default,
+                text("postgres", arena)?,
+                text(udt_schema.as_str(), arena)?,
+                text(udt_name.as_str(), arena)?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                text("1", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_domain_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domain_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+            ("is_deferrable", ColType::Text),
+            ("initially_deferred", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        for check in domain.checks() {
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(check.name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(domain.name.as_str(), arena)?,
+                    text("NO", arena)?,
+                    text("NO", arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(domain.name.as_str(), arena)?,
+                    text("NO", arena)?,
+                    text("NO", arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn info_check_constraints<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "check_constraints",
+        &[
+            ("constraint_catalog", ColType::Text),
+            ("constraint_schema", ColType::Text),
+            ("constraint_name", ColType::Text),
+            ("check_clause", ColType::Text),
+        ],
+    );
+    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
+        * (crate::storage::MAX_CHECKS + MAX_COLUMNS)
+        + crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
+    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let mut count = 0;
+    let mut append = |schema: &str, name: &str, clause: &str| -> Result<(), SqlError> {
+        if count == output.len() {
+            return Err(catalog_capacity_exceeded(
+                "information_schema.check_constraints",
+            ));
+        }
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(schema, arena)?,
+                text(name, arena)?,
+                text(clause, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for check in table.checks() {
+            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            append(table.schema.as_str(), check.name.as_str(), clause.as_str())?;
+        }
+        for column in table.columns() {
+            if column.not_null {
+                let name = not_null_constraint_name(table, column);
+                let clause = stack_format!(256, "{} IS NOT NULL", column.name.as_str());
+                append(table.schema.as_str(), name.as_str(), clause.as_str())?;
+            }
+        }
+    }
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        for check in domain.checks() {
+            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
+        }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            append(domain.schema.as_str(), name.as_str(), "VALUE IS NOT NULL")?;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+#[derive(Clone, Copy)]
+enum InformationSchemaTypeUsage {
+    Domain,
+    UnderlyingType,
+}
+
+fn info_column_domain_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_column_type_usage(storage, txid, arena, InformationSchemaTypeUsage::Domain)
+}
+
+fn info_column_udt_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    info_column_type_usage(
+        storage,
+        txid,
+        arena,
+        InformationSchemaTypeUsage::UnderlyingType,
+    )
+}
+
+fn info_column_type_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    usage: InformationSchemaTypeUsage,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        match usage {
+            InformationSchemaTypeUsage::Domain => "column_domain_usage",
+            InformationSchemaTypeUsage::UnderlyingType => "column_udt_usage",
+        },
+        match usage {
+            InformationSchemaTypeUsage::Domain => &[
+                ("domain_catalog", ColType::Text),
+                ("domain_schema", ColType::Text),
+                ("domain_name", ColType::Text),
+                ("table_catalog", ColType::Text),
+                ("table_schema", ColType::Text),
+                ("table_name", ColType::Text),
+                ("column_name", ColType::Text),
+            ],
+            InformationSchemaTypeUsage::UnderlyingType => &[
+                ("udt_catalog", ColType::Text),
+                ("udt_schema", ColType::Text),
+                ("udt_name", ColType::Text),
+                ("table_catalog", ColType::Text),
+                ("table_schema", ColType::Text),
+                ("table_name", ColType::Text),
+                ("column_name", ColType::Text),
+            ],
+        },
+    );
+    let table_capacity = storage
+        .table_count()
+        .checked_mul(MAX_COLUMNS)
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?;
+    let view_capacity = storage
+        .view_count()
+        .checked_mul(super::exec::MAX_PROJ)
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?;
+    let output = arena
+        .alloc_slice_with(
+            table_capacity
+                .checked_add(view_capacity)
+                .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?,
+            |_| &[] as &[Datum],
+        )
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    let mut append =
+        |schema: &str, table: &str, column: &str, metadata: &ColumnMeta| -> Result<(), SqlError> {
+            let declared_oid = catalog_column_type_oid(storage, metadata, txid)?;
+            let identity =
+                information_schema_usage_type(storage, txid, metadata, declared_oid, usage)?;
+            let Some((type_schema, type_name)) = identity else {
+                return Ok(());
+            };
+            debug_assert!(count < output.len());
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(type_schema.as_str(), arena)?,
+                    text(type_name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(schema, arena)?,
+                    text(table, arena)?,
+                    text(column, arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+            Ok(())
+        };
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        for column in table.columns() {
+            append(
+                table.schema.as_str(),
+                table.name.as_str(),
+                column.name.as_str(),
+                column,
+            )?;
+        }
+    }
+    for (_, view) in storage.views_visible_to(txid) {
+        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let column_count = describe_view(storage, txid, view, arena, &mut columns)?;
+        for column in &columns[..column_count] {
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
+            let metadata = ColumnMeta {
+                name: SqlName::EMPTY,
+                ctype,
+                type_mod: column.type_mod,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type,
+            };
+            append(
+                view.schema.as_str(),
+                view.name.as_str(),
+                column.name,
+                &metadata,
+            )?;
+        }
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn information_schema_usage_type(
+    storage: &Storage,
+    txid: u32,
+    column: &ColumnMeta,
+    declared_oid: i32,
+    usage: InformationSchemaTypeUsage,
+) -> Result<Option<(SqlName, StackStr<64>)>, SqlError> {
+    use crate::sql::types::oid;
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        .contains(&declared_oid);
+    match usage {
+        InformationSchemaTypeUsage::Domain => Ok(is_domain.then(|| {
+            let domain = storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid);
+            (domain.schema, StackStr::from_str(domain.name.as_str()))
+        })),
+        InformationSchemaTypeUsage::UnderlyingType if is_domain => {
+            let domain = storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid);
+            Ok(Some(match domain.base_domain {
+                Some(parent) => (parent.schema, StackStr::from_str(parent.name.as_str())),
+                None => (
+                    SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                    StackStr::from_str(domain.base.catalog_name()),
+                ),
+            }))
+        }
+        InformationSchemaTypeUsage::UnderlyingType => Ok(Some(match column.user_type {
+            Some(identity) => {
+                let mut name = StackStr::<64>::new();
+                if matches!(column.ctype, ColType::Array(_)) {
+                    use core::fmt::Write as _;
+                    let _ = write!(name, "_{}", identity.name.as_str());
+                } else {
+                    name = StackStr::from_str(identity.name.as_str());
+                }
+                (identity.schema, name)
+            }
+            None => (
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::from_str(column.ctype.catalog_name()),
+            ),
+        })),
+    }
+}
+
+fn info_domain_udt_usage<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "domain_udt_usage",
+        &[
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+            ("domain_catalog", ColType::Text),
+            ("domain_schema", ColType::Text),
+            ("domain_name", ColType::Text),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let mut count = 0;
+    for slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let (udt_schema, udt_name) = match domain.base_domain {
+            Some(parent) => (
+                parent.schema,
+                StackStr::<64>::from_str(parent.name.as_str()),
+            ),
+            None => (
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::<64>::from_str(domain.base.catalog_name()),
+            ),
+        };
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(udt_schema.as_str(), arena)?,
+                text(udt_name.as_str(), arena)?,
+                text("postgres", arena)?,
+                text(domain.schema.as_str(), arena)?,
+                text(domain.name.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+type InformationSchemaScalarMetadata = (
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+);
+
+fn information_schema_scalar_metadata(
+    ctype: ColType,
+    type_mod: TypeMod,
+) -> InformationSchemaScalarMetadata {
+    match type_mod {
+        TypeMod::Length(length) if matches!(ctype, ColType::Varchar | ColType::Bpchar) => {
+            (Some(length as i32), None, None, None, None)
+        }
+        TypeMod::NumericPS { precision, scale } => (
+            None,
+            Some(precision as i32),
+            Some(10),
+            Some(scale as i32),
+            None,
+        ),
+        TypeMod::TemporalPrecision(precision) => (None, None, None, None, Some(precision as i32)),
+        TypeMod::IntervalMod { precision, .. } => {
+            (None, None, None, None, precision.map(i32::from))
+        }
+        _ => match ctype {
+            ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
+            ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
+            ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
+            ColType::Float4 => (None, Some(24), Some(2), None, None),
+            ColType::Float8 => (None, Some(53), Some(2), None, None),
+            _ => (None, None, None, None, None),
+        },
+    }
+}
+
+fn info_schemata<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "schemata",
         &[
             ("catalog_name", ColType::Text),
             ("schema_name", ColType::Text),
+            ("schema_owner", ColType::Text),
+            ("default_character_set_catalog", ColType::Text),
+            ("default_character_set_schema", ColType::Text),
+            ("default_character_set_name", ColType::Text),
+            ("sql_path", ColType::Text),
         ],
     );
     let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
         [&[]; 2 + crate::storage::MAX_SCHEMAS];
     let mut n = 0;
-    for (_, schema) in storage.live_schemas() {
+    for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[
                 text("postgres", arena)?,
@@ -5817,18 +6900,54 @@ fn info_schemata<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
+                text(
+                    catalog_owner_name(
+                        storage,
+                        catalog_owner(
+                            storage,
+                            crate::storage::AccessObject {
+                                class: crate::storage::AccessClass::Schema,
+                                slot: slot as u16,
+                            },
+                            txid,
+                        ),
+                        txid,
+                    )
+                    .as_str(),
+                    arena,
+                )?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
             ],
             arena,
         )?;
         n += 1;
     }
     out[n] = row(
-        &[text("postgres", arena)?, text("pg_catalog", arena)?],
+        &[
+            text("postgres", arena)?,
+            text("pg_catalog", arena)?,
+            text("postgres", arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+        ],
         arena,
     )?;
     n += 1;
     out[n] = row(
-        &[text("postgres", arena)?, text("information_schema", arena)?],
+        &[
+            text("postgres", arena)?,
+            text("information_schema", arena)?,
+            text("postgres", arena)?,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+        ],
         arena,
     )?;
     n += 1;

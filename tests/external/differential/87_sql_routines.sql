@@ -23,7 +23,7 @@ SELECT parameter_name, parameter_mode, data_type
 BEGIN;
 CREATE OR REPLACE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 43';
 SELECT routine_answer();
-ROLLBACK;
+COMMIT;
 SELECT routine_answer();
 
 DROP FUNCTION routine_increment(integer);

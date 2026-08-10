@@ -124,11 +124,12 @@ impl WalStoredQueryDependencies<'_> {
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(dependencies) => {
-                1 + dependencies
+                2 + dependencies
                     .entries()
                     .iter()
                     .map(|dependency| {
-                        1 + 1
+                        1 + 8
+                            + 1
                             + dependency.schema.as_str().len()
                             + 1
                             + dependency.name.as_str().len()
@@ -147,9 +148,10 @@ impl WalStoredQueryDependencies<'_> {
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(dependencies) => {
-                let mut ok = buffer.append(&[dependencies.entries().len() as u8]);
+                let mut ok = buffer.append(&[0xff, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
+                        && buffer.append(&dependency.referenced_columns.to_le_bytes())
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
                         && append_stored_dependency_name(
@@ -2049,13 +2051,20 @@ fn stored_dependency_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a s
 }
 
 fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
-    let Some(&count) = payload.first() else {
+    let Some(&first) = payload.first() else {
         return false;
+    };
+    let (count, mut at, has_columns) = if first == 0xff {
+        let Some(&count) = payload.get(1) else {
+            return false;
+        };
+        (count, 2, true)
+    } else {
+        (first, 1, false)
     };
     if count as usize > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
         return false;
     }
-    let mut at = 1;
     for _ in 0..count {
         let Some(&class) = payload.get(at) else {
             return false;
@@ -2064,6 +2073,12 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
             return false;
         }
         at += 1;
+        if has_columns {
+            if payload.get(at..at + 8).is_none() {
+                return false;
+            }
+            at += 8;
+        }
         for _ in 0..4 {
             if stored_dependency_name(payload, &mut at).is_none() {
                 return false;
@@ -2078,23 +2093,32 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     if !validate_stored_query_dependencies(payload) {
         return None;
     }
-    let count = payload[0] as usize;
-    let mut at = 1;
+    let has_columns = payload[0] == 0xff;
+    let count = payload[has_columns as usize] as usize;
+    let mut at = if has_columns { 2 } else { 1 };
     let mut dependencies = StoredQueryDependencies::EMPTY;
     for _ in 0..count {
         let class = DependencyClass::from_code(payload[at])?;
         at += 1;
+        let referenced_columns = if has_columns {
+            let columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            columns
+        } else {
+            0
+        };
         let schema = stored_dependency_name(payload, &mut at)?;
         let name = stored_dependency_name(payload, &mut at)?;
         let referenced_schema = stored_dependency_name(payload, &mut at)?;
         let referenced_name = stored_dependency_name(payload, &mut at)?;
         dependencies
-            .serialized_push(
+            .serialized_push_with_columns(
                 class,
                 SqlName::parse(schema).ok()?,
                 SqlName::parse(name).ok()?,
                 SqlName::parse(referenced_schema).ok()?,
                 SqlName::parse(referenced_name).ok()?,
+                referenced_columns,
             )
             .ok()?;
     }
@@ -3457,6 +3481,30 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_query_dependency_columns_round_trip_in_wal() {
+        let mut dependencies = StoredQueryDependencies::EMPTY;
+        dependencies
+            .serialized_push_with_columns(
+                DependencyClass::Table,
+                SqlName::parse("public").unwrap(),
+                SqlName::parse("items").unwrap(),
+                SqlName::parse("").unwrap(),
+                SqlName::parse("items").unwrap(),
+                0b101,
+            )
+            .unwrap();
+        let mut budget = crate::mem::budget::Budget::new(1024);
+        let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 256).unwrap();
+        assert!(WalStoredQueryDependencies::Captured(&dependencies).append(&mut encoded));
+        assert_eq!(
+            WalStoredQueryDependencies::Encoded(encoded.readable())
+                .materialize()
+                .unwrap(),
+            dependencies
+        );
+    }
 
     #[test]
     fn operation_size_is_bounded_by_the_table_definition_variant() {

@@ -1215,6 +1215,32 @@ pub fn resolve_view_for_dml<'a>(
     }))
 }
 
+/// Whether a view satisfies the same structural predicate used by DML
+/// rewriting. Catalog rendering must use this predicate too, otherwise
+/// `information_schema.views` can disagree with executable behavior.
+pub fn view_is_auto_updatable(
+    storage: &Storage,
+    schema: &str,
+    name: &str,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    match resolve_view_for_dml(
+        storage,
+        QualName {
+            schema: Some(schema),
+            name,
+        },
+        txid,
+        arena,
+    ) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Combines a view's filter with a DML's WHERE (AND), for view DML rewriting.
 pub fn and_where<'a>(
     view_where: Option<&'a Expr<'a>>,

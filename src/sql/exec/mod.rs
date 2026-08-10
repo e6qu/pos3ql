@@ -2325,14 +2325,69 @@ pub fn drop_role(
                 "current user cannot be dropped"
             ));
         }
-        if storage.role_has_membership_dependents(slot, txn.txid)
-            || storage.role_has_object_dependents(slot, txn.txid)
-        {
+        if storage.role_has_object_dependents(slot, txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "role \"{}\" cannot be dropped because some objects depend on it",
                 resolved.as_str()
             ));
+        }
+        let membership_count = (0..storage.role_membership_count())
+            .filter(|membership_slot| {
+                let membership = storage.role_membership(*membership_slot);
+                membership.visible_to(txn.txid)
+                    && (membership.role as usize == slot || membership.member as usize == slot)
+            })
+            .count();
+        if membership_count + 1 > super::txn::MAX_TXN_DDL {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "dropping role \"{}\" changes too many role memberships",
+                resolved.as_str()
+            ));
+        }
+        // PostgreSQL removes memberships that name a dropped role.  Make each
+        // removal a normal transactional catalog transition so WAL/recovery
+        // and savepoint rollback cannot retain a dangling role slot.
+        for membership_slot in 0..storage.role_membership_count() {
+            let membership = *storage.role_membership(membership_slot);
+            if !membership.visible_to(txn.txid)
+                || (membership.role as usize != slot && membership.member as usize != slot)
+            {
+                continue;
+            }
+            let role_name = storage.role_name(membership.role as usize, txn.txid);
+            let member_name = storage.role_name(membership.member as usize, txn.txid);
+            let (changed_slot, prior) = match storage.change_role_membership(
+                membership.role as usize,
+                membership.member as usize,
+                membership.grantor as usize,
+                membership.options_to(txn.txid),
+                false,
+                txn.txid,
+            ) {
+                Ok(changed) => changed,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::DropRoleMembership {
+                    role: role_name.as_str(),
+                    member: member_name.as_str(),
+                },
+            ) {
+                storage.rollback_role_membership_change(changed_slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
+                slot: changed_slot as u32,
+                prior,
+            }) {
+                storage.rollback_role_membership_change(changed_slot, prior);
+                return sql_fail(error);
+            }
         }
         let name = storage.role_name(slot, txn.txid);
         let prior = match storage.drop_role_in(slot, txn.txid) {

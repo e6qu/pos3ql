@@ -608,6 +608,74 @@ fn role_membership_controls_set_role_and_catalog_rows() {
 }
 
 #[test]
+fn dropping_a_role_removes_memberships_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE dropped_parent; \
+         CREATE ROLE dropped_member; \
+         GRANT dropped_parent TO dropped_member",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP ROLE dropped_member; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_auth_members membership \
+             JOIN pg_roles parent ON parent.oid = membership.roleid \
+             JOIN pg_roles member ON member.oid = membership.member \
+             WHERE parent.rolname = 'dropped_parent' AND member.rolname = 'dropped_member'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP ROLE dropped_member; DROP ROLE dropped_parent; \
+             SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_roles \
+              WHERE rolname IN ('dropped_parent', 'dropped_member')",
+        )),
+        ["0", "0"]
+    );
+}
+
+#[test]
+fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
+    let config = test_config("dropped-role-memberships-wal-replay");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE replay_parent; \
+         CREATE ROLE replay_member; \
+         GRANT replay_parent TO replay_member; \
+         DROP ROLE replay_member; \
+         DROP ROLE replay_parent",
+    );
+    drop(engine);
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_roles \
+              WHERE rolname IN ('replay_parent', 'replay_member')",
+        )),
+        ["0", "0"]
+    );
+}
+
+#[test]
 fn create_role_membership_clauses_match_grant_role_state() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

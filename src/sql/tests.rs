@@ -608,6 +608,74 @@ fn role_membership_controls_set_role_and_catalog_rows() {
 }
 
 #[test]
+fn dropping_a_role_removes_memberships_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE dropped_parent; \
+         CREATE ROLE dropped_member; \
+         GRANT dropped_parent TO dropped_member",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP ROLE dropped_member; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_auth_members membership \
+             JOIN pg_roles parent ON parent.oid = membership.roleid \
+             JOIN pg_roles member ON member.oid = membership.member \
+             WHERE parent.rolname = 'dropped_parent' AND member.rolname = 'dropped_member'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP ROLE dropped_member; DROP ROLE dropped_parent; \
+             SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_roles \
+              WHERE rolname IN ('dropped_parent', 'dropped_member')",
+        )),
+        ["0", "0"]
+    );
+}
+
+#[test]
+fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
+    let config = test_config("dropped-role-memberships-wal-replay");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE replay_parent; \
+         CREATE ROLE replay_member; \
+         GRANT replay_parent TO replay_member; \
+         DROP ROLE replay_member; \
+         DROP ROLE replay_parent",
+    );
+    drop(engine);
+    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_roles \
+              WHERE rolname IN ('replay_parent', 'replay_member')",
+        )),
+        ["0", "0"]
+    );
+}
+
+#[test]
 fn create_role_membership_clauses_match_grant_role_state() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -2667,6 +2735,141 @@ fn information_schema_column_udt_usage_is_not_silently_capped() {
         )),
         ["1088"]
     );
+}
+
+#[test]
+fn information_schema_roles_collations_and_column_privileges_match_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE information_schema_parent; \
+         CREATE ROLE information_schema_member; \
+         GRANT information_schema_parent TO information_schema_member WITH ADMIN OPTION; \
+         CREATE ROLE information_schema_reader; \
+         CREATE TABLE information_schema_privileges (first integer, second text); \
+         GRANT SELECT ON information_schema_privileges TO information_schema_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT collation_name, pad_attribute FROM information_schema.collations \
+             WHERE collation_name IN ('C', 'POSIX', 'ucs_basic') ORDER BY collation_name",
+        )),
+        ["C|NO PAD", "POSIX|NO PAD", "ucs_basic|NO PAD"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT character_set_name FROM information_schema.collation_character_set_applicability \
+             WHERE collation_name = 'C'",
+        )),
+        ["UTF8"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, role_name, is_grantable \
+             FROM information_schema.applicable_roles \
+             WHERE role_name = 'information_schema_parent'",
+        )),
+        ["information_schema_member|information_schema_parent|YES"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, role_name FROM information_schema.administrable_role_authorizations \
+             WHERE role_name = 'information_schema_parent'",
+        )),
+        ["information_schema_member|information_schema_parent"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT role_name FROM information_schema.enabled_roles \
+             WHERE role_name IN ('information_schema_parent', 'information_schema_member') \
+             ORDER BY role_name",
+        )),
+        ["information_schema_member", "information_schema_parent"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, column_name, privilege_type, is_grantable \
+             FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_privileges' \
+               AND grantee = 'information_schema_reader' \
+             ORDER BY column_name, privilege_type",
+        )),
+        [
+            "information_schema_reader|first|SELECT|NO",
+            "information_schema_reader|second|SELECT|NO",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT grantee, column_name, privilege_type \
+             FROM information_schema.role_column_grants \
+             WHERE table_name = 'information_schema_privileges' \
+               AND grantee = 'information_schema_reader' \
+             ORDER BY column_name, privilege_type",
+        )),
+        [
+            "information_schema_reader|first|SELECT",
+            "information_schema_reader|second|SELECT",
+        ]
+    );
+}
+
+#[test]
+fn information_schema_column_privileges_follow_transactional_acl_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE information_schema_private_reader",
+    );
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE information_schema_private_privileges (value integer); \
+         GRANT SELECT ON information_schema_private_privileges \
+           TO information_schema_private_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT count(*) FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_private_privileges' \
+               AND grantee = 'information_schema_private_reader'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM information_schema.column_privileges \
+             WHERE table_name = 'information_schema_private_privileges'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
 }
 
 #[test]

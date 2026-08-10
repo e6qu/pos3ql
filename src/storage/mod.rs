@@ -5095,13 +5095,6 @@ impl Storage {
         })
     }
 
-    pub fn role_has_membership_dependents(&self, role: usize, txid: u32) -> bool {
-        self.role_memberships.iter().any(|membership| {
-            membership.visible_to(txid)
-                && (membership.role as usize == role || membership.member as usize == role)
-        })
-    }
-
     /// Committed schemas with their slot indices, for checkpoint and catalog
     /// output.
     pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {

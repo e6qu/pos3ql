@@ -6410,6 +6410,27 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.stage_enum_alter(slot, definition, 0)?;
             storage.commit_enum_alter(slot, 0);
         }
+        WalOp::AlterDomainIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            let slot = storage.domain_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::UNDEFINED_OBJECT,
+                    "domain \"{}\" for WAL identity change does not exist",
+                    name
+                )
+            })?;
+            storage.stage_domain_identity(
+                slot,
+                crate::storage::SqlName::parse(new_schema)?,
+                crate::storage::SqlName::parse(new_name)?,
+                0,
+            )?;
+            storage.commit_domain_alter(slot, 0);
+        }
         WalOp::Comment {
             class,
             schema,

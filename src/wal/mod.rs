@@ -92,6 +92,7 @@ const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
 const KIND_DROP_ROUTINE: u8 = 46;
 const KIND_ALTER_ROUTINE_IDENTITY: u8 = 47;
+const KIND_ALTER_DOMAIN_IDENTITY: u8 = 48;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -99,7 +100,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_ROUTINE_IDENTITY;
+const LAST_KIND: u8 = KIND_ALTER_DOMAIN_IDENTITY;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -510,6 +511,12 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         argument_type_codes: &'a [u8],
+        new_schema: &'a str,
+        new_name: &'a str,
+    },
+    AlterDomainIdentity {
+        schema: &'a str,
+        name: &'a str,
         new_schema: &'a str,
         new_name: &'a str,
     },
@@ -1248,6 +1255,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateRoutine(_) => KIND_CREATE_ROUTINE,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
+        WalOp::AlterDomainIdentity { .. } => KIND_ALTER_DOMAIN_IDENTITY,
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
@@ -1533,6 +1541,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + new_name.len()
         }
+        WalOp::AlterDomainIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => 1 + name.len() + 1 + schema.len() + 1 + new_schema.len() + 1 + new_name.len(),
         WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
         WalOp::Comment {
             schema, name, text, ..
@@ -2033,6 +2047,17 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && argument_type_codes.len() <= u8::MAX as usize
                 && buffer.append(&[argument_type_codes.len() as u8])
                 && buffer.append(argument_type_codes)
+                && name_bytes(buffer, new_schema)
+                && name_bytes(buffer, new_name)
+        }
+        WalOp::AlterDomainIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
                 && name_bytes(buffer, new_schema)
                 && name_bytes(buffer, new_name)
         }
@@ -3286,6 +3311,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_name,
             })
         }
+        KIND_ALTER_DOMAIN_IDENTITY => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::AlterDomainIdentity {
+                schema,
+                name,
+                new_schema,
+                new_name,
+            })
+        }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -4113,12 +4150,22 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                18,
+                &WalOp::AlterDomainIdentity {
+                    schema: "public",
+                    name: "domain",
+                    new_schema: "other",
+                    new_name: "renamed_domain",
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 17);
+        assert_eq!(seen.len(), 18);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -4186,10 +4233,15 @@ mod tests {
             "routine identity: {}",
             seen[16]
         );
-        assert_eq!(wal.last_lsn(), 17);
+        assert!(
+            seen[17].contains("AlterDomainIdentity") && seen[17].contains("renamed_domain"),
+            "domain identity: {}",
+            seen[17]
+        );
+        assert_eq!(wal.last_lsn(), 18);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            18,
+            19,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

@@ -422,6 +422,8 @@ impl<'a> Parser<'a> {
             if self.eat_ident("not")? {
                 self.expect_ident("null")?;
                 AlterDomainAction::SetNotNull
+            } else if self.eat_ident("schema")? {
+                AlterDomainAction::SetSchema(self.col_ident("schema name")?)
             } else {
                 self.expect_ident("default")?;
                 let start = self.peek_at;
@@ -430,8 +432,11 @@ impl<'a> Parser<'a> {
                     self.arena_str(self.text[start..self.peek_at].trim_end())?,
                 )
             }
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterDomainAction::Rename(self.col_ident("new domain name")?)
         } else {
-            return Err(self.err_here("expected ADD, DROP or SET after ALTER DOMAIN"));
+            return Err(self.err_here("expected ADD, DROP, RENAME or SET after ALTER DOMAIN"));
         };
         Ok(Stmt::AlterDomain { name, action })
     }

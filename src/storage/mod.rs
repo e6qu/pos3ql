@@ -1902,6 +1902,13 @@ pub struct DomainDef {
 pub(crate) struct PendingDomainDefinition {
     pub txid: u32,
     pub spec: DomainSpec,
+    pub identity: Option<PendingDomainIdentity>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingDomainIdentity {
+    pub schema: SqlName,
+    pub name: SqlName,
 }
 
 impl DomainDef {
@@ -1933,6 +1940,10 @@ impl DomainDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
+                schema: pending
+                    .identity
+                    .map_or(self.schema, |identity| identity.schema),
+                name: pending.identity.map_or(self.name, |identity| identity.name),
                 base_domain: pending.spec.base_domain,
                 base: pending.spec.base,
                 base_type_mod: pending.spec.base_type_mod,
@@ -3981,7 +3992,7 @@ impl Storage {
             }
             AccessClass::Schema => (SqlName::EMPTY, self.schemas[slot].name),
             AccessClass::Domain => {
-                let definition = &self.domains[slot];
+                let definition = self.domain_for(slot, txid);
                 (definition.schema, definition.name)
             }
             AccessClass::Enum => {
@@ -3994,7 +4005,7 @@ impl Storage {
             }
             AccessClass::Routine => {
                 let definition = &self.routines[slot];
-                (definition.schema, definition.name)
+                (definition.schema_for(txid), definition.name_for(txid))
             }
         }
     }
@@ -10674,28 +10685,32 @@ impl Storage {
     /// Resolves a (possibly schema-qualified) domain type name to its
     /// definition, visible to `txid`, searching the current path when
     /// unqualified.
-    pub fn find_domain(&self, type_name: &str, txid: u32) -> Option<&DomainDef> {
+    pub fn find_domain(&self, type_name: &str, txid: u32) -> Option<DomainDef> {
         let (qualifier, name) = match type_name.split_once('.') {
             Some((q, n)) => (Some(q), n),
             None => (None, type_name),
         };
         self.find_domain_slot(qualifier, name, txid)
-            .map(|slot| &self.domains[slot])
+            .map(|slot| self.domain_for(slot, txid))
     }
 
     fn find_domain_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
             return self.domains.iter().position(|d| {
-                d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+                let definition = d.definition_for(txid);
+                d.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
             });
         }
         for entry in self.path.entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.domains.iter().position(|d| {
+                    let definition = d.definition_for(txid);
                     d.visible_to(txid)
-                        && d.schema.as_str() == schema.as_str()
-                        && d.name.as_str() == name
+                        && definition.schema.as_str() == schema.as_str()
+                        && definition.name.as_str() == name
                 }) {
                     return Some(i);
                 }
@@ -10717,16 +10732,43 @@ impl Storage {
     /// The definition of a domain named `name` (any schema) visible to `txid` —
     /// for enforcing a column's domain constraints, where the column stores
     /// only the domain's name.
-    pub fn domain_by_name(&self, name: &str, txid: u32) -> Option<&DomainDef> {
+    pub fn domain_by_name(&self, name: &str, txid: u32) -> Option<DomainDef> {
         self.domains
             .iter()
-            .find(|d| d.visible_to(txid) && d.name.as_str() == name)
+            .position(|domain| {
+                domain.visible_to(txid) && domain.definition_for(txid).name.as_str() == name
+            })
+            .map(|slot| self.domain_for(slot, txid))
     }
 
     /// The domain named `(schema, name)` visible to `txid`, by slot.
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.domains.iter().position(|d| {
-            d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+            let definition = d.definition_for(txid);
+            d.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        })
+    }
+
+    /// Resolves a durable reference held by a column or a child domain. SQL
+    /// name lookup deliberately uses [`Self::domain_slot`] instead: an owning
+    /// transaction must not keep resolving a domain's retired public name.
+    pub(crate) fn domain_identity_slot(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.domain_slot(schema, name, txid).or_else(|| {
+            self.domains.iter().position(|domain| {
+                domain.visible_to(txid)
+                    && domain.schema.as_str() == schema
+                    && domain.name.as_str() == name
+                    && domain
+                        .pending_definition
+                        .is_some_and(|pending| pending.txid == txid && pending.identity.is_some())
+            })
         })
     }
 
@@ -10752,7 +10794,9 @@ impl Storage {
                         "domain-array column type lacks its durable identity"
                     )
                 })?;
-                if self.domain_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                if self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
+                    != Some(slot as usize)
+                {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "domain-array column type does not match its durable identity"
@@ -10806,7 +10850,7 @@ impl Storage {
                 oid: column.ctype.oid(),
             });
         };
-        if let Some(slot) = self.domain_slot(schema.as_str(), name.as_str(), txid) {
+        if let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid) {
             return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::domain_oid(slot as u16),
                 schema,
@@ -10962,7 +11006,88 @@ impl Storage {
             ));
         }
         let prior = domain.pending_definition;
-        domain.pending_definition = Some(PendingDomainDefinition { txid, spec });
+        domain.pending_definition = Some(PendingDomainDefinition {
+            txid,
+            spec,
+            identity: prior.and_then(|pending| pending.identity),
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn stage_domain_identity(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingDomainDefinition>, SqlError> {
+        let current = self.domain_for(slot, txid);
+        if current.schema == schema && current.name == name {
+            return Ok(self.domains[slot].pending_definition);
+        }
+        if let Some(blocker) = self
+            .domains
+            .iter()
+            .enumerate()
+            .find_map(|(other_slot, domain)| {
+                let definition = domain.definition_for(txid);
+                (other_slot != slot && definition.schema == schema && definition.name == name)
+                    .then(|| {
+                        domain
+                            .pending_definition
+                            .map(|pending| pending.txid)
+                            .or_else(|| domain.ddl_state.pending_txid())
+                    })
+                    .flatten()
+                    .filter(|&owner| owner != txid)
+            })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.domains.iter().enumerate().any(|(other_slot, domain)| {
+            other_slot != slot
+                && domain.visible_to(txid)
+                && domain.definition_for(txid).schema == schema
+                && domain.definition_for(txid).name == name
+        }) || self.enums.iter().any(|enumeration| {
+            enumeration.visible_to(txid)
+                && enumeration.schema == schema
+                && enumeration.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let domain = &mut self.domains[slot];
+        if let Some(pending) = domain.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "domain \"{}\" is being altered by another transaction",
+                domain.name.as_str()
+            ));
+        }
+        let prior = domain.pending_definition;
+        let spec = prior.map_or(
+            DomainSpec {
+                base_domain: domain.base_domain,
+                base: domain.base,
+                base_type_mod: domain.base_type_mod,
+                not_null: domain.not_null,
+                default_expr: domain.default_expr,
+                checks: domain.checks,
+                n_checks: domain.n_checks,
+            },
+            |pending| pending.spec,
+        );
+        domain.pending_definition = Some(PendingDomainDefinition {
+            txid,
+            spec,
+            identity: Some(PendingDomainIdentity { schema, name }),
+        });
         Ok(prior)
     }
 
@@ -10973,6 +11098,11 @@ impl Storage {
             .is_some()
         {
             let definition = self.domains[slot].definition_for(txid);
+            if definition.schema != self.domains[slot].schema
+                || definition.name != self.domains[slot].name
+            {
+                self.rename_domain_references(slot, definition.schema, definition.name);
+            }
             self.domains[slot] = definition;
         }
     }
@@ -10987,6 +11117,60 @@ impl Storage {
 
     pub fn restore_domain(&mut self, slot: usize, prior: DomainDef) {
         self.domains[slot] = prior;
+    }
+
+    fn rename_domain_references(&mut self, slot: usize, schema: SqlName, name: SqlName) {
+        let old_schema = self.domains[slot].schema;
+        let old_name = self.domains[slot].name;
+        self.domains[slot].schema = schema;
+        self.domains[slot].name = name;
+        for table in self
+            .tables
+            .iter_mut()
+            .filter(|table| table.live || table.pending_ddl.is_some())
+        {
+            let mut changed = false;
+            for column in table.def.columns[..table.def.n_columns].iter_mut() {
+                let uses_domain = column.user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+                    || matches!(
+                        column.ctype,
+                        ColType::Array(ArrElem::Domain { slot: domain_slot, .. })
+                            if domain_slot as usize == slot
+                    );
+                if uses_domain {
+                    column.user_type = Some(UserTypeName { schema, name });
+                    changed = true;
+                }
+            }
+            if changed {
+                table.mark_dirty();
+            }
+        }
+        for domain in self.domains.iter_mut() {
+            if domain.base_domain
+                == Some(UserTypeName {
+                    schema: old_schema,
+                    name: old_name,
+                })
+            {
+                domain.base_domain = Some(UserTypeName { schema, name });
+            }
+        }
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && comment.class == CommentClass::Type
+                && comment.schema == old_schema
+                && comment.name == old_name
+            {
+                comment.schema = schema;
+                comment.name = name;
+            }
+        }
+        self.rename_stored_query_dependency(DependencyClass::Domain, slot, schema, name);
     }
 
     pub fn drop_domain(

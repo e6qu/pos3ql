@@ -166,6 +166,38 @@ pub(super) fn storage_catalog(storage: &Storage, txid: u32) -> StorageCatalog<'_
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_> {
+    fn call_routine<'a>(
+        &self,
+        name: &str,
+        arguments: &[Datum<'a>],
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(routine) = self.storage.routine_for_call(name, arguments, self.txid) else {
+            return Ok(None);
+        };
+        let body = routine.body.as_str().trim();
+        let expression = body
+            .strip_prefix("SELECT ")
+            .or_else(|| body.strip_prefix("select "))
+            .expect("validated routine body");
+        let expression = arena
+            .alloc_str(expression)
+            .map_err(|_| super::eval::arena_full())?;
+        let expression = super::parser::parse_expr(expression, arena)?;
+        let hooks = EvalHooks {
+            catalog: Some(self),
+            ..super::eval::NO_HOOKS
+        };
+        super::eval::eval_full(
+            expression,
+            arena,
+            arguments,
+            &super::eval::NoColumns,
+            &hooks,
+        )
+        .map(Some)
+    }
+
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::relation_oid_is_visible(self.storage, self.txid, oid).then_some(true)
     }
@@ -175,7 +207,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
     }
 
     fn function_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::function_oid_is_visible(oid).then_some(true)
+        (super::catalog::function_oid_is_visible(oid)
+            || self.storage.routine_slot_by_oid(oid, self.txid).is_some())
+        .then_some(true)
+    }
+
+    fn function_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }
 
     fn collation_is_visible(&self, oid: i32) -> Option<bool> {
@@ -3880,6 +3918,47 @@ pub fn describe_catalog_items<'q>(
                     txid,
                 ) {
                     out[column] = description;
+                }
+                if let Expr::Call {
+                    name,
+                    args,
+                    star: false,
+                    ..
+                } = expression
+                {
+                    let resolver: &dyn super::exec::ColTypeResolver = match definition {
+                        Some(table) => &super::exec::DefCols(table),
+                        None => &super::exec::NoCols,
+                    };
+                    let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    if args.len() <= argument_types.len() {
+                        let mut known = true;
+                        for (argument_index, argument) in args.iter().enumerate() {
+                            let Ok((oid, _)) = super::exec::infer_type_res(argument, resolver)
+                            else {
+                                known = false;
+                                break;
+                            };
+                            let Some(ctype) = super::exec::coltype_of_oid_pub(oid) else {
+                                known = false;
+                                break;
+                            };
+                            argument_types[argument_index] = ctype;
+                        }
+                        if known
+                            && let Some(routine) = storage.routine_for_call_types(
+                                name,
+                                &argument_types[..args.len()],
+                                txid,
+                            )
+                        {
+                            out[column] = ColDesc::new(
+                                alias.unwrap_or(super::exec::derived_name(expression)),
+                                routine.result.oid(),
+                                routine.result.typlen(),
+                            );
+                        }
+                    }
                 }
                 column += 1;
             }

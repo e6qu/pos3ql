@@ -1005,12 +1005,25 @@ fn comparable(a: ColType, b: ColType) -> bool {
 }
 
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
+    use core::fmt::Write;
+    let mut left = crate::util::StackStr::<64>::new();
+    let mut right = crate::util::StackStr::<64>::new();
+    for (ctype, output) in [(l, &mut left), (r, &mut right)] {
+        match ctype {
+            ColType::Array(element) => {
+                let _ = write!(output, "{}[]", element.to_coltype().name());
+            }
+            _ => {
+                let _ = output.write_str(ctype.name());
+            }
+        }
+    }
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "operator does not exist: {} {} {}",
-        l.name(),
+        left.as_str(),
         operator,
-        r.name()
+        right.as_str()
     )
 }
 
@@ -1441,6 +1454,7 @@ pub fn infer_type_res(
             | "pg_get_expr"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
+            | "pg_get_functiondef"
             | "pg_get_viewdef"
             | "col_description"
             | "obj_description"

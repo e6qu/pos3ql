@@ -89,6 +89,8 @@ const KIND_DROP_PUBLICATION: u8 = 36;
 const KIND_ALTER_PUBLICATION: u8 = 42;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
+const KIND_CREATE_ROUTINE: u8 = 45;
+const KIND_DROP_ROUTINE: u8 = 46;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -96,7 +98,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_RENAME_PUBLICATION;
+const LAST_KIND: u8 = KIND_DROP_ROUTINE;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -496,6 +498,12 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         old_name: &'a str,
         new_name: &'a str,
+    },
+    CreateRoutine(crate::storage::RoutineDef),
+    DropRoutine {
+        schema: &'a str,
+        name: &'a str,
+        argument_type_codes: &'a [u8],
     },
     /// A `nextval`/`setval`/`RESTART` advance: the absolute value state, so
     /// replay is idempotent. Advances are non-transactional (they survive
@@ -1225,6 +1233,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
+        WalOp::CreateRoutine(_) => KIND_CREATE_ROUTINE,
+        WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
@@ -1471,6 +1481,27 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             old_name,
             new_name,
         } => 1 + old_name.len() + 1 + schema.len() + 1 + new_name.len(),
+        WalOp::CreateRoutine(def) => {
+            8 + 2
+                + 1
+                + def.name.as_str().len()
+                + 1
+                + def.schema.as_str().len()
+                + 1
+                + def
+                    .arguments()
+                    .iter()
+                    .map(|argument| 1 + argument.name.as_str().len() + 1)
+                    .sum::<usize>()
+                + 1
+                + 2
+                + def.body.as_str().len()
+        }
+        WalOp::DropRoutine {
+            schema,
+            name,
+            argument_type_codes,
+        } => 1 + name.len() + 1 + schema.len() + 1 + argument_type_codes.len(),
         WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
         WalOp::Comment {
             schema, name, text, ..
@@ -1908,6 +1939,32 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, old_name)
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, new_name)
+        }
+        WalOp::CreateRoutine(def) => {
+            let mut ok = buffer.append(&def.created_at.to_le_bytes())
+                && buffer.append(&def.ownership.owner.to_le_bytes())
+                && name_bytes(buffer, def.name.as_str())
+                && name_bytes(buffer, def.schema.as_str())
+                && buffer.append(&[def.argument_count as u8]);
+            for argument in def.arguments() {
+                ok &= name_bytes(buffer, argument.name.as_str())
+                    && buffer.append(&[argument.ctype.code()]);
+            }
+            ok &= buffer.append(&[def.result.code()])
+                && buffer.append(&(def.body.as_str().len() as u16).to_le_bytes())
+                && buffer.append(def.body.as_str().as_bytes());
+            ok
+        }
+        WalOp::DropRoutine {
+            schema,
+            name,
+            argument_type_codes,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && argument_type_codes.len() <= u8::MAX as usize
+                && buffer.append(&[argument_type_codes.len() as u8])
+                && buffer.append(argument_type_codes)
         }
         WalOp::SequenceAdvance {
             schema,
@@ -3062,6 +3119,70 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 old_name,
                 new_name,
+            })
+        }
+        KIND_CREATE_ROUTINE => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let argument_count = *payload.get(at)? as usize;
+            at += 1;
+            if argument_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                return None;
+            }
+            let mut arguments =
+                [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for argument in arguments.iter_mut().take(argument_count) {
+                let argument_name = take_name(&mut at)?;
+                let ctype = ColType::from_code(*payload.get(at)?)?;
+                at += 1;
+                *argument = crate::storage::RoutineArgumentDef {
+                    name: SqlName::parse(argument_name).ok()?,
+                    ctype,
+                };
+            }
+            let result = ColType::from_code(*payload.get(at)?)?;
+            at += 1;
+            let body_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
+            at += 2;
+            if body_len > crate::storage::ROUTINE_SQL_MAX {
+                return None;
+            }
+            let body = core::str::from_utf8(payload.get(at..at + body_len)?).ok()?;
+            at += body_len;
+            (at == payload.len()).then_some(WalOp::CreateRoutine(crate::storage::RoutineDef {
+                created_at,
+                schema: SqlName::parse(schema).ok()?,
+                name: SqlName::parse(name).ok()?,
+                arguments,
+                argument_count,
+                result,
+                body: crate::util::StackStr::from_str(body),
+                ownership: crate::storage::Ownership {
+                    owner,
+                    pending: None,
+                },
+                ddl_state: crate::storage::CatalogDdlState::Absent,
+            }))
+        }
+        KIND_DROP_ROUTINE => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            let argument_type_codes = payload.get(at..at + count)?;
+            at += count;
+            if at != payload.len() {
+                return None;
+            }
+            Some(WalOp::DropRoutine {
+                schema,
+                name,
+                argument_type_codes,
             })
         }
         KIND_CREATE_SCHEMA => {

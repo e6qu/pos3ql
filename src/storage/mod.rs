@@ -1359,7 +1359,7 @@ pub struct StoredQueryDependency {
 }
 
 impl StoredQueryDependency {
-    pub const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         class: DependencyClass::Table,
         slot: 0,
         referenced_columns: 0,
@@ -1377,7 +1377,7 @@ pub struct StoredQueryDependencies {
 }
 
 impl StoredQueryDependencies {
-    pub const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         entries: [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES],
         len: 0,
     };
@@ -1719,6 +1719,81 @@ pub(crate) const MAX_SEQUENCES: usize = 64;
 /// CHECK predicate text, so the catalog's static footprint is
 /// `MAX_DOMAINS * MAX_DOMAIN_CHECKS * CHECK_SQL_MAX`.
 pub(crate) const MAX_DOMAINS: usize = 32;
+
+/// Stored SQL routines share the table-sized catalog budget.  They are not
+/// executable closures: every durable definition is a bounded, replayable SQL
+/// identity and body.
+pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 16;
+pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
+/// User-defined routine OIDs occupy a stable, disjoint catalog range.
+pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
+
+pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
+    ROUTINE_OID_BASE
+        .checked_add(i32::try_from(routine.created_at).expect("routine OID range exhausted"))
+        .expect("routine OID range exhausted")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoutineArgumentDef {
+    pub name: SqlName,
+    pub ctype: ColType,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoutineSpec {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub argument_count: usize,
+    pub result: ColType,
+    pub body: StackStr<ROUTINE_SQL_MAX>,
+}
+
+impl RoutineArgumentDef {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        ctype: ColType::Text,
+    };
+}
+
+/// A durable scalar SQL-language routine.  Arguments and result type are
+/// stored as parsed types, so catalog rendering and execution cannot disagree
+/// over a textual type spelling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoutineDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub argument_count: usize,
+    pub result: ColType,
+    pub body: StackStr<ROUTINE_SQL_MAX>,
+    pub ownership: Ownership,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl RoutineDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+        argument_count: 0,
+        result: ColType::Text,
+        body: StackStr::new(),
+        ownership: Ownership::BOOTSTRAP,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn arguments(&self) -> &[RoutineArgumentDef] {
+        &self.arguments[..self.argument_count]
+    }
+}
 pub(crate) const MAX_DOMAIN_CHECKS: usize = 4;
 
 /// A `CREATE DOMAIN` type: a base type (with its typmod) plus optional
@@ -2831,6 +2906,7 @@ pub struct Storage {
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
+    routines: FixedVec<RoutineDef>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     view_dependencies: FixedVec<StoredQueryDependencies>,
@@ -3274,6 +3350,7 @@ impl Storage {
             * (size_of::<Table>()
                 + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                 + size_of::<ViewDef>()
+                + size_of::<RoutineDef>()
                 + size_of::<StoredQueryDependencies>()
                 + size_of::<MatviewDef>()
                 + size_of::<StoredQueryDependencies>()
@@ -3377,6 +3454,12 @@ impl Storage {
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
+                .expect("sized to max_tables");
+        }
+        let mut routines = FixedVec::new(budget, "routines", config.max_tables)?;
+        for _ in 0..config.max_tables {
+            routines
+                .push(RoutineDef::EMPTY)
                 .expect("sized to max_tables");
         }
         let view_dependencies =
@@ -3586,6 +3669,7 @@ impl Storage {
             pending_table_defs,
             pending_table_statistics,
             views,
+            routines,
             publications,
             replication_slots,
             view_dependencies,
@@ -4668,6 +4752,31 @@ impl Storage {
             "must be owner of {} {}",
             object_type,
             name.as_str()
+        ))
+    }
+
+    pub(crate) fn require_routine_owner(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let routine = self.routine(slot);
+        let owner = routine.ownership.owner_to(txid) as usize;
+        if self.role(role).attributes_to(txid).superuser
+            || owner == role
+            || self.role_can_set(role, owner, txid)
+        {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of function {}",
+            routine.name.as_str()
         ))
     }
 
@@ -11329,6 +11438,197 @@ impl Storage {
     pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
         let view = &mut self.views[slot];
         view.ddl_state = view.ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn routine_count(&self) -> usize {
+        self.routines.len()
+    }
+
+    pub(crate) fn routine(&self, slot: usize) -> &RoutineDef {
+        &self.routines[slot]
+    }
+
+    pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.routines
+            .iter()
+            .position(|routine| routine.visible_to(txid) && routine_oid(routine) == oid)
+    }
+
+    pub(crate) fn routine_for_call(
+        &self,
+        name: &str,
+        arguments: &[crate::sql::types::Datum<'_>],
+        txid: u32,
+    ) -> Option<&RoutineDef> {
+        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+        if arguments.len() > argument_types.len() {
+            return None;
+        }
+        for (slot, argument) in arguments.iter().enumerate() {
+            argument_types[slot] = crate::sql::exec::coltype_of_oid_pub(argument.type_oid())?;
+        }
+        self.routine_for_call_types(name, &argument_types[..arguments.len()], txid)
+    }
+
+    pub(crate) fn routine_for_call_types(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<&RoutineDef> {
+        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
+        self.routines.iter().find(|routine| {
+            routine.visible_to(txid)
+                && routine.schema.as_str() == schema
+                && routine.name.as_str() == name
+                && routine.argument_count == argument_types.len()
+                && routine
+                    .arguments()
+                    .iter()
+                    .zip(argument_types)
+                    .all(|(parameter, value)| parameter.ctype == *value)
+        })
+    }
+
+    pub(crate) fn routine_slot_by_signature(
+        &self,
+        schema: &str,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<usize> {
+        self.routines.iter().position(|routine| {
+            routine.visible_to(txid)
+                && routine.schema.as_str() == schema
+                && routine.name.as_str() == name
+                && routine.argument_count == argument_types.len()
+                && routine
+                    .arguments()
+                    .iter()
+                    .zip(argument_types)
+                    .all(|(argument, ctype)| argument.ctype == *ctype)
+        })
+    }
+
+    pub(crate) fn create_routine(
+        &mut self,
+        spec: RoutineSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let RoutineSpec {
+            schema,
+            name,
+            arguments,
+            argument_count,
+            result,
+            body,
+        } = spec;
+        self.require_schema_create(schema.as_str(), txid)?;
+        if let Some(blocker) = self.routines.iter().find_map(|routine| {
+            (routine.schema == schema
+                && routine.name == name
+                && routine.argument_count == argument_count
+                && routine.arguments()[..argument_count]
+                    .iter()
+                    .zip(&arguments[..argument_count])
+                    .all(|(left, right)| left.ctype == right.ctype))
+            .then_some(routine.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.routines.iter().any(|routine| {
+            routine.visible_to(txid)
+                && routine.schema == schema
+                && routine.name == name
+                && routine.argument_count == argument_count
+                && routine.arguments()[..argument_count]
+                    .iter()
+                    .zip(&arguments[..argument_count])
+                    .all(|(left, right)| left.ctype == right.ctype)
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "function \"{}\" already exists with same argument types",
+                name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .routines
+            .iter()
+            .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many routines (limit {})",
+                self.routines.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.routines[slot] = RoutineDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            arguments,
+            argument_count,
+            result,
+            body,
+            ownership: self.initial_ownership(txid),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn commit_routine_create(&mut self, slot: usize) {
+        self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
+        self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn drop_routine(&mut self, slot: usize, txid: u32) {
+        self.routines[slot].ddl_state = self.routines[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
+        self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
+        self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn replay_create_routine(&mut self, definition: RoutineDef) -> Result<(), SqlError> {
+        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+        for (slot, argument) in definition.arguments().iter().enumerate() {
+            argument_types[slot] = argument.ctype;
+        }
+        if let Some(slot) = self.routine_slot_by_signature(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            &argument_types[..definition.argument_count],
+            0,
+        ) {
+            self.drop_routine(slot, 0);
+            self.commit_routine_drop(slot);
+        }
+        let slot = self.create_routine(
+            RoutineSpec {
+                schema: definition.schema,
+                name: definition.name,
+                arguments: definition.arguments,
+                argument_count: definition.argument_count,
+                result: definition.result,
+                body: definition.body,
+            },
+            0,
+        )?;
+        self.routines[slot].created_at = definition.created_at;
+        self.routines[slot].ownership = definition.ownership;
+        self.catalog_seq = self.catalog_seq.max(definition.created_at);
+        self.commit_routine_create(slot);
+        Ok(())
     }
 
     pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {

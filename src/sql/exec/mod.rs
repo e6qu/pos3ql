@@ -13,14 +13,15 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    ColumnMeta, MAX_COLUMNS, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, ROUTINE_SQL_MAX, RoutineArgumentDef,
+    RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
 
 use super::ast::{
-    AlterAction, AlterTable, CreateTable, Delete, DropTable, Expr, Insert, LikeClause, Overriding,
-    QualName, SelectItem, Update,
+    AlterAction, AlterTable, CreateFunction, CreateTable, Delete, DropTable, Expr, Insert,
+    LikeClause, Overriding, QualName, SelectItem, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
@@ -5636,6 +5637,212 @@ pub struct CreateViewCommand<'a> {
     pub or_replace: bool,
     pub sql: &'a str,
     pub raw_path: &'a str,
+}
+
+pub fn create_function(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    function: &CreateFunction<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(function.name.schema, function.name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let name = match SqlName::parse(function.name.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let result = match ColType::from_sql_name(function.result_type) {
+        Some(result) => result,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                function.result_type
+            ));
+        }
+    };
+    let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    for (slot, argument) in function.arguments.iter().enumerate() {
+        let argument_name = match SqlName::parse(argument.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        let ctype = match ColType::from_sql_name(argument.type_name) {
+            Some(ctype) => ctype,
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    argument.type_name
+                ));
+            }
+        };
+        arguments[slot] = RoutineArgumentDef {
+            name: argument_name,
+            ctype,
+        };
+    }
+    let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+    for (slot, argument) in arguments[..function.arguments.len()].iter().enumerate() {
+        argument_types[slot] = argument.ctype;
+    }
+    let replaced = storage.routine_slot_by_signature(
+        schema.as_str(),
+        name.as_str(),
+        &argument_types[..function.arguments.len()],
+        txn.txid,
+    );
+    if let Some(replaced_slot) = replaced {
+        if !function.or_replace {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "function \"{}\" already exists with same argument types",
+                name.as_str()
+            ));
+        }
+        if let Err(error) = storage.require_routine_owner(replaced_slot, txn.txid) {
+            return sql_fail(error);
+        }
+        storage.drop_routine(replaced_slot, txn.txid);
+    }
+    let expression = function
+        .body
+        .trim()
+        .strip_prefix("SELECT ")
+        .or_else(|| function.body.trim().strip_prefix("select "));
+    let Some(expression) = expression else {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "SQL routine body must be a scalar SELECT expression"
+        ));
+    };
+    if let Err(error) = super::parser::parse_expr(expression, arena) {
+        return sql_fail(error);
+    }
+    let body = StackStr::<ROUTINE_SQL_MAX>::from_str(function.body);
+    if body.is_truncated() {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine definition exceeds {} bytes",
+            ROUTINE_SQL_MAX
+        ));
+    }
+    let slot = match storage.create_routine(
+        RoutineSpec {
+            schema,
+            name,
+            arguments,
+            argument_count: function.arguments.len(),
+            result,
+            body,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot))) {
+        storage.rollback_routine_create(slot);
+        if let Some(replaced_slot) = replaced {
+            storage.rollback_routine_drop(replaced_slot, txn.txid);
+        }
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
+        storage.rollback_routine_create(slot);
+        if let Some(replaced_slot) = replaced {
+            storage.rollback_routine_drop(replaced_slot, txn.txid);
+        }
+        return sql_fail(error);
+    }
+    if let Some(replaced_slot) = replaced
+        && let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::RoutineDropped(replaced_slot as u32))
+    {
+        storage.rollback_routine_create(slot);
+        storage.rollback_routine_drop(replaced_slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE FUNCTION")?;
+    sql_ok()
+}
+
+pub fn drop_function(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    functions: &[super::ast::RoutineIdentity<'_>],
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for identity in functions {
+        let schema = identity.name.schema.unwrap_or("public");
+        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+        if identity.argument_types.len() > argument_types.len() {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many function arguments"
+            ));
+        }
+        for (index, type_name) in identity.argument_types.iter().enumerate() {
+            let Some(ctype) = ColType::from_sql_name(type_name) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name
+                ));
+            };
+            argument_types[index] = ctype;
+        }
+        let Some(slot) = storage.routine_slot_by_signature(
+            schema,
+            identity.name.name,
+            &argument_types[..identity.argument_types.len()],
+            txn.txid,
+        ) else {
+            if if_exists {
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function \"{}\" does not exist",
+                identity.name.name
+            ));
+        };
+        if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
+            return sql_fail(error);
+        }
+        let routine = *storage.routine(slot);
+        let lsn = storage.bump_lsn();
+        let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            type_codes[index] = argument.ctype.code();
+        }
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRoutine {
+                schema: routine.schema.as_str(),
+                name: routine.name.as_str(),
+                argument_type_codes: &type_codes[..routine.argument_count],
+            },
+        ) {
+            return sql_fail(error);
+        }
+        storage.drop_routine(slot, txn.txid);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
+            storage.rollback_routine_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP FUNCTION")?;
+    sql_ok()
 }
 
 pub fn create_view(

@@ -158,6 +158,14 @@ pub enum Stmt<'a> {
         or_replace: bool,
         sql: &'a str,
     },
+    /// `CREATE FUNCTION` retains a parsed signature and body spelling.  The
+    /// executor resolves every type before the definition reaches storage.
+    CreateFunction(CreateFunction<'a>),
+    DropFunction {
+        functions: &'a [RoutineIdentity<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// DROP VIEW [IF EXISTS] name.
     DropView {
         names: &'a [QualName<'a>],
@@ -1095,6 +1103,27 @@ pub struct CreateDomain<'a> {
     pub not_null: bool,
     pub default_text: Option<&'a str>,
     pub checks: &'a [DomainCheck<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineArgument<'a> {
+    pub name: &'a str,
+    pub type_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateFunction<'a> {
+    pub name: QualName<'a>,
+    pub or_replace: bool,
+    pub arguments: &'a [RoutineArgument<'a>],
+    pub result_type: &'a str,
+    pub body: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineIdentity<'a> {
+    pub name: QualName<'a>,
+    pub argument_types: &'a [&'a str],
 }
 
 /// One domain `[CONSTRAINT name] CHECK (expr)` — `name` is `None` when the

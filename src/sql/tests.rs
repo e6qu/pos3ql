@@ -5462,6 +5462,159 @@ fn views_survive_restart() {
 }
 
 #[test]
+fn sql_routine_lifecycle_is_transactional_and_durable() {
+    let config = test_config("routine_lifecycle");
+    let answer_oid: i32;
+    {
+        let mut budget = Budget::new(1 << 28);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut guc = GucState::new();
+        let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+        macro_rules! execute {
+            ($sql:expr) => {
+                run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, $sql)
+            };
+        }
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42'",
+        );
+        assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+        let listed = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT proname, pronargs FROM pg_proc WHERE proname = 'answer'",
+        );
+        assert_eq!(
+            data_rows(&listed),
+            ["answer|0"],
+            "{}",
+            String::from_utf8_lossy(&listed)
+        );
+        let answer = run_with(&mut engine, &mut budget, "SELECT answer()");
+        assert_eq!(
+            data_rows(&answer),
+            ["42"],
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            row_description_type_oids(&describe_with(&mut engine, &mut budget, "SELECT answer()")),
+            [23]
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION increment(integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1'",
+        );
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, "SELECT increment(41)")),
+            ["42"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT routine_name, data_type FROM information_schema.routines WHERE routine_name = 'answer'",
+            )),
+            ["answer|integer"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT proname, pronargs, prorettype, prokind, proargtypes FROM pg_proc WHERE proname IN ('answer', 'increment') ORDER BY proname",
+            )),
+            ["answer|0|23|f|", "increment|1|23|f|23"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT parameter_name, data_type FROM information_schema.parameters WHERE specific_name LIKE 'increment_%'",
+            )),
+            ["NULL|integer"]
+        );
+        let oid = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid FROM pg_proc WHERE proname = 'answer'",
+        ))[0]
+            .parse::<i32>()
+            .unwrap();
+        answer_oid = oid;
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                &format!("SELECT pg_function_is_visible({oid})"),
+            )),
+            ["t"]
+        );
+        let definition = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_get_functiondef({oid})"),
+        ));
+        assert_eq!(
+            definition,
+            [
+                "CREATE OR REPLACE FUNCTION public.answer() RETURNS integer LANGUAGE sql AS 'SELECT 42'"
+            ]
+        );
+
+        execute!("BEGIN");
+        execute!("CREATE OR REPLACE FUNCTION answer() RETURNS integer LANGUAGE SQL AS 'SELECT 43'");
+        assert_eq!(data_rows(&execute!("SELECT answer()")), ["43"]);
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, "SELECT answer()")),
+            ["42"],
+            "a second transaction must retain the committed routine definition"
+        );
+        execute!("ROLLBACK");
+        assert_eq!(data_rows(&execute!("SELECT answer()")), ["42"]);
+        assert_eq!(
+            data_rows(&execute!(
+                "SELECT oid FROM pg_proc WHERE proname = 'answer'"
+            )),
+            [oid.to_string()]
+        );
+
+        execute!("BEGIN");
+        execute!("SAVEPOINT routine_drop");
+        execute!("DROP FUNCTION answer()");
+        let missing = execute!("SELECT answer()");
+        assert!(String::from_utf8_lossy(&missing).contains("42883"));
+        execute!("ROLLBACK TO SAVEPOINT routine_drop");
+        assert_eq!(data_rows(&execute!("SELECT answer()")), ["42"]);
+        execute!("COMMIT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT answer()")),
+        ["42"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid FROM pg_proc WHERE proname = 'answer'",
+        )),
+        [answer_oid.to_string()]
+    );
+    run_with(&mut engine, &mut budget, "DROP FUNCTION answer()");
+    engine.commit_wal().unwrap();
+    drop(engine);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let missing = run_with(&mut engine, &mut budget, "SELECT answer()");
+    assert!(String::from_utf8_lossy(&missing).contains("42883"));
+}
+
+#[test]
 fn matview_survives_restart() {
     // A materialized view's rows (its backing table) and its defining query
     // (the matview catalog) are both journaled, so they survive a WAL-replay

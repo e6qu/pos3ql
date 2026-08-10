@@ -10,9 +10,9 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateFunction,
+    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateRoutine,
     CreateSchemaElement, DomainCheck, PublicationOperations, RoleOptions, RoutineArgument,
-    RoutineIdentity,
+    RoutineCreateKind, RoutineIdentity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -34,9 +34,14 @@ impl<'a> Parser<'a> {
                 return self.create_view(true);
             }
             if self.eat_ident("function")? {
-                return self.create_function(true);
+                return self.create_routine(true, true);
             }
-            return Err(self.unexpected("expected VIEW or FUNCTION after CREATE OR REPLACE"));
+            if self.eat_ident("procedure")? {
+                return self.create_routine(true, false);
+            }
+            return Err(
+                self.unexpected("expected VIEW, FUNCTION, or PROCEDURE after CREATE OR REPLACE")
+            );
         }
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
@@ -46,7 +51,10 @@ impl<'a> Parser<'a> {
             return self.create_view(false);
         }
         if self.eat_ident("function")? {
-            return self.create_function(false);
+            return self.create_routine(false, true);
+        }
+        if self.eat_ident("procedure")? {
+            return self.create_routine(false, false);
         }
         if self.eat_ident("publication")? {
             return self.create_publication();
@@ -82,11 +90,14 @@ impl<'a> Parser<'a> {
         self.create_table()
     }
 
-    /// `CREATE [OR REPLACE] FUNCTION name(args) RETURNS type LANGUAGE SQL AS
-    /// body`.  The AST separates the signature from the body so execution can
-    /// validate all types before any catalog state is changed.
-    fn create_function(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
-        let name = self.qual_name("function name")?;
+    /// SQL-language routine definition. Its parsed kind makes omitting a
+    /// function return type or assigning one to a procedure impossible.
+    fn create_routine(&mut self, or_replace: bool, function: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name(if function {
+            "function name"
+        } else {
+            "procedure name"
+        })?;
         self.expect_op("(")?;
         let mut arguments = [RoutineArgument {
             name: "",
@@ -114,17 +125,23 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
-        self.expect_ident("returns")?;
-        let result_type = self.any_ident("function return type")?;
+        let kind = if function {
+            self.expect_ident("returns")?;
+            RoutineCreateKind::Function {
+                result_type: self.any_ident("function return type")?,
+            }
+        } else {
+            RoutineCreateKind::Procedure
+        };
         self.expect_ident("language")?;
         self.expect_ident("sql")?;
         self.expect_ident("as")?;
         let body = self.str_literal("function body")?;
-        Ok(Stmt::CreateFunction(CreateFunction {
+        Ok(Stmt::CreateRoutine(CreateRoutine {
             name,
             or_replace,
             arguments: self.arena_slice(&arguments[..count])?,
-            result_type,
+            kind,
             body,
         }))
     }
@@ -1169,7 +1186,10 @@ impl<'a> Parser<'a> {
             return self.drop_domain();
         }
         if self.eat_ident("function")? {
-            return self.drop_function();
+            return self.drop_routine(false);
+        }
+        if self.eat_ident("procedure")? {
+            return self.drop_routine(true);
         }
         if self.eat_ident("type")? {
             return self.drop_type();
@@ -1235,7 +1255,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn drop_function(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn drop_routine(&mut self, procedure: bool) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
@@ -1283,11 +1303,20 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        Ok(Stmt::DropFunction {
-            functions: self.arena_slice(&functions[..count])?,
-            if_exists,
-            cascade,
-        })
+        let routines = self.arena_slice(&functions[..count])?;
+        if procedure {
+            Ok(Stmt::DropProcedure {
+                procedures: routines,
+                if_exists,
+                cascade,
+            })
+        } else {
+            Ok(Stmt::DropFunction {
+                functions: routines,
+                if_exists,
+                cascade,
+            })
+        }
     }
 
     /// `[IF EXISTS] name [, ...]` after a DROP keyword.

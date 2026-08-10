@@ -4018,8 +4018,16 @@ pub fn describe_catalog_items<'q>(
                         {
                             out[column] = ColDesc::new(
                                 alias.unwrap_or(super::exec::derived_name(expression)),
-                                routine.result.oid(),
-                                routine.result.typlen(),
+                                routine
+                                    .kind
+                                    .function_result()
+                                    .expect("scalar routine used as an expression has a result")
+                                    .oid(),
+                                routine
+                                    .kind
+                                    .function_result()
+                                    .expect("scalar routine used as an expression has a result")
+                                    .typlen(),
                             );
                         }
                     }

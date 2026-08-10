@@ -1500,6 +1500,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 2
                 + def.body.as_str().len()
+                + usize::from(matches!(def.kind, crate::storage::RoutineKind::Procedure))
         }
         WalOp::DropRoutine {
             schema,
@@ -1975,9 +1976,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= name_bytes(buffer, argument.name.as_str())
                     && buffer.append(&[argument.ctype.code()]);
             }
-            ok &= buffer.append(&[def.result.code()])
+            ok &= buffer.append(&[def.kind.function_result().unwrap_or(ColType::Text).code()])
                 && buffer.append(&(def.body.as_str().len() as u16).to_le_bytes())
                 && buffer.append(def.body.as_str().as_bytes());
+            if matches!(def.kind, crate::storage::RoutineKind::Procedure) {
+                ok &= buffer.append(&[def.kind.wire_code()]);
+            }
             ok
         }
         WalOp::DropRoutine {
@@ -3185,13 +3189,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             let body = core::str::from_utf8(payload.get(at..at + body_len)?).ok()?;
             at += body_len;
+            let kind = if at == payload.len() {
+                crate::storage::RoutineKind::Function { result }
+            } else {
+                let kind = crate::storage::RoutineKind::from_wire_code(*payload.get(at)?, result)?;
+                at += 1;
+                kind
+            };
             (at == payload.len()).then_some(WalOp::CreateRoutine(crate::storage::RoutineDef {
                 created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 arguments,
                 argument_count,
-                result,
+                kind,
                 body: crate::util::StackStr::from_str(body),
                 ownership: crate::storage::Ownership {
                     owner,

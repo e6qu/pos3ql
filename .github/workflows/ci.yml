@@ -82,9 +82,13 @@ jobs:
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
 
-  # Independent deterministic seeds run on four bounded workers. This retains
-  # the endurance sweep while keeping the PR critical path near five minutes.
+  # Split the fixed seed range across runners. The complete 16-seed sweep is
+  # unchanged, but no one runner owns all four batches.
   storage-vopr:
+    strategy:
+      fail-fast: false
+      matrix:
+        seed0: [460259, 460263, 460267, 460271]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -100,10 +104,11 @@ jobs:
           key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-vopr-
 
-      - name: Storage VOPR (parallel extended sweep)
+      - name: Storage VOPR (seed range ${{ matrix.seed0 }})
         run: cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
         env:
-          POS3QL_STORAGE_VOPR_SEEDS: 16
+          POS3QL_STORAGE_VOPR_SEED0: ${{ matrix.seed0 }}
+          POS3QL_STORAGE_VOPR_SEEDS: 4
           POS3QL_STORAGE_VOPR_STEPS: 300
 
   # These cold external-run phases own the fixed object-store workload.

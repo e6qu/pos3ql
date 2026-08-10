@@ -5643,6 +5643,124 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
 }
 
 #[test]
+fn sql_procedure_call_is_typed_durable_and_catalogued() {
+    let config = test_config("sql_procedure_call");
+    {
+        let mut budget = Budget::new(1 << 28);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE procedure_log (value integer)",
+        );
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE PROCEDURE log_value(value integer) LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES ($1)'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let acl_setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE procedure_reader;
+             GRANT INSERT ON TABLE procedure_log TO procedure_reader;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&acl_setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&acl_setup)
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "REVOKE EXECUTE ON PROCEDURE log_value(integer) FROM PUBLIC",
+        );
+        let acl_denied = run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE procedure_reader; CALL log_value(40)",
+        );
+        assert!(
+            String::from_utf8_lossy(&acl_denied).contains("42501"),
+            "{}",
+            String::from_utf8_lossy(&acl_denied)
+        );
+        run_with(&mut engine, &mut budget, "RESET ROLE");
+        let acl_grant = run_with(
+            &mut engine,
+            &mut budget,
+            "GRANT EXECUTE ON PROCEDURE log_value(integer) TO procedure_reader;
+             SET ROLE procedure_reader;
+             CALL log_value(40);
+             RESET ROLE;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&acl_grant).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&acl_grant)
+        );
+        let called = run_with(&mut engine, &mut budget, "CALL log_value(41)");
+        assert!(
+            !String::from_utf8_lossy(&called).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&called)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT value FROM procedure_log"
+            )),
+            ["40", "41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT prokind, prorettype FROM pg_proc WHERE proname = 'log_value'"
+            )),
+            ["p|2278"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT routine_type, data_type FROM information_schema.routines WHERE routine_name = 'log_value'"
+            )),
+            ["PROCEDURE|NULL"]
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(&mut engine, &mut budget, "CALL log_value(42)");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM procedure_log ORDER BY value"
+        )),
+        ["40", "41", "42"]
+    );
+    let wrong_drop = run_with(&mut engine, &mut budget, "DROP FUNCTION log_value(integer)");
+    assert!(String::from_utf8_lossy(&wrong_drop).contains("42883"));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP PROCEDURE log_value(integer)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+}
+
+#[test]
 fn routine_acls_are_signature_typed_enforced_and_durable() {
     let config = test_config("routine_acls");
     {
@@ -5780,7 +5898,9 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              CREATE FUNCTION checkpoint_overload() RETURNS integer LANGUAGE SQL AS 'SELECT 7';
              CREATE FUNCTION checkpoint_overload(integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
              RESET ROLE;
-             GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;",
+             GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;
+             CREATE TABLE checkpoint_procedure_log (value integer);
+             CREATE PROCEDURE checkpoint_log(value integer) LANGUAGE SQL AS 'INSERT INTO checkpoint_procedure_log VALUES ($1)';",
         );
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -5798,9 +5918,11 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
             "SET ROLE checkpoint_reader;
              SELECT checkpoint_overload();
              RESET ROLE;
-             SELECT has_function_privilege('checkpoint_reader', 'checkpoint_overload(integer)', 'EXECUTE');",
+             CALL checkpoint_log(9);
+             SELECT has_function_privilege('checkpoint_reader', 'checkpoint_overload(integer)', 'EXECUTE');
+             SELECT value FROM checkpoint_procedure_log;",
         )),
-        ["7", "f"]
+        ["7", "f", "9"]
     );
 }
 

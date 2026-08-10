@@ -1747,8 +1747,48 @@ pub(crate) struct RoutineSpec {
     pub name: SqlName,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
-    pub result: ColType,
+    pub kind: RoutineKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
+}
+
+/// A routine's invocation contract. Keeping a function result inside the
+/// function variant makes a procedure with a fabricated scalar result
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineKind {
+    Function { result: ColType },
+    Procedure,
+}
+
+impl RoutineKind {
+    pub(crate) const fn function_result(self) -> Option<ColType> {
+        match self {
+            Self::Function { result } => Some(result),
+            Self::Procedure => None,
+        }
+    }
+
+    pub(crate) const fn catalog_kind(self) -> &'static str {
+        match self {
+            Self::Function { .. } => "f",
+            Self::Procedure => "p",
+        }
+    }
+
+    pub(crate) const fn wire_code(self) -> u8 {
+        match self {
+            Self::Function { .. } => 0,
+            Self::Procedure => 1,
+        }
+    }
+
+    pub(crate) const fn from_wire_code(code: u8, result: ColType) -> Option<Self> {
+        match code {
+            0 => Some(Self::Function { result }),
+            1 => Some(Self::Procedure),
+            _ => None,
+        }
+    }
 }
 
 /// The catalog identity of a routine definition. Replacement retains every
@@ -1779,7 +1819,7 @@ pub(crate) struct RoutineDef {
     pub name: SqlName,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
-    pub result: ColType,
+    pub kind: RoutineKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -1792,7 +1832,9 @@ impl RoutineDef {
         name: SqlName::EMPTY,
         arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         argument_count: 0,
-        result: ColType::Text,
+        kind: RoutineKind::Function {
+            result: ColType::Text,
+        },
         body: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
@@ -11549,6 +11591,28 @@ impl Storage {
         let (schema, name) = name.split_once('.').unwrap_or(("public", name));
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
+                && routine.kind.function_result().is_some()
+                && routine.schema.as_str() == schema
+                && routine.name.as_str() == name
+                && routine.argument_count == argument_types.len()
+                && routine
+                    .arguments()
+                    .iter()
+                    .zip(argument_types)
+                    .all(|(parameter, value)| parameter.ctype == *value)
+        })
+    }
+
+    pub(crate) fn procedure_slot_for_call_types(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<usize> {
+        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
+        self.routines.iter().position(|routine| {
+            routine.visible_to(txid)
+                && matches!(routine.kind, RoutineKind::Procedure)
                 && routine.schema.as_str() == schema
                 && routine.name.as_str() == name
                 && routine.argument_count == argument_types.len()
@@ -11598,7 +11662,7 @@ impl Storage {
             name,
             arguments,
             argument_count,
-            result,
+            kind,
             body,
         } = spec;
         self.require_schema_create(schema.as_str(), txid)?;
@@ -11662,7 +11726,7 @@ impl Storage {
             name,
             arguments,
             argument_count,
-            result,
+            kind,
             body,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -11726,7 +11790,7 @@ impl Storage {
                 name: definition.name,
                 arguments: definition.arguments,
                 argument_count: definition.argument_count,
-                result: definition.result,
+                kind: definition.kind,
                 body: definition.body,
             },
             0,

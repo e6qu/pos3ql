@@ -50,7 +50,7 @@ use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
 use ast::{Delete, Expr, Insert, Stmt, Update};
-use eval::{NO_PARAMS, NoColumns, SqlError, eval, sqlstate};
+use eval::{EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SqlError, eval, sqlstate};
 use exec::MAX_PROJ;
 use guc::GucState;
 use parser::{ParseError, Parser};
@@ -295,6 +295,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Analyze(_)
         | Stmt::Listen(_)
         | Stmt::Unlisten(_) => false,
+        Stmt::Call { .. } => true,
         Stmt::Copy(copy) => !copy.to,
         // A WITH wrapper exists only for a data-modifying main statement.
         Stmt::With { .. }
@@ -306,8 +307,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropTable(_)
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
-        | Stmt::CreateFunction(_)
+        | Stmt::CreateRoutine(_)
         | Stmt::DropFunction { .. }
+        | Stmt::DropProcedure { .. }
         | Stmt::DropView { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
@@ -4066,6 +4068,109 @@ impl Engine {
         Ok((records, bytes))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_call(
+        &mut self,
+        name: ast::QualName<'_>,
+        arguments: &[&Expr<'_>],
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if arguments.len() > values.len() {
+            return Ok(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many procedure arguments"
+            )));
+        }
+        let catalog = query::storage_catalog(&self.storage, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..NO_HOOKS
+        };
+        for (slot, argument) in arguments.iter().enumerate() {
+            values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+        let mut types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (slot, value) in values[..arguments.len()].iter().enumerate() {
+            let Some(ctype) = exec::coltype_of_oid_pub(value.type_oid()) else {
+                return Ok(Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "procedure \"{}\" does not exist",
+                    name.name
+                )));
+            };
+            types[slot] = ctype;
+        }
+        let qualified = match name.schema {
+            Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+            None => stack_format!(260, "{}", name.name),
+        };
+        let Some(slot) = self.storage.procedure_slot_for_call_types(
+            qualified.as_str(),
+            &types[..arguments.len()],
+            txn.txid,
+        ) else {
+            return Ok(Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "procedure \"{}\" does not exist",
+                qualified.as_str()
+            )));
+        };
+        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
+            return Ok(Err(error));
+        }
+        let body = self.storage.routine(slot).body;
+        let mut parser = match Parser::new(body.as_str(), arena) {
+            Ok(parser) => parser,
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        };
+        let statement = match parser.next_stmt() {
+            Ok(Some(statement)) => statement,
+            Ok(None) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "procedure body is empty"
+                )));
+            }
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        };
+        match parser.next_stmt() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL procedure bodies must contain exactly one statement"
+                )));
+            }
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        }
+        let output_mark = responder.buffer.mark();
+        let result = self.execute_stmt(
+            &statement,
+            arena,
+            &values[..arguments.len()],
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        );
+        responder.buffer.truncate_to(output_mark);
+        match result {
+            Ok(Ok(())) => responder.command_complete("CALL").map(|_| Ok(())),
+            other => other,
+        }
+    }
+
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
@@ -4381,25 +4486,47 @@ impl Engine {
                 arena,
                 responder,
             ),
-            Stmt::CreateFunction(function) => exec::create_function(
+            Stmt::CreateRoutine(routine) => exec::create_routine(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                function,
+                routine,
                 arena,
                 responder,
+            ),
+            Stmt::Call { name, arguments } => self.execute_call(
+                *name, arguments, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             Stmt::DropFunction {
                 functions,
                 if_exists,
                 cascade,
-            } => exec::drop_function(
+            } => exec::drop_routine(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                functions,
-                *if_exists,
-                *cascade,
+                exec::DropRoutineCommand {
+                    routines: functions,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                    procedure: false,
+                },
+                responder,
+            ),
+            Stmt::DropProcedure {
+                procedures,
+                if_exists,
+                cascade,
+            } => exec::drop_routine(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::DropRoutineCommand {
+                    routines: procedures,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                    procedure: true,
+                },
                 responder,
             ),
             Stmt::DropView {
@@ -5696,6 +5823,13 @@ fn emit_parse_warnings(
 
 fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), WireFull> {
     responder.error(e.sqlstate, e.message.as_str())
+}
+
+fn parse_error_to_sql(error: &ParseError) -> SqlError {
+    SqlError {
+        sqlstate: error.sqlstate,
+        message: stack_format!(192, "{}", error.message.as_str()),
+    }
 }
 
 /// Rewrites a CREATE SCHEMA element to create inside the new schema. An

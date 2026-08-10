@@ -186,6 +186,7 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
         oid::BOOL => ColType::Bool,
         oid::INT2 => ColType::Int2,
         oid::INT4 => ColType::Int4,
+        oid::OID => ColType::Oid,
         oid::INT8 => ColType::Int8,
         oid::NUMERIC => ColType::Numeric,
         oid::FLOAT4 => ColType::Float4,
@@ -991,7 +992,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     if a == b {
         return true;
     }
-    let numeric = |t: ColType| matches!(t, Int2 | Int4 | Int8 | Numeric | Float8 | Float4);
+    let numeric = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8 | Numeric | Float8 | Float4);
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
@@ -1441,7 +1442,6 @@ pub fn infer_type_res(
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
             | "pg_get_viewdef"
-            | "pg_get_functiondef"
             | "col_description"
             | "obj_description"
             | "shobj_description"

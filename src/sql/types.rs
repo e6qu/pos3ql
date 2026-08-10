@@ -99,6 +99,9 @@ pub enum ColType {
     /// It is transient catalog data and is never accepted as a stored column.
     Int2Vector,
     Int4,
+    /// PostgreSQL object identity, retaining its catalog and wire metadata
+    /// while sharing the engine's four-byte integer datum storage.
+    Oid,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
     /// typlen 4. On disk it keeps the historical 8-byte float8 layout
@@ -211,7 +214,7 @@ impl ColType {
             "text" | "regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
             | "regnamespace" | "regoper" | "regoperator" => Self::Text,
             "name" => Self::Name,
-            "oid" => Self::Int4,
+            "oid" => Self::Oid,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
@@ -242,6 +245,7 @@ impl ColType {
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
             Self::Int4 => oid::INT4,
+            Self::Oid => oid::OID,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
@@ -284,8 +288,8 @@ impl ColType {
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
             oid::INT4 => Some(Self::Int4),
-            oid::OID
-            | oid::REGPROC
+            oid::OID => Some(Self::Oid),
+            oid::REGPROC
             | oid::REGPROCEDURE
             | oid::REGOPER
             | oid::REGOPERATOR
@@ -394,7 +398,7 @@ impl ColType {
             Self::Bool => 1,
             Self::Int2 => 2,
             Self::Int2Vector => -1,
-            Self::Int4 | Self::Date | Self::Float4 => 4,
+            Self::Int4 | Self::Oid | Self::Date | Self::Float4 => 4,
             Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
@@ -423,6 +427,7 @@ impl ColType {
         match self {
             Self::Float4 => Self::Float8,
             Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
+            Self::Oid => Self::Int4,
             other => other,
         }
     }
@@ -434,6 +439,7 @@ impl ColType {
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
             Self::Int4 => "int4",
+            Self::Oid => "oid",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
@@ -483,6 +489,7 @@ impl ColType {
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
             Self::Int4 => "integer",
+            Self::Oid => "oid",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
@@ -522,6 +529,7 @@ impl ColType {
         match self {
             Self::Bool => 1,
             Self::Int4 => 2,
+            Self::Oid => 56,
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
@@ -571,6 +579,7 @@ impl ColType {
         Some(match code {
             1 => Self::Bool,
             2 => Self::Int4,
+            56 => Self::Oid,
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
@@ -1853,6 +1862,7 @@ mod tests {
     #[test]
     fn type_names_map() {
         assert_eq!(ColType::from_sql_name("integer"), Some(ColType::Int4));
+        assert_eq!(ColType::from_sql_name("oid"), Some(ColType::Oid));
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
         assert_eq!(ColType::from_sql_name("record"), Some(ColType::Record));
         assert_eq!(ColType::from_sql_name("geometry"), None);
@@ -1865,6 +1875,7 @@ mod tests {
             ColType::Bool,
             ColType::Int2,
             ColType::Int4,
+            ColType::Oid,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -1957,6 +1968,7 @@ mod code_roundtrip_tests {
             ColType::Bool,
             ColType::Int2,
             ColType::Int4,
+            ColType::Oid,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,

@@ -376,6 +376,16 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Whether this OID names a relation visible to the current query.
+    fn relation_is_visible(&self, oid: i32) -> Option<bool>;
+    /// Whether this OID names a type visible to the current query.
+    fn type_is_visible(&self, oid: i32) -> Option<bool>;
+    /// Whether this OID names a function visible to the current query.
+    fn function_is_visible(&self, oid: i32) -> Option<bool>;
+    /// Whether this OID names a collation visible to the current query.
+    fn collation_is_visible(&self, oid: i32) -> Option<bool>;
+    /// Whether this OID names a relation eligible for a publication.
+    fn relation_is_publishable(&self, oid: i32) -> Option<bool>;
     /// The index definition for this OID: `col == 0` gives the whole
     /// `btree (col, ...)` form; `col > 0` gives the name of that 1-based indexed
     /// column. `None` if no such index is known.

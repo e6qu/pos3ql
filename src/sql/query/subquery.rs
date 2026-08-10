@@ -1366,7 +1366,7 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         // An empty record: enough for coerce_unknown to leave values alone.
         ColType::Record => Datum::Record(&[]),
         ColType::Bool => Datum::Bool(false),
-        ColType::Int2 | ColType::Int4 => Datum::Int4(0),
+        ColType::Int2 | ColType::Int4 | ColType::Oid => Datum::Int4(0),
         ColType::Int8 => Datum::Int8(0),
         ColType::Time => Datum::Time(0),
         ColType::Timetz => Datum::Timetz(0, 0),

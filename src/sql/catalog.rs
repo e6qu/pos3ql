@@ -30,6 +30,227 @@ const PG_CLASS_OID: i32 = 1259;
 const PG_NAMESPACE_OID: i32 = 2615;
 const PG_TYPE_OID: i32 = 1247;
 
+#[derive(Clone, Copy)]
+struct IntrinsicRoutine {
+    oid: i32,
+    name: &'static str,
+    result_oid: i32,
+    argument_types: &'static str,
+    argument_count: i32,
+    volatility: &'static str,
+}
+
+const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    IntrinsicRoutine {
+        oid: 89,
+        name: "version",
+        result_oid: 25,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 861,
+        name: "current_database",
+        result_oid: 19,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1081,
+        name: "format_type",
+        result_oid: 25,
+        argument_types: "26 23",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1215,
+        name: "obj_description",
+        result_oid: 25,
+        argument_types: "26 19",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1216,
+        name: "col_description",
+        result_oid: 25,
+        argument_types: "26 23",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1264,
+        name: "pg_char_to_encoding",
+        result_oid: 23,
+        argument_types: "19",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1387,
+        name: "pg_get_constraintdef",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1402,
+        name: "current_schema",
+        result_oid: 19,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1403,
+        name: "current_schemas",
+        result_oid: 1003,
+        argument_types: "16",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1597,
+        name: "pg_encoding_to_char",
+        result_oid: 19,
+        argument_types: "23",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1641,
+        name: "pg_get_viewdef",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1642,
+        name: "pg_get_userbyid",
+        result_oid: 19,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1643,
+        name: "pg_get_indexdef",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1716,
+        name: "pg_get_expr",
+        result_oid: 25,
+        argument_types: "194 26",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2077,
+        name: "current_setting",
+        result_oid: 25,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2078,
+        name: "set_config",
+        result_oid: 25,
+        argument_types: "25 25 16",
+        argument_count: 3,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 2079,
+        name: "pg_table_is_visible",
+        result_oid: 16,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2080,
+        name: "pg_type_is_visible",
+        result_oid: 16,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2081,
+        name: "pg_function_is_visible",
+        result_oid: 16,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2168,
+        name: "pg_database_size",
+        result_oid: 20,
+        argument_types: "19",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 2322,
+        name: "pg_tablespace_size",
+        result_oid: 20,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 2997,
+        name: "pg_table_size",
+        result_oid: 20,
+        argument_types: "2205",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3778,
+        name: "pg_tablespace_location",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3810,
+        name: "pg_is_in_recovery",
+        result_oid: 16,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3815,
+        name: "pg_collation_is_visible",
+        result_oid: 16,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 6121,
+        name: "pg_relation_is_publishable",
+        result_oid: 16,
+        argument_types: "2205",
+        argument_count: 1,
+        volatility: "s",
+    },
+];
+
 fn catalog_relation_oid(name: &str) -> Option<i32> {
     Some(match name {
         "pg_type" => PG_TYPE_OID,
@@ -496,30 +717,7 @@ pub fn synthesize<'a>(
             ],
             arena,
         ),
-        (false, "pg_proc") => finish(
-            def_of(
-                "pg_proc",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("proname", ColType::Text),
-                    ("pronamespace", ColType::Int4),
-                    ("pronargs", ColType::Int4),
-                    ("prorettype", ColType::Int4),
-                    ("prokind", ColType::Bpchar),
-                    ("proargtypes", ColType::Text),
-                    ("provolatile", ColType::Bpchar),
-                    ("proparallel", ColType::Bpchar),
-                    ("proowner", ColType::Int4),
-                    ("prosecdef", ColType::Bool),
-                    ("proacl", ColType::Array(super::types::ArrElem::Text)),
-                    ("prolang", ColType::Int4),
-                    ("prosrc", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_proc") => pg_proc(arena),
         (false, "pg_operator") => finish(
             def_of(
                 "pg_operator",
@@ -1696,6 +1894,80 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
                 && schema.is_none_or(|schema| storage.view(slot).schema.as_str() == schema)
         })
         .map(view_oid)
+}
+
+/// Catalog identity checks used by PostgreSQL's visibility helpers.  The
+/// synthesized catalogs and executable SQL built-ins deliberately have
+/// separate namespaces, so an OID is accepted only by the predicate that
+/// owns it.
+pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
+    catalog_relation_oid_by_oid(oid)
+        || (0..storage.table_count())
+            .any(|slot| storage.table(slot).visible_to(txid) && table_oid(storage, slot) == oid)
+        || has_index_oid(storage, txid, oid)
+        || (0..storage.sequence_count()).any(|slot| {
+            storage.sequence_for(slot, txid).visible_to(txid) && sequence_oid(slot) == oid
+        })
+        || (0..storage.view_count())
+            .any(|slot| storage.view(slot).visible_to(txid) && view_oid(slot) == oid)
+}
+
+fn catalog_relation_oid_by_oid(oid: i32) -> bool {
+    [
+        "pg_type",
+        "pg_proc",
+        "pg_class",
+        "pg_attribute",
+        "pg_amop",
+        "pg_amproc",
+        "pg_cast",
+        "pg_constraint",
+        "pg_depend",
+        "pg_rewrite",
+        "pg_namespace",
+        "pg_opfamily",
+        "pg_extension",
+        "pg_default_acl",
+        "pg_replication_slots",
+        "pg_transform",
+    ]
+    .into_iter()
+    .any(|name| catalog_relation_oid(name) == Some(oid))
+}
+
+pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
+    if super::types::ColType::from_oid(oid).is_some()
+        || matches!(
+            oid,
+            26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 4096 | 4097
+        )
+    {
+        return true;
+    }
+    use super::types::oid as type_oid;
+    let visible_slot = |first, count, visible: &dyn Fn(usize) -> bool| {
+        (first..first + count as i32).contains(&oid) && visible((oid - first) as usize)
+    };
+    visible_slot(
+        type_oid::FIRST_DOMAIN,
+        crate::storage::MAX_DOMAINS,
+        &|slot| storage.domain(slot).visible_to(txid),
+    ) || visible_slot(type_oid::FIRST_ENUM, crate::storage::MAX_ENUMS, &|slot| {
+        storage.enum_for(slot, txid).visible_to(txid)
+    })
+}
+
+pub fn function_oid_is_visible(oid: i32) -> bool {
+    INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+pub fn collation_oid_is_visible(oid: i32) -> bool {
+    matches!(oid, 100 | 950 | 951 | 12_340)
+}
+
+pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bool {
+    (0..storage.table_count())
+        .any(|slot| storage.table(slot).visible_to(txid) && table_oid(storage, slot) == oid)
 }
 
 /// Stored SELECT text for `pg_get_viewdef`, by relation OID.
@@ -3932,6 +4204,60 @@ fn pg_attrdef<'a>(
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_proc<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_proc",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("proname", ColType::Name),
+            ("pronamespace", ColType::Oid),
+            ("pronargs", ColType::Int4),
+            ("prorettype", ColType::Oid),
+            ("prokind", ColType::Bpchar),
+            ("proargtypes", ColType::Text),
+            ("provolatile", ColType::Bpchar),
+            ("proparallel", ColType::Bpchar),
+            ("proowner", ColType::Oid),
+            ("prosecdef", ColType::Bool),
+            ("proacl", ColType::Array(super::types::ArrElem::Text)),
+            ("prolang", ColType::Oid),
+            ("prosrc", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; INTRINSIC_ROUTINES.len()] = [&[]; INTRINSIC_ROUTINES.len()];
+    for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Int4(1255),
+                Datum::Int4(routine.oid),
+                text(routine.name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(routine.argument_count),
+                Datum::Int4(routine.result_oid),
+                Datum::Bpchar("f"),
+                text(routine.argument_types, arena)?,
+                Datum::Bpchar(routine.volatility),
+                Datum::Bpchar("s"),
+                Datum::Int4(10),
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Int4(12),
+                text(
+                    if routine.oid == 89 {
+                        "pgsql_version"
+                    } else {
+                        routine.name
+                    },
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &rows, arena)
 }
 
 fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

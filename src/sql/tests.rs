@@ -12090,6 +12090,29 @@ fn psql_catalog_listing_contracts() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
+            "SELECT pg_table_is_visible('sized_relation'::regclass),
+                    pg_table_is_visible(999999),
+                    pg_type_is_visible(23),
+                    pg_type_is_visible(999999),
+                    pg_function_is_visible(0),
+                    pg_collation_is_visible(100),
+                    pg_relation_is_publishable('sized_relation'::regclass),
+                    pg_relation_is_publishable('pg_class'::regclass)"
+        )),
+        ["t|NULL|t|NULL|NULL|t|t|f"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_table_is_visible(4294983680::bigint)"
+        ))
+        .contains("22003")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
             "SELECT d.datname, t.spcname,
                     pg_database_size(d.datname) >= pg_table_size('sized_relation'::regclass)
              FROM pg_database d
@@ -12116,8 +12139,44 @@ fn psql_catalog_listing_contracts() {
         )),
         ["|t"]
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid, proname, proargtypes, prorettype
+             FROM pg_proc WHERE oid IN (89, 2079, 2081) ORDER BY oid"
+        )),
+        [
+            "89|version||25",
+            "2079|pg_table_is_visible|26|16",
+            "2081|pg_function_is_visible|26|16"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_function_is_visible(89), pg_function_is_visible(999999)"
+        )),
+        ["t|NULL"]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid, proname, pronamespace, prorettype FROM pg_proc WHERE oid = 89"
+        )),
+        [26, 19, 26, 26]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_functiondef(89)"
+        ))
+        .contains("42883")
+    );
     for query in [
-        "SELECT count(*) FROM pg_proc p LEFT JOIN pg_language l ON l.oid=p.prolang",
         "SELECT count(*) FROM pg_publication",
         "SELECT count(*) FROM pg_foreign_server s JOIN pg_foreign_data_wrapper f ON f.oid=s.srvfdw",
         "SELECT count(*) FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid=s.setdatabase",

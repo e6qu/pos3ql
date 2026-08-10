@@ -10044,7 +10044,7 @@ fn decode_binary_field_with_context<'a>(
             Ok(Datum::Int2(i16::from_be_bytes(b)))
         }
         ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
-        ColType::Int4 => via(oids::INT4),
+        ColType::Int4 | ColType::Oid => via(oids::INT4),
         ColType::Int8 => via(oids::INT8),
         ColType::Float4 => via(oids::FLOAT4),
         ColType::Float8 => via(oids::FLOAT8),

@@ -2631,6 +2631,45 @@ fn information_schema_constraint_and_type_usage_are_transaction_visible() {
 }
 
 #[test]
+fn information_schema_column_udt_usage_is_not_silently_capped() {
+    let mut config = test_config("information_schema_column_udt_usage_is_not_silently_capped");
+    config.max_tables = 17;
+    config.max_value_indexes = 17 * 64;
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut definition = String::new();
+    for table in 0..17 {
+        if table > 0 {
+            definition.push_str("; ");
+        }
+        definition.push_str(&format!("CREATE TABLE information_schema_usage_{table} ("));
+        for column in 0..64 {
+            if column > 0 {
+                definition.push_str(", ");
+            }
+            definition.push_str(&format!("column_{column} integer"));
+        }
+        definition.push(')');
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definition, 1 << 21);
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM information_schema.column_udt_usage",
+            1 << 21,
+        )),
+        ["1088"]
+    );
+}
+
+#[test]
 fn catalog_index_relations_are_not_silently_capped() {
     let mut config = test_config("catalog_index_relations_are_not_silently_capped");
     config.max_tables = 17;

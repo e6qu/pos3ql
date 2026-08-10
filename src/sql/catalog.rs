@@ -6654,7 +6654,22 @@ fn info_column_type_usage<'a>(
             ],
         },
     );
-    let mut output: [&[Datum]; 1024] = [&[]; 1024];
+    let table_capacity = storage
+        .table_count()
+        .checked_mul(MAX_COLUMNS)
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?;
+    let view_capacity = storage
+        .view_count()
+        .checked_mul(super::exec::MAX_PROJ)
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?;
+    let output = arena
+        .alloc_slice_with(
+            table_capacity
+                .checked_add(view_capacity)
+                .ok_or_else(|| catalog_capacity_exceeded("information_schema column type usage"))?,
+            |_| &[] as &[Datum],
+        )
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     let mut append =
         |schema: &str, table: &str, column: &str, metadata: &ColumnMeta| -> Result<(), SqlError> {
@@ -6664,11 +6679,7 @@ fn info_column_type_usage<'a>(
             let Some((type_schema, type_name)) = identity else {
                 return Ok(());
             };
-            if count == output.len() {
-                return Err(catalog_capacity_exceeded(
-                    "information_schema column type usage",
-                ));
-            }
+            debug_assert!(count < output.len());
             output[count] = row(
                 &[
                     text("postgres", arena)?,

@@ -159,6 +159,9 @@ pub(crate) enum DdlUndo {
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
     /// undo by reviving it.
     ViewDropped(u32),
+    /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
+    RoutineCreated(u32),
+    RoutineDropped(u32),
     /// CREATE PUBLICATION at this slot.
     PublicationCreated(u32),
     /// DROP PUBLICATION at this slot.
@@ -213,7 +216,11 @@ pub(crate) enum DdlUndo {
     /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)
-    SequenceReset { table: u32, column: u16, prior: i64 },
+    SequenceReset {
+        table: u32,
+        column: u16,
+        prior: i64,
+    },
     /// TRUNCATE ... RESTART IDENTITY reset a catalog sequence. Sequence value
     /// changes ordinarily survive rollback; this explicit restart is the one
     /// transactional exception PostgreSQL defines.

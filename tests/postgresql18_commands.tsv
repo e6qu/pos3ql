@@ -78,7 +78,7 @@ CREATE EVENT TRIGGER	missing	-
 CREATE EXTENSION	missing	-
 CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
-CREATE FUNCTION	missing	-
+CREATE FUNCTION	partial	87_sql_routines.sql
 CREATE GROUP	partial	83_roles_acl.sql
 CREATE INDEX	partial	43_indexes.sql
 CREATE LANGUAGE	missing	-
@@ -125,7 +125,7 @@ DROP EVENT TRIGGER	missing	-
 DROP EXTENSION	missing	-
 DROP FOREIGN DATA WRAPPER	missing	-
 DROP FOREIGN TABLE	missing	-
-DROP FUNCTION	missing	-
+DROP FUNCTION	partial	87_sql_routines.sql
 DROP GROUP	partial	83_roles_acl.sql
 DROP INDEX	complete	43_indexes.sql
 DROP LANGUAGE	missing	-

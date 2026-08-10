@@ -305,6 +305,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "views"
                 | "view_table_usage"
                 | "view_column_usage"
+                | "routines"
+                | "parameters"
         ),
         Some(_) => false,
         None => matches!(
@@ -717,7 +719,7 @@ pub fn synthesize<'a>(
             ],
             arena,
         ),
-        (false, "pg_proc") => pg_proc(arena),
+        (false, "pg_proc") => pg_proc(storage, txid, arena),
         (false, "pg_operator") => finish(
             def_of(
                 "pg_operator",
@@ -1151,6 +1153,8 @@ pub fn synthesize<'a>(
         (true, "column_privileges") => info_column_privileges(storage, txid, arena, true),
         (true, "role_column_grants") => info_column_privileges(storage, txid, arena, false),
         (true, "views") => info_views(storage, txid, arena),
+        (true, "routines") => info_routines(storage, txid, arena),
+        (true, "parameters") => info_parameters(storage, txid, arena),
         (true, "view_table_usage") => info_view_table_usage(storage, txid, arena),
         (true, "view_column_usage") => info_view_column_usage(storage, txid, arena),
         _ => Err(sql_err!(
@@ -1959,6 +1963,61 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+pub fn function_def_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine(slot);
+    use core::fmt::Write;
+    let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
+    write!(
+        definition,
+        "CREATE OR REPLACE FUNCTION {}.{}(",
+        routine.schema.as_str(),
+        routine.name.as_str()
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        if index != 0 {
+            write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
+        }
+        if !argument.name.as_str().is_empty() {
+            write!(definition, "{} ", argument.name.as_str())
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        write!(definition, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
+    }
+    write!(
+        definition,
+        ") RETURNS {} LANGUAGE sql AS '",
+        routine.result.name()
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    for character in routine.body.as_str().chars() {
+        write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
+        if character == '\'' {
+            write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+        }
+    }
+    write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+    if definition.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine definition exceeds catalog rendering capacity"
+        ));
+    }
+    Ok(Some(
+        arena
+            .alloc_str(definition.as_str())
+            .map_err(|_| super::eval::arena_full())?,
+    ))
 }
 
 pub fn collation_oid_is_visible(oid: i32) -> bool {
@@ -4206,7 +4265,7 @@ fn pg_attrdef<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_proc<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_proc",
         &[
@@ -4227,7 +4286,8 @@ fn pg_proc<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("prosrc", ColType::Text),
         ],
     );
-    let mut rows: [&[Datum]; INTRINSIC_ROUTINES.len()] = [&[]; INTRINSIC_ROUTINES.len()];
+    const MAX_ROWS: usize = 512;
+    let mut rows: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
         rows[index] = row(
             &[
@@ -4257,7 +4317,48 @@ fn pg_proc<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             arena,
         )?;
     }
-    finish(definition, &rows, arena)
+    let mut count = INTRINSIC_ROUTINES.len();
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine(slot);
+        if !routine.visible_to(txid) {
+            continue;
+        }
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_proc"));
+        }
+        let mut argument_types = crate::util::StackStr::<128>::new();
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            if index > 0 {
+                let _ = core::fmt::Write::write_str(&mut argument_types, " ");
+            }
+            let _ = core::fmt::Write::write_fmt(
+                &mut argument_types,
+                format_args!("{}", argument.ctype.oid()),
+            );
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(1255),
+                Datum::Int4(crate::storage::routine_oid(routine)),
+                text(routine.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, routine.schema.as_str())),
+                Datum::Int4(routine.argument_count as i32),
+                Datum::Int4(routine.result.oid()),
+                Datum::Bpchar("f"),
+                text(argument_types.as_str(), arena)?,
+                Datum::Bpchar("v"),
+                Datum::Bpchar("u"),
+                Datum::Int4(routine.ownership.owner_to(txid) as i32 + 10),
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Int4(14),
+                text(routine.body.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -5499,6 +5600,131 @@ fn info_tables<'a>(
         n += 1;
     }
     finish(def, &out[..n], arena)
+}
+
+fn routine_specific_name(routine: &crate::storage::RoutineDef) -> crate::util::StackStr<96> {
+    use core::fmt::Write;
+    let mut name = crate::util::StackStr::new();
+    let _ = write!(
+        name,
+        "{}_{}",
+        routine.name.as_str(),
+        crate::storage::routine_oid(routine)
+    );
+    name
+}
+
+fn info_routines<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "routines",
+        &[
+            ("specific_catalog", ColType::Text),
+            ("specific_schema", ColType::Text),
+            ("specific_name", ColType::Text),
+            ("routine_catalog", ColType::Text),
+            ("routine_schema", ColType::Text),
+            ("routine_name", ColType::Text),
+            ("routine_type", ColType::Text),
+            ("data_type", ColType::Text),
+            ("external_language", ColType::Text),
+            ("routine_definition", ColType::Text),
+        ],
+    );
+    let count = (0..storage.routine_count())
+        .filter(|slot| storage.routine(*slot).visible_to(txid))
+        .count();
+    let output = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut row_index = 0;
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine(slot);
+        if !routine.visible_to(txid) {
+            continue;
+        }
+        let specific_name = routine_specific_name(routine);
+        output[row_index] = row(
+            &[
+                text("postgres", arena)?,
+                text(routine.schema.as_str(), arena)?,
+                text(specific_name.as_str(), arena)?,
+                text("postgres", arena)?,
+                text(routine.schema.as_str(), arena)?,
+                text(routine.name.as_str(), arena)?,
+                text("FUNCTION", arena)?,
+                text(routine.result.name(), arena)?,
+                text("SQL", arena)?,
+                text(routine.body.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        row_index += 1;
+    }
+    finish(definition, output, arena)
+}
+
+fn info_parameters<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "parameters",
+        &[
+            ("specific_catalog", ColType::Text),
+            ("specific_schema", ColType::Text),
+            ("specific_name", ColType::Text),
+            ("ordinal_position", ColType::Int4),
+            ("parameter_mode", ColType::Text),
+            ("parameter_name", ColType::Text),
+            ("data_type", ColType::Text),
+            ("udt_catalog", ColType::Text),
+            ("udt_schema", ColType::Text),
+            ("udt_name", ColType::Text),
+        ],
+    );
+    let count = (0..storage.routine_count())
+        .filter(|slot| storage.routine(*slot).visible_to(txid))
+        .map(|slot| storage.routine(slot).argument_count)
+        .sum();
+    let output = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut row_index = 0;
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine(slot);
+        if !routine.visible_to(txid) {
+            continue;
+        }
+        let specific_name = routine_specific_name(routine);
+        for (argument_index, argument) in routine.arguments().iter().enumerate() {
+            output[row_index] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(routine.schema.as_str(), arena)?,
+                    text(specific_name.as_str(), arena)?,
+                    Datum::Int4((argument_index + 1) as i32),
+                    text("IN", arena)?,
+                    if argument.name.as_str().is_empty() {
+                        Datum::Null
+                    } else {
+                        text(argument.name.as_str(), arena)?
+                    },
+                    text(argument.ctype.name(), arena)?,
+                    text("postgres", arena)?,
+                    text("pg_catalog", arena)?,
+                    text(argument.ctype.name(), arena)?,
+                ],
+                arena,
+            )?;
+            row_index += 1;
+        }
+    }
+    finish(definition, output, arena)
 }
 
 fn info_views<'a>(

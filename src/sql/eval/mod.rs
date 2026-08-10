@@ -93,6 +93,7 @@ pub mod sqlstate {
     pub const RESERVED_NAME: &str = "42939";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const DUPLICATE_CURSOR: &str = "42P03";
+    pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const UNDEFINED_CURSOR: &str = "34000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const AMBIGUOUS_ALIAS: &str = "42P09";
@@ -376,12 +377,27 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Executes a catalog-resolved scalar SQL routine. `None` means this
+    /// catalog has no matching overload, preserving the normal undefined-
+    /// function diagnostic at the shared call choke point.
+    fn call_routine<'a>(
+        &self,
+        _name: &str,
+        _arguments: &[Datum<'a>],
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
     fn type_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a function visible to the current query.
     fn function_is_visible(&self, oid: i32) -> Option<bool>;
+    /// The canonical SQL definition for a function OID, if this catalog owns it.
+    fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// Whether this OID names a collation visible to the current query.
     fn collation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a relation eligible for a publication.
@@ -620,7 +636,12 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             // catalog, which this plan-time check does not carry; defer to
             // runtime, which resolves and validates it (a genuinely missing
             // type or bad enum label re-surfaces there).
-            Err(e) if e.sqlstate == sqlstate::UNDEFINED_OBJECT => None,
+            Err(e)
+                if e.sqlstate == sqlstate::UNDEFINED_OBJECT
+                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION =>
+            {
+                None
+            }
             Err(e) => return Err(e),
         });
     }
@@ -1911,6 +1932,17 @@ fn call<'a>(
     }
     if let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks) {
         return result;
+    }
+    if !star && let Some(catalog) = hooks.catalog {
+        let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];
+        if args.len() <= arguments.len() {
+            for (slot, argument) in args.iter().enumerate() {
+                arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
+            }
+            if let Some(result) = catalog.call_routine(name, &arguments[..args.len()], arena)? {
+                return Ok(result);
+            }
+        }
     }
     match name {
         "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every"

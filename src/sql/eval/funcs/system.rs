@@ -289,6 +289,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
+            | "pg_get_functiondef"
             | "pg_get_expr"
             | "pg_get_viewdef"
             | "pg_table_size"
@@ -662,6 +663,27 @@ pub(crate) fn dispatch<'a>(
                     .constraint_def(oid, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
+            }
+            "pg_get_functiondef" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => return Ok(Datum::Null),
+                };
+                match cat.function_def(oid, arena)? {
+                    Some(definition) => Ok(Datum::Text(definition)),
+                    None => Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_functiondef(integer) does not exist"
+                    )),
+                }
             }
             "obj_description" => {
                 // obj_description(objoid [, catalog]): the object's comment.

@@ -10,8 +10,9 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateSchemaElement,
-    DomainCheck, PublicationOperations, RoleOptions,
+    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateFunction,
+    CreateSchemaElement, DomainCheck, PublicationOperations, RoleOptions, RoutineArgument,
+    RoutineIdentity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -29,8 +30,13 @@ impl<'a> Parser<'a> {
             false
         };
         if or_replace {
-            self.expect_ident("view")?;
-            return self.create_view(true);
+            if self.eat_ident("view")? {
+                return self.create_view(true);
+            }
+            if self.eat_ident("function")? {
+                return self.create_function(true);
+            }
+            return Err(self.unexpected("expected VIEW or FUNCTION after CREATE OR REPLACE"));
         }
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
@@ -38,6 +44,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
+        }
+        if self.eat_ident("function")? {
+            return self.create_function(false);
         }
         if self.eat_ident("publication")? {
             return self.create_publication();
@@ -71,6 +80,53 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    /// `CREATE [OR REPLACE] FUNCTION name(args) RETURNS type LANGUAGE SQL AS
+    /// body`.  The AST separates the signature from the body so execution can
+    /// validate all types before any catalog state is changed.
+    fn create_function(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("function name")?;
+        self.expect_op("(")?;
+        let mut arguments = [RoutineArgument {
+            name: "",
+            type_name: "",
+        }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0;
+        if !self.eat_op(")")? {
+            loop {
+                if count == arguments.len() {
+                    return Err(self.limit("function arguments", arguments.len()));
+                }
+                let first = self.any_ident("function argument")?;
+                let type_name = if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+                    first
+                } else {
+                    let type_name = self.any_ident("function argument type")?;
+                    arguments[count].name = first;
+                    type_name
+                };
+                arguments[count].type_name = type_name;
+                count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        self.expect_ident("returns")?;
+        let result_type = self.any_ident("function return type")?;
+        self.expect_ident("language")?;
+        self.expect_ident("sql")?;
+        self.expect_ident("as")?;
+        let body = self.str_literal("function body")?;
+        Ok(Stmt::CreateFunction(CreateFunction {
+            name,
+            or_replace,
+            arguments: self.arena_slice(&arguments[..count])?,
+            result_type,
+            body,
+        }))
     }
 
     fn create_role(&mut self, user_spelling: bool) -> Result<Stmt<'a>, ParseError> {
@@ -1112,6 +1168,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("domain")? {
             return self.drop_domain();
         }
+        if self.eat_ident("function")? {
+            return self.drop_function();
+        }
         if self.eat_ident("type")? {
             return self.drop_type();
         }
@@ -1171,6 +1230,61 @@ impl<'a> Parser<'a> {
         };
         Ok(Stmt::DropSchema {
             names: self.arena_slice(&names[..n])?,
+            if_exists,
+            cascade,
+        })
+    }
+
+    fn drop_function(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut functions = [RoutineIdentity {
+            name: QualName::bare(""),
+            argument_types: &[],
+        }; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == functions.len() {
+                return Err(self.limit("functions", functions.len()));
+            }
+            let name = self.qual_name("function name")?;
+            self.expect_op("(")?;
+            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_count = 0;
+            if !self.eat_op(")")? {
+                loop {
+                    if argument_count == argument_types.len() {
+                        return Err(self.limit("function arguments", argument_types.len()));
+                    }
+                    argument_types[argument_count] = self.any_ident("function argument type")?;
+                    argument_count += 1;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+            }
+            functions[count] = RoutineIdentity {
+                name,
+                argument_types: self.arena_slice(&argument_types[..argument_count])?,
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropFunction {
+            functions: self.arena_slice(&functions[..count])?,
             if_exists,
             cascade,
         })

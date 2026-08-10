@@ -306,6 +306,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropTable(_)
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
+        | Stmt::CreateFunction(_)
+        | Stmt::DropFunction { .. }
         | Stmt::DropView { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
@@ -1929,6 +1931,8 @@ impl Engine {
                     );
                 }
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
+                DdlUndo::RoutineCreated(slot) => self.storage.commit_routine_create(*slot as usize),
+                DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
                 DdlUndo::PublicationCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_publication_create(slot);
@@ -2129,6 +2133,10 @@ impl Engine {
                 self.storage.rollback_table_def(slot as usize, txid);
             }
             DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
+            DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
+            DdlUndo::RoutineDropped(slot) => {
+                self.storage.rollback_routine_drop(slot as usize, txid)
+            }
             DdlUndo::ViewDropped(slot) => {
                 self.storage.rollback_view_drop(slot as usize, txid);
             }
@@ -4361,6 +4369,27 @@ impl Engine {
                 arena,
                 responder,
             ),
+            Stmt::CreateFunction(function) => exec::create_function(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                function,
+                arena,
+                responder,
+            ),
+            Stmt::DropFunction {
+                functions,
+                if_exists,
+                cascade,
+            } => exec::drop_function(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                functions,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::DropView {
                 names,
                 if_exists,
@@ -6078,6 +6107,39 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropDomain { schema, name } => {
             if let Some(slot) = storage.drop_domain(schema, name, 0)? {
                 storage.commit_domain_drop(slot);
+            }
+        }
+        WalOp::CreateRoutine(definition) => storage.replay_create_routine(definition)?,
+        WalOp::DropRoutine {
+            schema,
+            name,
+            argument_type_codes,
+        } => {
+            let mut argument_types =
+                [crate::sql::types::ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if argument_type_codes.len() > argument_types.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many routine arguments in WAL"
+                ));
+            }
+            for (index, code) in argument_type_codes.iter().enumerate() {
+                argument_types[index] =
+                    crate::sql::types::ColType::from_code(*code).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "invalid routine argument type in WAL"
+                        )
+                    })?;
+            }
+            if let Some(slot) = storage.routine_slot_by_signature(
+                schema,
+                name,
+                &argument_types[..argument_type_codes.len()],
+                0,
+            ) {
+                storage.drop_routine(slot, 0);
+                storage.commit_routine_drop(slot);
             }
         }
         WalOp::CreateEnum(def) => {

@@ -1347,6 +1347,11 @@ impl DependencyClass {
 pub struct StoredQueryDependency {
     pub class: DependencyClass,
     pub slot: u16,
+    /// One bit per referenced attribute (PostgreSQL attribute numbers start
+    /// at one, so bit zero represents attnum 1). Relation-only dependencies
+    /// retain zero; this avoids treating an unknown column set as every
+    /// column when reconstructing catalog dependencies.
+    pub referenced_columns: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -1357,6 +1362,7 @@ impl StoredQueryDependency {
     pub const EMPTY: Self = Self {
         class: DependencyClass::Table,
         slot: 0,
+        referenced_columns: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         referenced_schema: SqlName::EMPTY,
@@ -1407,6 +1413,33 @@ impl StoredQueryDependencies {
             .any(|entry| entry.class == class && entry.slot as usize == slot)
     }
 
+    pub fn mark_referenced_column(
+        &mut self,
+        class: DependencyClass,
+        slot: usize,
+        column: usize,
+    ) -> Result<(), SqlError> {
+        let bit = 1u64.checked_shl(column as u32).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query references a column beyond the static attribute bound"
+            )
+        })?;
+        let dependency = self
+            .entries
+            .iter_mut()
+            .take(self.len as usize)
+            .find(|entry| entry.class == class && entry.slot as usize == slot)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "column dependency has no owning relation dependency"
+                )
+            })?;
+        dependency.referenced_columns |= bit;
+        Ok(())
+    }
+
     pub fn serialized_push(
         &mut self,
         class: DependencyClass,
@@ -1425,12 +1458,27 @@ impl StoredQueryDependencies {
         self.entries[self.len as usize] = StoredQueryDependency {
             class,
             slot: u16::MAX,
+            referenced_columns: 0,
             schema,
             name,
             referenced_schema,
             referenced_name,
         };
         self.len += 1;
+        Ok(())
+    }
+
+    pub fn serialized_push_with_columns(
+        &mut self,
+        class: DependencyClass,
+        schema: SqlName,
+        name: SqlName,
+        referenced_schema: SqlName,
+        referenced_name: SqlName,
+        referenced_columns: u64,
+    ) -> Result<(), SqlError> {
+        self.serialized_push(class, schema, name, referenced_schema, referenced_name)?;
+        self.entries[self.len as usize - 1].referenced_columns = referenced_columns;
         Ok(())
     }
 
@@ -3151,6 +3199,7 @@ impl Storage {
             rebound.push(StoredQueryDependency {
                 class: dependency.class,
                 slot: slot as u16,
+                referenced_columns: dependency.referenced_columns,
                 schema: dependency.schema,
                 name: dependency.name,
                 referenced_schema: dependency.referenced_schema,

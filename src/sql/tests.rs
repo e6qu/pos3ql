@@ -2375,7 +2375,6 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
             "array_value|3|YES|ARRAY",
         ]
     );
-
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
     let mut observer = TxnState::new(&mut budget, 256).unwrap();
     run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
@@ -2866,6 +2865,145 @@ fn information_schema_column_privileges_follow_transactional_acl_visibility() {
             &mut observer,
             "SELECT count(*) FROM information_schema.column_privileges \
              WHERE table_name = 'information_schema_private_privileges'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
+fn view_catalog_metadata_uses_transactional_view_identities() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_catalog_source (id integer, value text); \
+         CREATE VIEW view_catalog_simple AS \
+           SELECT id, value FROM view_catalog_source; \
+         CREATE VIEW view_catalog_predicate AS \
+           SELECT value || value AS doubled FROM view_catalog_source WHERE id > 0; \
+         CREATE VIEW view_catalog_joined AS \
+           SELECT source.id FROM view_catalog_source source \
+           JOIN view_catalog_simple exposed ON exposed.id = source.id",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT table_name, check_option, is_updatable, is_insertable_into, \
+                    is_trigger_updatable \
+             FROM information_schema.views \
+             WHERE table_name IN ('view_catalog_simple', 'view_catalog_predicate', 'view_catalog_joined') \
+             ORDER BY table_name",
+        )),
+        [
+            "view_catalog_joined|NONE|NO|NO|NO",
+            "view_catalog_predicate|NONE|NO|NO|NO",
+            "view_catalog_simple|NONE|YES|YES|NO",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT view_name, table_name \
+             FROM information_schema.view_table_usage \
+             WHERE view_name IN ('view_catalog_simple', 'view_catalog_joined') \
+             ORDER BY view_name, table_name",
+        )),
+        [
+            "view_catalog_joined|view_catalog_simple",
+            "view_catalog_joined|view_catalog_source",
+            "view_catalog_simple|view_catalog_source",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT view_name, table_name, column_name \
+             FROM information_schema.view_column_usage \
+             WHERE view_name = 'view_catalog_simple' \
+             ORDER BY column_name",
+        )),
+        [
+            "view_catalog_simple|view_catalog_source|id",
+            "view_catalog_simple|view_catalog_source|value",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT column_name FROM information_schema.view_column_usage \
+             WHERE view_name = 'view_catalog_predicate' ORDER BY column_name",
+        )),
+        ["id", "value"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT table_name, column_name FROM information_schema.view_column_usage \
+             WHERE view_name = 'view_catalog_joined' ORDER BY table_name, column_name",
+        )),
+        ["view_catalog_simple|id", "view_catalog_source|id",]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT rulename, ev_type, ev_enabled, is_instead \
+             FROM pg_rewrite \
+             WHERE ev_class = 'view_catalog_simple'::regclass",
+        )),
+        ["_RETURN|1|O|t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT d.deptype, c.relname \
+             FROM pg_depend d JOIN pg_class c ON c.oid = d.refobjid \
+             WHERE d.classid = 'pg_rewrite'::regclass \
+               AND d.objid = (SELECT oid FROM pg_rewrite \
+                              WHERE ev_class = 'view_catalog_simple'::regclass) \
+             ORDER BY d.deptype, c.relname",
+        )),
+        [
+            "i|view_catalog_simple",
+            "n|view_catalog_source",
+            "n|view_catalog_source",
+        ]
+    );
+
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE VIEW pending_view_catalog AS SELECT id FROM view_catalog_source",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT table_name FROM information_schema.views \
+             WHERE table_name = 'pending_view_catalog'",
+        )),
+        ["pending_view_catalog"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_rewrite rewrite \
+             JOIN pg_class class ON class.oid = rewrite.ev_class \
+             WHERE class.relname = 'pending_view_catalog'",
         )),
         ["0"]
     );
@@ -5306,6 +5444,15 @@ fn views_survive_restart() {
             "SELECT id FROM big ORDER BY id"
         )),
         ["2", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT column_name FROM information_schema.view_column_usage \
+             WHERE view_name = 'big' ORDER BY column_name",
+        )),
+        ["id", "v"]
     );
     // The dropped view is gone.
     assert!(

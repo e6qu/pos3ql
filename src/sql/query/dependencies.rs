@@ -11,8 +11,8 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    DependencyClass, MAX_STORED_QUERY_DEPENDENCIES, PathContext, PathEntry, ResolvedRelation,
-    SqlName, Storage, StoredQueryDependencies, StoredQueryDependency,
+    DependencyClass, MAX_COLUMNS, MAX_STORED_QUERY_DEPENDENCIES, PathContext, PathEntry,
+    ResolvedRelation, SqlName, Storage, StoredQueryDependencies, StoredQueryDependency,
 };
 
 #[derive(Clone, Copy)]
@@ -61,6 +61,7 @@ pub(super) fn collect(
         &path,
         CteNames::EMPTY,
         &mut dependencies,
+        arena,
     )?;
     Ok(dependencies)
 }
@@ -72,6 +73,7 @@ fn collect_select<'a>(
     path: &PathContext,
     inherited_ctes: CteNames<'a>,
     dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let mut visible_ctes = inherited_ctes;
     for cte in select.with {
@@ -90,6 +92,7 @@ fn collect_select<'a>(
             path,
             definition_scope,
             dependencies,
+            arena,
         )?;
         visible_ctes.push(cte.name)?;
     }
@@ -97,13 +100,29 @@ fn collect_select<'a>(
     for item in select.items {
         match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                collect_expression(expression, storage, txid, path, visible_ctes, dependencies)?;
+                collect_expression(
+                    expression,
+                    storage,
+                    txid,
+                    path,
+                    visible_ctes,
+                    dependencies,
+                    arena,
+                )?;
             }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
         }
     }
     for expression in select.distinct_on {
-        collect_expression(expression, storage, txid, path, visible_ctes, dependencies)?;
+        collect_expression(
+            expression,
+            storage,
+            txid,
+            path,
+            visible_ctes,
+            dependencies,
+            arena,
+        )?;
     }
     for expression in select
         .where_clause
@@ -114,21 +133,288 @@ fn collect_select<'a>(
         .chain(select.limit)
         .chain(select.offset)
     {
-        collect_expression(expression, storage, txid, path, visible_ctes, dependencies)?;
+        collect_expression(
+            expression,
+            storage,
+            txid,
+            path,
+            visible_ctes,
+            dependencies,
+            arena,
+        )?;
     }
     if let Some(tree) = select.set_body {
-        collect_set_tree(tree, storage, txid, path, visible_ctes, dependencies)?;
+        collect_set_tree(tree, storage, txid, path, visible_ctes, dependencies, arena)?;
     }
     if let Some(from) = select.from {
-        collect_table_ref(&from.base, storage, txid, path, visible_ctes, dependencies)?;
+        collect_table_ref(
+            &from.base,
+            storage,
+            txid,
+            path,
+            visible_ctes,
+            dependencies,
+            arena,
+        )?;
         for join in from.joins {
-            collect_table_ref(&join.table, storage, txid, path, visible_ctes, dependencies)?;
+            collect_table_ref(
+                &join.table,
+                storage,
+                txid,
+                path,
+                visible_ctes,
+                dependencies,
+                arena,
+            )?;
             if let Some(on) = join.on {
-                collect_expression(on, storage, txid, path, visible_ctes, dependencies)?;
+                collect_expression(on, storage, txid, path, visible_ctes, dependencies, arena)?;
+            }
+        }
+        let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+        if sources.clone().all(|source| {
+            source.subquery.is_none()
+                && source.func_args.is_none()
+                && matches!(
+                    storage.resolve_relation_under(path, source.schema, source.table, txid),
+                    Some(ResolvedRelation::Table(_))
+                )
+        }) {
+            let scope = super::QueryScope::resolve_schema(storage, &from, txid, arena)?;
+            for item in select.items {
+                match item {
+                    SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                        record_column_references(expression, &scope, dependencies)?;
+                    }
+                    SelectItem::Wildcard => {
+                        for table in 0..scope.n {
+                            for column in 0..scope.defs[table].expect("resolved").n_columns {
+                                dependencies.mark_referenced_column(
+                                    DependencyClass::Table,
+                                    scope.slots[table],
+                                    column,
+                                )?;
+                            }
+                        }
+                    }
+                    SelectItem::TableWildcard(name) => {
+                        let table = scope.table_index(name)?;
+                        for column in 0..scope.defs[table].expect("resolved").n_columns {
+                            dependencies.mark_referenced_column(
+                                DependencyClass::Table,
+                                scope.slots[table],
+                                column,
+                            )?;
+                        }
+                    }
+                }
+            }
+            for expression in select
+                .distinct_on
+                .iter()
+                .copied()
+                .chain(select.where_clause)
+                .chain(select.group_by.iter().copied())
+                .chain(select.having)
+                .chain(select.order_by.iter().map(|order| order.expression))
+                .chain(select.limit)
+                .chain(select.offset)
+                .chain(from.joins.iter().filter_map(|join| join.on))
+            {
+                record_column_references(expression, &scope, dependencies)?;
+            }
+        }
+        record_relation_column_references(storage, txid, path, &from, select, dependencies, arena)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RelationSource<'a> {
+    class: DependencyClass,
+    slot: usize,
+    exposed: &'a str,
+    columns: [&'a str; MAX_COLUMNS],
+    n_columns: usize,
+}
+
+fn record_relation_column_references<'a>(
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    select: &'a Select<'a>,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut sources = [RelationSource {
+        class: DependencyClass::Table,
+        slot: 0,
+        exposed: "",
+        columns: [""; MAX_COLUMNS],
+        n_columns: 0,
+    }; super::MAX_JOIN_TABLES];
+    let mut n_sources = 0;
+    for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+        if table.subquery.is_some() || table.func_args.is_some() {
+            continue;
+        }
+        let Some(relation) = storage.resolve_relation_under(path, table.schema, table.table, txid)
+        else {
+            continue;
+        };
+        if n_sources == sources.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "view query exceeds static source bound"
+            ));
+        }
+        let source = &mut sources[n_sources];
+        source.exposed = table.alias.unwrap_or(table.table);
+        match relation {
+            ResolvedRelation::Table(slot) => {
+                let definition = storage.table_def(slot, txid);
+                source.class = DependencyClass::Table;
+                source.slot = slot;
+                source.n_columns = definition.columns().len();
+                for column in 0..source.n_columns {
+                    source.columns[column] = definition.columns()[column].name.as_str();
+                }
+            }
+            ResolvedRelation::View(slot) => {
+                let view = storage.view(slot);
+                let user = crate::sql::eval::funcs::system::session_user_owned();
+                let view_path =
+                    storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+                let mut described = [crate::sql::types::ColDesc::new("", 0, 0); MAX_COLUMNS];
+                source.class = DependencyClass::View;
+                source.slot = slot;
+                source.n_columns = super::describe_stored_query(
+                    view.sql.as_str(),
+                    storage,
+                    txid,
+                    view_path,
+                    storage.view_dependencies(slot),
+                    arena,
+                    &mut described,
+                )?;
+                for (column, described) in described.iter().enumerate().take(source.n_columns) {
+                    source.columns[column] = described.name;
+                }
+            }
+            _ => continue,
+        }
+        n_sources += 1;
+    }
+    let sources = &sources[..n_sources];
+    for item in select.items {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                record_relation_expression(expression, sources, dependencies)?
+            }
+            SelectItem::TableWildcard(name) => {
+                for source in sources.iter().filter(|source| source.exposed == *name) {
+                    for column in 0..source.n_columns {
+                        dependencies.mark_referenced_column(source.class, source.slot, column)?;
+                    }
+                }
+            }
+            SelectItem::Wildcard => {
+                for source in sources {
+                    for column in 0..source.n_columns {
+                        dependencies.mark_referenced_column(source.class, source.slot, column)?;
+                    }
+                }
             }
         }
     }
+    for expression in select
+        .distinct_on
+        .iter()
+        .copied()
+        .chain(select.where_clause)
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+        .chain(from.joins.iter().filter_map(|join| join.on))
+    {
+        record_relation_expression(expression, sources, dependencies)?;
+    }
     Ok(())
+}
+
+fn record_relation_expression(
+    expression: &Expr<'_>,
+    sources: &[RelationSource<'_>],
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let mut failure = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if failure.is_some() {
+            return;
+        }
+        let mut found = None;
+        for (source_index, source) in sources.iter().enumerate() {
+            if qualifier.is_some_and(|qualifier| qualifier != source.exposed) {
+                continue;
+            }
+            if let Some(column) = source.columns[..source.n_columns]
+                .iter()
+                .position(|column| *column == name)
+            {
+                if found.is_some() {
+                    failure = Some(sql_err!(
+                        sqlstate::AMBIGUOUS_COLUMN,
+                        "column reference \"{}\" is ambiguous",
+                        name
+                    ));
+                    return;
+                }
+                found = Some((source_index, column));
+            }
+        }
+        if let Some((source_index, column)) = found
+            && let Err(error) = dependencies.mark_referenced_column(
+                sources[source_index].class,
+                sources[source_index].slot,
+                column,
+            )
+        {
+            failure = Some(error);
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+fn record_column_references(
+    expression: &Expr<'_>,
+    scope: &super::QueryScope<'_>,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let mut failure = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if failure.is_some() {
+            return;
+        }
+        let resolved = match scope.find_column(qualifier, name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                failure = Some(error);
+                return;
+            }
+        };
+        if let super::ResolvedColumn::Table(table, column) = resolved
+            && let Err(error) = dependencies.mark_referenced_column(
+                DependencyClass::Table,
+                scope.slots[table],
+                column,
+            )
+        {
+            failure = Some(error);
+        }
+    });
+    failure.map_or(Ok(()), Err)
 }
 
 fn collect_set_tree<'a>(
@@ -138,12 +424,15 @@ fn collect_set_tree<'a>(
     path: &PathContext,
     ctes: CteNames<'a>,
     dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     match tree {
-        SetTree::Select(select) => collect_select(select, storage, txid, path, ctes, dependencies),
+        SetTree::Select(select) => {
+            collect_select(select, storage, txid, path, ctes, dependencies, arena)
+        }
         SetTree::Op { left, right, .. } => {
-            collect_set_tree(left, storage, txid, path, ctes, dependencies)?;
-            collect_set_tree(right, storage, txid, path, ctes, dependencies)
+            collect_set_tree(left, storage, txid, path, ctes, dependencies, arena)?;
+            collect_set_tree(right, storage, txid, path, ctes, dependencies, arena)
         }
     }
 }
@@ -155,9 +444,10 @@ fn collect_table_ref<'a>(
     path: &PathContext,
     ctes: CteNames<'a>,
     dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if let Some(select) = table.subquery {
-        collect_select(select, storage, txid, path, ctes, dependencies)?;
+        collect_select(select, storage, txid, path, ctes, dependencies, arena)?;
     } else if table.func_args.is_none()
         && table.cte.is_none()
         && !(table.schema.is_none() && ctes.contains(table.table))
@@ -168,6 +458,7 @@ fn collect_table_ref<'a>(
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::Table,
                     slot: slot as u16,
+                    referenced_columns: 0,
                     schema: definition.schema,
                     name: definition.name,
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
@@ -179,6 +470,7 @@ fn collect_table_ref<'a>(
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::View,
                     slot: slot as u16,
+                    referenced_columns: 0,
                     schema: view.schema,
                     name: view.name,
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
@@ -190,7 +482,7 @@ fn collect_table_ref<'a>(
     }
     if let Some(arguments) = table.func_args {
         for argument in arguments {
-            collect_expression(argument, storage, txid, path, ctes, dependencies)?;
+            collect_expression(argument, storage, txid, path, ctes, dependencies, arena)?;
         }
     }
     Ok(())
@@ -203,6 +495,7 @@ fn collect_expression<'a>(
     path: &PathContext,
     ctes: CteNames<'a>,
     dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if let Expr::Cast { type_name, .. } = expression {
         collect_type(type_name, storage, txid, path, dependencies)?;
@@ -214,7 +507,7 @@ fn collect_expression<'a>(
         collect_sequence(sequence_name, storage, txid, path, dependencies)?;
     }
     let mut child =
-        |expression| collect_expression(expression, storage, txid, path, ctes, dependencies);
+        |expression| collect_expression(expression, storage, txid, path, ctes, dependencies, arena);
     match expression {
         Expr::Cast { operand, .. } => child(operand),
         Expr::Unary { operand, .. }
@@ -322,13 +615,13 @@ fn collect_expression<'a>(
             Ok(())
         }
         Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-            collect_select(select, storage, txid, path, ctes, dependencies)
+            collect_select(select, storage, txid, path, ctes, dependencies, arena)
         }
         Expr::InSubquery {
             operand, select, ..
         } => {
             child(operand)?;
-            collect_select(select, storage, txid, path, ctes, dependencies)
+            collect_select(select, storage, txid, path, ctes, dependencies, arena)
         }
         Expr::Array(items) => {
             for expression in *items {
@@ -367,6 +660,7 @@ fn collect_type(
         dependencies.push(StoredQueryDependency {
             class,
             slot: slot as u16,
+            referenced_columns: 0,
             schema,
             name,
             referenced_schema,
@@ -462,6 +756,7 @@ fn collect_sequence(
         dependencies.push(StoredQueryDependency {
             class: DependencyClass::Sequence,
             slot: slot as u16,
+            referenced_columns: 0,
             schema: sequence.schema,
             name: sequence.name,
             referenced_schema: SqlName::parse(schema.unwrap_or(""))?,

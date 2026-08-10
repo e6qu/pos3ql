@@ -1851,22 +1851,24 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_legacy_view(storage, line)?;
                 }
-                tag @ (Some("vw2") | Some("vw3") | Some("vw4")) => {
+                tag @ (Some("vw2") | Some("vw3") | Some("vw4") | Some("vw5")) => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(
                         storage,
                         line,
                         tag == Some("vw3") || tag == Some("vw4"),
-                        tag == Some("vw4"),
+                        tag == Some("vw4") || tag == Some("vw5"),
+                        tag == Some("vw5"),
                     )?;
                 }
-                tag @ (Some("mv2") | Some("mv3") | Some("mv4")) => {
+                tag @ (Some("mv2") | Some("mv3") | Some("mv4") | Some("mv5")) => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_matview(
                         storage,
                         line,
                         tag == Some("mv3") || tag == Some("mv4"),
-                        tag == Some("mv4"),
+                        tag == Some("mv4") || tag == Some("mv5"),
+                        tag == Some("mv5"),
                     )?;
                 }
                 Some("pub") => {
@@ -3202,7 +3204,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw4 {} {} {} {} {}",
+                    "vw5 {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
@@ -3287,7 +3289,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "mv4 {} {} {} {} {} {}",
+                    "mv5 {} {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
@@ -4555,6 +4557,7 @@ fn load_view(
     line: &str,
     has_dependencies: bool,
     has_referenced_names: bool,
+    has_referenced_columns: bool,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
     let _tag = words.next();
@@ -4567,7 +4570,7 @@ fn load_view(
     let path = read_hex(words.next(), "vw2 path missing")?;
     let name = read_hex(words.next(), "vw2 name missing")?;
     let dependencies = if has_dependencies {
-        parse_stored_query_dependencies(&mut words, has_referenced_names)?
+        parse_stored_query_dependencies(&mut words, has_referenced_names, has_referenced_columns)?
     } else {
         crate::storage::StoredQueryDependencies::EMPTY
     };
@@ -4607,6 +4610,7 @@ fn load_matview(
     line: &str,
     has_dependencies: bool,
     has_referenced_names: bool,
+    has_referenced_columns: bool,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
     let _tag = words.next();
@@ -4620,7 +4624,7 @@ fn load_matview(
     let name = read_hex(words.next(), "mv2 name missing")?;
     let populated: u8 = parse_field(words.next(), "mv2 populated")?;
     let dependencies = if has_dependencies {
-        parse_stored_query_dependencies(&mut words, has_referenced_names)?
+        parse_stored_query_dependencies(&mut words, has_referenced_names, has_referenced_columns)?
     } else {
         crate::storage::StoredQueryDependencies::EMPTY
     };
@@ -4673,6 +4677,7 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             for byte in dependency.referenced_name.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
+            write!(output, " {}", dependency.referenced_columns)?;
         }
         Ok(())
     }
@@ -4681,6 +4686,7 @@ impl core::fmt::Display for ManifestDependencies<'_> {
 fn parse_stored_query_dependencies(
     words: &mut core::str::Split<'_, char>,
     has_referenced_names: bool,
+    has_referenced_columns: bool,
 ) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
     let count: usize = parse_field(words.next(), "stored-query dependency count")?;
     if count > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
@@ -4712,13 +4718,19 @@ fn parse_stored_query_dependencies(
         } else {
             (schema.clone(), name.clone())
         };
+        let referenced_columns = if has_referenced_columns {
+            parse_field(words.next(), "stored-query referenced columns")?
+        } else {
+            0
+        };
         dependencies
-            .serialized_push(
+            .serialized_push_with_columns(
                 class,
                 sql_name(&schema)?,
                 sql_name(&name)?,
                 sql_name(&referenced_schema)?,
                 sql_name(&referenced_name)?,
+                referenced_columns,
             )
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
@@ -4788,18 +4800,19 @@ mod stored_dependency_tests {
     fn manifest_round_trip_preserves_reference_names() {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies
-            .serialized_push(
+            .serialized_push_with_columns(
                 DependencyClass::Table,
                 SqlName::parse("moved").unwrap(),
                 SqlName::parse("current_name").unwrap(),
                 SqlName::parse("").unwrap(),
                 SqlName::parse("original_name").unwrap(),
+                0b101,
             )
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(&dependencies));
         let mut words = encoded.split(' ');
         assert_eq!(
-            parse_stored_query_dependencies(&mut words, true).unwrap(),
+            parse_stored_query_dependencies(&mut words, true, true).unwrap(),
             dependencies
         );
     }

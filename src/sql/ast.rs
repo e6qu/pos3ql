@@ -2109,6 +2109,99 @@ impl Expr<'_> {
             Expr::Array(items) => items.iter().for_each(|e| e.for_each_column(f)),
         }
     }
+
+    /// Visits column references while preserving an optional table qualifier.
+    /// Subqueries own their bindings and are visited by their enclosing query.
+    pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
+        match self {
+            Expr::Column { qualifier, name } => f(*qualifier, name),
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::Param(_)
+            | Expr::DefaultMarker
+            | Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => {}
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::Field { base: operand, .. } => operand.for_each_column_reference(f),
+            Expr::Slice { base, lower, upper } => {
+                base.for_each_column_reference(f);
+                if let Some(expression) = lower {
+                    expression.for_each_column_reference(f);
+                }
+                if let Some(expression) = upper {
+                    expression.for_each_column_reference(f);
+                }
+            }
+            Expr::Binary { left, right, .. }
+            | Expr::Subscript {
+                base: left,
+                index: right,
+            }
+            | Expr::AnyAll {
+                operand: left,
+                array: right,
+                ..
+            } => {
+                left.for_each_column_reference(f);
+                right.for_each_column_reference(f);
+            }
+            Expr::Call { args, .. } => args.iter().for_each(|argument| {
+                argument.for_each_column_reference(f);
+            }),
+            Expr::InList { operand, list, .. } => {
+                operand.for_each_column_reference(f);
+                list.iter()
+                    .for_each(|expression| expression.for_each_column_reference(f));
+            }
+            Expr::Between {
+                operand, low, high, ..
+            } => {
+                operand.for_each_column_reference(f);
+                low.for_each_column_reference(f);
+                high.for_each_column_reference(f);
+            }
+            Expr::Like {
+                operand, pattern, ..
+            }
+            | Expr::Match {
+                operand, pattern, ..
+            } => {
+                operand.for_each_column_reference(f);
+                pattern.for_each_column_reference(f);
+            }
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+                ..
+            } => {
+                if let Some(expression) = operand {
+                    expression.for_each_column_reference(f);
+                }
+                for (condition, result) in *whens {
+                    condition.for_each_column_reference(f);
+                    result.for_each_column_reference(f);
+                }
+                if let Some(expression) = otherwise {
+                    expression.for_each_column_reference(f);
+                }
+            }
+            Expr::Array(items) => items.iter().for_each(|expression| {
+                expression.for_each_column_reference(f);
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,9 +10,9 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterPublicationAction, AlterTypeAction, CreateDomain, CreateRoutine,
-    CreateSchemaElement, DomainCheck, PublicationOperations, RoleOptions, RoutineArgument,
-    RoutineCreateKind, RoutineIdentity,
+    AlterDomainAction, AlterPublicationAction, AlterRoutineAction, AlterTypeAction, CreateDomain,
+    CreateRoutine, CreateSchemaElement, DomainCheck, PublicationOperations, RoleOptions,
+    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -1186,10 +1186,13 @@ impl<'a> Parser<'a> {
             return self.drop_domain();
         }
         if self.eat_ident("function")? {
-            return self.drop_routine(false);
+            return self.drop_routine(RoutineTargetKind::Function);
         }
         if self.eat_ident("procedure")? {
-            return self.drop_routine(true);
+            return self.drop_routine(RoutineTargetKind::Procedure);
+        }
+        if self.eat_ident("routine")? {
+            return self.drop_routine(RoutineTargetKind::Either);
         }
         if self.eat_ident("type")? {
             return self.drop_type();
@@ -1255,21 +1258,21 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn drop_routine(&mut self, procedure: bool) -> Result<Stmt<'a>, ParseError> {
+    fn drop_routine(&mut self, kind: RoutineTargetKind) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
         } else {
             false
         };
-        let mut functions = [RoutineIdentity {
+        let mut routines = [RoutineIdentity {
             name: QualName::bare(""),
             argument_types: &[],
         }; MAX_LIST];
         let mut count = 0;
         loop {
-            if count == functions.len() {
-                return Err(self.limit("functions", functions.len()));
+            if count == routines.len() {
+                return Err(self.limit("routines", routines.len()));
             }
             let name = self.qual_name("function name")?;
             self.expect_op("(")?;
@@ -1288,7 +1291,7 @@ impl<'a> Parser<'a> {
                     self.expect_op(",")?;
                 }
             }
-            functions[count] = RoutineIdentity {
+            routines[count] = RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..argument_count])?,
             };
@@ -1303,20 +1306,67 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        let routines = self.arena_slice(&functions[..count])?;
-        if procedure {
-            Ok(Stmt::DropProcedure {
-                procedures: routines,
-                if_exists,
-                cascade,
-            })
-        } else {
-            Ok(Stmt::DropFunction {
+        let routines = self.arena_slice(&routines[..count])?;
+        match kind {
+            RoutineTargetKind::Function => Ok(Stmt::DropFunction {
                 functions: routines,
                 if_exists,
                 cascade,
-            })
+            }),
+            RoutineTargetKind::Procedure => Ok(Stmt::DropProcedure {
+                procedures: routines,
+                if_exists,
+                cascade,
+            }),
+            RoutineTargetKind::Either => Ok(Stmt::DropRoutine {
+                routines,
+                if_exists,
+                cascade,
+            }),
         }
+    }
+
+    pub(super) fn alter_routine(
+        &mut self,
+        kind: RoutineTargetKind,
+    ) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("routine name")?;
+        self.expect_op("(")?;
+        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0;
+        if !self.eat_op(")")? {
+            loop {
+                if count == argument_types.len() {
+                    return Err(self.limit("routine arguments", argument_types.len()));
+                }
+                argument_types[count] = self.any_ident("routine argument type")?;
+                count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterRoutineAction::SetOwner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterRoutineAction::Rename(self.col_ident("routine name")?)
+        } else if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
+        } else {
+            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
+        };
+        Ok(Stmt::AlterRoutine {
+            kind,
+            routine: RoutineIdentity {
+                name,
+                argument_types: self.arena_slice(&argument_types[..count])?,
+            },
+            action,
+        })
     }
 
     /// `[IF EXISTS] name [, ...]` after a DROP keyword.

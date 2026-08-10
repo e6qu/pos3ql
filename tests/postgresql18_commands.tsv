@@ -25,7 +25,7 @@ ALTER EVENT TRIGGER	missing	-
 ALTER EXTENSION	missing	-
 ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
-ALTER FUNCTION	missing	-
+ALTER FUNCTION	partial	90_routine_lifecycle.sql
 ALTER GROUP	partial	83_roles_acl.sql
 ALTER INDEX	missing	-
 ALTER LANGUAGE	missing	-
@@ -35,10 +35,10 @@ ALTER OPERATOR	missing	-
 ALTER OPERATOR CLASS	missing	-
 ALTER OPERATOR FAMILY	missing	-
 ALTER POLICY	missing	-
-ALTER PROCEDURE	missing	-
+ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
-ALTER ROUTINE	missing	-
+ALTER ROUTINE	partial	90_routine_lifecycle.sql
 ALTER RULE	missing	-
 ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
@@ -138,7 +138,7 @@ DROP POLICY	missing	-
 DROP PROCEDURE	partial	89_sql_procedures.sql
 DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql
-DROP ROUTINE	missing	-
+DROP ROUTINE	partial	90_routine_lifecycle.sql
 DROP RULE	missing	-
 DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql

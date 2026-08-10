@@ -2837,6 +2837,15 @@ impl<'a> Parser<'a> {
         if self.eat_ident("publication")? {
             return self.alter_publication();
         }
+        if self.eat_ident("function")? {
+            return self.alter_routine(crate::sql::ast::RoutineTargetKind::Function);
+        }
+        if self.eat_ident("procedure")? {
+            return self.alter_routine(crate::sql::ast::RoutineTargetKind::Procedure);
+        }
+        if self.eat_ident("routine")? {
+            return self.alter_routine(crate::sql::ast::RoutineTargetKind::Either);
+        }
         if self.eat_ident("schema")? {
             let name = QualName {
                 schema: None,

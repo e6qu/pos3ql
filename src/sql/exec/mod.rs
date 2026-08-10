@@ -3744,8 +3744,8 @@ pub fn drop_owned(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
-                schema: routine.schema.as_str(),
-                name: routine.name.as_str(),
+                schema: routine.schema_for(txn.txid).as_str(),
+                name: routine.name_for(txn.txid).as_str(),
                 argument_type_codes: &type_codes[..routine.argument_count],
             },
         ) {
@@ -4048,7 +4048,9 @@ fn resolve_privilege_objects(
                         }
                         for slot in 0..storage.routine_count() {
                             let routine = storage.routine(slot);
-                            if routine.visible_to(txid) && routine.schema.as_str() == schema {
+                            if routine.visible_to(txid)
+                                && routine.schema_for(txid).as_str() == schema
+                            {
                                 add_privilege_object(
                                     objects,
                                     &mut count,
@@ -5951,7 +5953,189 @@ pub struct DropRoutineCommand<'a> {
     pub routines: &'a [super::ast::RoutineIdentity<'a>],
     pub if_exists: bool,
     pub cascade: bool,
-    pub procedure: bool,
+    pub kind: crate::sql::ast::RoutineTargetKind,
+}
+
+pub fn alter_routine(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    kind: crate::sql::ast::RoutineTargetKind,
+    identity: &super::ast::RoutineIdentity<'_>,
+    action: crate::sql::ast::AlterRoutineAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = identity.name.schema.unwrap_or("public");
+    let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+    for (index, type_name) in identity.argument_types.iter().enumerate() {
+        let Some(ctype) = ColType::from_sql_name(type_name) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                type_name
+            ));
+        };
+        argument_types[index] = ctype;
+    }
+    let Some(slot) = storage.routine_slot_by_signature(
+        schema,
+        identity.name.name,
+        &argument_types[..identity.argument_types.len()],
+        txn.txid,
+    ) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "routine \"{}\" does not exist",
+            identity.name.name
+        ));
+    };
+    let routine = *storage.routine(slot);
+    let actual_kind = if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
+        crate::sql::ast::RoutineTargetKind::Procedure
+    } else {
+        crate::sql::ast::RoutineTargetKind::Function
+    };
+    if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "{} \"{}\" does not exist",
+            kind.noun(),
+            identity.name.name
+        ));
+    }
+    if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
+        return sql_fail(error);
+    }
+    if let crate::sql::ast::AlterRoutineAction::SetOwner(role) = action {
+        let role = resolve_role_name(role);
+        let Some(new_owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                role.as_str()
+            ));
+        };
+        let object = Storage::routine_access_object(slot);
+        let current = super::eval::funcs::system::current_user_owned();
+        let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                current.as_str()
+            ));
+        };
+        let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+        if !superuser
+            && current_role != new_owner
+            && !storage.role_can_set(current_role, new_owner, txn.txid)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "must be able to SET ROLE \"{}\"",
+                role.as_str()
+            ));
+        }
+        if !superuser
+            && let Err(error) = storage.require_schema_create_as(
+                routine.schema_for(txn.txid).as_str(),
+                new_owner,
+                txn.txid,
+            )
+        {
+            return sql_fail(error);
+        }
+        let old_owner = storage.object_owner(object, txn.txid) as u16;
+        let prior = storage.set_object_owner(object, new_owner, txn.txid);
+        if let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior })
+        {
+            storage.restore_object_owner(object, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) =
+            rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
+        {
+            return sql_fail(error);
+        }
+        responder.command_complete(match kind {
+            crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+            crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+            crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+        })?;
+        return sql_ok();
+    }
+    let (new_schema, new_name) = match action {
+        crate::sql::ast::AlterRoutineAction::Rename(name) => {
+            let name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (routine.schema_for(txn.txid), name)
+        }
+        crate::sql::ast::AlterRoutineAction::SetSchema(schema) => {
+            let Some(_) = storage.find_schema_visible(schema, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            };
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            let schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            (schema, routine.name_for(txn.txid))
+        }
+        crate::sql::ast::AlterRoutineAction::SetOwner(_) => unreachable!(),
+    };
+    let old_schema = routine.schema_for(txn.txid);
+    let old_name = routine.name_for(txn.txid);
+    if old_schema == new_schema && old_name == new_name {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_FUNCTION,
+            "routine \"{}\" already exists",
+            new_name.as_str()
+        ));
+    }
+    let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        type_codes[index] = argument.ctype.code();
+    }
+    let prior = match storage.alter_routine_identity(slot, new_schema, new_name, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::AlterRoutineIdentity {
+            schema: old_schema.as_str(),
+            name: old_name.as_str(),
+            argument_type_codes: &type_codes[..routine.argument_count],
+            new_schema: new_schema.as_str(),
+            new_name: new_name.as_str(),
+        },
+    ) {
+        storage.restore_routine_identity(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineIdentityAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_routine_identity(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete(match kind {
+        crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+        crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+        crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+    })?;
+    sql_ok()
 }
 
 pub fn drop_routine(
@@ -5965,7 +6149,7 @@ pub fn drop_routine(
         routines,
         if_exists,
         cascade: _,
-        procedure,
+        kind,
     } = command;
     for identity in routines {
         let schema = identity.name.schema.unwrap_or("public");
@@ -6001,18 +6185,22 @@ pub fn drop_routine(
                 identity.name.name
             ));
         };
-        if matches!(
+        let actual_kind = if matches!(
             storage.routine(slot).kind,
             crate::storage::RoutineKind::Procedure
-        ) != procedure
-        {
+        ) {
+            crate::sql::ast::RoutineTargetKind::Procedure
+        } else {
+            crate::sql::ast::RoutineTargetKind::Function
+        };
+        if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
             if if_exists {
                 continue;
             }
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "{} \"{}\" does not exist",
-                if procedure { "procedure" } else { "function" },
+                kind.noun(),
                 identity.name.name
             ));
         }
@@ -6029,8 +6217,8 @@ pub fn drop_routine(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
-                schema: routine.schema.as_str(),
-                name: routine.name.as_str(),
+                schema: routine.schema_for(txn.txid).as_str(),
+                name: routine.name_for(txn.txid).as_str(),
                 argument_type_codes: &type_codes[..routine.argument_count],
             },
         ) {
@@ -6042,10 +6230,10 @@ pub fn drop_routine(
             return sql_fail(error);
         }
     }
-    responder.command_complete(if procedure {
-        "DROP PROCEDURE"
-    } else {
-        "DROP FUNCTION"
+    responder.command_complete(match kind {
+        crate::sql::ast::RoutineTargetKind::Function => "DROP FUNCTION",
+        crate::sql::ast::RoutineTargetKind::Procedure => "DROP PROCEDURE",
+        crate::sql::ast::RoutineTargetKind::Either => "DROP ROUTINE",
     })?;
     sql_ok()
 }

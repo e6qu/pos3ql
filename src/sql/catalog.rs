@@ -1992,8 +1992,8 @@ pub fn function_def_text<'a>(
         } else {
             "FUNCTION"
         },
-        routine.schema.as_str(),
-        routine.name.as_str()
+        routine.schema_for(txid).as_str(),
+        routine.name_for(txid).as_str()
     )
     .map_err(|_| super::eval::arena_full())?;
     for (index, argument) in routine.arguments().iter().enumerate() {
@@ -4353,8 +4353,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             &[
                 Datum::Int4(1255),
                 Datum::Int4(crate::storage::routine_oid(routine)),
-                text(routine.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, routine.schema.as_str())),
+                text(routine.name_for(txid).as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(
                     routine
@@ -5621,13 +5621,16 @@ fn info_tables<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn routine_specific_name(routine: &crate::storage::RoutineDef) -> crate::util::StackStr<96> {
+fn routine_specific_name(
+    routine: &crate::storage::RoutineDef,
+    txid: u32,
+) -> crate::util::StackStr<96> {
     use core::fmt::Write;
     let mut name = crate::util::StackStr::new();
     let _ = write!(
         name,
         "{}_{}",
-        routine.name.as_str(),
+        routine.name_for(txid).as_str(),
         crate::storage::routine_oid(routine)
     );
     name
@@ -5665,15 +5668,15 @@ fn info_routines<'a>(
         if !routine.visible_to(txid) {
             continue;
         }
-        let specific_name = routine_specific_name(routine);
+        let specific_name = routine_specific_name(routine, txid);
         output[row_index] = row(
             &[
                 text("postgres", arena)?,
-                text(routine.schema.as_str(), arena)?,
+                text(routine.schema_for(txid).as_str(), arena)?,
                 text(specific_name.as_str(), arena)?,
                 text("postgres", arena)?,
-                text(routine.schema.as_str(), arena)?,
-                text(routine.name.as_str(), arena)?,
+                text(routine.schema_for(txid).as_str(), arena)?,
+                text(routine.name_for(txid).as_str(), arena)?,
                 text(
                     if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
                         "PROCEDURE"
@@ -5740,7 +5743,7 @@ fn info_routine_privileges<'a>(
                 ));
             }
             let routine = storage.routine(slot);
-            let specific_name = routine_specific_name(routine);
+            let specific_name = routine_specific_name(routine, txid);
             let grantor_name = storage.role_name(grantor as usize, txid);
             let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
                 SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
@@ -5752,11 +5755,11 @@ fn info_routine_privileges<'a>(
                     text(grantor_name.as_str(), arena)?,
                     text(grantee_name.as_str(), arena)?,
                     text("postgres", arena)?,
-                    text(routine.schema.as_str(), arena)?,
+                    text(routine.schema_for(txid).as_str(), arena)?,
                     text(specific_name.as_str(), arena)?,
                     text("postgres", arena)?,
-                    text(routine.schema.as_str(), arena)?,
-                    text(routine.name.as_str(), arena)?,
+                    text(routine.schema_for(txid).as_str(), arena)?,
+                    text(routine.name_for(txid).as_str(), arena)?,
                     text("EXECUTE", arena)?,
                     text(if grantable { "YES" } else { "NO" }, arena)?,
                 ],
@@ -5836,12 +5839,12 @@ fn info_parameters<'a>(
         if !routine.visible_to(txid) {
             continue;
         }
-        let specific_name = routine_specific_name(routine);
+        let specific_name = routine_specific_name(routine, txid);
         for (argument_index, argument) in routine.arguments().iter().enumerate() {
             output[row_index] = row(
                 &[
                     text("postgres", arena)?,
-                    text(routine.schema.as_str(), arena)?,
+                    text(routine.schema_for(txid).as_str(), arena)?,
                     text(specific_name.as_str(), arena)?,
                     Datum::Int4((argument_index + 1) as i32),
                     text("IN", arena)?,

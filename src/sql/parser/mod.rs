@@ -3799,6 +3799,13 @@ impl<'a> Parser<'a> {
         self.expect_ident("delete")?;
         self.expect_ident("from")?;
         let table = self.qual_name("table name")?;
+        let alias = if self.eat_ident("as")?
+            || matches!(self.peeked, Tok::Ident(word) if word != "using" && word != "where" && word != "returning")
+        {
+            Some(self.col_ident("table alias")?)
+        } else {
+            None
+        };
         let using = if self.eat_ident("using")? {
             let fc = self.from_clause()?;
             Some(
@@ -3814,6 +3821,7 @@ impl<'a> Parser<'a> {
         let returning = self.returning()?;
         Ok(Stmt::Delete(Delete {
             table,
+            alias,
             using,
             where_clause,
             returning,

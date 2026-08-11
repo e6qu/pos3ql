@@ -1394,6 +1394,7 @@ fn subst_delete<'a>(
 ) -> Result<Delete<'a>, SqlError> {
     Ok(Delete {
         table: statement.table,
+        alias: statement.alias,
         using: match statement.using {
             Some(using) => Some(
                 &*arena

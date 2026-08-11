@@ -44,10 +44,7 @@ pub struct RowCtx<'s, 'v, 'd> {
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
-            && !self
-                .alias
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(q))
-            && !crate::sql::eval::qualifier_answers_single(self.def, q)
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -70,11 +67,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
-        if !self
-            .alias
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(table))
-            && table != self.def.name.as_str()
-        {
+        if !crate::sql::eval::qualifier_answers_target(self.def, self.alias, table) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -103,7 +96,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str()
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
         }
@@ -114,7 +107,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str()
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
         }
@@ -137,6 +130,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
+pub(crate) use describe::AliasedDefCols;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -13149,6 +13143,7 @@ pub fn insert(
                     storage,
                     txn.txid,
                     &def,
+                    None,
                     &values[..def.n_columns],
                     statement.returning,
                     arena,
@@ -13364,6 +13359,7 @@ pub fn insert(
                 storage,
                 txn.txid,
                 &def,
+                None,
                 &values[..def.n_columns],
                 statement.returning,
                 arena,
@@ -13409,6 +13405,7 @@ fn emit_conflict_returning(
         storage,
         txid,
         def,
+        None,
         &updated[..def.n_columns],
         items,
         arena,
@@ -13423,6 +13420,7 @@ fn emit_projected(
     storage: &Storage,
     txid: u32,
     def: &TableDef,
+    alias: Option<&str>,
     values: &[Datum],
     items: &[SelectItem],
     arena: &Arena,
@@ -13430,11 +13428,7 @@ fn emit_projected(
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let context = RowCtx {
-        def,
-        values,
-        alias: None,
-    };
+    let context = RowCtx { def, values, alias };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
     for item in items {
@@ -13474,7 +13468,7 @@ fn emit_projected(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                if !crate::sql::eval::qualifier_answers_single(def, q) {
+                if !crate::sql::eval::qualifier_answers_target(def, alias, q) {
                     return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
@@ -13689,9 +13683,10 @@ pub fn update(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items(
+        match super::query::describe_catalog_items_as(
             statement.returning,
             Some(&def),
+            statement.alias,
             storage,
             txn.txid,
             &mut columns,
@@ -13919,6 +13914,7 @@ pub fn update(
                 storage,
                 txn.txid,
                 &def,
+                statement.alias,
                 &new_values[..def.n_columns],
                 statement.returning,
                 arena,
@@ -14001,7 +13997,7 @@ pub fn delete(
             storage,
             table_index,
             &def,
-            None,
+            statement.alias,
             schema,
             using,
             statement.where_clause,
@@ -14014,7 +14010,7 @@ pub fn delete(
         collect_matches(
             storage,
             table_index,
-            None,
+            statement.alias,
             txn.txid,
             schema,
             statement.where_clause,
@@ -14050,9 +14046,10 @@ pub fn delete(
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items(
+        match super::query::describe_catalog_items_as(
             statement.returning,
             Some(&def),
+            statement.alias,
             storage,
             txn.txid,
             &mut columns,
@@ -14108,6 +14105,7 @@ pub fn delete(
                     storage,
                     txn.txid,
                     &def,
+                    statement.alias,
                     &old_values[..def.n_columns],
                     statement.returning,
                     arena,

@@ -3842,6 +3842,7 @@ impl Engine {
                             };
                             match arena.alloc(Delete {
                                 table: view.base,
+                                alias: delete.alias,
                                 using: rewritten.using,
                                 where_clause,
                                 returning: rewritten.returning,

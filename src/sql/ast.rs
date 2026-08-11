@@ -1507,6 +1507,7 @@ pub struct Update<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delete<'a> {
     pub table: QualName<'a>,
+    pub alias: Option<&'a str>,
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,

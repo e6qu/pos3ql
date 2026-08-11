@@ -32,6 +32,7 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<&'q TableDef>,
+    table_alias: Option<&str>,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let mut n = 0;
@@ -61,7 +62,8 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let matches = def.is_some_and(|d| crate::sql::eval::qualifier_answers_single(d, q));
+                let matches = def
+                    .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, q));
                 if !matches {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -74,10 +76,17 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                describe_record_star(base, def, &mut push)?;
+                describe_record_star(base, def, table_alias, &mut push)?;
             }
             SelectItem::Expr { expression, alias } => {
-                let (mut type_oid, mut typlen) = infer_type_pub(expression, def)?;
+                let resolver: &dyn ColTypeResolver = match def {
+                    Some(definition) => &AliasedDefCols {
+                        definition,
+                        alias: table_alias,
+                    },
+                    None => &NoCols,
+                };
+                let (mut type_oid, mut typlen) = infer_type_res(expression, resolver)?;
                 // A bare unknown (string literal / param) resolves to text
                 // for output, as PostgreSQL does.
                 if type_oid == oid::UNKNOWN {
@@ -101,17 +110,21 @@ pub fn describe_items<'q>(
 fn describe_record_star<'q>(
     base: &Expr<'q>,
     def: Option<&'q TableDef>,
+    table_alias: Option<&str>,
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
             let resolver: &dyn ColTypeResolver = match def {
-                Some(d) => &DefCols(d),
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
                 None => &NoCols,
             };
             check_row_field_types(base, resolver)?;
             for (i, arg) in args.iter().take(RECORD_FIELD_NAMES.len()).enumerate() {
-                let (oid, typlen) = infer_type_pub(arg, def)?;
+                let (oid, typlen) = infer_type_res(arg, resolver)?;
                 push(ColDesc::new(RECORD_FIELD_NAMES[i], oid, typlen))?;
             }
             Ok(())
@@ -128,7 +141,9 @@ fn describe_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if def.is_some_and(|d| d.name.as_str() == *table) => {
+        } if def
+            .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, table)) =>
+        {
             for c in def.expect("matched").columns() {
                 push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
             }
@@ -139,7 +154,10 @@ fn describe_record_star<'q>(
         // key/value); a shape whose names this cannot cover refuses loudly.
         _ => {
             let resolver: &dyn ColTypeResolver = match def {
-                Some(d) => &DefCols(d),
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
                 None => &NoCols,
             };
             let Some(handle) = expr_record_handle(base, resolver) else {
@@ -919,6 +937,48 @@ impl ColTypeResolver for DefCols<'_> {
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         (name == self.0.name.as_str()).then(|| self.0.columns())
+    }
+}
+
+/// A single DML target's columns, with its optional PostgreSQL correlation name.
+pub(crate) struct AliasedDefCols<'d, 'a> {
+    pub definition: &'d TableDef,
+    pub alias: Option<&'a str>,
+}
+impl ColTypeResolver for AliasedDefCols<'_, '_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        if let Some(qualifier) = qualifier
+            && !crate::sql::eval::qualifier_answers_target(self.definition, self.alias, qualifier)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                qualifier
+            ));
+        }
+        self.definition
+            .column_index(name)
+            .map(|index| self.definition.columns()[index].ctype)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                )
+            })
+    }
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.resolve(qualifier, name).ok()?;
+        let index = self.definition.column_index(name)?;
+        let column = &self.definition.columns()[index];
+        (column.ctype == ColType::Record).then_some(column.type_mod)
+    }
+    fn is_whole_row(&self, name: &str) -> bool {
+        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
+    }
+    fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
+        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
+            .then(|| self.definition.columns())
     }
 }
 

@@ -3960,7 +3960,18 @@ pub fn describe_catalog_items<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    let count = describe_items(items, definition, out)?;
+    describe_catalog_items_as(items, definition, None, storage, txid, out)
+}
+
+pub fn describe_catalog_items_as<'q>(
+    items: &[SelectItem<'q>],
+    definition: Option<&'q TableDef>,
+    alias: Option<&str>,
+    storage: &Storage,
+    txid: u32,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
+    let count = describe_items(items, definition, alias, out)?;
     let mut column = 0;
     for item in items {
         match item {
@@ -3969,7 +3980,7 @@ pub fn describe_catalog_items<'q>(
             }
             SelectItem::RecordStar(base) => {
                 let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                    Some(table) => &super::exec::DefCols(table),
+                    Some(definition) => &super::exec::AliasedDefCols { definition, alias },
                     None => &super::exec::NoCols,
                 };
                 column += super::exec::record_shape(base, resolver, |_, _| {})
@@ -3992,7 +4003,10 @@ pub fn describe_catalog_items<'q>(
                 } = expression
                 {
                     let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                        Some(table) => &super::exec::DefCols(table),
+                        Some(definition) => &super::exec::AliasedDefCols {
+                            definition,
+                            alias: *alias,
+                        },
                         None => &super::exec::NoCols,
                     };
                     let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];

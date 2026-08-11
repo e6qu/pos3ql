@@ -317,6 +317,19 @@ pub fn qualifier_answers_single(def: &crate::storage::TableDef, q: &str) -> bool
     }
 }
 
+/// A DML correlation name replaces its target relation name everywhere that
+/// statement can name the target.
+pub fn qualifier_answers_target(
+    def: &crate::storage::TableDef,
+    alias: Option<&str>,
+    q: &str,
+) -> bool {
+    match alias {
+        Some(alias) => alias.eq_ignore_ascii_case(q),
+        None => qualifier_answers_single(def, q),
+    }
+}
+
 pub struct NoColumns;
 
 impl<'a> ColumnLookup<'a> for NoColumns {

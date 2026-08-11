@@ -4841,15 +4841,58 @@ fn update_from_and_delete_using() {
         "INSERT INTO s VALUES (1,100,'one'),(2,200,'two')",
     );
     // UPDATE ... FROM: the SET may reference both target and source columns.
+    let returned = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
+         FROM s WHERE target.id = s.id RETURNING target.id, target.label",
+    );
+    let mut updated = data_rows(&returned);
+    updated.sort_unstable();
+    assert_eq!(
+        updated,
+        ["1|one", "2|two"],
+        "UPDATE alias RETURNING: {}",
+        String::from_utf8_lossy(&returned)
+    );
+    let wildcard = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING target.*",
+    ));
+    assert_eq!(wildcard, ["3|30|z"], "UPDATE alias wildcard: {wildcard:?}");
+    let record_wildcard = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING (target).*",
+    ));
+    assert_eq!(
+        record_wildcard,
+        ["3|30|z"],
+        "UPDATE alias record wildcard: {record_wildcard:?}"
+    );
+    let hidden_name = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE t.id = 3 RETURNING target.id",
+    );
     assert!(
-        run_txn(
-            &mut e,
-            &mut b,
-            &mut t,
-            "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
-             FROM s WHERE target.id = s.id"
-        )
-        .contains("UPDATE 2")
+        hidden_name.contains("42P01"),
+        "DML alias must hide the target relation name: {hidden_name}"
+    );
+    let hidden_output = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING t.*",
+    );
+    assert!(
+        hidden_output.contains("42P01"),
+        "DML result description must hide the target relation name: {hidden_output}"
     );
     let rows = data_rows(&run_with_txn_bytes(
         &mut e,
@@ -4877,9 +4920,10 @@ fn update_from_and_delete_using() {
             &mut e,
             &mut b,
             &mut t,
-            "DELETE FROM d USING k WHERE d.id = k.id"
+            "DELETE FROM d AS target USING k WHERE target.id = k.id \
+             RETURNING target.id"
         )
-        .contains("DELETE 2")
+        .contains("2")
     );
     let left = data_rows(&run_with_txn_bytes(
         &mut e,

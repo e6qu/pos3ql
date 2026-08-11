@@ -1206,6 +1206,8 @@ pub enum AlterDomainAction<'a> {
     DropNotNull,
     SetDefault(&'a str),
     DropDefault,
+    Rename(&'a str),
+    SetSchema(&'a str),
 }
 
 /// One `ALTER TYPE` action on an enum type.

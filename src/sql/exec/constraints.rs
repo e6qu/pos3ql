@@ -51,7 +51,7 @@ pub(crate) fn coerce_domain_value<'a>(
     let domain = storage.domain_for(slot, txid);
     let value = if let Some(parent_name) = domain.base_domain {
         let parent = storage
-            .domain_slot(parent_name.schema.as_str(), parent_name.name.as_str(), txid)
+            .domain_identity_slot(parent_name.schema.as_str(), parent_name.name.as_str(), txid)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -130,7 +130,7 @@ pub(crate) fn check_domain_constraints(
             continue;
         }
         let Some(slot) =
-            storage.domain_slot(user_type.schema.as_str(), user_type.name.as_str(), txid)
+            storage.domain_identity_slot(user_type.schema.as_str(), user_type.name.as_str(), txid)
         else {
             continue;
         };

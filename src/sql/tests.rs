@@ -10065,6 +10065,142 @@ fn domain_alterations_are_private_until_commit() {
 }
 
 #[test]
+fn domain_identity_changes_are_transactional_and_update_dependents() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA domain_target; \
+         CREATE DOMAIN domain_old AS integer CHECK (VALUE > 0); \
+         COMMENT ON DOMAIN domain_old IS 'domain identity comment'; \
+         CREATE DOMAIN domain_child AS domain_old; \
+         CREATE TABLE domain_values (value domain_old, values domain_old[]); \
+         INSERT INTO domain_values VALUES (3, ARRAY[4, 5]::domain_old[])",
+    );
+
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    let renamed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER DOMAIN domain_old RENAME TO domain_new; SELECT 6::domain_new",
+    );
+    assert!(renamed.contains("6"), "{renamed}");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT 6::domain_old"
+        )
+        .contains("6")
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT 6::domain_new"
+        )
+        .contains("42704")
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT 6::domain_old"
+        )
+        .contains("6")
+    );
+
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN domain_old RENAME TO domain_new; \
+         ALTER DOMAIN domain_new SET SCHEMA domain_target; \
+         INSERT INTO domain_values VALUES (7, ARRAY[8]::domain_target.domain_new[]); \
+         SELECT value FROM domain_values ORDER BY value; \
+         SELECT 9::domain_child",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["3", "7", "9"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT description FROM pg_description d JOIN pg_type t ON t.oid = d.objoid \
+             WHERE t.typname = 'domain_new'",
+        )),
+        ["domain identity comment"]
+    );
+}
+
+#[test]
+fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
+    let mut config = test_config("domain-identity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("domain-identity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA recovered_domain; \
+         CREATE DOMAIN recover_old AS integer CHECK (VALUE > 0); \
+         CREATE DOMAIN recover_child AS recover_old; \
+         CREATE TABLE recover_values (value recover_old, values recover_old[]); \
+         INSERT INTO recover_values VALUES (3, ARRAY[4]::recover_old[]); \
+         ALTER DOMAIN recover_old RENAME TO recover_new; \
+         ALTER DOMAIN recover_new SET SCHEMA recovered_domain; \
+         INSERT INTO recover_values VALUES (5, ARRAY[6]::recovered_domain.recover_new[])",
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT value FROM recover_values ORDER BY value; SELECT 7::recover_child; SELECT 8::recovered_domain.recover_new",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3", "5", "7", "8"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(restarted.checkpoint().unwrap());
+    drop(restarted);
+
+    let mut checkpoint_budget = Budget::new(1 << 29);
+    let mut checkpoint_restarted = Engine::new(&config, &mut checkpoint_budget).unwrap();
+    let output = run_with(
+        &mut checkpoint_restarted,
+        &mut checkpoint_budget,
+        "SELECT value FROM recover_values ORDER BY value; SELECT 9::recover_child; SELECT 10::recovered_domain.recover_new",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3", "5", "9", "10"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn enum_definitions_are_private_until_commit() {
     let (mut engine, mut budget) = test_engine();
     run_with(

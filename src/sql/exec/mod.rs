@@ -8304,6 +8304,70 @@ pub fn alter_domain(
     ) {
         return sql_fail(error);
     }
+    if matches!(action, A::Rename(_) | A::SetSchema(_)) {
+        let current = storage.domain_for(slot, txn.txid);
+        let (schema, domain_name) = match action {
+            A::Rename(domain_name) => {
+                let domain_name = match SqlName::parse(domain_name) {
+                    Ok(domain_name) => domain_name,
+                    Err(error) => return sql_fail(error),
+                };
+                (current.schema, domain_name)
+            }
+            A::SetSchema(schema) => {
+                if storage.find_schema_visible(schema, txn.txid).is_none() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "schema \"{}\" does not exist",
+                        schema
+                    ));
+                }
+                if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                    return sql_fail(error);
+                }
+                let schema = match SqlName::parse(schema) {
+                    Ok(schema) => schema,
+                    Err(error) => return sql_fail(error),
+                };
+                (schema, current.name)
+            }
+            _ => unreachable!(),
+        };
+        if current.schema == schema && current.name == domain_name {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                domain_name.as_str()
+            ));
+        }
+        let prior = match storage.stage_domain_identity(slot, schema, domain_name, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterDomainIdentity {
+                schema: current.schema.as_str(),
+                name: current.name.as_str(),
+                new_schema: schema.as_str(),
+                new_name: domain_name.as_str(),
+            },
+        ) {
+            storage.rollback_domain_alter(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_domain_alter(slot, prior);
+            return sql_fail(error);
+        }
+        responder.command_complete("ALTER DOMAIN")?;
+        return sql_ok();
+    }
     // Start from the current definition and apply the action.
     let current = storage.domain_for(slot, txn.txid);
     let mut spec = crate::storage::DomainSpec {
@@ -8411,6 +8475,7 @@ pub fn alter_domain(
             spec.n_checks -= 1;
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
         }
+        A::Rename(_) | A::SetSchema(_) => unreachable!(),
     }
     let prior = match storage.stage_domain_alter(slot, spec, txn.txid) {
         Ok(prior) => prior,

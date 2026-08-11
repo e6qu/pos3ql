@@ -12535,6 +12535,58 @@ fn create_index_and_unique() {
 }
 
 #[test]
+fn reindex_rebuilds_named_index_and_table_cache() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_rows (id int, value text); \
+         INSERT INTO reindex_rows VALUES (1, 'one'), (2, 'two'); \
+         CREATE INDEX reindex_value ON reindex_rows (value)",
+    );
+    let table = engine.storage.find_table("public", "reindex_rows").unwrap();
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    let index = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX reindex_value; SELECT id FROM reindex_rows WHERE value = 'two'",
+    );
+    assert!(String::from_utf8_lossy(&index).contains("REINDEX"));
+    assert_eq!(data_rows(&index), ["2"]);
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    let table_rebuild = run_with(&mut engine, &mut budget, "REINDEX TABLE reindex_rows");
+    assert!(String::from_utf8_lossy(&table_rebuild).contains("REINDEX"));
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA reindex_schema; \
+         CREATE TABLE reindex_schema.rows (id int); \
+         CREATE INDEX reindex_schema_rows ON reindex_schema.rows (id)",
+    );
+    let schema_rebuild = run_with(&mut engine, &mut budget, "REINDEX SCHEMA reindex_schema");
+    assert!(String::from_utf8_lossy(&schema_rebuild).contains("REINDEX"));
+    let schema_table = engine.storage.find_table("reindex_schema", "rows").unwrap();
+    assert!(engine.storage.value_cache_complete(schema_table, &[0]));
+
+    let concurrent = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX CONCURRENTLY reindex_value",
+    );
+    assert!(String::from_utf8_lossy(&concurrent).contains("0A000"));
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX absent_reindex_index",
+    );
+    assert!(String::from_utf8_lossy(&missing).contains("42704"));
+}
+
+#[test]
 fn joins_are_not_capped_at_eight_edges() {
     let mut config = test_config("wide-join");
     config.max_tables = 16;

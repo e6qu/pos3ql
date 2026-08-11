@@ -12090,6 +12090,14 @@ impl Storage {
             .any(|x| x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name)
     }
 
+    /// The transaction-visible index definition. Returning the copy keeps a
+    /// caller from retaining a catalog borrow across cache reconstruction.
+    pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
+        self.indexes.iter().copied().find(|index| {
+            index.visible_to(txid) && index.schema.as_str() == schema && index.name.as_str() == name
+        })
+    }
+
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.

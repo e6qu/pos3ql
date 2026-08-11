@@ -10114,6 +10114,125 @@ pub fn drop_index(
     sql_ok()
 }
 
+/// REINDEX rebuilds the selected table's bounded value-index cache from the
+/// authoritative committed rows. The cache is disposable by design, so its
+/// reconstruction is not journaled; restart uses the same reconstruction path.
+pub fn reindex(
+    storage: &mut Storage,
+    txn: &mut super::txn::TxnState,
+    target: crate::sql::ast::ReindexTarget,
+    name: &QualName,
+    concurrently: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if concurrently {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "REINDEX CONCURRENTLY is not implemented"
+        ));
+    }
+    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
+    let mut table_count = 0usize;
+    match target {
+        crate::sql::ast::ReindexTarget::Table => match resolve_dml_table(storage, name, txn.txid) {
+            Ok(table) => tables[0] = table,
+            Err(error) => return sql_fail(error),
+        },
+        crate::sql::ast::ReindexTarget::Index => {
+            let index = match name.schema {
+                Some(schema) => storage.index_definition(schema, name.name, txn.txid),
+                None => storage
+                    .path()
+                    .entries()
+                    .iter()
+                    .find_map(|entry| match entry {
+                        crate::storage::PathEntry::Schema(slot) => storage.index_definition(
+                            storage.schema_def(*slot as usize).name.as_str(),
+                            name.name,
+                            txn.txid,
+                        ),
+                        crate::storage::PathEntry::Catalog => None,
+                    }),
+            };
+            let Some(index) = index else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "index \"{}\" does not exist",
+                    name.name
+                ));
+            };
+            let Some(table) = storage.find_table(index.schema.as_str(), index.table.as_str())
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "index \"{}\" has no table",
+                    index.name.as_str()
+                ));
+            };
+            tables[0] = table;
+        }
+        crate::sql::ast::ReindexTarget::Schema => {
+            let Some(schema) = storage.find_schema_visible(name.name, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    name.name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Schema,
+                slot: schema as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txn.txid, "schema") {
+                return sql_fail(error);
+            }
+            for table in 0..storage.table_count() {
+                let definition = storage.table_def(table, txn.txid);
+                if storage.table(table).visible_to(txn.txid)
+                    && definition.schema.as_str() == name.name
+                {
+                    if table_count == tables.len() {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "REINDEX schema has too many tables"
+                        ));
+                    }
+                    tables[table_count] = table;
+                    table_count += 1;
+                }
+            }
+        }
+    }
+    if target != crate::sql::ast::ReindexTarget::Schema {
+        table_count = 1;
+    }
+    for &table in &tables[..table_count] {
+        if let Err(error) = require_table_privilege(
+            storage,
+            table,
+            crate::storage::PrivilegeSet::MAINTAIN,
+            txn.txid,
+        ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::Share,
+            false,
+        ) {
+            return sql_fail(error);
+        }
+    }
+    for &table in &tables[..table_count] {
+        if let Err(error) = storage.refresh_enforcers(table) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("REINDEX")?;
+    sql_ok()
+}
+
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 #[derive(Clone, Copy)]

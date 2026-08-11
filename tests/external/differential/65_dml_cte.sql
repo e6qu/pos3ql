@@ -67,6 +67,7 @@ INSERT INTO dmc_copy_source VALUES (1, 'copied'), (2, 'ignored');
 INSERT INTO dmc_copy_target VALUES (1, 'before');
 UPDATE dmc_copy_target AS target SET payload = source.payload
 FROM dmc_copy_source AS source WHERE target.id = source.id RETURNING target.id, target.payload;
+UPDATE dmc_copy_target AS target SET payload = payload RETURNING target.*;
 SELECT id, payload FROM dmc_copy_target;
 
 CREATE SEQUENCE dmc_update_sequence;

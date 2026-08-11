@@ -4856,6 +4856,23 @@ fn update_from_and_delete_using() {
         "UPDATE alias RETURNING: {}",
         String::from_utf8_lossy(&returned)
     );
+    let wildcard = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING target.*",
+    ));
+    assert_eq!(wildcard, ["3|30|z"], "UPDATE alias wildcard: {wildcard:?}");
+    let hidden_name = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE t.id = 3 RETURNING target.id",
+    );
+    assert!(
+        hidden_name.contains("42P01"),
+        "DML alias must hide the target relation name: {hidden_name}"
+    );
     let rows = data_rows(&run_with_txn_bytes(
         &mut e,
         &mut b,

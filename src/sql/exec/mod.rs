@@ -44,10 +44,7 @@ pub struct RowCtx<'s, 'v, 'd> {
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
-            && !self
-                .alias
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(q))
-            && !crate::sql::eval::qualifier_answers_single(self.def, q)
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -70,11 +67,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
-        if !self
-            .alias
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(table))
-            && table != self.def.name.as_str()
-        {
+        if !crate::sql::eval::qualifier_answers_target(self.def, self.alias, table) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -103,7 +96,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str()
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
         }
@@ -114,7 +107,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if let Some(q) = qualifier
-            && q != self.def.name.as_str()
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
         }
@@ -137,6 +130,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
+pub(crate) use describe::AliasedDefCols;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -13474,7 +13468,7 @@ fn emit_projected(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                if !crate::sql::eval::qualifier_answers_single(def, q) {
+                if !crate::sql::eval::qualifier_answers_target(def, alias, q) {
                     return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",

@@ -62,7 +62,8 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let matches = def.is_some_and(|d| crate::sql::eval::qualifier_answers_single(d, q));
+                let matches = def
+                    .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, q));
                 if !matches {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -75,7 +76,7 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                describe_record_star(base, def, &mut push)?;
+                describe_record_star(base, def, table_alias, &mut push)?;
             }
             SelectItem::Expr { expression, alias } => {
                 let resolver: &dyn ColTypeResolver = match def {
@@ -109,17 +110,21 @@ pub fn describe_items<'q>(
 fn describe_record_star<'q>(
     base: &Expr<'q>,
     def: Option<&'q TableDef>,
+    table_alias: Option<&str>,
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
             let resolver: &dyn ColTypeResolver = match def {
-                Some(d) => &DefCols(d),
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
                 None => &NoCols,
             };
             check_row_field_types(base, resolver)?;
             for (i, arg) in args.iter().take(RECORD_FIELD_NAMES.len()).enumerate() {
-                let (oid, typlen) = infer_type_pub(arg, def)?;
+                let (oid, typlen) = infer_type_res(arg, resolver)?;
                 push(ColDesc::new(RECORD_FIELD_NAMES[i], oid, typlen))?;
             }
             Ok(())
@@ -136,7 +141,9 @@ fn describe_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if def.is_some_and(|d| d.name.as_str() == *table) => {
+        } if def
+            .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, table)) =>
+        {
             for c in def.expect("matched").columns() {
                 push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
             }
@@ -147,7 +154,10 @@ fn describe_record_star<'q>(
         // key/value); a shape whose names this cannot cover refuses loudly.
         _ => {
             let resolver: &dyn ColTypeResolver = match def {
-                Some(d) => &DefCols(d),
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
                 None => &NoCols,
             };
             let Some(handle) = expr_record_handle(base, resolver) else {
@@ -938,10 +948,7 @@ pub(crate) struct AliasedDefCols<'d, 'a> {
 impl ColTypeResolver for AliasedDefCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(qualifier) = qualifier
-            && !self
-                .alias
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
-            && !crate::sql::eval::qualifier_answers_single(self.definition, qualifier)
+            && !crate::sql::eval::qualifier_answers_target(self.definition, self.alias, qualifier)
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -967,16 +974,11 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
         (column.ctype == ColType::Record).then_some(column.type_mod)
     }
     fn is_whole_row(&self, name: &str) -> bool {
-        self.alias
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
-            || name == self.definition.name.as_str()
+        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
     }
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        (self
-            .alias
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
-            || name == self.definition.name.as_str())
-        .then(|| self.definition.columns())
+        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
+            .then(|| self.definition.columns())
     }
 }
 

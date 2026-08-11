@@ -3980,7 +3980,7 @@ pub fn describe_catalog_items_as<'q>(
             }
             SelectItem::RecordStar(base) => {
                 let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                    Some(table) => &super::exec::DefCols(table),
+                    Some(definition) => &super::exec::AliasedDefCols { definition, alias },
                     None => &super::exec::NoCols,
                 };
                 column += super::exec::record_shape(base, resolver, |_, _| {})
@@ -4003,7 +4003,10 @@ pub fn describe_catalog_items_as<'q>(
                 } = expression
                 {
                     let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                        Some(table) => &super::exec::DefCols(table),
+                        Some(definition) => &super::exec::AliasedDefCols {
+                            definition,
+                            alias: *alias,
+                        },
                         None => &super::exec::NoCols,
                     };
                     let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];

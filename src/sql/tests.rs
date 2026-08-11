@@ -12754,7 +12754,7 @@ fn unique_expression_indexes_are_transactional_and_durable() {
         &mut engine,
         &mut budget,
         "CREATE TABLE expression_key_rows (email text, active boolean); \
-         CREATE UNIQUE INDEX normalized_email ON expression_key_rows (lower(email)); \
+         CREATE UNIQUE INDEX normalized_email ON expression_key_rows ((lower(email))); \
          INSERT INTO expression_key_rows VALUES ('Alice@example.com', true)",
     );
     let duplicate = run_with(

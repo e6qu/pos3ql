@@ -19,6 +19,19 @@ use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
+fn index_expression_source<'a>(expression: &Expr<'a>, text: &'a str) -> &'a str {
+    // PostgreSQL's index definition printer discards redundant grouping around
+    // a function call, while arithmetic grouping remains semantically useful.
+    if !matches!(expression, Expr::Call { .. }) {
+        return text;
+    }
+    let mut text = text.trim();
+    while text.starts_with('(') && text.ends_with(')') {
+        text = text[1..text.len() - 1].trim();
+    }
+    text
+}
+
 impl<'a> Parser<'a> {
     pub(super) fn alter_index(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
@@ -941,7 +954,8 @@ impl<'a> Parser<'a> {
             }
             let start = self.peek_at;
             let expression = self.expression(0)?;
-            let expression_text = self.text[start..self.peek_at].trim_end();
+            let expression_text =
+                index_expression_source(expression, self.text[start..self.peek_at].trim_end());
             let column = match expression {
                 Expr::Column {
                     qualifier: None,

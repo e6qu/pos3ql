@@ -558,6 +558,7 @@ struct CopiedIndex {
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
     n_include_cols: usize,
+    nulls_not_distinct: bool,
     predicate: Option<crate::util::StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     unique: bool,
 }
@@ -581,6 +582,7 @@ fn copy_like_indexes(
             nulls_first: [false; crate::storage::MAX_INDEX_COLS],
             n_cols: 0,
             n_include_cols: 0,
+            nulls_not_distinct: false,
             predicate: None,
             unique: false,
         }; MAX_LIKE_INDEXES];
@@ -608,6 +610,7 @@ fn copy_like_indexes(
                 nulls_first: index.nulls_first,
                 n_cols: index.n_cols,
                 n_include_cols: index.n_include_cols,
+                nulls_not_distinct: index.nulls_not_distinct,
                 predicate: index.predicate,
                 unique: index.unique,
             };
@@ -632,6 +635,7 @@ fn copy_like_indexes(
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
                     n_include_cols: index.n_include_cols,
+                    nulls_not_distinct: index.nulls_not_distinct,
                     predicate: index.predicate,
                     unique: index.unique,
                     ddl_state: crate::storage::CatalogDdlState::Present,
@@ -652,6 +656,7 @@ fn copy_like_indexes(
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
                     n_include_cols: index.n_include_cols,
+                    nulls_not_distinct: index.nulls_not_distinct,
                     predicate: index.predicate.as_ref().map(|text| text.as_str()),
                     unique: index.unique,
                 },
@@ -748,36 +753,46 @@ fn next_auto_value<'x>(
 /// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
 enum Arbiter {
     Any,
-    Columns([u16; crate::storage::MAX_INDEX_COLS], usize),
+    Columns([u16; crate::storage::MAX_INDEX_COLS], usize, bool),
 }
 
 #[derive(Clone, Copy)]
 struct PartialArbiter<'a> {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
+    nulls_not_distinct: bool,
     predicate: &'a Expr<'a>,
 }
 
 /// Does some unique constraint/index on `def` cover exactly `want` (as a set,
 /// order-independent)? Validates an `ON CONFLICT (columns)` inference target.
-fn unique_arbiter_matches(storage: &Storage, def: &TableDef, want: &[u16], txid: u32) -> bool {
+fn unique_arbiter_matches(
+    storage: &Storage,
+    def: &TableDef,
+    want: &[u16],
+    txid: u32,
+) -> Option<bool> {
     let same = |cols: &[u16]| cols.len() == want.len() && want.iter().all(|w| cols.contains(w));
     for (i, c) in def.columns().iter().enumerate() {
         if c.unique && same(&[i as u16]) {
-            return true;
+            return Some(false);
         }
     }
     for uk in def.uniques() {
         if same(uk.columns()) {
-            return true;
+            return Some(false);
         }
     }
+    let mut matched = false;
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if index.predicate.is_none() && same(&index.columns[..index.n_cols]) {
-            return true;
+            matched = true;
+            if index.nulls_not_distinct {
+                return Some(true);
+            }
         }
     }
-    false
+    matched.then_some(false)
 }
 
 /// Resolves `ON CONSTRAINT name` to the named arbiter's column set: a named
@@ -788,20 +803,20 @@ fn arbiter_by_name(
     def: &TableDef,
     name: &str,
     txid: u32,
-) -> Option<([u16; crate::storage::MAX_INDEX_COLS], usize)> {
+) -> Option<([u16; crate::storage::MAX_INDEX_COLS], usize, bool)> {
     let mut cols = [0u16; crate::storage::MAX_INDEX_COLS];
     for uk in def.uniques() {
         if uk.name.as_str() == name {
             let n = uk.n_cols;
             cols[..n].copy_from_slice(uk.columns());
-            return Some((cols, n));
+            return Some((cols, n, false));
         }
     }
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if index.predicate.is_none() && index.name_for(txid).as_str() == name {
             let n = index.n_cols;
             cols[..n].copy_from_slice(&index.columns[..n]);
-            return Some((cols, n));
+            return Some((cols, n, index.nulls_not_distinct));
         }
     }
     for (i, c) in def.columns().iter().enumerate() {
@@ -814,7 +829,7 @@ fn arbiter_by_name(
         };
         if synth.map(|nm| nm.as_str() == name).unwrap_or(false) {
             cols[0] = i as u16;
-            return Some((cols, 1));
+            return Some((cols, 1, false));
         }
     }
     None
@@ -848,8 +863,8 @@ fn resolve_arbiter(
             want[n] = index as u16;
             n += 1;
         }
-        if unique_arbiter_matches(storage, def, &want[..n], txid) {
-            return Ok(Arbiter::Columns(want, n));
+        if let Some(nulls_not_distinct) = unique_arbiter_matches(storage, def, &want[..n], txid) {
+            return Ok(Arbiter::Columns(want, n, nulls_not_distinct));
         }
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -857,8 +872,8 @@ fn resolve_arbiter(
         ));
     }
     if let Some(cname) = oc.constraint {
-        if let Some((cols, n)) = arbiter_by_name(storage, def, cname, txid) {
-            return Ok(Arbiter::Columns(cols, n));
+        if let Some((cols, n, nulls_not_distinct)) = arbiter_by_name(storage, def, cname, txid) {
+            return Ok(Arbiter::Columns(cols, n, nulls_not_distinct));
         }
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -910,6 +925,7 @@ fn find_conflict<'a>(
         partial[next_partial] = Some(PartialArbiter {
             columns,
             n_columns: index.n_cols,
+            nulls_not_distinct: index.nulls_not_distinct,
             predicate: crate::sql::parser::parse_expr(source, arena)?,
         });
         next_partial += 1;
@@ -930,12 +946,15 @@ fn find_conflict<'a>(
                     compare_datums(a, b).map(|ordering| ordering.is_eq())
                 }
             };
-            let key_hit = |cols: &[u16]| {
-                if cols.iter().any(|&column| values[column as usize].is_null()) {
-                    return Ok(false);
-                }
+            let key_hit = |cols: &[u16], nulls_not_distinct: bool| {
                 for &column in cols {
                     if !eq(&values[column as usize], &other[column as usize])? {
+                        if nulls_not_distinct
+                            && values[column as usize].is_null()
+                            && other[column as usize].is_null()
+                        {
+                            continue;
+                        }
                         return Ok(false);
                     }
                 }
@@ -943,7 +962,9 @@ fn find_conflict<'a>(
             };
             match arbiter {
                 // A named/inferred arbiter conflicts on its own columns only.
-                Arbiter::Columns(cols, n) => key_hit(&cols[..*n]),
+                Arbiter::Columns(cols, n, nulls_not_distinct) => {
+                    key_hit(&cols[..*n], *nulls_not_distinct)
+                }
                 // No target (DO NOTHING): any unique violation is a conflict.
                 Arbiter::Any => {
                     for (i, c) in def.columns().iter().enumerate() {
@@ -952,14 +973,16 @@ fn find_conflict<'a>(
                         }
                     }
                     for uk in def.uniques() {
-                        if key_hit(uk.columns())? {
+                        if key_hit(uk.columns(), false)? {
                             return Ok(true);
                         }
                     }
                     for index in
                         storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
                     {
-                        if index.predicate.is_none() && key_hit(&index.columns[..index.n_cols])? {
+                        if index.predicate.is_none()
+                            && key_hit(&index.columns[..index.n_cols], index.nulls_not_distinct)?
+                        {
                             return Ok(true);
                         }
                     }
@@ -974,8 +997,10 @@ fn find_conflict<'a>(
                             &other,
                             partial_index.predicate,
                             arena,
-                        )? && key_hit(&partial_index.columns[..partial_index.n_columns])?
-                        {
+                        )? && key_hit(
+                            &partial_index.columns[..partial_index.n_columns],
+                            partial_index.nulls_not_distinct,
+                        )? {
                             return Ok(true);
                         }
                     }
@@ -9956,6 +9981,7 @@ pub fn create_index(
     table: &QualName,
     index_columns: &[crate::sql::ast::IndexColumn<'_>],
     include_column_names: &[&str],
+    nulls_not_distinct: bool,
     predicate_expression: Option<&Expr<'_>>,
     predicate_text: Option<&str>,
     arena: &Arena,
@@ -10071,6 +10097,7 @@ pub fn create_index(
         nulls_first,
         n_cols,
         n_include_cols: include_column_names.len(),
+        nulls_not_distinct,
         predicate,
         unique,
         ddl_state: crate::storage::CatalogDdlState::Present,
@@ -10109,6 +10136,7 @@ pub fn create_index(
                         Some(rowid),
                         txn.txid,
                         &columns[..n_cols],
+                        nulls_not_distinct,
                         &crate::sql::exec::constraints::ConstraintName::Named(name),
                         predicate_expression,
                         arena,
@@ -10157,6 +10185,7 @@ pub fn create_index(
             nulls_first,
             n_cols,
             n_include_cols: include_column_names.len(),
+            nulls_not_distinct,
             predicate: predicate.as_ref().map(|text| text.as_str()),
             unique,
         },

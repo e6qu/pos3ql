@@ -2398,6 +2398,8 @@ pub struct IndexDef {
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub n_include_cols: usize,
+    /// `true` makes NULL key values collide in this unique index.
+    pub nulls_not_distinct: bool,
     /// `None` denotes a full-table index. `Some` is the only representation
     /// of a partial index and is re-parsed before any membership decision.
     pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
@@ -3780,6 +3782,7 @@ impl Storage {
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
                     n_include_cols: 0,
+                    nulls_not_distinct: false,
                     predicate: None,
                     unique: false,
                     ddl_state: CatalogDdlState::Absent,

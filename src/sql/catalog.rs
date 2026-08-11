@@ -1634,6 +1634,7 @@ struct IdxInfo {
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
     n_include_cols: usize,
+    nulls_not_distinct: bool,
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
@@ -1657,6 +1658,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                       descending: [bool; crate::storage::MAX_INDEX_COLS],
                       nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
                       predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
+                      nulls_not_distinct: bool,
                       is_primary: bool,
                       is_unique: bool,
                       name: StackStr<64>| {
@@ -1675,6 +1677,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 nulls_first,
                 n_cols: columns.len(),
                 n_include_cols: include_columns.len(),
+                nulls_not_distinct,
                 predicate,
                 is_primary,
                 is_unique,
@@ -1692,6 +1695,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
                     None,
+                    false,
                     true,
                     true,
                     name,
@@ -1707,6 +1711,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     [false; crate::storage::MAX_INDEX_COLS],
                     None,
                     false,
+                    false,
                     true,
                     name,
                 ));
@@ -1720,6 +1725,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
                 None,
+                false,
                 uk.is_primary,
                 true,
                 stack_str_64(uk.name.as_str()),
@@ -1733,6 +1739,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.descending,
                 index.nulls_first,
                 index.predicate,
+                index.nulls_not_distinct,
                 false,
                 index.unique,
                 stack_str_64(index.name_for(txid).as_str()),
@@ -1753,6 +1760,7 @@ fn empty_index() -> IdxInfo {
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
         n_include_cols: 0,
+        nulls_not_distinct: false,
         predicate: None,
         is_primary: false,
         is_unique: false,
@@ -4043,7 +4051,7 @@ fn pg_index<'a>(
                 Datum::Bool(true),  // indisvalid
                 Datum::Bool(true),  // constraints are checked immediately
                 Datum::Bool(false), // indisreplident
-                Datum::Bool(false), // NULL values are distinct by default
+                Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),
                 int2vector(&attributes[..info.n_cols + info.n_include_cols], arena)?,
@@ -5005,6 +5013,9 @@ fn pg_indexes<'a>(
                     );
                 }
                 let _ = indexdef.write_str(")");
+            }
+            if info.nulls_not_distinct {
+                let _ = indexdef.write_str(" NULLS NOT DISTINCT");
             }
             if let Some(predicate) = info.predicate {
                 let _ = write!(indexdef, " WHERE {}", predicate.as_str());

@@ -12740,6 +12740,113 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
 }
 
 #[test]
+fn unique_nulls_not_distinct_are_transactional_and_durable() {
+    let mut config = test_config("unique-nulls-not-distinct");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("unique-nulls-not-distinct-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE null_key_rows (key integer, payload text); \
+         CREATE UNIQUE INDEX null_key ON null_key_rows (key) NULLS NOT DISTINCT; \
+         INSERT INTO null_key_rows VALUES (NULL, 'first')",
+    );
+    assert!(
+        engine
+            .storage
+            .unique_indexes_for("public", "null_key_rows", 0)
+            .any(|index| index.name.as_str() == "null_key" && index.nulls_not_distinct)
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO null_key_rows VALUES (NULL, 'duplicate')",
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate).contains("23505"),
+        "{}",
+        String::from_utf8_lossy(&duplicate)
+    );
+    let ignored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO null_key_rows VALUES (NULL, 'ignored') ON CONFLICT (key) DO NOTHING",
+    );
+    assert!(!String::from_utf8_lossy(&ignored).contains("ERROR"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE null_key_pairs (left_key integer, right_key integer); \
+         CREATE UNIQUE INDEX null_key_pair ON null_key_pairs (left_key, right_key) NULLS NOT DISTINCT; \
+         INSERT INTO null_key_pairs VALUES (NULL, 1), (NULL, 2)",
+    );
+    let pair_duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO null_key_pairs VALUES (NULL, 1)",
+    );
+    assert!(String::from_utf8_lossy(&pair_duplicate).contains("23505"));
+    let non_unique = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX invalid_null_key ON null_key_rows (payload) NULLS NOT DISTINCT",
+    );
+    assert!(!String::from_utf8_lossy(&non_unique).contains("ERROR"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copied_null_key_rows (LIKE null_key_rows INCLUDING INDEXES)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname IN ('null_key', 'copied_null_key_rows_key_idx') ORDER BY indexname; \
+             SELECT indnullsnotdistinct FROM pg_index index_catalog \
+             JOIN pg_class relation ON relation.oid = index_catalog.indexrelid \
+             WHERE relation.relname = 'null_key'",
+        )),
+        [
+            "CREATE UNIQUE INDEX copied_null_key_rows_key_idx ON public.copied_null_key_rows USING btree (key) NULLS NOT DISTINCT",
+            "CREATE UNIQUE INDEX null_key ON public.null_key_rows USING btree (key) NULLS NOT DISTINCT",
+            "t",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE UNIQUE INDEX rolled_null_key ON null_key_rows (payload) NULLS NOT DISTINCT; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'rolled_null_key'",
+        )),
+        ["0"]
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let duplicate_after_restart = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "INSERT INTO null_key_rows VALUES (NULL, 'after restart')",
+    );
+    assert!(String::from_utf8_lossy(&duplicate_after_restart).contains("23505"));
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn reindex_rebuilds_named_index_and_table_cache() {
     let (mut engine, mut budget) = test_engine();
     run_with(

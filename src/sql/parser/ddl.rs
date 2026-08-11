@@ -860,6 +860,7 @@ impl<'a> Parser<'a> {
                     table,
                     columns,
                     include_columns,
+                    nulls_not_distinct,
                     predicate,
                     predicate_text,
                     unique,
@@ -868,6 +869,7 @@ impl<'a> Parser<'a> {
                     table,
                     columns,
                     include_columns,
+                    nulls_not_distinct,
                     predicate,
                     predicate_text,
                     unique,
@@ -981,6 +983,13 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
+        let nulls_not_distinct = if self.eat_ident("nulls")? {
+            self.expect_ident("not")?;
+            self.expect_ident("distinct")?;
+            true
+        } else {
+            false
+        };
         let (predicate, predicate_text) = if self.eat_ident("where")? {
             let start = self.peek_at;
             let predicate = self.expression(0)?;
@@ -996,6 +1005,7 @@ impl<'a> Parser<'a> {
             table,
             columns,
             include_columns,
+            nulls_not_distinct,
             predicate,
             predicate_text,
             unique,

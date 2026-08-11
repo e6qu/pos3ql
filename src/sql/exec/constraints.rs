@@ -279,20 +279,20 @@ fn enforce_expression_index_uniqueness<'a>(
     predicate: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    if let Some(predicate) = predicate {
-        if !index_predicate_matches(def, values, predicate, arena)? {
-            return Ok(());
-        }
+    if let Some(predicate) = predicate
+        && !index_predicate_matches(def, values, predicate, arena)?
+    {
+        return Ok(());
     }
     let keys = index_key_values(def, values, columns, expressions, arena)?;
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
-        if let Some(predicate) = predicate {
-            if !index_predicate_matches(def, other, predicate, arena)? {
-                return Ok(false);
-            }
+        if let Some(predicate) = predicate
+            && !index_predicate_matches(def, other, predicate, arena)?
+        {
+            return Ok(false);
         }
         let other_keys = index_key_values(def, other, columns, expressions, arena)?;
         key_values_equal(

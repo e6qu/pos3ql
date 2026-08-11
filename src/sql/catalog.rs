@@ -4063,11 +4063,11 @@ fn pg_index<'a>(
         let zeros = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
         attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
-        for position in 0..info.n_cols {
+        for (position, attribute) in attributes.iter_mut().enumerate().take(info.n_cols) {
             if info.expression_keys[position] {
                 // PostgreSQL reserves attribute number zero in `indkey` for
                 // an expression key; the source lives in `indexprs`.
-                attributes[position] = u16::MAX;
+                *attribute = u16::MAX;
             }
         }
         attributes[info.n_cols..info.n_cols + info.n_include_cols]
@@ -4093,7 +4093,7 @@ fn pg_index<'a>(
                 },
                 Datum::Bool(true),
                 match (0..info.n_cols)
-                    .find_map(|position| index_expression_source(storage, &info, position, txid))
+                    .find_map(|position| index_expression_source(storage, info, position, txid))
                 {
                     Some(expression) => text(expression.as_str(), arena)?,
                     None => Datum::Null,
@@ -5027,7 +5027,7 @@ fn pg_indexes<'a>(
                 if k > 0 {
                     let _ = indexdef.write_str(", ");
                 }
-                if let Some(expression) = index_expression_source(storage, &info, k, txid) {
+                if let Some(expression) = index_expression_source(storage, info, k, txid) {
                     let _ = indexdef.write_str(expression.as_str());
                 } else {
                     let _ = indexdef

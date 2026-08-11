@@ -173,15 +173,15 @@ fn unique_violation(def: &TableDef, name: &ConstraintName) -> SqlError {
     }
 }
 
-/// Whether the row `rowid`'s committed image has an all-non-NULL key over
-/// `columns` equal to `values` — the verification of an index probe candidate
-/// (and of a full-scan candidate) against the authoritative row bytes.
+/// Whether the row `rowid`'s committed key equals `values` under this index's
+/// NULL-equality rule.
 fn committed_key_matches(
     storage: &Storage,
     table_index: usize,
     schema: &[ColType],
     columns: &[u16],
     values: &[Datum],
+    nulls_not_distinct: bool,
     rowid: u64,
 ) -> Result<bool, SqlError> {
     let Some(state) = storage.row_state(table_index, rowid)? else {
@@ -193,16 +193,26 @@ fn committed_key_matches(
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut other = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut other)?;
-        key_equal(columns, values, &other)
+        key_equal(columns, values, &other, nulls_not_distinct)
     })
 }
 
-/// Whether every key column is non-NULL and equal between a candidate `values`
-/// tuple and a decoded `other` row (SQL treats a NULL key as distinct).
-fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> Result<bool, SqlError> {
+/// Whether both keys are equal under the index's NULL-equality rule.
+fn key_equal(
+    columns: &[u16],
+    values: &[Datum],
+    other: &[Datum],
+    nulls_not_distinct: bool,
+) -> Result<bool, SqlError> {
     for &column in columns {
         let index = column as usize;
-        if other[index].is_null() || !compare_datums(&values[index], &other[index])?.is_eq() {
+        if values[index].is_null() || other[index].is_null() {
+            if nulls_not_distinct && values[index].is_null() && other[index].is_null() {
+                continue;
+            }
+            return Ok(false);
+        }
+        if !compare_datums(&values[index], &other[index])?.is_eq() {
             return Ok(false);
         }
     }
@@ -215,8 +225,8 @@ fn key_equal(columns: &[u16], values: &[Datum], other: &[Datum]) -> Result<bool,
 /// committed side is served by the value index when the table carries an
 /// enforcer for these columns (an O(1) probe), falling back to a full scan
 /// otherwise; the pending side is always a bounded scan of the resident overlay
-/// (pending rows are never evicted). A NULL in any key column makes the
-/// candidate distinct.
+/// (pending rows are never evicted). The index definition controls whether a
+/// NULL key is distinct.
 #[allow(clippy::too_many_arguments)]
 fn enforce_key_uniqueness(
     storage: &Storage,
@@ -227,9 +237,10 @@ fn enforce_key_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     columns: &[u16],
+    nulls_not_distinct: bool,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
-    if columns.iter().any(|&c| values[c as usize].is_null()) {
+    if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
     }
     if storage.has_pending_table_def(table_index, txid) {
@@ -238,6 +249,7 @@ fn enforce_key_uniqueness(
             table_index,
             schema,
             columns,
+            nulls_not_distinct,
             values,
             self_rowid,
             txid,
@@ -246,18 +258,33 @@ fn enforce_key_uniqueness(
         );
     }
 
-    let hash = hash_key(values, columns);
     let mut result: Result<(), SqlError> = Ok(());
-    let served = storage.probe_value(table_index, columns, hash, |rowid| {
-        if result.is_err() || Some(rowid) == self_rowid {
-            return;
-        }
-        match committed_key_matches(storage, table_index, schema, columns, values, rowid) {
-            Ok(true) => result = Err(unique_violation(def, name)),
-            Ok(false) => {}
-            Err(e) => result = Err(e),
-        }
-    })?;
+    // Value caches omit NULL keys because normal UNIQUE indexes never need to
+    // compare them. NULLS NOT DISTINCT makes those keys authoritative, so scan
+    // their bounded durable row set instead of treating a cache miss as proof.
+    let served = if nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
+        false
+    } else {
+        let hash = hash_key(values, columns);
+        storage.probe_value(table_index, columns, hash, |rowid| {
+            if result.is_err() || Some(rowid) == self_rowid {
+                return;
+            }
+            match committed_key_matches(
+                storage,
+                table_index,
+                schema,
+                columns,
+                values,
+                nulls_not_distinct,
+                rowid,
+            ) {
+                Ok(true) => result = Err(unique_violation(def, name)),
+                Ok(false) => {}
+                Err(e) => result = Err(e),
+            }
+        })?
+    };
     result?;
     if !served {
         committed_scan_uniqueness(
@@ -265,6 +292,7 @@ fn enforce_key_uniqueness(
             table_index,
             schema,
             columns,
+            nulls_not_distinct,
             values,
             self_rowid,
             def,
@@ -276,6 +304,7 @@ fn enforce_key_uniqueness(
         table_index,
         schema,
         columns,
+        nulls_not_distinct,
         values,
         self_rowid,
         txid,
@@ -284,15 +313,15 @@ fn enforce_key_uniqueness(
     )
 }
 
-/// The committed-image fallback when a table has no value index for `columns`
-/// (an unindexed unique index, or before an enforcer is built): a full scan of
-/// committed rows, matching the value index's verdict.
+/// The committed-image check when a key has no value-cache binding: a full
+/// scan of committed rows preserves the authoritative uniqueness verdict.
 #[allow(clippy::too_many_arguments)]
 fn committed_scan_uniqueness(
     storage: &Storage,
     table_index: usize,
     schema: &[ColType],
     columns: &[u16],
+    nulls_not_distinct: bool,
     values: &[Datum],
     self_rowid: Option<u64>,
     def: &TableDef,
@@ -309,7 +338,7 @@ fn committed_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            key_equal(columns, values, &other)
+            key_equal(columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
             return Err(unique_violation(def, name));
@@ -330,6 +359,7 @@ fn pending_scan_uniqueness(
     table_index: usize,
     schema: &[ColType],
     columns: &[u16],
+    nulls_not_distinct: bool,
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
@@ -349,7 +379,7 @@ fn pending_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, RowHome::Heap(loc), |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            key_equal(columns, values, &other)
+            key_equal(columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
             if pending.txid != txid {
@@ -380,20 +410,22 @@ pub(crate) fn enforce_partial_index_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     columns: &[u16],
+    nulls_not_distinct: bool,
     name: &ConstraintName,
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     if !index_predicate_matches(def, values, predicate, arena)?
-        || columns
-            .iter()
-            .any(|&column| values[column as usize].is_null())
+        || (!nulls_not_distinct
+            && columns
+                .iter()
+                .any(|&column| values[column as usize].is_null()))
     {
         return Ok(());
     }
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         Ok(index_predicate_matches(def, other, predicate, arena)?
-            && key_equal(columns, values, other)?)
+            && key_equal(columns, values, other, nulls_not_distinct)?)
     };
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -495,6 +527,7 @@ pub fn check_unique(
             self_rowid,
             txid,
             &[i as u16],
+            false,
             &name,
         )?;
     }
@@ -573,7 +606,7 @@ fn check_index_tuple_sizes(
 }
 
 /// Enforces every UNIQUE index on the table: a candidate row conflicts if some
-/// other visible row has an equal, all-non-NULL tuple over the index columns
+/// other visible row has an equal key under that index's NULL-equality rule
 /// (23505; a conflicting uncommitted row from another transaction waits).
 /// Named indexes share the same bounded acceleration cache as table
 /// constraints. CREATE INDEX validates against authoritative rows before its
@@ -605,6 +638,7 @@ pub fn check_unique_indexes(
                 self_rowid,
                 txid,
                 icols,
+                index.nulls_not_distinct,
                 &name,
                 expression,
                 arena,
@@ -619,6 +653,7 @@ pub fn check_unique_indexes(
                 self_rowid,
                 txid,
                 icols,
+                index.nulls_not_distinct,
                 &name,
             )?;
         }
@@ -648,6 +683,7 @@ fn check_unique_keys(
             self_rowid,
             txid,
             uk.columns(),
+            false,
             &ConstraintName::Named(uk.name.as_str()),
         )?;
     }

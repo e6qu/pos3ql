@@ -2273,6 +2273,25 @@ impl Checkpointer {
                     for column in include_columns.iter_mut().take(n_include_cols) {
                         *column = parse_field(words.next(), "idx included column")?;
                     }
+                    // Older manifests leave an empty INCLUDE field when an
+                    // index has no included columns. Consume that separator
+                    // before the optional new flag.
+                    let nulls_not_distinct_field = match words.next() {
+                        Some("") => words.next(),
+                        field => field,
+                    };
+                    let nulls_not_distinct = match nulls_not_distinct_field {
+                        Some(value) => match parse_field(Some(value), "idx nulls-not-distinct")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad index nulls-not-distinct",
+                                ));
+                            }
+                        },
+                        None => false,
+                    };
                     if words.next().is_some_and(|field| !field.is_empty()) {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -2299,6 +2318,7 @@ impl Checkpointer {
                                 nulls_first,
                                 n_cols,
                                 n_include_cols,
+                                nulls_not_distinct,
                                 predicate,
                                 unique: unique != 0,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
@@ -3604,7 +3624,7 @@ impl Checkpointer {
         }
         // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>
         // <hex-schema> <descending-mask> <nulls-first-mask> <hex-predicate|->
-        // <ninclude> <include-cols...>`.
+        // <ninclude> <include-cols...> <nulls-not-distinct>`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
@@ -3647,7 +3667,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {} {} {} {} {} {}",
+                    "idx {} {} {}{} {} {} {} {} {} {} {} {}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -3659,6 +3679,7 @@ impl Checkpointer {
                     predicate.as_str(),
                     index.n_include_cols,
                     includes.as_str(),
+                    u8::from(index.nulls_not_distinct),
                 ),
             )?;
         }

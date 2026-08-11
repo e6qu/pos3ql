@@ -806,9 +806,61 @@ fn describe_leaf<'a>(
         None => super::describe_catalog_items(s.items, None, storage, txid, columns),
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(s.items, &scope, storage, txid, columns)
+            describe_scope_items(s.items, &scope, storage, txid, arena, columns)
         }
     }
+}
+
+/// A set operation keeps the first leaf's output identity. Record output is
+/// no exception: carry its registered shape with that description so a derived
+/// set source remains a typed composite instead of an anonymous record.
+fn register_first_leaf_record_shapes(
+    storage: &Storage,
+    statement: &Select,
+    txid: u32,
+    arena: &Arena,
+    columns: &mut [ColDesc],
+    count: usize,
+) -> Result<(), SqlError> {
+    let scope = statement
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .transpose()?;
+    let scope = scope.as_ref();
+    let mut slot = 0usize;
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard => slot += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(name) => {
+                slot += scope
+                    .and_then(|scope| {
+                        scope
+                            .table_index(name)
+                            .ok()
+                            .map(|table| scope.defs[table].expect("resolved").n_columns)
+                    })
+                    .unwrap_or(0);
+            }
+            SelectItem::RecordStar(base) => {
+                slot += scope.map_or(0, |scope| super::record_star_width(base, scope));
+            }
+            SelectItem::Expr { expression, .. } => {
+                if slot < count && columns[slot].type_oid == crate::sql::types::oid::RECORD {
+                    let resolver: &dyn crate::sql::exec::ColTypeResolver = match scope {
+                        Some(scope) => &super::ScopeCols(scope),
+                        None => &crate::sql::exec::NoCols,
+                    };
+                    if let Some(handle) = crate::sql::exec::register_shape_for(expression, resolver)
+                    {
+                        columns[slot].type_mod = handle;
+                    }
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The common type of two set-operation columns: equal types, the numeric
@@ -877,11 +929,12 @@ pub(crate) fn describe_set_body<'a>(
     let mut leaves: [Option<&Select>; MAX_SET_LEAVES] = [None; MAX_SET_LEAVES];
     let mut n_leaves = 0;
     collect_set_leaves(tree, &mut leaves, &mut n_leaves)?;
-    let n_cols = describe_leaf(storage, leaves[0].expect(">=1 leaf"), txid, columns, arena)?;
+    let leaf0 = leaves[0].expect(">=1 leaf");
+    let n_cols = describe_leaf(storage, leaf0, txid, columns, arena)?;
+    register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
-    let leaf0 = leaves[0].expect(">=1 leaf");
     for (c, col) in columns[..n_cols].iter().enumerate() {
         target[c] = if leaf_col_unknown(storage, leaf0, c, txid, arena) {
             None

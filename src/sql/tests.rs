@@ -1021,6 +1021,28 @@ fn row_description_type_oids(bytes: &[u8]) -> Vec<i32> {
     panic!("response has no RowDescription")
 }
 
+fn row_description_names(bytes: &[u8]) -> Vec<&str> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if tag == b'T' {
+            let payload = &bytes[offset + 5..offset + 1 + length];
+            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+            let mut fields = &payload[2..];
+            let mut names = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name_end = fields.iter().position(|byte| *byte == 0).unwrap();
+                names.push(std::str::from_utf8(&fields[..name_end]).unwrap());
+                fields = &fields[name_end + 19..];
+            }
+            return names;
+        }
+        offset += 1 + length;
+    }
+    panic!("response has no RowDescription")
+}
+
 fn command_tags(bytes: &[u8]) -> Vec<String> {
     let mut tags = Vec::new();
     let mut index = 0;
@@ -1463,6 +1485,60 @@ fn select_one_still_works() {
     let (mut e, mut b) = test_engine();
     let bytes = run_with(&mut e, &mut b, "SELECT 1");
     assert_eq!(message_types(&bytes), [b'T', b'D', b'C']);
+}
+
+#[test]
+fn derived_record_expansion_keeps_names_and_ordinal_targets() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE record_source (priority integer, label text); \
+         INSERT INTO record_source VALUES (2, 'second'), (1, 'first')",
+    );
+    let query = "SELECT (record_value).* \
+                 FROM (SELECT record_source AS record_value FROM record_source) derived \
+                 ORDER BY 1";
+    let result = run_with(&mut engine, &mut budget, query);
+    assert_eq!(row_description_names(&result), ["priority", "label"]);
+    assert_eq!(data_rows(&result), ["1|first", "2|second"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "WITH records AS (SELECT record_source AS record_value FROM record_source) \
+             SELECT (record_value).* FROM records ORDER BY 1"
+        )),
+        ["1|first", "2|second"]
+    );
+    let unioned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (record_value).* FROM ( \
+             SELECT record_source AS record_value FROM record_source WHERE priority = 1 \
+             UNION ALL \
+             SELECT record_source FROM record_source WHERE priority = 2 \
+         ) records ORDER BY 1",
+    );
+    assert_eq!(
+        data_rows(&unioned),
+        ["1|first", "2|second"],
+        "{}",
+        String::from_utf8_lossy(&unioned)
+    );
+    let grouped = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (record_value).* \
+         FROM (SELECT record_source AS record_value FROM record_source) derived \
+         GROUP BY 1, 2 ORDER BY 2 DESC",
+    );
+    assert_eq!(
+        data_rows(&grouped),
+        ["2|second", "1|first"],
+        "{}",
+        String::from_utf8_lossy(&grouped)
+    );
 }
 
 #[test]

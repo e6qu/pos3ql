@@ -368,7 +368,8 @@ pub(crate) fn synth_derived_def_outer<'a>(
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                let n = describe_scope_items(sub.items, &ss, storage, txid, &mut descriptors)?;
+                let n =
+                    describe_scope_items(sub.items, &ss, storage, txid, arena, &mut descriptors)?;
                 // A bare scalar/array subquery item (possibly correlated) has
                 // no static type from the scope and describes as text; infer
                 // its real type from the inner select's projection so the
@@ -427,6 +428,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                 outer.expect("checked"),
                 storage,
                 txid,
+                arena,
                 &mut descriptors,
             )?,
             None => {

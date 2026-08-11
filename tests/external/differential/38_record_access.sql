@@ -13,6 +13,8 @@ SELECT ((rt)).b FROM rt ORDER BY 1;
 SELECT (rt.*).* FROM rt ORDER BY a;
 SELECT (rt).* FROM rt ORDER BY a;
 SELECT (rt.*).*, 5 FROM rt ORDER BY a;
+SELECT (rt).* FROM rt ORDER BY 2 DESC;
+SELECT (rt).* FROM rt GROUP BY 1, 2 ORDER BY 1;
 SELECT pg_typeof((rt.*).a) FROM rt LIMIT 1;
 SELECT * FROM rt WHERE (rt).a = 1;
 SELECT (rt).a FROM rt ORDER BY (rt).a DESC;
@@ -70,6 +72,12 @@ CREATE TABLE rt2(a int, b text);
 INSERT INTO rt2 VALUES (2,'y'),(1,'x');
 SELECT (v).r, ((v).r).a FROM (SELECT rt2 AS r FROM rt2) v ORDER BY 2;
 SELECT ((v).r).b FROM (SELECT rt2 AS r FROM rt2) v ORDER BY 1;
+SELECT ((v).r).* FROM (SELECT rt2 AS r FROM rt2) v ORDER BY 1;
+WITH record_cte AS (SELECT rt2 AS r FROM rt2) SELECT (r).* FROM record_cte ORDER BY 1;
+SELECT (r).* FROM (
+  SELECT rt2 AS r FROM rt2 WHERE a = 1
+  UNION ALL SELECT rt2 FROM rt2 WHERE a = 2
+) record_union ORDER BY 1;
 SELECT q FROM (SELECT ROW(2,'b'::text) AS q UNION ALL SELECT ROW(1,'a'::text)) s ORDER BY q;
 SELECT DISTINCT q FROM (SELECT ROW(1,2) AS q UNION ALL SELECT ROW(1,2)) s;
 SELECT count(q) FROM (SELECT ROW(1,2) AS q) s;

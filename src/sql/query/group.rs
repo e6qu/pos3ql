@@ -887,21 +887,21 @@ fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
     }
 }
 
-/// Expands `*` and `t.*` select items of a grouped query into their column
-/// references (a merged join column expands to its COALESCE), leaving every
-/// other item as written. Returns the statement unchanged when no star is
-/// present.
+/// Expands every select-list star of a grouped query into column references
+/// (a merged join column expands to its COALESCE), leaving every other item as
+/// written. Returns the statement unchanged when no star is present.
 fn expand_grouped_stars<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     use crate::sql::ast::SelectItem;
-    if !statement
-        .items
-        .iter()
-        .any(|i| matches!(i, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
-    {
+    if !statement.items.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_)
+        )
+    }) {
         return Ok(statement);
     }
     let mut expanded: [SelectItem<'a>; MAX_PROJ] = [SelectItem::Wildcard; MAX_PROJ];
@@ -944,6 +944,40 @@ fn expand_grouped_stars<'a>(
                         },
                         &mut n,
                     )?;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                let mut error = None;
+                let expanded =
+                    crate::sql::exec::record_shape(base, &super::ScopeCols(scope), |name, _| {
+                        if error.is_some() {
+                            return;
+                        }
+                        let result = arena
+                            .alloc_str(name)
+                            .map_err(|_| arena_full())
+                            .and_then(|field| {
+                                arena
+                                    .alloc(Expr::Field { base, field })
+                                    .map(|expression| SelectItem::Expr {
+                                        expression: &*expression,
+                                        alias: None,
+                                    })
+                                    .map_err(|_| arena_full())
+                            })
+                            .and_then(|item| push(item, &mut n));
+                        if let Err(e) = result {
+                            error = Some(e);
+                        }
+                    });
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                if expanded.is_none() {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "row expansion is not supported on this expression"
+                    ));
                 }
             }
             other => push(*other, &mut n)?,

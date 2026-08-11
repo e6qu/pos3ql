@@ -1211,12 +1211,24 @@ fn resolve_position_target<'a>(
                 };
                 let width = record_star_width(base, scope);
                 if remaining < width {
-                    // A positional (ORDER BY/GROUP BY ordinal) reference into a
-                    // `(record).*` expansion has no simple column to resolve to.
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "ORDER BY/GROUP BY position into a record expansion is not supported"
-                    ));
+                    let target = remaining;
+                    let mut result = None;
+                    let mut index = 0usize;
+                    super::exec::record_shape(base, &ScopeCols(scope), |name, _| {
+                        if result.is_none() && index == target {
+                            result =
+                                Some(arena.alloc_str(name).map_err(|_| arena_full()).and_then(
+                                    |field| {
+                                        arena
+                                            .alloc(Expr::Field { base, field })
+                                            .map(|expression| &*expression)
+                                            .map_err(|_| arena_full())
+                                    },
+                                ));
+                        }
+                        index += 1;
+                    });
+                    return result.unwrap_or_else(|| Err(position_error()));
                 }
                 remaining -= width;
             }
@@ -1505,7 +1517,7 @@ fn describe_select<'a>(
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(sel.items, &scope, storage, txid, out)
+            describe_scope_items(sel.items, &scope, storage, txid, arena, out)
         }
         None => describe_catalog_items(sel.items, None, storage, txid, out),
     }
@@ -2322,10 +2334,11 @@ pub fn select_query<'a>(
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_scope_items(statement.items, &scope, storage, txid, &mut columns) {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
-    };
+    let n_cols =
+        match describe_scope_items(statement.items, &scope, storage, txid, arena, &mut columns) {
+            Ok(n) => n,
+            Err(e) => return sql_fail(e),
+        };
     patch_subquery_column_types(
         statement.items,
         Some(&scope),
@@ -3142,7 +3155,7 @@ fn select_into_rows_mode<'a>(
         let mut vals = [Datum::Null; MAX_PROJ];
         for row in &rows[start..end] {
             for (c, slot) in vals[..n].iter_mut().enumerate() {
-                *slot = super::exec::decode_projected_pub(row, c);
+                *slot = super::exec::decode_projected_col_record(row, c, arena)?;
             }
             emit(&vals[..n])?;
         }
@@ -3926,6 +3939,7 @@ pub fn describe_scope_items<'q>(
     scope: &QueryScope<'q>,
     storage: &Storage,
     txid: u32,
+    arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let mut n = 0;
@@ -3964,7 +3978,7 @@ pub fn describe_scope_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                n = describe_scope_record_star(base, scope, out, n)?;
+                n = describe_scope_record_star(base, scope, arena, out, n)?;
             }
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
@@ -4114,11 +4128,11 @@ pub fn describe_select_items<'q>(
     scope: Option<&QueryScope<'q>>,
     storage: &Storage,
     txid: u32,
-    arena: &Arena,
+    arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let count = match scope {
-        Some(scope) => describe_scope_items(items, scope, storage, txid, out)?,
+        Some(scope) => describe_scope_items(items, scope, storage, txid, arena, out)?,
         None => describe_catalog_items(items, None, storage, txid, out)?,
     };
     let mut column = 0;
@@ -4250,6 +4264,7 @@ fn user_type_cast_description<'q>(
 fn describe_scope_record_star<'q>(
     base: &Expr<'q>,
     scope: &QueryScope<'q>,
+    arena: &'q Arena,
     out: &mut [ColDesc<'q>],
     mut n: usize,
 ) -> Result<usize, SqlError> {
@@ -4307,27 +4322,13 @@ fn describe_scope_record_star<'q>(
                 if push_err.is_some() {
                     return;
                 }
-                // Copy the registry name into the arena? ColDesc borrows 'q —
-                // registry names are thread-local copies; the caller's arena
-                // is not in reach here, so lease the static field names when
-                // they match, else fail loudly below.
-                let leased = super::exec::RECORD_FIELD_NAMES
-                    .iter()
-                    .chain(["key", "value"].iter())
-                    .find(|n| n.eq_ignore_ascii_case(field_name))
-                    .copied();
-                match leased {
-                    Some(name) => {
+                match arena.alloc_str(field_name) {
+                    Ok(name) => {
                         if let Err(e) = push(ColDesc::of_type(name, ctype), &mut n) {
                             push_err = Some(e);
                         }
                     }
-                    None => {
-                        push_err = Some(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "row expansion of this record's field names is not supported here"
-                        ))
-                    }
+                    Err(_) => push_err = Some(arena_full()),
                 }
             });
             if let Some(e) = push_err {

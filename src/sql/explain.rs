@@ -97,11 +97,12 @@ fn projected_shape<'a>(
     scope: Option<&QueryScope<'a>>,
     storage: &Storage,
     txid: u32,
+    arena: &'a Arena,
 ) -> Result<(u32, StackStr<256>), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
     let count = match scope {
         Some(scope) => {
-            query::describe_scope_items(statement.items, scope, storage, txid, &mut columns)?
+            query::describe_scope_items(statement.items, scope, storage, txid, arena, &mut columns)?
         }
         None => query::describe_catalog_items(statement.items, None, storage, txid, &mut columns)?,
     };
@@ -585,7 +586,7 @@ pub(super) fn plan_select(
         Some(from) => Some(QueryScope::resolve_schema(storage, from, txid, arena)?),
         None => None,
     };
-    let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid)?;
+    let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
 
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;

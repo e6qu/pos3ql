@@ -49,8 +49,18 @@ PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
 run_groups_strict() {
     groups=$1
     echo "=== external suite, groups: $groups ==="
-    { POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
-        zsh tests/external/run.sh 2>&1; echo $? > "$TMP/run.status"; } | tee "$TMP/run.log"
+    {
+        if POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
+            zsh tests/external/run.sh 2>&1; then
+            echo 0 > "$TMP/run.status"
+        else
+            echo $? > "$TMP/run.status"
+        fi
+    } | tee "$TMP/run.log"
+    if [ ! -f "$TMP/run.status" ]; then
+        echo "FAIL: tests/external/run.sh did not report an exit status (groups $groups)"
+        exit 1
+    fi
     if [ "$(cat "$TMP/run.status")" != "0" ]; then
         echo "FAIL: tests/external/run.sh (groups $groups); its FAIL lines:"
         grep '^FAIL' "$TMP/run.log" || true

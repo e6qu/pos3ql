@@ -12535,6 +12535,107 @@ fn create_index_and_unique() {
 }
 
 #[test]
+fn reindex_rebuilds_named_index_and_table_cache() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_rows (id int, value text); \
+         INSERT INTO reindex_rows VALUES (1, 'one'), (2, 'two'); \
+         CREATE INDEX reindex_value ON reindex_rows (value)",
+    );
+    let table = engine.storage.find_table("public", "reindex_rows").unwrap();
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    let index = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX reindex_value; SELECT id FROM reindex_rows WHERE value = 'two'",
+    );
+    assert!(String::from_utf8_lossy(&index).contains("REINDEX"));
+    assert_eq!(data_rows(&index), ["2"]);
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    let table_rebuild = run_with(&mut engine, &mut budget, "REINDEX TABLE reindex_rows");
+    assert!(String::from_utf8_lossy(&table_rebuild).contains("REINDEX"));
+    assert!(engine.storage.value_cache_complete(table, &[1]));
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA reindex_schema; \
+         CREATE TABLE reindex_schema.rows (id int); \
+         CREATE INDEX reindex_schema_rows ON reindex_schema.rows (id)",
+    );
+    let schema_rebuild = run_with(&mut engine, &mut budget, "REINDEX SCHEMA reindex_schema");
+    assert!(String::from_utf8_lossy(&schema_rebuild).contains("REINDEX"));
+    let schema_table = engine.storage.find_table("reindex_schema", "rows").unwrap();
+    assert!(engine.storage.value_cache_complete(schema_table, &[0]));
+
+    let concurrent = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX CONCURRENTLY reindex_value",
+    );
+    assert!(String::from_utf8_lossy(&concurrent).contains("0A000"));
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX absent_reindex_index",
+    );
+    assert!(String::from_utf8_lossy(&missing).contains("42704"));
+}
+
+#[test]
+fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
+    let mut config = test_config("reindex-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("reindex-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_recovery_rows (id int, value text); \
+         INSERT INTO reindex_recovery_rows VALUES (1, 'one'), (2, 'two'); \
+         CREATE INDEX reindex_recovery_value ON reindex_recovery_rows (value); \
+         REINDEX INDEX reindex_recovery_value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id FROM reindex_recovery_rows ORDER BY id; \
+             SELECT id FROM reindex_recovery_rows WHERE value = 'two'",
+        )),
+        ["1", "2", "2"]
+    );
+    let table = restarted
+        .storage
+        .find_table("public", "reindex_recovery_rows")
+        .unwrap();
+    assert!(restarted.storage.value_probe_complete(table, &[1]));
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn joins_are_not_capped_at_eight_edges() {
     let mut config = test_config("wide-join");
     config.max_tables = 16;

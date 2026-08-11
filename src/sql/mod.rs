@@ -330,6 +330,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropType { .. }
         | Stmt::CreateIndex { .. }
         | Stmt::DropIndex { .. }
+        | Stmt::Reindex { .. }
         | Stmt::Checkpoint
         | Stmt::AlterTable(_)
         | Stmt::CreateSchema { .. }
@@ -386,6 +387,7 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
         Stmt::Truncate { .. } => "TRUNCATE",
         Stmt::Vacuum { .. } => "VACUUM",
         Stmt::Checkpoint => "CHECKPOINT",
+        Stmt::Reindex { .. } => "REINDEX",
         Stmt::Notify { .. } => "NOTIFY",
         _ => "DDL",
     }
@@ -4777,6 +4779,18 @@ impl Engine {
                 txn,
                 names,
                 *if_exists,
+                responder,
+            ),
+            Stmt::Reindex {
+                target,
+                name,
+                concurrently,
+            } => exec::reindex(
+                &mut self.storage,
+                txn,
+                *target,
+                name,
+                *concurrently,
                 responder,
             ),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(

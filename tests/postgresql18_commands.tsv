@@ -174,7 +174,7 @@ PREPARE	complete	14_surface.sql
 PREPARE TRANSACTION	missing	-
 REASSIGN OWNED	complete	83_roles_acl.sql
 REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
-REINDEX	missing	-
+REINDEX	partial	92_reindex.sql
 RELEASE SAVEPOINT	complete	05_transactions.sql
 RESET	complete	75_guc_mutation.sql
 REVOKE	partial	83_roles_acl.sql

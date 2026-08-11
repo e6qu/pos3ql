@@ -963,6 +963,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Stmt::Checkpoint)
             }
+            Tok::Ident("reindex") => self.reindex(),
             Tok::Ident("vacuum") => self.vacuum_or_analyze(true),
             Tok::Ident("analyze") | Tok::Ident("analyse") => self.vacuum_or_analyze(false),
             Tok::Ident("refresh") => {
@@ -2821,6 +2822,31 @@ impl<'a> Parser<'a> {
             roles,
             members,
             admin_option_only,
+        })
+    }
+
+    /// `REINDEX [ ( options ) ] { INDEX | TABLE } [ CONCURRENTLY ] name`.
+    /// The supported target is parsed before execution; unsupported global
+    /// target classes remain loud syntax errors instead of aliases.
+    fn reindex(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("reindex")?;
+        if self.eat_op("(")? {
+            return Err(self.err_here("REINDEX options are not implemented"));
+        }
+        let target = if self.eat_ident("index")? {
+            ReindexTarget::Index
+        } else if self.eat_ident("table")? {
+            ReindexTarget::Table
+        } else if self.eat_ident("schema")? {
+            ReindexTarget::Schema
+        } else {
+            return Err(self.err_here("REINDEX supports INDEX, TABLE or SCHEMA"));
+        };
+        let concurrently = self.eat_ident("concurrently")?;
+        Ok(Stmt::Reindex {
+            target,
+            name: self.qual_name("reindex target")?,
+            concurrently,
         })
     }
 

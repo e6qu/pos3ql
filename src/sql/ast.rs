@@ -297,6 +297,13 @@ pub enum Stmt<'a> {
         names: &'a [QualName<'a>],
         if_exists: bool,
     },
+    /// REINDEX INDEX/TABLE name. The target kind is typed at parse time so an
+    /// executor cannot silently treat an index rebuild as a table rebuild.
+    Reindex {
+        target: ReindexTarget,
+        name: QualName<'a>,
+        concurrently: bool,
+    },
     /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
     /// value (quotes included); the session GUC store validates and applies it.
     Set {
@@ -665,6 +672,15 @@ pub struct IndexColumn<'a> {
     pub name: &'a str,
     pub descending: bool,
     pub nulls_first: bool,
+}
+
+/// The relation class selected by REINDEX. Other PostgreSQL forms require
+/// global/catalog state this engine does not expose as a user relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexTarget {
+    Index,
+    Table,
+    Schema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

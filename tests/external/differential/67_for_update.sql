@@ -1,10 +1,7 @@
 -- Row-locking clauses: FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
 -- [OF t, …] [NOWAIT | SKIP LOCKED], matching PostgreSQL 18. In a single
 -- session a locking clause returns the same rows as the plain query; the
--- corpus pins that, the analysis-time restrictions, and OF resolution. (The
--- cross-transaction blocking/NOWAIT/SKIP-LOCKED behavior is not exercised
--- here — it needs two concurrent sessions the differential harness does not
--- drive; see BUGS.md.)
+-- corpus pins that, the analysis-time restrictions, and OF resolution.
 --
 -- Distinctive names + drop up front (the differential corpora share a database).
 DROP TABLE IF EXISTS fu_t;

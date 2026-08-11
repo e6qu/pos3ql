@@ -4156,42 +4156,47 @@ impl Engine {
             Ok(parser) => parser,
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
         };
-        let statement = match parser.next_stmt() {
-            Ok(Some(statement)) => statement,
-            Ok(None) => {
-                return Ok(Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "procedure body is empty"
-                )));
-            }
-            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-        };
-        match parser.next_stmt() {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return Ok(Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL procedure bodies must contain exactly one statement"
-                )));
-            }
-            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-        }
         let output_mark = responder.buffer.mark();
-        let result = self.execute_stmt(
-            &statement,
-            arena,
-            &values[..arguments.len()],
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            responder,
-        );
-        responder.buffer.truncate_to(output_mark);
-        match result {
-            Ok(Ok(())) => responder.command_complete("CALL").map(|_| Ok(())),
-            other => other,
+        let mut statements = 0usize;
+        loop {
+            let statement = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                Ok(None) => break,
+                Err(error) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(parse_error_to_sql(&error)));
+                }
+            };
+            statements += 1;
+            match self.execute_stmt(
+                &statement,
+                arena,
+                &values[..arguments.len()],
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(error));
+                }
+                Err(error) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Err(error);
+                }
+            }
         }
+        responder.buffer.truncate_to(output_mark);
+        if statements == 0 {
+            return Ok(Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "procedure body is empty"
+            )));
+        }
+        responder.command_complete("CALL").map(|_| Ok(()))
     }
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
@@ -5923,7 +5928,7 @@ fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), W
     responder.error(e.sqlstate, e.message.as_str())
 }
 
-fn parse_error_to_sql(error: &ParseError) -> SqlError {
+pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {
     SqlError {
         sqlstate: error.sqlstate,
         message: stack_format!(192, "{}", error.message.as_str()),

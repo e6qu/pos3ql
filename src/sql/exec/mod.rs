@@ -612,6 +612,7 @@ fn copy_like_indexes(
                 IndexDef {
                     schema: def.schema,
                     name,
+                    pending_name: None,
                     table: def.name,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
@@ -773,7 +774,7 @@ fn arbiter_by_name(
         }
     }
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if index.name.as_str() == name {
+        if index.name_for(txid).as_str() == name {
             let n = index.n_cols;
             cols[..n].copy_from_slice(&index.columns[..n]);
             return Some((cols, n));
@@ -9936,6 +9937,7 @@ pub fn create_index(
     let def = IndexDef {
         schema: tdef.schema,
         name: sqlname,
+        pending_name: None,
         table: tdef.name,
         ownership: crate::storage::Ownership::BOOTSTRAP,
         columns,
@@ -10024,6 +10026,117 @@ pub fn create_index(
     }
     responder.command_complete("CREATE INDEX")?;
     sql_ok()
+}
+
+pub fn alter_index(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    name: &QualName,
+    if_exists: bool,
+    action: crate::sql::ast::AlterIndexAction,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match name.schema {
+        Some(schema) => match storage.find_schema_visible(schema, txn.txid) {
+            Some(slot) => storage
+                .index_slot(schema, name.name, txn.txid)
+                .map(|_| storage.schema_def(slot).name),
+            None if if_exists => None,
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+        },
+        None => storage
+            .path()
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                crate::storage::PathEntry::Schema(slot) => {
+                    let schema = storage.schema_def(*slot as usize).name;
+                    storage
+                        .index_slot(schema.as_str(), name.name, txn.txid)
+                        .map(|_| schema)
+                }
+                crate::storage::PathEntry::Catalog => None,
+            }),
+    };
+    let Some(schema) = schema else {
+        if if_exists {
+            responder.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "index \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+            return Ok(Ok(responder.command_complete("ALTER INDEX")?));
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "index \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let slot = storage
+        .index_slot(schema.as_str(), name.name, txn.txid)
+        .expect("resolved index exists");
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Index,
+        slot: slot as u16,
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "index") {
+        return sql_fail(error);
+    }
+    let Some(table) = storage.index_table_slot(slot) else {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "index \"{}\" has no table",
+            name.name
+        ));
+    };
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
+    match action {
+        crate::sql::ast::AlterIndexAction::Rename(new_name) => {
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.rename_index(slot, new_name, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenameIndex {
+                    schema: schema.as_str(),
+                    name: name.name,
+                    new_name: new_name.as_str(),
+                },
+            ) {
+                storage.rollback_index_rename(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_index_rename(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    Ok(Ok(responder.command_complete("ALTER INDEX")?))
 }
 
 /// DROP INDEX [IF EXISTS].

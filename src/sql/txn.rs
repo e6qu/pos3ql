@@ -217,6 +217,10 @@ pub(crate) enum DdlUndo {
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.
     IndexDropped(u32),
+    IndexRenamed {
+        slot: u32,
+        prior: Option<crate::storage::PendingIndexName>,
+    },
     /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)

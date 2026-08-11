@@ -480,7 +480,7 @@ fn index_name(
         let index = storage
             .indexes_for(definition.schema.as_str(), definition.name.as_str(), txid)
             .find(|index| index.n_cols == 1 && index.columns[0] as usize == column)?;
-        let _ = write!(name, "{}", index.name.as_str());
+        let _ = write!(name, "{}", index.name_for(txid).as_str());
     }
     Some(name)
 }

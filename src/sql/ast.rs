@@ -292,6 +292,12 @@ pub enum Stmt<'a> {
         columns: &'a [IndexColumn<'a>],
         unique: bool,
     },
+    /// ALTER INDEX [IF EXISTS] name RENAME TO new_name.
+    AlterIndex {
+        name: QualName<'a>,
+        if_exists: bool,
+        action: AlterIndexAction<'a>,
+    },
     /// DROP INDEX [IF EXISTS] name.
     DropIndex {
         names: &'a [QualName<'a>],
@@ -479,6 +485,13 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+/// A parsed ALTER INDEX operation. Keeping the supported operation typed
+/// prevents execution from accepting an index alteration it cannot enact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterIndexAction<'a> {
+    Rename(&'a str),
 }
 
 /// Row-change operations a publication emits through logical replication.

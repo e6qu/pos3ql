@@ -2366,6 +2366,7 @@ pub struct IndexDef {
     /// its table's schema).
     pub schema: SqlName,
     pub name: SqlName,
+    pub(crate) pending_name: Option<PendingIndexName>,
     pub table: SqlName,
     pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
@@ -2381,6 +2382,18 @@ impl IndexDef {
     pub fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
+
+    pub fn name_for(&self, txid: u32) -> SqlName {
+        self.pending_name
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingIndexName {
+    pub txid: u32,
+    pub name: SqlName,
 }
 
 /// How many schemas may exist at once, including the built-in "public".
@@ -3730,6 +3743,7 @@ impl Storage {
                 .push(IndexDef {
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
+                    pending_name: None,
                     table: SqlName::parse("").expect("empty name fits"),
                     ownership: Ownership::BOOTSTRAP,
                     columns: [0; MAX_INDEX_COLS],
@@ -3950,7 +3964,7 @@ impl Storage {
             AccessClass::Index => self.indexes.iter().position(|index| {
                 index.visible_to(txid)
                     && index.schema.as_str() == schema
-                    && index.name.as_str() == name
+                    && index.name_for(txid).as_str() == name
             }),
             AccessClass::Routine => self.routines.iter().position(|routine| {
                 routine.visible_to(txid)
@@ -4001,7 +4015,7 @@ impl Storage {
             }
             AccessClass::Index => {
                 let definition = &self.indexes[slot];
-                (definition.schema, definition.name)
+                (definition.schema, definition.name_for(txid))
             }
             AccessClass::Routine => {
                 let definition = &self.routines[slot];
@@ -12085,17 +12099,106 @@ impl Storage {
     }
 
     pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {
-        self.indexes
-            .iter()
-            .any(|x| x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name)
+        self.index_slot(schema, name, txid).is_some()
+    }
+
+    pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.indexes.iter().position(|index| {
+            index.visible_to(txid)
+                && index.schema.as_str() == schema
+                && index.name_for(txid).as_str() == name
+        })
     }
 
     /// The transaction-visible index definition. Returning the copy keeps a
     /// caller from retaining a catalog borrow across cache reconstruction.
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
-        self.indexes.iter().copied().find(|index| {
-            index.visible_to(txid) && index.schema.as_str() == schema && index.name.as_str() == name
-        })
+        self.index_slot(schema, name, txid)
+            .map(|slot| self.indexes[slot])
+    }
+
+    pub(crate) fn rename_index(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingIndexName>, SqlError> {
+        let index = self.indexes[slot];
+        if !index.visible_to(txid) {
+            return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"));
+        }
+        if let Some(blocker) = self
+            .indexes
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot
+                    && candidate.schema == index.schema
+                    && candidate
+                        .pending_name
+                        .is_some_and(|pending| pending.name == name && pending.txid != txid))
+                .then_some(candidate.pending_name?.txid)
+            })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.indexes.iter().enumerate().any(|(other, candidate)| {
+            other != slot
+                && candidate.visible_to(txid)
+                && candidate.schema == index.schema
+                && candidate.name_for(txid) == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let index = &mut self.indexes[slot];
+        if let Some(pending) = index.pending_name
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "index \"{}\" is being renamed by another transaction",
+                index.name.as_str()
+            ));
+        }
+        let prior = index.pending_name;
+        index.pending_name = Some(PendingIndexName { txid, name });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) {
+        let (schema, old_name, new_name) = {
+            let index = &mut self.indexes[slot];
+            let Some(pending) = index.pending_name else {
+                return;
+            };
+            if pending.txid != txid {
+                return;
+            }
+            let old_name = index.name;
+            index.name = pending.name;
+            index.pending_name = None;
+            (index.schema, old_name, pending.name)
+        };
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && comment.class == CommentClass::Relation
+                && comment.schema == schema
+                && comment.name == old_name
+            {
+                comment.name = new_name;
+            }
+        }
+        if let Some(table) = self.index_table_slot(slot) {
+            self.tables[table].mark_dirty();
+        }
+    }
+
+    pub(crate) fn rollback_index_rename(&mut self, slot: usize, prior: Option<PendingIndexName>) {
+        self.indexes[slot].pending_name = prior;
     }
 
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
@@ -12105,7 +12208,7 @@ impl Storage {
         self.require_schema_create(def.schema.as_str(), txid)?;
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
             (index.schema.as_str() == def.schema.as_str()
-                && index.name.as_str() == def.name.as_str())
+                && index.name_for(txid).as_str() == def.name.as_str())
             .then_some(index.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
@@ -12193,15 +12296,13 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.schema.as_str() == schema && index.name.as_str() == name)
+            (index.schema.as_str() == schema && index.name_for(txid).as_str() == name)
                 .then_some(index.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.indexes.iter().position(|x| {
-            x.visible_to(txid) && x.schema.as_str() == schema && x.name.as_str() == name
-        }) else {
+        let Some(i) = self.index_slot(schema, name, txid) else {
             return Ok(None);
         };
         self.pending_drop_index(i, txid);

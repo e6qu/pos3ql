@@ -10,6 +10,11 @@ SELECT lastval();
 SELECT start_value, min_value, max_value, increment_by, cycle, cache_size
   FROM pg_sequences WHERE sequencename = 's1';
 
+-- Set-operation materialization evaluates each volatile branch once.
+CREATE SEQUENCE set_operation_sequence;
+SELECT nextval('set_operation_sequence') UNION ALL SELECT nextval('set_operation_sequence') ORDER BY 1;
+SELECT nextval('set_operation_sequence');
+
 -- setval positions the generator; a two-arg setval sets is_called=true, so the
 -- next value steps past it; the three-arg false form makes the next value equal.
 SELECT setval('s1', 100);

@@ -371,6 +371,10 @@ pub trait SequenceAccess {
     fn currval(&self, name: &str) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
+    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError>;
+    fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
+    fn dry_lastval(&self) -> Result<i64, SqlError>;
+    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's

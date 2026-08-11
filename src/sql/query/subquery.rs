@@ -1835,7 +1835,7 @@ fn run_set_subquery<'a>(
     params: &[Datum<'a>],
     row_arity: usize,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let (rows, target, n_cols) = materialize_set_body(storage, txid, tree, arena, params)?;
+    let (rows, target, n_cols) = materialize_set_body(storage, txid, tree, arena, params, None)?;
     if n_cols != row_arity {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,

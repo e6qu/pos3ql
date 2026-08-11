@@ -10,7 +10,7 @@ use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql::ast::{Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{SqlError, compare_datums, sqlstate};
+use crate::sql::eval::{SequenceAccess, SqlError, compare_datums, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, Datum};
@@ -24,6 +24,44 @@ use super::{
 
 const MAX_SET_LEAVES: usize = 32;
 
+struct DrySequence<'a>(&'a dyn SequenceAccess);
+
+#[derive(Clone, Copy)]
+struct ExternalSetContext<'a> {
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &'a [Datum<'a>],
+    sequences: Option<&'a dyn SequenceAccess>,
+}
+
+impl SequenceAccess for DrySequence<'_> {
+    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+        self.0.dry_nextval(name)
+    }
+    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+        self.0.dry_currval(name)
+    }
+    fn lastval(&self) -> Result<i64, SqlError> {
+        self.0.dry_lastval()
+    }
+    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        self.0.dry_setval(name, value, is_called)
+    }
+    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
+        self.0.dry_nextval(name)
+    }
+    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
+        self.0.dry_currval(name)
+    }
+    fn dry_lastval(&self) -> Result<i64, SqlError> {
+        self.0.dry_lastval()
+    }
+    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        self.0.dry_setval(name, value, is_called)
+    }
+}
+
 /// Executes a set-operation query (UNION / INTERSECT / EXCEPT). Each SELECT
 /// leaf is materialized to self-describing rows coerced to the columns' common
 /// type; the operators combine those multisets; then the trailing ORDER BY /
@@ -35,6 +73,7 @@ pub fn set_query<'a>(
     q: &'a SetQuery<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
     // A row-locking clause can never apply to a set operation, matching
@@ -70,6 +109,7 @@ pub fn set_query<'a>(
             q,
             arena,
             params,
+            sequences,
             &target[..n_cols],
             &columns[..n_cols],
             responder,
@@ -77,7 +117,15 @@ pub fn set_query<'a>(
     }
 
     // Materialize and combine the tree.
-    let rows = match eval_set_tree(body, storage, txid, arena, params, &target[..n_cols]) {
+    let rows = match eval_set_tree(
+        body,
+        storage,
+        txid,
+        arena,
+        params,
+        sequences,
+        &target[..n_cols],
+    ) {
         Ok(r) => r,
         Err(e) => return sql_fail(e),
     };
@@ -222,14 +270,11 @@ fn push_run(
 
 fn external_set_leaf<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
+    context: ExternalSetContext<'a>,
     target: &[ColType],
     sorted: bool,
 ) -> Result<Option<ExternalRun>, SqlError> {
-    let mut sorter = storage.external_sorter()?;
+    let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
     let mut compare = if sorted {
         byte_order as fn(&[u8], &[u8]) -> Result<_, _>
@@ -237,13 +282,13 @@ fn external_set_leaf<'a>(
         insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
     };
     select_into_rows_recycling(
-        storage,
-        txid,
+        context.storage,
+        context.txid,
         select,
-        arena,
-        params,
+        context.arena,
+        context.params,
         None,
-        None,
+        context.sequences,
         &mut |values| {
             if values.len() != target.len() {
                 return Err(sql_err!(
@@ -253,9 +298,11 @@ fn external_set_leaf<'a>(
             }
             let mut coerced = [Datum::Null; MAX_PROJ];
             for column in 0..target.len() {
-                coerced[column] = crate::sql::eval::cast_to(values[column], target[column], arena)?;
+                coerced[column] =
+                    crate::sql::eval::cast_to(values[column], target[column], context.arena)?;
             }
-            storage
+            context
+                .storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(
                         blocks,
@@ -267,17 +314,15 @@ fn external_set_leaf<'a>(
                 .expect("spill-attached block store")
         },
     )?;
-    storage
+    context
+        .storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("spill-attached block store")
 }
 
 fn external_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
+    context: ExternalSetContext<'a>,
     target: &[ColType],
     sorted: bool,
 ) -> Result<Option<ExternalRun>, SqlError> {
@@ -291,29 +336,13 @@ fn external_set_tree<'a>(
         let SetTree::Select(select) = tree else {
             unreachable!()
         };
-        return external_set_leaf(select, storage, txid, arena, params, target, sorted);
+        return external_set_leaf(select, context, target, sorted);
     };
     let merge_inputs = !(*operator == SetOp::Union && *all);
-    let left_run = external_set_tree(
-        left,
-        storage,
-        txid,
-        arena,
-        params,
-        target,
-        sorted || merge_inputs,
-    )?;
-    let right_run = external_set_tree(
-        right,
-        storage,
-        txid,
-        arena,
-        params,
-        target,
-        sorted || merge_inputs,
-    )?;
+    let left_run = external_set_tree(left, context, target, sorted || merge_inputs)?;
+    let right_run = external_set_tree(right, context, target, sorted || merge_inputs)?;
 
-    let mut sorter = storage.external_sorter()?;
+    let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
     let mut output_compare = if sorted || merge_inputs {
         byte_order as fn(&[u8], &[u8]) -> Result<_, _>
@@ -321,21 +350,35 @@ fn external_set_tree<'a>(
         insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
     };
     if *operator == SetOp::Union && *all {
-        let mut reader = storage.external_run_reader()?;
+        let mut reader = context.storage.external_run_reader()?;
         if let Some(run) = left_run {
-            push_run(storage, &mut reader, run, &mut sorter, &mut output_compare)?;
+            push_run(
+                context.storage,
+                &mut reader,
+                run,
+                &mut sorter,
+                &mut output_compare,
+            )?;
         }
         if let Some(run) = right_run {
-            push_run(storage, &mut reader, run, &mut sorter, &mut output_compare)?;
+            push_run(
+                context.storage,
+                &mut reader,
+                run,
+                &mut sorter,
+                &mut output_compare,
+            )?;
         }
     } else if let Some(left_run) = left_run {
-        let mut left_reader = storage.external_run_reader()?;
-        let mut right_reader = storage.external_run_reader()?;
-        storage
+        let mut left_reader = context.storage.external_run_reader()?;
+        let mut right_reader = context.storage.external_run_reader()?;
+        context
+            .storage
             .with_block_store(|blocks| left_reader.start(blocks, left_run))
             .expect("spill-attached block store")?;
         if let Some(right_run) = right_run {
-            storage
+            context
+                .storage
                 .with_block_store(|blocks| right_reader.start(blocks, right_run))
                 .expect("spill-attached block store")?;
         }
@@ -344,7 +387,8 @@ fn external_set_tree<'a>(
             let mut left_count = 0u64;
             while left_reader.row() == Some(left_reader.output(left_length)) {
                 left_count += 1;
-                storage
+                context
+                    .storage
                     .with_block_store(|blocks| left_reader.advance(blocks))
                     .expect("spill-attached block store")?;
             }
@@ -352,7 +396,8 @@ fn external_set_tree<'a>(
             while right_reader.row().is_some_and(|row| row < left_row) {
                 let right_length = right_reader.stage_current().expect("current right row");
                 if *operator == SetOp::Union {
-                    storage
+                    context
+                        .storage
                         .with_block_store(|blocks| {
                             sorter.push_encoded(
                                 blocks,
@@ -363,7 +408,8 @@ fn external_set_tree<'a>(
                         .expect("spill-attached block store")?;
                 }
                 while right_reader.row() == Some(right_reader.output(right_length)) {
-                    storage
+                    context
+                        .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
                         .expect("spill-attached block store")?;
                 }
@@ -371,7 +417,8 @@ fn external_set_tree<'a>(
             let mut right_count = 0u64;
             while right_reader.row() == Some(left_row) {
                 right_count += 1;
-                storage
+                context
+                    .storage
                     .with_block_store(|blocks| right_reader.advance(blocks))
                     .expect("spill-attached block store")?;
             }
@@ -384,7 +431,8 @@ fn external_set_tree<'a>(
                 _ => unreachable!(),
             };
             for _ in 0..copies {
-                storage
+                context
+                    .storage
                     .with_block_store(|blocks| {
                         sorter.push_encoded(blocks, left_row, &mut output_compare)
                     })
@@ -394,7 +442,8 @@ fn external_set_tree<'a>(
         if *operator == SetOp::Union && !*all {
             while right_reader.row().is_some() {
                 let right_length = right_reader.stage_current().expect("current right row");
-                storage
+                context
+                    .storage
                     .with_block_store(|blocks| {
                         sorter.push_encoded(
                             blocks,
@@ -404,21 +453,24 @@ fn external_set_tree<'a>(
                     })
                     .expect("spill-attached block store")?;
                 while right_reader.row() == Some(right_reader.output(right_length)) {
-                    storage
+                    context
+                        .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
                         .expect("spill-attached block store")?;
                 }
             }
         }
     } else if *operator == SetOp::Union && !*all {
-        let mut reader = storage.external_run_reader()?;
+        let mut reader = context.storage.external_run_reader()?;
         if let Some(run) = right_run {
-            storage
+            context
+                .storage
                 .with_block_store(|blocks| reader.start(blocks, run))
                 .expect("spill-attached block store")?;
             while reader.row().is_some() {
                 let right_length = reader.stage_current().expect("current right row");
-                storage
+                context
+                    .storage
                     .with_block_store(|blocks| {
                         sorter.push_encoded(
                             blocks,
@@ -428,14 +480,16 @@ fn external_set_tree<'a>(
                     })
                     .expect("spill-attached block store")?;
                 while reader.row() == Some(reader.output(right_length)) {
-                    storage
+                    context
+                        .storage
                         .with_block_store(|blocks| reader.advance(blocks))
                         .expect("spill-attached block store")?;
                 }
             }
         }
     }
-    storage
+    context
+        .storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut output_compare))
         .expect("spill-attached block store")
 }
@@ -457,6 +511,7 @@ pub(crate) fn external_set_body_into<'a>(
     with_ties: bool,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -467,10 +522,13 @@ pub(crate) fn external_set_body_into<'a>(
     }
     let Some(run) = external_set_tree(
         tree,
-        storage,
-        txid,
-        arena,
-        params,
+        ExternalSetContext {
+            storage,
+            txid,
+            arena,
+            params,
+            sequences,
+        },
         &target[..column_count],
         false,
     )?
@@ -545,11 +603,23 @@ fn external_set_query<'a>(
     query: &'a SetQuery<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
     columns: &[ColDesc<'a>],
     responder: &mut Responder,
 ) -> Outcome {
-    let run = match external_set_tree(tree, storage, txid, arena, params, target, false) {
+    let run = match external_set_tree(
+        tree,
+        ExternalSetContext {
+            storage,
+            txid,
+            arena,
+            params,
+            sequences,
+        },
+        target,
+        false,
+    ) {
         Ok(run) => run,
         Err(error) => return sql_fail(error),
     };
@@ -775,18 +845,19 @@ fn eval_set_tree<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
-        SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, target),
+        SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, sequences, target),
         SetTree::Op {
             operator,
             all,
             left,
             right,
         } => {
-            let l = eval_set_tree(left, storage, txid, arena, params, target)?;
-            let r = eval_set_tree(right, storage, txid, arena, params, target)?;
+            let l = eval_set_tree(left, storage, txid, arena, params, sequences, target)?;
+            let r = eval_set_tree(right, storage, txid, arena, params, sequences, target)?;
             combine_sets(*operator, *all, l, r, arena)
         }
     }
@@ -870,8 +941,9 @@ pub(crate) fn materialize_set_body<'a>(
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
-    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params)?;
+    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params, sequences)?;
     // `materialize_set_body_tied` ties all inputs to one lifetime because the
     // row executor may temporarily decode datums borrowed from storage. None
     // of those datums escape: every output row is projected-encoded into
@@ -887,6 +959,7 @@ fn materialize_set_body_tied<'a>(
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n = describe_set_body(storage, tree, txid, &mut columns, arena)?;
@@ -897,7 +970,7 @@ fn materialize_set_body_tied<'a>(
     let target = arena
         .alloc_slice_copy(&tgt[..n])
         .map_err(|_| arena_full())?;
-    let rows = eval_set_tree(tree, storage, txid, arena, params, target)?;
+    let rows = eval_set_tree(tree, storage, txid, arena, params, sequences, target)?;
     Ok((rows, target, n))
 }
 
@@ -907,35 +980,57 @@ fn eval_set_leaf<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     // Pass 1: count the rows. Pass 2: coerce to the target types and encode.
     let mut count = 0usize;
-    select_into_rows(storage, txid, s, arena, params, None, None, &mut |_| {
-        count += 1;
-        Ok(())
-    })?;
+    let dry_sequences = sequences.map(DrySequence);
+    select_into_rows(
+        storage,
+        txid,
+        s,
+        arena,
+        params,
+        None,
+        dry_sequences
+            .as_ref()
+            .map(|sequence| sequence as &dyn SequenceAccess),
+        &mut |_| {
+            count += 1;
+            Ok(())
+        },
+    )?;
     let empty: &[u8] = &[];
     let rows = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
     let n = target.len();
     let mut at = 0usize;
-    select_into_rows(storage, txid, s, arena, params, None, None, &mut |vals| {
-        if vals.len() != n {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "each UNION query must have the same number of columns"
-            ));
-        }
-        let mut coerced = [Datum::Null; MAX_PROJ];
-        for c in 0..n {
-            coerced[c] = crate::sql::eval::cast_to(vals[c], target[c], arena)?;
-        }
-        rows[at] = exec::encode_projected_pub(&coerced[..n], arena)?;
-        at += 1;
-        Ok(())
-    })?;
+    select_into_rows(
+        storage,
+        txid,
+        s,
+        arena,
+        params,
+        None,
+        sequences,
+        &mut |vals| {
+            if vals.len() != n {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "each UNION query must have the same number of columns"
+                ));
+            }
+            let mut coerced = [Datum::Null; MAX_PROJ];
+            for c in 0..n {
+                coerced[c] = crate::sql::eval::cast_to(vals[c], target[c], arena)?;
+            }
+            rows[at] = exec::encode_projected_pub(&coerced[..n], arena)?;
+            at += 1;
+            Ok(())
+        },
+    )?;
     Ok(rows)
 }
 

@@ -15381,6 +15381,35 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     }
 
     if phase == "all" || phase == "set" {
+        let created = run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "CREATE SEQUENCE external_set_sequence",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let volatile_union = run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT nextval('external_set_sequence') UNION ALL SELECT nextval('external_set_sequence') ORDER BY 1",
+        );
+        assert_eq!(
+            data_rows(&volatile_union),
+            ["1", "2"],
+            "external set leaves must not advance sequences during sizing: {}",
+            String::from_utf8_lossy(&volatile_union)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut restarted,
+                &mut restarted_budget,
+                "SELECT nextval('external_set_sequence')",
+            )),
+            ["3"]
+        );
         let union_output = run_with(
             &mut restarted,
             &mut restarted_budget,
@@ -16998,6 +17027,27 @@ fn set_operations() {
             "(SELECT 1) UNION (SELECT 2) ORDER BY 1"
         )),
         ["1", "2"]
+    );
+    // Set materialization must execute each volatile branch once.
+    run_with(&mut e, &mut b, "CREATE SEQUENCE set_operation_sequence");
+    let volatile_set = run_with(
+        &mut e,
+        &mut b,
+        "SELECT nextval('set_operation_sequence') UNION ALL SELECT nextval('set_operation_sequence') ORDER BY 1",
+    );
+    assert_eq!(
+        data_rows(&volatile_set),
+        ["1", "2"],
+        "{}",
+        String::from_utf8_lossy(&volatile_set)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT nextval('set_operation_sequence')"
+        )),
+        ["3"]
     );
 }
 

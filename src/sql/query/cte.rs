@@ -778,6 +778,7 @@ fn external_recursive_tree(
         false,
         arena,
         params,
+        None,
         &mut |values| {
             storage
                 .with_block_store(|blocks| {
@@ -1064,7 +1065,7 @@ fn materialize_recursive<'a>(
     // Base rows; UNION (without ALL) deduplicates them among themselves.
     // Projected-row encoding is order-preserving-for-equality, so byte equality
     // is row equality.
-    let (base_rows, _, _) = materialize_set_body(storage, txid, base_tree, arena, params)?;
+    let (base_rows, _, _) = materialize_set_body(storage, txid, base_tree, arena, params, None)?;
     const EMPTY: &[u8] = &[];
     let mut all_rows: &'a [&'a [u8]] = if union_all {
         base_rows
@@ -1130,7 +1131,8 @@ fn materialize_recursive<'a>(
                 ));
             }
         }
-        let (step_rows, _, _) = materialize_set_body(storage, txid, step_tree, arena, params)?;
+        let (step_rows, _, _) =
+            materialize_set_body(storage, txid, step_tree, arena, params, None)?;
         // Keep the rows this iteration added: all of them under UNION ALL, only
         // never-seen ones under UNION.
         let fresh: &'a [&'a [u8]] = if union_all {

@@ -2382,15 +2382,6 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
     );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
     let mut observer = TxnState::new(&mut budget, 256).unwrap();
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT description FROM pg_description d JOIN pg_type t ON t.oid = d.objoid \
-             WHERE t.typname = 'domain_old'",
-        )),
-        ["domain identity comment"]
-    );
     run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
     run_txn(
         &mut engine,
@@ -10081,6 +10072,7 @@ fn domain_identity_changes_are_transactional_and_update_dependents() {
         &mut budget,
         "CREATE SCHEMA domain_target; \
          CREATE DOMAIN domain_old AS integer CHECK (VALUE > 0); \
+         COMMENT ON DOMAIN domain_old IS 'domain identity comment'; \
          CREATE DOMAIN domain_child AS domain_old; \
          CREATE TABLE domain_values (value domain_old, values domain_old[]); \
          INSERT INTO domain_values VALUES (3, ARRAY[4, 5]::domain_old[])",
@@ -10139,6 +10131,15 @@ fn domain_identity_changes_are_transactional_and_update_dependents() {
         ["3", "7", "9"],
         "{}",
         String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT description FROM pg_description d JOIN pg_type t ON t.oid = d.objoid \
+             WHERE t.typname = 'domain_new'",
+        )),
+        ["domain identity comment"]
     );
 }
 

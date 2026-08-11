@@ -1372,6 +1372,7 @@ fn subst_update<'a>(
 ) -> Result<Update<'a>, SqlError> {
     Ok(Update {
         table: statement.table,
+        alias: statement.alias,
         assignments: subst_assignments(statement.assignments, context, arena)?,
         from: match statement.from {
             Some(from) => Some(

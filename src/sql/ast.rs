@@ -1496,6 +1496,7 @@ pub struct OnConflictTarget<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Update<'a> {
     pub table: QualName<'a>,
+    pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
     pub from: Option<&'a FromClause<'a>>,

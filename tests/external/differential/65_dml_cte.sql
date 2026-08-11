@@ -61,6 +61,20 @@ WITH picked AS (SELECT 3 AS id, 'C' AS v)
 UPDATE dmc_src SET v = picked.v FROM picked
 WHERE dmc_src.id = picked.id RETURNING dmc_src.id, dmc_src.v;
 
+CREATE TABLE dmc_copy_source (id int, payload text);
+CREATE TABLE dmc_copy_target (id int, payload text);
+INSERT INTO dmc_copy_source VALUES (1, 'copied'), (2, 'ignored');
+INSERT INTO dmc_copy_target VALUES (1, 'before');
+UPDATE dmc_copy_target AS target SET payload = source.payload
+FROM dmc_copy_source AS source WHERE target.id = source.id;
+SELECT id, payload FROM dmc_copy_target;
+
+CREATE SEQUENCE dmc_update_sequence;
+UPDATE dmc_copy_target AS target SET payload = nextval('dmc_update_sequence')::text
+FROM dmc_copy_source AS source WHERE target.id = source.id;
+SELECT id, payload FROM dmc_copy_target;
+SELECT nextval('dmc_update_sequence');
+
 WITH picked AS (SELECT 4 AS id)
 DELETE FROM dmc_src USING picked
 WHERE dmc_src.id = picked.id RETURNING dmc_src.id;
@@ -102,3 +116,6 @@ SELECT id, v FROM dmc_final ORDER BY id;
 DROP TABLE dmc_src;
 DROP TABLE dmc_log;
 DROP TABLE dmc_final;
+DROP TABLE dmc_copy_source;
+DROP TABLE dmc_copy_target;
+DROP SEQUENCE dmc_update_sequence;

@@ -163,6 +163,18 @@ fn prepare_cold_pax_fixture(config: &Config) {
         "{}",
         String::from_utf8_lossy(&inserted)
     );
+    let target = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE wide_pax_target (id int PRIMARY KEY, payload text); \
+         INSERT INTO wide_pax_target VALUES (287, 'before')",
+        1 << 16,
+    );
+    assert!(
+        !String::from_utf8_lossy(&target).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&target)
+    );
     assert!(engine.checkpoint().unwrap());
 }
 
@@ -4834,7 +4846,8 @@ fn update_from_and_delete_using() {
             &mut e,
             &mut b,
             &mut t,
-            "UPDATE t SET v = t.v + s.delta, label = s.lbl FROM s WHERE t.id = s.id"
+            "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
+             FROM s WHERE target.id = s.id"
         )
         .contains("UPDATE 2")
     );
@@ -4875,6 +4888,42 @@ fn update_from_and_delete_using() {
         "SELECT id FROM d ORDER BY id",
     ));
     assert_eq!(left, ["1"], "delete using: {left:?}");
+
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE SEQUENCE update_from_sequence",
+    );
+    assert!(
+        run_txn(
+            &mut e,
+            &mut b,
+            &mut t,
+            "UPDATE t AS target SET v = nextval('update_from_sequence') FROM s \
+             WHERE target.id = s.id AND target.id = 1"
+        )
+        .contains("UPDATE 1")
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT v FROM t WHERE id = 1",
+        )),
+        ["1"],
+        "UPDATE FROM must evaluate SET with sequence access"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT nextval('update_from_sequence')",
+        )),
+        ["2"]
+    );
 }
 
 #[test]
@@ -15111,6 +15160,41 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         "SELECT EXISTS (SELECT 1 FROM wide_pax)",
         &["t"],
         None,
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let before = engine.storage.block_io_stats();
+    let updated = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "UPDATE wide_pax_target AS target \
+         SET payload = source.payload_0 \
+         FROM wide_pax AS source \
+         WHERE target.id = source.id",
+        1 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&updated).contains("UPDATE 1"),
+        "{}",
+        String::from_utf8_lossy(&updated)
+    );
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT length(payload) FROM wide_pax_target",
+            1 << 20,
+        )),
+        ["2048"],
+        "UPDATE FROM must retain source columns consumed only by SET"
+    );
+    let reads = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        reads.object_read_bytes < 2 << 20,
+        "cold UPDATE FROM must decode its predicate and assignment columns only: bytes={}",
+        reads.object_read_bytes
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

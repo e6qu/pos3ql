@@ -3789,6 +3789,7 @@ impl Engine {
                             };
                             match arena.alloc(Update {
                                 table: view.base,
+                                alias: update.alias,
                                 assignments: rewritten.assignments,
                                 from: rewritten.from,
                                 where_clause,

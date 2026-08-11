@@ -4863,6 +4863,17 @@ fn update_from_and_delete_using() {
         "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING target.*",
     ));
     assert_eq!(wildcard, ["3|30|z"], "UPDATE alias wildcard: {wildcard:?}");
+    let record_wildcard = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING (target).*",
+    ));
+    assert_eq!(
+        record_wildcard,
+        ["3|30|z"],
+        "UPDATE alias record wildcard: {record_wildcard:?}"
+    );
     let hidden_name = run_txn(
         &mut e,
         &mut b,
@@ -4872,6 +4883,16 @@ fn update_from_and_delete_using() {
     assert!(
         hidden_name.contains("42P01"),
         "DML alias must hide the target relation name: {hidden_name}"
+    );
+    let hidden_output = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = v WHERE target.id = 3 RETURNING t.*",
+    );
+    assert!(
+        hidden_output.contains("42P01"),
+        "DML result description must hide the target relation name: {hidden_output}"
     );
     let rows = data_rows(&run_with_txn_bytes(
         &mut e,

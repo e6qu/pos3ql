@@ -160,7 +160,10 @@ pub fn set_query<'a>(
     for row in &rows[start..end] {
         let mut out = [Datum::Null; MAX_PROJ];
         for (c, slot) in out[..n_cols].iter_mut().enumerate() {
-            *slot = exec::decode_projected_pub(row, c);
+            *slot = match exec::decode_projected_col_record(row, c, arena) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            };
         }
         if responder.data_row(&out[..n_cols]).is_err() {
             return Err(WireFull);
@@ -579,7 +582,7 @@ pub(crate) fn external_set_body_into<'a>(
         if logical >= offset {
             let mut values = [Datum::Null; MAX_PROJ];
             for (column, value) in values.iter_mut().enumerate().take(column_count) {
-                *value = exec::decode_projected_pub(context.row, column);
+                *value = exec::decode_projected_col_record(context.row, column, arena)?;
             }
             emit(&values[..column_count])?;
         }
@@ -702,7 +705,11 @@ fn external_set_query<'a>(
                 if logical >= offset {
                     let mut values = [Datum::Null; MAX_PROJ];
                     for (column, value) in values.iter_mut().enumerate().take(target.len()) {
-                        *value = exec::decode_projected_pub(context.row, column);
+                        *value = match exec::decode_projected_col_record(context.row, column, arena)
+                        {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
                     }
                     responder.data_row(&values[..target.len()])?;
                     emitted += 1;

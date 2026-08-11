@@ -640,7 +640,9 @@ wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then
     ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
   else
-    bad "forced-spill differential"; tail -30 "$WORK/spilldiff.out"
+    bad "forced-spill differential"
+    grep -A 32 -B 2 '^FAIL:' "$WORK/spilldiff.out" | head -80 || true
+    tail -30 "$WORK/spilldiff.out"
   fi
 else
   print -- "SKIP: forced-spill differential needs real PostgreSQL 18"

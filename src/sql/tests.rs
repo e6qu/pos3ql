@@ -1542,6 +1542,43 @@ fn derived_record_expansion_keeps_names_and_ordinal_targets() {
 }
 
 #[test]
+fn object_resident_set_records_keep_their_structural_fields() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("set-record-spill-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("sql-set-record-spill-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE spill_record_source (priority integer, label text); \
+         INSERT INTO spill_record_source VALUES (2, 'second'), (1, 'first')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (record_value).* FROM ( \
+                 SELECT spill_record_source AS record_value FROM spill_record_source WHERE priority = 1 \
+                 UNION ALL \
+                 SELECT spill_record_source FROM spill_record_source WHERE priority = 2 \
+             ) records ORDER BY 1"
+        )),
+        ["1|first", "2|second"]
+    );
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(

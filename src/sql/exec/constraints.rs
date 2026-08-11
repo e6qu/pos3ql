@@ -219,6 +219,137 @@ fn key_equal(
     Ok(true)
 }
 
+pub(crate) fn key_values_equal(
+    values: &[Datum],
+    other: &[Datum],
+    nulls_not_distinct: bool,
+) -> Result<bool, SqlError> {
+    for (value, other_value) in values.iter().zip(other) {
+        if value.is_null() || other_value.is_null() {
+            if nulls_not_distinct && value.is_null() && other_value.is_null() {
+                continue;
+            }
+            return Ok(false);
+        }
+        if !compare_datums(value, other_value)?.is_eq() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn index_key_values<'a>(
+    def: &TableDef,
+    row: &[Datum<'a>],
+    columns: &[u16],
+    expressions: &[Option<&'a Expr<'a>>],
+    arena: &'a Arena,
+) -> Result<[Datum<'a>; crate::storage::MAX_INDEX_COLS], SqlError> {
+    let mut keys = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    for (position, expression) in expressions.iter().enumerate() {
+        keys[position] = match expression {
+            Some(expression) => eval(
+                expression,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &RowCtx { def, values: row },
+            )?,
+            None => row[columns[position] as usize],
+        };
+    }
+    Ok(keys)
+}
+
+/// Enforces a unique expression index without manufacturing a column-only
+/// cache key. Expressions and an optional predicate are evaluated against the
+/// authoritative committed and pending images with one parser representation.
+#[allow(clippy::too_many_arguments)]
+fn enforce_expression_index_uniqueness<'a>(
+    storage: &Storage,
+    table_index: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum<'a>],
+    self_rowid: Option<u64>,
+    txid: u32,
+    columns: &[u16],
+    expressions: &[Option<&'a Expr<'a>>],
+    nulls_not_distinct: bool,
+    name: &ConstraintName,
+    predicate: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if let Some(predicate) = predicate {
+        if !index_predicate_matches(def, values, predicate, arena)? {
+            return Ok(());
+        }
+    }
+    let keys = index_key_values(def, values, columns, expressions, arena)?;
+    if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
+        return Ok(());
+    }
+    let matches = |other: &[Datum]| -> Result<bool, SqlError> {
+        if let Some(predicate) = predicate {
+            if !index_predicate_matches(def, other, predicate, arena)? {
+                return Ok(false);
+            }
+        }
+        let other_keys = index_key_values(def, other, columns, expressions, arena)?;
+        key_values_equal(
+            &keys[..columns.len()],
+            &other_keys[..columns.len()],
+            nulls_not_distinct,
+        )
+    };
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        if Some(rowid) == self_rowid {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            matches(&other)
+        })?;
+        if matched {
+            return Err(unique_violation(def, name));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    for (&rowid, state) in storage.table(table_index).rows.iter() {
+        if Some(rowid) == self_rowid {
+            continue;
+        }
+        let Some(pending) = state.pending.last() else {
+            continue;
+        };
+        let Some(location) = pending.loc else {
+            continue;
+        };
+        let matched =
+            storage.with_row_bytes(table_index, rowid, RowHome::Heap(location), |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                matches(&other)
+            })?;
+        if !matched {
+            continue;
+        }
+        if pending.txid != txid {
+            storage.wait_for_transaction(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a concurrent unique-key writer"
+            ));
+        }
+        return Err(unique_violation(def, name));
+    }
+    Ok(())
+}
+
 /// The shared uniqueness enforcement for one key (a single-column flag, a
 /// table-level key, or a unique index). Committed collisions raise 23505; a
 /// collision against another transaction's pending image waits for it. The
@@ -597,7 +728,11 @@ fn check_index_tuple_sizes(
         check_index_tuple_size(unique.columns(), values)?;
     }
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if index.predicate.is_some() {
+        if index.predicate.is_some()
+            || index.expressions[..index.n_cols]
+                .iter()
+                .any(Option::is_some)
+        {
             continue;
         }
         check_index_tuple_size(&index.columns[..index.n_cols], values)?;
@@ -627,6 +762,45 @@ pub fn check_unique_indexes(
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
         let name = ConstraintName::Named(index_name.as_str());
+        if index.expressions[..index.n_cols]
+            .iter()
+            .any(Option::is_some)
+        {
+            let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+            for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
+                if let Some(source) = source {
+                    let source = arena
+                        .alloc_str(source.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                }
+            }
+            let predicate = match index.predicate {
+                Some(source) => {
+                    let source = arena
+                        .alloc_str(source.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    Some(crate::sql::parser::parse_expr(source, arena)?)
+                }
+                None => None,
+            };
+            enforce_expression_index_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                icols,
+                &expressions[..index.n_cols],
+                index.nulls_not_distinct,
+                &name,
+                predicate,
+                arena,
+            )?;
+            continue;
+        }
         if let Some(predicate) = index.predicate {
             let expression = crate::sql::parser::parse_expr(predicate.as_str(), arena)?;
             enforce_partial_index_uniqueness(

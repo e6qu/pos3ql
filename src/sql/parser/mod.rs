@@ -3405,7 +3405,13 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.expect_ident("conflict")?;
-        let mut target: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let null_expression = self.arena_expr(Expr::Null)?;
+        let mut target: [crate::sql::ast::OnConflictTarget<'a>; MAX_LIST] =
+            [crate::sql::ast::OnConflictTarget {
+                column: None,
+                expression: null_expression,
+                expression_text: "",
+            }; MAX_LIST];
         let mut nt = 0;
         let mut constraint = None;
         if self.eat_op("(")? {
@@ -3413,7 +3419,20 @@ impl<'a> Parser<'a> {
                 if nt == MAX_LIST {
                     return Err(self.limit("conflict target", MAX_LIST));
                 }
-                target[nt] = self.col_ident("column name")?;
+                let start = self.peek_at;
+                let expression = self.expression(0)?;
+                let expression_text = self.text[start..self.peek_at].trim_end();
+                target[nt] = crate::sql::ast::OnConflictTarget {
+                    column: match expression {
+                        Expr::Column {
+                            qualifier: None,
+                            name,
+                        } => Some(*name),
+                        _ => None,
+                    },
+                    expression,
+                    expression_text,
+                };
                 nt += 1;
                 if !self.eat_op(",")? {
                     break;

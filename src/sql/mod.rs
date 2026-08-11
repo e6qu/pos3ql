@@ -6533,8 +6533,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             n_include_cols,
             nulls_not_distinct,
             predicate,
+            expressions,
             unique,
         } => {
+            let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
+            for (index, expression) in expressions.into_iter().enumerate() {
+                stored_expressions[index] = expression
+                    .map(crate::storage::index_expression_stackstr)
+                    .transpose()?;
+            }
             let slot = storage.create_index(
                 crate::storage::IndexDef {
                     schema: crate::storage::SqlName::parse(schema)?,
@@ -6543,6 +6550,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     table: crate::storage::SqlName::parse(table)?,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
+                    expressions: stored_expressions,
                     include_columns,
                     descending,
                     nulls_first,

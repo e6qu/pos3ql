@@ -694,11 +694,14 @@ impl RoleOptions<'_> {
     };
 }
 
-/// One btree index key. PostgreSQL's defaults depend on direction: ascending
-/// keys put NULLs last, descending keys put them first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One btree index key. A plain column retains its resolved name; every other
+/// key is an expression with durable canonical source. PostgreSQL's defaults
+/// depend on direction: ascending keys put NULLs last, descending keys first.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IndexColumn<'a> {
-    pub name: &'a str,
+    pub column: Option<&'a str>,
+    pub expression: &'a Expr<'a>,
+    pub expression_text: &'a str,
     pub descending: bool,
     pub nulls_first: bool,
 }
@@ -1468,10 +1471,10 @@ pub enum Overriding {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OnConflict<'a> {
-    /// Conflict-target columns (`ON CONFLICT (a, b)`); empty means no
+    /// Conflict-target keys (`ON CONFLICT (a, lower(b))`); empty means no
     /// column-inference target was given (either a named `constraint`, or —
     /// with neither — any unique constraint for DO NOTHING).
-    pub target: &'a [&'a str],
+    pub target: &'a [OnConflictTarget<'a>],
     /// A named arbiter constraint (`ON CONFLICT ON CONSTRAINT name`); mutually
     /// exclusive with a column `target`.
     pub constraint: Option<&'a str>,
@@ -1481,6 +1484,13 @@ pub struct OnConflict<'a> {
     pub update: Option<&'a [(&'a str, &'a Expr<'a>)]>,
     /// Optional WHERE on DO UPDATE.
     pub update_where: Option<&'a Expr<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnConflictTarget<'a> {
+    pub column: Option<&'a str>,
+    pub expression: &'a Expr<'a>,
+    pub expression_text: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

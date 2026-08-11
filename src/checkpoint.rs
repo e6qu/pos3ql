@@ -2292,6 +2292,31 @@ impl Checkpointer {
                         },
                         None => false,
                     };
+                    let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+                    let expression_mask_field = match words.next() {
+                        Some("") => words.next(),
+                        field => field,
+                    };
+                    if let Some(mask) = expression_mask_field.filter(|field| !field.is_empty()) {
+                        let mask: u16 = parse_field(Some(mask), "idx expression mask")?;
+                        if mask >> n_cols != 0 {
+                            return Err(CheckpointSetupError::Corrupt("bad index expression mask"));
+                        }
+                        for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
+                            if mask & (1 << index) != 0 {
+                                *expression = Some(
+                                    crate::storage::index_expression_stackstr(&decode_hex_name(
+                                        words.next().ok_or(CheckpointSetupError::Corrupt(
+                                            "idx expression missing",
+                                        ))?,
+                                    )?)
+                                    .map_err(|_| {
+                                        CheckpointSetupError::Corrupt("idx expression too long")
+                                    })?,
+                                );
+                            }
+                        }
+                    }
                     if words.next().is_some_and(|field| !field.is_empty()) {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -2313,6 +2338,7 @@ impl Checkpointer {
                                 table: sql_name(&table)?,
                                 ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,
+                                expressions,
                                 include_columns,
                                 descending,
                                 nulls_first,
@@ -3664,10 +3690,24 @@ impl Checkpointer {
                 }
                 None => StackStr::from_str("-"),
             };
+            let mut expression_mask = 0u16;
+            let mut encoded_expressions = StackStr::<
+                { crate::storage::MAX_INDEX_COLS * (crate::storage::INDEX_EXPRESSION_MAX * 2 + 1) },
+            >::new();
+            for (position, expression) in index.expressions.iter().enumerate().take(index.n_cols) {
+                let Some(expression) = expression else {
+                    continue;
+                };
+                expression_mask |= 1 << position;
+                let _ = encoded_expressions.write_str(" ");
+                for byte in expression.as_str().as_bytes() {
+                    let _ = write!(encoded_expressions, "{byte:02x}");
+                }
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {} {} {} {} {} {} {}",
+                    "idx {} {} {}{} {} {} {} {} {} {} {} {} {}{}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -3680,6 +3720,8 @@ impl Checkpointer {
                     index.n_include_cols,
                     includes.as_str(),
                     u8::from(index.nulls_not_distinct),
+                    expression_mask,
+                    encoded_expressions.as_str(),
                 ),
             )?;
         }

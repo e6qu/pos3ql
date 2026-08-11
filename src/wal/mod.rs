@@ -405,6 +405,9 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         table: &'a str,
         columns: [u16; MAX_INDEX_COLS],
+        /// Canonical source for expression keys; `None` denotes the matching
+        /// physical table column in `columns`.
+        expressions: [Option<&'a str>; MAX_INDEX_COLS],
         include_columns: [u16; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
@@ -1408,6 +1411,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n_cols,
             predicate,
             n_include_cols,
+            expressions,
             ..
         } => {
             1 + name.len()
@@ -1425,6 +1429,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 2
                 + n_include_cols * 2
                 + 2
+                + 2
+                + expressions
+                    .iter()
+                    .take(*n_cols)
+                    .enumerate()
+                    .filter(|(_, value)| value.is_some())
+                    .map(|(_, value)| 2 + value.unwrap().len())
+                    .sum::<usize>()
         }
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameIndex {
@@ -1876,6 +1888,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             table,
             columns,
+            expressions,
             include_columns,
             descending,
             nulls_first,
@@ -1911,6 +1924,18 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&column.to_le_bytes());
             }
             ok &= buffer.append(&[0xa4, u8::from(*nulls_not_distinct)]);
+            let expression_mask = expressions[..*n_cols]
+                .iter()
+                .enumerate()
+                .fold(0u8, |mask, (index, expression)| {
+                    mask | (u8::from(expression.is_some()) << index)
+                });
+            ok &= buffer.append(&[0xa5, expression_mask]);
+            for expression in expressions[..*n_cols].iter().flatten() {
+                ok &= expression.len() <= u16::MAX as usize
+                    && buffer.append(&(expression.len() as u16).to_le_bytes())
+                    && buffer.append(expression.as_bytes());
+            }
             ok
         }
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
@@ -2988,6 +3013,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 return None;
             }
             let mut columns = [0u16; MAX_INDEX_COLS];
+            let mut expressions = [None; MAX_INDEX_COLS];
             for c in columns.iter_mut().take(n_cols) {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
@@ -3064,11 +3090,34 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 };
                 at += 1;
             }
+            if at < payload.len() {
+                if *payload.get(at)? != 0xa5 {
+                    return None;
+                }
+                at += 1;
+                let mask = *payload.get(at)?;
+                at += 1;
+                if mask >> n_cols != 0 {
+                    return None;
+                }
+                for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
+                    if mask & (1 << index) == 0 {
+                        continue;
+                    }
+                    let len =
+                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                    at += 2;
+                    let raw = payload.get(at..at + len)?;
+                    at += len;
+                    *expression = Some(core::str::from_utf8(raw).ok()?);
+                }
+            }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 schema,
                 name,
                 table,
                 columns,
+                expressions,
                 include_columns,
                 descending,
                 nulls_first,
@@ -4445,6 +4494,7 @@ mod tests {
             name,
             table,
             columns,
+            expressions,
             descending,
             nulls_first,
             n_cols,
@@ -4461,6 +4511,7 @@ mod tests {
         assert_eq!(name, "u");
         assert_eq!(table, "t");
         assert_eq!(&columns[..n_cols], [0, 1]);
+        assert!(expressions.iter().all(Option::is_none));
         assert!(unique);
         assert!(!descending[..n_cols].iter().any(|direction| *direction));
         assert!(!nulls_first[..n_cols].iter().any(|placement| *placement));
@@ -4477,6 +4528,16 @@ mod tests {
             name: "active_values",
             table: "rows",
             columns: [1; MAX_INDEX_COLS],
+            expressions: [
+                Some("lower(value)"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
             include_columns: [2; MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],

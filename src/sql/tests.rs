@@ -12740,6 +12740,103 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
 }
 
 #[test]
+fn unique_expression_indexes_are_transactional_and_durable() {
+    let mut config = test_config("unique-expression-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("unique-expression-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE expression_key_rows (email text, active boolean); \
+         CREATE UNIQUE INDEX normalized_email ON expression_key_rows (lower(email)); \
+         INSERT INTO expression_key_rows VALUES ('Alice@example.com', true)",
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO expression_key_rows VALUES ('alice@example.com', true)",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    let ignored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO expression_key_rows VALUES ('ALICE@example.com', false) ON CONFLICT ((lower(email))) DO NOTHING",
+    );
+    assert!(!String::from_utf8_lossy(&ignored).contains("ERROR"));
+    let targetless_ignored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO expression_key_rows VALUES ('alice@EXAMPLE.com', false) ON CONFLICT DO NOTHING",
+    );
+    assert!(!String::from_utf8_lossy(&targetless_ignored).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'normalized_email'",
+        )),
+        [
+            "CREATE UNIQUE INDEX normalized_email ON public.expression_key_rows USING btree (lower(email))"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indkey, indexprs FROM pg_index index_catalog JOIN pg_class relation ON relation.oid = index_catalog.indexrelid WHERE relation.relname = 'normalized_email'",
+        )),
+        ["0|lower(email)"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE expression_partial_rows (email text, active boolean); \
+         CREATE UNIQUE INDEX active_normalized_email ON expression_partial_rows (lower(email)) WHERE active; \
+         INSERT INTO expression_partial_rows VALUES ('separate@example.com', false), ('SEPARATE@example.com', false), ('member@example.com', true)",
+    );
+    let partial_duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO expression_partial_rows VALUES ('MEMBER@example.com', true)",
+    );
+    assert!(String::from_utf8_lossy(&partial_duplicate).contains("23505"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copied_expression_key_rows (LIKE expression_key_rows INCLUDING INDEXES)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO copied_expression_key_rows VALUES ('Copied@example.com', true)",
+    );
+    let copied_duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO copied_expression_key_rows VALUES ('copied@example.com', false)",
+    );
+    assert!(String::from_utf8_lossy(&copied_duplicate).contains("23505"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let duplicate_after_restart = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "INSERT INTO expression_key_rows VALUES ('ALICE@example.com', true)",
+    );
+    assert!(String::from_utf8_lossy(&duplicate_after_restart).contains("23505"));
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn unique_nulls_not_distinct_are_transactional_and_durable() {
     let mut config = test_config("unique-nulls-not-distinct");
     config.object_store_on = true;

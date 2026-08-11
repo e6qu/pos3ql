@@ -2363,6 +2363,8 @@ pub(crate) const MAX_INDEX_COLS: usize = 8;
 /// Predicate text is catalog data, not request-owned parser memory. A fixed
 /// representation keeps the definition replayable without runtime growth.
 pub(crate) const INDEX_PREDICATE_MAX: usize = CHECK_SQL_MAX;
+/// Maximum canonical source length of one expression index key.
+pub(crate) const INDEX_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 /// Copies validated partial-index predicate source into its durable bounded
 /// representation.
@@ -2380,6 +2382,21 @@ pub(crate) fn index_predicate_stackstr(
     Ok(value)
 }
 
+/// Copies validated expression-key source into its durable bounded form.
+pub(crate) fn index_expression_stackstr(
+    expression: &str,
+) -> Result<StackStr<INDEX_EXPRESSION_MAX>, SqlError> {
+    let value = StackStr::from_str(expression);
+    if value.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "index expression exceeds {} bytes",
+            INDEX_EXPRESSION_MAX
+        ));
+    }
+    Ok(value)
+}
+
 /// A named btree index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
@@ -2391,6 +2408,9 @@ pub struct IndexDef {
     pub table: SqlName,
     pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
+    /// `Some` is a canonical expression key; `None` uses the resolved table
+    /// column in the matching `columns` slot.
+    pub expressions: [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
     /// Covering columns are carried separately from key columns: they are
     /// readable from the index relation but cannot affect key semantics.
     pub include_columns: [u16; MAX_INDEX_COLS],
@@ -3777,6 +3797,7 @@ impl Storage {
                     table: SqlName::parse("").expect("empty name fits"),
                     ownership: Ownership::BOOTSTRAP,
                     columns: [0; MAX_INDEX_COLS],
+                    expressions: [None; MAX_INDEX_COLS],
                     include_columns: [0; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
@@ -8906,6 +8927,9 @@ impl Storage {
                 // Partial membership is predicate-defined, so it has a
                 // separate authoritative enforcement path.
                 && index.predicate.is_none()
+                // Expression keys cannot be represented by a column-tuple
+                // cache without changing their SQL semantics.
+                && index.expressions[..index.n_cols].iter().all(Option::is_none)
         }) {
             let columns = &index.columns[..index.n_cols];
             if want[..n_want]

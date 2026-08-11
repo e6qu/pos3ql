@@ -3960,7 +3960,18 @@ pub fn describe_catalog_items<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    let count = describe_items(items, definition, out)?;
+    describe_catalog_items_as(items, definition, None, storage, txid, out)
+}
+
+pub fn describe_catalog_items_as<'q>(
+    items: &[SelectItem<'q>],
+    definition: Option<&'q TableDef>,
+    alias: Option<&str>,
+    storage: &Storage,
+    txid: u32,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
+    let count = describe_items(items, definition, alias, out)?;
     let mut column = 0;
     for item in items {
         match item {

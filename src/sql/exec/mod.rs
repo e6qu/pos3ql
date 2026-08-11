@@ -13149,6 +13149,7 @@ pub fn insert(
                     storage,
                     txn.txid,
                     &def,
+                    None,
                     &values[..def.n_columns],
                     statement.returning,
                     arena,
@@ -13364,6 +13365,7 @@ pub fn insert(
                 storage,
                 txn.txid,
                 &def,
+                None,
                 &values[..def.n_columns],
                 statement.returning,
                 arena,
@@ -13409,6 +13411,7 @@ fn emit_conflict_returning(
         storage,
         txid,
         def,
+        None,
         &updated[..def.n_columns],
         items,
         arena,
@@ -13423,6 +13426,7 @@ fn emit_projected(
     storage: &Storage,
     txid: u32,
     def: &TableDef,
+    alias: Option<&str>,
     values: &[Datum],
     items: &[SelectItem],
     arena: &Arena,
@@ -13430,11 +13434,7 @@ fn emit_projected(
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let context = RowCtx {
-        def,
-        values,
-        alias: None,
-    };
+    let context = RowCtx { def, values, alias };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
     for item in items {
@@ -13689,9 +13689,10 @@ pub fn update(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items(
+        match super::query::describe_catalog_items_as(
             statement.returning,
             Some(&def),
+            statement.alias,
             storage,
             txn.txid,
             &mut columns,
@@ -13919,6 +13920,7 @@ pub fn update(
                 storage,
                 txn.txid,
                 &def,
+                statement.alias,
                 &new_values[..def.n_columns],
                 statement.returning,
                 arena,
@@ -14001,7 +14003,7 @@ pub fn delete(
             storage,
             table_index,
             &def,
-            None,
+            statement.alias,
             schema,
             using,
             statement.where_clause,
@@ -14014,7 +14016,7 @@ pub fn delete(
         collect_matches(
             storage,
             table_index,
-            None,
+            statement.alias,
             txn.txid,
             schema,
             statement.where_clause,
@@ -14050,9 +14052,10 @@ pub fn delete(
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items(
+        match super::query::describe_catalog_items_as(
             statement.returning,
             Some(&def),
+            statement.alias,
             storage,
             txn.txid,
             &mut columns,
@@ -14108,6 +14111,7 @@ pub fn delete(
                     storage,
                     txn.txid,
                     &def,
+                    statement.alias,
                     &old_values[..def.n_columns],
                     statement.returning,
                     arena,

@@ -4841,15 +4841,20 @@ fn update_from_and_delete_using() {
         "INSERT INTO s VALUES (1,100,'one'),(2,200,'two')",
     );
     // UPDATE ... FROM: the SET may reference both target and source columns.
-    assert!(
-        run_txn(
-            &mut e,
-            &mut b,
-            &mut t,
-            "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
-             FROM s WHERE target.id = s.id"
-        )
-        .contains("UPDATE 2")
+    let returned = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
+         FROM s WHERE target.id = s.id RETURNING target.id, target.label",
+    );
+    let mut updated = data_rows(&returned);
+    updated.sort_unstable();
+    assert_eq!(
+        updated,
+        ["1|one", "2|two"],
+        "UPDATE alias RETURNING: {}",
+        String::from_utf8_lossy(&returned)
     );
     let rows = data_rows(&run_with_txn_bytes(
         &mut e,
@@ -4877,9 +4882,10 @@ fn update_from_and_delete_using() {
             &mut e,
             &mut b,
             &mut t,
-            "DELETE FROM d USING k WHERE d.id = k.id"
+            "DELETE FROM d AS target USING k WHERE target.id = k.id \
+             RETURNING target.id"
         )
-        .contains("DELETE 2")
+        .contains("2")
     );
     let left = data_rows(&run_with_txn_bytes(
         &mut e,

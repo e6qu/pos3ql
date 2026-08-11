@@ -58,15 +58,15 @@ WITH picked AS (SELECT id, v FROM dmc_src WHERE id <= 2 ORDER BY id)
 INSERT INTO dmc_log SELECT id, v FROM picked RETURNING id, v;
 
 WITH picked AS (SELECT 3 AS id, 'C' AS v)
-UPDATE dmc_src SET v = picked.v FROM picked
-WHERE dmc_src.id = picked.id RETURNING dmc_src.id, dmc_src.v;
+UPDATE dmc_src AS target SET v = picked.v FROM picked
+WHERE target.id = picked.id RETURNING target.id, target.v;
 
 CREATE TABLE dmc_copy_source (id int, payload text);
 CREATE TABLE dmc_copy_target (id int, payload text);
 INSERT INTO dmc_copy_source VALUES (1, 'copied'), (2, 'ignored');
 INSERT INTO dmc_copy_target VALUES (1, 'before');
 UPDATE dmc_copy_target AS target SET payload = source.payload
-FROM dmc_copy_source AS source WHERE target.id = source.id;
+FROM dmc_copy_source AS source WHERE target.id = source.id RETURNING target.id, target.payload;
 SELECT id, payload FROM dmc_copy_target;
 
 CREATE SEQUENCE dmc_update_sequence;
@@ -76,8 +76,8 @@ SELECT id, payload FROM dmc_copy_target;
 SELECT nextval('dmc_update_sequence');
 
 WITH picked AS (SELECT 4 AS id)
-DELETE FROM dmc_src USING picked
-WHERE dmc_src.id = picked.id RETURNING dmc_src.id;
+DELETE FROM dmc_src AS target USING picked
+WHERE target.id = picked.id RETURNING target.id;
 
 WITH RECURSIVE numbers(n) AS (
     VALUES (10) UNION ALL SELECT n + 1 FROM numbers WHERE n < 12

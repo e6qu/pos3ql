@@ -175,6 +175,85 @@ pub fn set_query<'a>(
     sql_ok()
 }
 
+/// Streams a complete set-operation query into an internal consumer. This is
+/// the same semantic boundary as wire output, so function programs, derived
+/// consumers, and protocol responses cannot drift in their treatment of
+/// CTEs, ordering, limits, or composite values.
+pub(crate) fn set_query_into_rows<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    query: &'a SetQuery<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if let Some(clause) = query.locking.first() {
+        return Err(sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} is not allowed with UNION/INTERSECT/EXCEPT",
+            clause.strength.keyword()
+        ));
+    }
+    let body = expand_set_tree_exec(query.with, query.body, storage, txid, arena, params)?;
+    if storage.spill_attached() {
+        return external_set_body_into(
+            storage,
+            txid,
+            body,
+            query.order_by,
+            query.limit,
+            query.offset,
+            query.with_ties,
+            arena,
+            params,
+            sequences,
+            emit,
+        );
+    }
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let column_count = describe_set_body(storage, body, txid, &mut columns, arena)?;
+    let mut target = [ColType::Bool; MAX_PROJ];
+    for (column, desc) in columns[..column_count].iter().enumerate() {
+        target[column] = exec::coltype_of_oid(desc.type_oid).unwrap_or(ColType::Text);
+    }
+    let rows = eval_set_tree(
+        body,
+        storage,
+        txid,
+        arena,
+        params,
+        sequences,
+        &target[..column_count],
+    )?;
+    sort_set_rows(arena, rows, query.order_by, &columns[..column_count])?;
+    let limit = exec::eval_limit_pub(query.limit, arena, params)?;
+    let offset = exec::eval_offset_pub(query.offset, arena, params)?;
+    let start = (offset as usize).min(rows.len());
+    let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
+    if query.with_ties && limit > 0 && end < rows.len() && end > start {
+        let boundary = rows[end - 1];
+        while end < rows.len()
+            && set_rows_tie(
+                boundary,
+                rows[end],
+                query.order_by,
+                &columns[..column_count],
+            )
+        {
+            end += 1;
+        }
+    }
+    for row in &rows[start..end] {
+        let mut values = [Datum::Null; MAX_PROJ];
+        for (column, value) in values.iter_mut().enumerate().take(column_count) {
+            *value = exec::decode_projected_col_record(row, column, arena)?;
+        }
+        emit(&values[..column_count])?;
+    }
+    Ok(())
+}
+
 fn byte_order(left: &[u8], right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
     Ok(left.cmp(right))
 }

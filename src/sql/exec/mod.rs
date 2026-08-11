@@ -6158,32 +6158,8 @@ pub fn create_routine(
         crate::storage::RoutineKind::Function { .. }
         | crate::storage::RoutineKind::SetFunction { .. }
         | crate::storage::RoutineKind::TableFunction => {
-            let mut parser = match super::parser::Parser::new(routine.body, arena) {
-                Ok(parser) => parser,
-                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
-            };
-            let statement = match parser.next_stmt() {
-                Ok(Some(statement)) => statement,
-                Ok(None) => {
-                    return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
-                }
-                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
-            };
-            if !matches!(statement, super::ast::Stmt::Select(_)) {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL function body must be a SELECT query"
-                ));
-            }
-            match parser.next_stmt() {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL function body must contain one SELECT query"
-                    ));
-                }
-                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            if let Err(error) = super::query::parse_routine_query_program(routine.body, arena) {
+                return sql_fail(error);
             }
         }
         crate::storage::RoutineKind::Procedure => {

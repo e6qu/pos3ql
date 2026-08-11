@@ -13719,12 +13719,24 @@ pub fn update(
             if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
                 // row joined with the first matching FROM row.
+                let mut observed = [&Expr::Null; MAX_COLUMNS];
+                for (index, (_, expression)) in statement.assignments.iter().enumerate() {
+                    observed[index] = expression;
+                }
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let hooks = super::eval::EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..super::eval::NO_HOOKS
+                };
                 let mut set_err: Option<SqlError> = None;
                 let r = super::query::first_from_match(
                     storage,
                     from,
                     txn.txid,
                     statement.where_clause,
+                    &observed[..statement.assignments.len()],
                     arena,
                     params,
                     &context,
@@ -13735,7 +13747,7 @@ pub fn update(
                             if def.columns()[targets[a]].default.is_generated() {
                                 continue;
                             }
-                            let v = eval(expression, arena, params, &combined)?;
+                            let v = eval_full(expression, arena, params, &combined, &hooks)?;
                             new_values[targets[a]] =
                                 coerce(v, &def.columns()[targets[a]], storage, txn.txid, arena)?;
                         }
@@ -15941,6 +15953,7 @@ fn collect_join_matches<'a>(
                 from,
                 txid,
                 where_clause,
+                &[],
                 arena,
                 params,
                 &context,

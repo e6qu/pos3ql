@@ -4352,6 +4352,7 @@ pub fn first_from_match<'a>(
     from: &'a FromClause<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
+    observed: &[&'a Expr<'a>],
     arena: &'a Arena,
     params: &[Datum<'a>],
     target: &dyn ColumnLookup<'a>,
@@ -4370,10 +4371,17 @@ pub fn first_from_match<'a>(
         sequences: None,
     };
     let mut found = false;
-    let pax_columns = match where_clause {
-        Some(predicate) => pax_column_demand(&scope, from, &[predicate]),
-        None => pax_column_demand(&scope, from, &[]),
-    };
+    let mut expressions = [&Expr::Null; MAX_PROJ + 1];
+    let mut expression_count = 0usize;
+    if let Some(predicate) = where_clause {
+        expressions[expression_count] = predicate;
+        expression_count += 1;
+    }
+    for &expression in observed {
+        expressions[expression_count] = expression;
+        expression_count += 1;
+    }
+    let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
     scan_source_with_pax_columns(
         storage,
         &scope,

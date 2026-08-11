@@ -1321,7 +1321,8 @@ pub(crate) fn apply_fk_parent_actions(
                                     seq_session,
                                     txn.txid,
                                 );
-                                let catalog = crate::sql::query::storage_catalog(storage, txn.txid);
+                                let catalog =
+                                    crate::sql::query::storage_catalog(storage, arena, txn.txid);
                                 let hooks = crate::sql::eval::EvalHooks {
                                     catalog: Some(&catalog),
                                     sequences: Some(&sequence),

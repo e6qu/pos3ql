@@ -6107,19 +6107,32 @@ pub fn create_routine(
     }
     match kind {
         crate::storage::RoutineKind::Function { .. } => {
-            let expression = routine
-                .body
-                .trim()
-                .strip_prefix("SELECT ")
-                .or_else(|| routine.body.trim().strip_prefix("select "));
-            let Some(expression) = expression else {
+            let mut parser = match super::parser::Parser::new(routine.body, arena) {
+                Ok(parser) => parser,
+                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            };
+            let statement = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                Ok(None) => {
+                    return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+                }
+                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            };
+            if !matches!(statement, super::ast::Stmt::Select(_)) {
                 return sql_fail(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL function body must be a scalar SELECT expression"
+                    "SQL function body must be a SELECT query"
                 ));
-            };
-            if let Err(error) = super::parser::parse_expr(expression, arena) {
-                return sql_fail(error);
+            }
+            match parser.next_stmt() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "SQL function body must contain one SELECT query"
+                    ));
+                }
+                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
             }
         }
         crate::storage::RoutineKind::Procedure => {
@@ -12157,7 +12170,7 @@ where
     'arena: 'values,
 {
     let sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
-    let catalog = super::query::storage_catalog(storage, txid);
+    let catalog = super::query::storage_catalog(storage, arena, txid);
     let hooks = super::eval::EvalHooks {
         catalog: Some(&catalog),
         sequences: Some(&sequence),
@@ -12771,7 +12784,7 @@ fn merge_insert(
             ));
         }
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let catalog = super::query::storage_catalog(storage, txn.txid);
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         let hooks = super::eval::EvalHooks {
             catalog: Some(&catalog),
             sequences: Some(&seq),
@@ -12787,7 +12800,7 @@ fn merge_insert(
     // Defaults + auto-increment + generated for the unset columns.
     {
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let catalog = super::query::storage_catalog(storage, txn.txid);
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         let hooks = super::eval::EvalHooks {
             catalog: Some(&catalog),
             sequences: Some(&seq),
@@ -13032,7 +13045,7 @@ pub fn insert(
             // evaluator, so a `nextval` default advances once per inserted row).
             {
                 let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let hooks = super::eval::EvalHooks {
                     catalog: Some(&catalog),
                     sequences: Some(&seq),
@@ -13230,7 +13243,7 @@ pub fn insert(
                 Err(error) => return sql_fail(error),
             };
             let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            let catalog = super::query::storage_catalog(storage, txn.txid);
+            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
             let hooks = super::eval::EvalHooks {
                 catalog: Some(&catalog),
                 sequences: Some(&seq),
@@ -13603,7 +13616,7 @@ pub fn update(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let catalog = super::query::storage_catalog(storage, txn.txid);
+    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -13743,7 +13756,7 @@ pub fn update(
                     observed[index] = expression;
                 }
                 let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let hooks = super::eval::EvalHooks {
                     catalog: Some(&catalog),
                     sequences: Some(&sequences),
@@ -13785,7 +13798,7 @@ pub fn update(
                 // row; a scoped sequence evaluator (shared `&storage`) supplies
                 // them and is dropped before the row is written back mutably.
                 let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let catalog = super::query::storage_catalog(storage, txn.txid);
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let hooks = super::eval::EvalHooks {
                     catalog: Some(&catalog),
                     sequences: Some(&seq),
@@ -13989,7 +14002,7 @@ pub fn delete(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let catalog = super::query::storage_catalog(storage, txn.txid);
+    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -15324,7 +15337,8 @@ fn alter_table_inner(
                                     seq_session,
                                     txn.txid,
                                 );
-                                let catalog = super::query::storage_catalog(storage, txn.txid);
+                                let catalog =
+                                    super::query::storage_catalog(storage, arena, txn.txid);
                                 let hooks = super::eval::EvalHooks {
                                     catalog: Some(&catalog),
                                     sequences: Some(&seq),

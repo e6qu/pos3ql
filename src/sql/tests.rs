@@ -5610,6 +5610,47 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             data_rows(&run_with(&mut engine, &mut budget, "SELECT increment(41)")),
             ["42"]
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE routine_lookup (id integer PRIMARY KEY, value integer);
+             INSERT INTO routine_lookup VALUES (1, 40), (2, 41);
+             CREATE FUNCTION lookup_routine_value(integer) RETURNS integer LANGUAGE SQL
+               AS 'SELECT value FROM routine_lookup WHERE id = $1';
+             CREATE FUNCTION nested_routine_value(integer) RETURNS integer LANGUAGE SQL
+               AS 'SELECT lookup_routine_value($1) + 1'",
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT lookup_routine_value(1), nested_routine_value(2)",
+            )),
+            ["40|42"]
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION ambiguous_routine_value() RETURNS integer LANGUAGE SQL
+               AS 'SELECT value FROM routine_lookup'",
+        );
+        let cardinality = run_with(&mut engine, &mut budget, "SELECT ambiguous_routine_value()");
+        assert!(
+            String::from_utf8_lossy(&cardinality).contains("21000"),
+            "{}",
+            String::from_utf8_lossy(&cardinality)
+        );
+        let invalid_body = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION invalid_routine_body() RETURNS integer LANGUAGE SQL
+               AS 'INSERT INTO routine_lookup VALUES (3, 42)'",
+        );
+        assert!(
+            String::from_utf8_lossy(&invalid_body).contains("0A000"),
+            "{}",
+            String::from_utf8_lossy(&invalid_body)
+        );
         assert_eq!(
             data_rows(&run_with(
                 &mut engine,

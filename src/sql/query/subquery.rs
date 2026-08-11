@@ -858,7 +858,7 @@ fn subquery_exists<'a>(
         depth - 1,
         outer,
     )?;
-    let catalog = super::storage_catalog(storage, txid);
+    let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         group: None,
         aggs: None,
@@ -1565,7 +1565,7 @@ fn run_subquery<'a>(
         depth - 1,
         outer,
     )?;
-    let catalog = super::storage_catalog(storage, txid);
+    let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         group: None,
         aggs: None,

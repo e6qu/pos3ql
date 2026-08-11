@@ -1,10 +1,20 @@
 DROP FUNCTION IF EXISTS routine_increment(integer);
 DROP FUNCTION IF EXISTS routine_answer();
+DROP FUNCTION IF EXISTS routine_lookup_value(integer);
+DROP FUNCTION IF EXISTS routine_nested_value(integer);
+DROP TABLE IF EXISTS routine_values;
 
 CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
 CREATE FUNCTION routine_increment(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
 
 SELECT routine_answer(), routine_increment(41);
+CREATE TABLE routine_values (id integer PRIMARY KEY, value integer);
+INSERT INTO routine_values VALUES (1, 40), (2, 41);
+CREATE FUNCTION routine_lookup_value(integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT value FROM routine_values WHERE id = $1';
+CREATE FUNCTION routine_nested_value(integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT routine_lookup_value($1) + 1';
+SELECT routine_lookup_value(1), routine_nested_value(2);
 SELECT proname, pronargs, prorettype, prokind, proargtypes
   FROM pg_proc
  WHERE proname IN ('routine_answer', 'routine_increment')
@@ -28,3 +38,6 @@ SELECT routine_answer();
 
 DROP FUNCTION routine_increment(integer);
 DROP FUNCTION routine_answer();
+DROP FUNCTION routine_lookup_value(integer);
+DROP FUNCTION routine_nested_value(integer);
+DROP TABLE routine_values;

@@ -4111,7 +4111,7 @@ impl Engine {
                 "too many procedure arguments"
             )));
         }
-        let catalog = query::storage_catalog(&self.storage, txn.txid);
+        let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             ..NO_HOOKS

@@ -1346,6 +1346,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         };
         let table_columns = routine.table_columns();
         let scalar_result = routine.kind.function_result();
+        let _formal_scope = crate::sql::exec::enter_routine_parameter_types(routine.arguments());
         let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in args.iter().enumerate() {
             let value = crate::sql::eval::eval(argument, arena, params, columns)?;

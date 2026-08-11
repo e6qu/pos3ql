@@ -13,9 +13,9 @@ CREATE FUNCTION routine_increment(value integer) RETURNS integer LANGUAGE SQL AS
 
 SELECT routine_answer(), routine_increment(41);
 CREATE FUNCTION routine_multi_query_value(integer) RETURNS integer LANGUAGE SQL
-  AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; SELECT $1 + 2';
+  AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; WITH routine_input AS (SELECT $1 AS value), derived_input AS (SELECT value + 1 AS value FROM routine_input) SELECT value + 1 FROM derived_input';
 CREATE FUNCTION routine_multi_query_pairs(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
-  AS 'SELECT $1; WITH first_pair AS (SELECT $1::integer AS value) SELECT value, value + 1 FROM first_pair UNION ALL SELECT $1 + 1, $1 + 2';
+  AS 'SELECT $1; WITH first_pair AS (SELECT $1 AS value), derived_pair AS (SELECT value, value + 1 AS next_value FROM first_pair) SELECT value, next_value FROM derived_pair UNION ALL SELECT $1 + 1, $1 + 2';
 SELECT routine_multi_query_value(40);
 SELECT routine_id, routine_value FROM routine_multi_query_pairs(7) ORDER BY routine_id;
 SELECT routine_multi_query_value(0);
@@ -32,6 +32,17 @@ CREATE FUNCTION routine_values_from(integer) RETURNS SETOF integer LANGUAGE SQL
 CREATE FUNCTION routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
   AS 'SELECT id, value FROM routine_values WHERE id >= $1';
 SELECT routine_lookup_value(1), routine_nested_value(2);
+CREATE OR REPLACE FUNCTION routine_multi_query_value(integer) RETURNS integer LANGUAGE SQL
+  AS 'INSERT INTO routine_values VALUES (3, $1); WITH inserted_value AS (SELECT value FROM routine_values WHERE id = 3) SELECT value + 2 FROM inserted_value';
+SELECT routine_multi_query_value(40);
+SELECT id, value FROM routine_values WHERE id = 3;
+CREATE SCHEMA routine_path;
+SET search_path TO routine_path, public;
+CREATE FUNCTION write_on_path(integer) RETURNS integer LANGUAGE SQL
+  AS 'INSERT INTO public.routine_values VALUES (4, $1); WITH inserted_value AS (SELECT value FROM public.routine_values WHERE id = 4) SELECT value + 2 FROM inserted_value';
+SELECT write_on_path(60);
+SET search_path TO public;
+SELECT id, value FROM routine_values WHERE id = 4;
 SELECT value FROM routine_values_from(1) AS values_from(value) ORDER BY value;
 SELECT values_from.value, values_from.ordinality
   FROM routine_values_from(1) WITH ORDINALITY AS values_from(value, ordinality)

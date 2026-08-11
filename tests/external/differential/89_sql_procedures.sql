@@ -9,7 +9,7 @@ CREATE PROCEDURE procedure_log_value(value integer)
 CALL procedure_log_value(41);
 SELECT value FROM procedure_log;
 CREATE PROCEDURE procedure_log_pair(value integer)
-  LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES ($1); INSERT INTO procedure_log VALUES ($1 + 1)';
+  LANGUAGE SQL AS 'WITH routine_input AS (SELECT $1 AS value), incremented_input AS (SELECT value + 1 AS value FROM routine_input) INSERT INTO procedure_log SELECT value FROM routine_input UNION ALL SELECT value FROM incremented_input';
 CALL procedure_log_pair(42);
 SELECT value FROM procedure_log ORDER BY value;
 SELECT proname, pronargs, prorettype, prokind, proargtypes

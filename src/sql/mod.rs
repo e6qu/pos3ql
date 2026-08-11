@@ -3924,6 +3924,198 @@ impl Engine {
         }
     }
 
+    /// Executes the unambiguous `SELECT function(...)` form when that SQL
+    /// function has preceding data-modifying statements.  General expression
+    /// evaluation remains on the read-only catalog path until scan callbacks
+    /// can suspend their immutable snapshot borrow before entering this
+    /// mutable routine executor.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_direct_write_function_select(
+        &mut self,
+        statement: &ast::Select<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Option<Result<(), SqlError>>, WireFull> {
+        use ast::SelectItem;
+        let [SelectItem::Expr { expression, alias }] = statement.items else {
+            return Ok(None);
+        };
+        let ast::Expr::Call {
+            name,
+            args,
+            star: false,
+            distinct: false,
+            order_by,
+            over: None,
+            filter: None,
+        } = *expression
+        else {
+            return Ok(None);
+        };
+        if statement.from.is_some()
+            || statement.where_clause.is_some()
+            || !statement.with.is_empty()
+            || statement.set_body.is_some()
+            || statement.distinct
+            || !statement.distinct_on.is_empty()
+            || !statement.group_by.is_empty()
+            || !statement.grouping_sets.is_empty()
+            || statement.having.is_some()
+            || !statement.order_by.is_empty()
+            || statement.limit.is_some()
+            || statement.offset.is_some()
+            || statement.with_ties
+            || !statement.locking.is_empty()
+            || !order_by.is_empty()
+        {
+            return Ok(None);
+        }
+        if !self
+            .storage
+            .has_scalar_routine_on_path(name, args.len(), txn.txid)
+        {
+            return Ok(None);
+        }
+        let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..NO_HOOKS
+        };
+        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() > values.len() {
+            return Ok(Some(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many function arguments"
+            ))));
+        }
+        for (slot, argument) in args.iter().enumerate() {
+            values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
+                Ok(value) => value,
+                Err(error) => return Ok(Some(Err(error))),
+            };
+        }
+        let Some(slot) = self
+            .storage
+            .routine_slot_for_call(name, &values[..args.len()], txn.txid)
+        else {
+            return Ok(None);
+        };
+        let routine = *self.storage.routine(slot);
+        let Some(result_type) = routine.kind.function_result() else {
+            return Ok(None);
+        };
+        if routine.kind.is_set_returning() {
+            return Ok(None);
+        }
+        let program = match query::parse_routine_function_program(routine.body.as_str(), arena) {
+            Ok(program) => program,
+            Err(error) => return Ok(Some(Err(error))),
+        };
+        if !program
+            .preceding
+            .iter()
+            .any(|step| matches!(step, query::RoutinePrelude::DataModification(_)))
+        {
+            return Ok(None);
+        }
+        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
+            return Ok(Some(Err(error)));
+        }
+        let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+        let output_mark = responder.buffer.mark();
+        for step in program.preceding {
+            match step {
+                query::RoutinePrelude::Query(query) => {
+                    if let Err(error) = query::execute_routine_query(
+                        query,
+                        &self.storage,
+                        txn.txid,
+                        &self.work,
+                        &values[..args.len()],
+                        true,
+                        &mut |_| Ok(()),
+                    ) {
+                        responder.buffer.truncate_to(output_mark);
+                        return Ok(Some(Err(error)));
+                    }
+                }
+                query::RoutinePrelude::DataModification(statement) => {
+                    self.work.reset();
+                    match self.execute_routine_stmt(
+                        statement,
+                        arena,
+                        &values[..args.len()],
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    ) {
+                        Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
+                        Ok(Err(error)) => {
+                            responder.buffer.truncate_to(output_mark);
+                            return Ok(Some(Err(error)));
+                        }
+                        Err(error) => {
+                            responder.buffer.truncate_to(output_mark);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+        let mut result = None;
+        let outcome = query::execute_routine_query(
+            program.result,
+            &self.storage,
+            txn.txid,
+            &self.work,
+            &values[..args.len()],
+            true,
+            &mut |row| {
+                if row.len() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "SQL function query must return one column"
+                    ));
+                }
+                if result.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::CARDINALITY_VIOLATION,
+                        "SQL function query returned more than one row"
+                    ));
+                }
+                let encoded = exec::encode_projected_pub(row, arena)?;
+                result = Some(exec::decode_projected_pub(encoded, 0));
+                Ok(())
+            },
+        );
+        if let Err(error) = outcome {
+            responder.buffer.truncate_to(output_mark);
+            return Ok(Some(Err(error)));
+        }
+        let value = match eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena) {
+            Ok(value) => value,
+            Err(error) => {
+                responder.buffer.truncate_to(output_mark);
+                return Ok(Some(Err(error)));
+            }
+        };
+        responder.buffer.truncate_to(output_mark);
+        responder.row_description(&[ColDesc::of_type(
+            alias.unwrap_or(exec::derived_name(expression)),
+            result_type,
+        )])?;
+        responder.data_row(&[value])?;
+        responder.command_complete("SELECT 1")?;
+        Ok(Some(Ok(())))
+    }
+
     fn execute_explained_statement(
         &mut self,
         statement: &Stmt<'_>,
@@ -4151,7 +4343,9 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
-        let body = self.storage.routine(slot).body;
+        let routine = self.storage.routine(slot);
+        let body = routine.body;
+        let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let mut parser = match Parser::new(body.as_str(), arena) {
             Ok(parser) => parser,
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
@@ -4168,7 +4362,11 @@ impl Engine {
                 }
             };
             statements += 1;
-            match self.execute_stmt(
+            // A top-level CALL has no enclosing query workspace; reclaim each
+            // suppressed internal result exactly as the ordinary dispatcher
+            // did before routine dispatch gained a non-resetting mode.
+            self.work.reset();
+            match self.execute_routine_stmt(
                 &statement,
                 arena,
                 &values[..arguments.len()],
@@ -4212,6 +4410,44 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        self.execute_stmt_with_workspace(
+            statement, arena, params, txn, sqlprep, cursors, guc, responder, true,
+        )
+    }
+
+    /// Dispatches a statement entered from an SQL routine.  The enclosing
+    /// query owns `work`, so a nested statement must not reclaim it beneath
+    /// the evaluator that invoked the routine.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_routine_stmt(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        self.execute_stmt_with_workspace(
+            statement, arena, params, txn, sqlprep, cursors, guc, responder, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stmt_with_workspace(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+        reset_workspace: bool,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         if statement_writes(statement) && self.block_reads_pending() {
             return Ok(Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
@@ -4222,9 +4458,12 @@ impl Engine {
             self.disable_async_block_reads();
         }
         let _guc_eval_scope = guc::enter_eval_scope(guc);
-        // Reclaim the shared execution arena from the previous statement: its
-        // materialized rows have already been paged to the wire.
-        self.work.reset();
+        // Reclaim the shared execution arena from the previous top-level
+        // statement. A routine entered from an active query keeps that query's
+        // materialized state alive until evaluation returns.
+        if reset_workspace {
+            self.work.reset();
+        }
         // Drop any diagnostic detail a swallowed error left behind, and
         // install this session's effective search path for the statement:
         // every name resolution below reads it from storage.
@@ -4487,7 +4726,12 @@ impl Engine {
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                 ctes, statement, arena, params, txn, guc, responder,
             ),
-            Stmt::Select(s) => self.execute_select(s, arena, params, txn, guc, responder),
+            Stmt::Select(s) => match self.execute_direct_write_function_select(
+                s, arena, params, txn, sqlprep, cursors, guc, responder,
+            )? {
+                Some(outcome) => Ok(outcome),
+                None => self.execute_select(s, arena, params, txn, guc, responder),
+            },
             Stmt::SetQuery(q) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 query::set_query(

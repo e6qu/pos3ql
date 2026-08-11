@@ -131,6 +131,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 mod describe;
 pub(crate) use describe::AliasedDefCols;
+pub(crate) use describe::enter_routine_parameter_types;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -6155,8 +6156,12 @@ pub fn create_routine(
         storage.drop_routine(replaced_slot, txn.txid);
     }
     match kind {
-        crate::storage::RoutineKind::Function { .. }
-        | crate::storage::RoutineKind::SetFunction { .. }
+        crate::storage::RoutineKind::Function { .. } => {
+            if let Err(error) = super::query::parse_routine_function_program(routine.body, arena) {
+                return sql_fail(error);
+            }
+        }
+        crate::storage::RoutineKind::SetFunction { .. }
         | crate::storage::RoutineKind::TableFunction => {
             if let Err(error) = super::query::parse_routine_query_program(routine.body, arena) {
                 return sql_fail(error);

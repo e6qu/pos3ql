@@ -2060,16 +2060,36 @@ pub fn function_def_text<'a>(
         write!(definition, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
     }
     match routine.kind {
-        crate::storage::RoutineKind::Function {
-            result,
-            set_returning,
-        } => {
+        crate::storage::RoutineKind::Function { result } => {
+            write!(definition, ") RETURNS {} LANGUAGE sql AS '", result.name())
+        }
+        crate::storage::RoutineKind::SetFunction { result } => {
             write!(
                 definition,
-                ") RETURNS {}{} LANGUAGE sql AS '",
-                if set_returning { "SETOF " } else { "" },
+                ") RETURNS SETOF {} LANGUAGE sql AS '",
                 result.name()
             )
+        }
+        crate::storage::RoutineKind::TableFunction => {
+            write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;
+            for (index, column) in routine
+                .table_columns()
+                .expect("table routine columns")
+                .iter()
+                .enumerate()
+            {
+                if index != 0 {
+                    write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
+                }
+                write!(
+                    definition,
+                    "{} {}",
+                    column.name.as_str(),
+                    column.ctype.name()
+                )
+                .map_err(|_| super::eval::arena_full())?;
+            }
+            write!(definition, ") LANGUAGE sql AS '")
         }
         crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql AS '"),
     }

@@ -6048,6 +6048,8 @@ pub fn create_routine(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
+    let mut result_columns = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let mut result_column_count = 0;
     let kind = match routine.kind {
         super::ast::RoutineCreateKind::Function {
             result_type,
@@ -6060,10 +6062,31 @@ pub fn create_routine(
                     result_type
                 ));
             };
-            crate::storage::RoutineKind::Function {
-                result,
-                set_returning,
+            if set_returning {
+                crate::storage::RoutineKind::SetFunction { result }
+            } else {
+                crate::storage::RoutineKind::Function { result }
             }
+        }
+        super::ast::RoutineCreateKind::TableFunction { columns } => {
+            let mut output = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+            for (slot, column) in columns.iter().enumerate() {
+                let name = match SqlName::parse(column.name) {
+                    Ok(name) => name,
+                    Err(error) => return sql_fail(error),
+                };
+                let Some(ctype) = ColType::from_sql_name(column.type_name) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        column.type_name
+                    ));
+                };
+                output[slot] = RoutineArgumentDef { name, ctype };
+            }
+            result_columns = output;
+            result_column_count = columns.len();
+            crate::storage::RoutineKind::TableFunction
         }
         super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
@@ -6109,8 +6132,14 @@ pub fn create_routine(
         if let Err(error) = storage.require_routine_owner(replaced_slot, txn.txid) {
             return sql_fail(error);
         }
-        let prior_kind = storage.routine(replaced_slot).kind;
-        if prior_kind != kind {
+        let prior = storage.routine(replaced_slot);
+        let prior_kind = prior.kind;
+        let same_result_contract = prior_kind == kind
+            && (!matches!(kind, crate::storage::RoutineKind::TableFunction)
+                || (prior.result_column_count == result_column_count
+                    && prior.result_columns[..result_column_count]
+                        == result_columns[..result_column_count]));
+        if !same_result_contract {
             let message =
                 if prior_kind.function_result().is_some() && kind.function_result().is_some() {
                     "cannot change return type of existing function"
@@ -6126,7 +6155,9 @@ pub fn create_routine(
         storage.drop_routine(replaced_slot, txn.txid);
     }
     match kind {
-        crate::storage::RoutineKind::Function { .. } => {
+        crate::storage::RoutineKind::Function { .. }
+        | crate::storage::RoutineKind::SetFunction { .. }
+        | crate::storage::RoutineKind::TableFunction => {
             let mut parser = match super::parser::Parser::new(routine.body, arena) {
                 Ok(parser) => parser,
                 Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
@@ -6194,6 +6225,8 @@ pub fn create_routine(
             arguments,
             argument_count: routine.arguments.len(),
             kind,
+            result_columns,
+            result_column_count,
             body,
         },
         txn.txid,
@@ -6234,7 +6267,9 @@ pub fn create_routine(
         return sql_fail(error);
     }
     responder.command_complete(match kind {
-        crate::storage::RoutineKind::Function { .. } => "CREATE FUNCTION",
+        crate::storage::RoutineKind::Function { .. }
+        | crate::storage::RoutineKind::SetFunction { .. }
+        | crate::storage::RoutineKind::TableFunction => "CREATE FUNCTION",
         crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
     })?;
     sql_ok()

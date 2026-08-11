@@ -5620,7 +5620,9 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              CREATE FUNCTION nested_routine_value(integer) RETURNS integer LANGUAGE SQL
                AS 'SELECT lookup_routine_value($1) + 1';
              CREATE FUNCTION routine_values_from(integer) RETURNS SETOF integer LANGUAGE SQL
-               AS 'SELECT value FROM routine_lookup WHERE id >= $1'",
+               AS 'SELECT value FROM routine_lookup WHERE id >= $1';
+             CREATE FUNCTION routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
+               AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'",
         );
         assert_eq!(
             data_rows(&run_with(
@@ -5637,6 +5639,35 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                 "SELECT value FROM routine_values_from(1) AS values_from(value) ORDER BY value",
             )),
             ["40", "41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT routine_id, routine_value FROM routine_pairs_from(1) ORDER BY routine_id",
+            )),
+            ["1|40", "2|41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT lookup.id, pairs.routine_value \
+                 FROM routine_lookup AS lookup \
+                 JOIN LATERAL routine_pairs_from(lookup.id) AS pairs ON true \
+                 ORDER BY lookup.id, pairs.routine_value",
+            )),
+            ["1|40", "1|41", "2|41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT routine_id, routine_value, ordinality \
+                 FROM routine_pairs_from(1) WITH ORDINALITY \
+                 ORDER BY ordinality",
+            )),
+            ["1|40|1", "2|41|2"]
         );
         assert_eq!(
             data_rows(&run_with(
@@ -5681,6 +5712,38 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "{}",
             String::from_utf8_lossy(&changed_set_contract)
         );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT proretset, prorettype, pg_get_functiondef(oid) \
+                 FROM pg_proc WHERE proname = 'routine_pairs_from'",
+            )),
+            [
+                "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE sql AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'"
+            ]
+        );
+        let changed_table_contract = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE OR REPLACE FUNCTION routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value text) LANGUAGE SQL \
+             AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'",
+        );
+        assert!(
+            String::from_utf8_lossy(&changed_table_contract).contains("42P13"),
+            "{}",
+            String::from_utf8_lossy(&changed_table_contract)
+        );
+        let duplicate_table_columns = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION duplicate_table_columns() RETURNS TABLE (value integer, value text) LANGUAGE SQL AS 'SELECT 1, 2'",
+        );
+        assert!(
+            String::from_utf8_lossy(&duplicate_table_columns).contains("42P13"),
+            "{}",
+            String::from_utf8_lossy(&duplicate_table_columns)
+        );
         run_with(
             &mut engine,
             &mut budget,
@@ -5692,6 +5755,11 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             String::from_utf8_lossy(&cardinality).contains("21000"),
             "{}",
             String::from_utf8_lossy(&cardinality)
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "DROP FUNCTION ambiguous_routine_value()",
         );
         let invalid_body = run_with(
             &mut engine,
@@ -5816,6 +5884,14 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "SELECT value FROM routine_values_from(1) AS values_from(value) ORDER BY value",
         )),
         ["40", "41"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_id, routine_value FROM routine_pairs_from(1) ORDER BY routine_id",
+        )),
+        ["1|40", "2|41"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -6284,6 +6360,9 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              RESET ROLE;
              GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;
              CREATE TABLE checkpoint_procedure_log (value integer);
+             INSERT INTO checkpoint_procedure_log VALUES (4), (5);
+             CREATE FUNCTION checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE SQL
+               AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value';
              CREATE PROCEDURE checkpoint_log(value integer) LANGUAGE SQL AS 'INSERT INTO checkpoint_procedure_log VALUES ($1)';",
         );
         assert!(
@@ -6304,9 +6383,21 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              RESET ROLE;
              CALL checkpoint_log(9);
              SELECT has_function_privilege('checkpoint_reader', 'checkpoint_overload(integer)', 'EXECUTE');
-             SELECT value FROM checkpoint_procedure_log;",
+             SELECT value FROM checkpoint_procedure_log;
+             SELECT position, value FROM checkpoint_pairs() ORDER BY position;
+             SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'checkpoint_pairs';",
         )),
-        ["7", "f", "9"]
+        [
+            "7",
+            "f",
+            "4",
+            "5",
+            "9",
+            "1|4",
+            "2|5",
+            "6|9",
+            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
+        ]
     );
 }
 

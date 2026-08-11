@@ -165,4 +165,20 @@ impl SequenceAccess for SeqEval<'_> {
         self.session.record_setval(slot, seq.created_at, value);
         Ok(result)
     }
+
+    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
+        Self { dry: true, ..*self }.nextval(name)
+    }
+
+    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
+        Self { dry: true, ..*self }.currval(name)
+    }
+
+    fn dry_lastval(&self) -> Result<i64, SqlError> {
+        Self { dry: true, ..*self }.lastval()
+    }
+
+    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        Self { dry: true, ..*self }.setval(name, value, is_called)
+    }
 }

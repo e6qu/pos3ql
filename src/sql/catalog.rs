@@ -1629,6 +1629,7 @@ struct IdxInfo {
     table_slot: usize,
     name: StackStr<64>,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
+    expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
     include_columns: [u16; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
@@ -1654,6 +1655,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
         let mut mk = |columns: &[u16],
+                      expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
                       include_columns: &[u16],
                       descending: [bool; crate::storage::MAX_INDEX_COLS],
                       nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
@@ -1672,6 +1674,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 table_slot: slot,
                 name,
                 columns: c,
+                expression_keys,
                 include_columns: included,
                 descending,
                 nulls_first,
@@ -1691,6 +1694,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
                     &[ci as u16],
+                    [false; crate::storage::MAX_INDEX_COLS],
                     &[],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
@@ -1706,6 +1710,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 );
                 visit(mk(
                     &[ci as u16],
+                    [false; crate::storage::MAX_INDEX_COLS],
                     &[],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
@@ -1721,6 +1726,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         for uk in def.uniques() {
             visit(mk(
                 uk.columns(),
+                [false; crate::storage::MAX_INDEX_COLS],
                 &[],
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
@@ -1735,6 +1741,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
             visit(mk(
                 &index.columns[..index.n_cols],
+                index.expressions.map(|expression| expression.is_some()),
                 &index.include_columns[..index.n_include_cols],
                 index.descending,
                 index.nulls_first,
@@ -1755,6 +1762,7 @@ fn empty_index() -> IdxInfo {
         table_slot: 0,
         name: StackStr::new(),
         columns: [0; crate::storage::MAX_INDEX_COLS],
+        expression_keys: [false; crate::storage::MAX_INDEX_COLS],
         include_columns: [0; crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
@@ -1765,6 +1773,22 @@ fn empty_index() -> IdxInfo {
         is_primary: false,
         is_unique: false,
     }
+}
+
+fn index_expression_source(
+    storage: &Storage,
+    info: &IdxInfo,
+    position: usize,
+    txid: u32,
+) -> Option<StackStr<{ crate::storage::INDEX_EXPRESSION_MAX }>> {
+    if !info.expression_keys[position] {
+        return None;
+    }
+    let table = storage.table_def(info.table_slot, txid);
+    storage
+        .indexes_for(table.schema.as_str(), table.name.as_str(), txid)
+        .find(|index| index.name_for(txid).as_str() == info.name.as_str())?
+        .expressions[position]
 }
 
 /// Materializes every visible index in the statement arena. This is sized from
@@ -4039,6 +4063,13 @@ fn pg_index<'a>(
         let zeros = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
         attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
+        for (position, attribute) in attributes.iter_mut().enumerate().take(info.n_cols) {
+            if info.expression_keys[position] {
+                // PostgreSQL reserves attribute number zero in `indkey` for
+                // an expression key; the source lives in `indexprs`.
+                *attribute = u16::MAX;
+            }
+        }
         attributes[info.n_cols..info.n_cols + info.n_include_cols]
             .copy_from_slice(&info.include_columns[..info.n_include_cols]);
         out[n] = row(
@@ -4061,7 +4092,12 @@ fn pg_index<'a>(
                     None => Datum::Null,
                 },
                 Datum::Bool(true),
-                Datum::Null,
+                match (0..info.n_cols)
+                    .find_map(|position| index_expression_source(storage, info, position, txid))
+                {
+                    Some(expression) => text(expression.as_str(), arena)?,
+                    None => Datum::Null,
+                },
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
             ],
@@ -4089,7 +4125,12 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
         .alloc_slice_with(columns.len() * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
     for (index, column) in columns.iter().enumerate() {
-        raw[index * 2..index * 2 + 2].copy_from_slice(&(*column as i16 + 1).to_le_bytes());
+        let attribute_number = if *column == u16::MAX {
+            0
+        } else {
+            *column as i16 + 1
+        };
+        raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
     Ok(Datum::Int2Vector(raw))
 }
@@ -4986,8 +5027,12 @@ fn pg_indexes<'a>(
                 if k > 0 {
                     let _ = indexdef.write_str(", ");
                 }
-                let _ =
-                    indexdef.write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+                if let Some(expression) = index_expression_source(storage, info, k, txid) {
+                    let _ = indexdef.write_str(expression.as_str());
+                } else {
+                    let _ = indexdef
+                        .write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+                }
                 if info.descending[k] {
                     let _ = indexdef.write_str(" DESC");
                 }

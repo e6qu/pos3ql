@@ -3933,14 +3933,18 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Select(select) => self.execute_select(select, arena, params, txn, guc, responder),
-            Stmt::SetQuery(query) => query::set_query(
-                &self.storage,
-                txn.txid,
-                query,
-                &self.work,
-                params,
-                responder,
-            ),
+            Stmt::SetQuery(query) => {
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                query::set_query(
+                    &self.storage,
+                    txn.txid,
+                    query,
+                    &self.work,
+                    params,
+                    Some(&sequence),
+                    responder,
+                )
+            }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
                 &mut self.scratch,
@@ -4478,7 +4482,16 @@ impl Engine {
             ),
             Stmt::Select(s) => self.execute_select(s, arena, params, txn, guc, responder),
             Stmt::SetQuery(q) => {
-                query::set_query(&self.storage, txn.txid, q, &self.work, params, responder)
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                query::set_query(
+                    &self.storage,
+                    txn.txid,
+                    q,
+                    &self.work,
+                    params,
+                    Some(&sequence),
+                    responder,
+                )
             }
             Stmt::CreateTable(c) => {
                 exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
@@ -5152,6 +5165,8 @@ impl Engine {
                         Responder::new(cursors.result_buffer(at))
                     };
                     capture.set_render(guc.render());
+                    let sequence =
+                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                     match &parsed {
                         Stmt::Select(sel) => {
                             let sel = match query::expand_ctes_exec(
@@ -5179,7 +5194,7 @@ impl Engine {
                                     sel,
                                     &self.work,
                                     params,
-                                    None,
+                                    Some(&sequence),
                                     &mut capture,
                                 )
                             } else {
@@ -5189,7 +5204,7 @@ impl Engine {
                                     sel,
                                     &self.work,
                                     params,
-                                    None,
+                                    Some(&sequence),
                                     &mut capture,
                                 )
                             }
@@ -5200,6 +5215,7 @@ impl Engine {
                             q,
                             &self.work,
                             params,
+                            Some(&sequence),
                             &mut capture,
                         ),
                         _ => {
@@ -6533,8 +6549,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             n_include_cols,
             nulls_not_distinct,
             predicate,
+            expressions,
             unique,
         } => {
+            let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
+            for (index, expression) in expressions.into_iter().enumerate() {
+                stored_expressions[index] = expression
+                    .map(crate::storage::index_expression_stackstr)
+                    .transpose()?;
+            }
             let slot = storage.create_index(
                 crate::storage::IndexDef {
                     schema: crate::storage::SqlName::parse(schema)?,
@@ -6543,6 +6566,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     table: crate::storage::SqlName::parse(table)?,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
+                    expressions: stored_expressions,
                     include_columns,
                     descending,
                     nulls_first,

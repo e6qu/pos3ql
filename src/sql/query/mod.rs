@@ -3054,10 +3054,11 @@ fn select_into_rows_mode<'a>(
                 statement.with_ties,
                 arena,
                 params,
+                seq,
                 emit,
             );
         }
-        let (mut rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params)?;
+        let (mut rows, _target, n) = materialize_set_body(storage, txid, tree, arena, params, seq)?;
         let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
         let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
         // A trailing ORDER BY needs one final sort over the combined multiset.

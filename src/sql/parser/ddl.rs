@@ -11,13 +11,26 @@ use super::{
 };
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement, DomainCheck,
+    AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement, DomainCheck, Expr,
     PublicationOperations, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
     RoutineTargetKind,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
+
+fn index_expression_source<'a>(expression: &Expr<'a>, text: &'a str) -> &'a str {
+    // PostgreSQL's index definition printer discards redundant grouping around
+    // a function call, while arithmetic grouping remains semantically useful.
+    if !matches!(expression, Expr::Call { .. }) {
+        return text;
+    }
+    let mut text = text.trim();
+    while text.starts_with('(') && text.ends_with(')') {
+        text = text[1..text.len() - 1].trim();
+    }
+    text
+}
 
 impl<'a> Parser<'a> {
     pub(super) fn alter_index(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -926,8 +939,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("(")?;
+        let null_expression = self.arena_expr(Expr::Null)?;
         let mut columns = [crate::sql::ast::IndexColumn {
-            name: "",
+            column: None,
+            expression: null_expression,
+            expression_text: "",
             descending: false,
             nulls_first: false,
         }; MAX_LIST];
@@ -936,7 +952,17 @@ impl<'a> Parser<'a> {
             if n == MAX_LIST {
                 return Err(self.limit("index columns", MAX_LIST));
             }
-            let name = self.col_ident("column name")?;
+            let start = self.peek_at;
+            let expression = self.expression(0)?;
+            let expression_text =
+                index_expression_source(expression, self.text[start..self.peek_at].trim_end());
+            let column = match expression {
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } => Some(*name),
+                _ => None,
+            };
             let descending = if self.eat_ident("asc")? {
                 false
             } else {
@@ -953,7 +979,9 @@ impl<'a> Parser<'a> {
                 descending
             };
             columns[n] = crate::sql::ast::IndexColumn {
-                name,
+                column,
+                expression,
+                expression_text,
                 descending,
                 nulls_first,
             };

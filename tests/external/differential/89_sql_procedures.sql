@@ -1,5 +1,6 @@
 DROP TABLE IF EXISTS procedure_log;
 DROP PROCEDURE IF EXISTS procedure_log_value(integer);
+DROP PROCEDURE IF EXISTS procedure_log_pair(integer);
 
 CREATE TABLE procedure_log (value integer);
 CREATE PROCEDURE procedure_log_value(value integer)
@@ -7,6 +8,10 @@ CREATE PROCEDURE procedure_log_value(value integer)
 
 CALL procedure_log_value(41);
 SELECT value FROM procedure_log;
+CREATE PROCEDURE procedure_log_pair(value integer)
+  LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES ($1); INSERT INTO procedure_log VALUES ($1 + 1)';
+CALL procedure_log_pair(42);
+SELECT value FROM procedure_log ORDER BY value;
 SELECT proname, pronargs, prorettype, prokind, proargtypes
   FROM pg_proc
  WHERE proname = 'procedure_log_value';
@@ -21,4 +26,5 @@ SELECT parameter_name, parameter_mode, data_type
  WHERE specific_name LIKE 'procedure_log_value_%';
 
 DROP PROCEDURE procedure_log_value(integer);
+DROP PROCEDURE procedure_log_pair(integer);
 DROP TABLE procedure_log;

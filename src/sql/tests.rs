@@ -5922,13 +5922,49 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
             "{}",
             String::from_utf8_lossy(&called)
         );
+        let multi_created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE PROCEDURE log_pair(value integer) LANGUAGE SQL AS \
+             'INSERT INTO procedure_log VALUES ($1); \
+              SELECT value FROM procedure_log WHERE value = $1; \
+              INSERT INTO procedure_log VALUES ($1 + 1)'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&multi_created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&multi_created)
+        );
+        let multi_called = run_with(&mut engine, &mut budget, "CALL log_pair(42)");
+        assert!(
+            data_rows(&multi_called).is_empty()
+                && String::from_utf8_lossy(&multi_called).contains("CALL"),
+            "procedure results stay internal: {}",
+            String::from_utf8_lossy(&multi_called)
+        );
+        let failing_created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
+             'INSERT INTO procedure_log VALUES ($1); INSERT INTO missing_log VALUES ($1)'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&failing_created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&failing_created)
+        );
+        let failed = run_with(&mut engine, &mut budget, "CALL log_then_fail(99)");
+        assert!(
+            String::from_utf8_lossy(&failed).contains("42P01"),
+            "{failed:?}"
+        );
         assert_eq!(
             data_rows(&run_with(
                 &mut engine,
                 &mut budget,
-                "SELECT value FROM procedure_log"
+                "SELECT value FROM procedure_log ORDER BY value"
             )),
-            ["40", "41"]
+            ["40", "41", "42", "43"]
         );
         assert_eq!(
             data_rows(&run_with(
@@ -5957,7 +5993,7 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
             &mut budget,
             "SELECT value FROM procedure_log ORDER BY value"
         )),
-        ["40", "41", "42"]
+        ["40", "41", "42", "42", "43"]
     );
     let wrong_drop = run_with(&mut engine, &mut budget, "DROP FUNCTION log_value(integer)");
     assert!(String::from_utf8_lossy(&wrong_drop).contains("42883"));
@@ -5970,6 +6006,12 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         !String::from_utf8_lossy(&dropped).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&dropped)
+    );
+    run_with(&mut engine, &mut budget, "DROP PROCEDURE log_pair(integer)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP PROCEDURE log_then_fail(integer)",
     );
 }
 

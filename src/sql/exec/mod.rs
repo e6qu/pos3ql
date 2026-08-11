@@ -6123,13 +6123,20 @@ pub fn create_routine(
             }
         }
         crate::storage::RoutineKind::Procedure => {
-            let parsed = super::parser::Parser::new(routine.body, arena)
-                .and_then(|mut parser| parser.next_stmt());
-            if !matches!(parsed, Ok(Some(_))) {
-                return sql_fail(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "invalid SQL procedure body"
-                ));
+            let mut parser = match super::parser::Parser::new(routine.body, arena) {
+                Ok(parser) => parser,
+                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            };
+            let mut statements = 0usize;
+            loop {
+                match parser.next_stmt() {
+                    Ok(Some(_)) => statements += 1,
+                    Ok(None) => break,
+                    Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+                }
+            }
+            if statements == 0 {
+                return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "procedure body is empty"));
             }
         }
     }

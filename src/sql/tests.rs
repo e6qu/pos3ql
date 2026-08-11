@@ -13662,6 +13662,123 @@ fn publication_rename_blocks_conflicting_catalog_changes() {
 }
 
 #[test]
+fn alter_index_rename_is_transactional_durable_and_typed() {
+    let mut config = test_config("alter-index-rename-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("alter-index-rename-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE index_rename_rows (id integer, value text); \
+         CREATE INDEX index_rename_old ON index_rename_rows (value)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON INDEX index_rename_old IS 'renamed index comment'",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER INDEX index_rename_old RENAME TO index_rename_new; \
+             SELECT indexname FROM pg_indexes \
+             WHERE tablename = 'index_rename_rows' ORDER BY indexname; \
+             ROLLBACK; SELECT indexname FROM pg_indexes \
+             WHERE tablename = 'index_rename_rows' ORDER BY indexname",
+        )),
+        ["index_rename_new", "index_rename_old"]
+    );
+    let mut renamer = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut renamer, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut renamer,
+        "ALTER INDEX index_rename_old RENAME TO index_rename_new",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT indexname FROM pg_indexes \
+             WHERE tablename = 'index_rename_rows' ORDER BY indexname",
+        )),
+        ["index_rename_old"],
+        "other transactions must retain the committed index identity"
+    );
+    run_txn(&mut engine, &mut budget, &mut renamer, "ROLLBACK");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX index_rename_old RENAME TO index_rename_new; \
+         REINDEX INDEX index_rename_new",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX index_rename_other ON index_rename_rows (id)",
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX index_rename_new RENAME TO index_rename_other",
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate).contains("42P07"),
+        "renaming onto an existing relation must fail: {}",
+        String::from_utf8_lossy(&duplicate)
+    );
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX IF EXISTS index_rename_missing RENAME TO index_rename_unused",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing).contains("ALTER INDEX"),
+        "IF EXISTS must complete with a notice: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    let unsupported = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX index_rename_new SET TABLESPACE elsewhere",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "an unimplemented form must be rejected: {}",
+        String::from_utf8_lossy(&unsupported)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'index_rename_rows' ORDER BY indexname",
+        )),
+        ["index_rename_new", "index_rename_other"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT obj_description('index_rename_new'::regclass)",
+        )),
+        ["renamed index comment"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(

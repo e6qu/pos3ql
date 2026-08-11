@@ -329,6 +329,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterType { .. }
         | Stmt::DropType { .. }
         | Stmt::CreateIndex { .. }
+        | Stmt::AlterIndex { .. }
         | Stmt::DropIndex { .. }
         | Stmt::Reindex { .. }
         | Stmt::Checkpoint
@@ -2051,6 +2052,9 @@ impl Engine {
                         index_table_count += 1;
                     }
                 }
+                DdlUndo::IndexRenamed { slot, .. } => {
+                    self.storage.commit_index_rename(*slot as usize, txn.txid)
+                }
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => {
@@ -2218,6 +2222,9 @@ impl Engine {
             }
             DdlUndo::IndexDropped(slot) => {
                 self.storage.rollback_index_drop(slot as usize, txid);
+            }
+            DdlUndo::IndexRenamed { slot, prior } => {
+                self.storage.rollback_index_rename(slot as usize, prior)
             }
             DdlUndo::SequenceReset {
                 table,
@@ -4773,6 +4780,19 @@ impl Engine {
                 *unique,
                 responder,
             ),
+            Stmt::AlterIndex {
+                name,
+                if_exists,
+                action,
+            } => exec::alter_index(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_exists,
+                *action,
+                responder,
+            ),
             Stmt::DropIndex { names, if_exists } => exec::drop_index(
                 &mut self.storage,
                 &mut self.wal,
@@ -6188,6 +6208,22 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.rename_publication(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
             storage.commit_publication_rename(slot, 0);
         }
+        WalOp::RenameIndex {
+            schema,
+            name,
+            new_name,
+        } => {
+            let slot = storage.index_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal rename for unknown index \"{}.{}\"",
+                    schema,
+                    name
+                )
+            })?;
+            storage.rename_index(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
+            storage.commit_index_rename(slot, 0);
+        }
         WalOp::CreateMatview {
             schema,
             name,
@@ -6482,6 +6518,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::IndexDef {
                     schema: crate::storage::SqlName::parse(schema)?,
                     name: crate::storage::SqlName::parse(name)?,
+                    pending_name: None,
                     table: crate::storage::SqlName::parse(table)?,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,

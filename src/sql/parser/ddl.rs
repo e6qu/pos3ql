@@ -10,15 +10,39 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterPublicationAction, AlterRoutineAction, AlterTypeAction, CreateDomain,
-    CreateRoutine, CreateSchemaElement, DomainCheck, PublicationOperations, RoleOptions,
-    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind,
+    AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
+    AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement, DomainCheck,
+    PublicationOperations, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
+    RoutineTargetKind,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
 impl<'a> Parser<'a> {
+    pub(super) fn alter_index(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("index name")?;
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterIndex {
+                name,
+                if_exists,
+                action: AlterIndexAction::Rename(self.col_ident("new index name")?),
+            });
+        }
+        Err(ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "ALTER INDEX form is not implemented"),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        })
+    }
+
     /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
     /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {

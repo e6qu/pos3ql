@@ -486,7 +486,7 @@ pub fn check_unique_indexes(
             self_rowid,
             txid,
             icols,
-            &ConstraintName::Named(index.name.as_str()),
+            &ConstraintName::Named(index.name_for(txid).as_str()),
         )?;
     }
     Ok(())

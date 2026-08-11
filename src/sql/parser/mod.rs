@@ -2863,6 +2863,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("publication")? {
             return self.alter_publication();
         }
+        if self.eat_ident("index")? {
+            return self.alter_index();
+        }
         if self.eat_ident("function")? {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Function);
         }
@@ -4618,6 +4621,35 @@ mod tests {
                 assert_eq!(
                     action,
                     crate::sql::ast::AlterPublicationAction::Rename("renamed_changes")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn index_rename_is_typed_without_allocation() {
+        with_parser(
+            "ALTER INDEX IF EXISTS public.old_index RENAME TO new_index",
+            |parser| {
+                let Some(Stmt::AlterIndex {
+                    name,
+                    if_exists,
+                    action,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("index rename did not parse")
+                };
+                assert_eq!(
+                    name,
+                    QualName {
+                        schema: Some("public"),
+                        name: "old_index"
+                    }
+                );
+                assert!(if_exists);
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterIndexAction::Rename("new_index")
                 );
             },
         );

@@ -2265,6 +2265,7 @@ impl Checkpointer {
                             crate::storage::IndexDef {
                                 schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
+                                pending_name: None,
                                 table: sql_name(&table)?,
                                 ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,

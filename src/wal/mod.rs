@@ -93,6 +93,7 @@ const KIND_CREATE_ROUTINE: u8 = 45;
 const KIND_DROP_ROUTINE: u8 = 46;
 const KIND_ALTER_ROUTINE_IDENTITY: u8 = 47;
 const KIND_ALTER_DOMAIN_IDENTITY: u8 = 48;
+const KIND_RENAME_INDEX: u8 = 49;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -100,7 +101,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_DOMAIN_IDENTITY;
+const LAST_KIND: u8 = KIND_RENAME_INDEX;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -412,6 +413,11 @@ pub(crate) enum WalOp<'a> {
     DropIndex {
         schema: &'a str,
         name: &'a str,
+    },
+    RenameIndex {
+        schema: &'a str,
+        name: &'a str,
+        new_name: &'a str,
     },
     /// A serial/identity column's sequence position: the last value handed
     /// out. Absolute, so replay is idempotent and order-tolerant within a
@@ -1235,6 +1241,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
+        WalOp::RenameIndex { .. } => KIND_RENAME_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
         WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
         WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
@@ -1396,6 +1403,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len() + 1 + n_cols,
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::RenameIndex {
+            schema,
+            name,
+            new_name,
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
         WalOp::SetTableSchema {
@@ -1859,6 +1871,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::RenameIndex {
+            schema,
+            name,
+            new_name,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_name),
         WalOp::SequenceSet {
             schema,
             table,
@@ -2973,6 +2990,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 "public"
             };
             (at == payload.len()).then_some(WalOp::DropIndex { schema, name })
+        }
+        KIND_RENAME_INDEX => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameIndex {
+                schema,
+                name,
+                new_name,
+            })
         }
         KIND_SEQUENCE_SET => {
             let table = take_name(&mut at)?;
@@ -4160,12 +4187,21 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                19,
+                &WalOp::RenameIndex {
+                    schema: "public",
+                    name: "old_index",
+                    new_name: "new_index",
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 18);
+        assert_eq!(seen.len(), 19);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -4238,10 +4274,15 @@ mod tests {
             "domain identity: {}",
             seen[17]
         );
-        assert_eq!(wal.last_lsn(), 18);
+        assert!(
+            seen[18].contains("RenameIndex") && seen[18].contains("new_index"),
+            "index identity: {}",
+            seen[18]
+        );
+        assert_eq!(wal.last_lsn(), 19);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            19,
+            20,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

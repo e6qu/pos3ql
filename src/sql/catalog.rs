@@ -1717,7 +1717,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.nulls_first,
                 false,
                 index.unique,
-                stack_str_64(index.name.as_str()),
+                stack_str_64(index.name_for(txid).as_str()),
             ));
         }
     }

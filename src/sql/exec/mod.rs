@@ -38,11 +38,15 @@ pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
 pub struct RowCtx<'s, 'v, 'd> {
     pub def: &'d TableDef,
     pub values: &'s [Datum<'v>],
+    pub alias: Option<&'d str>,
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
+            && !self
+                .alias
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(q))
             && !crate::sql::eval::qualifier_answers_single(self.def, q)
         {
             return Err(sql_err!(
@@ -66,7 +70,11 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
-        if table != self.def.name.as_str() {
+        if !self
+            .alias
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(table))
+            && table != self.def.name.as_str()
+        {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -12119,6 +12127,7 @@ fn compute_generated<'a>(
     let context = RowCtx {
         def,
         values: &snapshot[..def.n_columns],
+        alias: None,
     };
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
@@ -12652,6 +12661,7 @@ pub fn merge(
             let source_ctx = RowCtx {
                 def: source_def,
                 values: sv,
+                alias: None,
             };
             for when in statement.whens.iter().filter(|w| !w.matched) {
                 if let Some(cond) = when.cond {
@@ -13420,7 +13430,11 @@ fn emit_projected(
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let context = RowCtx { def, values };
+    let context = RowCtx {
+        def,
+        values,
+        alias: None,
+    };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
     for item in items {
@@ -13603,6 +13617,7 @@ pub fn update(
             storage,
             table_index,
             &def,
+            statement.alias,
             schema,
             from,
             statement.where_clause,
@@ -13615,6 +13630,7 @@ pub fn update(
         collect_matches(
             storage,
             table_index,
+            statement.alias,
             txn.txid,
             schema,
             statement.where_clause,
@@ -13715,6 +13731,7 @@ pub fn update(
             let context = RowCtx {
                 def: &def,
                 values: &values[..def.n_columns],
+                alias: statement.alias,
             };
             if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
@@ -13984,6 +14001,7 @@ pub fn delete(
             storage,
             table_index,
             &def,
+            None,
             schema,
             using,
             statement.where_clause,
@@ -13996,6 +14014,7 @@ pub fn delete(
         collect_matches(
             storage,
             table_index,
+            None,
             txn.txid,
             schema,
             statement.where_clause,
@@ -15272,6 +15291,7 @@ fn alter_table_inner(
                                     let ctx = RowCtx {
                                         def: &def,
                                         values: &old_values[..def.n_columns],
+                                        alias: None,
                                     };
                                     match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
                                         Ok(v) => v,
@@ -15828,6 +15848,7 @@ fn row_matches<'a>(
     table_index: usize,
     rowid: u64,
     def: &TableDef,
+    alias: Option<&str>,
     schema: &[ColType],
     home: RowHome,
     where_clause: Option<&Expr<'a>>,
@@ -15845,12 +15866,13 @@ fn row_matches<'a>(
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut values = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut values)?;
-        row_matches_values(def, &values, w, arena, params, hooks)
+        row_matches_values(def, alias, &values, w, arena, params, hooks)
     })
 }
 
 fn row_matches_values<'a>(
     def: &TableDef,
+    alias: Option<&str>,
     values: &[Datum<'_>],
     w: &Expr<'a>,
     arena: &'a Arena,
@@ -15860,6 +15882,7 @@ fn row_matches_values<'a>(
     let context = RowCtx {
         def,
         values: &values[..def.n_columns],
+        alias,
     };
     match super::eval::eval_full(w, arena, params, &context, hooks)? {
         Datum::Bool(true) => Ok(true),
@@ -15875,6 +15898,7 @@ fn row_matches_values<'a>(
 fn collect_matches<'a>(
     storage: &Storage,
     table_index: usize,
+    alias: Option<&str>,
     txid: u32,
     schema: &[ColType],
     where_clause: Option<&Expr<'a>>,
@@ -15896,6 +15920,7 @@ fn collect_matches<'a>(
             table_index,
             rowid,
             def,
+            alias,
             schema,
             loc,
             where_clause,
@@ -15924,6 +15949,7 @@ fn collect_join_matches<'a>(
     storage: &'a Storage,
     table_index: usize,
     def: &TableDef,
+    alias: Option<&str>,
     schema: &[ColType],
     from: &'a super::ast::FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
@@ -15947,6 +15973,7 @@ fn collect_join_matches<'a>(
             let context = RowCtx {
                 def,
                 values: &tv[..def.n_columns],
+                alias,
             };
             super::query::first_from_match(
                 storage,

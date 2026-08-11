@@ -3484,6 +3484,12 @@ impl<'a> Parser<'a> {
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("update")?;
         let table = self.qual_name("table name")?;
+        let alias =
+            if self.eat_ident("as")? || matches!(self.peeked, Tok::Ident(word) if word != "set") {
+                Some(self.col_ident("table alias")?)
+            } else {
+                None
+            };
         self.expect_ident("set")?;
         let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
         let mut assignments = [dummy; MAX_LIST];
@@ -3516,6 +3522,7 @@ impl<'a> Parser<'a> {
         let returning = self.returning()?;
         Ok(Stmt::Update(Update {
             table,
+            alias,
             assignments: self.arena_slice(&assignments[..n])?,
             from,
             where_clause,

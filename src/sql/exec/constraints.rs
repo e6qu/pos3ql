@@ -252,7 +252,11 @@ pub(crate) fn index_key_values<'a>(
                 expression,
                 arena,
                 crate::sql::eval::NO_PARAMS,
-                &RowCtx { def, values: row },
+                &RowCtx {
+                    def,
+                    values: row,
+                    alias: None,
+                },
             )?,
             None => row[columns[position] as usize],
         };
@@ -617,7 +621,11 @@ pub(crate) fn index_predicate_matches(
         predicate,
         arena,
         crate::sql::eval::NO_PARAMS,
-        &RowCtx { def, values },
+        &RowCtx {
+            def,
+            values,
+            alias: None,
+        },
     )? {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
@@ -987,7 +995,11 @@ fn check_row_checks(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
-    let context = RowCtx { def, values };
+    let context = RowCtx {
+        def,
+        values,
+        alias: None,
+    };
     for (i, c) in def.checks().iter().enumerate() {
         let Some(expression) = checks[i] else {
             continue;

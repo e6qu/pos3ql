@@ -4846,7 +4846,8 @@ fn update_from_and_delete_using() {
             &mut e,
             &mut b,
             &mut t,
-            "UPDATE t SET v = t.v + s.delta, label = s.lbl FROM s WHERE t.id = s.id"
+            "UPDATE t AS target SET v = target.v + s.delta, label = s.lbl \
+             FROM s WHERE target.id = s.id"
         )
         .contains("UPDATE 2")
     );
@@ -4899,8 +4900,8 @@ fn update_from_and_delete_using() {
             &mut e,
             &mut b,
             &mut t,
-            "UPDATE t SET v = nextval('update_from_sequence') FROM s \
-             WHERE t.id = s.id AND t.id = 1"
+            "UPDATE t AS target SET v = nextval('update_from_sequence') FROM s \
+             WHERE target.id = s.id AND target.id = 1"
         )
         .contains("UPDATE 1")
     );

@@ -408,6 +408,9 @@ pub(crate) enum WalOp<'a> {
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
+        /// Absent for a full-table index; otherwise the canonical predicate
+        /// source persisted alongside the physical key columns.
+        predicate: Option<&'a str>,
         unique: bool,
     },
     DropIndex {
@@ -1400,8 +1403,22 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             table,
             n_cols,
+            predicate,
             ..
-        } => 1 + name.len() + 1 + table.len() + 1 + 1 + n_cols * 2 + 1 + schema.len() + 1 + n_cols,
+        } => {
+            1 + name.len()
+                + 1
+                + table.len()
+                + 1
+                + 1
+                + n_cols * 2
+                + 1
+                + schema.len()
+                + 1
+                + n_cols
+                + 2
+                + predicate.map_or(0, |text| 2 + text.len())
+        }
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameIndex {
             schema,
@@ -1855,6 +1872,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             descending,
             nulls_first,
             n_cols,
+            predicate,
             unique,
         } => {
             let mut ok = name_bytes(buffer, name)
@@ -1868,6 +1886,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for i in 0..*n_cols {
                 ok &= buffer.append(&[u8::from(descending[i]) | (u8::from(nulls_first[i]) << 1)]);
             }
+            ok &= buffer.append(&[0xa2]);
+            ok &= match predicate {
+                Some(text) => {
+                    text.len() <= u16::MAX as usize
+                        && buffer.append(&[1])
+                        && buffer.append(&(text.len() as u16).to_le_bytes())
+                        && buffer.append(text.as_bytes())
+                }
+                None => buffer.append(&[0]),
+            };
             ok
         }
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
@@ -2956,6 +2984,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             let mut descending = [false; MAX_INDEX_COLS];
             let mut nulls_first = [false; MAX_INDEX_COLS];
+            let mut predicate = None;
             if at < payload.len() {
                 if *payload.get(at)? != 0xa1 {
                     return None;
@@ -2971,6 +3000,25 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     nulls_first[i] = flags & 2 != 0;
                 }
             }
+            if at < payload.len() {
+                if *payload.get(at)? != 0xa2 {
+                    return None;
+                }
+                at += 1;
+                match *payload.get(at)? {
+                    0 => at += 1,
+                    1 => {
+                        at += 1;
+                        let len =
+                            u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                        at += 2;
+                        let raw = payload.get(at..at + len)?;
+                        at += len;
+                        predicate = Some(core::str::from_utf8(raw).ok()?);
+                    }
+                    _ => return None,
+                }
+            }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 schema,
                 name,
@@ -2979,6 +3027,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 descending,
                 nulls_first,
                 n_cols,
+                predicate,
                 unique,
             })
         }
@@ -4351,6 +4400,7 @@ mod tests {
             descending,
             nulls_first,
             n_cols,
+            predicate,
             unique,
         }) = decode_op(KIND_CREATE_INDEX, &payload)
         else {
@@ -4363,6 +4413,37 @@ mod tests {
         assert!(unique);
         assert!(!descending[..n_cols].iter().any(|direction| *direction));
         assert!(!nulls_first[..n_cols].iter().any(|placement| *placement));
+        assert_eq!(predicate, None);
+    }
+
+    #[test]
+    fn partial_index_payload_round_trips_without_name_length_limits() {
+        let operation = WalOp::CreateIndex {
+            schema: "public",
+            name: "active_values",
+            table: "rows",
+            columns: [1; MAX_INDEX_COLS],
+            descending: [false; MAX_INDEX_COLS],
+            nulls_first: [false; MAX_INDEX_COLS],
+            n_cols: 1,
+            predicate: Some("active AND value IS NOT NULL"),
+            unique: true,
+        };
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(
+            &mut budget,
+            "partial index WAL payload",
+            encoded_payload_len(&operation),
+        )
+        .unwrap();
+        assert!(append_payload(&mut payload, &operation));
+        assert_eq!(payload.len(), encoded_payload_len(&operation));
+        let Some(WalOp::CreateIndex { predicate, .. }) =
+            decode_op(KIND_CREATE_INDEX, payload.readable())
+        else {
+            panic!("partial index WAL payload must decode");
+        };
+        assert_eq!(predicate, Some("active AND value IS NOT NULL"));
     }
 
     #[test]

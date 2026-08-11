@@ -2358,6 +2358,27 @@ impl SequenceDef {
 
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
+/// Maximum stored source length of a partial-index membership predicate.
+///
+/// Predicate text is catalog data, not request-owned parser memory. A fixed
+/// representation keeps the definition replayable without runtime growth.
+pub(crate) const INDEX_PREDICATE_MAX: usize = CHECK_SQL_MAX;
+
+/// Copies validated partial-index predicate source into its durable bounded
+/// representation.
+pub(crate) fn index_predicate_stackstr(
+    predicate: &str,
+) -> Result<StackStr<INDEX_PREDICATE_MAX>, SqlError> {
+    let value = StackStr::from_str(predicate);
+    if value.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "index predicate exceeds {} bytes",
+            INDEX_PREDICATE_MAX
+        ));
+    }
+    Ok(value)
+}
 
 /// A named btree index over a table's columns.
 #[derive(Clone, Copy)]
@@ -2373,6 +2394,9 @@ pub struct IndexDef {
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
+    /// `None` denotes a full-table index. `Some` is the only representation
+    /// of a partial index and is re-parsed before any membership decision.
+    pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
     pub unique: bool,
     pub ddl_state: CatalogDdlState,
 }
@@ -3750,6 +3774,7 @@ impl Storage {
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
+                    predicate: None,
                     unique: false,
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -8868,6 +8893,10 @@ impl Storage {
                 index.visible_to(owner)
             }) && index.schema == table_schema
                 && index.table == table_name
+                // A value enforcer represents every table row for its key.
+                // Partial membership is predicate-defined, so it has a
+                // separate authoritative enforcement path.
+                && index.predicate.is_none()
         }) {
             let columns = &index.columns[..index.n_cols];
             if want[..n_want]

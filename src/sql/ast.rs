@@ -26,6 +26,8 @@ pub enum CreateSchemaElement<'a> {
         name: &'a str,
         table: QualName<'a>,
         columns: &'a [IndexColumn<'a>],
+        predicate: Option<&'a Expr<'a>>,
+        predicate_text: Option<&'a str>,
         unique: bool,
     },
     Sequence {
@@ -290,6 +292,13 @@ pub enum Stmt<'a> {
         name: &'a str,
         table: QualName<'a>,
         columns: &'a [IndexColumn<'a>],
+        /// The parsed `WHERE` membership predicate. Keeping this separate
+        /// from the durable spelling makes an absent predicate impossible to
+        /// confuse with an always-true one.
+        predicate: Option<&'a Expr<'a>>,
+        /// Exact source retained for WAL and checkpoints; it is parsed again
+        /// only at the catalog boundary that evaluates a row.
+        predicate_text: Option<&'a str>,
         unique: bool,
     },
     /// ALTER INDEX [IF EXISTS] name RENAME TO new_name.

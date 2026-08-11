@@ -4769,6 +4769,8 @@ impl Engine {
                 name,
                 table,
                 columns,
+                predicate,
+                predicate_text,
                 unique,
             } => exec::create_index(
                 &mut self.storage,
@@ -4777,6 +4779,9 @@ impl Engine {
                 name,
                 table,
                 columns,
+                *predicate,
+                *predicate_text,
+                arena,
                 *unique,
                 responder,
             ),
@@ -5944,11 +5949,15 @@ fn requalify_schema_element<'a>(
             name,
             table,
             columns,
+            predicate,
+            predicate_text,
             unique,
         } => Stmt::CreateIndex {
             name,
             table: requalify(*table)?,
             columns,
+            predicate: *predicate,
+            predicate_text: *predicate_text,
             unique: *unique,
         },
         ast::CreateSchemaElement::Sequence {
@@ -6512,6 +6521,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             descending,
             nulls_first,
             n_cols,
+            predicate,
             unique,
         } => {
             let slot = storage.create_index(
@@ -6525,6 +6535,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     descending,
                     nulls_first,
                     n_cols,
+                    predicate: predicate
+                        .map(crate::storage::index_predicate_stackstr)
+                        .transpose()?,
                     unique,
                     ddl_state: crate::storage::CatalogDdlState::Present,
                 },

@@ -146,7 +146,7 @@ pub(crate) fn check_domain_constraints(
 /// Names a uniqueness constraint for its 23505 message: a single-column flag
 /// synthesizes PostgreSQL's `<table>_pkey` / `<table>_<column>_key`, while a
 /// table-level key or index carries its stored name.
-enum ConstraintName<'a> {
+pub(crate) enum ConstraintName<'a> {
     PrimaryFlag,
     UniqueFlag(&'a str),
     Named(&'a str),
@@ -365,6 +365,107 @@ fn pending_scan_uniqueness(
     Ok(())
 }
 
+/// Enforces a partial UNIQUE index against its predicate-defined member set.
+/// A partial index deliberately has no column-only value-cache binding: a
+/// cache key cannot encode arbitrary SQL membership without duplicating the
+/// expression executor. Both the candidate and every authoritative competing
+/// image are therefore evaluated with the same parsed predicate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_partial_index_uniqueness(
+    storage: &Storage,
+    table_index: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    columns: &[u16],
+    name: &ConstraintName,
+    predicate: &Expr,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if !index_predicate_matches(def, values, predicate, arena)?
+        || columns
+            .iter()
+            .any(|&column| values[column as usize].is_null())
+    {
+        return Ok(());
+    }
+    let matches = |other: &[Datum]| -> Result<bool, SqlError> {
+        Ok(index_predicate_matches(def, other, predicate, arena)?
+            && key_equal(columns, values, other)?)
+    };
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        if Some(rowid) == self_rowid {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let Some(home) = state.committed else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            matches(&other)
+        })?;
+        if matched {
+            return Err(unique_violation(def, name));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    for (&rowid, state) in storage.table(table_index).rows.iter() {
+        if Some(rowid) == self_rowid {
+            continue;
+        }
+        let Some(pending) = state.pending.last() else {
+            continue;
+        };
+        let Some(location) = pending.loc else {
+            continue;
+        };
+        let matched =
+            storage.with_row_bytes(table_index, rowid, RowHome::Heap(location), |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                matches(&other)
+            })?;
+        if !matched {
+            continue;
+        }
+        if pending.txid != txid {
+            storage.wait_for_transaction(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a concurrent unique-key writer"
+            ));
+        }
+        return Err(unique_violation(def, name));
+    }
+    Ok(())
+}
+
+pub(crate) fn index_predicate_matches(
+    def: &TableDef,
+    values: &[Datum],
+    predicate: &Expr,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    match eval(
+        predicate,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        &RowCtx { def, values },
+    )? {
+        Datum::Bool(value) => Ok(value),
+        Datum::Null => Ok(false),
+        _ => Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "argument of WHERE must be type boolean, not type {}",
+            "unknown"
+        )),
+    }
+}
+
 /// Unique/PK enforcement for the single-column column flags: each `unique`
 /// column's value must not equal that column in any other visible row.
 pub fn check_unique(
@@ -410,9 +511,19 @@ pub fn check_all_unique(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     check_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
-    check_unique_indexes(storage, table_index, def, schema, values, self_rowid, txid)?;
+    check_unique_indexes(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        self_rowid,
+        txid,
+        arena,
+    )?;
     check_unique_keys(storage, table_index, def, schema, values, self_rowid, txid)
 }
 
@@ -453,6 +564,9 @@ fn check_index_tuple_sizes(
         check_index_tuple_size(unique.columns(), values)?;
     }
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if index.predicate.is_some() {
+            continue;
+        }
         check_index_tuple_size(&index.columns[..index.n_cols], values)?;
     }
     Ok(())
@@ -474,20 +588,40 @@ pub fn check_unique_indexes(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         let icols = &index.columns[..index.n_cols];
-        enforce_key_uniqueness(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            icols,
-            &ConstraintName::Named(index.name_for(txid).as_str()),
-        )?;
+        let index_name = index.name_for(txid);
+        let name = ConstraintName::Named(index_name.as_str());
+        if let Some(predicate) = index.predicate {
+            let expression = crate::sql::parser::parse_expr(predicate.as_str(), arena)?;
+            enforce_partial_index_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                icols,
+                &name,
+                expression,
+                arena,
+            )?;
+        } else {
+            enforce_key_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                icols,
+                &name,
+            )?;
+        }
     }
     Ok(())
 }
@@ -594,7 +728,16 @@ pub(crate) fn enforce_row_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     check_index_tuple_sizes(storage, def, values, txid)?;
-    check_all_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
+    check_all_unique(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        self_rowid,
+        txid,
+        arena,
+    )?;
     check_row_checks(def, checks, values, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;

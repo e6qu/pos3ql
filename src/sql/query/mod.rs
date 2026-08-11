@@ -158,11 +158,20 @@ type Outcome = Result<Result<(), SqlError>, WireFull>;
 /// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
 pub(super) struct StorageCatalog<'s> {
     storage: &'s Storage,
+    routine_workspace: &'s Arena,
     txid: u32,
 }
 
-pub(super) fn storage_catalog(storage: &Storage, txid: u32) -> StorageCatalog<'_> {
-    StorageCatalog { storage, txid }
+pub(super) fn storage_catalog<'a>(
+    storage: &'a Storage,
+    routine_workspace: &'a Arena,
+    txid: u32,
+) -> StorageCatalog<'a> {
+    StorageCatalog {
+        storage,
+        routine_workspace,
+        txid,
+    }
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_> {
@@ -180,27 +189,65 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         };
         self.storage.require_routine_execute(slot, self.txid)?;
         let routine = self.storage.routine(slot);
-        let body = routine.body.as_str().trim();
-        let expression = body
-            .strip_prefix("SELECT ")
-            .or_else(|| body.strip_prefix("select "))
-            .expect("validated routine body");
-        let expression = arena
-            .alloc_str(expression)
-            .map_err(|_| super::eval::arena_full())?;
-        let expression = super::parser::parse_expr(expression, arena)?;
-        let hooks = EvalHooks {
-            catalog: Some(self),
-            ..super::eval::NO_HOOKS
+        let result_type = routine
+            .kind
+            .function_result()
+            .expect("routine call resolution returns functions only");
+        let mut parser = super::parser::Parser::new(routine.body.as_str(), self.routine_workspace)
+            .map_err(|error| super::parse_error_to_sql(&error))?;
+        let Some(super::ast::Stmt::Select(select)) = parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?
+        else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must be a SELECT query"
+            ));
         };
-        super::eval::eval_full(
-            expression,
-            arena,
-            arguments,
-            &super::eval::NoColumns,
-            &hooks,
-        )
-        .map(Some)
+        if parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must contain one SELECT query"
+            ));
+        }
+        let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (slot, argument) in arguments.iter().enumerate() {
+            let encoded =
+                crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
+            parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
+        }
+        let mut result = None;
+        select_into_rows_recycling(
+            self.storage,
+            self.txid,
+            &select,
+            self.routine_workspace,
+            &parameters[..arguments.len()],
+            None,
+            None,
+            &mut |values| {
+                if values.len() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "SQL function query must return one column"
+                    ));
+                }
+                if result.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::CARDINALITY_VIOLATION,
+                        "SQL function query returned more than one row"
+                    ));
+                }
+                let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+                result = Some(crate::sql::exec::decode_projected_pub(encoded, 0));
+                Ok(())
+            },
+        )?;
+        super::eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena).map(Some)
     }
 
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
@@ -2210,7 +2257,11 @@ pub fn select_query<'a>(
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
-    let catalog = StorageCatalog { storage, txid };
+    let catalog = StorageCatalog {
+        storage,
+        routine_workspace: arena,
+        txid,
+    };
     let hooks = EvalHooks {
         group: None,
         aggs: None,
@@ -2675,7 +2726,11 @@ pub fn constant_select<'a>(
         arena,
         &mut columns[..n],
     );
-    let catalog = StorageCatalog { storage, txid };
+    let catalog = StorageCatalog {
+        storage,
+        routine_workspace: arena,
+        txid,
+    };
     let hooks = EvalHooks {
         group: None,
         aggs: None,
@@ -3094,7 +3149,11 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     }
     check_select_constants(statement, arena)?;
-    let catalog = StorageCatalog { storage, txid };
+    let catalog = StorageCatalog {
+        storage,
+        routine_workspace: arena,
+        txid,
+    };
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
@@ -4368,7 +4427,11 @@ pub fn first_from_match<'a>(
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, Some(target))?;
     let subs = subquery_hooks(&[where_clause], storage, txid, arena, params)?;
-    let catalog = StorageCatalog { storage, txid };
+    let catalog = StorageCatalog {
+        storage,
+        routine_workspace: arena,
+        txid,
+    };
     let hooks = EvalHooks {
         group: None,
         aggs: None,

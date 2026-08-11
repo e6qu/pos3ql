@@ -658,7 +658,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             filter: None,
         })
         .map_err(|_| arena_full())?;
-    let catalog = super::storage_catalog(storage, txid);
+    let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS

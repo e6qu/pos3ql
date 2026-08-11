@@ -315,7 +315,7 @@ pub(super) fn resolve_default(
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
     if !expression.contains_call() {
-        let catalog = crate::sql::query::storage_catalog(storage, txid);
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
         let hooks = EvalHooks {
             group: None,
             aggs: None,

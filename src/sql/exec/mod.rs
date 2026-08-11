@@ -10161,7 +10161,8 @@ pub fn reindex(
                     name.name
                 ));
             };
-            let Some(table) = storage.find_table(index.schema.as_str(), index.table.as_str())
+            let Some(table) =
+                storage.find_visible(index.schema.as_str(), index.table.as_str(), txn.txid)
             else {
                 return sql_fail(sql_err!(
                     sqlstate::INTERNAL_ERROR,

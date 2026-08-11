@@ -5618,7 +5618,9 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              CREATE FUNCTION lookup_routine_value(integer) RETURNS integer LANGUAGE SQL
                AS 'SELECT value FROM routine_lookup WHERE id = $1';
              CREATE FUNCTION nested_routine_value(integer) RETURNS integer LANGUAGE SQL
-               AS 'SELECT lookup_routine_value($1) + 1'",
+               AS 'SELECT lookup_routine_value($1) + 1';
+             CREATE FUNCTION routine_values_from(integer) RETURNS SETOF integer LANGUAGE SQL
+               AS 'SELECT value FROM routine_lookup WHERE id >= $1'",
         );
         assert_eq!(
             data_rows(&run_with(
@@ -5627,6 +5629,57 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                 "SELECT lookup_routine_value(1), nested_routine_value(2)",
             )),
             ["40|42"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT value FROM routine_values_from(1) AS values_from(value) ORDER BY value",
+            )),
+            ["40", "41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT lookup.id, values_from.value \
+                 FROM routine_lookup AS lookup \
+                 JOIN LATERAL routine_values_from(lookup.id) AS values_from(value) ON true \
+                 ORDER BY lookup.id, values_from.value",
+            )),
+            ["1|40", "1|41", "2|41"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT value, ordinality \
+                 FROM routine_values_from(1) WITH ORDINALITY AS values_from(value, ordinality) \
+                 ORDER BY ordinality",
+            )),
+            ["40|1", "41|2"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT proretset, pg_get_functiondef(oid) \
+                 FROM pg_proc WHERE proname = 'routine_values_from'",
+            )),
+            [
+                "t|CREATE OR REPLACE FUNCTION public.routine_values_from(integer) RETURNS SETOF integer LANGUAGE sql AS 'SELECT value FROM routine_lookup WHERE id >= $1'"
+            ],
+        );
+        let changed_set_contract = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE OR REPLACE FUNCTION routine_values_from(integer) RETURNS integer LANGUAGE SQL \
+             AS 'SELECT value FROM routine_lookup WHERE id >= $1'",
+        );
+        assert!(
+            String::from_utf8_lossy(&changed_set_contract).contains("42P13"),
+            "{}",
+            String::from_utf8_lossy(&changed_set_contract)
         );
         run_with(
             &mut engine,
@@ -5725,8 +5778,13 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         execute!("SET ROLE routine_owner");
         execute!("CREATE FUNCTION owned_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 41'");
         execute!("RESET ROLE");
-        execute!(
+        let owned_replacement = execute!(
             "CREATE OR REPLACE FUNCTION owned_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 44'"
+        );
+        assert!(
+            !String::from_utf8_lossy(&owned_replacement).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&owned_replacement)
         );
         assert_eq!(
             data_rows(&execute!(
@@ -5755,6 +5813,14 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
+            "SELECT value FROM routine_values_from(1) AS values_from(value) ORDER BY value",
+        )),
+        ["40", "41"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
             "SELECT oid FROM pg_proc WHERE proname = 'answer'",
         )),
         [answer_oid.to_string()]
@@ -5774,6 +5840,28 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let missing = run_with(&mut engine, &mut budget, "SELECT answer()");
     assert!(String::from_utf8_lossy(&missing).contains("42883"));
+}
+
+#[test]
+fn schema_qualified_set_routine_is_a_typed_table_source() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA routine_schema;
+         CREATE TABLE routine_source (id integer, value integer);
+         INSERT INTO routine_source VALUES (1, 40), (2, 41);
+         CREATE FUNCTION routine_schema.values_from(integer) RETURNS SETOF integer LANGUAGE SQL
+           AS 'SELECT value FROM routine_source WHERE id = $1'",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM routine_schema.values_from(2) AS values_from(value)",
+        )),
+        ["41"]
+    );
 }
 
 #[test]

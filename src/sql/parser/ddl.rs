@@ -165,6 +165,7 @@ impl<'a> Parser<'a> {
         let kind = if function {
             self.expect_ident("returns")?;
             RoutineCreateKind::Function {
+                set_returning: self.eat_ident("setof")?,
                 result_type: self.any_ident("function return type")?,
             }
         } else {

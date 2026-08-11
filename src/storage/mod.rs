@@ -1756,16 +1756,29 @@ pub(crate) struct RoutineSpec {
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutineKind {
-    Function { result: ColType },
+    Function {
+        result: ColType,
+        set_returning: bool,
+    },
     Procedure,
 }
 
 impl RoutineKind {
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
-            Self::Function { result } => Some(result),
+            Self::Function { result, .. } => Some(result),
             Self::Procedure => None,
         }
+    }
+
+    pub(crate) const fn is_set_returning(self) -> bool {
+        matches!(
+            self,
+            Self::Function {
+                set_returning: true,
+                ..
+            }
+        )
     }
 
     pub(crate) const fn catalog_kind(self) -> &'static str {
@@ -1777,15 +1790,29 @@ impl RoutineKind {
 
     pub(crate) const fn wire_code(self) -> u8 {
         match self {
-            Self::Function { .. } => 0,
+            Self::Function {
+                set_returning: false,
+                ..
+            } => 0,
+            Self::Function {
+                set_returning: true,
+                ..
+            } => 2,
             Self::Procedure => 1,
         }
     }
 
     pub(crate) const fn from_wire_code(code: u8, result: ColType) -> Option<Self> {
         match code {
-            0 => Some(Self::Function { result }),
+            0 => Some(Self::Function {
+                result,
+                set_returning: false,
+            }),
             1 => Some(Self::Procedure),
+            2 => Some(Self::Function {
+                result,
+                set_returning: true,
+            }),
             _ => None,
         }
     }
@@ -1836,6 +1863,7 @@ impl RoutineDef {
         argument_count: 0,
         kind: RoutineKind::Function {
             result: ColType::Text,
+            set_returning: false,
         },
         body: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
@@ -11873,6 +11901,28 @@ impl Storage {
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
                 && routine.kind.function_result().is_some()
+                && !routine.kind.is_set_returning()
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name
+                && routine.argument_count == argument_types.len()
+                && routine
+                    .arguments()
+                    .iter()
+                    .zip(argument_types)
+                    .all(|(parameter, value)| parameter.ctype == *value)
+        })
+    }
+
+    pub(crate) fn routine_slot_for_table_call_types(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<usize> {
+        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
+        self.routines.iter().position(|routine| {
+            routine.visible_to(txid)
+                && routine.kind.is_set_returning()
                 && routine.schema_for(txid).as_str() == schema
                 && routine.name_for(txid).as_str() == name
                 && routine.argument_count == argument_types.len()

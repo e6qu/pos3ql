@@ -1220,7 +1220,10 @@ pub struct CreateRoutine<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineCreateKind<'a> {
-    Function { result_type: &'a str },
+    Function {
+        result_type: &'a str,
+        set_returning: bool,
+    },
     Procedure,
 }
 

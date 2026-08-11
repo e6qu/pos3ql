@@ -1946,7 +1946,10 @@ impl Checkpointer {
                         )?;
                     }
                     let kind = match words.next() {
-                        None => crate::storage::RoutineKind::Function { result },
+                        None => crate::storage::RoutineKind::Function {
+                            result,
+                            set_returning: false,
+                        },
                         Some(code) => {
                             let code: u8 = parse_field(Some(code), "routine kind")?;
                             let kind = crate::storage::RoutineKind::from_wire_code(code, result)

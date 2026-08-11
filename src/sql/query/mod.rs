@@ -18,7 +18,8 @@ use crate::stack_format;
 use crate::storage::{ColumnMeta, Storage, TableDef};
 
 use super::ast::{
-    Expr, FrameBound, FromClause, OrderBy, QualName, Select, SelectItem, TableRef, WindowFrame,
+    Expr, FrameBound, FromClause, OrderBy, QualName, Select, SelectItem, SetQuery, Stmt, TableRef,
+    WindowFrame,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, compare_datums, eval_full,
@@ -154,6 +155,97 @@ const SUBQUERY_DEPTH: u32 = 4;
 
 type Outcome = Result<Result<(), SqlError>, WireFull>;
 
+/// A parsed SQL-language function body. Its representation makes a missing
+/// result query or a non-query statement impossible for callers to observe.
+pub(crate) struct RoutineQueryProgram<'a> {
+    pub preceding: &'a [RoutineQuery<'a>],
+    pub result: &'a RoutineQuery<'a>,
+}
+
+/// A SQL-language function body can contain either ordinary or set-operation
+/// queries; no DML statement can cross this boundary.
+#[derive(Clone, Copy)]
+pub(crate) enum RoutineQuery<'a> {
+    Select(Select<'a>),
+    Set(SetQuery<'a>),
+}
+
+/// Parse the read-only query program accepted as a SQL-language function
+/// body. PostgreSQL evaluates every query and uses only the final query as
+/// the function result; retaining that distinction prevents an earlier query
+/// from accidentally becoming the result as the body grows.
+pub(crate) fn parse_routine_query_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<RoutineQueryProgram<'a>, SqlError> {
+    const MAX_ROUTINE_QUERIES: usize = 64;
+    let mut parser = super::parser::Parser::new(body, arena)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    let mut parsed = [None; MAX_ROUTINE_QUERIES];
+    let mut count = 0usize;
+    loop {
+        let statement = parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?;
+        let Some(statement) = statement else { break };
+        let query = match statement {
+            Stmt::Select(select) => RoutineQuery::Select(select),
+            Stmt::SetQuery(query) => RoutineQuery::Set(query),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL function body may contain only SELECT queries"
+                ));
+            }
+        };
+        if count == parsed.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL function body exceeds {} queries",
+                parsed.len()
+            ));
+        }
+        parsed[count] = Some(query);
+        count += 1;
+    }
+    if count == 0 {
+        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+    }
+    let queries = arena
+        .alloc_slice_with(count, |index| parsed[index].expect("counted parsed query"))
+        .map_err(|_| arena_full())?;
+    Ok(RoutineQueryProgram {
+        preceding: &queries[..count - 1],
+        result: &queries[count - 1],
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "routine-query execution plumbing"
+)]
+fn execute_routine_query<'a>(
+    query: &RoutineQuery<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    recycling: bool,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    match query {
+        RoutineQuery::Select(select) if recycling => {
+            select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
+        }
+        RoutineQuery::Select(select) => {
+            select_into_rows(storage, txid, select, arena, params, None, None, emit)
+        }
+        RoutineQuery::Set(query) => {
+            setops::set_query_into_rows(storage, txid, query, arena, params, None, emit)
+        }
+    }
+}
+
 /// Bridges `EvalHooks`' abstract `CatalogAccess` to the concrete `Storage`, so
 /// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
 pub(super) struct StorageCatalog<'s> {
@@ -193,42 +285,32 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             .kind
             .function_result()
             .expect("routine call resolution returns functions only");
-        let mut parser = super::parser::Parser::new(routine.body.as_str(), self.routine_workspace)
-            .map_err(|error| super::parse_error_to_sql(&error))?;
-        let Some(super::ast::Stmt::Select(select)) = parser
-            .next_stmt()
-            .map_err(|error| super::parse_error_to_sql(&error))?
-        else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "SQL function body must be a SELECT query"
-            ));
-        };
-        if parser
-            .next_stmt()
-            .map_err(|error| super::parse_error_to_sql(&error))?
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "SQL function body must contain one SELECT query"
-            ));
-        }
+        let program = parse_routine_query_program(routine.body.as_str(), self.routine_workspace)?;
         let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in arguments.iter().enumerate() {
             let encoded =
                 crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
             parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
+        for query in program.preceding {
+            execute_routine_query(
+                query,
+                self.storage,
+                self.txid,
+                self.routine_workspace,
+                &parameters[..arguments.len()],
+                true,
+                &mut |_| Ok(()),
+            )?;
+        }
         let mut result = None;
-        select_into_rows_recycling(
+        execute_routine_query(
+            program.result,
             self.storage,
             self.txid,
-            &select,
             self.routine_workspace,
             &parameters[..arguments.len()],
-            None,
-            None,
+            true,
             &mut |values| {
                 if values.len() != 1 {
                     return Err(sql_err!(

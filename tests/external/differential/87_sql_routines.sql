@@ -4,12 +4,23 @@ DROP FUNCTION IF EXISTS routine_lookup_value(integer);
 DROP FUNCTION IF EXISTS routine_nested_value(integer);
 DROP FUNCTION IF EXISTS routine_values_from(integer);
 DROP FUNCTION IF EXISTS routine_pairs_from(integer);
+DROP FUNCTION IF EXISTS routine_multi_query_value(integer);
+DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
 DROP TABLE IF EXISTS routine_values;
 
 CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
 CREATE FUNCTION routine_increment(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
 
 SELECT routine_answer(), routine_increment(41);
+CREATE FUNCTION routine_multi_query_value(integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; SELECT $1 + 2';
+CREATE FUNCTION routine_multi_query_pairs(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
+  AS 'SELECT $1; WITH first_pair AS (SELECT $1::integer AS value) SELECT value, value + 1 FROM first_pair UNION ALL SELECT $1 + 1, $1 + 2';
+SELECT routine_multi_query_value(40);
+SELECT routine_id, routine_value FROM routine_multi_query_pairs(7) ORDER BY routine_id;
+SELECT routine_multi_query_value(0);
+DROP FUNCTION routine_multi_query_value(integer);
+DROP FUNCTION routine_multi_query_pairs(integer);
 CREATE TABLE routine_values (id integer PRIMARY KEY, value integer);
 INSERT INTO routine_values VALUES (1, 40), (2, 41);
 CREATE FUNCTION routine_lookup_value(integer) RETURNS integer LANGUAGE SQL

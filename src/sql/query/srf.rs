@@ -8,10 +8,9 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, Select, SelectItem, Stmt, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
-use crate::sql::{Parser, parse_error_to_sql};
 
 /// Pieces one `string_to_table` call may split into.
 const MAX_PIECES: usize = 1024;
@@ -1353,39 +1352,29 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
             routine_params[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
-        let mut parser = Parser::new(routine.body.as_str(), arena)
-            .map_err(|error| parse_error_to_sql(&error))?;
-        let Some(Stmt::Select(select)) = parser
-            .next_stmt()
-            .map_err(|error| parse_error_to_sql(&error))?
-        else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "SQL function body must be a SELECT query"
-            ));
-        };
-        if parser
-            .next_stmt()
-            .map_err(|error| parse_error_to_sql(&error))?
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "SQL function body must contain one SELECT query"
-            ));
+        let program = super::parse_routine_query_program(routine.body.as_str(), arena)?;
+        for query in program.preceding {
+            super::execute_routine_query(
+                query,
+                storage,
+                txid,
+                arena,
+                &routine_params[..args.len()],
+                false,
+                &mut |_| Ok(()),
+            )?;
         }
         const EMPTY: &[u8] = &[];
         let mut rows: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
-        super::select_into_rows(
+        super::execute_routine_query(
+            program.result,
             storage,
             txid,
-            &select,
             arena,
             &routine_params[..args.len()],
-            None,
-            None,
+            false,
             &mut |values| {
                 let expected_columns = table_columns.map_or(1, <[_]>::len);
                 if values.len() != expected_columns {

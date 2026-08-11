@@ -5745,6 +5745,56 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             )),
             ["40|42"]
         );
+        let multi_query_created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION multi_query_value(integer) RETURNS integer LANGUAGE SQL \
+               AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; SELECT $1 + 2'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&multi_query_created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&multi_query_created)
+        );
+        let multi_query_pairs_created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION multi_query_pairs(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL \
+               AS 'SELECT $1; WITH first_pair AS (SELECT $1::integer AS value) \
+                   SELECT value, value + 1 FROM first_pair UNION ALL SELECT $1 + 1, $1 + 2'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&multi_query_pairs_created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&multi_query_pairs_created)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT multi_query_value(40)",
+            )),
+            ["42"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT routine_id, routine_value FROM multi_query_pairs(7) ORDER BY routine_id",
+            )),
+            ["7|8", "8|9"]
+        );
+        let leading_query_error = run_with(&mut engine, &mut budget, "SELECT multi_query_value(0)");
+        assert!(
+            String::from_utf8_lossy(&leading_query_error).contains("22012"),
+            "{}",
+            String::from_utf8_lossy(&leading_query_error)
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer)",
+        );
         assert_eq!(
             data_rows(&run_with(
                 &mut engine,

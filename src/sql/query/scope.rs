@@ -321,7 +321,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, true);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(storage, tref, arena, params, true, outer);
+            return self.add_table_func(storage, tref, txid, arena, params, true, outer);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -486,7 +486,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(tref, m, arena, false);
         }
         if tref.func_args.is_some() {
-            return self.add_table_func(storage, tref, arena, &[], false, None);
+            return self.add_table_func(storage, tref, txid, arena, &[], false, None);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -583,10 +583,12 @@ impl<'d> QueryScope<'d> {
 
     /// Registers a table function (`FROM func(args) alias`) as a derived-table
     /// entry. `materialize` false = schema only (Describe / synth-def path).
+    #[allow(clippy::too_many_arguments)]
     fn add_table_func<'a>(
         &mut self,
         storage: &'a Storage,
         tref: &'a TableRef<'a>,
+        txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
         materialize: bool,
@@ -605,9 +607,9 @@ impl<'d> QueryScope<'d> {
             outer,
         };
         let def_reference = if self.n == 0 && outer.is_none() {
-            table_func_def(tref, arena, params)?
+            table_func_def(tref, storage, txid, arena, params)?
         } else {
-            table_func_def_outer(tref, arena, params, &columns)?
+            table_func_def_outer(tref, storage, txid, arena, params, &columns)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
@@ -633,9 +635,9 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
-            table_func_rows_outer(tref, storage, arena, params, &columns)?
+            table_func_rows_outer(tref, storage, txid, arena, params, &columns)?
         } else {
-            table_func_rows(tref, storage, arena, params)?
+            table_func_rows(tref, storage, txid, arena, params)?
         };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);

@@ -1565,7 +1565,13 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 2
                 + def.body.as_str().len()
-                + usize::from(matches!(def.kind, crate::storage::RoutineKind::Procedure))
+                + usize::from(!matches!(
+                    def.kind,
+                    crate::storage::RoutineKind::Function {
+                        set_returning: false,
+                        ..
+                    }
+                ))
         }
         WalOp::DropRoutine {
             schema,
@@ -2104,7 +2110,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[def.kind.function_result().unwrap_or(ColType::Text).code()])
                 && buffer.append(&(def.body.as_str().len() as u16).to_le_bytes())
                 && buffer.append(def.body.as_str().as_bytes());
-            if matches!(def.kind, crate::storage::RoutineKind::Procedure) {
+            if !matches!(
+                def.kind,
+                crate::storage::RoutineKind::Function {
+                    set_returning: false,
+                    ..
+                }
+            ) {
                 ok &= buffer.append(&[def.kind.wire_code()]);
             }
             ok
@@ -3429,7 +3441,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let body = core::str::from_utf8(payload.get(at..at + body_len)?).ok()?;
             at += body_len;
             let kind = if at == payload.len() {
-                crate::storage::RoutineKind::Function { result }
+                crate::storage::RoutineKind::Function {
+                    result,
+                    set_returning: false,
+                }
             } else {
                 let kind = crate::storage::RoutineKind::from_wire_code(*payload.get(at)?, result)?;
                 at += 1;

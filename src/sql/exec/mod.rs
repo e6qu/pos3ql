@@ -6049,7 +6049,10 @@ pub fn create_routine(
         Err(error) => return sql_fail(error),
     };
     let kind = match routine.kind {
-        super::ast::RoutineCreateKind::Function { result_type } => {
+        super::ast::RoutineCreateKind::Function {
+            result_type,
+            set_returning,
+        } => {
             let Some(result) = ColType::from_sql_name(result_type) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -6057,7 +6060,10 @@ pub fn create_routine(
                     result_type
                 ));
             };
-            crate::storage::RoutineKind::Function { result }
+            crate::storage::RoutineKind::Function {
+                result,
+                set_returning,
+            }
         }
         super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
@@ -6102,6 +6108,20 @@ pub fn create_routine(
         }
         if let Err(error) = storage.require_routine_owner(replaced_slot, txn.txid) {
             return sql_fail(error);
+        }
+        let prior_kind = storage.routine(replaced_slot).kind;
+        if prior_kind != kind {
+            let message =
+                if prior_kind.function_result().is_some() && kind.function_result().is_some() {
+                    "cannot change return type of existing function"
+                } else {
+                    "cannot change routine kind of existing routine"
+                };
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "{}",
+                message
+            ));
         }
         storage.drop_routine(replaced_slot, txn.txid);
     }

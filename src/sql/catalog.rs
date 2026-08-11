@@ -2060,8 +2060,16 @@ pub fn function_def_text<'a>(
         write!(definition, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
     }
     match routine.kind {
-        crate::storage::RoutineKind::Function { result } => {
-            write!(definition, ") RETURNS {} LANGUAGE sql AS '", result.name())
+        crate::storage::RoutineKind::Function {
+            result,
+            set_returning,
+        } => {
+            write!(
+                definition,
+                ") RETURNS {}{} LANGUAGE sql AS '",
+                if set_returning { "SETOF " } else { "" },
+                result.name()
+            )
         }
         crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql AS '"),
     }
@@ -4368,6 +4376,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("pronamespace", ColType::Oid),
             ("pronargs", ColType::Int4),
             ("prorettype", ColType::Oid),
+            ("proretset", ColType::Bool),
             ("prokind", ColType::Bpchar),
             ("proargtypes", ColType::Text),
             ("provolatile", ColType::Bpchar),
@@ -4390,6 +4399,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
+                Datum::Bool(false),
                 Datum::Bpchar("f"),
                 text(routine.argument_types, arena)?,
                 Datum::Bpchar(routine.volatility),
@@ -4443,6 +4453,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         .map(ColType::oid)
                         .unwrap_or(2278),
                 ),
+                Datum::Bool(routine.kind.is_set_returning()),
                 Datum::Bpchar(routine.kind.catalog_kind()),
                 text(argument_types.as_str(), arena)?,
                 Datum::Bpchar("v"),

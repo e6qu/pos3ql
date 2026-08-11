@@ -8,15 +8,17 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, Stmt, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
+use crate::sql::{Parser, parse_error_to_sql};
 
 /// Pieces one `string_to_table` call may split into.
 const MAX_PIECES: usize = 1024;
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
+use crate::util::StackStr;
 
 use super::setops::describe_set_body;
 use super::subquery::subquery_witness;
@@ -522,10 +524,19 @@ pub(crate) fn synth_derived_def_outer<'a>(
 /// function name), so a bare reference to the alias resolves to the value.
 pub(super) fn table_func_def<'a>(
     tref: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<&'a TableDef, SqlError> {
-    table_func_def_outer(tref, arena, params, &crate::sql::eval::NoColumns)
+    table_func_def_outer(
+        tref,
+        storage,
+        txid,
+        arena,
+        params,
+        &crate::sql::eval::NoColumns,
+    )
 }
 
 /// [`table_func_def`] with column types supplied by an enclosing row or the
@@ -534,6 +545,8 @@ pub(super) fn table_func_def<'a>(
 /// every referenced column.
 pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
@@ -553,42 +566,30 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
     let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
-    if !is_gs
-        && !is_unnest
-        && !is_re
-        && !is_keys
-        && !is_elems
-        && !is_each
-        && !is_rstt
-        && !is_gsub
-        && !is_stt
-        && !is_options
-        && !is_sequence_data
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "table function \"{}\" is not supported",
-            tref.table
-        ));
-    }
-    let base_name = if is_gs {
-        "generate_series"
-    } else if is_re {
-        "regexp_matches"
-    } else if is_keys
+    let built_in = is_gs
+        || is_unnest
+        || is_re
+        || is_keys
         || is_elems
         || is_each
         || is_rstt
         || is_gsub
         || is_stt
         || is_options
-        || is_sequence_data
-    {
-        tref.table
+        || is_sequence_data;
+    let routine = if built_in {
+        None
     } else {
-        "unnest"
+        table_func_routine(tref, storage, txid, arena, params, columns)?
     };
-    let name = tref.alias.unwrap_or(base_name);
+    if !built_in && routine.is_none() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "table function \"{}\" is not supported",
+            tref.table
+        ));
+    }
+    let name = tref.alias.unwrap_or(tref.table);
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -608,7 +609,13 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // generate_series yields int8; regexp_matches yields text[]; unnest yields
     // the array's element type; array_elements' default column is `value`.
     let mut default_cols: [(&str, ColType); 2] = [("", ColType::Bool); 2];
-    let n_default = if is_sequence_data {
+    let n_default = if let Some(routine) = routine {
+        default_cols[0] = (
+            name,
+            routine.kind.function_result().expect("set routine result"),
+        );
+        1
+    } else if is_sequence_data {
         default_cols[0] = ("last_value", ColType::Int8);
         default_cols[1] = ("is_called", ColType::Bool);
         2
@@ -734,17 +741,65 @@ pub(super) fn is_json_each_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("jsonb_each_text")
 }
 
-/// Materializes a table function's rows. Currently `generate_series(start, stop
-/// [, step])` over integers; the arguments are evaluated as constants (a lateral
-/// argument referencing an outer column surfaces loudly as an unresolved
-/// column). Each row is one `int8` value, projected-encoded.
+fn table_func_routine<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<Option<&'a RoutineDef>, SqlError> {
+    use core::fmt::Write as _;
+
+    let args = tref.func_args.expect("table function carries arguments");
+    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Ok(None);
+    }
+    let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (slot, argument) in args.iter().enumerate() {
+        argument_types[slot] = match crate::sql::eval::static_type_pub(argument, columns) {
+            Some(ctype) => ctype,
+            None => {
+                let value = crate::sql::eval::eval(argument, arena, params, columns)?;
+                let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(value.type_oid()) else {
+                    return Ok(None);
+                };
+                ctype
+            }
+        };
+    }
+    let mut qualified = StackStr::<128>::new();
+    let name = if let Some(schema) = tref.schema {
+        write!(qualified, "{schema}.{}", tref.table).map_err(|_| arena_full())?;
+        qualified.as_str()
+    } else {
+        tref.table
+    };
+    let Some(slot) =
+        storage.routine_slot_for_table_call_types(name, &argument_types[..args.len()], txid)
+    else {
+        return Ok(None);
+    };
+    storage.require_routine_execute(slot, txid)?;
+    Ok(Some(storage.routine(slot)))
+}
+
+/// Materializes built-in and SQL-language table-function rows as projected records.
 pub(super) fn table_func_rows<'a>(
     tref: &'a TableRef<'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    table_func_rows_outer(tref, storage, arena, params, &crate::sql::eval::NoColumns)
+    table_func_rows_outer(
+        tref,
+        storage,
+        txid,
+        arena,
+        params,
+        &crate::sql::eval::NoColumns,
+    )
 }
 
 /// [`table_func_rows`] evaluating the function's arguments against `columns` — an
@@ -752,15 +807,16 @@ pub(super) fn table_func_rows<'a>(
 pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let rows = table_func_base_rows_outer(tref, storage, arena, params, columns)?;
+    let rows = table_func_base_rows_outer(tref, storage, txid, arena, params, columns)?;
     if !tref.with_ordinality {
         return Ok(rows);
     }
-    let def = table_func_def_outer(tref, arena, params, columns)?;
+    let def = table_func_def_outer(tref, storage, txid, arena, params, columns)?;
     let base_columns = def.n_columns - 1;
     const EMPTY: &[u8] = &[];
     let wrapped = arena
@@ -781,6 +837,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
 fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
@@ -1262,6 +1319,88 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             *slot = crate::sql::exec::encode_projected_pub(&[v], arena)?;
         }
         return Ok(&*rows);
+    }
+    if !tref.table.eq_ignore_ascii_case("generate_series") {
+        let Some(routine) = table_func_routine(tref, storage, txid, arena, params, columns)? else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "table function \"{}\" is not supported",
+                tref.table
+            ));
+        };
+        let result_type = routine.kind.function_result().expect("set routine result");
+        let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (slot, argument) in args.iter().enumerate() {
+            let value = crate::sql::eval::eval(argument, arena, params, columns)?;
+            let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            routine_params[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
+        }
+        let mut parser = Parser::new(routine.body.as_str(), arena)
+            .map_err(|error| parse_error_to_sql(&error))?;
+        let Some(Stmt::Select(select)) = parser
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?
+        else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must be a SELECT query"
+            ));
+        };
+        if parser
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must contain one SELECT query"
+            ));
+        }
+        const EMPTY: &[u8] = &[];
+        let mut rows: *mut &[u8] = core::ptr::null_mut();
+        let mut len = 0usize;
+        let mut cap = 0usize;
+        super::select_into_rows(
+            storage,
+            txid,
+            &select,
+            arena,
+            &routine_params[..args.len()],
+            None,
+            None,
+            &mut |values| {
+                if values.len() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "SQL function query must return one column"
+                    ));
+                }
+                let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
+                let value = crate::sql::exec::decode_projected_pub(projected, 0);
+                let value = crate::sql::eval::cast_to(value, result_type, arena)?;
+                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                if len == cap {
+                    let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                    let fresh = arena
+                        .alloc_slice_with(new_cap, |_| EMPTY)
+                        .map_err(|_| arena_full())?;
+                    if len > 0 {
+                        let prior = unsafe { core::slice::from_raw_parts(rows, len) };
+                        fresh[..len].copy_from_slice(prior);
+                    }
+                    rows = fresh.as_mut_ptr();
+                    cap = new_cap;
+                }
+                unsafe { rows.add(len).write(encoded) };
+                len += 1;
+                Ok(())
+            },
+        )?;
+        return Ok(if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(rows, len) }
+        });
     }
     if args.len() != 2 && args.len() != 3 {
         return Err(sql_err!(

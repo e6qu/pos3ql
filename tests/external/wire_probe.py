@@ -731,6 +731,24 @@ def test_catalog_aware_binary_bind_parameters():
         has_sqlstate(messages, "23514"),
         messages,
     )
+    simple_query(
+        s,
+        "CREATE TABLE wire_routine_values (id integer, value integer); "
+        "INSERT INTO wire_routine_values VALUES (1, 40), (2, 41); "
+        "CREATE FUNCTION wire_values_from(integer) RETURNS SETOF integer LANGUAGE SQL "
+        "AS 'SELECT value FROM wire_routine_values WHERE id >= $1'",
+    )
+    messages = extended_binary_parameter(
+        s,
+        "SELECT value FROM wire_values_from($1) AS values_from(value) ORDER BY value",
+        23,
+        struct.pack("!i", 1),
+    )
+    check(
+        "binary Bind resolves a set-returning SQL function parameter",
+        [first_text_row([message]) for message in messages if message[0] == b"D"] == ["40", "41"],
+        messages,
+    )
     s.close()
 
 

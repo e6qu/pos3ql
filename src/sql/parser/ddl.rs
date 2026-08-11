@@ -859,11 +859,15 @@ impl<'a> Parser<'a> {
                     name,
                     table,
                     columns,
+                    predicate,
+                    predicate_text,
                     unique,
                 } => CreateSchemaElement::Index {
                     name,
                     table,
                     columns,
+                    predicate,
+                    predicate_text,
                     unique,
                 },
                 Stmt::CreateSequence {
@@ -956,10 +960,22 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         let columns = self.arena_slice(&columns[..n])?;
+        let (predicate, predicate_text) = if self.eat_ident("where")? {
+            let start = self.peek_at;
+            let predicate = self.expression(0)?;
+            (
+                Some(predicate),
+                Some(self.text[start..self.peek_at].trim_end()),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Stmt::CreateIndex {
             name,
             table,
             columns,
+            predicate,
+            predicate_text,
             unique,
         })
     }

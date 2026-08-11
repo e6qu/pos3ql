@@ -1632,6 +1632,7 @@ struct IdxInfo {
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
+    predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
 }
@@ -1652,6 +1653,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         let mut mk = |columns: &[u16],
                       descending: [bool; crate::storage::MAX_INDEX_COLS],
                       nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+                      predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
                       is_primary: bool,
                       is_unique: bool,
                       name: StackStr<64>| {
@@ -1666,6 +1668,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 descending,
                 nulls_first,
                 n_cols: columns.len(),
+                predicate,
                 is_primary,
                 is_unique,
             };
@@ -1680,6 +1683,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
+                    None,
                     true,
                     true,
                     name,
@@ -1692,6 +1696,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
+                    None,
                     false,
                     true,
                     name,
@@ -1704,6 +1709,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
+                None,
                 uk.is_primary,
                 true,
                 stack_str_64(uk.name.as_str()),
@@ -1715,6 +1721,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 &index.columns[..index.n_cols],
                 index.descending,
                 index.nulls_first,
+                index.predicate,
                 false,
                 index.unique,
                 stack_str_64(index.name_for(txid).as_str()),
@@ -1733,6 +1740,7 @@ fn empty_index() -> IdxInfo {
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
+        predicate: None,
         is_primary: false,
         is_unique: false,
     }
@@ -2704,6 +2712,9 @@ pub fn index_def_text<'a>(
             }
         }
         let _ = s.write_str(")");
+        if let Some(predicate) = info.predicate {
+            let _ = write!(s, " WHERE {}", predicate.as_str());
+        }
         return Ok(Some(alloc_rendered(
             &s,
             "index definition is too long",
@@ -4020,7 +4031,10 @@ fn pg_index<'a>(
                 Datum::Int4(info.n_cols as i32),
                 int2vector(&info.columns[..info.n_cols], arena)?,
                 option_array(&zeros[..info.n_cols], arena)?,
-                Datum::Null, // partial indexes are not yet accepted by the DDL grammar
+                match info.predicate {
+                    Some(predicate) => text(predicate.as_str(), arena)?,
+                    None => Datum::Null,
+                },
                 Datum::Bool(true),
                 Datum::Null,
                 empty_int_array(arena)?,
@@ -4961,6 +4975,9 @@ fn pg_indexes<'a>(
                 }
             }
             let _ = indexdef.write_str(")");
+            if let Some(predicate) = info.predicate {
+                let _ = write!(indexdef, " WHERE {}", predicate.as_str());
+            }
         }
         out[n] = row(
             &[

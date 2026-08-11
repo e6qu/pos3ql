@@ -12535,6 +12535,120 @@ fn create_index_and_unique() {
 }
 
 #[test]
+fn partial_indexes_are_typed_transactional_and_durable() {
+    let mut config = test_config("partial-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("partial-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE partial_rows (id integer, value text, active boolean); \
+         INSERT INTO partial_rows VALUES (1, 'same', true), (2, 'same', false); \
+         CREATE UNIQUE INDEX partial_active_value ON partial_rows (value) WHERE active",
+    );
+    let table = engine.storage.find_table("public", "partial_rows").unwrap();
+    assert!(
+        !engine.storage.value_cache_complete(table, &[1]),
+        "predicate membership cannot be represented by the full-table value cache"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO partial_rows VALUES (3, 'same', false)",
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO partial_rows VALUES (4, 'same', true)",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    let ignored = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO partial_rows VALUES (5, 'same', true) ON CONFLICT DO NOTHING",
+    );
+    assert!(
+        !String::from_utf8_lossy(&ignored).contains("ERROR"),
+        "targetless DO NOTHING must recognize a matching partial unique index: {}",
+        String::from_utf8_lossy(&ignored)
+    );
+    let invalid_arbiter = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO partial_rows VALUES (6, 'other', true) ON CONFLICT (value) DO NOTHING",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid_arbiter).contains("42P10"),
+        "a partial index cannot infer an arbiter without its predicate: {}",
+        String::from_utf8_lossy(&invalid_arbiter)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'partial_active_value'; \
+             SELECT indpred FROM pg_index index_catalog \
+             JOIN pg_class relation ON relation.oid = index_catalog.indexrelid \
+             WHERE relation.relname = 'partial_active_value'",
+        )),
+        [
+            "CREATE UNIQUE INDEX partial_active_value ON public.partial_rows USING btree (value) WHERE active",
+            "active",
+        ]
+    );
+    let non_boolean = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX partial_bad_type ON partial_rows (value) WHERE id",
+    );
+    assert!(String::from_utf8_lossy(&non_boolean).contains("42804"));
+    let unknown_column = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX partial_bad_column ON partial_rows (value) WHERE missing = 1",
+    );
+    assert!(String::from_utf8_lossy(&unknown_column).contains("42703"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE INDEX partial_rolled_back ON partial_rows (id) WHERE active; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'partial_rolled_back'",
+        )),
+        ["0"]
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'partial_active_value'; \
+             INSERT INTO partial_rows VALUES (5, 'same', false); \
+             INSERT INTO partial_rows VALUES (6, 'same', true)",
+        )),
+        [
+            "CREATE UNIQUE INDEX partial_active_value ON public.partial_rows USING btree (value) WHERE active"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn reindex_rebuilds_named_index_and_table_cache() {
     let (mut engine, mut budget) = test_engine();
     run_with(

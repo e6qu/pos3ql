@@ -556,6 +556,7 @@ struct CopiedIndex {
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
+    predicate: Option<crate::util::StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     unique: bool,
 }
 
@@ -576,6 +577,7 @@ fn copy_like_indexes(
             descending: [false; crate::storage::MAX_INDEX_COLS],
             nulls_first: [false; crate::storage::MAX_INDEX_COLS],
             n_cols: 0,
+            predicate: None,
             unique: false,
         }; MAX_LIKE_INDEXES];
         let mut n_copied = 0;
@@ -600,6 +602,7 @@ fn copy_like_indexes(
                 descending: index.descending,
                 nulls_first: index.nulls_first,
                 n_cols: index.n_cols,
+                predicate: index.predicate,
                 unique: index.unique,
             };
             n_copied += 1;
@@ -619,6 +622,7 @@ fn copy_like_indexes(
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
+                    predicate: index.predicate,
                     unique: index.unique,
                     ddl_state: crate::storage::CatalogDdlState::Present,
                 },
@@ -636,6 +640,7 @@ fn copy_like_indexes(
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
+                    predicate: index.predicate.as_ref().map(|text| text.as_str()),
                     unique: index.unique,
                 },
             ) {
@@ -734,6 +739,13 @@ enum Arbiter {
     Columns([u16; crate::storage::MAX_INDEX_COLS], usize),
 }
 
+#[derive(Clone, Copy)]
+struct PartialArbiter<'a> {
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_columns: usize,
+    predicate: &'a Expr<'a>,
+}
+
 /// Does some unique constraint/index on `def` cover exactly `want` (as a set,
 /// order-independent)? Validates an `ON CONFLICT (columns)` inference target.
 fn unique_arbiter_matches(storage: &Storage, def: &TableDef, want: &[u16], txid: u32) -> bool {
@@ -749,7 +761,7 @@ fn unique_arbiter_matches(storage: &Storage, def: &TableDef, want: &[u16], txid:
         }
     }
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if same(&index.columns[..index.n_cols]) {
+        if index.predicate.is_none() && same(&index.columns[..index.n_cols]) {
             return true;
         }
     }
@@ -774,7 +786,7 @@ fn arbiter_by_name(
         }
     }
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if index.name_for(txid).as_str() == name {
+        if index.predicate.is_none() && index.name_for(txid).as_str() == name {
             let n = index.n_cols;
             cols[..n].copy_from_slice(&index.columns[..n]);
             return Some((cols, n));
@@ -855,7 +867,8 @@ fn resolve_arbiter(
 /// Finds an existing visible row that conflicts with the candidate on the
 /// resolved [`Arbiter`] — the row `ON CONFLICT` acts on. NULLs are distinct, so
 /// a candidate with a NULL key column never conflicts.
-fn find_conflict(
+#[allow(clippy::too_many_arguments)]
+fn find_conflict<'a>(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
@@ -863,7 +876,32 @@ fn find_conflict(
     values: &[Datum],
     arbiter: &Arbiter,
     txid: u32,
+    arena: &'a Arena,
 ) -> Result<Option<u64>, SqlError> {
+    let partial_count = storage
+        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+        .filter(|index| index.predicate.is_some())
+        .count();
+    let partial = arena
+        .alloc_slice_with(partial_count, |_| None::<PartialArbiter<'a>>)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut next_partial = 0usize;
+    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        let Some(text) = index.predicate else {
+            continue;
+        };
+        let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+        columns[..index.n_cols].copy_from_slice(&index.columns[..index.n_cols]);
+        let source = arena
+            .alloc_str(text.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        partial[next_partial] = Some(PartialArbiter {
+            columns,
+            n_columns: index.n_cols,
+            predicate: crate::sql::parser::parse_expr(source, arena)?,
+        });
+        next_partial += 1;
+    }
     let mut found: Option<u64> = None;
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -909,7 +947,23 @@ fn find_conflict(
                     for index in
                         storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
                     {
-                        if key_hit(&index.columns[..index.n_cols])? {
+                        if index.predicate.is_none() && key_hit(&index.columns[..index.n_cols])? {
+                            return Ok(true);
+                        }
+                    }
+                    for partial_index in partial.iter().flatten() {
+                        if crate::sql::exec::constraints::index_predicate_matches(
+                            def,
+                            values,
+                            partial_index.predicate,
+                            arena,
+                        )? && crate::sql::exec::constraints::index_predicate_matches(
+                            def,
+                            &other,
+                            partial_index.predicate,
+                            arena,
+                        )? && key_hit(&partial_index.columns[..partial_index.n_columns])?
+                        {
                             return Ok(true);
                         }
                     }
@@ -995,7 +1049,16 @@ fn handle_conflict<'a>(
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
-    let Some(rowid) = find_conflict(storage, table_index, def, schema, values, arbiter, txn.txid)?
+    let Some(rowid) = find_conflict(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        arbiter,
+        txn.txid,
+        arena,
+    )?
     else {
         return Ok(ConflictOutcome::Store);
     };
@@ -9880,6 +9943,9 @@ pub fn create_index(
     name: &str,
     table: &QualName,
     index_columns: &[crate::sql::ast::IndexColumn<'_>],
+    predicate_expression: Option<&Expr<'_>>,
+    predicate_text: Option<&str>,
+    arena: &Arena,
     unique: bool,
     responder: &mut Responder,
 ) -> Outcome {
@@ -9904,6 +9970,18 @@ pub fn create_index(
         return sql_fail(error);
     }
     let tdef = *storage.table_def(table_index, txn.txid);
+    if let Some(predicate_expression) = predicate_expression {
+        let (type_oid, _) = match infer_type_pub(predicate_expression, Some(&tdef)) {
+            Ok(value) => value,
+            Err(error) => return sql_fail(error),
+        };
+        if type_oid != crate::sql::types::oid::BOOL {
+            return sql_fail(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of WHERE must be type boolean"
+            ));
+        }
+    }
     if index_columns.is_empty() || index_columns.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9934,6 +10012,13 @@ pub fn create_index(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    let predicate = match predicate_text {
+        Some(text) => match crate::storage::index_predicate_stackstr(text) {
+            Ok(predicate) => Some(predicate),
+            Err(error) => return sql_fail(error),
+        },
+        None => None,
+    };
     let def = IndexDef {
         schema: tdef.schema,
         name: sqlname,
@@ -9944,6 +10029,7 @@ pub fn create_index(
         descending,
         nulls_first,
         n_cols,
+        predicate,
         unique,
         ddl_state: crate::storage::CatalogDdlState::Present,
     };
@@ -9967,19 +10053,38 @@ pub fn create_index(
         storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-            check_index_tuple_size(&columns[..n_cols], &values[..tdef.n_columns])?;
+            if predicate_expression.is_none() {
+                check_index_tuple_size(&columns[..n_cols], &values[..tdef.n_columns])?;
+            }
             if unique {
-                check_unique_indexes(
-                    storage,
-                    table_index,
-                    &tdef,
-                    &schema[..tdef.n_columns],
-                    &values[..tdef.n_columns],
-                    Some(rowid),
-                    // The just-registered index is an uncommitted CREATE owned
-                    // by this transaction; validation must see it.
-                    txn.txid,
-                )?;
+                if let Some(predicate_expression) = predicate_expression {
+                    crate::sql::exec::constraints::enforce_partial_index_uniqueness(
+                        storage,
+                        table_index,
+                        &tdef,
+                        &schema[..tdef.n_columns],
+                        &values[..tdef.n_columns],
+                        Some(rowid),
+                        txn.txid,
+                        &columns[..n_cols],
+                        &crate::sql::exec::constraints::ConstraintName::Named(name),
+                        predicate_expression,
+                        arena,
+                    )?;
+                } else {
+                    check_unique_indexes(
+                        storage,
+                        table_index,
+                        &tdef,
+                        &schema[..tdef.n_columns],
+                        &values[..tdef.n_columns],
+                        Some(rowid),
+                        // The just-registered index is an uncommitted CREATE owned
+                        // by this transaction; validation must see it.
+                        txn.txid,
+                        arena,
+                    )?;
+                }
             }
             Ok(())
         })?;
@@ -10008,6 +10113,7 @@ pub fn create_index(
             descending,
             nulls_first,
             n_cols,
+            predicate: predicate.as_ref().map(|text| text.as_str()),
             unique,
         },
     ) {

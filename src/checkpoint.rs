@@ -2251,6 +2251,18 @@ impl Checkpointer {
                         Some(mask) => parse_field(Some(mask), "idx nulls-first mask")?,
                         None => 0,
                     };
+                    let predicate = match words.next() {
+                        Some("-") | None => None,
+                        Some(hex) => Some(
+                            crate::storage::index_predicate_stackstr(&decode_hex_name(hex)?)
+                                .map_err(|_| {
+                                    CheckpointSetupError::Corrupt("idx predicate too long")
+                                })?,
+                        ),
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
+                    }
                     if descending_mask >> n_cols != 0 || nulls_first_mask >> n_cols != 0 {
                         return Err(CheckpointSetupError::Corrupt("bad index ordering mask"));
                     }
@@ -2272,6 +2284,7 @@ impl Checkpointer {
                                 descending,
                                 nulls_first,
                                 n_cols,
+                                predicate,
                                 unique: unique != 0,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
                             },
@@ -3575,7 +3588,7 @@ impl Checkpointer {
             )?;
         }
         // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>
-        // <hex-schema> <descending-mask> <nulls-first-mask>`.
+        // <hex-schema> <descending-mask> <nulls-first-mask> <hex-predicate|->`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
@@ -3600,10 +3613,21 @@ impl Checkpointer {
                 descending_mask |= u16::from(index.descending[i]) << i;
                 nulls_first_mask |= u16::from(index.nulls_first[i]) << i;
             }
+            let predicate = match index.predicate {
+                Some(text) => {
+                    let mut hex =
+                        StackStr::<{ crate::storage::INDEX_PREDICATE_MAX * 2 + 2 }>::new();
+                    for byte in text.as_str().as_bytes() {
+                        let _ = write!(hex, "{byte:02x}");
+                    }
+                    hex
+                }
+                None => StackStr::from_str("-"),
+            };
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {} {} {}",
+                    "idx {} {} {}{} {} {} {} {} {}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -3612,6 +3636,7 @@ impl Checkpointer {
                     hschema.as_str(),
                     descending_mask,
                     nulls_first_mask,
+                    predicate.as_str(),
                 ),
             )?;
         }

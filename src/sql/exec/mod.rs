@@ -553,9 +553,11 @@ fn remap_columns(
 #[derive(Clone, Copy)]
 struct CopiedIndex {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
+    include_columns: [u16; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
+    n_include_cols: usize,
     predicate: Option<crate::util::StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     unique: bool,
 }
@@ -574,9 +576,11 @@ fn copy_like_indexes(
         // Collected up front: creating one needs `storage` mutably.
         let mut copied = [CopiedIndex {
             columns: [0; crate::storage::MAX_INDEX_COLS],
+            include_columns: [0; crate::storage::MAX_INDEX_COLS],
             descending: [false; crate::storage::MAX_INDEX_COLS],
             nulls_first: [false; crate::storage::MAX_INDEX_COLS],
             n_cols: 0,
+            n_include_cols: 0,
             predicate: None,
             unique: false,
         }; MAX_LIKE_INDEXES];
@@ -599,9 +603,11 @@ fn copy_like_indexes(
             }
             copied[n_copied] = CopiedIndex {
                 columns: index.columns,
+                include_columns: index.include_columns,
                 descending: index.descending,
                 nulls_first: index.nulls_first,
                 n_cols: index.n_cols,
+                n_include_cols: index.n_include_cols,
                 predicate: index.predicate,
                 unique: index.unique,
             };
@@ -610,6 +616,8 @@ fn copy_like_indexes(
         let source = source_def;
         for index in &copied[..n_copied] {
             let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
+            let include_columns =
+                remap_columns(def, &source, &index.include_columns[..index.n_include_cols])?;
             let name = auto_key_name(def, &columns[..index.n_cols], "idx", true)?;
             let slot = storage.create_index(
                 IndexDef {
@@ -619,9 +627,11 @@ fn copy_like_indexes(
                     table: def.name,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
+                    include_columns,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
+                    n_include_cols: index.n_include_cols,
                     predicate: index.predicate,
                     unique: index.unique,
                     ddl_state: crate::storage::CatalogDdlState::Present,
@@ -637,9 +647,11 @@ fn copy_like_indexes(
                     name: name.as_str(),
                     table: def.name.as_str(),
                     columns,
+                    include_columns,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
+                    n_include_cols: index.n_include_cols,
                     predicate: index.predicate.as_ref().map(|text| text.as_str()),
                     unique: index.unique,
                 },
@@ -9943,6 +9955,7 @@ pub fn create_index(
     name: &str,
     table: &QualName,
     index_columns: &[crate::sql::ast::IndexColumn<'_>],
+    include_column_names: &[&str],
     predicate_expression: Option<&Expr<'_>>,
     predicate_text: Option<&str>,
     arena: &Arena,
@@ -9990,6 +10003,7 @@ pub fn create_index(
         ));
     }
     let mut columns = [0u16; MAX_INDEX_COLS];
+    let mut include_columns = [0u16; MAX_INDEX_COLS];
     let mut descending = [false; MAX_INDEX_COLS];
     let mut nulls_first = [false; MAX_INDEX_COLS];
     for (i, index_column) in index_columns.iter().enumerate() {
@@ -10003,6 +10017,32 @@ pub fn create_index(
         columns[i] = column_index as u16;
         descending[i] = index_column.descending;
         nulls_first[i] = index_column.nulls_first;
+    }
+    if include_column_names.len() > MAX_INDEX_COLS {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "an index may include at most {} columns",
+            MAX_INDEX_COLS
+        ));
+    }
+    for (i, name) in include_column_names.iter().enumerate() {
+        let Some(column_index) = tdef.column_index(name) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ));
+        };
+        if columns[..index_columns.len()].contains(&(column_index as u16))
+            || include_columns[..i].contains(&(column_index as u16))
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column \"{}\" appears more than once in index definition",
+                name
+            ));
+        }
+        include_columns[i] = column_index as u16;
     }
     // The written column list's length — not the fixed array's, whose
     // padding would quietly widen the index's tuple (a UNIQUE index on (b)
@@ -10026,9 +10066,11 @@ pub fn create_index(
         table: tdef.name,
         ownership: crate::storage::Ownership::BOOTSTRAP,
         columns,
+        include_columns,
         descending,
         nulls_first,
         n_cols,
+        n_include_cols: include_column_names.len(),
         predicate,
         unique,
         ddl_state: crate::storage::CatalogDdlState::Present,
@@ -10110,9 +10152,11 @@ pub fn create_index(
             name,
             table: tdef.name.as_str(),
             columns,
+            include_columns,
             descending,
             nulls_first,
             n_cols,
+            n_include_cols: include_column_names.len(),
             predicate: predicate.as_ref().map(|text| text.as_str()),
             unique,
         },

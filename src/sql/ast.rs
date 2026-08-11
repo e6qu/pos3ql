@@ -26,6 +26,7 @@ pub enum CreateSchemaElement<'a> {
         name: &'a str,
         table: QualName<'a>,
         columns: &'a [IndexColumn<'a>],
+        include_columns: &'a [&'a str],
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
         unique: bool,
@@ -292,6 +293,9 @@ pub enum Stmt<'a> {
         name: &'a str,
         table: QualName<'a>,
         columns: &'a [IndexColumn<'a>],
+        /// Non-key covering columns. A distinct AST field makes it impossible
+        /// for execution to accidentally use them for ordering or uniqueness.
+        include_columns: &'a [&'a str],
         /// The parsed `WHERE` membership predicate. Keeping this separate
         /// from the durable spelling makes an absent predicate impossible to
         /// confuse with an always-true one.

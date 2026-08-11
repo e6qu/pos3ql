@@ -164,9 +164,35 @@ impl<'a> Parser<'a> {
         }
         let kind = if function {
             self.expect_ident("returns")?;
-            RoutineCreateKind::Function {
-                set_returning: self.eat_ident("setof")?,
-                result_type: self.any_ident("function return type")?,
+            if self.eat_ident("table")? {
+                self.expect_op("(")?;
+                let mut columns = [RoutineArgument {
+                    name: "",
+                    type_name: "",
+                }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut column_count = 0;
+                loop {
+                    if column_count == columns.len() {
+                        return Err(self.limit("function result columns", columns.len()));
+                    }
+                    columns[column_count] = RoutineArgument {
+                        name: self.any_ident("function result column")?,
+                        type_name: self.any_ident("function result column type")?,
+                    };
+                    column_count += 1;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+                RoutineCreateKind::TableFunction {
+                    columns: self.arena_slice(&columns[..column_count])?,
+                }
+            } else {
+                RoutineCreateKind::Function {
+                    set_returning: self.eat_ident("setof")?,
+                    result_type: self.any_ident("function return type")?,
+                }
             }
         } else {
             RoutineCreateKind::Procedure

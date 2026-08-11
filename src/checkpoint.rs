@@ -1908,8 +1908,6 @@ impl Checkpointer {
                             .ok_or(CheckpointSetupError::Corrupt("routine owner missing"))?,
                     )?;
                     let result_code: u8 = parse_field(words.next(), "routine result type")?;
-                    let result = ColType::from_code(result_code)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid routine result type"))?;
                     let argument_count: usize =
                         parse_field(words.next(), "routine argument count")?;
                     if argument_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
@@ -1945,21 +1943,62 @@ impl Checkpointer {
                             CheckpointSetupError::Corrupt("invalid routine argument type"),
                         )?;
                     }
+                    let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
+                        crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    let mut result_column_count = 0;
                     let kind = match words.next() {
                         None => crate::storage::RoutineKind::Function {
-                            result,
-                            set_returning: false,
+                            result: ColType::from_code(result_code).ok_or(
+                                CheckpointSetupError::Corrupt("invalid routine result type"),
+                            )?,
                         },
                         Some(code) => {
                             let code: u8 = parse_field(Some(code), "routine kind")?;
-                            let kind = crate::storage::RoutineKind::from_wire_code(code, result)
+                            if code == 3 {
+                                result_column_count =
+                                    parse_field(words.next(), "routine result column count")?;
+                                if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "too many routine result columns",
+                                    ));
+                                }
+                                for column in &mut result_columns[..result_column_count] {
+                                    column.name = sql_name(&decode_hex_name(
+                                        words.next().ok_or(CheckpointSetupError::Corrupt(
+                                            "routine result column name missing",
+                                        ))?,
+                                    )?)?;
+                                    let type_code: u8 =
+                                        parse_field(words.next(), "routine result column type")?;
+                                    column.ctype = ColType::from_code(type_code).ok_or(
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid routine result column type",
+                                        ),
+                                    )?;
+                                }
+                                if words.next().is_some() {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "malformed routine record",
+                                    ));
+                                }
+                                crate::storage::RoutineKind::TableFunction
+                            } else {
+                                let kind = crate::storage::RoutineKind::from_wire_code(
+                                    code,
+                                    ColType::from_code(result_code).ok_or(
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid routine result type",
+                                        ),
+                                    )?,
+                                )
                                 .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed routine record",
-                                ));
+                                if words.next().is_some() {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "malformed routine record",
+                                    ));
+                                }
+                                kind
                             }
-                            kind
                         }
                     };
                     let owner = storage
@@ -1982,6 +2021,8 @@ impl Checkpointer {
                                 arguments,
                                 argument_count,
                                 kind,
+                                result_columns,
+                                result_column_count,
                                 body,
                             },
                             0,
@@ -3602,10 +3643,27 @@ impl Checkpointer {
                     argument.ctype.code()
                 );
             }
+            let mut result_columns =
+                StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 132 }>::new();
+            if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+                let _ = write!(result_columns, " {}", routine.result_column_count);
+                for column in &routine.result_columns[..routine.result_column_count] {
+                    let mut column_name = StackStr::<130>::new();
+                    for byte in column.name.as_str().as_bytes() {
+                        let _ = write!(column_name, "{byte:02x}");
+                    }
+                    let _ = write!(
+                        result_columns,
+                        " {} {}",
+                        column_name.as_str(),
+                        column.ctype.code()
+                    );
+                }
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{} {}",
+                    "rtn {} {} {} {} {} {} {}{} {}{}",
                     routine.created_at,
                     owner.as_str(),
                     routine
@@ -3619,6 +3677,7 @@ impl Checkpointer {
                     body.as_str(),
                     arguments.as_str(),
                     routine.kind.wire_code(),
+                    result_columns.as_str(),
                 ),
             )?;
         }

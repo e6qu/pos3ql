@@ -1734,7 +1734,7 @@ pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
         .expect("routine OID range exhausted")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoutineArgumentDef {
     pub name: SqlName,
     pub ctype: ColType,
@@ -1748,6 +1748,8 @@ pub(crate) struct RoutineSpec {
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
     pub kind: RoutineKind,
+    pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub result_column_count: usize,
     pub body: StackStr<ROUTINE_SQL_MAX>,
 }
 
@@ -1756,63 +1758,46 @@ pub(crate) struct RoutineSpec {
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutineKind {
-    Function {
-        result: ColType,
-        set_returning: bool,
-    },
+    Function { result: ColType },
+    SetFunction { result: ColType },
+    TableFunction,
     Procedure,
 }
 
 impl RoutineKind {
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
-            Self::Function { result, .. } => Some(result),
+            Self::Function { result } | Self::SetFunction { result } => Some(result),
+            Self::TableFunction => Some(ColType::Record),
             Self::Procedure => None,
         }
     }
 
     pub(crate) const fn is_set_returning(self) -> bool {
-        matches!(
-            self,
-            Self::Function {
-                set_returning: true,
-                ..
-            }
-        )
+        matches!(self, Self::SetFunction { .. } | Self::TableFunction)
     }
 
     pub(crate) const fn catalog_kind(self) -> &'static str {
         match self {
-            Self::Function { .. } => "f",
+            Self::Function { .. } | Self::SetFunction { .. } | Self::TableFunction => "f",
             Self::Procedure => "p",
         }
     }
 
     pub(crate) const fn wire_code(self) -> u8 {
         match self {
-            Self::Function {
-                set_returning: false,
-                ..
-            } => 0,
-            Self::Function {
-                set_returning: true,
-                ..
-            } => 2,
+            Self::Function { .. } => 0,
+            Self::SetFunction { .. } => 2,
+            Self::TableFunction => 3,
             Self::Procedure => 1,
         }
     }
 
     pub(crate) const fn from_wire_code(code: u8, result: ColType) -> Option<Self> {
         match code {
-            0 => Some(Self::Function {
-                result,
-                set_returning: false,
-            }),
+            0 => Some(Self::Function { result }),
             1 => Some(Self::Procedure),
-            2 => Some(Self::Function {
-                result,
-                set_returning: true,
-            }),
+            2 => Some(Self::SetFunction { result }),
             _ => None,
         }
     }
@@ -1836,9 +1821,8 @@ impl RoutineArgumentDef {
     };
 }
 
-/// A durable scalar SQL-language routine.  Arguments and result type are
-/// stored as parsed types, so catalog rendering and execution cannot disagree
-/// over a textual type spelling.
+/// A durable SQL-language routine. Arguments and result contracts are stored
+/// as parsed types, so catalog rendering and execution cannot disagree.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RoutineDef {
     pub created_at: u64,
@@ -1848,6 +1832,8 @@ pub(crate) struct RoutineDef {
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
     pub kind: RoutineKind,
+    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) result_column_count: usize,
     pub body: StackStr<ROUTINE_SQL_MAX>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -1863,8 +1849,9 @@ impl RoutineDef {
         argument_count: 0,
         kind: RoutineKind::Function {
             result: ColType::Text,
-            set_returning: false,
         },
+        result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+        result_column_count: 0,
         body: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
@@ -1876,6 +1863,11 @@ impl RoutineDef {
 
     pub(crate) fn arguments(&self) -> &[RoutineArgumentDef] {
         &self.arguments[..self.argument_count]
+    }
+
+    pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
+        matches!(self.kind, RoutineKind::TableFunction)
+            .then_some(&self.result_columns[..self.result_column_count])
     }
 
     pub(crate) fn schema_for(&self, txid: u32) -> SqlName {
@@ -12073,8 +12065,48 @@ impl Storage {
             arguments,
             argument_count,
             kind,
+            result_columns,
+            result_column_count,
             body,
         } = spec;
+        match kind {
+            RoutineKind::TableFunction => {
+                if result_column_count == 0 || result_column_count > result_columns.len() {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "table function must have between one and {} result columns",
+                        result_columns.len()
+                    ));
+                }
+                if result_columns[..result_column_count]
+                    .iter()
+                    .enumerate()
+                    .any(|(index, column)| {
+                        result_columns[..index]
+                            .iter()
+                            .any(|prior| prior.name == column.name)
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "table function result column names must be distinct"
+                    ));
+                }
+            }
+            RoutineKind::Function { .. }
+            | RoutineKind::SetFunction { .. }
+            | RoutineKind::Procedure
+                if result_column_count != 0 =>
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "only table functions may define result columns"
+                ));
+            }
+            RoutineKind::Function { .. }
+            | RoutineKind::SetFunction { .. }
+            | RoutineKind::Procedure => {}
+        }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
             (routine.schema_for(txid) == schema
@@ -12138,6 +12170,8 @@ impl Storage {
             arguments,
             argument_count,
             kind,
+            result_columns,
+            result_column_count,
             body,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -12202,6 +12236,8 @@ impl Storage {
                 arguments: definition.arguments,
                 argument_count: definition.argument_count,
                 kind: definition.kind,
+                result_columns: definition.result_columns,
+                result_column_count: definition.result_column_count,
                 body: definition.body,
             },
             0,

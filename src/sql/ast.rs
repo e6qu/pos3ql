@@ -1224,6 +1224,9 @@ pub enum RoutineCreateKind<'a> {
         result_type: &'a str,
         set_returning: bool,
     },
+    TableFunction {
+        columns: &'a [RoutineArgument<'a>],
+    },
     Procedure,
 }
 

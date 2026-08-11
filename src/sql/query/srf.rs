@@ -608,20 +608,28 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // family (two columns), a single column named per the function otherwise.
     // generate_series yields int8; regexp_matches yields text[]; unnest yields
     // the array's element type; array_elements' default column is `value`.
-    let mut default_cols: [(&str, ColType); 2] = [("", ColType::Bool); 2];
+    let mut default_cols: [(SqlName, ColType); MAX_COLUMNS] =
+        [(SqlName::EMPTY, ColType::Bool); MAX_COLUMNS];
     let n_default = if let Some(routine) = routine {
-        default_cols[0] = (
-            name,
-            routine.kind.function_result().expect("set routine result"),
-        );
-        1
+        if let Some(output) = routine.table_columns() {
+            for (slot, column) in output.iter().enumerate() {
+                default_cols[slot] = (column.name, column.ctype);
+            }
+            output.len()
+        } else {
+            default_cols[0] = (
+                SqlName::parse(name)?,
+                routine.kind.function_result().expect("set routine result"),
+            );
+            1
+        }
     } else if is_sequence_data {
-        default_cols[0] = ("last_value", ColType::Int8);
-        default_cols[1] = ("is_called", ColType::Bool);
+        default_cols[0] = (SqlName::parse("last_value")?, ColType::Int8);
+        default_cols[1] = (SqlName::parse("is_called")?, ColType::Bool);
         2
     } else if is_options {
-        default_cols[0] = ("option_name", ColType::Text);
-        default_cols[1] = ("option_value", ColType::Text);
+        default_cols[0] = (SqlName::parse("option_name")?, ColType::Text);
+        default_cols[1] = (SqlName::parse("option_value")?, ColType::Text);
         2
     } else if is_each {
         let value_type = if tref.table.eq_ignore_ascii_case("json_each") {
@@ -631,8 +639,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         } else {
             ColType::Text // json_each_text / jsonb_each_text
         };
-        default_cols[0] = ("key", ColType::Text);
-        default_cols[1] = ("value", value_type);
+        default_cols[0] = (SqlName::parse("key")?, ColType::Text);
+        default_cols[1] = (SqlName::parse("value")?, value_type);
         2
     } else {
         let single_type = if is_gs {
@@ -680,7 +688,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         };
         // A single-column function's default column name is `value` for
         // array_elements, else the (aliased) function name.
-        default_cols[0] = (if is_elems { "value" } else { name }, single_type);
+        default_cols[0] = (
+            SqlName::parse(if is_elems { "value" } else { name })?,
+            single_type,
+        );
         1
     };
     // `WITH ORDINALITY` appends a `bigint` ordinality column.
@@ -706,9 +717,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         let col_name = tref
             .col_alias
             .and_then(|a| a.get(i).copied())
-            .unwrap_or(default_name);
+            .map(SqlName::parse)
+            .transpose()?
+            .unwrap_or(*default_name);
         columns[i] = ColumnMeta {
-            name: SqlName::parse(col_name)?,
+            name: col_name,
             ctype: *ctype,
             ..blank
         };
@@ -717,9 +730,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         let col_name = tref
             .col_alias
             .and_then(|a| a.get(n_default).copied())
-            .unwrap_or("ordinality");
+            .map(SqlName::parse)
+            .transpose()?
+            .unwrap_or(SqlName::parse("ordinality")?);
         columns[n_default] = ColumnMeta {
-            name: SqlName::parse(col_name)?,
+            name: col_name,
             ctype: ColType::Int8,
             ..blank
         };
@@ -1328,7 +1343,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 tref.table
             ));
         };
-        let result_type = routine.kind.function_result().expect("set routine result");
+        let table_columns = routine.table_columns();
+        let scalar_result = routine.kind.function_result();
         let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in args.iter().enumerate() {
             let value = crate::sql::eval::eval(argument, arena, params, columns)?;
@@ -1369,16 +1385,37 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             None,
             None,
             &mut |values| {
-                if values.len() != 1 {
+                let expected_columns = table_columns.map_or(1, <[_]>::len);
+                if values.len() != expected_columns {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return one column"
+                        "SQL function query must return {} column{}",
+                        expected_columns,
+                        if expected_columns == 1 { "" } else { "s" }
                     ));
                 }
-                let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
-                let value = crate::sql::exec::decode_projected_pub(projected, 0);
-                let value = crate::sql::eval::cast_to(value, result_type, arena)?;
-                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                let encoded = if let Some(output) = table_columns {
+                    let mut cast = [Datum::Null; MAX_COLUMNS];
+                    for (slot, column) in output.iter().enumerate() {
+                        let projected =
+                            crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
+                        cast[slot] = crate::sql::eval::cast_to(
+                            crate::sql::exec::decode_projected_pub(projected, 0),
+                            column.ctype,
+                            arena,
+                        )?;
+                    }
+                    crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
+                } else {
+                    let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
+                    let value = crate::sql::exec::decode_projected_pub(projected, 0);
+                    let value = crate::sql::eval::cast_to(
+                        value,
+                        scalar_result.expect("set routine result"),
+                        arena,
+                    )?;
+                    crate::sql::exec::encode_projected_pub(&[value], arena)?
+                };
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
                     let fresh = arena

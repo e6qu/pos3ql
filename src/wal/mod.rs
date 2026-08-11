@@ -405,9 +405,11 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         table: &'a str,
         columns: [u16; MAX_INDEX_COLS],
+        include_columns: [u16; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
+        n_include_cols: usize,
         /// Absent for a full-table index; otherwise the canonical predicate
         /// source persisted alongside the physical key columns.
         predicate: Option<&'a str>,
@@ -1404,6 +1406,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             n_cols,
             predicate,
+            n_include_cols,
             ..
         } => {
             1 + name.len()
@@ -1418,6 +1421,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + n_cols
                 + 2
                 + predicate.map_or(0, |text| 2 + text.len())
+                + 2
+                + n_include_cols * 2
         }
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameIndex {
@@ -1869,9 +1874,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             table,
             columns,
+            include_columns,
             descending,
             nulls_first,
             n_cols,
+            n_include_cols,
             predicate,
             unique,
         } => {
@@ -1896,6 +1903,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
                 None => buffer.append(&[0]),
             };
+            ok &= buffer.append(&[0xa3, *n_include_cols as u8]);
+            for column in &include_columns[..*n_include_cols] {
+                ok &= buffer.append(&column.to_le_bytes());
+            }
             ok
         }
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
@@ -2985,6 +2996,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let mut descending = [false; MAX_INDEX_COLS];
             let mut nulls_first = [false; MAX_INDEX_COLS];
             let mut predicate = None;
+            let mut include_columns = [0u16; MAX_INDEX_COLS];
+            let mut n_include_cols = 0usize;
             if at < payload.len() {
                 if *payload.get(at)? != 0xa1 {
                     return None;
@@ -3019,14 +3032,31 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     _ => return None,
                 }
             }
+            if at < payload.len() {
+                if *payload.get(at)? != 0xa3 {
+                    return None;
+                }
+                at += 1;
+                n_include_cols = *payload.get(at)? as usize;
+                at += 1;
+                if n_include_cols > MAX_INDEX_COLS {
+                    return None;
+                }
+                for column in include_columns.iter_mut().take(n_include_cols) {
+                    *column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                }
+            }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 schema,
                 name,
                 table,
                 columns,
+                include_columns,
                 descending,
                 nulls_first,
                 n_cols,
+                n_include_cols,
                 predicate,
                 unique,
             })
@@ -4400,6 +4430,8 @@ mod tests {
             descending,
             nulls_first,
             n_cols,
+            include_columns,
+            n_include_cols,
             predicate,
             unique,
         }) = decode_op(KIND_CREATE_INDEX, &payload)
@@ -4414,6 +4446,8 @@ mod tests {
         assert!(!descending[..n_cols].iter().any(|direction| *direction));
         assert!(!nulls_first[..n_cols].iter().any(|placement| *placement));
         assert_eq!(predicate, None);
+        assert_eq!(n_include_cols, 0);
+        assert!(include_columns.iter().all(|column| *column == 0));
     }
 
     #[test]
@@ -4423,9 +4457,11 @@ mod tests {
             name: "active_values",
             table: "rows",
             columns: [1; MAX_INDEX_COLS],
+            include_columns: [2; MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
             n_cols: 1,
+            n_include_cols: 1,
             predicate: Some("active AND value IS NOT NULL"),
             unique: true,
         };
@@ -4438,11 +4474,17 @@ mod tests {
         .unwrap();
         assert!(append_payload(&mut payload, &operation));
         assert_eq!(payload.len(), encoded_payload_len(&operation));
-        let Some(WalOp::CreateIndex { predicate, .. }) =
-            decode_op(KIND_CREATE_INDEX, payload.readable())
+        let Some(WalOp::CreateIndex {
+            predicate,
+            include_columns,
+            n_include_cols,
+            ..
+        }) = decode_op(KIND_CREATE_INDEX, payload.readable())
         else {
             panic!("partial index WAL payload must decode");
         };
+        assert_eq!(n_include_cols, 1);
+        assert_eq!(include_columns[0], 2);
         assert_eq!(predicate, Some("active AND value IS NOT NULL"));
     }
 

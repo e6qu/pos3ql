@@ -12649,6 +12649,97 @@ fn partial_indexes_are_typed_transactional_and_durable() {
 }
 
 #[test]
+fn included_index_columns_are_distinct_durable_covering_metadata() {
+    let mut config = test_config("included-index-columns");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("included-index-columns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE covered_rows (key integer, payload text, note text); \
+         CREATE UNIQUE INDEX covered_key ON covered_rows (key) INCLUDE (payload, note); \
+         INSERT INTO covered_rows VALUES (1, 'one', 'first')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'covered_key'; \
+             SELECT indnatts, indnkeyatts, indkey FROM pg_index index_catalog \
+             JOIN pg_class relation ON relation.oid = index_catalog.indexrelid \
+             WHERE relation.relname = 'covered_key'",
+        )),
+        [
+            "CREATE UNIQUE INDEX covered_key ON public.covered_rows USING btree (key) INCLUDE (payload, note)",
+            "3|1|1 2 3",
+        ]
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO covered_rows VALUES (1, 'different', 'also different')",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    let repeated = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX duplicate_include ON covered_rows (key) INCLUDE (key)",
+    );
+    assert!(String::from_utf8_lossy(&repeated).contains("42701"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copied_cover (LIKE covered_rows INCLUDING INDEXES)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'copied_cover'",
+        )),
+        [
+            "CREATE UNIQUE INDEX copied_cover_key_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE INDEX rolled_cover ON covered_rows (key) INCLUDE (payload); ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'rolled_cover'",
+        )),
+        ["0"]
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'covered_key'",
+        )),
+        [
+            "CREATE UNIQUE INDEX covered_key ON public.covered_rows USING btree (key) INCLUDE (payload, note)"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn reindex_rebuilds_named_index_and_table_cache() {
     let (mut engine, mut budget) = test_engine();
     run_with(

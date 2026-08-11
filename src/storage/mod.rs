@@ -2391,9 +2391,13 @@ pub struct IndexDef {
     pub table: SqlName,
     pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
+    /// Covering columns are carried separately from key columns: they are
+    /// readable from the index relation but cannot affect key semantics.
+    pub include_columns: [u16; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
+    pub n_include_cols: usize,
     /// `None` denotes a full-table index. `Some` is the only representation
     /// of a partial index and is re-parsed before any membership decision.
     pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
@@ -3771,9 +3775,11 @@ impl Storage {
                     table: SqlName::parse("").expect("empty name fits"),
                     ownership: Ownership::BOOTSTRAP,
                     columns: [0; MAX_INDEX_COLS],
+                    include_columns: [0; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
+                    n_include_cols: 0,
                     predicate: None,
                     unique: false,
                     ddl_state: CatalogDdlState::Absent,

@@ -1629,9 +1629,11 @@ struct IdxInfo {
     table_slot: usize,
     name: StackStr<64>,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
+    include_columns: [u16; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
+    n_include_cols: usize,
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
@@ -1651,6 +1653,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
         let mut mk = |columns: &[u16],
+                      include_columns: &[u16],
                       descending: [bool; crate::storage::MAX_INDEX_COLS],
                       nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
                       predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
@@ -1659,15 +1662,19 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                       name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
+            let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
+            included[..include_columns.len()].copy_from_slice(include_columns);
             let info = IdxInfo {
                 oid: index_oid(slot, pos),
                 table_oid: toid,
                 table_slot: slot,
                 name,
                 columns: c,
+                include_columns: included,
                 descending,
                 nulls_first,
                 n_cols: columns.len(),
+                n_include_cols: include_columns.len(),
                 predicate,
                 is_primary,
                 is_unique,
@@ -1681,6 +1688,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
                     &[ci as u16],
+                    &[],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
                     None,
@@ -1694,6 +1702,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 );
                 visit(mk(
                     &[ci as u16],
+                    &[],
                     [false; crate::storage::MAX_INDEX_COLS],
                     [false; crate::storage::MAX_INDEX_COLS],
                     None,
@@ -1707,6 +1716,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         for uk in def.uniques() {
             visit(mk(
                 uk.columns(),
+                &[],
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
                 None,
@@ -1719,6 +1729,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
             visit(mk(
                 &index.columns[..index.n_cols],
+                &index.include_columns[..index.n_include_cols],
                 index.descending,
                 index.nulls_first,
                 index.predicate,
@@ -1737,9 +1748,11 @@ fn empty_index() -> IdxInfo {
         table_slot: 0,
         name: StackStr::new(),
         columns: [0; crate::storage::MAX_INDEX_COLS],
+        include_columns: [0; crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
+        n_include_cols: 0,
         predicate: None,
         is_primary: false,
         is_unique: false,
@@ -4016,6 +4029,10 @@ fn pg_index<'a>(
         // indkey is the 1-based attribute numbers as an int2vector-like array;
         // indoption is one flag per column (0 = default ascending).
         let zeros = [0u16; crate::storage::MAX_INDEX_COLS];
+        let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
+        attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
+        attributes[info.n_cols..info.n_cols + info.n_include_cols]
+            .copy_from_slice(&info.include_columns[..info.n_include_cols]);
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -4027,9 +4044,9 @@ fn pg_index<'a>(
                 Datum::Bool(true),  // constraints are checked immediately
                 Datum::Bool(false), // indisreplident
                 Datum::Bool(false), // NULL values are distinct by default
+                Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),
-                Datum::Int4(info.n_cols as i32),
-                int2vector(&info.columns[..info.n_cols], arena)?,
+                int2vector(&attributes[..info.n_cols + info.n_include_cols], arena)?,
                 option_array(&zeros[..info.n_cols], arena)?,
                 match info.predicate {
                     Some(predicate) => text(predicate.as_str(), arena)?,
@@ -4975,6 +4992,20 @@ fn pg_indexes<'a>(
                 }
             }
             let _ = indexdef.write_str(")");
+            if info.n_include_cols != 0 {
+                let _ = indexdef.write_str(" INCLUDE (");
+                for k in 0..info.n_include_cols {
+                    if k > 0 {
+                        let _ = indexdef.write_str(", ");
+                    }
+                    let _ = indexdef.write_str(
+                        table_def.columns()[info.include_columns[k] as usize]
+                            .name
+                            .as_str(),
+                    );
+                }
+                let _ = indexdef.write_str(")");
+            }
             if let Some(predicate) = info.predicate {
                 let _ = write!(indexdef, " WHERE {}", predicate.as_str());
             }

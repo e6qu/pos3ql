@@ -859,6 +859,7 @@ impl<'a> Parser<'a> {
                     name,
                     table,
                     columns,
+                    include_columns,
                     predicate,
                     predicate_text,
                     unique,
@@ -866,6 +867,7 @@ impl<'a> Parser<'a> {
                     name,
                     table,
                     columns,
+                    include_columns,
                     predicate,
                     predicate_text,
                     unique,
@@ -960,6 +962,25 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         let columns = self.arena_slice(&columns[..n])?;
+        let include_columns = if self.eat_ident("include")? {
+            self.expect_op("(")?;
+            let mut names = [""; MAX_LIST];
+            let mut count = 0;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("index included columns", names.len()));
+                }
+                names[count] = self.col_ident("included column name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            self.arena_slice(&names[..count])?
+        } else {
+            &[]
+        };
         let (predicate, predicate_text) = if self.eat_ident("where")? {
             let start = self.peek_at;
             let predicate = self.expression(0)?;
@@ -974,6 +995,7 @@ impl<'a> Parser<'a> {
             name,
             table,
             columns,
+            include_columns,
             predicate,
             predicate_text,
             unique,

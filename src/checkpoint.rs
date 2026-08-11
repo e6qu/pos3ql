@@ -2260,7 +2260,20 @@ impl Checkpointer {
                                 })?,
                         ),
                     };
-                    if words.next().is_some() {
+                    let n_include_cols: usize = match words.next() {
+                        Some(value) => parse_field(Some(value), "idx included column count")?,
+                        None => 0,
+                    };
+                    if n_include_cols > crate::storage::MAX_INDEX_COLS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "bad index included column count",
+                        ));
+                    }
+                    let mut include_columns = [0u16; crate::storage::MAX_INDEX_COLS];
+                    for column in include_columns.iter_mut().take(n_include_cols) {
+                        *column = parse_field(words.next(), "idx included column")?;
+                    }
+                    if words.next().is_some_and(|field| !field.is_empty()) {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
                     if descending_mask >> n_cols != 0 || nulls_first_mask >> n_cols != 0 {
@@ -2281,9 +2294,11 @@ impl Checkpointer {
                                 table: sql_name(&table)?,
                                 ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,
+                                include_columns,
                                 descending,
                                 nulls_first,
                                 n_cols,
+                                n_include_cols,
                                 predicate,
                                 unique: unique != 0,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
@@ -3588,12 +3603,17 @@ impl Checkpointer {
             )?;
         }
         // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>
-        // <hex-schema> <descending-mask> <nulls-first-mask> <hex-predicate|->`.
+        // <hex-schema> <descending-mask> <nulls-first-mask> <hex-predicate|->
+        // <ninclude> <include-cols...>`.
         for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
             for c in &index.columns[..index.n_cols] {
                 let _ = write!(columns, "{c} ");
+            }
+            let mut includes = StackStr::<128>::new();
+            for c in &index.include_columns[..index.n_include_cols] {
+                let _ = write!(includes, "{c} ");
             }
             let mut hex_name = StackStr::<130>::new();
             for b in index.name.as_str().as_bytes() {
@@ -3627,7 +3647,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {} {} {} {}",
+                    "idx {} {} {}{} {} {} {} {} {} {} {}",
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -3637,6 +3657,8 @@ impl Checkpointer {
                     descending_mask,
                     nulls_first_mask,
                     predicate.as_str(),
+                    index.n_include_cols,
+                    includes.as_str(),
                 ),
             )?;
         }

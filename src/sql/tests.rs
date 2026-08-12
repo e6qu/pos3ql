@@ -6270,6 +6270,38 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
 }
 
 #[test]
+fn setof_void_routine_is_a_typed_table_source() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION set_void() RETURNS SETOF void LANGUAGE SQL \
+         AS 'SELECT NULL UNION ALL SELECT NULL'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM set_void() AS result(value)",
+        )),
+        [crate::sql::types::oid::VOID]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM set_void() AS result(value)",
+        )),
+        ["2"]
+    );
+}
+
+#[test]
 fn schema_qualified_set_routine_is_a_typed_table_source() {
     let (mut engine, mut budget) = test_engine();
     run_with(

@@ -6063,12 +6063,6 @@ pub fn create_routine(
                     result_type
                 ));
             };
-            if set_returning && result == ColType::Void {
-                return sql_fail(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "functions returning setof void are not supported"
-                ));
-            }
             if set_returning {
                 crate::storage::RoutineKind::SetFunction { result }
             } else {

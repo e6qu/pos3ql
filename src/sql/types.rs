@@ -35,6 +35,8 @@ pub mod oid {
     pub const BIT: i32 = 1560;
     /// Variable-length bit string `bit varying(n)` / `varbit`.
     pub const VARBIT: i32 = 1562;
+    /// PostgreSQL's pseudo-type for an action-only function result.
+    pub const VOID: i32 = 2278;
     pub const BIT_ARRAY: i32 = 1561;
     pub const VARBIT_ARRAY: i32 = 1563;
     // Network address types.
@@ -91,6 +93,9 @@ pub mod oid {
 /// Column types the engine stores. A deliberately small, growing set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
+    /// `void` is a routine-result pseudo-type. It is never a stored column or
+    /// routine argument; a `void` result is represented by `Datum::Null`.
+    Void,
     Bool,
     /// `smallint`/`int2`. A real i16 datum with PostgreSQL's OID 21 and
     /// two-byte binary wire representation.
@@ -190,6 +195,11 @@ const ARRAY_CODE_BASE: u8 = 64;
 const RANGE_KINDS: u8 = 6;
 
 impl ColType {
+    /// Pseudo-types describe executor contracts rather than stored values.
+    pub const fn is_pseudo(self) -> bool {
+        matches!(self, Self::Void | Self::Record)
+    }
+
     /// Maps a SQL type name (already case-folded) to a column type.
     pub fn from_sql_name(name: &str) -> Option<Self> {
         // `element[]` is an array of a scalar element type.
@@ -203,6 +213,7 @@ impl ColType {
             return Some(Self::Multirange(k));
         }
         Some(match name {
+            "void" => Self::Void,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,
@@ -241,6 +252,7 @@ impl ColType {
 
     pub fn oid(self) -> i32 {
         match self {
+            Self::Void => oid::VOID,
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
@@ -284,6 +296,7 @@ impl ColType {
     pub fn from_oid(type_oid: i32) -> Option<ColType> {
         // Scalars.
         let scalar = match type_oid {
+            oid::VOID => Some(Self::Void),
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
@@ -395,6 +408,7 @@ impl ColType {
 
     pub fn typlen(self) -> i16 {
         match self {
+            Self::Void => 4,
             Self::Bool => 1,
             Self::Int2 => 2,
             Self::Int2Vector => -1,
@@ -435,6 +449,7 @@ impl ColType {
     /// The catalog (internal) name, used to title cast result columns.
     pub fn internal_name(self) -> &'static str {
         match self {
+            Self::Void => "void",
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
@@ -485,6 +500,7 @@ impl ColType {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Void => "void",
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
@@ -527,6 +543,9 @@ impl ColType {
     /// can never drift. Composite types fold in their element/kind `code()`.
     pub fn code(self) -> u8 {
         match self {
+            // Routine definitions persist their result type, including `void`.
+            // Row encoding separately rejects pseudo-types.
+            Self::Void => 57,
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
@@ -578,6 +597,7 @@ impl ColType {
     pub fn from_code(code: u8) -> Option<Self> {
         Some(match code {
             1 => Self::Bool,
+            57 => Self::Void,
             2 => Self::Int4,
             56 => Self::Oid,
             3 => Self::Int8,
@@ -1872,6 +1892,7 @@ mod tests {
     fn from_oid_inverts_oid() {
         // Every type the binary-parameter path can name by OID round-trips.
         let mut types = vec![
+            ColType::Void,
             ColType::Bool,
             ColType::Int2,
             ColType::Int4,
@@ -1965,6 +1986,7 @@ mod code_roundtrip_tests {
     #[test]
     fn every_coltype_code_roundtrips() {
         let mut types = vec![
+            ColType::Void,
             ColType::Bool,
             ColType::Int2,
             ColType::Int4,

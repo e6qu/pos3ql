@@ -5820,6 +5820,54 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "{}",
             String::from_utf8_lossy(&complete_dml_result)
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION clean_routine_value() RETURNS void LANGUAGE SQL \
+               AS 'DELETE FROM routine_lookup WHERE id = 2'",
+        );
+        assert_eq!(
+            row_description_type_oids(&describe_with(
+                &mut engine,
+                &mut budget,
+                "SELECT clean_routine_value()",
+            )),
+            [crate::sql::types::oid::VOID]
+        );
+        let void_result = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; SELECT clean_routine_value(); \
+             SELECT count(*) FROM routine_lookup; ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&void_result),
+            ["NULL", "2"],
+            "{}",
+            String::from_utf8_lossy(&void_result)
+        );
+        let void_column = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE invalid_void (value void)",
+        );
+        assert!(
+            String::from_utf8_lossy(&void_column).contains("42P16"),
+            "{}",
+            String::from_utf8_lossy(&void_column)
+        );
+        let void_transaction_control = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE OR REPLACE FUNCTION clean_routine_value() RETURNS void LANGUAGE SQL \
+               AS 'SAVEPOINT function_savepoint'; \
+             SELECT clean_routine_value()",
+        );
+        assert!(
+            String::from_utf8_lossy(&void_transaction_control).contains("25001"),
+            "{}",
+            String::from_utf8_lossy(&void_transaction_control)
+        );
         let utility_prelude = run_with(
             &mut engine,
             &mut budget,
@@ -5927,6 +5975,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut budget,
             "DELETE FROM routine_lookup WHERE id IN (3, 4, 5); \
              DROP FUNCTION create_routine_table(); DROP FUNCTION update_all_routine_values(); \
+             DROP FUNCTION clean_routine_value(); \
              DROP TABLE routine_created_in_function; \
              DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer); \
              DROP FUNCTION routine_path.write_on_path(integer); \

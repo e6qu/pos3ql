@@ -1363,6 +1363,7 @@ pub(super) fn correlated_where_passes<'a>(
 /// (no spurious error), matching that these accept an unknown literal as-is.
 fn type_witness(ct: ColType) -> Datum<'static> {
     match ct {
+        ColType::Void => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.
         ColType::Record => Datum::Record(&[]),
         ColType::Bool => Datum::Bool(false),

@@ -182,6 +182,8 @@ pub(crate) enum RoutinePrelude<'a> {
 pub(crate) enum RoutineFunctionResult<'a> {
     Query(&'a RoutineQuery<'a>),
     DataModification(&'a Stmt<'a>),
+    Void(&'a Stmt<'a>),
+    Forbidden(&'static str),
 }
 
 /// A SQL-language function program with one typed final result statement.
@@ -247,6 +249,7 @@ pub(crate) fn parse_routine_query_program<'a>(
 pub(crate) fn parse_routine_function_program<'a>(
     body: &'a str,
     arena: &'a Arena,
+    returns_void: bool,
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
     const MAX_ROUTINE_STATEMENTS: usize = 64;
     let mut parser = super::parser::Parser::new(body, arena)
@@ -276,25 +279,32 @@ pub(crate) fn parse_routine_function_program<'a>(
     let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
         return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
     };
-    let result = match last {
-        RoutinePrelude::Statement(Stmt::Select(query)) => RoutineFunctionResult::Query(
-            arena
-                .alloc(RoutineQuery::Select(*query))
-                .map_err(|_| arena_full())?,
-        ),
-        RoutinePrelude::Statement(Stmt::SetQuery(query)) => RoutineFunctionResult::Query(
-            arena
-                .alloc(RoutineQuery::Set(*query))
-                .map_err(|_| arena_full())?,
-        ),
-        RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
-            RoutineFunctionResult::DataModification(statement)
+    let result = if returns_void {
+        match last {
+            RoutinePrelude::Statement(statement) => RoutineFunctionResult::Void(statement),
+            RoutinePrelude::Forbidden(statement) => RoutineFunctionResult::Forbidden(statement),
         }
-        RoutinePrelude::Statement(_) | RoutinePrelude::Forbidden(_) => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
-            ));
+    } else {
+        match last {
+            RoutinePrelude::Statement(Stmt::Select(query)) => RoutineFunctionResult::Query(
+                arena
+                    .alloc(RoutineQuery::Select(*query))
+                    .map_err(|_| arena_full())?,
+            ),
+            RoutinePrelude::Statement(Stmt::SetQuery(query)) => RoutineFunctionResult::Query(
+                arena
+                    .alloc(RoutineQuery::Set(*query))
+                    .map_err(|_| arena_full())?,
+            ),
+            RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
+                RoutineFunctionResult::DataModification(statement)
+            }
+            RoutinePrelude::Statement(_) | RoutinePrelude::Forbidden(_) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
+                ));
+            }
         }
     };
     let preceding = arena
@@ -410,8 +420,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             .function_result()
             .expect("routine call resolution returns functions only");
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
-        let function_program =
-            parse_routine_function_program(routine.body.as_str(), self.routine_workspace)?;
+        let function_program = parse_routine_function_program(
+            routine.body.as_str(),
+            self.routine_workspace,
+            result_type == ColType::Void,
+        )?;
         if function_program.preceding.iter().any(|step| match step {
             RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
             RoutinePrelude::Forbidden(_) => true,
@@ -450,11 +463,39 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             )?;
         }
         let mut result = None;
-        let RoutineFunctionResult::Query(result_query) = function_program.result else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "data-modifying SQL function results require a top-level SELECT function(...) call"
-            ));
+        let result_query = match function_program.result {
+            RoutineFunctionResult::Query(result_query) => result_query,
+            RoutineFunctionResult::DataModification(_) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "data-modifying SQL function results require a top-level SELECT function(...) call"
+                ));
+            }
+            RoutineFunctionResult::Void(statement) => {
+                let query = match statement {
+                    Stmt::Select(query) => RoutineQuery::Select(*query),
+                    Stmt::SetQuery(query) => RoutineQuery::Set(*query),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "data-modifying SQL functions require a top-level SELECT function(...) call"
+                        ));
+                    }
+                };
+                execute_routine_query(
+                    &query,
+                    self.storage,
+                    self.txid,
+                    self.routine_workspace,
+                    &parameters[..arguments.len()],
+                    true,
+                    &mut |_| Ok(()),
+                )?;
+                return Ok(Some(Datum::Null));
+            }
+            RoutineFunctionResult::Forbidden(statement) => {
+                return Err(routine_forbidden_statement_error(statement));
+            }
         };
         execute_routine_query(
             result_query,

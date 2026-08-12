@@ -6063,6 +6063,12 @@ pub fn create_routine(
                     result_type
                 ));
             };
+            if set_returning && result == ColType::Void {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "functions returning setof void are not supported"
+                ));
+            }
             if set_returning {
                 crate::storage::RoutineKind::SetFunction { result }
             } else {
@@ -6083,6 +6089,14 @@ pub fn create_routine(
                         column.type_name
                     ));
                 };
+                if ctype.is_pseudo() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "TABLE function column \"{}\" has pseudo-type {}",
+                        column.name,
+                        column.type_name
+                    ));
+                }
                 output[slot] = RoutineArgumentDef { name, ctype };
             }
             result_columns = output;
@@ -6107,6 +6121,14 @@ pub fn create_routine(
                 ));
             }
         };
+        if ctype.is_pseudo() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "function argument \"{}\" has pseudo-type {}",
+                argument.name,
+                argument.type_name
+            ));
+        }
         arguments[slot] = RoutineArgumentDef {
             name: argument_name,
             ctype,
@@ -6157,7 +6179,15 @@ pub fn create_routine(
     }
     match kind {
         crate::storage::RoutineKind::Function { .. } => {
-            if let Err(error) = super::query::parse_routine_function_program(routine.body, arena) {
+            let returns_void = matches!(
+                kind,
+                crate::storage::RoutineKind::Function {
+                    result: ColType::Void
+                }
+            );
+            if let Err(error) =
+                super::query::parse_routine_function_program(routine.body, arena, returns_void)
+            {
                 return sql_fail(error);
             }
         }
@@ -11299,6 +11329,7 @@ fn decode_binary_field_with_context<'a>(
     };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
+        ColType::Void => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;

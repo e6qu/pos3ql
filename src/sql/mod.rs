@@ -4014,7 +4014,11 @@ impl Engine {
         if routine.kind.is_set_returning() {
             return Ok(None);
         }
-        let program = match query::parse_routine_function_program(routine.body.as_str(), arena) {
+        let program = match query::parse_routine_function_program(
+            routine.body.as_str(),
+            arena,
+            result_type == ColType::Void,
+        ) {
             Ok(program) => program,
             Err(error) => return Ok(Some(Err(error))),
         };
@@ -4026,6 +4030,10 @@ impl Engine {
         }) && !matches!(
             program.result,
             query::RoutineFunctionResult::DataModification(_)
+        ) && !matches!(
+            program.result,
+            query::RoutineFunctionResult::Void(statement)
+                if !query::routine_statement_is_query(statement)
         ) {
             return Ok(None);
         }
@@ -4115,6 +4123,33 @@ impl Engine {
                     }
                     Err(error) => return Err(error),
                 }
+            }
+            query::RoutineFunctionResult::Void(statement) => {
+                self.work.reset();
+                match self.execute_routine_stmt(
+                    statement,
+                    arena,
+                    &values[..args.len()],
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                    None,
+                ) {
+                    Ok(Ok(())) => {
+                        responder.buffer.truncate_to(output_mark);
+                        Ok(())
+                    }
+                    Ok(Err(error)) => {
+                        responder.buffer.truncate_to(output_mark);
+                        Err(error)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            query::RoutineFunctionResult::Forbidden(statement) => {
+                Err(query::routine_forbidden_statement_error(statement))
             }
         };
         if let Err(error) = outcome {

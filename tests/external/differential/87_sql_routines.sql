@@ -8,6 +8,7 @@ DROP FUNCTION IF EXISTS routine_multi_query_value(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
 DROP FUNCTION IF EXISTS routine_utility_prelude();
 DROP FUNCTION IF EXISTS routine_update_all_values();
+DROP FUNCTION IF EXISTS routine_set_void();
 DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
@@ -36,6 +37,8 @@ CREATE FUNCTION routine_nested_value(integer) RETURNS integer LANGUAGE SQL
   AS 'SELECT routine_lookup_value($1) + 1';
 CREATE FUNCTION routine_values_from(integer) RETURNS SETOF integer LANGUAGE SQL
   AS 'SELECT value FROM routine_values WHERE id >= $1';
+CREATE FUNCTION routine_set_void() RETURNS SETOF void LANGUAGE SQL
+  AS 'SELECT NULL UNION ALL SELECT NULL';
 CREATE FUNCTION routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
   AS 'SELECT id, value FROM routine_values WHERE id >= $1';
 SELECT routine_lookup_value(1), routine_nested_value(2);
@@ -68,6 +71,7 @@ SELECT routine_values.id, values_from.value
   JOIN LATERAL routine_values_from(routine_values.id) AS values_from(value) ON true
  ORDER BY routine_values.id, values_from.value;
 SELECT proretset FROM pg_proc WHERE proname = 'routine_values_from';
+SELECT count(*) FROM routine_set_void() AS result(value);
 SELECT routine_id, routine_value FROM routine_pairs_from(1) ORDER BY routine_id;
 SELECT routine_values.id, pairs.routine_value
   FROM routine_values
@@ -106,5 +110,6 @@ DROP FUNCTION routine_values_from(integer);
 DROP FUNCTION routine_pairs_from(integer);
 DROP FUNCTION routine_utility_prelude();
 DROP FUNCTION routine_update_all_values();
+DROP FUNCTION routine_set_void();
 DROP TABLE routine_created_in_function;
 DROP TABLE routine_values;

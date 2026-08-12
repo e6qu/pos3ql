@@ -6455,6 +6455,8 @@ fn sql_write_function_survives_wal_recovery() {
             "CREATE TABLE write_function_log (id integer PRIMARY KEY, value integer); \
              CREATE FUNCTION write_function_value(value integer) RETURNS integer LANGUAGE SQL \
                AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value + 1'; \
+             CREATE FUNCTION recovered_set_void() RETURNS SETOF void LANGUAGE SQL \
+               AS 'SELECT NULL UNION ALL SELECT NULL'; \
              SELECT write_function_value(40)",
         );
         assert_eq!(
@@ -6471,11 +6473,12 @@ fn sql_write_function_survives_wal_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT write_function_value(41); \
-         SELECT id, value FROM write_function_log ORDER BY id",
+         SELECT id, value FROM write_function_log ORDER BY id; \
+         SELECT count(*) FROM recovered_set_void() AS result(value)",
     );
     assert_eq!(
         data_rows(&output),
-        ["43", "40|41", "41|42"],
+        ["43", "40|41", "41|42", "2"],
         "{}",
         String::from_utf8_lossy(&output)
     );

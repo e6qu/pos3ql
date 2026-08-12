@@ -4021,7 +4021,9 @@ impl Engine {
         if !program
             .preceding
             .iter()
-            .any(|step| matches!(step, query::RoutinePrelude::DataModification(_)))
+            .any(|query::RoutinePrelude::Statement(statement)| {
+                !query::routine_statement_is_query(statement)
+            })
             && !matches!(
                 program.result,
                 query::RoutineFunctionResult::DataModification(_)
@@ -4034,45 +4036,27 @@ impl Engine {
         }
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let output_mark = responder.buffer.mark();
-        for step in program.preceding {
-            match step {
-                query::RoutinePrelude::Query(query) => {
-                    if let Err(error) = query::execute_routine_query(
-                        query,
-                        &self.storage,
-                        txn.txid,
-                        &self.work,
-                        &values[..args.len()],
-                        true,
-                        &mut |_| Ok(()),
-                    ) {
-                        responder.buffer.truncate_to(output_mark);
-                        return Ok(Some(Err(error)));
-                    }
+        for query::RoutinePrelude::Statement(statement) in program.preceding {
+            self.work.reset();
+            match self.execute_routine_stmt(
+                statement,
+                arena,
+                &values[..args.len()],
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+                None,
+            ) {
+                Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
+                Ok(Err(error)) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Some(Err(error)));
                 }
-                query::RoutinePrelude::DataModification(statement) => {
-                    self.work.reset();
-                    match self.execute_routine_stmt(
-                        statement,
-                        arena,
-                        &values[..args.len()],
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                        None,
-                    ) {
-                        Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
-                        Ok(Err(error)) => {
-                            responder.buffer.truncate_to(output_mark);
-                            return Ok(Some(Err(error)));
-                        }
-                        Err(error) => {
-                            responder.buffer.truncate_to(output_mark);
-                            return Err(error);
-                        }
-                    }
+                Err(error) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Err(error);
                 }
             }
         }

@@ -36,7 +36,7 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 - A sequence's staged parameters and value state are visible only to the owning transaction; rollback restores the exact savepoint image and WAL publishes only the final committed image.
 - A slot acknowledgement is validated before its WAL record can be committed; pgoutput versions are parser-validated protocol states.
 - DML target aliases bind uniformly in predicates, joined sources, static result description, and `RETURNING` evaluation.
-- SQL function programs type every formal through CTE, derived, and set-query descriptions. Every preceding query or direct-call DML step runs; the final query alone returns rows. Scalar calls cannot resolve set-returning definitions, and table calls cannot resolve scalar definitions. `RETURNS TABLE` owns ordered result names and types through replacement, WAL, checkpoints, catalogs, and scans.
+- SQL function programs type every formal through CTE, derived, and set-query descriptions. Every preceding query or direct-call DML step runs; the final query or DML `RETURNING` statement supplies the result. Scalar calls cannot resolve set-returning definitions, and table calls cannot resolve scalar definitions. `RETURNS TABLE` owns ordered result names and types through replacement, WAL, checkpoints, catalogs, and scans.
 - Publication identity, membership, schema selectors, operations, and ownership are durable typed states; catalog reads see their own staged state, while replication sees only committed selection.
 - Engine startup initializes named-zone TZif history before allocation freezes; unavailable historical data is not approximated.
 - Checksums, immutable blocks, and CAS manifests make cache loss recoverable.

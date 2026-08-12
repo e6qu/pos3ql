@@ -5800,6 +5800,32 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "{}",
             String::from_utf8_lossy(&returned_writes)
         );
+        let utility_prelude = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION create_routine_table() RETURNS integer LANGUAGE SQL \
+               AS 'CREATE TABLE routine_created_in_function (value integer); SELECT 44'; \
+             SELECT create_routine_table(); \
+             INSERT INTO routine_created_in_function VALUES (45); \
+             SELECT value FROM routine_created_in_function",
+        );
+        assert_eq!(
+            data_rows(&utility_prelude),
+            ["44", "45"],
+            "{}",
+            String::from_utf8_lossy(&utility_prelude)
+        );
+        let transaction_control = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION transaction_control_in_function() RETURNS integer LANGUAGE SQL \
+               AS 'SAVEPOINT function_savepoint; SELECT 1'",
+        );
+        assert!(
+            String::from_utf8_lossy(&transaction_control).contains("25001"),
+            "{}",
+            String::from_utf8_lossy(&transaction_control)
+        );
         let on_path = execute!(
             "CREATE SCHEMA routine_path; \
              SET search_path TO routine_path, public; \
@@ -5867,6 +5893,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "DELETE FROM routine_lookup WHERE id IN (3, 4, 5); \
+             DROP FUNCTION create_routine_table(); DROP TABLE routine_created_in_function; \
              DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer); \
              DROP FUNCTION routine_path.write_on_path(integer); \
              DROP FUNCTION routine_path.table_on_path(integer); \

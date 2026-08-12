@@ -170,13 +170,11 @@ pub(crate) enum RoutineQuery<'a> {
     Set(SetQuery<'a>),
 }
 
-/// A non-final SQL-function step.  Keeping data modification separate from a
-/// result query makes it impossible to accidentally expose a command tag or
-/// a discarded `RETURNING` stream as the function result.
+/// A non-final SQL-function statement. It cannot be used as the result, so a
+/// command tag or discarded `RETURNING` stream cannot escape the function.
 #[derive(Clone, Copy)]
 pub(crate) enum RoutinePrelude<'a> {
-    Query(&'a RoutineQuery<'a>),
-    DataModification(&'a Stmt<'a>),
+    Statement(&'a Stmt<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -242,10 +240,9 @@ pub(crate) fn parse_routine_query_program<'a>(
     })
 }
 
-/// Parses a SQL-language function body that may perform data modification
-/// before its final result query.  The result remains a query in this program
-/// form; a final DML `RETURNING` result has a distinct executor contract and
-/// is rejected at the parse boundary rather than being treated as a query.
+/// Parses a SQL-language function body. PostgreSQL permits supported SQL
+/// statements before the final result, but transaction control cannot cross a
+/// function boundary.
 pub(crate) fn parse_routine_function_program<'a>(
     body: &'a str,
     arena: &'a Arena,
@@ -260,31 +257,13 @@ pub(crate) fn parse_routine_function_program<'a>(
             .next_stmt()
             .map_err(|error| super::parse_error_to_sql(&error))?;
         let Some(statement) = statement else { break };
-        let step = match statement {
-            Stmt::Select(select) => RoutinePrelude::Query(
-                arena
-                    .alloc(RoutineQuery::Select(select))
-                    .map_err(|_| arena_full())?,
-            ),
-            Stmt::SetQuery(query) => RoutinePrelude::Query(
-                arena
-                    .alloc(RoutineQuery::Set(query))
-                    .map_err(|_| arena_full())?,
-            ),
-            Stmt::Insert(_)
-            | Stmt::Update(_)
-            | Stmt::Delete(_)
-            | Stmt::Merge(_)
-            | Stmt::With { .. } => {
-                RoutinePrelude::DataModification(arena.alloc(statement).map_err(|_| arena_full())?)
-            }
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL function body contains an unsupported statement"
-                ));
-            }
-        };
+        if routine_statement_forbidden(&statement) {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "transaction control is not allowed in an SQL function"
+            ));
+        }
+        let step = RoutinePrelude::Statement(arena.alloc(statement).map_err(|_| arena_full())?);
         if count == parsed.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -299,11 +278,20 @@ pub(crate) fn parse_routine_function_program<'a>(
         return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
     };
     let result = match last {
-        RoutinePrelude::Query(query) => RoutineFunctionResult::Query(query),
-        RoutinePrelude::DataModification(statement) if statement_returns_rows(statement) => {
+        RoutinePrelude::Statement(Stmt::Select(query)) => RoutineFunctionResult::Query(
+            arena
+                .alloc(RoutineQuery::Select(*query))
+                .map_err(|_| arena_full())?,
+        ),
+        RoutinePrelude::Statement(Stmt::SetQuery(query)) => RoutineFunctionResult::Query(
+            arena
+                .alloc(RoutineQuery::Set(*query))
+                .map_err(|_| arena_full())?,
+        ),
+        RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
             RoutineFunctionResult::DataModification(statement)
         }
-        RoutinePrelude::DataModification(_) => {
+        RoutinePrelude::Statement(_) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
@@ -316,6 +304,22 @@ pub(crate) fn parse_routine_function_program<'a>(
         })
         .map_err(|_| arena_full())?;
     Ok(RoutineFunctionProgram { preceding, result })
+}
+
+fn routine_statement_forbidden(statement: &Stmt<'_>) -> bool {
+    matches!(
+        statement,
+        Stmt::Begin(_)
+            | Stmt::Commit
+            | Stmt::Rollback
+            | Stmt::Savepoint(_)
+            | Stmt::ReleaseSavepoint(_)
+            | Stmt::RollbackToSavepoint(_)
+    )
+}
+
+pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
+    matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
 }
 
 fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
@@ -402,7 +406,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         if function_program
             .preceding
             .iter()
-            .any(|step| matches!(step, RoutinePrelude::DataModification(_)))
+            .any(|RoutinePrelude::Statement(statement)| !routine_statement_is_query(statement))
         {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -415,12 +419,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                 crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
             parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
-        for step in function_program.preceding {
-            let RoutinePrelude::Query(query) = step else {
-                unreachable!("data-modifying steps were rejected above");
+        for RoutinePrelude::Statement(statement) in function_program.preceding {
+            let query = match statement {
+                Stmt::Select(query) => RoutineQuery::Select(*query),
+                Stmt::SetQuery(query) => RoutineQuery::Set(*query),
+                _ => unreachable!("mutable routine prelude was rejected above"),
             };
             execute_routine_query(
-                query,
+                &query,
                 self.storage,
                 self.txid,
                 self.routine_workspace,

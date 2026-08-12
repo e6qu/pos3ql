@@ -333,6 +333,24 @@ pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
     matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
 }
 
+/// Whether a scalar routine needs the engine-owned executor rather than the
+/// read-only evaluator bridge. This is a property of the parsed program, not
+/// a spelling heuristic at an individual call site.
+pub(crate) fn routine_program_requires_mutable_execution(
+    program: &RoutineFunctionProgram<'_>,
+) -> bool {
+    program.preceding.iter().any(|step| match step {
+        RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
+        RoutinePrelude::Forbidden(_) => true,
+    }) || matches!(
+        program.result,
+        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_)
+    ) || matches!(
+        program.result,
+        RoutineFunctionResult::Void(statement) if !routine_statement_is_query(statement)
+    )
+}
+
 pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
     sql_err!(
         sqlstate::ACTIVE_SQL_TRANSACTION,
@@ -425,10 +443,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             self.routine_workspace,
             result_type == ColType::Void,
         )?;
-        if function_program.preceding.iter().any(|step| match step {
-            RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
-            RoutinePrelude::Forbidden(_) => true,
-        }) {
+        if routine_program_requires_mutable_execution(&function_program) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a top-level SELECT function(...) call"

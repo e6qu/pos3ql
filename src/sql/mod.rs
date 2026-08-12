@@ -4022,19 +4022,7 @@ impl Engine {
             Ok(program) => program,
             Err(error) => return Ok(Some(Err(error))),
         };
-        if !program.preceding.iter().any(|step| match step {
-            query::RoutinePrelude::Statement(statement) => {
-                !query::routine_statement_is_query(statement)
-            }
-            query::RoutinePrelude::Forbidden(_) => true,
-        }) && !matches!(
-            program.result,
-            query::RoutineFunctionResult::DataModification(_)
-        ) && !matches!(
-            program.result,
-            query::RoutineFunctionResult::Void(statement)
-                if !query::routine_statement_is_query(statement)
-        ) {
+        if !query::routine_program_requires_mutable_execution(&program) {
             return Ok(None);
         }
         let value = match self.execute_scalar_routine_program(

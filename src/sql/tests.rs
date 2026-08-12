@@ -5822,7 +5822,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                AS 'SAVEPOINT function_savepoint; SELECT 1'",
         );
         assert!(
-            String::from_utf8_lossy(&transaction_control).contains("25001"),
+            String::from_utf8_lossy(&transaction_control).contains("2F003"),
             "{}",
             String::from_utf8_lossy(&transaction_control)
         );

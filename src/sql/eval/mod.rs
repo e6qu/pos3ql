@@ -148,6 +148,7 @@ pub mod sqlstate {
     pub const IO_ERROR: &str = "58030";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
+    pub const PROHIBITED_SQL_STATEMENT_ATTEMPTED: &str = "2F003";
     pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
     pub const AMBIGUOUS_COLUMN: &str = "42702";
     pub const AMBIGUOUS_FUNCTION: &str = "42725";

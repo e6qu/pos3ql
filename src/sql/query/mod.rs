@@ -259,7 +259,7 @@ pub(crate) fn parse_routine_function_program<'a>(
         let Some(statement) = statement else { break };
         if routine_statement_forbidden(&statement) {
             return Err(sql_err!(
-                sqlstate::ACTIVE_SQL_TRANSACTION,
+                sqlstate::PROHIBITED_SQL_STATEMENT_ATTEMPTED,
                 "transaction control is not allowed in an SQL function"
             ));
         }

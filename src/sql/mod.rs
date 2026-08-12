@@ -618,6 +618,16 @@ impl Engine {
         exec::decode_binary_input(&self.storage, oid, bytes, arena, txid)
     }
 
+    pub(crate) fn decode_text_parameter<'a>(
+        &self,
+        oid: i32,
+        bytes: &'a [u8],
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<Datum<'a>, SqlError> {
+        exec::decode_text_input(&self.storage, oid, bytes, arena, txid)
+    }
+
     pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
         let slot = self.storage.find_role(name)?;
         let attributes = self.storage.role(slot).attributes;

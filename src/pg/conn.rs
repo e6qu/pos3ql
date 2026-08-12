@@ -1139,7 +1139,7 @@ impl Conn {
             }
             wire::FMSG_FLUSH => Step::Continue,
             wire::FMSG_PARSE => self.handle_parse(total),
-            wire::FMSG_BIND => self.handle_bind(total),
+            wire::FMSG_BIND => self.handle_bind(engine, total),
             wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
             wire::FMSG_EXECUTE => self.handle_execute(engine, total),
             wire::FMSG_CLOSE => self.handle_close(total),
@@ -1576,23 +1576,25 @@ impl Conn {
 
     fn handle_parse(&mut self, total: usize) -> Step {
         let payload = &self.recv.readable()[5..total];
-        let mut msg = MsgIn::new(payload);
-        let parse = || -> Result<(&str, &str, [i32; MAX_BIND_PARAMS]), wire::Malformed> {
+        let parse = || -> Result<(&str, &str, usize, [i32; MAX_BIND_PARAMS]), wire::Malformed> {
             let mut m = MsgIn::new(payload);
             let name = m.cstr()?;
             let query = m.cstr()?;
-            let n_types = m.i16()?.max(0) as usize;
-            let mut oids = [0i32; MAX_BIND_PARAMS];
-            for i in 0..n_types {
-                let oid = m.i32()?;
-                if let Some(slot) = oids.get_mut(i) {
-                    *slot = oid;
-                }
+            let n_types = usize::try_from(m.i16()?).map_err(|_| wire::Malformed)?;
+            if n_types > MAX_BIND_PARAMS {
+                return Err(wire::Malformed);
             }
-            Ok((name, query, oids))
+            let mut oids = [0i32; MAX_BIND_PARAMS];
+            for slot in oids.iter_mut().take(n_types) {
+                let oid = m.i32()?;
+                *slot = oid;
+            }
+            if !m.done() {
+                return Err(wire::Malformed);
+            }
+            Ok((name, query, n_types, oids))
         };
-        let _ = &mut msg;
-        let Ok((name, query, param_oids)) = parse() else {
+        let Ok((name, query, n_types, param_oids)) = parse() else {
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -1645,6 +1647,14 @@ impl Conn {
                 &mut self.phase,
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many parameters (the limit is 32)",
+            );
+        }
+        if n_types > n_params as usize {
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "Parse message supplies more parameter types than the statement uses",
             );
         }
 
@@ -1707,9 +1717,10 @@ impl Conn {
         }
     }
 
-    fn handle_bind(&mut self, total: usize) -> Step {
+    fn handle_bind(&mut self, engine: &mut Engine, total: usize) -> Step {
         enum BindProblem {
             Malformed,
+            UnsupportedFormat,
             TooManyResultCols,
             TooManyParams,
         }
@@ -1727,20 +1738,32 @@ impl Conn {
             let mut m = MsgIn::new(payload);
             let portal = m.cstr().map_err(|_| BindProblem::Malformed)?;
             let statement = m.cstr().map_err(|_| BindProblem::Malformed)?;
-            let n_fmt = m.i16().map_err(|_| BindProblem::Malformed)?.max(0) as usize;
+            let n_fmt = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
+                .map_err(|_| BindProblem::Malformed)?;
+            if n_fmt > MAX_BIND_PARAMS {
+                return Err(BindProblem::TooManyParams);
+            }
             let mut formats = [false; MAX_BIND_PARAMS];
             let mut uniform: Option<bool> = None;
-            for i in 0..n_fmt {
-                let binary = m.i16().map_err(|_| BindProblem::Malformed)? == 1;
+            for slot in formats.iter_mut().take(n_fmt) {
+                let binary = match m.i16().map_err(|_| BindProblem::Malformed)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(BindProblem::UnsupportedFormat),
+                };
                 if n_fmt == 1 {
                     uniform = Some(binary);
-                } else if let Some(slot) = formats.get_mut(i) {
+                } else {
                     *slot = binary;
                 }
             }
-            let n_params = m.i16().map_err(|_| BindProblem::Malformed)?.max(0) as usize;
+            let n_params = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
+                .map_err(|_| BindProblem::Malformed)?;
             if n_params > MAX_BIND_PARAMS {
                 return Err(BindProblem::TooManyParams);
+            }
+            if n_fmt != 0 && n_fmt != 1 && n_fmt != n_params {
+                return Err(BindProblem::Malformed);
             }
             if let Some(all) = uniform {
                 formats = [all; MAX_BIND_PARAMS];
@@ -1749,28 +1772,36 @@ impl Conn {
             let mut spans = [(0u32, 0u32); MAX_BIND_PARAMS];
             for span in spans.iter_mut().take(n_params) {
                 let len = m.i32().map_err(|_| BindProblem::Malformed)?;
-                if len < 0 {
+                if len == -1 {
                     *span = (0, u32::MAX);
                 } else {
+                    if len < -1 {
+                        return Err(BindProblem::Malformed);
+                    }
                     let at = payload.len() - m.remaining();
                     m.take(len as usize).map_err(|_| BindProblem::Malformed)?;
                     *span = ((at - values_start) as u32, len as u32);
                 }
             }
             let values = &payload[values_start..payload.len() - m.remaining()];
-            let n_rfmt = m.i16().map_err(|_| BindProblem::Malformed)?.max(0) as usize;
-            let mut rcodes = [false; MAX_RESULT_COLS];
-            for i in 0..n_rfmt {
-                let binary = m.i16().map_err(|_| BindProblem::Malformed)? == 1;
-                if let Some(slot) = rcodes.get_mut(i) {
-                    *slot = binary;
-                } else if binary {
-                    // A binary format beyond the tracked column count cannot be
-                    // honored; reject rather than silently emitting text.
-                    return Err(BindProblem::TooManyResultCols);
-                }
+            let n_rfmt = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
+                .map_err(|_| BindProblem::Malformed)?;
+            if n_rfmt > MAX_RESULT_COLS {
+                return Err(BindProblem::TooManyResultCols);
             }
-            let result_formats = ResultFmt::new(rcodes, n_rfmt.min(MAX_RESULT_COLS) as u16);
+            let mut rcodes = [false; MAX_RESULT_COLS];
+            for slot in rcodes.iter_mut().take(n_rfmt) {
+                let binary = match m.i16().map_err(|_| BindProblem::Malformed)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(BindProblem::UnsupportedFormat),
+                };
+                *slot = binary;
+            }
+            let result_formats = ResultFmt::new(rcodes, n_rfmt as u16);
+            if !m.done() {
+                return Err(BindProblem::Malformed);
+            }
             Ok((
                 portal,
                 statement,
@@ -1790,6 +1821,14 @@ impl Conn {
                         &mut self.phase,
                         sqlstate::PROTOCOL_VIOLATION,
                         "malformed Bind message",
+                    );
+                }
+                Err(BindProblem::UnsupportedFormat) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "unsupported Bind format code",
                     );
                 }
                 Err(BindProblem::TooManyResultCols) => {
@@ -1829,6 +1868,49 @@ impl Conn {
                 sqlstate::PROTOCOL_VIOLATION,
                 "bind parameter count differs from the statement",
             );
+        }
+        if !result_formats.matches_column_count(1) {
+            // A per-column result-format list needs the query's described
+            // shape. Probe that same typed boundary before a portal exists,
+            // discard its provisional response, and retain only a valid
+            // format state for execution.
+            self.arena.reset();
+            let text = core::str::from_utf8(self.prepared[stmt_slot].text.readable())
+                .expect("stored from valid UTF-8");
+            let mark = self.send.mark();
+            let described = {
+                let mut responder = Responder::for_describe(&mut self.send, result_formats);
+                engine.describe(text, &self.arena, &self.txn, &mut responder)
+            };
+            match described {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.phase = Phase::SkipToSync;
+                    return Step::Continue;
+                }
+                Err(WireFull) => return Step::Close,
+            }
+            let columns = match self.send.filled_mut().get(mark..) {
+                Some([wire::MSG_ROW_DESCRIPTION, _, _, _, _, high, low, ..]) => {
+                    usize::from(u16::from_be_bytes([*high, *low]))
+                }
+                Some([wire::MSG_NO_DATA, _, _, _, _]) => 0,
+                _ => return Step::Close,
+            };
+            self.send.truncate_to(mark);
+            if !result_formats.matches_column_count(columns) {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    sqlstate::PROTOCOL_VIOLATION,
+                    crate::stack_format!(
+                        96,
+                        "bind message has {} result formats but query has {columns} columns",
+                        result_formats.count(),
+                    )
+                    .as_str(),
+                );
+            }
         }
         // Text-format parameters must be valid UTF-8, checked at bind time.
         for (i, &(offset, len)) in spans.iter().take(n_params).enumerate() {
@@ -2020,15 +2102,12 @@ impl Conn {
             }
             let mut params = [Datum::Null; MAX_BIND_PARAMS];
             let raw = portal.params.readable();
-            // Resolve any parameter the client left untyped (OID 0) from its use
-            // in the query, so a binary-format value decodes as its real type
-            // even without a prior statement Describe — e.g. an empty range,
-            // which the client cannot subtype and so sends untyped. Mirrors what
-            // Describe already does; text params are unaffected.
+            // Resolve every parameter the client left untyped (OID 0) from
+            // its use in the query before decoding either wire format. Text
+            // Bind values are values of the inferred type, not SQL literals.
             let mut param_oids = prepared.param_oids;
-            let has_untyped_binary =
-                (0..portal.n_params as usize).any(|i| portal.binary[i] && param_oids[i] == 0);
-            if has_untyped_binary {
+            let has_untyped_parameter = (0..portal.n_params as usize).any(|i| param_oids[i] == 0);
+            if has_untyped_parameter {
                 param_oids =
                     engine.infer_param_types(text, &self.arena, &self.txn, &prepared.param_oids);
             }
@@ -2071,7 +2150,22 @@ impl Conn {
                         }
                     }
                 } else {
-                    params[i] = Datum::Text(unsafe { core::str::from_utf8_unchecked(bytes) });
+                    match engine.decode_text_parameter(
+                        param_oids[i],
+                        bytes,
+                        &self.arena,
+                        self.txn.txid,
+                    ) {
+                        Ok(value) => params[i] = value,
+                        Err(error) => {
+                            return ext_err(
+                                &mut self.send,
+                                &mut self.phase,
+                                error.sqlstate,
+                                error.message.as_str(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -3280,7 +3374,9 @@ pub(crate) fn decode_binary_param<'a>(
             core::str::from_utf8(rest)
                 .map(|t| Datum::Json {
                     text: t,
-                    jsonb: true,
+                    // The common decoder applies jsonb's parser and
+                    // canonicalizer after this wire-level version check.
+                    jsonb: false,
                 })
                 .map_err(|_| "invalid UTF-8 in binary jsonb parameter")
         }

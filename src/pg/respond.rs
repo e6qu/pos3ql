@@ -36,12 +36,23 @@ impl ResultFmt {
         Self { codes, n }
     }
 
+    /// PostgreSQL permits no result formats, one format for every column, or
+    /// exactly one format per result column. Bind validates the third case
+    /// before a value can reach this emitter.
+    pub(crate) fn matches_column_count(&self, columns: usize) -> bool {
+        self.n <= 1 || self.n as usize == columns
+    }
+
+    pub(crate) fn count(&self) -> u16 {
+        self.n
+    }
+
     /// Whether column `col` is requested in binary.
     fn is_binary(&self, col: usize) -> bool {
         match self.n {
             0 => false,
             1 => self.codes[0],
-            _ => self.codes.get(col).copied().unwrap_or(false),
+            _ => self.codes[col],
         }
     }
 }

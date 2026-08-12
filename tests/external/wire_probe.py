@@ -267,6 +267,108 @@ def test_binary_cursor_fetches_binary_rows():
     s.close()
 
 
+def test_bind_rejects_invalid_format_codes_and_lengths():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    parse = frontend_message(b"P", b"\x00SELECT $1\x00\x00\x00")
+    invalid_format_bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 1, 2, 1) + struct.pack("!i", 1) + b"1" + struct.pack("!h", 0),
+    )
+    s.sendall(parse + invalid_format_bind + frontend_message(b"S"))
+    out = [read_message(s), read_message(s), read_message(s)]
+    check(
+        "Bind rejects an unsupported parameter format code",
+        [kind for kind, _ in out] == [b"1", b"E", b"Z"] and has_sqlstate(out, "08P01"),
+        out,
+    )
+
+    parse = frontend_message(b"P", b"\x00SELECT $1\x00\x00\x00")
+    invalid_length_bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 0, 1, 1) + struct.pack("!i", -2) + struct.pack("!h", 0),
+    )
+    s.sendall(parse + invalid_length_bind + frontend_message(b"S"))
+    out = [read_message(s), read_message(s), read_message(s)]
+    check(
+        "Bind rejects a parameter length other than -1 or a byte count",
+        [kind for kind, _ in out] == [b"1", b"E", b"Z"] and has_sqlstate(out, "08P01"),
+        out,
+    )
+    s.close()
+
+
+def test_bind_rejects_mismatched_result_format_count():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    parse = frontend_message(b"P", b"\x00SELECT 1\x00\x00\x00")
+    mismatched_formats = frontend_message(
+        b"B",
+        b"\x00\x00"
+        + struct.pack("!hhhhh", 0, 0, 2, 0, 1),
+    )
+    s.sendall(parse + mismatched_formats + frontend_message(b"S"))
+    out = [read_message(s), read_message(s), read_message(s)]
+    check(
+        "Bind rejects result formats that do not match query columns",
+        [kind for kind, _ in out] == [b"1", b"E", b"Z"]
+        and has_sqlstate(out, "08P01")
+        and b"bind message has 2 result formats but query has 1 columns" in out[1][1],
+        out,
+    )
+
+    parse = frontend_message(b"P", b"\x00SELECT 1::int4, 2::int4\x00\x00\x00")
+    matching_formats = frontend_message(
+        b"B",
+        b"\x00\x00"
+        + struct.pack("!hhhhh", 0, 0, 2, 1, 0),
+    )
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + matching_formats + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "Bind keeps each validated result format",
+        row == b"\x00\x02\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x012",
+        out,
+    )
+    s.close()
+
+
+def test_parse_rejects_invalid_type_counts_and_trailing_bytes():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    negative_count = frontend_message(b"P", b"\x00SELECT 1\x00" + struct.pack("!h", -1))
+    s.sendall(negative_count + frontend_message(b"S"))
+    out = [read_message(s), read_message(s)]
+    check(
+        "Parse rejects a negative parameter-type count",
+        [kind for kind, _ in out] == [b"E", b"Z"] and has_sqlstate(out, "08P01"),
+        out,
+    )
+
+    trailing = frontend_message(b"P", b"\x00SELECT 1\x00\x00\x00x")
+    s.sendall(trailing + frontend_message(b"S"))
+    out = [read_message(s), read_message(s)]
+    check(
+        "Parse rejects trailing bytes",
+        [kind for kind, _ in out] == [b"E", b"Z"] and has_sqlstate(out, "08P01"),
+        out,
+    )
+    s.close()
+
+
 def test_logical_replication_simple_query_mode():
     s = connect()
     s.sendall(startup_payload(0, parameters=(("replication", "database"),)))
@@ -611,6 +713,25 @@ def extended_binary_parameter(s, text, oid, value):
             return out
 
 
+def extended_text_parameter(s, text, oid, value):
+    parse = frontend_message(
+        b"P", b"\x00" + text.encode() + b"\x00" + struct.pack("!hi", 1, oid)
+    )
+    encoded_value = struct.pack("!i", -1) if value is None else struct.pack("!i", len(value)) + value
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 1, 0, 1) + encoded_value + struct.pack("!h", 0),
+    )
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            return out
+
+
 def first_text_row(messages):
     row = next((payload for kind, payload in messages if kind == b"D"), None)
     if row is None or row[:2] != b"\x00\x01":
@@ -646,6 +767,8 @@ def test_catalog_aware_binary_bind_parameters():
     )
     cases = [
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
+        ("json", "SELECT $1::json", 114, b'{"b": 1, "a": 2}', '{"b": 1, "a": 2}', None),
+        ("jsonb", "SELECT $1::jsonb", 3802, b'\x01{"b": 1, "a": 2}', '{"a": 2, "b": 1}', None),
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
         (
@@ -673,6 +796,8 @@ def test_catalog_aware_binary_bind_parameters():
             None,
         ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),
+        ("invalid json", "SELECT $1::json", 114, b"{not json}", None, "22P02"),
+        ("invalid jsonb", "SELECT $1::jsonb", 3802, b"\x01{not json}", None, "22P02"),
         (
             "invalid domain",
             "SELECT $1::wire_binary_positive",
@@ -749,6 +874,49 @@ def test_catalog_aware_binary_bind_parameters():
         [first_text_row([message]) for message in messages if message[0] == b"D"] == ["40", "41"],
         messages,
     )
+    s.close()
+
+
+def test_catalog_aware_text_bind_parameters():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(
+        s,
+        "CREATE TYPE wire_text_state AS ENUM ('ready', 'blocked'); "
+        "CREATE DOMAIN wire_text_positive AS integer CHECK (VALUE > 0); "
+        "CREATE DOMAIN wire_text_required AS integer NOT NULL",
+    )
+    enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_state'")))
+    domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_positive'")))
+    enum_array_oid = 160000 + enum_oid - 120000
+    domain_array_oid = 150000 + domain_oid - 110000
+    required_domain_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_required'"))
+    )
+    cases = [
+        ("integer identity", "SELECT pg_typeof($1)", 23, b"7", "integer", None),
+        ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
+        ("enum", "SELECT $1::wire_text_state", enum_oid, b"ready", "ready", None),
+        ("domain", "SELECT $1::wire_text_positive", domain_oid, b"7", "7", None),
+        ("enum array", "SELECT $1::wire_text_state[]", enum_array_oid, b"{ready,blocked}", "{ready,blocked}", None),
+        ("domain array", "SELECT $1::wire_text_positive[]", domain_array_oid, b"{3,5}", "{3,5}", None),
+        ("invalid UTF-8", "SELECT $1::text", 25, b"\xff", None, "22021"),
+        ("invalid enum", "SELECT $1::wire_text_state", enum_oid, b"missing", None, "22P02"),
+        ("invalid domain", "SELECT $1::wire_text_positive", domain_oid, b"-1", None, "23514"),
+        ("invalid domain array", "SELECT $1::wire_text_positive[]", domain_array_oid, b"{3,-1}", None, "23514"),
+        ("null required domain", "SELECT $1::wire_text_required", required_domain_oid, None, None, "23502"),
+    ]
+    for name, text, oid, value, expected, state in cases:
+        messages = extended_text_parameter(s, text, oid, value)
+        if expected is not None:
+            check(f"text Bind catalog {name}", first_text_row(messages) == expected, messages)
+        else:
+            check(
+                f"text Bind catalog {name} rejects invalid value",
+                has_sqlstate(messages, state),
+                messages,
+            )
     s.close()
 
 

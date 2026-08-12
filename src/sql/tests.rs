@@ -1694,6 +1694,52 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "wire text"
     );
+    // Text Bind uses the same catalog resolver as binary Bind.  In particular,
+    // the format bit cannot decide whether a domain, enum, or array constraint
+    // is observed by the executor.
+    assert_eq!(
+        engine
+            .decode_text_parameter(crate::sql::types::oid::INT4, b"7", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "7"
+    );
+    assert_eq!(
+        engine
+            .decode_text_parameter(enum_oid, b"ready", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "ready"
+    );
+    assert_eq!(
+        engine
+            .decode_text_parameter(domain_oid, b"7", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "7"
+    );
+    assert_eq!(
+        engine
+            .decode_text_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "wire text"
+    );
+    let invalid_text = engine
+        .decode_text_parameter(crate::sql::types::oid::TEXT, b"\xff", &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_text.sqlstate, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
+    let invalid_text_enum = engine
+        .decode_text_parameter(enum_oid, b"missing", &arena, 0)
+        .unwrap_err();
+    assert_eq!(
+        invalid_text_enum.sqlstate,
+        sqlstate::INVALID_TEXT_REPRESENTATION
+    );
+    let invalid_text_domain = engine
+        .decode_text_parameter(domain_oid, b"-1", &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_text_domain.sqlstate, sqlstate::CHECK_VIOLATION);
     let invalid_enum = engine
         .decode_binary_parameter(enum_oid, b"missing", &arena, 0)
         .unwrap_err();
@@ -1702,6 +1748,15 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0)
         .unwrap_err();
     assert_eq!(invalid_domain.sqlstate, sqlstate::CHECK_VIOLATION);
+    for (oid, bytes) in [
+        (crate::sql::types::oid::JSON, b"{not json}".as_slice()),
+        (crate::sql::types::oid::JSONB, b"\x01{not json}".as_slice()),
+    ] {
+        let error = engine
+            .decode_binary_parameter(oid, bytes, &arena, 0)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
+    }
     let required_domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
@@ -1740,6 +1795,23 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "{ready,blocked}"
     );
+    assert_eq!(
+        engine
+            .decode_text_parameter(
+                crate::sql::types::oid::enum_array_oid(
+                    engine
+                        .storage
+                        .enum_slot("public", "binary_state", 0)
+                        .unwrap() as u16,
+                ),
+                b"{ready,blocked}",
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{ready,blocked}"
+    );
 
     let mut domain_array = Vec::new();
     domain_array.extend_from_slice(&1_i32.to_be_bytes());
@@ -1768,6 +1840,40 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "{3,5}"
     );
+    assert_eq!(
+        engine
+            .decode_text_parameter(
+                crate::sql::types::oid::domain_array_oid(
+                    engine
+                        .storage
+                        .domain_slot("public", "binary_positive", 0)
+                        .unwrap() as u16,
+                ),
+                b"{3,5}",
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{3,5}"
+    );
+    let invalid_text_domain_array = engine
+        .decode_text_parameter(
+            crate::sql::types::oid::domain_array_oid(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_positive", 0)
+                    .unwrap() as u16,
+            ),
+            b"{3,-1}",
+            &arena,
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(
+        invalid_text_domain_array.sqlstate,
+        sqlstate::CHECK_VIOLATION
+    );
     domain_array[8..12].copy_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
     let wrong_element_oid = engine
         .decode_binary_parameter(
@@ -1784,6 +1890,46 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .unwrap_err();
     assert_eq!(wrong_element_oid.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
     domain_array[8..12].copy_from_slice(&domain_oid.to_be_bytes());
+
+    let malformed_array = [
+        0, 0, 0, 1, // one dimension
+        0, 0, 0, 1, // has nulls
+        0, 0, 0, 23, // int4 element
+        0, 0, 0, 1, // dimension size
+        0, 0, 0, 1, // lower bound
+        0xff, 0xff, 0xff, 0xfe, // only -1 is a NULL field length
+    ];
+    let malformed_array = engine
+        .decode_binary_parameter(
+            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4).oid(),
+            &malformed_array,
+            &arena,
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(malformed_array.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+
+    let reserved_range_flags = engine
+        .decode_binary_parameter(
+            crate::sql::types::RangeKind::Int4.oid(),
+            &[0x98], // reserved bit plus both infinity flags
+            &arena,
+            0,
+        )
+        .unwrap();
+    assert_eq!(reserved_range_flags.to_string(), "(,)");
+    let null_finite_range_bound = engine
+        .decode_binary_parameter(
+            crate::sql::types::RangeKind::Int4.oid(),
+            &[0x00, 0xff, 0xff, 0xff, 0xff], // finite bound cannot be NULL
+            &arena,
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(
+        null_finite_range_bound.sqlstate,
+        sqlstate::BAD_COPY_FILE_FORMAT
+    );
 
     let mut record = Vec::new();
     record.extend_from_slice(&4_i32.to_be_bytes());
@@ -19102,6 +19248,24 @@ fn copy_query_to_stdout() {
         "COPY (SELECT count(*) FROM cq) TO STDOUT",
     );
     assert!(String::from_utf8_lossy(&out).contains('2'), "aggregate");
+
+    // Anonymous records are transient, but their binary representation is
+    // self-describing and therefore valid in COPY (query) output too.
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT ROW(42::integer, 'x'::text)) TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&out).contains(&b'E') && out.windows(6).any(|bytes| bytes == b"PGCOPY"),
+        "binary record COPY: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        out.windows(8)
+            .any(|bytes| bytes == [0, 0, 0, 2, 0, 0, 0, 23]),
+        "record field body is self-describing: {out:?}"
+    );
 
     // A query source is TO-only; FROM STDIN is rejected.
     let out = run_with(

@@ -4022,7 +4022,7 @@ impl Engine {
             query::RoutinePrelude::Statement(statement) => {
                 !query::routine_statement_is_query(statement)
             }
-            query::RoutinePrelude::TransactionControl => true,
+            query::RoutinePrelude::Forbidden(_) => true,
         }) && !matches!(
             program.result,
             query::RoutineFunctionResult::DataModification(_)
@@ -4037,9 +4037,11 @@ impl Engine {
         for step in program.preceding {
             let statement = match step {
                 query::RoutinePrelude::Statement(statement) => statement,
-                query::RoutinePrelude::TransactionControl => {
+                query::RoutinePrelude::Forbidden(forbidden) => {
                     responder.buffer.truncate_to(output_mark);
-                    return Ok(Some(Err(query::routine_transaction_control_error())));
+                    return Ok(Some(Err(query::routine_forbidden_statement_error(
+                        forbidden,
+                    ))));
                 }
             };
             self.work.reset();

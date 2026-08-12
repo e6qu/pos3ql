@@ -5827,6 +5827,18 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "{}",
             String::from_utf8_lossy(&transaction_control)
         );
+        let vacuum_in_function = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION vacuum_in_function() RETURNS integer LANGUAGE SQL \
+               AS 'VACUUM routine_lookup; SELECT 1'; \
+             SELECT vacuum_in_function()",
+        );
+        assert!(
+            String::from_utf8_lossy(&vacuum_in_function).contains("25001"),
+            "{}",
+            String::from_utf8_lossy(&vacuum_in_function)
+        );
         let on_path = execute!(
             "CREATE SCHEMA routine_path; \
              SET search_path TO routine_path, public; \

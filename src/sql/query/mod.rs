@@ -175,7 +175,7 @@ pub(crate) enum RoutineQuery<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum RoutinePrelude<'a> {
     Statement(&'a Stmt<'a>),
-    TransactionControl,
+    Forbidden(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -258,8 +258,8 @@ pub(crate) fn parse_routine_function_program<'a>(
             .next_stmt()
             .map_err(|error| super::parse_error_to_sql(&error))?;
         let Some(statement) = statement else { break };
-        let step = if routine_statement_forbidden(&statement) {
-            RoutinePrelude::TransactionControl
+        let step = if let Some(name) = routine_statement_forbidden(&statement) {
+            RoutinePrelude::Forbidden(name)
         } else {
             RoutinePrelude::Statement(arena.alloc(statement).map_err(|_| arena_full())?)
         };
@@ -290,7 +290,7 @@ pub(crate) fn parse_routine_function_program<'a>(
         RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
             RoutineFunctionResult::DataModification(statement)
         }
-        RoutinePrelude::Statement(_) | RoutinePrelude::TransactionControl => {
+        RoutinePrelude::Statement(_) | RoutinePrelude::Forbidden(_) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
@@ -305,26 +305,29 @@ pub(crate) fn parse_routine_function_program<'a>(
     Ok(RoutineFunctionProgram { preceding, result })
 }
 
-fn routine_statement_forbidden(statement: &Stmt<'_>) -> bool {
-    matches!(
-        statement,
-        Stmt::Begin(_)
-            | Stmt::Commit
-            | Stmt::Rollback
-            | Stmt::Savepoint(_)
-            | Stmt::ReleaseSavepoint(_)
-            | Stmt::RollbackToSavepoint(_)
-    )
+fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
+    Some(match statement {
+        Stmt::Begin(_) => "BEGIN",
+        Stmt::Commit => "COMMIT",
+        Stmt::Rollback => "ROLLBACK",
+        Stmt::Savepoint(_) => "SAVEPOINT",
+        Stmt::ReleaseSavepoint(_) => "RELEASE SAVEPOINT",
+        Stmt::RollbackToSavepoint(_) => "ROLLBACK TO SAVEPOINT",
+        Stmt::Vacuum { .. } => "VACUUM",
+        Stmt::Checkpoint => "CHECKPOINT",
+        _ => return None,
+    })
 }
 
 pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
     matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
 }
 
-pub(crate) fn routine_transaction_control_error() -> SqlError {
+pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
     sql_err!(
         sqlstate::ACTIVE_SQL_TRANSACTION,
-        "transaction control is not allowed in an SQL function"
+        "{} cannot be executed from an SQL function",
+        statement
     )
 }
 
@@ -411,7 +414,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             parse_routine_function_program(routine.body.as_str(), self.routine_workspace)?;
         if function_program.preceding.iter().any(|step| match step {
             RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
-            RoutinePrelude::TransactionControl => true,
+            RoutinePrelude::Forbidden(_) => true,
         }) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -426,7 +429,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         }
         for step in function_program.preceding {
             let RoutinePrelude::Statement(statement) = step else {
-                return Err(routine_transaction_control_error());
+                let RoutinePrelude::Forbidden(statement) = step else {
+                    unreachable!("routine prelude has two variants");
+                };
+                return Err(routine_forbidden_statement_error(statement));
             };
             let query = match statement {
                 Stmt::Select(query) => RoutineQuery::Select(*query),

@@ -62,7 +62,29 @@ enum BoundRow<'a> {
 /// The masks live in statement stack/arena state rather than a growable plan
 /// structure: every source must have a complete proof before PAX may omit a
 /// column from its decoded row.
-pub(crate) type PaxColumnDemand = [u64; MAX_JOIN_TABLES];
+#[derive(Clone, Copy)]
+pub(crate) struct PaxColumnDemand {
+    masks: [u64; MAX_JOIN_TABLES],
+}
+
+impl PaxColumnDemand {
+    const fn empty() -> Self {
+        Self {
+            masks: [0; MAX_JOIN_TABLES],
+        }
+    }
+
+    fn observe(&mut self, table: usize, column: usize) {
+        debug_assert!(table < MAX_JOIN_TABLES);
+        debug_assert!(column < u64::BITS as usize);
+        self.masks[table] |= 1u64 << column;
+    }
+
+    /// The verified physical fields required for one base source.
+    pub(crate) fn mask(self, table: usize) -> u64 {
+        self.masks[table]
+    }
+}
 
 /// Builds the complete physical-column demand for a source scan.
 /// Returning `None` deliberately retains full decoding whenever an expression
@@ -86,7 +108,7 @@ fn pax_column_demand_bounded(
     from: &FromClause,
     expressions: &[&Expr],
 ) -> Option<PaxColumnDemand> {
-    let mut columns = [0u64; MAX_JOIN_TABLES];
+    let mut columns = PaxColumnDemand::empty();
     fn collect_table(table: &TableRef, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         if let Some(arguments) = table.func_args
             && arguments
@@ -168,7 +190,7 @@ fn pax_column_demand_bounded(
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
                 Ok(ResolvedColumn::Table(table, column)) if scope.derived[table].is_none() => {
-                    columns[table] |= 1u64 << column
+                    columns.observe(table, column)
                 }
                 Ok(ResolvedColumn::Table(_, _)) => {}
                 // An unresolved name can be an enclosing correlated column.
@@ -1410,7 +1432,7 @@ fn scan_source_mode<'a>(
                 for &bytes in rows {
                     insert_derived!(bytes);
                 }
-            } else if let Some(demand) = pax_columns.map(|demand| demand[build_t])
+            } else if let Some(demand) = pax_columns.map(|demand| demand.mask(build_t))
                 && storage.spill_rows_are_unshadowed(build_slot)
             {
                 storage.for_each_spilled_row_batch(
@@ -1480,7 +1502,7 @@ fn scan_source_mode<'a>(
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             probe_def.schema(&mut probe_schema);
             let probe_schema = &probe_schema[..probe_def.n_columns];
-            if let Some(demand) = pax_columns.map(|demand| demand[probe_t])
+            if let Some(demand) = pax_columns.map(|demand| demand.mask(probe_t))
                 && storage.spill_rows_are_unshadowed(probe_slot)
             {
                 let mut stopped = false;
@@ -1985,7 +2007,7 @@ fn scan_source_mode<'a>(
                     $slot,
                     arena,
                     recycle_rows,
-                    pax_columns.map(|demand| demand[order[depth]]),
+                    pax_columns.map(|demand| demand.mask(order[depth])),
                     &mut |rows| {
                         for spilled in rows {
                             check_timeout()?;
@@ -2473,13 +2495,13 @@ fn scan_source_mode<'a>(
                 None
             };
             let mut emit_unmatched =
-                |bytes: &'a [u8],
+                |candidate: BoundRow<'a>,
                  rowid: Option<u64>,
                  f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
                  -> Result<bool, SqlError> {
                     bound.fill(None);
                     bound_rowids.fill(None);
-                    bound[d] = Some(BoundRow::Encoded(bytes));
+                    bound[d] = Some(candidate);
                     bound_rowids[d] = rowid;
                     if d + 1 == scope.n {
                         // Last level: the row is complete once the left side nulls.
@@ -2551,7 +2573,7 @@ fn scan_source_mode<'a>(
                             } else {
                                 let owned =
                                     arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                                emit_unmatched(owned, None, f)
+                                emit_unmatched(BoundRow::Encoded(owned), None, f)
                             }
                         })
                     }?;
@@ -2576,12 +2598,65 @@ fn scan_source_mode<'a>(
                         if already_matched {
                             Ok(true)
                         } else {
-                            emit_unmatched(bytes, None, f)
+                            emit_unmatched(BoundRow::Encoded(bytes), None, f)
                         }
                     })?;
                     if !keep_scanning {
                         return Ok(());
                     }
+                }
+            } else if let Some(demand) = pax_columns.map(|demand| demand.mask(d))
+                && storage.spill_rows_are_unshadowed(scope.slots[d])
+            {
+                let mut index = 0usize;
+                let mut done = false;
+                storage.for_each_spilled_row_batch(
+                    scope.slots[d],
+                    arena,
+                    recycle_rows,
+                    Some(demand),
+                    &mut |rows| {
+                        for spilled in rows {
+                            let this = index;
+                            index += 1;
+                            let keep_scanning = recycled(arena, recycle_rows, || {
+                                let already_matched = if external_match_map {
+                                    match external_match_reader.as_deref_mut() {
+                                        Some(reader) => {
+                                            external_match_contains(storage, reader, d, this)?
+                                        }
+                                        None => false,
+                                    }
+                                } else {
+                                    local_matches.expect("local match map")[this].get()
+                                };
+                                if already_matched {
+                                    Ok(true)
+                                } else {
+                                    emit_unmatched(
+                                        match spilled.representation {
+                                            crate::storage::SpilledRowRepresentation::Encoded(
+                                                bytes,
+                                            ) => BoundRow::Encoded(bytes),
+                                            crate::storage::SpilledRowRepresentation::Values(
+                                                values,
+                                            ) => BoundRow::Values(values),
+                                        },
+                                        Some(spilled.rowid),
+                                        f,
+                                    )
+                                }
+                            })?;
+                            if !keep_scanning {
+                                done = true;
+                                return Ok(core::ops::ControlFlow::Break(()));
+                            }
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+                if done {
+                    return Ok(());
                 }
             } else {
                 let mut index = 0usize;
@@ -2608,7 +2683,7 @@ fn scan_source_mode<'a>(
                             Ok(true)
                         } else {
                             let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;
-                            emit_unmatched(bytes, Some(rowid), f)
+                            emit_unmatched(BoundRow::Encoded(bytes), Some(rowid), f)
                         }
                     })?;
                     if !keep_scanning {

@@ -25,7 +25,7 @@ The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DM
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.
 
-The completion work is physical-demand propagation through query execution, object-native logical-replication interoperability where practical, and remaining PostgreSQL SQL/catalog/tooling coverage. PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
+The completion work is object-native logical-replication interoperability where practical and remaining PostgreSQL SQL/catalog/tooling coverage. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
 
 ## Quick start
 

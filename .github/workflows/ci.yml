@@ -68,7 +68,12 @@ jobs:
         run: cargo clippy --lib --bins -- -D warnings
 
       - name: Test
-        run: cargo test --locked -- --skip sim::storage::storage_vopr --skip sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache
+        run: >-
+          cargo test --locked -- --skip sim::storage::storage_vopr
+          --skip sql::tests::external_cold_order_and_distinct_runs_use_object_storage
+          --skip sql::tests::external_recursive_runs_use_object_storage
+          --skip sql::tests::external_lateral_runs_use_object_storage
+          --skip sql::tests::external_set_runs_use_object_storage
 
       - name: Object-store gateway contract
         run: |
@@ -118,7 +123,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        phase: [cold, recursive, lateral, set]
+        include:
+          - phase: cold
+            test: external_cold_order_and_distinct_runs_use_object_storage
+          - phase: recursive
+            test: external_recursive_runs_use_object_storage
+          - phase: lateral
+            test: external_lateral_runs_use_object_storage
+          - phase: set
+            test: external_set_runs_use_object_storage
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -135,6 +148,4 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Cold external-run regression
-        run: cargo test --locked --lib sql::tests::external_order_and_distinct_runs_use_object_storage_after_cold_cache
-        env:
-          POS3QL_EXTERNAL_RUN_PHASE: ${{ matrix.phase }}
+        run: cargo test --locked --lib sql::tests::${{ matrix.test }} -- --exact

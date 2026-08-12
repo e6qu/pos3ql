@@ -5674,7 +5674,8 @@ fn views_survive_restart() {
 
 #[test]
 fn sql_routine_lifecycle_is_transactional_and_durable() {
-    let config = test_config("routine_lifecycle");
+    let mut config = test_config("routine_lifecycle");
+    config.max_tables = 16;
     let answer_oid: i32;
     {
         let mut budget = Budget::new(1 << 28);
@@ -5749,7 +5750,10 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "CREATE FUNCTION multi_query_value(integer) RETURNS integer LANGUAGE SQL \
-               AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; SELECT $1 + 2'",
+               AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; \
+                   INSERT INTO routine_lookup VALUES (3, $1); \
+                   WITH inserted_value AS (SELECT value FROM routine_lookup WHERE id = 3) \
+                   SELECT value + 2 FROM inserted_value'",
         );
         assert!(
             !String::from_utf8_lossy(&multi_query_created).contains("ERROR"),
@@ -5760,8 +5764,9 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "CREATE FUNCTION multi_query_pairs(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL \
-               AS 'SELECT $1; WITH first_pair AS (SELECT $1::integer AS value) \
-                   SELECT value, value + 1 FROM first_pair UNION ALL SELECT $1 + 1, $1 + 2'",
+               AS 'SELECT $1; WITH first_pair AS (SELECT $1 AS value), \
+                        derived_pair AS (SELECT value, value + 1 AS next_value FROM first_pair) \
+                   SELECT value, next_value FROM derived_pair UNION ALL SELECT $1 + 1, $1 + 2'",
         );
         assert!(
             !String::from_utf8_lossy(&multi_query_pairs_created).contains("ERROR"),
@@ -5776,6 +5781,47 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             )),
             ["42"]
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION update_routine_value(integer) RETURNS integer LANGUAGE SQL \
+               AS 'UPDATE routine_lookup SET value = value + $1 WHERE id = 1 RETURNING value'; \
+             CREATE FUNCTION delete_routine_value() RETURNS integer LANGUAGE SQL \
+               AS 'DELETE FROM routine_lookup WHERE id = 2 RETURNING value'",
+        );
+        let returned_writes = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; SELECT update_routine_value(2); SELECT delete_routine_value(); ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&returned_writes),
+            ["42", "41"],
+            "{}",
+            String::from_utf8_lossy(&returned_writes)
+        );
+        let on_path = execute!(
+            "CREATE SCHEMA routine_path; \
+             SET search_path TO routine_path, public; \
+             CREATE FUNCTION write_on_path(integer) RETURNS integer LANGUAGE SQL \
+               AS 'INSERT INTO public.routine_lookup VALUES (4, $1); \
+                   WITH inserted_value AS (SELECT value FROM public.routine_lookup WHERE id = 4) \
+                   SELECT value + 2 FROM inserted_value'; \
+             CREATE FUNCTION table_on_path(integer) RETURNS TABLE (result integer) LANGUAGE SQL \
+               AS 'SELECT $1'; \
+             CREATE PROCEDURE procedure_on_path(integer) LANGUAGE SQL \
+               AS 'INSERT INTO public.routine_lookup VALUES (5, $1)'; \
+             SELECT write_on_path(60); \
+             SELECT result FROM table_on_path(61); \
+             CALL procedure_on_path(62); \
+             SET search_path TO public"
+        );
+        assert_eq!(
+            data_rows(&on_path),
+            ["62", "61"],
+            "{}",
+            String::from_utf8_lossy(&on_path)
+        );
         assert_eq!(
             data_rows(&run_with(
                 &mut engine,
@@ -5783,6 +5829,33 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                 "SELECT routine_id, routine_value FROM multi_query_pairs(7) ORDER BY routine_id",
             )),
             ["7|8", "8|9"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT id, value FROM routine_lookup WHERE id IN (3, 4, 5) ORDER BY id",
+            )),
+            ["3|40", "4|60", "5|62"]
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM routine_lookup WHERE id IN (3, 4, 5)",
+        );
+        let rolled_back = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             SELECT multi_query_value(50); \
+             ROLLBACK; \
+             SELECT count(*) FROM routine_lookup WHERE id = 3",
+        );
+        assert_eq!(
+            data_rows(&rolled_back),
+            ["52", "0"],
+            "{}",
+            String::from_utf8_lossy(&rolled_back)
         );
         let leading_query_error = run_with(&mut engine, &mut budget, "SELECT multi_query_value(0)");
         assert!(
@@ -5793,7 +5866,12 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         run_with(
             &mut engine,
             &mut budget,
-            "DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer)",
+            "DELETE FROM routine_lookup WHERE id IN (3, 4, 5); \
+             DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer); \
+             DROP FUNCTION routine_path.write_on_path(integer); \
+             DROP FUNCTION routine_path.table_on_path(integer); \
+             DROP PROCEDURE routine_path.procedure_on_path(integer); \
+             DROP SCHEMA routine_path",
         );
         assert_eq!(
             data_rows(&run_with(
@@ -6224,6 +6302,45 @@ fn routine_identity_changes_are_typed_transactional_and_durable() {
 }
 
 #[test]
+fn sql_write_function_survives_wal_recovery() {
+    let config = test_config("sql_write_function_recovery");
+    {
+        let mut budget = Budget::new(1 << 28);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE write_function_log (id integer PRIMARY KEY, value integer); \
+             CREATE FUNCTION write_function_value(value integer) RETURNS integer LANGUAGE SQL \
+               AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value + 1'; \
+             SELECT write_function_value(40)",
+        );
+        assert_eq!(
+            data_rows(&setup),
+            ["42"],
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut recovered_budget = Budget::new(1 << 28);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT write_function_value(41); \
+         SELECT id, value FROM write_function_log ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["43", "40|41", "41|42"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn sql_procedure_call_is_typed_durable_and_catalogued() {
     let config = test_config("sql_procedure_call");
     {
@@ -6294,9 +6411,10 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
             &mut engine,
             &mut budget,
             "CREATE PROCEDURE log_pair(value integer) LANGUAGE SQL AS \
-             'INSERT INTO procedure_log VALUES ($1); \
-              SELECT value FROM procedure_log WHERE value = $1; \
-              INSERT INTO procedure_log VALUES ($1 + 1)'",
+             'WITH routine_input AS (SELECT $1 AS value), \
+                   incremented_input AS (SELECT value + 1 AS value FROM routine_input) \
+              INSERT INTO procedure_log SELECT value FROM routine_input UNION ALL SELECT value FROM incremented_input; \
+              SELECT value FROM procedure_log WHERE value = $1'",
         );
         assert!(
             !String::from_utf8_lossy(&multi_created).contains("ERROR"),
@@ -15669,11 +15787,40 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
+#[derive(Clone, Copy)]
+enum ExternalRunPhase {
+    Cold,
+    Recursive,
+    Lateral,
+    Set,
+}
+
 #[test]
-fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
+fn external_cold_order_and_distinct_runs_use_object_storage() {
+    external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Cold);
+}
+
+#[test]
+fn external_recursive_runs_use_object_storage() {
+    external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Recursive);
+}
+
+#[test]
+fn external_lateral_runs_use_object_storage() {
+    external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Lateral);
+}
+
+#[test]
+fn external_set_runs_use_object_storage() {
+    external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Set);
+}
+
+fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SERIAL.lock().expect("external-run test mutex poisoned");
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("external-runs-{sequence}"));
     config.object_store_on = true;
@@ -15726,17 +15873,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget = Budget::new((1 << 28) + (96 << 20));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
-    let phase = match std::env::var("POS3QL_EXTERNAL_RUN_PHASE").as_deref() {
-        Ok("cold") => "cold",
-        Ok("recursive") => "recursive",
-        Ok("lateral") => "lateral",
-        Ok("set") => "set",
-        Err(std::env::VarError::NotPresent) => "all",
-        Ok(other) => panic!("unknown external-run phase: {other}"),
-        Err(error) => panic!("cannot read external-run phase: {error}"),
-    };
-
-    if phase == "all" || phase == "cold" {
+    if matches!(phase, ExternalRunPhase::Cold) {
         let before = restarted.storage.block_io_stats();
         let ordered = run_with(
             &mut restarted,
@@ -15837,11 +15974,12 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         assert_eq!(
             data_rows(&scalar),
             ["512"],
-            "LIMIT must stop an externally spooled scalar subquery before its cardinality check"
+            "LIMIT must stop an externally spooled scalar subquery before its cardinality check: {}",
+            String::from_utf8_lossy(&scalar)
         );
     }
 
-    if phase == "all" || phase == "recursive" {
+    if matches!(phase, ExternalRunPhase::Recursive) {
         let updated = run_with_arena_bytes(
             &mut restarted,
             &mut restarted_budget,
@@ -15883,7 +16021,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         );
     }
 
-    if phase == "all" || phase == "lateral" {
+    if matches!(phase, ExternalRunPhase::Lateral) {
         let lateral = run_with_arena_bytes(
             &mut restarted,
             &mut restarted_budget,
@@ -15933,7 +16071,7 @@ fn external_order_and_distinct_runs_use_object_storage_after_cold_cache() {
         );
     }
 
-    if phase == "all" || phase == "set" {
+    if matches!(phase, ExternalRunPhase::Set) {
         let created = run_with(
             &mut restarted,
             &mut restarted_budget,

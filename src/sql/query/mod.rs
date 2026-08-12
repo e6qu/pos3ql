@@ -170,6 +170,28 @@ pub(crate) enum RoutineQuery<'a> {
     Set(SetQuery<'a>),
 }
 
+/// A non-final SQL-function step.  Keeping data modification separate from a
+/// result query makes it impossible to accidentally expose a command tag or
+/// a discarded `RETURNING` stream as the function result.
+#[derive(Clone, Copy)]
+pub(crate) enum RoutinePrelude<'a> {
+    Query(&'a RoutineQuery<'a>),
+    DataModification(&'a Stmt<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RoutineFunctionResult<'a> {
+    Query(&'a RoutineQuery<'a>),
+    DataModification(&'a Stmt<'a>),
+}
+
+/// A SQL-language function program with one typed final result statement.
+/// PostgreSQL runs every preceding statement and takes values only from the final result.
+pub(crate) struct RoutineFunctionProgram<'a> {
+    pub preceding: &'a [RoutinePrelude<'a>],
+    pub result: RoutineFunctionResult<'a>,
+}
+
 /// Parse the read-only query program accepted as a SQL-language function
 /// body. PostgreSQL evaluates every query and uses only the final query as
 /// the function result; retaining that distinction prevents an earlier query
@@ -220,11 +242,97 @@ pub(crate) fn parse_routine_query_program<'a>(
     })
 }
 
+/// Parses a SQL-language function body that may perform data modification
+/// before its final result query.  The result remains a query in this program
+/// form; a final DML `RETURNING` result has a distinct executor contract and
+/// is rejected at the parse boundary rather than being treated as a query.
+pub(crate) fn parse_routine_function_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<RoutineFunctionProgram<'a>, SqlError> {
+    const MAX_ROUTINE_STATEMENTS: usize = 64;
+    let mut parser = super::parser::Parser::new(body, arena)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    let mut parsed = [None; MAX_ROUTINE_STATEMENTS];
+    let mut count = 0usize;
+    loop {
+        let statement = parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?;
+        let Some(statement) = statement else { break };
+        let step = match statement {
+            Stmt::Select(select) => RoutinePrelude::Query(
+                arena
+                    .alloc(RoutineQuery::Select(select))
+                    .map_err(|_| arena_full())?,
+            ),
+            Stmt::SetQuery(query) => RoutinePrelude::Query(
+                arena
+                    .alloc(RoutineQuery::Set(query))
+                    .map_err(|_| arena_full())?,
+            ),
+            Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::Merge(_)
+            | Stmt::With { .. } => {
+                RoutinePrelude::DataModification(arena.alloc(statement).map_err(|_| arena_full())?)
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL function body contains an unsupported statement"
+                ));
+            }
+        };
+        if count == parsed.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL function body exceeds {} statements",
+                parsed.len()
+            ));
+        }
+        parsed[count] = Some(step);
+        count += 1;
+    }
+    let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
+        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+    };
+    let result = match last {
+        RoutinePrelude::Query(query) => RoutineFunctionResult::Query(query),
+        RoutinePrelude::DataModification(statement) if statement_returns_rows(statement) => {
+            RoutineFunctionResult::DataModification(statement)
+        }
+        RoutinePrelude::DataModification(_) => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
+            ));
+        }
+    };
+    let preceding = arena
+        .alloc_slice_with(count - 1, |index| {
+            parsed[index].expect("counted routine step")
+        })
+        .map_err(|_| arena_full())?;
+    Ok(RoutineFunctionProgram { preceding, result })
+}
+
+fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::Insert(insert) => !insert.returning.is_empty(),
+        Stmt::Update(update) => !update.returning.is_empty(),
+        Stmt::Delete(delete) => !delete.returning.is_empty(),
+        Stmt::With { statement, .. } => statement_returns_rows(statement),
+        _ => false,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "routine-query execution plumbing"
 )]
-fn execute_routine_query<'a>(
+pub(crate) fn execute_routine_query<'a>(
     query: &RoutineQuery<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -234,11 +342,14 @@ fn execute_routine_query<'a>(
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match query {
-        RoutineQuery::Select(select) if recycling => {
-            select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
-        }
         RoutineQuery::Select(select) => {
-            select_into_rows(storage, txid, select, arena, params, None, None, emit)
+            let select = expand_ctes_exec(select, storage, txid, arena, params, &[])?;
+            validate_locking(select)?;
+            if recycling {
+                select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
+            } else {
+                select_into_rows(storage, txid, select, arena, params, None, None, emit)
+            }
         }
         RoutineQuery::Set(query) => {
             setops::set_query_into_rows(storage, txid, query, arena, params, None, emit)
@@ -285,14 +396,29 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             .kind
             .function_result()
             .expect("routine call resolution returns functions only");
-        let program = parse_routine_query_program(routine.body.as_str(), self.routine_workspace)?;
+        let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
+        let function_program =
+            parse_routine_function_program(routine.body.as_str(), self.routine_workspace)?;
+        if function_program
+            .preceding
+            .iter()
+            .any(|step| matches!(step, RoutinePrelude::DataModification(_)))
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "data-modifying SQL functions require a top-level SELECT function(...) call"
+            ));
+        }
         let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in arguments.iter().enumerate() {
             let encoded =
                 crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
             parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
-        for query in program.preceding {
+        for step in function_program.preceding {
+            let RoutinePrelude::Query(query) = step else {
+                unreachable!("data-modifying steps were rejected above");
+            };
             execute_routine_query(
                 query,
                 self.storage,
@@ -304,8 +430,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             )?;
         }
         let mut result = None;
+        let RoutineFunctionResult::Query(result_query) = function_program.result else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "data-modifying SQL function results require a top-level SELECT function(...) call"
+            ));
+        };
         execute_routine_query(
-            program.result,
+            result_query,
             self.storage,
             self.txid,
             self.routine_workspace,

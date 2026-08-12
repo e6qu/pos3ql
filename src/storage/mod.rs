@@ -1803,6 +1803,23 @@ impl RoutineKind {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RoutineCallKind {
+    Scalar,
+    Set,
+    Procedure,
+}
+
+impl RoutineCallKind {
+    const fn accepts(self, kind: RoutineKind) -> bool {
+        match self {
+            Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
+            Self::Set => kind.is_set_returning(),
+            Self::Procedure => matches!(kind, RoutineKind::Procedure),
+        }
+    }
+}
+
 /// The catalog identity of a routine definition. Replacement retains every
 /// catalog-owned field; a new definition receives them once.
 #[derive(Debug, Clone, Copy)]
@@ -11889,19 +11906,35 @@ impl Storage {
         argument_types: &[ColType],
         txid: u32,
     ) -> Option<usize> {
-        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
-        self.routines.iter().position(|routine| {
-            routine.visible_to(txid)
-                && routine.kind.function_result().is_some()
-                && !routine.kind.is_set_returning()
-                && routine.schema_for(txid).as_str() == schema
-                && routine.name_for(txid).as_str() == name
-                && routine.argument_count == argument_types.len()
-                && routine
-                    .arguments()
-                    .iter()
-                    .zip(argument_types)
-                    .all(|(parameter, value)| parameter.ctype == *value)
+        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Scalar)
+    }
+
+    pub(crate) fn has_scalar_routine_on_path(
+        &self,
+        name: &str,
+        argument_count: usize,
+        txid: u32,
+    ) -> bool {
+        if let Some((schema, name)) = name.split_once('.') {
+            return self.routine_name_in(
+                schema,
+                name,
+                argument_count,
+                txid,
+                RoutineCallKind::Scalar,
+            );
+        }
+        self.path.entries().iter().any(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return false;
+            };
+            self.routine_name_in(
+                self.schemas[*slot as usize].name.as_str(),
+                name,
+                argument_count,
+                txid,
+                RoutineCallKind::Scalar,
+            )
         })
     }
 
@@ -11911,10 +11944,53 @@ impl Storage {
         argument_types: &[ColType],
         txid: u32,
     ) -> Option<usize> {
-        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
+        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Set)
+    }
+
+    pub(crate) fn procedure_slot_for_call_types(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+    ) -> Option<usize> {
+        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Procedure)
+    }
+
+    fn routine_slot_on_path(
+        &self,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+        kind: RoutineCallKind,
+    ) -> Option<usize> {
+        if let Some((schema, name)) = name.split_once('.') {
+            return self.routine_slot_in(schema, name, argument_types, txid, kind);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            self.routine_slot_in(
+                self.schemas[*slot as usize].name.as_str(),
+                name,
+                argument_types,
+                txid,
+                kind,
+            )
+        })
+    }
+
+    fn routine_slot_in(
+        &self,
+        schema: &str,
+        name: &str,
+        argument_types: &[ColType],
+        txid: u32,
+        kind: RoutineCallKind,
+    ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             routine.visible_to(txid)
-                && routine.kind.is_set_returning()
+                && kind.accepts(routine.kind)
                 && routine.schema_for(txid).as_str() == schema
                 && routine.name_for(txid).as_str() == name
                 && routine.argument_count == argument_types.len()
@@ -11926,24 +12002,20 @@ impl Storage {
         })
     }
 
-    pub(crate) fn procedure_slot_for_call_types(
+    fn routine_name_in(
         &self,
+        schema: &str,
         name: &str,
-        argument_types: &[ColType],
+        argument_count: usize,
         txid: u32,
-    ) -> Option<usize> {
-        let (schema, name) = name.split_once('.').unwrap_or(("public", name));
-        self.routines.iter().position(|routine| {
+        kind: RoutineCallKind,
+    ) -> bool {
+        self.routines.iter().any(|routine| {
             routine.visible_to(txid)
-                && matches!(routine.kind, RoutineKind::Procedure)
+                && kind.accepts(routine.kind)
                 && routine.schema_for(txid).as_str() == schema
                 && routine.name_for(txid).as_str() == name
-                && routine.argument_count == argument_types.len()
-                && routine
-                    .arguments()
-                    .iter()
-                    .zip(argument_types)
-                    .all(|(parameter, value)| parameter.ctype == *value)
+                && routine.argument_count == argument_count
         })
     }
 

@@ -12,7 +12,8 @@ use crate::sql::ast::{Expr, SelectItem};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{ColDesc, ColType, oid};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, TableDef};
+use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
+use core::cell::Cell;
 
 /// Result-column names and types, statically inferred. Names borrow the
 /// statement (aliases) or the catalog (wildcard columns); `'q` is whichever
@@ -449,6 +450,55 @@ pub trait ColTypeResolver {
     fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
         None
     }
+}
+
+/// Declared formal-parameter types for the SQL routine currently undergoing
+/// static analysis.  Routine bodies re-enter normal query planning for CTEs,
+/// derived tables, and set-operation leaves; keeping the declaration at this
+/// shared inference boundary prevents any one of those paths from silently
+/// degrading `$n` to `unknown`.
+#[derive(Clone, Copy)]
+struct RoutineParameterTypes {
+    types: [Option<ColType>; MAX_ROUTINE_ARGUMENTS],
+}
+
+impl RoutineParameterTypes {
+    const EMPTY: Self = Self {
+        types: [None; MAX_ROUTINE_ARGUMENTS],
+    };
+}
+
+std::thread_local! {
+    static ROUTINE_PARAMETER_TYPES: Cell<RoutineParameterTypes> =
+        const { Cell::new(RoutineParameterTypes::EMPTY) };
+}
+
+/// Restores the enclosing routine's declaration when nested SQL routines
+/// return.  A parameter type is execution context, not a process-wide default.
+pub(crate) struct RoutineParameterScope(RoutineParameterTypes);
+
+pub(crate) fn enter_routine_parameter_types(
+    arguments: &[RoutineArgumentDef],
+) -> RoutineParameterScope {
+    let mut current = RoutineParameterTypes::EMPTY;
+    for (slot, argument) in arguments.iter().enumerate() {
+        current.types[slot] = Some(argument.ctype);
+    }
+    let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
+    RoutineParameterScope(prior)
+}
+
+impl Drop for RoutineParameterScope {
+    fn drop(&mut self) {
+        ROUTINE_PARAMETER_TYPES.with(|slot| slot.set(self.0));
+    }
+}
+
+fn routine_parameter_type(index: u32) -> Option<ColType> {
+    index.checked_sub(1).and_then(|index| {
+        ROUTINE_PARAMETER_TYPES
+            .with(|types| types.get().types.get(index as usize).copied().flatten())
+    })
 }
 
 /// One field of a registered record shape (see [`register_record_shape`]).
@@ -1104,7 +1154,10 @@ pub fn infer_type_res(
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     Ok(match expression {
-        Expr::Null | Expr::Str(_) | Expr::Param(_) => (oid::UNKNOWN, -2),
+        Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
+        Expr::Param(index) => routine_parameter_type(*index)
+            .map(of)
+            .unwrap_or((oid::UNKNOWN, -2)),
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.
         Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {

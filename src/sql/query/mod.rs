@@ -179,11 +179,17 @@ pub(crate) enum RoutinePrelude<'a> {
     DataModification(&'a Stmt<'a>),
 }
 
-/// A SQL-language function program with one typed result query.  PostgreSQL
-/// runs every preceding statement and takes values only from the final query.
+#[derive(Clone, Copy)]
+pub(crate) enum RoutineFunctionResult<'a> {
+    Query(&'a RoutineQuery<'a>),
+    DataModification(&'a Stmt<'a>),
+}
+
+/// A SQL-language function program with one typed final result statement.
+/// PostgreSQL runs every preceding statement and takes values only from the final result.
 pub(crate) struct RoutineFunctionProgram<'a> {
     pub preceding: &'a [RoutinePrelude<'a>],
-    pub result: &'a RoutineQuery<'a>,
+    pub result: RoutineFunctionResult<'a>,
 }
 
 /// Parse the read-only query program accepted as a SQL-language function
@@ -289,12 +295,20 @@ pub(crate) fn parse_routine_function_program<'a>(
         parsed[count] = Some(step);
         count += 1;
     }
-    let Some(RoutinePrelude::Query(result)) = count.checked_sub(1).and_then(|index| parsed[index])
-    else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "SQL function body must end with a SELECT query"
-        ));
+    let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
+        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+    };
+    let result = match last {
+        RoutinePrelude::Query(query) => RoutineFunctionResult::Query(query),
+        RoutinePrelude::DataModification(statement) if statement_returns_rows(statement) => {
+            RoutineFunctionResult::DataModification(statement)
+        }
+        RoutinePrelude::DataModification(_) => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
+            ));
+        }
     };
     let preceding = arena
         .alloc_slice_with(count - 1, |index| {
@@ -302,6 +316,16 @@ pub(crate) fn parse_routine_function_program<'a>(
         })
         .map_err(|_| arena_full())?;
     Ok(RoutineFunctionProgram { preceding, result })
+}
+
+fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::Insert(insert) => !insert.returning.is_empty(),
+        Stmt::Update(update) => !update.returning.is_empty(),
+        Stmt::Delete(delete) => !delete.returning.is_empty(),
+        Stmt::With { statement, .. } => statement_returns_rows(statement),
+        _ => false,
+    }
 }
 
 #[allow(
@@ -406,8 +430,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             )?;
         }
         let mut result = None;
+        let RoutineFunctionResult::Query(result_query) = function_program.result else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "data-modifying SQL function results require a top-level SELECT function(...) call"
+            ));
+        };
         execute_routine_query(
-            function_program.result,
+            result_query,
             self.storage,
             self.txid,
             self.routine_workspace,

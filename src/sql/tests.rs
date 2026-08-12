@@ -5781,6 +5781,25 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             )),
             ["42"]
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION update_routine_value(integer) RETURNS integer LANGUAGE SQL \
+               AS 'UPDATE routine_lookup SET value = value + $1 WHERE id = 1 RETURNING value'; \
+             CREATE FUNCTION delete_routine_value() RETURNS integer LANGUAGE SQL \
+               AS 'DELETE FROM routine_lookup WHERE id = 2 RETURNING value'",
+        );
+        let returned_writes = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; SELECT update_routine_value(2); SELECT delete_routine_value(); ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&returned_writes),
+            ["42", "41"],
+            "{}",
+            String::from_utf8_lossy(&returned_writes)
+        );
         let on_path = execute!(
             "CREATE SCHEMA routine_path; \
              SET search_path TO routine_path, public; \
@@ -6293,9 +6312,7 @@ fn sql_write_function_survives_wal_recovery() {
             &mut budget,
             "CREATE TABLE write_function_log (id integer PRIMARY KEY, value integer); \
              CREATE FUNCTION write_function_value(value integer) RETURNS integer LANGUAGE SQL \
-               AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1); \
-                   WITH inserted_value AS (SELECT value FROM write_function_log WHERE id = $1) \
-                   SELECT value + 1 FROM inserted_value'; \
+               AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value + 1'; \
              SELECT write_function_value(40)",
         );
         assert_eq!(

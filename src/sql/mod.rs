@@ -58,6 +58,8 @@ use prep::SqlPreparedPool;
 use txn::{DdlUndo, IsolationLevel, TxnMode, TxnState};
 use types::{ColDesc, ColType, Datum};
 
+type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError> + 'a;
+
 #[derive(Debug)]
 pub enum EngineSetupError {
     Budget(BudgetError),
@@ -3699,7 +3701,7 @@ impl Engine {
     /// been expanded. View rewriting lives here as well, so a data-modifying
     /// CTE and a main DML statement have exactly the same target semantics.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn execute_data_modification<'a>(
+    fn execute_data_modification<'a, 'capture>(
         storage: &mut Storage,
         scratch: &mut FixedVec<(u64, RowHome)>,
         arena: &Arena,
@@ -3708,7 +3710,7 @@ impl Engine {
         params: &[Datum<'a>],
         guc: &mut GucState,
         responder: &mut Responder,
-        capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Insert(insert) => {
@@ -4020,6 +4022,10 @@ impl Engine {
             .preceding
             .iter()
             .any(|step| matches!(step, query::RoutinePrelude::DataModification(_)))
+            && !matches!(
+                program.result,
+                query::RoutineFunctionResult::DataModification(_)
+            )
         {
             return Ok(None);
         }
@@ -4055,6 +4061,7 @@ impl Engine {
                         cursors,
                         guc,
                         responder,
+                        None,
                     ) {
                         Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
                         Ok(Err(error)) => {
@@ -4070,31 +4077,58 @@ impl Engine {
             }
         }
         let mut result = None;
-        let outcome = query::execute_routine_query(
-            program.result,
-            &self.storage,
-            txn.txid,
-            &self.work,
-            &values[..args.len()],
-            true,
-            &mut |row| {
-                if row.len() != 1 {
-                    return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return one column"
-                    ));
+        let mut capture_result = |row: &[Datum]| {
+            if row.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "SQL function query must return one column"
+                ));
+            }
+            if result.is_some() {
+                return Err(sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "SQL function query returned more than one row"
+                ));
+            }
+            let encoded = exec::encode_projected_pub(row, arena)?;
+            result = Some(exec::decode_projected_pub(encoded, 0));
+            Ok(())
+        };
+        let outcome = match program.result {
+            query::RoutineFunctionResult::Query(result_query) => query::execute_routine_query(
+                result_query,
+                &self.storage,
+                txn.txid,
+                &self.work,
+                &values[..args.len()],
+                true,
+                &mut capture_result,
+            ),
+            query::RoutineFunctionResult::DataModification(statement) => {
+                self.work.reset();
+                match self.execute_routine_stmt(
+                    statement,
+                    arena,
+                    &values[..args.len()],
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                    Some(&mut capture_result),
+                ) {
+                    Ok(Ok(())) => {
+                        responder.buffer.truncate_to(output_mark);
+                        Ok(())
+                    }
+                    Ok(Err(error)) => {
+                        responder.buffer.truncate_to(output_mark);
+                        Err(error)
+                    }
+                    Err(error) => return Err(error),
                 }
-                if result.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::CARDINALITY_VIOLATION,
-                        "SQL function query returned more than one row"
-                    ));
-                }
-                let encoded = exec::encode_projected_pub(row, arena)?;
-                result = Some(exec::decode_projected_pub(encoded, 0));
-                Ok(())
-            },
-        );
+            }
+        };
         if let Err(error) = outcome {
             responder.buffer.truncate_to(output_mark);
             return Ok(Some(Err(error)));
@@ -4161,7 +4195,7 @@ impl Engine {
                 responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder,
+                ctes, statement, arena, params, txn, guc, responder, None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4174,7 +4208,7 @@ impl Engine {
     /// EXPLAIN ANALYZE and ordinary execution share this choke point so CTE
     /// materialization, snapshot visibility, and DML dispatch cannot drift.
     #[allow(clippy::too_many_arguments)]
-    fn execute_with_data_modification<'a>(
+    fn execute_with_data_modification<'a, 'capture>(
         &mut self,
         ctes: &'a [ast::Cte<'a>],
         statement: &'a Stmt<'a>,
@@ -4183,6 +4217,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &mut GucState,
         responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
             Ok(materialized) => materialized.unwrap_or(&[]),
@@ -4210,7 +4245,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
-                None,
+                capture,
             ),
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
@@ -4375,6 +4410,7 @@ impl Engine {
                 cursors,
                 guc,
                 responder,
+                None,
             ) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -4411,7 +4447,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         self.execute_stmt_with_workspace(
-            statement, arena, params, txn, sqlprep, cursors, guc, responder, true,
+            statement, arena, params, txn, sqlprep, cursors, guc, responder, true, None,
         )
     }
 
@@ -4419,7 +4455,7 @@ impl Engine {
     /// query owns `work`, so a nested statement must not reclaim it beneath
     /// the evaluator that invoked the routine.
     #[allow(clippy::too_many_arguments)]
-    fn execute_routine_stmt(
+    fn execute_routine_stmt<'capture>(
         &mut self,
         statement: &Stmt,
         arena: &Arena,
@@ -4429,14 +4465,15 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         self.execute_stmt_with_workspace(
-            statement, arena, params, txn, sqlprep, cursors, guc, responder, false,
+            statement, arena, params, txn, sqlprep, cursors, guc, responder, false, capture,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_stmt_with_workspace(
+    fn execute_stmt_with_workspace<'capture>(
         &mut self,
         statement: &Stmt,
         arena: &Arena,
@@ -4447,6 +4484,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
         reset_workspace: bool,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if statement_writes(statement) && self.block_reads_pending() {
             return Ok(Err(sql_err!(
@@ -4724,7 +4762,7 @@ impl Engine {
                 explain::emit_plan(&plan, *options, actual, responder)
             }
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder,
+                ctes, statement, arena, params, txn, guc, responder, capture,
             ),
             Stmt::Select(s) => match self.execute_direct_write_function_select(
                 s, arena, params, txn, sqlprep, cursors, guc, responder,
@@ -5095,7 +5133,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
-                None,
+                capture,
             ),
             Stmt::Merge(m) => exec::merge(
                 &mut self.storage,

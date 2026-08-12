@@ -36,6 +36,10 @@ CREATE OR REPLACE FUNCTION routine_multi_query_value(integer) RETURNS integer LA
   AS 'INSERT INTO routine_values VALUES (3, $1); WITH inserted_value AS (SELECT value FROM routine_values WHERE id = 3) SELECT value + 2 FROM inserted_value';
 SELECT routine_multi_query_value(40);
 SELECT id, value FROM routine_values WHERE id = 3;
+CREATE FUNCTION routine_returning_value(integer) RETURNS integer LANGUAGE SQL
+  AS 'INSERT INTO routine_values VALUES (5, $1) RETURNING value + 2';
+SELECT routine_returning_value(40);
+SELECT id, value FROM routine_values WHERE id = 5;
 CREATE SCHEMA routine_path;
 SET search_path TO routine_path, public;
 CREATE FUNCTION write_on_path(integer) RETURNS integer LANGUAGE SQL

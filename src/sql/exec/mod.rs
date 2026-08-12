@@ -10912,23 +10912,6 @@ pub fn copy_begin(
         ));
     }
     let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
-    // Binary format speaks each type's real binary wire form. The types whose
-    // binary format has no stored column representation — only anonymous
-    // `record` — are refused loudly rather than emit something a binary
-    // consumer would misparse. Every other column type, composites included,
-    // has a byte-exact binary send/recv codec.
-    if fmt.binary {
-        for &target in &targets[..n_targets] {
-            let ctype = def.columns()[target].ctype;
-            if !binary_copy_supported(ctype) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "COPY BINARY of type {} is not supported yet",
-                    ctype.name()
-                ));
-            }
-        }
-    }
     if !statement.to {
         for &target in &targets[..n_targets] {
             if def.columns()[target].default.is_generated() {
@@ -10946,16 +10929,6 @@ pub fn copy_begin(
         n_targets,
         fmt,
     })
-}
-
-/// Whether COPY BINARY can round-trip a column of this type (its binary wire
-/// format is emitted and decoded faithfully). The text-shortcut types are not
-/// yet covered.
-fn binary_copy_supported(ctype: ColType) -> bool {
-    // Arrays, ranges, multiranges and bit strings all have binary send/recv
-    // codecs. Record is anonymous-composite only (never a stored column type)
-    // and has no stable binary column representation, so it stays unsupported.
-    !matches!(ctype, ColType::Record)
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -11188,29 +11161,32 @@ pub(crate) fn decode_binary_field_with_catalog<'a>(
     )
 }
 
+/// A catalog-resolved parameter type. Both text and binary Bind values pass
+/// through this boundary, so catalog types cannot be accepted by one format
+/// while silently bypassing their input rules in the other.
 #[derive(Clone, Copy)]
-pub(crate) enum BinaryInputType {
+pub(crate) enum ParameterInputType {
     Builtin(ColType),
     Domain { slot: usize, base: ColType },
     DomainArray(crate::sql::types::ArrElem),
 }
 
-pub(crate) fn resolve_binary_input_type(
+pub(crate) fn resolve_parameter_input_type(
     storage: &Storage,
     oid: i32,
     txid: u32,
-) -> Result<BinaryInputType, SqlError> {
+) -> Result<ParameterInputType, SqlError> {
     use crate::sql::types::oid as oids;
 
     let unknown_type = || {
         sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "binary parameter type OID {} does not exist",
+            "parameter type OID {} does not exist",
             oid
         )
     };
     if oid == 0 || oid == oids::UNKNOWN {
-        return Ok(BinaryInputType::Builtin(ColType::Text));
+        return Ok(ParameterInputType::Builtin(ColType::Text));
     }
     let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
     if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32).contains(&oid)
@@ -11219,7 +11195,7 @@ pub(crate) fn resolve_binary_input_type(
         if !domain.visible_to(txid) {
             return Err(unknown_type());
         }
-        return Ok(BinaryInputType::Domain {
+        return Ok(ParameterInputType::Domain {
             slot: domain_slot,
             base: domain.base,
         });
@@ -11239,7 +11215,7 @@ pub(crate) fn resolve_binary_input_type(
                     "binary input of a record-valued domain is not supported"
                 )
             })?;
-        return Ok(BinaryInputType::DomainArray(element));
+        return Ok(ParameterInputType::DomainArray(element));
     }
     let ctype = ColType::from_oid(oid).ok_or_else(|| {
         sql_err!(
@@ -11255,7 +11231,7 @@ pub(crate) fn resolve_binary_input_type(
         {
             Err(unknown_type())
         }
-        _ => Ok(BinaryInputType::Builtin(ctype)),
+        _ => Ok(ParameterInputType::Builtin(ctype)),
     }
 }
 
@@ -11266,11 +11242,11 @@ pub(crate) fn decode_binary_input<'a>(
     arena: &'a Arena,
     txid: u32,
 ) -> Result<Datum<'a>, SqlError> {
-    match resolve_binary_input_type(storage, oid, txid)? {
-        BinaryInputType::Builtin(ctype) => {
+    match resolve_parameter_input_type(storage, oid, txid)? {
+        ParameterInputType::Builtin(ctype) => {
             decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid)
         }
-        BinaryInputType::Domain { slot, base } => {
+        ParameterInputType::Domain { slot, base } => {
             let value = decode_binary_field_with_catalog(base, bytes, arena, storage, txid)?;
             coerce_domain_value(
                 storage,
@@ -11281,8 +11257,50 @@ pub(crate) fn decode_binary_input<'a>(
                 crate::sql::eval::NO_PARAMS,
             )
         }
-        BinaryInputType::DomainArray(element) => {
+        ParameterInputType::DomainArray(element) => {
             decode_binary_field_with_catalog(ColType::Array(element), bytes, arena, storage, txid)
+        }
+    }
+}
+
+/// Decodes a UTF-8 text Bind value according to its declared PostgreSQL type.
+///
+/// The wire format is text, not an untyped SQL literal: resolving it here
+/// gives text and binary Bind identical domain, enum, array, and typmod
+/// boundaries before the executor observes the parameter.
+pub(crate) fn decode_text_input<'a>(
+    storage: &Storage,
+    oid: i32,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    txid: u32,
+) -> Result<Datum<'a>, SqlError> {
+    let text = core::str::from_utf8(bytes).map_err(|_| {
+        sql_err!(
+            sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+            "invalid byte sequence for encoding \"UTF8\""
+        )
+    })?;
+    let decode_builtin = |ctype| match ctype {
+        ColType::Enum(slot) => coerce_enum_value(Datum::Text(text), slot, storage, txid, arena),
+        ColType::Array(
+            element @ (crate::sql::types::ArrElem::Enum(_)
+            | crate::sql::types::ArrElem::Domain { .. }),
+        ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena),
+        _ => crate::sql::eval::cast_to(Datum::Text(text), ctype, arena),
+    };
+    match resolve_parameter_input_type(storage, oid, txid)? {
+        ParameterInputType::Builtin(ctype) => decode_builtin(ctype),
+        ParameterInputType::Domain { slot, base } => coerce_domain_value(
+            storage,
+            slot,
+            decode_builtin(base)?,
+            txid,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+        ),
+        ParameterInputType::DomainArray(element) => {
+            coerce_user_type_array(Datum::Text(text), element, storage, txid, arena)
         }
     }
 }
@@ -11296,8 +11314,8 @@ pub(crate) fn coerce_binary_input_null<'a>(
     if oid == 0 {
         return Ok(Datum::Null);
     }
-    match resolve_binary_input_type(storage, oid, txid)? {
-        BinaryInputType::Domain { slot, .. } => coerce_domain_value(
+    match resolve_parameter_input_type(storage, oid, txid)? {
+        ParameterInputType::Domain { slot, .. } => coerce_domain_value(
             storage,
             slot,
             Datum::Null,
@@ -11305,7 +11323,7 @@ pub(crate) fn coerce_binary_input_null<'a>(
             arena,
             crate::sql::eval::NO_PARAMS,
         ),
-        BinaryInputType::Builtin(_) | BinaryInputType::DomainArray(_) => Ok(Datum::Null),
+        ParameterInputType::Builtin(_) | ParameterInputType::DomainArray(_) => Ok(Datum::Null),
     }
 }
 
@@ -11360,8 +11378,12 @@ fn decode_binary_field_with_context<'a>(
             Ok(Datum::Timetz(time, -zone))
         }
         ColType::Interval => via(oids::INTERVAL),
-        ColType::Json => via(oids::JSON),
-        ColType::Jsonb => via(oids::JSONB),
+        // The wire representation contains UTF-8 JSON text, but valid UTF-8
+        // is not necessarily valid JSON. Reuse the type input functions here
+        // so binary Bind, nested fields, and binary COPY cannot create an
+        // invalid JSON datum.
+        ColType::Json => crate::sql::eval::cast_to(via(oids::JSON)?, ColType::Json, arena),
+        ColType::Jsonb => crate::sql::eval::cast_to(via(oids::JSONB)?, ColType::Jsonb, arena),
         ColType::Uuid => via(oids::UUID),
         ColType::Bytea => via(oids::BYTEA),
         ColType::Numeric => via(oids::NUMERIC),
@@ -11550,10 +11572,13 @@ fn decode_binary_array<'a>(
     let mut saw_null = false;
     for slot in items.iter_mut().take(count) {
         let len = reader.i32().map_err(|_| bad())?;
-        if len < 0 {
+        if len == -1 {
             *slot = Datum::Null;
             saw_null = true;
             continue;
+        }
+        if len < -1 {
+            return Err(bad());
         }
         let field = reader.take(len as usize).map_err(|_| bad())?;
         let value = decode_binary_field_with_context(element_type, field, arena, context)?;
@@ -11613,7 +11638,10 @@ fn decode_range_body<'a>(
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary range");
-    let flags = reader.u8().map_err(|_| bad())?;
+    // PostgreSQL masks reserved range flag bits before interpreting the
+    // message. Keep that wire rule here; rejecting them would make a client
+    // payload PostgreSQL accepts fail only against pos3ql.
+    let flags = reader.u8().map_err(|_| bad())? & 0x1f;
     let mut parsed = crate::sql::range::Parsed {
         empty: flags & 0x01 != 0,
         lower: None,
@@ -11629,7 +11657,7 @@ fn decode_range_body<'a>(
         |reader: &mut crate::pg::wire::MsgIn<'a>| -> Result<Option<&'a str>, SqlError> {
             let len = reader.i32().map_err(|_| bad())?;
             if len < 0 {
-                return Ok(None);
+                return Err(bad());
             }
             let field = reader.take(len as usize).map_err(|_| bad())?;
             let datum = decode_binary_field(element_type, field, arena)?;
@@ -11977,18 +12005,11 @@ pub fn copy_out_query(
     let fmt = copy_fmt_for_columns(&names[..n], options)?;
     if fmt.binary {
         for c in &columns[..n] {
-            let Some(ctype) = coltype_of_oid(c.type_oid) else {
+            if coltype_of_oid(c.type_oid).is_none() {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "COPY BINARY cannot send a column of type oid {}",
                     c.type_oid
-                ));
-            };
-            if !binary_copy_supported(ctype) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "COPY BINARY of type {} is not supported yet",
-                    ctype.name()
                 ));
             }
         }

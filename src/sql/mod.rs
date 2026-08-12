@@ -4076,10 +4076,7 @@ impl Engine {
                 ));
             }
             if result.is_some() {
-                return Err(sql_err!(
-                    sqlstate::CARDINALITY_VIOLATION,
-                    "SQL function query returned more than one row"
-                ));
+                return Ok(());
             }
             let encoded = exec::encode_projected_pub(row, arena)?;
             result = Some(exec::decode_projected_pub(encoded, 0));

@@ -7,6 +7,7 @@ DROP FUNCTION IF EXISTS routine_pairs_from(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_value(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
 DROP FUNCTION IF EXISTS routine_utility_prelude();
+DROP FUNCTION IF EXISTS routine_update_all_values();
 DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
@@ -25,6 +26,10 @@ DROP FUNCTION routine_multi_query_value(integer);
 DROP FUNCTION routine_multi_query_pairs(integer);
 CREATE TABLE routine_values (id integer PRIMARY KEY, value integer);
 INSERT INTO routine_values VALUES (1, 40), (2, 41);
+CREATE FUNCTION routine_update_all_values() RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 RETURNING value';
+SELECT routine_update_all_values();
+SELECT id, value FROM routine_values ORDER BY id;
 CREATE FUNCTION routine_lookup_value(integer) RETURNS integer LANGUAGE SQL
   AS 'SELECT value FROM routine_values WHERE id = $1';
 CREATE FUNCTION routine_nested_value(integer) RETURNS integer LANGUAGE SQL
@@ -100,5 +105,6 @@ DROP FUNCTION routine_nested_value(integer);
 DROP FUNCTION routine_values_from(integer);
 DROP FUNCTION routine_pairs_from(integer);
 DROP FUNCTION routine_utility_prelude();
+DROP FUNCTION routine_update_all_values();
 DROP TABLE routine_created_in_function;
 DROP TABLE routine_values;

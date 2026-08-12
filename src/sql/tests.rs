@@ -5800,6 +5800,26 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "{}",
             String::from_utf8_lossy(&returned_writes)
         );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION update_all_routine_values() RETURNS integer LANGUAGE SQL \
+               AS 'UPDATE routine_lookup SET value = value + 1 RETURNING value'",
+        );
+        let complete_dml_result = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             SELECT update_all_routine_values(); \
+             SELECT value FROM routine_lookup ORDER BY id; \
+             ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&complete_dml_result),
+            ["41", "41", "42", "41"],
+            "{}",
+            String::from_utf8_lossy(&complete_dml_result)
+        );
         let utility_prelude = run_with(
             &mut engine,
             &mut budget,
@@ -5906,7 +5926,8 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "DELETE FROM routine_lookup WHERE id IN (3, 4, 5); \
-             DROP FUNCTION create_routine_table(); DROP TABLE routine_created_in_function; \
+             DROP FUNCTION create_routine_table(); DROP FUNCTION update_all_routine_values(); \
+             DROP TABLE routine_created_in_function; \
              DROP FUNCTION multi_query_value(integer); DROP FUNCTION multi_query_pairs(integer); \
              DROP FUNCTION routine_path.write_on_path(integer); \
              DROP FUNCTION routine_path.table_on_path(integer); \
@@ -6031,11 +6052,11 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             "CREATE FUNCTION ambiguous_routine_value() RETURNS integer LANGUAGE SQL
                AS 'SELECT value FROM routine_lookup'",
         );
-        let cardinality = run_with(&mut engine, &mut budget, "SELECT ambiguous_routine_value()");
+        let first_row = run_with(&mut engine, &mut budget, "SELECT ambiguous_routine_value()");
         assert!(
-            String::from_utf8_lossy(&cardinality).contains("21000"),
+            data_rows(&first_row) == ["40"],
             "{}",
-            String::from_utf8_lossy(&cardinality)
+            String::from_utf8_lossy(&first_row)
         );
         run_with(
             &mut engine,

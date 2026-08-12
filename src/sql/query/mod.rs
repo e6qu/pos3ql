@@ -471,10 +471,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                     ));
                 }
                 if result.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::CARDINALITY_VIOLATION,
-                        "SQL function query returned more than one row"
-                    ));
+                    return Ok(());
                 }
                 let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
                 result = Some(crate::sql::exec::decode_projected_pub(encoded, 0));

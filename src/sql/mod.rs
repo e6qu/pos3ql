@@ -4037,8 +4037,48 @@ impl Engine {
         ) {
             return Ok(None);
         }
+        let value = match self.execute_scalar_routine_program(
+            slot,
+            routine,
+            result_type,
+            program,
+            &values[..args.len()],
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )? {
+            Ok(value) => value,
+            Err(error) => return Ok(Some(Err(error))),
+        };
+        responder.row_description(&[ColDesc::of_type(
+            alias.unwrap_or(exec::derived_name(expression)),
+            result_type,
+        )])?;
+        responder.data_row(&[value])?;
+        responder.command_complete("SELECT 1")?;
+        Ok(Some(Ok(())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_scalar_routine_program<'a>(
+        &mut self,
+        slot: usize,
+        routine: crate::storage::RoutineDef,
+        result_type: ColType,
+        program: query::RoutineFunctionProgram<'a>,
+        arguments: &[Datum<'a>],
+        arena: &'a Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-            return Ok(Some(Err(error)));
+            return Ok(Err(error));
         }
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let output_mark = responder.buffer.mark();
@@ -4047,27 +4087,17 @@ impl Engine {
                 query::RoutinePrelude::Statement(statement) => statement,
                 query::RoutinePrelude::Forbidden(forbidden) => {
                     responder.buffer.truncate_to(output_mark);
-                    return Ok(Some(Err(query::routine_forbidden_statement_error(
-                        forbidden,
-                    ))));
+                    return Ok(Err(query::routine_forbidden_statement_error(forbidden)));
                 }
             };
             self.work.reset();
             match self.execute_routine_stmt(
-                statement,
-                arena,
-                &values[..args.len()],
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-                None,
+                statement, arena, arguments, txn, sqlprep, cursors, guc, responder, None,
             ) {
                 Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
                 Ok(Err(error)) => {
                     responder.buffer.truncate_to(output_mark);
-                    return Ok(Some(Err(error)));
+                    return Ok(Err(error));
                 }
                 Err(error) => {
                     responder.buffer.truncate_to(output_mark);
@@ -4083,11 +4113,10 @@ impl Engine {
                     "SQL function query must return one column"
                 ));
             }
-            if result.is_some() {
-                return Ok(());
+            if result.is_none() {
+                let encoded = exec::encode_projected_pub(row, arena)?;
+                result = Some(exec::decode_projected_pub(encoded, 0));
             }
-            let encoded = exec::encode_projected_pub(row, arena)?;
-            result = Some(exec::decode_projected_pub(encoded, 0));
             Ok(())
         };
         let outcome = match program.result {
@@ -4096,7 +4125,7 @@ impl Engine {
                 &self.storage,
                 txn.txid,
                 &self.work,
-                &values[..args.len()],
+                arguments,
                 true,
                 &mut capture_result,
             ),
@@ -4105,7 +4134,7 @@ impl Engine {
                 match self.execute_routine_stmt(
                     statement,
                     arena,
-                    &values[..args.len()],
+                    arguments,
                     txn,
                     sqlprep,
                     cursors,
@@ -4127,15 +4156,7 @@ impl Engine {
             query::RoutineFunctionResult::Void(statement) => {
                 self.work.reset();
                 match self.execute_routine_stmt(
-                    statement,
-                    arena,
-                    &values[..args.len()],
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    None,
+                    statement, arena, arguments, txn, sqlprep, cursors, guc, responder, None,
                 ) {
                     Ok(Ok(())) => {
                         responder.buffer.truncate_to(output_mark);
@@ -4154,23 +4175,17 @@ impl Engine {
         };
         if let Err(error) = outcome {
             responder.buffer.truncate_to(output_mark);
-            return Ok(Some(Err(error)));
+            return Ok(Err(error));
         }
         let value = match eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena) {
             Ok(value) => value,
             Err(error) => {
                 responder.buffer.truncate_to(output_mark);
-                return Ok(Some(Err(error)));
+                return Ok(Err(error));
             }
         };
         responder.buffer.truncate_to(output_mark);
-        responder.row_description(&[ColDesc::of_type(
-            alias.unwrap_or(exec::derived_name(expression)),
-            result_type,
-        )])?;
-        responder.data_row(&[value])?;
-        responder.command_complete("SELECT 1")?;
-        Ok(Some(Ok(())))
+        Ok(Ok(value))
     }
 
     fn execute_explained_statement(

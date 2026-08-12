@@ -175,6 +175,7 @@ pub(crate) enum RoutineQuery<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum RoutinePrelude<'a> {
     Statement(&'a Stmt<'a>),
+    TransactionControl,
 }
 
 #[derive(Clone, Copy)]
@@ -257,13 +258,11 @@ pub(crate) fn parse_routine_function_program<'a>(
             .next_stmt()
             .map_err(|error| super::parse_error_to_sql(&error))?;
         let Some(statement) = statement else { break };
-        if routine_statement_forbidden(&statement) {
-            return Err(sql_err!(
-                sqlstate::PROHIBITED_SQL_STATEMENT_ATTEMPTED,
-                "transaction control is not allowed in an SQL function"
-            ));
-        }
-        let step = RoutinePrelude::Statement(arena.alloc(statement).map_err(|_| arena_full())?);
+        let step = if routine_statement_forbidden(&statement) {
+            RoutinePrelude::TransactionControl
+        } else {
+            RoutinePrelude::Statement(arena.alloc(statement).map_err(|_| arena_full())?)
+        };
         if count == parsed.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -291,7 +290,7 @@ pub(crate) fn parse_routine_function_program<'a>(
         RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
             RoutineFunctionResult::DataModification(statement)
         }
-        RoutinePrelude::Statement(_) => {
+        RoutinePrelude::Statement(_) | RoutinePrelude::TransactionControl => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
@@ -320,6 +319,13 @@ fn routine_statement_forbidden(statement: &Stmt<'_>) -> bool {
 
 pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
     matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
+}
+
+pub(crate) fn routine_transaction_control_error() -> SqlError {
+    sql_err!(
+        sqlstate::ACTIVE_SQL_TRANSACTION,
+        "transaction control is not allowed in an SQL function"
+    )
 }
 
 fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
@@ -403,11 +409,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
         let function_program =
             parse_routine_function_program(routine.body.as_str(), self.routine_workspace)?;
-        if function_program
-            .preceding
-            .iter()
-            .any(|RoutinePrelude::Statement(statement)| !routine_statement_is_query(statement))
-        {
+        if function_program.preceding.iter().any(|step| match step {
+            RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
+            RoutinePrelude::TransactionControl => true,
+        }) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a top-level SELECT function(...) call"
@@ -419,7 +424,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
                 crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
             parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
-        for RoutinePrelude::Statement(statement) in function_program.preceding {
+        for step in function_program.preceding {
+            let RoutinePrelude::Statement(statement) = step else {
+                return Err(routine_transaction_control_error());
+            };
             let query = match statement {
                 Stmt::Select(query) => RoutineQuery::Select(*query),
                 Stmt::SetQuery(query) => RoutineQuery::Set(*query),

@@ -4018,17 +4018,15 @@ impl Engine {
             Ok(program) => program,
             Err(error) => return Ok(Some(Err(error))),
         };
-        if !program
-            .preceding
-            .iter()
-            .any(|query::RoutinePrelude::Statement(statement)| {
+        if !program.preceding.iter().any(|step| match step {
+            query::RoutinePrelude::Statement(statement) => {
                 !query::routine_statement_is_query(statement)
-            })
-            && !matches!(
-                program.result,
-                query::RoutineFunctionResult::DataModification(_)
-            )
-        {
+            }
+            query::RoutinePrelude::TransactionControl => true,
+        }) && !matches!(
+            program.result,
+            query::RoutineFunctionResult::DataModification(_)
+        ) {
             return Ok(None);
         }
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
@@ -4036,7 +4034,14 @@ impl Engine {
         }
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let output_mark = responder.buffer.mark();
-        for query::RoutinePrelude::Statement(statement) in program.preceding {
+        for step in program.preceding {
+            let statement = match step {
+                query::RoutinePrelude::Statement(statement) => statement,
+                query::RoutinePrelude::TransactionControl => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Some(Err(query::routine_transaction_control_error())));
+                }
+            };
             self.work.reset();
             match self.execute_routine_stmt(
                 statement,

@@ -5819,10 +5819,11 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "CREATE FUNCTION transaction_control_in_function() RETURNS integer LANGUAGE SQL \
-               AS 'SAVEPOINT function_savepoint; SELECT 1'",
+               AS 'SAVEPOINT function_savepoint; SELECT 1'; \
+             SELECT transaction_control_in_function()",
         );
         assert!(
-            String::from_utf8_lossy(&transaction_control).contains("2F003"),
+            String::from_utf8_lossy(&transaction_control).contains("25001"),
             "{}",
             String::from_utf8_lossy(&transaction_control)
         );

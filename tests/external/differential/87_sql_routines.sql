@@ -6,6 +6,8 @@ DROP FUNCTION IF EXISTS routine_values_from(integer);
 DROP FUNCTION IF EXISTS routine_pairs_from(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_value(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
+DROP FUNCTION IF EXISTS routine_utility_prelude();
+DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
 CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
@@ -40,6 +42,11 @@ CREATE FUNCTION routine_returning_value(integer) RETURNS integer LANGUAGE SQL
   AS 'INSERT INTO routine_values VALUES (5, $1) RETURNING value + 2';
 SELECT routine_returning_value(40);
 SELECT id, value FROM routine_values WHERE id = 5;
+CREATE FUNCTION routine_utility_prelude() RETURNS integer LANGUAGE SQL
+  AS 'CREATE TABLE routine_created_in_function (value integer); SELECT 44';
+SELECT routine_utility_prelude();
+INSERT INTO routine_created_in_function VALUES (45);
+SELECT value FROM routine_created_in_function;
 CREATE SCHEMA routine_path;
 SET search_path TO routine_path, public;
 CREATE FUNCTION write_on_path(integer) RETURNS integer LANGUAGE SQL
@@ -92,4 +99,6 @@ DROP FUNCTION routine_lookup_value(integer);
 DROP FUNCTION routine_nested_value(integer);
 DROP FUNCTION routine_values_from(integer);
 DROP FUNCTION routine_pairs_from(integer);
+DROP FUNCTION routine_utility_prelude();
+DROP TABLE routine_created_in_function;
 DROP TABLE routine_values;

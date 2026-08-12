@@ -425,6 +425,12 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
 pub trait ColTypeResolver {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError>;
 
+    /// SQL-routine result type resolved from already-inferred argument types.
+    /// Plain column resolvers have no catalog and therefore expose none.
+    fn routine_result(&self, _name: &str, _arguments: &[ColType]) -> Option<ColType> {
+        None
+    }
+
     /// Whether an unqualified `name` names a FROM item (so a bare reference to
     /// it is a whole-row/record value). Defaults to false.
     fn is_whole_row(&self, _name: &str) -> bool {
@@ -1153,6 +1159,34 @@ pub fn infer_type_res(
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
+    if let Expr::Call {
+        name,
+        args,
+        star: false,
+        ..
+    } = expression
+    {
+        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
+        if args.len() <= argument_types.len() {
+            let mut known = true;
+            for (index, argument) in args.iter().enumerate() {
+                let Ok((type_oid, _)) = infer_type_res(argument, columns) else {
+                    known = false;
+                    break;
+                };
+                let Some(ctype) = coltype_of_oid(type_oid) else {
+                    known = false;
+                    break;
+                };
+                argument_types[index] = ctype;
+            }
+            if known
+                && let Some(result) = columns.routine_result(name, &argument_types[..args.len()])
+            {
+                return Ok(of(result));
+            }
+        }
+    }
     Ok(match expression {
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => routine_parameter_type(*index)

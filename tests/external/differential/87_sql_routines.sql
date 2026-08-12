@@ -6,6 +6,14 @@ DROP FUNCTION IF EXISTS routine_values_from(integer);
 DROP FUNCTION IF EXISTS routine_pairs_from(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_value(integer);
 DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
+DROP FUNCTION IF EXISTS routine_utility_prelude();
+DROP FUNCTION IF EXISTS routine_update_all_values();
+DROP FUNCTION IF EXISTS routine_set_void();
+DROP FUNCTION IF EXISTS routine_correlated_write(integer);
+DROP FUNCTION IF EXISTS routine_write_rows(integer);
+DROP FUNCTION IF EXISTS routine_nested_write(integer);
+DROP FUNCTION IF EXISTS routine_nested_write_result(integer);
+DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
 CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
@@ -23,12 +31,42 @@ DROP FUNCTION routine_multi_query_value(integer);
 DROP FUNCTION routine_multi_query_pairs(integer);
 CREATE TABLE routine_values (id integer PRIMARY KEY, value integer);
 INSERT INTO routine_values VALUES (1, 40), (2, 41);
+CREATE FUNCTION routine_correlated_write(integer) RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+BEGIN;
+SELECT routine_correlated_write(id) FROM routine_values ORDER BY id;
+SELECT id, value FROM routine_values ORDER BY id;
+ROLLBACK;
+DROP FUNCTION routine_correlated_write(integer);
+CREATE FUNCTION routine_write_rows(integer) RETURNS SETOF integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+BEGIN;
+SELECT value FROM routine_write_rows(1) AS result(value);
+SELECT id, value FROM routine_values WHERE id = 1;
+ROLLBACK;
+DROP FUNCTION routine_write_rows(integer);
+CREATE FUNCTION routine_nested_write(integer) RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+CREATE FUNCTION routine_nested_write_result(integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT routine_nested_write($1)';
+BEGIN;
+SELECT routine_nested_write_result(1);
+SELECT id, value FROM routine_values WHERE id = 1;
+ROLLBACK;
+DROP FUNCTION routine_nested_write_result(integer);
+DROP FUNCTION routine_nested_write(integer);
+CREATE FUNCTION routine_update_all_values() RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 RETURNING value';
+SELECT routine_update_all_values();
+SELECT id, value FROM routine_values ORDER BY id;
 CREATE FUNCTION routine_lookup_value(integer) RETURNS integer LANGUAGE SQL
   AS 'SELECT value FROM routine_values WHERE id = $1';
 CREATE FUNCTION routine_nested_value(integer) RETURNS integer LANGUAGE SQL
   AS 'SELECT routine_lookup_value($1) + 1';
 CREATE FUNCTION routine_values_from(integer) RETURNS SETOF integer LANGUAGE SQL
   AS 'SELECT value FROM routine_values WHERE id >= $1';
+CREATE FUNCTION routine_set_void() RETURNS SETOF void LANGUAGE SQL
+  AS 'SELECT NULL UNION ALL SELECT NULL';
 CREATE FUNCTION routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
   AS 'SELECT id, value FROM routine_values WHERE id >= $1';
 SELECT routine_lookup_value(1), routine_nested_value(2);
@@ -40,6 +78,11 @@ CREATE FUNCTION routine_returning_value(integer) RETURNS integer LANGUAGE SQL
   AS 'INSERT INTO routine_values VALUES (5, $1) RETURNING value + 2';
 SELECT routine_returning_value(40);
 SELECT id, value FROM routine_values WHERE id = 5;
+CREATE FUNCTION routine_utility_prelude() RETURNS integer LANGUAGE SQL
+  AS 'CREATE TABLE routine_created_in_function (value integer); SELECT 44';
+SELECT routine_utility_prelude();
+INSERT INTO routine_created_in_function VALUES (45);
+SELECT value FROM routine_created_in_function;
 CREATE SCHEMA routine_path;
 SET search_path TO routine_path, public;
 CREATE FUNCTION write_on_path(integer) RETURNS integer LANGUAGE SQL
@@ -56,6 +99,7 @@ SELECT routine_values.id, values_from.value
   JOIN LATERAL routine_values_from(routine_values.id) AS values_from(value) ON true
  ORDER BY routine_values.id, values_from.value;
 SELECT proretset FROM pg_proc WHERE proname = 'routine_values_from';
+SELECT count(*) FROM routine_set_void() AS result(value);
 SELECT routine_id, routine_value FROM routine_pairs_from(1) ORDER BY routine_id;
 SELECT routine_values.id, pairs.routine_value
   FROM routine_values
@@ -92,4 +136,8 @@ DROP FUNCTION routine_lookup_value(integer);
 DROP FUNCTION routine_nested_value(integer);
 DROP FUNCTION routine_values_from(integer);
 DROP FUNCTION routine_pairs_from(integer);
+DROP FUNCTION routine_utility_prelude();
+DROP FUNCTION routine_update_all_values();
+DROP FUNCTION routine_set_void();
+DROP TABLE routine_created_in_function;
 DROP TABLE routine_values;

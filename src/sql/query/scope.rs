@@ -17,8 +17,7 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
 
 use super::{
     Chained, MAX_JOIN_TABLES, arena_full, common_using_type, select_into_rows, synth_derived_def,
-    synth_derived_def_outer, table_func_def, table_func_def_outer, table_func_rows,
-    table_func_rows_outer,
+    synth_derived_def_outer, table_func_def, table_func_def_outer, table_func_rows_outer,
 };
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
@@ -635,9 +634,18 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
-            table_func_rows_outer(tref, storage, txid, arena, params, &columns)?
+            table_func_rows_outer(tref, storage, txid, arena, params, &columns, None, None)?
         } else {
-            table_func_rows(tref, storage, txid, arena, params)?
+            table_func_rows_outer(
+                tref,
+                storage,
+                txid,
+                arena,
+                params,
+                &crate::sql::eval::NoColumns,
+                None,
+                None,
+            )?
         };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);

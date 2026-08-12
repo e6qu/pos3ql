@@ -555,6 +555,12 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
+    if let Some(catalog) = hooks.catalog {
+        catalog.rewind_routine_invocation_cursor();
+    }
+    if let Some(sequences) = hooks.sequences {
+        sequences.rewind_statement_cursor();
+    }
     // Pass 2: project + keys, encode.
     {
         let mut at = 0usize;

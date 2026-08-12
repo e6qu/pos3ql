@@ -630,7 +630,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
     if tref.func_args.is_some() {
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
         // arguments against the outer row.
-        return super::table_func_rows_outer(tref, storage, txid, arena, params, outer);
+        return super::table_func_rows_outer(tref, storage, txid, arena, params, outer, None, None);
     }
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,

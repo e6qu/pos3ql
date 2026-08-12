@@ -196,6 +196,14 @@ pub(super) fn build_column(
             }
         }
     };
+    if ctype.is_pseudo() {
+        return Err(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "column \"{}\" has pseudo-type {}",
+            c.name,
+            c.type_name
+        ));
+    }
     if let Some(identity) = user_type {
         storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
     }

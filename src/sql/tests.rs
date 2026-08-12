@@ -6297,7 +6297,410 @@ fn setof_void_routine_is_a_typed_table_source() {
             &mut budget,
             "SELECT count(*) FROM set_void() AS result(value)",
         )),
-        ["2"]
+        ["0"]
+    );
+}
+
+#[test]
+fn setof_void_routine_allows_a_final_data_modification_action() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE setof_void_action_rows (id integer PRIMARY KEY); \
+         INSERT INTO setof_void_action_rows VALUES (1); \
+         CREATE FUNCTION clear_setof_void_action_rows() RETURNS SETOF void LANGUAGE SQL \
+           AS 'DELETE FROM setof_void_action_rows'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT count(*) FROM clear_setof_void_action_rows() AS result(value); \
+         SELECT count(*) FROM setof_void_action_rows; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_set_and_table_routines_resume_as_table_sources() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_rows (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_rows VALUES (1, 10), (2, 20); \
+         CREATE FUNCTION bump_set_rows() RETURNS SETOF integer LANGUAGE SQL \
+           AS 'UPDATE routine_rows SET value = value + 1 RETURNING value'; \
+         CREATE FUNCTION bump_table_rows() RETURNS TABLE (value integer) LANGUAGE SQL \
+           AS 'UPDATE routine_rows SET value = value + 1 WHERE id = 1 RETURNING value'",
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM bump_set_rows() AS result(value)",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT value FROM bump_set_rows() AS result(value) ORDER BY value; \
+         SELECT value FROM bump_table_rows() ORDER BY value; \
+         SELECT id, value FROM routine_rows ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["11", "21", "12", "1|12", "2|21"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_lateral_table_routine_resumes_per_outer_row() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_lateral_source (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_lateral_source VALUES (1, 10), (2, 20); \
+         CREATE FUNCTION bump_lateral_row(target integer) RETURNS SETOF integer LANGUAGE SQL \
+           AS 'UPDATE routine_lateral_source SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT source.id, result.value FROM routine_lateral_source AS source \
+         CROSS JOIN LATERAL bump_lateral_row(source.id) AS result(value) ORDER BY source.id; \
+         SELECT id, value FROM routine_lateral_source ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|11", "2|21", "1|11", "2|21"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn nested_mutable_scalar_routine_resumes_inside_routine_result_query() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_nested_write (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_nested_write VALUES (1, 40); \
+         CREATE FUNCTION bump_nested_write(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_nested_write SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION call_nested_write(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT bump_nested_write($1)'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT call_nested_write(1); \
+         SELECT value FROM routine_nested_write WHERE id = 1; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "41"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn nested_mutable_table_routine_resumes_inside_routine_result_query() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_nested_table (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_nested_table VALUES (1, 40), (2, 50); \
+         CREATE FUNCTION bump_nested_table() RETURNS SETOF integer LANGUAGE SQL \
+           AS 'UPDATE routine_nested_table SET value = value + 1 RETURNING value'; \
+         CREATE FUNCTION count_nested_table() RETURNS integer LANGUAGE SQL \
+           AS 'SELECT count(*) FROM bump_nested_table() AS result(value)'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT count_nested_table(); \
+         SELECT value FROM routine_nested_table ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["2", "41", "51"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn data_modifying_scalar_routine_uses_physical_returning_order() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_returning_order (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_returning_order VALUES (1, 40), (2, 41); \
+         CREATE FUNCTION increment_routine_returning_order() RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_returning_order SET value = value + 1 RETURNING value'; \
+         SELECT increment_routine_returning_order(); \
+         SELECT value FROM routine_returning_order ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "41", "42"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn table_routine_final_query_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_table_nested_scalar (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_table_nested_scalar VALUES (1, 40), (2, 50); \
+         CREATE FUNCTION bump_table_nested_scalar(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_table_nested_scalar SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION rows_table_nested_scalar() RETURNS SETOF integer LANGUAGE SQL \
+           AS 'SELECT bump_table_nested_scalar(id) FROM routine_table_nested_scalar ORDER BY id'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT value FROM rows_table_nested_scalar() AS result(value) ORDER BY value; \
+         SELECT value FROM routine_table_nested_scalar ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "51", "41", "51"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_dml_nested (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_dml_nested VALUES (1, 40); \
+         CREATE FUNCTION bump_dml_nested(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_dml_nested SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION return_dml_nested(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_dml_nested SET value = bump_dml_nested($1) WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT return_dml_nested(1); \
+         SELECT value FROM routine_dml_nested WHERE id = 1; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "41"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn data_modifying_table_routine_result_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_table_dml_nested (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_table_dml_nested VALUES (1, 40), (2, 50); \
+         CREATE FUNCTION bump_table_dml_nested(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_table_dml_nested SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION rows_table_dml_nested() RETURNS SETOF integer LANGUAGE SQL \
+           AS 'UPDATE routine_table_dml_nested SET value = bump_table_dml_nested(id) RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT value FROM rows_table_dml_nested() AS result(value) ORDER BY value; \
+         SELECT value FROM routine_table_dml_nested ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "51", "41", "51"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn void_routine_result_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_void_nested (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_void_nested VALUES (1, 40); \
+         CREATE FUNCTION bump_void_nested(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_void_nested SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION run_void_nested(target integer) RETURNS void LANGUAGE SQL \
+           AS 'UPDATE routine_void_nested SET value = bump_void_nested($1) WHERE id = $1'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT run_void_nested(1); \
+         SELECT value FROM routine_void_nested WHERE id = 1; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["NULL", "41"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_routine_writes_obey_enclosing_savepoint_rollback() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_savepoint_rows (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_savepoint_rows VALUES (1, 40); \
+         CREATE FUNCTION bump_savepoint_row(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_savepoint_rows SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SAVEPOINT before_routine; \
+         SELECT bump_savepoint_row(1); \
+         ROLLBACK TO SAVEPOINT before_routine; \
+         SELECT value FROM routine_savepoint_rows WHERE id = 1; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "40"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn nested_dml_routine_retry_rewinds_writes_before_pending_call() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_retry_rows (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_retry_rows VALUES (1, 40), (2, 50); \
+         CREATE FUNCTION bump_retry_row(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_retry_rows SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION update_retry_rows() RETURNS SETOF integer LANGUAGE SQL \
+           AS 'UPDATE routine_retry_rows SET value = CASE WHEN id = 2 THEN bump_retry_row(id) ELSE value + 10 END RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT value FROM update_retry_rows() AS result(value) ORDER BY value; \
+         SELECT id, value FROM routine_retry_rows ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["50", "51", "1|50", "2|51"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn routine_prelude_query_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_prelude_rows (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_prelude_rows VALUES (1, 40); \
+         CREATE FUNCTION bump_prelude_row(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_prelude_rows SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION routine_prelude_result(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT bump_prelude_row($1); SELECT 7'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT routine_prelude_result(1); \
+         SELECT value FROM routine_prelude_rows WHERE id = 1; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["7", "41"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_routine_prelude_query_resumes_nested_mutable_scalar_routine() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_mutable_prelude_rows (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_mutable_prelude_rows VALUES (1, 40); \
+         CREATE FUNCTION bump_mutable_prelude_row(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_mutable_prelude_rows SET value = value + 1 WHERE id = $1 RETURNING value'; \
+         CREATE FUNCTION mutable_prelude_result(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'INSERT INTO routine_mutable_prelude_rows VALUES (2, 20); SELECT bump_mutable_prelude_row($1); SELECT 7'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT mutable_prelude_result(1); \
+         SELECT id, value FROM routine_mutable_prelude_rows ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["7", "1|41", "2|20"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -6311,6 +6714,14 @@ fn correlated_scalar_write_routine_resumes_after_scan_borrow() {
          INSERT INTO routine_source VALUES (1, 40), (2, 41); \
          CREATE FUNCTION bump_routine_value(target integer) RETURNS integer LANGUAGE SQL \
            AS 'UPDATE routine_source SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT bump_routine_value(id) FROM routine_source",
+        )),
+        [crate::sql::types::oid::INT4]
     );
     let output = run_with(
         &mut engine,
@@ -6539,6 +6950,8 @@ fn sql_write_function_survives_wal_recovery() {
             "CREATE TABLE write_function_log (id integer PRIMARY KEY, value integer); \
              CREATE FUNCTION write_function_value(value integer) RETURNS integer LANGUAGE SQL \
                AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value + 1'; \
+             CREATE FUNCTION write_function_rows(value integer) RETURNS SETOF integer LANGUAGE SQL \
+               AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value'; \
              CREATE FUNCTION recovered_set_void() RETURNS SETOF void LANGUAGE SQL \
                AS 'SELECT NULL UNION ALL SELECT NULL'; \
              SELECT write_function_value(40)",
@@ -6557,12 +6970,13 @@ fn sql_write_function_survives_wal_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT write_function_value(41); \
+         SELECT value FROM write_function_rows(42) AS result(value); \
          SELECT id, value FROM write_function_log ORDER BY id; \
          SELECT count(*) FROM recovered_set_void() AS result(value)",
     );
     assert_eq!(
         data_rows(&output),
-        ["43", "40|41", "41|42", "2"],
+        ["43", "43", "40|41", "41|42", "42|43", "0"],
         "{}",
         String::from_utf8_lossy(&output)
     );

@@ -10,6 +10,9 @@ DROP FUNCTION IF EXISTS routine_utility_prelude();
 DROP FUNCTION IF EXISTS routine_update_all_values();
 DROP FUNCTION IF EXISTS routine_set_void();
 DROP FUNCTION IF EXISTS routine_correlated_write(integer);
+DROP FUNCTION IF EXISTS routine_write_rows(integer);
+DROP FUNCTION IF EXISTS routine_nested_write(integer);
+DROP FUNCTION IF EXISTS routine_nested_write_result(integer);
 DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
@@ -35,6 +38,23 @@ SELECT routine_correlated_write(id) FROM routine_values ORDER BY id;
 SELECT id, value FROM routine_values ORDER BY id;
 ROLLBACK;
 DROP FUNCTION routine_correlated_write(integer);
+CREATE FUNCTION routine_write_rows(integer) RETURNS SETOF integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+BEGIN;
+SELECT value FROM routine_write_rows(1) AS result(value);
+SELECT id, value FROM routine_values WHERE id = 1;
+ROLLBACK;
+DROP FUNCTION routine_write_rows(integer);
+CREATE FUNCTION routine_nested_write(integer) RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+CREATE FUNCTION routine_nested_write_result(integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT routine_nested_write($1)';
+BEGIN;
+SELECT routine_nested_write_result(1);
+SELECT id, value FROM routine_values WHERE id = 1;
+ROLLBACK;
+DROP FUNCTION routine_nested_write_result(integer);
+DROP FUNCTION routine_nested_write(integer);
 CREATE FUNCTION routine_update_all_values() RETURNS integer LANGUAGE SQL
   AS 'UPDATE routine_values SET value = value + 1 RETURNING value';
 SELECT routine_update_all_values();

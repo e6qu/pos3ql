@@ -6187,7 +6187,15 @@ pub fn create_routine(
         }
         crate::storage::RoutineKind::SetFunction { .. }
         | crate::storage::RoutineKind::TableFunction => {
-            if let Err(error) = super::query::parse_routine_query_program(routine.body, arena) {
+            let returns_void = matches!(
+                kind,
+                crate::storage::RoutineKind::SetFunction {
+                    result: ColType::Void
+                }
+            );
+            if let Err(error) =
+                super::query::parse_routine_function_program(routine.body, arena, returns_void)
+            {
                 return sql_fail(error);
             }
         }
@@ -16018,6 +16026,10 @@ fn collect_matches<'a>(
         }
         Ok(ControlFlow::Continue(()))
     })?;
+    // DML RETURNING follows the target table's physical row order. The row
+    // map is hash-addressed, so restore the monotonic row identity assigned
+    // when the heap image was first appended before locks and writes begin.
+    scratch.sort_unstable_by_key(|(rowid, _)| *rowid);
     Ok(())
 }
 

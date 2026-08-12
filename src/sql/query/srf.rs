@@ -611,7 +611,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // the array's element type; array_elements' default column is `value`.
     let mut default_cols: [(SqlName, ColType); MAX_COLUMNS] =
         [(SqlName::EMPTY, ColType::Bool); MAX_COLUMNS];
-    let n_default = if let Some(routine) = routine {
+    let n_default = if let Some((_, routine)) = routine {
         if let Some(output) = routine.table_columns() {
             for (slot, column) in output.iter().enumerate() {
                 default_cols[slot] = (column.name, column.ctype);
@@ -764,7 +764,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
-) -> Result<Option<&'a RoutineDef>, SqlError> {
+) -> Result<Option<(usize, &'a RoutineDef)>, SqlError> {
     use core::fmt::Write as _;
 
     let args = tref.func_args.expect("table function carries arguments");
@@ -797,29 +797,12 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
         return Ok(None);
     };
     storage.require_routine_execute(slot, txid)?;
-    Ok(Some(storage.routine(slot)))
+    Ok(Some((slot, storage.routine(slot))))
 }
 
-/// Materializes built-in and SQL-language table-function rows as projected records.
-pub(super) fn table_func_rows<'a>(
-    tref: &'a TableRef<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-) -> Result<&'a [&'a [u8]], SqlError> {
-    table_func_rows_outer(
-        tref,
-        storage,
-        txid,
-        arena,
-        params,
-        &crate::sql::eval::NoColumns,
-    )
-}
-
-/// [`table_func_rows`] evaluating the function's arguments against `columns` — an
+/// Evaluates a table function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     storage: &'a Storage,
@@ -827,8 +810,19 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
+    invocations: Option<&super::RoutineInvocationState<'a>>,
+    statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let rows = table_func_base_rows_outer(tref, storage, txid, arena, params, columns)?;
+    let rows = table_func_base_rows_outer(
+        tref,
+        storage,
+        txid,
+        arena,
+        params,
+        columns,
+        invocations,
+        statement_arena,
+    )?;
     if !tref.with_ordinality {
         return Ok(rows);
     }
@@ -850,6 +844,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     Ok(&*wrapped)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     tref: &'a TableRef<'a>,
     storage: &'a Storage,
@@ -857,6 +852,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
+    invocations: Option<&super::RoutineInvocationState<'a>>,
+    statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
     if tref.table.eq_ignore_ascii_case("pg_get_sequence_data") {
@@ -1337,7 +1334,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         return Ok(&*rows);
     }
     if !tref.table.eq_ignore_ascii_case("generate_series") {
-        let Some(routine) = table_func_routine(tref, storage, txid, arena, params, columns)? else {
+        let Some((routine_slot, routine)) =
+            table_func_routine(tref, storage, txid, arena, params, columns)?
+        else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "table function \"{}\" is not supported",
@@ -1353,10 +1352,50 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
             routine_params[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
         }
-        let program = super::parse_routine_query_program(routine.body.as_str(), arena)?;
+        let program = super::parse_routine_function_program(
+            routine.body.as_str(),
+            arena,
+            scalar_result == Some(ColType::Void),
+        )?;
+        if super::routine_program_requires_mutable_execution(&program) {
+            let (invocations, statement_arena) = match (invocations, statement_arena) {
+                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "data-modifying SQL table functions require a resumable query executor"
+                    )
+                })?,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    ));
+                }
+            };
+            return invocations
+                .resolve_rows(routine_slot, &routine_params[..args.len()], statement_arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "pending SQL table routine did not suspend query execution"
+                    )
+                });
+        }
         for query in program.preceding {
+            let super::RoutinePrelude::Statement(statement) = query else {
+                let super::RoutinePrelude::Forbidden(statement) = query else {
+                    unreachable!("routine prelude has two variants");
+                };
+                return Err(super::routine_forbidden_statement_error(statement));
+            };
+            let query = match statement {
+                crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(*query),
+                crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(*query),
+                _ => unreachable!("mutable table routine was classified before execution"),
+            };
             super::execute_routine_query(
-                query,
+                &query,
                 storage,
                 txid,
                 arena,
@@ -1365,12 +1404,37 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &mut |_| Ok(()),
             )?;
         }
+        let result_query = match program.result {
+            super::RoutineFunctionResult::Query(query) => query,
+            super::RoutineFunctionResult::Void(statement) => match statement {
+                crate::sql::ast::Stmt::Select(query) => arena
+                    .alloc(super::RoutineQuery::Select(*query))
+                    .map_err(|_| arena_full())?,
+                crate::sql::ast::Stmt::SetQuery(query) => arena
+                    .alloc(super::RoutineQuery::Set(*query))
+                    .map_err(|_| arena_full())?,
+                _ => unreachable!("mutable table routine was classified before execution"),
+            },
+            _ => unreachable!("mutable table routine was classified before execution"),
+        };
+        if scalar_result == Some(ColType::Void) {
+            super::execute_routine_query(
+                result_query,
+                storage,
+                txid,
+                arena,
+                &routine_params[..args.len()],
+                false,
+                &mut |_| Ok(()),
+            )?;
+            return Ok(&[]);
+        }
         const EMPTY: &[u8] = &[];
         let mut rows: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
         super::execute_routine_query(
-            program.result,
+            result_query,
             storage,
             txid,
             arena,

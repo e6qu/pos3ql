@@ -72,9 +72,7 @@ mod aggregate;
 use aggregate::{AggState, fold_aggregates};
 
 mod srf;
-use srf::{
-    find_srf, srf_count, srf_max_count, table_func_def, table_func_def_outer, table_func_rows,
-};
+use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_def_outer};
 pub(crate) use srf::{synth_derived_def, synth_derived_def_outer, table_func_rows_outer};
 
 mod group;
@@ -156,11 +154,82 @@ pub(crate) struct PendingRoutineInvocation<'a> {
     pub argument_count: usize,
 }
 
+/// A completed routine invocation is either a scalar expression value or the
+/// encoded rows of a table source. Keeping the two contracts distinct prevents
+/// a restart from ever interpreting one as the other.
+#[derive(Clone, Copy)]
+enum RoutineInvocationResult<'a> {
+    Scalar(Datum<'a>),
+    Rows(&'a [&'a [u8]]),
+}
+
 pub(crate) struct RoutineInvocationState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation<'a>>>,
-    results: [Cell<Datum<'a>>; MAX_ROUTINE_INVOCATIONS],
+    results: [Cell<RoutineInvocationResult<'a>>; MAX_ROUTINE_INVOCATIONS],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineInvocationContext<'a> {
+    invocations: &'a RoutineInvocationState<'a>,
+    statement_arena: &'a Arena,
+}
+
+impl<'a> RoutineInvocationContext<'a> {
+    pub(crate) const fn new(
+        invocations: &'a RoutineInvocationState<'a>,
+        statement_arena: &'a Arena,
+    ) -> Self {
+        Self {
+            invocations,
+            statement_arena,
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_ROUTINE_INVOCATIONS: Cell<Option<(*const (), *const ())>> = const { Cell::new(None) };
+}
+
+/// Installs the statement-owned routine invocation log while its query work
+/// arena is scanned. Scan callbacks do not own an engine reference, so this
+/// scoped bridge carries the already-borrowed context without duplicating it.
+pub(crate) struct RoutineInvocationScope(Option<(*const (), *const ())>);
+
+impl Drop for RoutineInvocationScope {
+    fn drop(&mut self) {
+        ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.set(self.0));
+    }
+}
+
+pub(crate) fn enter_routine_invocation_scope(
+    context: Option<RoutineInvocationContext<'_>>,
+) -> RoutineInvocationScope {
+    let current = match context {
+        Some(context) => Some((
+            context.invocations as *const RoutineInvocationState<'_> as *const (),
+            context.statement_arena as *const Arena as *const (),
+        )),
+        None => ACTIVE_ROUTINE_INVOCATIONS.with(Cell::get),
+    };
+    let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
+    RoutineInvocationScope(prior)
+}
+
+pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationState<'a>, &'a Arena)>
+{
+    ACTIVE_ROUTINE_INVOCATIONS.with(|active| {
+        let (invocations, arena) = active.get()?;
+        // The only writer is `enter_routine_invocation_scope`; its guard stays
+        // live for the synchronous scan and restores any enclosing execution.
+        Some(unsafe {
+            (
+                &*(invocations as *const RoutineInvocationState<'a>),
+                &*(arena as *const Arena),
+            )
+        })
+    })
 }
 
 impl<'a> RoutineInvocationState<'a> {
@@ -169,7 +238,8 @@ impl<'a> RoutineInvocationState<'a> {
             next: Cell::new(0),
             completed: Cell::new(0),
             pending: Cell::new(None),
-            results: [const { Cell::new(Datum::Null) }; MAX_ROUTINE_INVOCATIONS],
+            results: [const { Cell::new(RoutineInvocationResult::Scalar(Datum::Null)) };
+                MAX_ROUTINE_INVOCATIONS],
         }
     }
 
@@ -199,8 +269,13 @@ impl<'a> RoutineInvocationState<'a> {
         }
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let encoded =
-                super::exec::encode_projected_pub(&[self.results[ordinal].get()], query_arena)?;
+            let RoutineInvocationResult::Scalar(value) = self.results[ordinal].get() else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "SQL routine invocation changed from a table source to a scalar expression"
+                ));
+            };
+            let encoded = super::exec::encode_projected_pub(&[value], query_arena)?;
             return Ok(Some(super::exec::decode_projected_pub(encoded, 0)));
         }
         self.pending.set(Some(PendingRoutineInvocation {
@@ -227,7 +302,56 @@ impl<'a> RoutineInvocationState<'a> {
                 MAX_ROUTINE_INVOCATIONS
             ));
         }
-        self.results[ordinal].set(result);
+        self.results[ordinal].set(RoutineInvocationResult::Scalar(result));
+        self.completed.set(ordinal + 1);
+        Ok(())
+    }
+
+    pub(crate) fn resolve_rows(
+        &self,
+        slot: usize,
+        arguments: &[Datum],
+        statement_arena: &'a Arena,
+    ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
+        let ordinal = self.next.get();
+        if ordinal == MAX_ROUTINE_INVOCATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} mutable routine invocations",
+                MAX_ROUTINE_INVOCATIONS
+            ));
+        }
+        self.next.set(ordinal + 1);
+        if ordinal < self.completed.get() {
+            let RoutineInvocationResult::Rows(rows) = self.results[ordinal].get() else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "SQL routine invocation changed from a scalar expression to a table source"
+                ));
+            };
+            return Ok(Some(rows));
+        }
+        self.pending.set(Some(PendingRoutineInvocation {
+            slot,
+            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            argument_count: arguments.len(),
+        }));
+        Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "mutable SQL routine invocation is pending"
+        ))
+    }
+
+    pub(crate) fn complete_rows(&self, rows: &'a [&'a [u8]]) -> Result<(), SqlError> {
+        let ordinal = self.completed.get();
+        if ordinal == MAX_ROUTINE_INVOCATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} mutable routine invocations",
+                MAX_ROUTINE_INVOCATIONS
+            ));
+        }
+        self.results[ordinal].set(RoutineInvocationResult::Rows(rows));
         self.completed.set(ordinal + 1);
         Ok(())
     }
@@ -239,13 +363,6 @@ const MAX_SUBQUERIES: usize = 8;
 const SUBQUERY_DEPTH: u32 = 4;
 
 type Outcome = Result<Result<(), SqlError>, WireFull>;
-
-/// A parsed SQL-language function body. Its representation makes a missing
-/// result query or a non-query statement impossible for callers to observe.
-pub(crate) struct RoutineQueryProgram<'a> {
-    pub preceding: &'a [RoutineQuery<'a>],
-    pub result: &'a RoutineQuery<'a>,
-}
 
 /// A SQL-language function body can contain either ordinary or set-operation
 /// queries; no DML statement can cross this boundary.
@@ -276,56 +393,6 @@ pub(crate) enum RoutineFunctionResult<'a> {
 pub(crate) struct RoutineFunctionProgram<'a> {
     pub preceding: &'a [RoutinePrelude<'a>],
     pub result: RoutineFunctionResult<'a>,
-}
-
-/// Parse the read-only query program accepted as a SQL-language function
-/// body. PostgreSQL evaluates every query and uses only the final query as
-/// the function result; retaining that distinction prevents an earlier query
-/// from accidentally becoming the result as the body grows.
-pub(crate) fn parse_routine_query_program<'a>(
-    body: &'a str,
-    arena: &'a Arena,
-) -> Result<RoutineQueryProgram<'a>, SqlError> {
-    const MAX_ROUTINE_QUERIES: usize = 64;
-    let mut parser = super::parser::Parser::new(body, arena)
-        .map_err(|error| super::parse_error_to_sql(&error))?;
-    let mut parsed = [None; MAX_ROUTINE_QUERIES];
-    let mut count = 0usize;
-    loop {
-        let statement = parser
-            .next_stmt()
-            .map_err(|error| super::parse_error_to_sql(&error))?;
-        let Some(statement) = statement else { break };
-        let query = match statement {
-            Stmt::Select(select) => RoutineQuery::Select(select),
-            Stmt::SetQuery(query) => RoutineQuery::Set(query),
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL function body may contain only SELECT queries"
-                ));
-            }
-        };
-        if count == parsed.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL function body exceeds {} queries",
-                parsed.len()
-            ));
-        }
-        parsed[count] = Some(query);
-        count += 1;
-    }
-    if count == 0 {
-        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
-    }
-    let queries = arena
-        .alloc_slice_with(count, |index| parsed[index].expect("counted parsed query"))
-        .map_err(|_| arena_full())?;
-    Ok(RoutineQueryProgram {
-        preceding: &queries[..count - 1],
-        result: &queries[count - 1],
-    })
 }
 
 /// Parses a SQL-language function body. PostgreSQL permits supported SQL
@@ -542,9 +609,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     arena,
                 );
             }
+            if let Some((invocations, statement_arena)) = active_routine_invocations() {
+                return invocations.resolve(slot, arguments, statement_arena, arena);
+            }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "data-modifying SQL functions require a top-level SELECT function(...) call"
+                "data-modifying SQL functions require a resumable query executor"
             ));
         }
         let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -581,7 +651,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             RoutineFunctionResult::DataModification(_) => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "data-modifying SQL function results require a top-level SELECT function(...) call"
+                    "data-modifying SQL function results require a resumable query executor"
                 ));
             }
             RoutineFunctionResult::Void(statement) => {
@@ -591,7 +661,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
-                            "data-modifying SQL functions require a top-level SELECT function(...) call"
+                            "data-modifying SQL functions require a resumable query executor"
                         ));
                     }
                 };
@@ -637,6 +707,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn rewind_routine_invocation_cursor(&self) {
         if let Some(invocations) = self.invocations {
+            invocations.rewind_cursor();
+        } else if let Some((invocations, _)) = active_routine_invocations() {
             invocations.rewind_cursor();
         }
     }
@@ -4457,7 +4529,19 @@ pub fn describe_scope_items<'q>(
                 let user_type = user_type_cast_description(expression, name, storage, txid);
                 let (oid, typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
-                    None => infer_scope_type(expression, scope)?,
+                    None => {
+                        let resolver = CatalogScopeCols {
+                            scope,
+                            storage,
+                            txid,
+                        };
+                        let (oid, typlen) = super::exec::infer_type_res(expression, &resolver)?;
+                        if oid == super::types::oid::UNKNOWN {
+                            (super::types::oid::TEXT, -1)
+                        } else {
+                            (oid, typlen)
+                        }
+                    }
                 };
                 // A bare column carries its declared modifier and a cast its
                 // target's, as RowDescription reports them; anything computed

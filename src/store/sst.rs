@@ -1486,7 +1486,7 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
                 if len != 0 {
                     return Err(corrupt());
                 }
-            } else if len < (2 + columns.div_ceil(8)) as u32 {
+            } else if !(2 + columns.div_ceil(8)..=MAX_INLINE_ROW).contains(&(len as usize)) {
                 return Err(corrupt());
             }
         }
@@ -3035,6 +3035,14 @@ mod tests {
         assert_eq!(kind, BlockType::SstDataPaxV2);
         let layout = pax_layout(&raw[..length]).unwrap();
         assert!(layout.external_columns());
+        let mut oversized_row = raw[..length].to_vec();
+        let row_length = 8 + layout.columns() + PAX_ROW_HEADER;
+        oversized_row[row_length..row_length + 4]
+            .copy_from_slice(&((MAX_INLINE_ROW + 1) as u32).to_le_bytes());
+        assert!(
+            pax_layout(&oversized_row).is_err(),
+            "a PAX descriptor must reject a row length beyond the fixed row buffer"
+        );
         assert_ne!(
             layout.column_ref(&raw[..length], 0).unwrap(),
             layout.column_ref(&raw[..length], 1).unwrap()

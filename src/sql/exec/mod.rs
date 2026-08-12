@@ -13018,7 +13018,7 @@ pub fn insert(
         let mut count = 0usize;
         {
             let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows(
+            if let Err(e) = super::query::select_into_rows_recycling(
                 storage,
                 txn.txid,
                 sel,

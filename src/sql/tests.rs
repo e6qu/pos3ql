@@ -65,14 +65,14 @@ fn assert_cold_pax_query(
     assert_eq!(
         data_rows(&result),
         expected,
-        "{}",
-        String::from_utf8_lossy(&result)
+        "cold PAX query failed: {sql_text}\n{}",
+        String::from_utf8_lossy(&result),
     );
     if let Some(max_object_read_bytes) = max_object_read_bytes {
         let reads = engine.storage.block_io_stats().saturating_sub(before);
         assert!(
             reads.object_read_bytes < max_object_read_bytes,
-            "cold PAX query must read only its demanded extents: bytes={}",
+            "cold PAX query must read only its demanded extents: {sql_text}; bytes={}",
             reads.object_read_bytes
         );
     }
@@ -16337,6 +16337,17 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT right_side.id \
+         FROM wide_pax_third AS left_side \
+         FULL JOIN wide_pax_right AS right_side ON left_side.id = right_side.id \
+         WHERE right_side.id = 1",
+        &["1"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT id, count(*) FROM wide_pax GROUP BY id ORDER BY id LIMIT 1",
         &["1|1"],
         None,
@@ -16393,6 +16404,54 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     );
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 71);
+    let mut fault_budget = Budget::new(1 << 30);
+    let mut faulted = Engine::new(&config, &mut fault_budget).unwrap();
+    namespace.borrow_mut().faults.rot_per_mille = 1000;
+    let rejected = run_with_arena_bytes(
+        &mut faulted,
+        &mut fault_budget,
+        "SELECT id FROM wide_pax WHERE id = 287",
+        1 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("58030"),
+        "a corrupt object-store PAX extent must fail loudly: {}",
+        String::from_utf8_lossy(&rejected)
+    );
+    drop(faulted);
+    namespace.borrow_mut().faults.rot_per_mille = 0;
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT id FROM wide_pax WHERE id = 287",
+        &["287"],
+        Some(1 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "CREATE TABLE wide_pax_insert_target (id int PRIMARY KEY, payload text); \
+         INSERT INTO wide_pax_insert_target \
+         SELECT id, payload_0 FROM wide_pax WHERE id = 287 \
+         RETURNING id",
+        &["287"],
+        Some(3 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "DELETE FROM wide_pax_target AS target \
+         USING wide_pax AS source \
+         WHERE target.id = source.id \
+         RETURNING target.id",
+        &["287"],
+        Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let before = engine.storage.block_io_stats();
@@ -16402,11 +16461,13 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         "UPDATE wide_pax_target AS target \
          SET payload = source.payload_0 \
          FROM wide_pax AS source \
-         WHERE target.id = source.id",
+         WHERE target.id = source.id \
+         RETURNING target.id",
         1 << 20,
     );
-    assert!(
-        String::from_utf8_lossy(&updated).contains("UPDATE 1"),
+    assert_eq!(
+        data_rows(&updated),
+        ["287"],
         "{}",
         String::from_utf8_lossy(&updated)
     );

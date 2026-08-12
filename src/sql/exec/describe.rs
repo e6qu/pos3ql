@@ -2001,16 +2001,21 @@ pub fn infer_type_res(
             "to_date" => of(ColType::Date),
             "to_timestamp" => of(ColType::Timestamptz),
             "generate_series" => {
-                let a = args
+                let start = args
                     .first()
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
-                    .map(|t| t.0);
-                if a == Some(oid::INT8) {
-                    of(ColType::Int8)
-                } else {
-                    of(ColType::Int4)
-                }
+                    .and_then(|(type_oid, _)| coltype_of_oid(type_oid));
+                let has_numeric = args.iter().any(|argument| {
+                    infer_type_res(argument, columns)
+                        .ok()
+                        .and_then(|(type_oid, _)| coltype_of_oid(type_oid))
+                        == Some(ColType::Numeric)
+                });
+                of(crate::sql::eval::generate_series_result_type(
+                    start,
+                    has_numeric,
+                ))
             }
             "unnest" => {
                 // The element type of the array argument.

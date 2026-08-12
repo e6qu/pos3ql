@@ -2091,37 +2091,49 @@ fn call<'a>(
                     Datum::Int8(v)
                 });
             }
-            // Temporal series: date/timestamp[tz] start with an interval step.
-            let Some((base, kind)) = timestamp_series_start(&start) else {
-                if start.is_null() {
-                    return Ok(Datum::Null);
+            if let Some((base, kind)) = timestamp_series_start(&start) {
+                if args.len() != 3 {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "generate_series over timestamps requires a step"
+                    ));
                 }
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "generate_series is supported for integer and timestamp arguments"
-                ));
-            };
-            let stop_micros =
-                timestamp_series_start(&cast_to(stop, kind.coltype(), arena)?).map(|(m, _)| m);
-            // The step is an interval — coerce a bare string literal, as
-            // PostgreSQL's function resolution does.
-            let Datum::Interval(step_iv) = cast_to(step, ColType::Interval, arena)? else {
+                let stop_micros =
+                    timestamp_series_start(&cast_to(stop, kind.coltype(), arena)?).map(|(m, _)| m);
+                // The step is an interval — coerce a bare string literal, as
+                // PostgreSQL's function resolution does.
+                let Datum::Interval(step_iv) = cast_to(step, ColType::Interval, arena)? else {
+                    return Ok(Datum::Null);
+                };
+                // Iterative addition — calendar month/day arithmetic does not
+                // distribute over multiplication, so the k-th value is `start`
+                // stepped k-1 times (matching PostgreSQL).
+                let mut v = base;
+                for _ in 1..k {
+                    v = super::datetime::add_interval(v, step_iv);
+                }
+                // Past the end of this series (lockstep with a longer SRF): NULL.
+                let positive = interval_is_positive(step_iv);
+                return match stop_micros {
+                    Some(stop) if (positive && v > stop) || (!positive && v < stop) => {
+                        Ok(Datum::Null)
+                    }
+                    Some(_) => Ok(kind.datum(v)),
+                    None => Ok(Datum::Null),
+                };
+            }
+            if start.is_null() || stop.is_null() || step.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (Datum::Numeric(start), Datum::Numeric(stop), Datum::Numeric(step)) = (
+                cast_to(start, ColType::Numeric, arena)?,
+                cast_to(stop, ColType::Numeric, arena)?,
+                cast_to(step, ColType::Numeric, arena)?,
+            ) else {
                 return Ok(Datum::Null);
             };
-            // Iterative addition — calendar month/day arithmetic does not
-            // distribute over multiplication, so the k-th value is `start`
-            // stepped k-1 times (matching PostgreSQL).
-            let mut v = base;
-            for _ in 1..k {
-                v = super::datetime::add_interval(v, step_iv);
-            }
-            // Past the end of this series (lockstep with a longer SRF): NULL.
-            let positive = interval_is_positive(step_iv);
-            match stop_micros {
-                Some(stop) if (positive && v > stop) || (!positive && v < stop) => Ok(Datum::Null),
-                Some(_) => Ok(kind.datum(v)),
-                None => Ok(Datum::Null),
-            }
+            Ok(numeric_series_at(start, stop, step, k as usize, arena)?
+                .map_or(Datum::Null, Datum::Numeric))
         }
         // Set-returning `regexp_matches(string, pattern [, flags])`: for the
         // current expansion index k, the capture groups of the k-th match as a
@@ -2624,6 +2636,97 @@ pub fn bit_aggregate<'a>(
 pub enum SeriesKind {
     Timestamp,
     Timestamptz,
+}
+
+/// PostgreSQL resolves `generate_series` from its first argument's concrete
+/// overload family. Keep the type decision in one place so select-list,
+/// FROM, Describe, and Result encoding cannot disagree about a temporal
+/// series' wire type.
+pub(crate) fn generate_series_result_type(start: Option<ColType>, has_numeric: bool) -> ColType {
+    if has_numeric {
+        return ColType::Numeric;
+    }
+    match start {
+        Some(ColType::Timestamp) => ColType::Timestamp,
+        Some(ColType::Timestamptz | ColType::Date) => ColType::Timestamptz,
+        Some(ColType::Numeric) => ColType::Numeric,
+        Some(ColType::Int8) => ColType::Int8,
+        _ => ColType::Int4,
+    }
+}
+
+/// Counts a numeric `generate_series` without allowing an unsupported value
+/// family to enter the executor. The bounded arena is the ordinary result
+/// limit; this counter additionally prevents an unbounded loop before a row
+/// can be materialized.
+pub(crate) fn numeric_series_count(
+    start: Numeric<'_>,
+    stop: Numeric<'_>,
+    step: Numeric<'_>,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
+    use core::cmp::Ordering;
+    if step.is_zero() || step.is_nan() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero"
+        ));
+    }
+    let positive = crate::sql::numeric::compare(&step, &Numeric::ZERO) == Ordering::Greater;
+    let mut value = start;
+    let mut count = 0usize;
+    while if positive {
+        crate::sql::numeric::compare(&value, &stop) != Ordering::Greater
+    } else {
+        crate::sql::numeric::compare(&value, &stop) != Ordering::Less
+    } {
+        count += 1;
+        if count > 100_000_000 {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "generate_series produces too many rows"
+            ));
+        }
+        value = crate::sql::numeric::add(&value, &step, arena)?;
+    }
+    Ok(count)
+}
+
+/// The one-based numeric series value, or None after its stop bound. This is
+/// shared by SELECT-list SRF expansion and FROM materialization so their row
+/// count and values cannot drift.
+pub(crate) fn numeric_series_at<'a>(
+    start: Numeric<'a>,
+    stop: Numeric<'a>,
+    step: Numeric<'a>,
+    index: usize,
+    arena: &'a Arena,
+) -> Result<Option<Numeric<'a>>, SqlError> {
+    use core::cmp::Ordering;
+    if index == 0 {
+        return Ok(None);
+    }
+    if step.is_zero() || step.is_nan() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero"
+        ));
+    }
+    let value = if index == 1 {
+        start
+    } else {
+        let offset = Numeric::from_i64((index - 1) as i64, arena)?;
+        let increment = crate::sql::numeric::mul(&step, &offset, arena)?;
+        crate::sql::numeric::add(&start, &increment, arena)?
+    };
+    let positive = crate::sql::numeric::compare(&step, &Numeric::ZERO) == Ordering::Greater;
+    if (positive && crate::sql::numeric::compare(&value, &stop) == Ordering::Greater)
+        || (!positive && crate::sql::numeric::compare(&value, &stop) == Ordering::Less)
+    {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 impl SeriesKind {

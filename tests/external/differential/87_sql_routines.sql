@@ -9,6 +9,7 @@ DROP FUNCTION IF EXISTS routine_multi_query_pairs(integer);
 DROP FUNCTION IF EXISTS routine_utility_prelude();
 DROP FUNCTION IF EXISTS routine_update_all_values();
 DROP FUNCTION IF EXISTS routine_set_void();
+DROP FUNCTION IF EXISTS routine_correlated_write(integer);
 DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
@@ -27,6 +28,13 @@ DROP FUNCTION routine_multi_query_value(integer);
 DROP FUNCTION routine_multi_query_pairs(integer);
 CREATE TABLE routine_values (id integer PRIMARY KEY, value integer);
 INSERT INTO routine_values VALUES (1, 40), (2, 41);
+CREATE FUNCTION routine_correlated_write(integer) RETURNS integer LANGUAGE SQL
+  AS 'UPDATE routine_values SET value = value + 1 WHERE id = $1 RETURNING value';
+BEGIN;
+SELECT routine_correlated_write(id) FROM routine_values ORDER BY id;
+SELECT id, value FROM routine_values ORDER BY id;
+ROLLBACK;
+DROP FUNCTION routine_correlated_write(integer);
 CREATE FUNCTION routine_update_all_values() RETURNS integer LANGUAGE SQL
   AS 'UPDATE routine_values SET value = value + 1 RETURNING value';
 SELECT routine_update_all_values();

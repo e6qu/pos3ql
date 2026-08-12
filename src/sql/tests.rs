@@ -6302,6 +6302,90 @@ fn setof_void_routine_is_a_typed_table_source() {
 }
 
 #[test]
+fn correlated_scalar_write_routine_resumes_after_scan_borrow() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_source (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_source VALUES (1, 40), (2, 41); \
+         CREATE FUNCTION bump_routine_value(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_source SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT bump_routine_value(id) FROM routine_source ORDER BY id; \
+         SELECT id, value FROM routine_source ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["41", "42", "1|41", "2|42"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_scalar_routine_runs_in_predicates_and_joins() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_left (id integer PRIMARY KEY, value integer); \
+         CREATE TABLE routine_right (id integer PRIMARY KEY); \
+         INSERT INTO routine_left VALUES (1, 10), (2, 20); \
+         INSERT INTO routine_right VALUES (1), (2); \
+         CREATE FUNCTION touch_routine_left(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_left SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT left_side.id FROM routine_left AS left_side \
+          JOIN routine_right AS right_side ON left_side.id = right_side.id \
+          WHERE touch_routine_left(left_side.id) > 0 ORDER BY left_side.id; \
+         SELECT id, value FROM routine_left ORDER BY id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "2", "1|11", "2|21"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn mutable_routine_continuation_preserves_prior_sequence_calls() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE routine_sequence; \
+         CREATE TABLE routine_sequence_target (id integer PRIMARY KEY, value integer); \
+         INSERT INTO routine_sequence_target VALUES (1, 40); \
+         CREATE FUNCTION bump_sequence_target(target integer) RETURNS integer LANGUAGE SQL \
+           AS 'UPDATE routine_sequence_target SET value = value + 1 WHERE id = $1 RETURNING value'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT nextval('routine_sequence'), bump_sequence_target(id) \
+           FROM routine_sequence_target",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|41"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn schema_qualified_set_routine_is_a_typed_table_source() {
     let (mut engine, mut budget) = test_engine();
     run_with(

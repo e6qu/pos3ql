@@ -106,6 +106,7 @@ use window::{
 /// second, smaller executor limit.
 pub const MAX_JOIN_TABLES: usize = 64;
 const MAX_AGGS: usize = 16;
+pub(crate) const MAX_ROUTINE_INVOCATIONS: usize = 1024;
 
 use core::cell::Cell;
 std::thread_local! {
@@ -146,6 +147,90 @@ pub fn check_timeout() -> Result<(), SqlError> {
         ));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRoutineInvocation<'a> {
+    pub slot: usize,
+    pub arguments: &'a [u8],
+    pub argument_count: usize,
+}
+
+pub(crate) struct RoutineInvocationState<'a> {
+    next: Cell<usize>,
+    completed: Cell<usize>,
+    pending: Cell<Option<PendingRoutineInvocation<'a>>>,
+    results: [Cell<Datum<'a>>; MAX_ROUTINE_INVOCATIONS],
+}
+
+impl<'a> RoutineInvocationState<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            next: Cell::new(0),
+            completed: Cell::new(0),
+            pending: Cell::new(None),
+            results: [const { Cell::new(Datum::Null) }; MAX_ROUTINE_INVOCATIONS],
+        }
+    }
+
+    pub(crate) fn begin_attempt(&self) {
+        self.next.set(0);
+        self.pending.set(None);
+    }
+
+    pub(crate) fn rewind_cursor(&self) {
+        self.next.set(0);
+    }
+
+    pub(crate) fn resolve<'query>(
+        &self,
+        slot: usize,
+        arguments: &[Datum],
+        statement_arena: &'a Arena,
+        query_arena: &'query Arena,
+    ) -> Result<Option<Datum<'query>>, SqlError> {
+        let ordinal = self.next.get();
+        if ordinal == MAX_ROUTINE_INVOCATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} mutable routine invocations",
+                MAX_ROUTINE_INVOCATIONS
+            ));
+        }
+        self.next.set(ordinal + 1);
+        if ordinal < self.completed.get() {
+            let encoded =
+                super::exec::encode_projected_pub(&[self.results[ordinal].get()], query_arena)?;
+            return Ok(Some(super::exec::decode_projected_pub(encoded, 0)));
+        }
+        self.pending.set(Some(PendingRoutineInvocation {
+            slot,
+            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            argument_count: arguments.len(),
+        }));
+        Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "mutable SQL routine invocation is pending"
+        ))
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation<'a>> {
+        self.pending.replace(None)
+    }
+
+    pub(crate) fn complete(&self, result: Datum<'a>) -> Result<(), SqlError> {
+        let ordinal = self.completed.get();
+        if ordinal == MAX_ROUTINE_INVOCATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} mutable routine invocations",
+                MAX_ROUTINE_INVOCATIONS
+            ));
+        }
+        self.results[ordinal].set(result);
+        self.completed.set(ordinal + 1);
+        Ok(())
+    }
 }
 pub(super) const MAX_WINDOWS: usize = 16;
 /// Maximum ORDER BY / PARTITION BY keys in one window clause.
@@ -400,25 +485,29 @@ pub(crate) fn execute_routine_query<'a>(
 
 /// Bridges `EvalHooks`' abstract `CatalogAccess` to the concrete `Storage`, so
 /// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
-pub(super) struct StorageCatalog<'s> {
-    storage: &'s Storage,
-    routine_workspace: &'s Arena,
+pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> {
+    storage: &'storage Storage,
+    routine_workspace: &'workspace Arena,
     txid: u32,
+    invocations: Option<&'invocation RoutineInvocationState<'statement>>,
+    statement_arena: Option<&'statement Arena>,
 }
 
 pub(super) fn storage_catalog<'a>(
     storage: &'a Storage,
     routine_workspace: &'a Arena,
     txid: u32,
-) -> StorageCatalog<'a> {
+) -> StorageCatalog<'a, 'a, 'static, 'static> {
     StorageCatalog {
         storage,
         routine_workspace,
         txid,
+        invocations: None,
+        statement_arena: None,
     }
 }
 
-impl super::eval::CatalogAccess for StorageCatalog<'_> {
+impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn call_routine<'a>(
         &self,
         name: &str,
@@ -444,6 +533,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             result_type == ColType::Void,
         )?;
         if routine_program_requires_mutable_execution(&function_program) {
+            if let Some(invocations) = self.invocations {
+                return invocations.resolve(
+                    slot,
+                    arguments,
+                    self.statement_arena
+                        .expect("routine invocation state has statement arena"),
+                    arena,
+                );
+            }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a top-level SELECT function(...) call"
@@ -535,6 +633,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_> {
             },
         )?;
         super::eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena).map(Some)
+    }
+
+    fn rewind_routine_invocation_cursor(&self) {
+        if let Some(invocations) = self.invocations {
+            invocations.rewind_cursor();
+        }
     }
 
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
@@ -2458,6 +2562,23 @@ pub fn select_query<'a>(
     seq: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
+    select_query_resumable(
+        storage, txid, statement, arena, params, seq, None, None, responder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_query_resumable<'a, 'statement>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    seq: Option<&dyn SequenceAccess>,
+    invocations: Option<&RoutineInvocationState<'statement>>,
+    statement_arena: Option<&'statement Arena>,
+    responder: &mut Responder,
+) -> Outcome {
     let from = statement
         .from
         .as_ref()
@@ -2491,7 +2612,17 @@ pub fn select_query<'a>(
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
-            return select_query(storage, txid, rewritten, arena, params, seq, responder);
+            return select_query_resumable(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            );
         }
     }
     // Catalog relations (pg_catalog / information_schema) are synthesized and
@@ -2560,6 +2691,8 @@ pub fn select_query<'a>(
         storage,
         routine_workspace: arena,
         txid,
+        invocations,
+        statement_arena,
     };
     let hooks = EvalHooks {
         group: None,
@@ -2576,7 +2709,11 @@ pub fn select_query<'a>(
     // PostgreSQL), not only when a row reaches them. SELECT items are also
     // type-checked by describe below.
     {
-        let columns = ScopeCols(&scope);
+        let columns = CatalogScopeCols {
+            scope: &scope,
+            storage,
+            txid,
+        };
         let check = |e: &Expr| -> Result<(), SqlError> {
             super::exec::infer_type_res(e, &columns).map(|_| ())
         };
@@ -2962,6 +3099,23 @@ pub fn constant_select<'a>(
     seq: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
+    constant_select_resumable(
+        storage, txid, statement, arena, params, seq, None, None, responder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn constant_select_resumable<'a, 'statement>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    seq: Option<&dyn SequenceAccess>,
+    invocations: Option<&RoutineInvocationState<'statement>>,
+    statement_arena: Option<&'statement Arena>,
+    responder: &mut Responder,
+) -> Outcome {
     if let Err(e) = check_select_constants(statement, arena) {
         return sql_fail(e);
     }
@@ -2981,7 +3135,17 @@ pub fn constant_select<'a>(
     }
     if n_win > 0 {
         return match over_one_row(statement, arena) {
-            Ok(wrapped) => select_query(storage, txid, wrapped, arena, params, seq, responder),
+            Ok(wrapped) => select_query_resumable(
+                storage,
+                txid,
+                wrapped,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            ),
             Err(e) => sql_fail(e),
         };
     }
@@ -3030,6 +3194,8 @@ pub fn constant_select<'a>(
         storage,
         routine_workspace: arena,
         txid,
+        invocations,
+        statement_arena,
     };
     let hooks = EvalHooks {
         group: None,
@@ -3073,7 +3239,17 @@ pub fn constant_select<'a>(
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
-            return select_query(storage, txid, rewritten, arena, params, seq, responder);
+            return select_query_resumable(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            );
         }
         responder.row_description(&columns[..n])?;
         let hook_data = match fromless_aggregate_hooks(
@@ -3453,6 +3629,8 @@ fn select_into_rows_mode<'a>(
         storage,
         routine_workspace: arena,
         txid,
+        invocations: None,
+        statement_arena: None,
     };
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
@@ -4666,6 +4844,52 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 }
 
+struct CatalogScopeCols<'scope, 'definition, 'storage> {
+    scope: &'scope QueryScope<'definition>,
+    storage: &'storage Storage,
+    txid: u32,
+}
+
+impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        let entry = self.scope.find_column(qualifier, name)?;
+        Ok(self.scope.output_type(entry))
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[ColType]) -> Option<ColType> {
+        self.storage
+            .routine_for_call_types(name, arguments, self.txid)?
+            .kind
+            .function_result()
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.scope.table_index(name).is_ok()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.scope.func_scalar_type(name)
+    }
+
+    fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
+        let table = self.scope.table_index(name).ok()?;
+        Some(self.scope.defs[table]?.columns())
+    }
+
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let entry = self.scope.find_column(qualifier, name).ok()?;
+        if self.scope.output_type(entry) != ColType::Record {
+            return None;
+        }
+        match entry {
+            scope::ResolvedColumn::Table(table, column) => {
+                Some(self.scope.defs[table]?.columns()[column].type_mod)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The number of columns a `(base).*` record expansion contributes, or 0 when
 /// its shape is not statically known (surfaced loudly at projection time).
 pub(super) fn record_star_width(base: &Expr, scope: &QueryScope) -> usize {
@@ -4719,6 +4943,8 @@ pub fn first_from_match<'a>(
         storage,
         routine_workspace: arena,
         txid,
+        invocations: None,
+        statement_arena: None,
     };
     let hooks = EvalHooks {
         group: None,

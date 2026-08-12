@@ -50,7 +50,7 @@ use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
 use ast::{Delete, Expr, Insert, Stmt, Update};
-use eval::{EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SqlError, eval, sqlstate};
+use eval::{EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, eval, sqlstate};
 use exec::MAX_PROJ;
 use guc::GucState;
 use parser::{ParseError, Parser};
@@ -3875,13 +3875,72 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_select(
         &mut self,
         statement: &ast::Select<'_>,
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let invocations = query::RoutineInvocationState::new();
+        let sequence_state = sequence::SequenceReplayState::new();
+        let source_snapshot = txn.command_id().saturating_add(1);
+        loop {
+            self.work.reset();
+            self.storage.set_read_snapshot(source_snapshot);
+            invocations.begin_attempt();
+            sequence_state.begin_attempt();
+            let output_mark = responder.buffer.mark();
+            let outcome = self.execute_select_once(
+                statement,
+                arena,
+                params,
+                txn,
+                guc,
+                Some(&invocations),
+                Some(&sequence_state),
+                responder,
+            )?;
+            let Err(error) = outcome else {
+                return Ok(outcome);
+            };
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Ok(Err(error));
+            }
+            responder.buffer.truncate_to(output_mark);
+            let Some(pending) = invocations.take_pending() else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine invocation yielded without a pending call"
+                )));
+            };
+            let value = match self.execute_pending_scalar_routine(
+                pending, arena, txn, sqlprep, cursors, guc, responder,
+            )? {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) = invocations.complete(value) {
+                return Ok(Err(error));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_once<'statement>(
+        &mut self,
+        statement: &ast::Select<'_>,
+        arena: &'statement Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        guc: &mut GucState,
+        invocations: Option<&query::RoutineInvocationState<'statement>>,
+        sequence_state: Option<&sequence::SequenceReplayState>,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let dml_mats = match self.run_dml_ctes(statement.with, txn, arena, params, guc, responder) {
@@ -3902,152 +3961,38 @@ impl Engine {
         if let Err(error) = query::validate_locking(statement) {
             return Ok(Err(error));
         }
-        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+        let base_sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+        let replay_sequence =
+            sequence_state.map(|state| sequence::ReplaySeqEval::new(base_sequence, state));
+        let sequence: &dyn SequenceAccess = replay_sequence
+            .as_ref()
+            .map(|sequence| sequence as &dyn SequenceAccess)
+            .unwrap_or(&base_sequence);
         if statement.from.is_none() {
-            query::constant_select(
+            query::constant_select_resumable(
                 &self.storage,
                 txn.txid,
                 statement,
                 &self.work,
                 params,
-                Some(&sequence),
+                Some(sequence),
+                invocations,
+                invocations.map(|_| arena),
                 responder,
             )
         } else {
-            query::select_query(
+            query::select_query_resumable(
                 &self.storage,
                 txn.txid,
                 statement,
                 &self.work,
                 params,
-                Some(&sequence),
+                Some(sequence),
+                invocations,
+                invocations.map(|_| arena),
                 responder,
             )
         }
-    }
-
-    /// Executes the unambiguous `SELECT function(...)` form when that SQL
-    /// function has preceding data-modifying statements.  General expression
-    /// evaluation remains on the read-only catalog path until scan callbacks
-    /// can suspend their immutable snapshot borrow before entering this
-    /// mutable routine executor.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_direct_write_function_select(
-        &mut self,
-        statement: &ast::Select<'_>,
-        arena: &Arena,
-        params: &[Datum],
-        txn: &mut TxnState,
-        sqlprep: &mut SqlPreparedPool,
-        cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
-        responder: &mut Responder,
-    ) -> Result<Option<Result<(), SqlError>>, WireFull> {
-        use ast::SelectItem;
-        let [SelectItem::Expr { expression, alias }] = statement.items else {
-            return Ok(None);
-        };
-        let ast::Expr::Call {
-            name,
-            args,
-            star: false,
-            distinct: false,
-            order_by,
-            over: None,
-            filter: None,
-        } = *expression
-        else {
-            return Ok(None);
-        };
-        if statement.from.is_some()
-            || statement.where_clause.is_some()
-            || !statement.with.is_empty()
-            || statement.set_body.is_some()
-            || statement.distinct
-            || !statement.distinct_on.is_empty()
-            || !statement.group_by.is_empty()
-            || !statement.grouping_sets.is_empty()
-            || statement.having.is_some()
-            || !statement.order_by.is_empty()
-            || statement.limit.is_some()
-            || statement.offset.is_some()
-            || statement.with_ties
-            || !statement.locking.is_empty()
-            || !order_by.is_empty()
-        {
-            return Ok(None);
-        }
-        if !self
-            .storage
-            .has_scalar_routine_on_path(name, args.len(), txn.txid)
-        {
-            return Ok(None);
-        }
-        let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..NO_HOOKS
-        };
-        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        if args.len() > values.len() {
-            return Ok(Some(Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many function arguments"
-            ))));
-        }
-        for (slot, argument) in args.iter().enumerate() {
-            values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
-                Ok(value) => value,
-                Err(error) => return Ok(Some(Err(error))),
-            };
-        }
-        let Some(slot) = self
-            .storage
-            .routine_slot_for_call(name, &values[..args.len()], txn.txid)
-        else {
-            return Ok(None);
-        };
-        let routine = *self.storage.routine(slot);
-        let Some(result_type) = routine.kind.function_result() else {
-            return Ok(None);
-        };
-        if routine.kind.is_set_returning() {
-            return Ok(None);
-        }
-        let program = match query::parse_routine_function_program(
-            routine.body.as_str(),
-            arena,
-            result_type == ColType::Void,
-        ) {
-            Ok(program) => program,
-            Err(error) => return Ok(Some(Err(error))),
-        };
-        if !query::routine_program_requires_mutable_execution(&program) {
-            return Ok(None);
-        }
-        let value = match self.execute_scalar_routine_program(
-            slot,
-            routine,
-            result_type,
-            program,
-            &values[..args.len()],
-            arena,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            responder,
-        )? {
-            Ok(value) => value,
-            Err(error) => return Ok(Some(Err(error))),
-        };
-        responder.row_description(&[ColDesc::of_type(
-            alias.unwrap_or(exec::derived_name(expression)),
-            result_type,
-        )])?;
-        responder.data_row(&[value])?;
-        responder.command_complete("SELECT 1")?;
-        Ok(Some(Ok(())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4176,6 +4121,76 @@ impl Engine {
         Ok(Ok(value))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_pending_scalar_routine<'a>(
+        &mut self,
+        pending: query::PendingRoutineInvocation<'a>,
+        arena: &'a Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
+        let routine = *self.storage.routine(pending.slot);
+        let Some(result_type) = routine.kind.function_result() else {
+            return Ok(Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "scalar routine resolved to a procedure"
+            )));
+        };
+        if routine.kind.is_set_returning() {
+            return Ok(Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "scalar routine resolved to a set-returning function"
+            )));
+        }
+        let body = match arena.alloc_str(routine.body.as_str()) {
+            Ok(body) => body,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement arena exhausted while invoking SQL function"
+                )));
+            }
+        };
+        let program = match query::parse_routine_function_program(
+            body,
+            arena,
+            result_type == ColType::Void,
+        ) {
+            Ok(program) => program,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if pending.argument_count > arguments.len() {
+            return Ok(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many function arguments"
+            )));
+        }
+        for (index, argument) in arguments
+            .iter_mut()
+            .enumerate()
+            .take(pending.argument_count)
+        {
+            *argument = exec::decode_projected_pub(pending.arguments, index);
+        }
+        self.execute_scalar_routine_program(
+            pending.slot,
+            routine,
+            result_type,
+            program,
+            &arguments[..pending.argument_count],
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )
+    }
+
     fn execute_explained_statement(
         &mut self,
         statement: &Stmt<'_>,
@@ -4186,7 +4201,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
-            Stmt::Select(select) => self.execute_select(select, arena, params, txn, guc, responder),
+            Stmt::Select(select) => {
+                self.execute_select_once(select, arena, params, txn, guc, None, None, responder)
+            }
             Stmt::SetQuery(query) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 query::set_query(
@@ -4790,12 +4807,9 @@ impl Engine {
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                 ctes, statement, arena, params, txn, guc, responder, capture,
             ),
-            Stmt::Select(s) => match self.execute_direct_write_function_select(
-                s, arena, params, txn, sqlprep, cursors, guc, responder,
-            )? {
-                Some(outcome) => Ok(outcome),
-                None => self.execute_select(s, arena, params, txn, guc, responder),
-            },
+            Stmt::Select(select) => {
+                self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
+            }
             Stmt::SetQuery(q) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 query::set_query(

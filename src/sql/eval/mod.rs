@@ -173,6 +173,9 @@ pub mod sqlstate {
     /// A non-blocking block fetch is in progress; the statement must park and
     /// retry when the reactor completes the fetch.
     pub(crate) const INTERNAL_IO_WAIT: &str = "PZ002";
+    /// Evaluation yielded a scalar routine which must run after the caller
+    /// releases its immutable storage borrow.
+    pub(crate) const INTERNAL_ROUTINE_INVOCATION: &str = "PZ003";
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
@@ -389,6 +392,9 @@ pub trait SequenceAccess {
     fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
     fn dry_lastval(&self) -> Result<i64, SqlError>;
     fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
+    /// Restarts replay of volatile sequence calls when a physical executor
+    /// pass repeats the same logical expression stream.
+    fn rewind_statement_cursor(&self) {}
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -406,6 +412,7 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
+    fn rewind_routine_invocation_cursor(&self) {}
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.

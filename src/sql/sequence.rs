@@ -13,7 +13,59 @@ use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
 use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
+use core::cell::Cell;
 
+pub const MAX_REPLAYED_SEQUENCE_CALLS: usize = 1024;
+
+/// Bounded effect log for an expression stream that may be physically retried
+/// while waiting for a mutable SQL routine. Sequence calls are replayed in
+/// logical call order, never advanced again by a retry.
+pub struct SequenceReplayState {
+    next: Cell<usize>,
+    completed: Cell<usize>,
+    values: [Cell<i64>; MAX_REPLAYED_SEQUENCE_CALLS],
+}
+
+impl SequenceReplayState {
+    pub fn new() -> Self {
+        Self {
+            next: Cell::new(0),
+            completed: Cell::new(0),
+            values: [const { Cell::new(0) }; MAX_REPLAYED_SEQUENCE_CALLS],
+        }
+    }
+
+    pub fn begin_attempt(&self) {
+        self.next.set(0);
+    }
+
+    fn invoke(&self, action: impl FnOnce() -> Result<i64, SqlError>) -> Result<i64, SqlError> {
+        let ordinal = self.next.get();
+        if ordinal == MAX_REPLAYED_SEQUENCE_CALLS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} volatile sequence calls",
+                MAX_REPLAYED_SEQUENCE_CALLS
+            ));
+        }
+        self.next.set(ordinal + 1);
+        if ordinal < self.completed.get() {
+            return Ok(self.values[ordinal].get());
+        }
+        let value = action()?;
+        self.values[ordinal].set(value);
+        self.completed.set(ordinal + 1);
+        Ok(value)
+    }
+}
+
+impl Default for SequenceReplayState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct SeqEval<'a> {
     storage: &'a Storage,
     session: &'a SeqSession,
@@ -23,6 +75,17 @@ pub struct SeqEval<'a> {
     /// uses it so a `nextval` in the projection fires exactly once — in the
     /// second, materializing pass — not twice.
     dry: bool,
+}
+
+pub struct ReplaySeqEval<'base, 'state> {
+    base: SeqEval<'base>,
+    state: &'state SequenceReplayState,
+}
+
+impl<'base, 'state> ReplaySeqEval<'base, 'state> {
+    pub fn new(base: SeqEval<'base>, state: &'state SequenceReplayState) -> Self {
+        Self { base, state }
+    }
 }
 
 impl<'a> SeqEval<'a> {
@@ -180,5 +243,36 @@ impl SequenceAccess for SeqEval<'_> {
 
     fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         Self { dry: true, ..*self }.setval(name, value, is_called)
+    }
+}
+
+impl SequenceAccess for ReplaySeqEval<'_, '_> {
+    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+        self.state.invoke(|| self.base.nextval(name))
+    }
+    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+        self.state.invoke(|| self.base.currval(name))
+    }
+    fn lastval(&self) -> Result<i64, SqlError> {
+        self.state.invoke(|| self.base.lastval())
+    }
+    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        self.state
+            .invoke(|| self.base.setval(name, value, is_called))
+    }
+    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
+        self.base.dry_nextval(name)
+    }
+    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
+        self.base.dry_currval(name)
+    }
+    fn dry_lastval(&self) -> Result<i64, SqlError> {
+        self.base.dry_lastval()
+    }
+    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+        self.base.dry_setval(name, value, is_called)
+    }
+    fn rewind_statement_cursor(&self) {
+        self.state.begin_attempt();
     }
 }

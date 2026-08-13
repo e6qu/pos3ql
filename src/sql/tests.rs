@@ -2572,7 +2572,6 @@ fn transactional_alter_table_versions_shape_and_rows() {
         )),
         ["0"]
     );
-
     let observer_rows = run_with_txn_bytes(
         &mut engine,
         &mut budget,
@@ -4680,6 +4679,109 @@ fn generate_series_table_function() {
             "SELECT count(*) FROM generate_series(0, array_upper(NULL::int2[], 1)) g"
         )),
         ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric) AS s ORDER BY s",
+        )),
+        ["1.5", "2.0", "2.5"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(1, 2.0::numeric, 0.5::numeric) AS s ORDER BY s",
+        )),
+        ["1", "1.5", "2.0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT s FROM generate_series(1.0::numeric, 2.0::numeric) AS s ORDER BY s",
+        )),
+        ["1.0", "2.0"]
+    );
+    let zero_step = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT generate_series(1.0::numeric, 2.0::numeric, 0::numeric)",
+    );
+    assert!(
+        core::str::from_utf8(&zero_step)
+            .expect("wire response is UTF-8 outside payload values")
+            .contains("22023"),
+        "{zero_step:?}"
+    );
+    let sql = "SELECT generate_series('2000-01-01'::timestamp, '2000-01-02'::timestamp)";
+    let response = run_with_txn_bytes(&mut e, &mut b, &mut t, sql);
+    assert!(
+        core::str::from_utf8(&response)
+            .expect("wire response is UTF-8 outside payload values")
+            .contains("42883"),
+        "{sql}: {response:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric)",
+        )),
+        ["1.5", "2.0", "2.5"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT generate_series(1.0::numeric, 2.0::numeric)",
+        )),
+        ["1.0", "2.0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT count(*) FROM (SELECT generate_series(1::numeric, 5000::numeric)) AS series",
+        )),
+        ["5000"],
+        "numeric select-list SRFs must advance directly rather than replaying every prior step"
+    );
+
+    // The overload's result type reaches every description path. A timestamp
+    // series must not advertise int4 while emitting timestamp binary/text
+    // values, and a regular integer series retains the integer overload.
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut e,
+            &mut b,
+            "SELECT generate_series('2000-01-01'::timestamp, '2000-01-02'::timestamp, '1 day'::interval)",
+        )),
+        [crate::sql::types::oid::TIMESTAMP]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut e,
+            &mut b,
+            "SELECT s FROM generate_series(1, 2) AS s",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut e,
+            &mut b,
+            "SELECT s FROM generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric) AS s",
+        )),
+        [crate::sql::types::oid::NUMERIC]
     );
 }
 

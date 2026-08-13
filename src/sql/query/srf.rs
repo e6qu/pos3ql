@@ -145,23 +145,34 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             };
             return Ok(n as usize);
         }
-        // Temporal series: date/timestamp[tz] bounds with an interval step.
-        // Coerce bare string literals for the stop and step, as PostgreSQL's
-        // function resolution does.
-        let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start) else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "generate_series is supported for integer and timestamp arguments"
-            ));
-        };
-        let stop = crate::sql::eval::cast_to(stop, kind.coltype(), arena)?;
-        let step = crate::sql::eval::cast_to(step, ColType::Interval, arena)?;
-        let (Some((stop_micros, _)), Datum::Interval(step_iv)) =
-            (crate::sql::eval::timestamp_series_start(&stop), step)
-        else {
-            return Ok(0);
-        };
-        crate::sql::eval::timestamp_series_count(base, stop_micros, step_iv)
+        if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start) {
+            if args.len() != 3 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "generate_series over timestamps requires a step"
+                ));
+            }
+            // Temporal series: date/timestamp[tz] bounds with an interval
+            // step. Coerce bare strings according to the chosen overload.
+            let stop = crate::sql::eval::cast_to(stop, kind.coltype(), arena)?;
+            let step = crate::sql::eval::cast_to(step, ColType::Interval, arena)?;
+            let (Some((stop_micros, _)), Datum::Interval(step_iv)) =
+                (crate::sql::eval::timestamp_series_start(&stop), step)
+            else {
+                return Ok(0);
+            };
+            crate::sql::eval::timestamp_series_count(base, stop_micros, step_iv)
+        } else {
+            let start = crate::sql::eval::cast_to(start, ColType::Numeric, arena)?;
+            let stop = crate::sql::eval::cast_to(stop, ColType::Numeric, arena)?;
+            let step = crate::sql::eval::cast_to(step, ColType::Numeric, arena)?;
+            let (Datum::Numeric(start), Datum::Numeric(stop), Datum::Numeric(step)) =
+                (start, stop, step)
+            else {
+                return Ok(0);
+            };
+            crate::sql::eval::numeric_series_count(start, stop, step, arena)
+        }
     } else if name.eq_ignore_ascii_case("regexp_matches") {
         // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
         if !(2..=3).contains(&args.len()) {
@@ -607,8 +618,9 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     };
     // Each supported function's output columns: `key`/`value` for the `each`
     // family (two columns), a single column named per the function otherwise.
-    // generate_series yields int8; regexp_matches yields text[]; unnest yields
-    // the array's element type; array_elements' default column is `value`.
+    // generate_series yields its resolved overload type; regexp_matches yields
+    // text[]; unnest yields the array's element type; array_elements' default
+    // column is `value`.
     let mut default_cols: [(SqlName, ColType); MAX_COLUMNS] =
         [(SqlName::EMPTY, ColType::Bool); MAX_COLUMNS];
     let n_default = if let Some((_, routine)) = routine {
@@ -645,20 +657,14 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         2
     } else {
         let single_type = if is_gs {
-            // Integer series → int8; a date/timestamp start makes it temporal.
-            match tref.func_args.and_then(|a| a.first()) {
-                Some(e) => match crate::sql::eval::static_type_pub(e, columns) {
-                    Some(ColType::Timestamp) => ColType::Timestamp,
-                    Some(ColType::Timestamptz | ColType::Date) => ColType::Timestamptz,
-                    Some(_) => ColType::Int8,
-                    None => match crate::sql::eval::eval(e, arena, params, columns)? {
-                        Datum::Timestamp(_) => ColType::Timestamp,
-                        Datum::Timestamptz(_) | Datum::Date(_) => ColType::Timestamptz,
-                        _ => ColType::Int8,
-                    },
-                },
-                None => ColType::Int8,
-            }
+            let arguments = tref.func_args.unwrap_or(&[]);
+            let start = arguments
+                .first()
+                .and_then(|argument| crate::sql::eval::static_type_pub(argument, columns));
+            let has_numeric = arguments.iter().any(|argument| {
+                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Numeric)
+            });
+            crate::sql::eval::generate_series_result_type(start, has_numeric)
         } else if is_gsub {
             ColType::Int4
         } else if is_re {
@@ -1504,6 +1510,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     // Temporal series: a date/timestamp start with an interval step.
     let start_val =
         crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
+    let stop_raw = crate::sql::eval::eval(args[1], arena, params, columns)?;
+    let step_raw = if args.len() == 3 {
+        crate::sql::eval::eval(args[2], arena, params, columns)?
+    } else {
+        Datum::Int4(1)
+    };
     if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start_val) {
         if args.len() != 3 {
             return Err(sql_err!(
@@ -1513,12 +1525,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         // Coerce bare string literals for the stop and step (function resolution).
         let stop_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?),
+            crate::sql::eval::text_view(stop_raw),
             kind.coltype(),
             arena,
         )?;
         let step_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[2], arena, params, columns)?),
+            crate::sql::eval::text_view(step_raw),
             ColType::Interval,
             arena,
         )?;
@@ -1543,6 +1555,32 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     if start_val.is_null() {
         return Ok(&[]);
     }
+    if matches!(start_val, Datum::Numeric(_))
+        || matches!(stop_raw, Datum::Numeric(_))
+        || matches!(step_raw, Datum::Numeric(_))
+    {
+        if stop_raw.is_null() || step_raw.is_null() {
+            return Ok(&[]);
+        }
+        let (Datum::Numeric(start), Datum::Numeric(stop), Datum::Numeric(step)) = (
+            crate::sql::eval::cast_to(start_val, ColType::Numeric, arena)?,
+            crate::sql::eval::cast_to(stop_raw, ColType::Numeric, arena)?,
+            crate::sql::eval::cast_to(step_raw, ColType::Numeric, arena)?,
+        ) else {
+            return Ok(&[]);
+        };
+        let count = crate::sql::eval::numeric_series_count(start, stop, step, arena)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (index, slot) in rows.iter_mut().enumerate() {
+            let value = crate::sql::eval::numeric_series_at(start, stop, step, index + 1, arena)?
+                .expect("numeric series count and value share one boundary");
+            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Numeric(value)], arena)?;
+        }
+        return Ok(&*rows);
+    }
     let as_i64 = |value: Datum<'a>| match value {
         Datum::Int4(value) => Ok(Some(value as i64)),
         Datum::Int8(value) => Ok(Some(value)),
@@ -1555,11 +1593,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     let Some(start) = as_i64(start_val)? else {
         return Ok(&[]);
     };
-    let Some(stop) = as_i64(crate::sql::eval::eval(args[1], arena, params, columns)?)? else {
+    let Some(stop) = as_i64(stop_raw)? else {
         return Ok(&[]);
     };
     let step = if args.len() == 3 {
-        let Some(step) = as_i64(crate::sql::eval::eval(args[2], arena, params, columns)?)? else {
+        let Some(step) = as_i64(step_raw)? else {
             return Ok(&[]);
         };
         step

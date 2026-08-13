@@ -344,6 +344,42 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_generate_series_result_types_and_binary_format():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    def run(text, expected_oid):
+        parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
+        bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1))
+        describe = frontend_message(b"D", b"P\x00")
+        execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+        s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+        out = []
+        while True:
+            item = read_message(s)
+            out.append(item)
+            if item[0] == b"Z":
+                break
+        description = next((payload for kind, payload in out if kind == b"T"), None)
+        rows = [payload for kind, payload in out if kind == b"D"]
+        check(
+            f"generate_series {expected_oid}: binary Result metadata",
+            description is not None
+            and row_description_type_oids(description) == [expected_oid]
+            and row_description_formats(description) == [1]
+            and len(rows) == 3,
+            out,
+        )
+
+    run(
+        "SELECT generate_series('2000-01-01'::timestamp, '2000-01-03'::timestamp, '1 day'::interval)",
+        1114,
+    )
+    run("SELECT generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric)", 1700)
+    s.close()
+
+
 def test_parse_rejects_invalid_type_counts_and_trailing_bytes():
     s = connect()
     s.sendall(startup_payload(0))

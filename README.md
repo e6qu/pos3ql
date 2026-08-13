@@ -4,7 +4,7 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 
 ## Architecture
 
-- PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including catalog-typed text/binary Bind, Result, and COPY for implemented types.
+- PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including catalog-typed text/binary Bind, Result, COPY, and set-returning integer/numeric/temporal output for implemented types.
 - Durable state: immutable commit batches, immutable SST blocks, and compare-and-swap roots. A node can cold-start with an empty local disk.
 - Object storage: the engine depends only on a generic gateway with immutable or conditional PUT, full/ranged GET, LIST, DELETE, and strong-ETag compare-and-swap. Provider protocols and SDKs are outside the application. [Contract and qualification](docs/object-storage.md).
 - Memory: all runtime memory is budgeted at startup. Pools and queues have fixed limits; exhaustion is an error.

@@ -61,6 +61,8 @@ bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 # profile). Refuse instead. And the probe succeeding only proves *a*
 # server answered, so the started process must still be alive afterwards.
 START_PID=0
+. "$EXT/liveness.sh"
+
 start_pos3ql() { # <config> <log> <port>
   local conf=$1 log=$2 port=$3
   if nc -z 127.0.0.1 $port 2>/dev/null; then
@@ -73,7 +75,7 @@ start_pos3ql() { # <config> <log> <port>
     "$PSQL" -h 127.0.0.1 -p $port -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
     sleep 0.1
   done
-  if ! kill -0 "$START_PID" 2>/dev/null; then
+  if ! server_alive "$START_PID"; then
     bad "pos3ql under test exited at startup (see $log)"
     tail -10 "$log"
     exit 1

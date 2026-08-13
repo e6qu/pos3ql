@@ -54,6 +54,8 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
+. "$EXT/liveness.sh"
+
 cleanup() { [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -93,7 +95,7 @@ wait_up() { # host port
 }
 wait_p3() {
   for _ in $(seq 1 100); do
-    if ! kill -0 "$P3_PID" 2>/dev/null; then
+    if ! server_alive "$P3_PID"; then
       echo "pos3ql process $P3_PID exited during startup"
       tail -40 "$WORK/p3.log"
       return 1
@@ -329,7 +331,7 @@ normalize() {
 }
 run_corpus() { # host port outfile file
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off -v VERBOSITY=verbose -f "$4" 2>&1 | normalize > "$3"
-  if [[ "$2" == "$P3_PORT" ]] && ! kill -0 "$P3_PID" 2>/dev/null; then
+  if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"
     tail -80 "$WORK/p3.log"
     exit 1

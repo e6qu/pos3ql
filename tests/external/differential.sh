@@ -27,6 +27,8 @@ FAIL=0
 ok()  { PASS=$((PASS+1)); print -- "PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 
+. "$EXT/liveness.sh"
+
 cleanup() {
   [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
   [[ -d "$WORK/pgdata" ]] && "$PGBIN/pg_ctl" -D "$WORK/pgdata" stop -m immediate >/dev/null 2>&1
@@ -97,7 +99,7 @@ for i in {1..50}; do
   sleep 0.1
 done
 # The probe succeeding proves *a* server answered — make sure it is ours.
-if [[ $P3_READY -ne 1 ]] || ! kill -0 "$P3_PID" 2>/dev/null; then
+if [[ $P3_READY -ne 1 ]] || ! server_alive "$P3_PID"; then
   bad "pos3ql did not accept connections at startup (see $WORK/p3.log)"
   tail -20 "$WORK/p3.log"
   exit 1
@@ -128,6 +130,11 @@ normalize() {
 run_corpus() { # port name file
   "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
     -v VERBOSITY=verbose -f "$3" 2>&1 | normalize > "$WORK/$2"
+  if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
+    bad "pos3ql exited during $(basename "$3")"
+    tail -80 "$WORK/p3.log"
+    exit 1
+  fi
 }
 
 print -- "=== corpus diffs (real PostgreSQL vs pos3ql) ==="

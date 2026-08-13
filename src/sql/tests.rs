@@ -1810,6 +1810,21 @@ fn supported_operator_catalog_aliases_preserve_identity() {
 }
 
 #[test]
+fn catalog_alias_casts_keep_their_own_result_names() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '+(integer,integer)'::regoperator, '+'::regoper, \
+                'version()'::regprocedure, 'version'::regproc",
+    );
+    assert_eq!(
+        row_description_names(&output),
+        ["regoperator", "regoper", "regprocedure", "regproc"]
+    );
+}
+
+#[test]
 fn catalog_oid_columns_unify_with_regclass_set_operands() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

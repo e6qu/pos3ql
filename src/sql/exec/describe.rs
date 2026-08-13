@@ -362,8 +362,20 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             }
             // The object-identifier types parse to text storage but title
             // as themselves (`'int4'::regtype` is a `regtype` column).
-            _ if type_name.eq_ignore_ascii_case("regtype") => Some("regtype"),
-            _ if type_name.eq_ignore_ascii_case("regclass") => Some("regclass"),
+            _ if matches!(
+                ColType::from_sql_name(type_name),
+                Some(ColType::Regtype)
+                    | Some(ColType::Regproc)
+                    | Some(ColType::Regprocedure)
+                    | Some(ColType::Regoper)
+                    | Some(ColType::Regoperator)
+                    | Some(ColType::Regclass)
+                    | Some(ColType::Regnamespace)
+                    | Some(ColType::Regrole)
+            ) =>
+            {
+                ColType::from_sql_name(type_name).map(ColType::name)
+            }
             _ if type_name.eq_ignore_ascii_case("oid") => Some("oid"),
             // A cast to an array type titles as the *element*'s internal name
             // (`'{1}'::int2[]` is an `int2` column), as PostgreSQL has it.

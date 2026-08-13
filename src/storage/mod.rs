@@ -3401,6 +3401,18 @@ impl CollationRuntime {
                 config.database_collation_locale
             ));
         }
+        // Force libc to finish locale initialization while startup may still
+        // allocate. Runtime comparisons must remain inside the frozen-memory
+        // contract.
+        let empty = b"\0";
+        let compared = unsafe { strcoll_l(empty.as_ptr().cast(), empty.as_ptr().cast(), locale) };
+        if compared != 0 {
+            unsafe { libc::freelocale(locale) };
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "database collation locale did not compare equal strings equally"
+            ));
+        }
         let scratch = CollationScratch {
             left: FixedBuf::new(
                 budget,

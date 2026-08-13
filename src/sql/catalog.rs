@@ -7,7 +7,7 @@
 //! and joins all work against them.
 
 use crate::mem::arena::Arena;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, SqlName, Storage, TableDef};
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
@@ -722,24 +722,10 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_proc") => pg_proc(storage, txid, arena),
-        (false, "pg_operator") => finish(
-            def_of(
-                "pg_operator",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("oprname", ColType::Name),
-                    ("oprnamespace", ColType::Int4),
-                    ("oprowner", ColType::Int4),
-                    ("oprkind", ColType::Bpchar),
-                    ("oprleft", ColType::Int4),
-                    ("oprright", ColType::Int4),
-                    ("oprcode", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_operator") => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pg_operator catalog is not implemented"
+        )),
         (false, "pg_opclass") => finish(
             def_of(
                 "pg_opclass",
@@ -2043,6 +2029,168 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
+    match written.split_once('.') {
+        Some((written_schema, written_name)) => written_schema == schema && written_name == name,
+        None => written == name,
+    }
+}
+
+fn parse_routine_signature<'a>(
+    written: &'a str,
+    arguments: &mut [ColType; MAX_ROUTINE_ARGUMENTS],
+) -> Option<(&'a str, usize)> {
+    let (name, written_arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let written_arguments = written_arguments.trim();
+    if written_arguments.is_empty() {
+        return Some((name.trim(), 0));
+    }
+    let mut count = 0;
+    for written_type in written_arguments.split(',') {
+        let written_type = written_type
+            .trim()
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(written_type.trim());
+        if count == arguments.len() {
+            return None;
+        }
+        arguments[count] = ColType::from_sql_name(written_type)?;
+        count += 1;
+    }
+    Some((name.trim(), count))
+}
+
+fn intrinsic_argument_matches(routine: IntrinsicRoutine, arguments: &[ColType]) -> bool {
+    if routine.argument_count != arguments.len() as i32 {
+        return false;
+    }
+    routine
+        .argument_types
+        .split_ascii_whitespace()
+        .zip(arguments)
+        .all(|(oid, argument)| oid.parse::<i32>().ok() == Some(argument.oid()))
+}
+
+fn routine_signature<'a>(
+    name: &str,
+    arguments: impl Iterator<Item = ColType>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use core::fmt::Write;
+    let mut text = StackStr::<256>::new();
+    write!(text, "{}(", name).map_err(|_| super::eval::arena_full())?;
+    for (index, argument) in arguments.enumerate() {
+        if index != 0 {
+            write!(text, ",").map_err(|_| super::eval::arena_full())?;
+        }
+        write!(text, "{}", argument.name()).map_err(|_| super::eval::arena_full())?;
+    }
+    write!(text, ")").map_err(|_| super::eval::arena_full())?;
+    arena
+        .alloc_str(text.as_str())
+        .map_err(|_| super::eval::arena_full())
+}
+
+/// Resolves the function catalog object types. `regproc` names a routine by
+/// unqualified name; `regprocedure` includes its complete argument signature.
+pub(crate) fn routine_oid_by_name(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+    signature: bool,
+) -> Result<Option<i32>, SqlError> {
+    let mut arguments = [ColType::Bool; MAX_ROUTINE_ARGUMENTS];
+    let (name, argument_count) = if signature {
+        let Some(parsed) = parse_routine_signature(written, &mut arguments) else {
+            return Ok(None);
+        };
+        parsed
+    } else {
+        (written.trim(), 0)
+    };
+    let mut found = None;
+    let mut consider = |oid| -> Result<(), SqlError> {
+        if found.replace(oid).is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "more than one function named \"{}\"",
+                written
+            ));
+        }
+        Ok(())
+    };
+    for routine in INTRINSIC_ROUTINES {
+        if !routine_name_matches(name, "pg_catalog", routine.name)
+            || (signature && !intrinsic_argument_matches(*routine, &arguments[..argument_count]))
+        {
+            continue;
+        }
+        consider(routine.oid)?;
+    }
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine(slot);
+        if !routine.visible_to(txid)
+            || !routine_name_matches(
+                name,
+                routine.schema_for(txid).as_str(),
+                routine.name_for(txid).as_str(),
+            )
+            || (signature
+                && (routine.argument_count != argument_count
+                    || !routine
+                        .arguments()
+                        .iter()
+                        .zip(&arguments[..argument_count])
+                        .all(|(defined, argument)| defined.ctype == *argument)))
+        {
+            continue;
+        }
+        consider(crate::storage::routine_oid(routine))?;
+    }
+    Ok(found)
+}
+
+pub(crate) fn routine_name_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    signature: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        if !signature {
+            return arena
+                .alloc_str(routine.name)
+                .map(Some)
+                .map_err(|_| super::eval::arena_full());
+        }
+        let arguments = routine
+            .argument_types
+            .split_ascii_whitespace()
+            .filter_map(|oid| oid.parse::<i32>().ok())
+            .filter_map(ColType::from_oid);
+        return routine_signature(routine.name, arguments, arena).map(Some);
+    }
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine(slot);
+    let current_name = routine.name_for(txid);
+    let name = current_name.as_str();
+    if !signature {
+        return arena
+            .alloc_str(name)
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
+    routine_signature(
+        name,
+        routine.arguments().iter().map(|argument| argument.ctype),
+        arena,
+    )
+    .map(Some)
 }
 
 pub fn function_def_text<'a>(

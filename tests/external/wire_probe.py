@@ -987,7 +987,9 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
         "CREATE DOMAIN wire_binary_vector AS integer[]; "
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
-        "CREATE TABLE wire_binary_regclass (id integer)",
+        "CREATE TABLE wire_binary_regclass (id integer); "
+        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
+        "AS 'SELECT value'",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
@@ -1002,6 +1004,9 @@ def test_catalog_aware_binary_bind_parameters():
     regclass_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
     )
+    routine_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_proc WHERE proname = 'wire_binary_routine'"))
+    )
     cases = [
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("regtype", "SELECT $1::regtype", 2206, struct.pack("!i", 23), "integer", None),
@@ -1011,6 +1016,15 @@ def test_catalog_aware_binary_bind_parameters():
             2205,
             struct.pack("!i", regclass_oid),
             "wire_binary_regclass",
+            None,
+        ),
+        ("regproc", "SELECT $1::regproc", 24, struct.pack("!i", routine_oid), "wire_binary_routine", None),
+        (
+            "regprocedure",
+            "SELECT $1::regprocedure",
+            2202,
+            struct.pack("!i", routine_oid),
+            "wire_binary_routine(integer)",
             None,
         ),
         ("invalid regtype", "SELECT $1::regtype", 2206, b"\x00", None, "22P03"),
@@ -1142,7 +1156,9 @@ def test_catalog_aware_text_bind_parameters():
         "CREATE TYPE wire_text_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_text_positive AS integer CHECK (VALUE > 0); "
         "CREATE DOMAIN wire_text_required AS integer NOT NULL; "
-        "CREATE TABLE wire_text_regclass (id integer)",
+        "CREATE TABLE wire_text_regclass (id integer); "
+        "CREATE FUNCTION wire_text_routine(value integer) RETURNS integer LANGUAGE SQL "
+        "AS 'SELECT value'",
     )
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_state'")))
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_positive'")))
@@ -1156,6 +1172,15 @@ def test_catalog_aware_text_bind_parameters():
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("regtype", "SELECT $1::regtype", 2206, b"integer", "integer", None),
         ("regclass", "SELECT $1::regclass", 2205, b"wire_text_regclass", "wire_text_regclass", None),
+        ("regproc", "SELECT $1::regproc", 24, b"wire_text_routine", "wire_text_routine", None),
+        (
+            "regprocedure",
+            "SELECT $1::regprocedure",
+            2202,
+            b"wire_text_routine(integer)",
+            "wire_text_routine(integer)",
+            None,
+        ),
         ("invalid regtype", "SELECT $1::regtype", 2206, b"not_a_type", None, "42704"),
         ("enum", "SELECT $1::wire_text_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_text_positive", domain_oid, b"7", "7", None),

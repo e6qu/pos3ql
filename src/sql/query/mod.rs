@@ -791,6 +791,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::schema_oid_by_name(self.storage, self.txid, name)
     }
 
+    fn routine_name<'a>(
+        &self,
+        oid: i32,
+        signature: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::routine_name_by_oid(self.storage, self.txid, oid, signature, arena)
+    }
+
+    fn routine_oid(&self, name: &str, signature: bool) -> Result<Option<i32>, SqlError> {
+        super::catalog::routine_oid_by_name(self.storage, self.txid, name, signature)
+    }
+
     fn has_table_privilege(
         &self,
         role: Option<&str>,

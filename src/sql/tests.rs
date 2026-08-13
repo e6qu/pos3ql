@@ -1683,6 +1683,99 @@ fn regclass_casts_compare_with_catalog_oid_columns() {
 }
 
 #[test]
+fn routine_catalog_columns_preserve_regproc_and_regprocedure_identity() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION routine_catalog_reference(value integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT value'; \
+         CREATE TABLE routine_catalog_values ( \
+             routine_value regproc DEFAULT 'routine_catalog_reference'::regproc, \
+             signature_value regprocedure \
+                 DEFAULT 'routine_catalog_reference(integer)'::regprocedure \
+         ); \
+         INSERT INTO routine_catalog_values DEFAULT VALUES; \
+         INSERT INTO routine_catalog_values VALUES ( \
+             'routine_catalog_reference', 'routine_catalog_reference(integer)' \
+         )",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value, pg_typeof(routine_value), \
+                    pg_typeof(signature_value) \
+             FROM routine_catalog_values ORDER BY routine_value",
+        )),
+        [
+            "routine_catalog_reference|routine_catalog_reference(integer)|regproc|regprocedure",
+            "routine_catalog_reference|routine_catalog_reference(integer)|regproc|regprocedure",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value FROM routine_catalog_values",
+        )),
+        [
+            crate::sql::types::oid::REGPROC,
+            crate::sql::types::oid::REGPROCEDURE,
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_catalog_reference(integer) RENAME TO routine_catalog_renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value FROM routine_catalog_values ORDER BY routine_value",
+        )),
+        [
+            "routine_catalog_renamed|routine_catalog_renamed(integer)",
+            "routine_catalog_renamed|routine_catalog_renamed(integer)",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION routine_catalog_overload(value text) RETURNS text LANGUAGE SQL \
+           AS 'SELECT value'; \
+         CREATE FUNCTION routine_catalog_overload(value integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT value'",
+    );
+    let ambiguous = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'routine_catalog_overload'::regproc",
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous).contains("42725"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'routine_catalog_overload(integer)'::regprocedure",
+        )),
+        ["routine_catalog_overload(integer)"]
+    );
+}
+
+#[test]
+fn unimplemented_operator_catalog_fails_instead_of_looking_empty() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget, "SELECT * FROM pg_operator");
+    assert!(String::from_utf8_lossy(&output).contains("0A000"));
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -6077,14 +6170,20 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
             "CREATE ROLE durable_catalog_role; \
              CREATE SCHEMA durable_catalog_schema; \
              CREATE TABLE durable_catalog_reference (id integer); \
+             CREATE FUNCTION durable_catalog_routine(value integer) RETURNS integer LANGUAGE SQL \
+                 AS 'SELECT value'; \
              CREATE TABLE durable_catalog_values ( \
                  relation_value regclass DEFAULT 'durable_catalog_reference'::regclass, \
                  role_value regrole DEFAULT 'durable_catalog_role'::regrole, \
-                 schema_value regnamespace DEFAULT 'durable_catalog_schema'::regnamespace \
+                 schema_value regnamespace DEFAULT 'durable_catalog_schema'::regnamespace, \
+                 routine_value regproc DEFAULT 'durable_catalog_routine'::regproc, \
+                 signature_value regprocedure \
+                     DEFAULT 'durable_catalog_routine(integer)'::regprocedure \
              ); \
              INSERT INTO durable_catalog_values DEFAULT VALUES; \
              INSERT INTO durable_catalog_values VALUES ( \
-                 'durable_catalog_reference', 'durable_catalog_role', 'durable_catalog_schema' \
+                 'durable_catalog_reference', 'durable_catalog_role', 'durable_catalog_schema', \
+                 'durable_catalog_routine', 'durable_catalog_routine(integer)' \
              )",
         );
         run_with(&mut engine, &mut budget, "CHECKPOINT");
@@ -6095,15 +6194,16 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "SELECT relation_value, role_value, schema_value, \
-                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value) \
+        "SELECT relation_value, role_value, schema_value, routine_value, signature_value, \
+                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value), \
+                pg_typeof(routine_value), pg_typeof(signature_value) \
          FROM durable_catalog_values ORDER BY relation_value",
     );
     assert_eq!(
         data_rows(&output),
         [
-            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|regclass|regrole|regnamespace",
-            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|regclass|regrole|regnamespace",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|regclass|regrole|regnamespace|regproc|regprocedure",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|regclass|regrole|regnamespace|regproc|regprocedure",
         ]
     );
     assert_eq!(
@@ -6112,6 +6212,10 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
             crate::sql::types::oid::REGCLASS,
             crate::sql::types::oid::REGROLE,
             crate::sql::types::oid::REGNAMESPACE,
+            crate::sql::types::oid::REGPROC,
+            crate::sql::types::oid::REGPROCEDURE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,

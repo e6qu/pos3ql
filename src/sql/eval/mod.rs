@@ -460,6 +460,20 @@ pub trait CatalogAccess {
     fn schema_oid(&self, _name: &str) -> Option<i32> {
         None
     }
+    /// Resolve a routine OID to its catalog spelling. `signature` selects the
+    /// regprocedure spelling with argument types rather than regproc's name.
+    fn routine_name<'a>(
+        &self,
+        _oid: i32,
+        _signature: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve a routine catalog spelling to its OID.
+    fn routine_oid(&self, _name: &str, _signature: bool) -> Result<Option<i32>, SqlError> {
+        Ok(None)
+    }
     /// PostgreSQL privilege inquiry functions. `None` represents a missing
     /// object or role, for which PostgreSQL returns NULL in the OID forms.
     fn has_table_privilege(
@@ -678,13 +692,13 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns) {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
-            // A cast to a user-defined type (enum) cannot fold without the
-            // catalog, which this plan-time check does not carry; defer to
-            // runtime, which resolves and validates it (a genuinely missing
-            // type or bad enum label re-surfaces there).
+            // Catalog-resolved values cannot fold without the catalog this
+            // plan-time check intentionally does not carry. Runtime resolves
+            // and validates them with the query catalog.
             Err(e)
                 if e.sqlstate == sqlstate::UNDEFINED_OBJECT
-                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION =>
+                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION
+                    || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED =>
             {
                 None
             }
@@ -3768,12 +3782,13 @@ pub(crate) fn regobject_cast<'a>(
     if value.is_null() {
         return Ok(Datum::Null);
     }
-    if let Datum::RegObject { type_oid, .. } = value
-        && type_oid == target.oid()
-    {
-        return Ok(value);
-    }
     let object_oid = match value {
+        Datum::RegObject {
+            type_oid,
+            referenced_oid,
+            ..
+        } if type_oid == target.oid() => referenced_oid,
+        Datum::RegObject { .. } => return Err(cast_unsupported(&value, target.name())),
         Datum::Int2(value) => i32::from(value),
         Datum::Int4(value) => value,
         Datum::Int8(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
@@ -3811,6 +3826,15 @@ pub(crate) fn regobject_cast<'a>(
                             name
                         )
                     })?,
+                    ColType::Regproc | ColType::Regprocedure => catalog
+                        .routine_oid(name, target == ColType::Regprocedure)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "function \"{}\" does not exist",
+                                name
+                            )
+                        })?,
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3834,6 +3858,10 @@ pub(crate) fn regobject_cast<'a>(
             .flatten(),
         ColType::Regnamespace => catalog
             .map(|catalog| catalog.schema_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regproc | ColType::Regprocedure => catalog
+            .map(|catalog| catalog.routine_name(object_oid, target == ColType::Regprocedure, arena))
             .transpose()?
             .flatten(),
         _ => None,

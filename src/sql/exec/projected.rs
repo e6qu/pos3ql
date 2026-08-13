@@ -519,7 +519,8 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             )
         }
         16 => {
-            let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+            let kind = crate::sql::types::RangeKind::from_code(bytes[at])
+                .expect("projected range carries a valid kind code");
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
             let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
                 .expect("projected range was encoded from valid UTF-8");
@@ -533,7 +534,8 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             (Datum::Bit { bits: s, varying }, 5 + len)
         }
         18 => {
-            let kind = crate::sql::types::RangeKind::from_code(bytes[at]);
+            let kind = crate::sql::types::RangeKind::from_code(bytes[at])
+                .expect("projected multirange carries a valid kind code");
             let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
             let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
                 .expect("projected multirange was encoded from valid UTF-8");

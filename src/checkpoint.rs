@@ -5141,10 +5141,10 @@ fn empty_column() -> ColumnMeta {
 
 /// Column defaults travel in the manifest as hex of the WAL default
 /// encoding ("-" for none-with-no-bytes readability).
-fn default_to_hex(d: &Option<OwnedDatum>) -> StackStr<128> {
+fn default_to_hex(d: &Option<OwnedDatum>) -> StackStr<{ 2 * crate::wal::MAX_DEFAULT_ENCODED }> {
     let mut scratch = [0u8; crate::wal::MAX_DEFAULT_ENCODED];
     let n = crate::wal::encode_default_bytes(d, &mut scratch);
-    let mut out = StackStr::<128>::new();
+    let mut out = StackStr::<{ 2 * crate::wal::MAX_DEFAULT_ENCODED }>::new();
     use core::fmt::Write;
     for b in &scratch[..n] {
         let _ = write!(out, "{b:02x}");
@@ -5154,10 +5154,10 @@ fn default_to_hex(d: &Option<OwnedDatum>) -> StackStr<128> {
 
 fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupError> {
     let corrupt = || CheckpointSetupError::Corrupt("bad default encoding");
-    if !hex.len().is_multiple_of(2) || hex.len() > 256 {
+    if !hex.len().is_multiple_of(2) || hex.len() > 2 * crate::wal::MAX_DEFAULT_ENCODED {
         return Err(corrupt());
     }
-    let mut bytes = [0u8; 128];
+    let mut bytes = [0u8; crate::wal::MAX_DEFAULT_ENCODED];
     let n = hex.len() / 2;
     for i in 0..n {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| corrupt())?;

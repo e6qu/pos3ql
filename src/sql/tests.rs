@@ -8607,6 +8607,120 @@ fn altered_table_survives_restart() {
 }
 
 #[test]
+fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
+    let mut config = test_config("typed-complex-defaults");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("typed-complex-defaults-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new((1 << 29) + (96 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE default_parent (id uuid PRIMARY KEY);
+             CREATE TABLE default_values (
+                 id int PRIMARY KEY,
+                 day date DEFAULT DATE '2024-01-02',
+                 stamp timestamp DEFAULT TIMESTAMP '2024-01-02 03:04:05',
+                 zoned timestamptz DEFAULT TIMESTAMPTZ '2024-01-02 03:04:05+00',
+                 clock time DEFAULT TIME '03:04:05',
+                 zoned_clock timetz DEFAULT TIMETZ '03:04:05+02',
+                 span interval DEFAULT INTERVAL '2 days 03:04:05',
+                 document jsonb DEFAULT '{\"a\":[1,2]}'::jsonb,
+                 numbers integer[] DEFAULT ARRAY[4,5],
+                 bounds int4range DEFAULT '[2,7]'::int4range,
+                 bitset bit(3) DEFAULT B'101',
+                 payload bytea DEFAULT '\\x00ff'::bytea,
+                 token uuid DEFAULT '00000000-0000-0000-0000-000000000099'::uuid
+                     REFERENCES default_parent(id) ON DELETE SET DEFAULT
+             );
+             CREATE TABLE default_child (
+                 id int PRIMARY KEY,
+                 token uuid DEFAULT '00000000-0000-0000-0000-000000000099'::uuid
+                     REFERENCES default_parent(id) ON DELETE SET DEFAULT
+             );
+             INSERT INTO default_parent VALUES
+                 ('00000000-0000-0000-0000-000000000001'),
+                 ('00000000-0000-0000-0000-000000000099');
+             INSERT INTO default_values (id) VALUES (1);
+             INSERT INTO default_child VALUES (1, '00000000-0000-0000-0000-000000000001');",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    {
+        let mut budget = Budget::new((1 << 29) + (96 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let altered = run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO default_values (id) VALUES (2);
+             ALTER TABLE default_values ALTER COLUMN document SET DEFAULT '{\"b\":3}'::jsonb;
+             UPDATE default_values SET document = DEFAULT WHERE id = 1;
+             BEGIN;
+             SAVEPOINT typed_default;
+             ALTER TABLE default_values ALTER COLUMN document SET DEFAULT '{\"discarded\":true}'::jsonb;
+             ROLLBACK TO SAVEPOINT typed_default;
+             COMMIT;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&altered).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&altered)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO default_values (id) VALUES (3);
+         DELETE FROM default_parent WHERE id = '00000000-0000-0000-0000-000000000001';
+         SELECT day, stamp, zoned, clock, zoned_clock, span, document, numbers,
+                bounds, bitset, encode(payload, 'hex'), token
+           FROM default_values ORDER BY id;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&rows).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+    assert_eq!(
+        data_rows(&rows),
+        [
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"a\": [1, 2]}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT token FROM default_child",
+        )),
+        ["00000000-0000-0000-0000-000000000099"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn alter_column_default_and_not_null() {
     let config = test_config("alter-column");
     let mut b = Budget::new(1 << 25);

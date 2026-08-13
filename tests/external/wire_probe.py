@@ -302,6 +302,33 @@ def test_binary_cursor_preserves_type_modifier():
     s.close()
 
 
+def test_binary_cursor_preserves_catalog_identity():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    out = simple_query(
+        s,
+        "BEGIN; DECLARE catalog_identity_probe BINARY CURSOR FOR "
+        "SELECT '+(integer,integer)'::regoperator AS value; "
+        "FETCH ALL FROM catalog_identity_probe; COMMIT",
+    )
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary cursor: FETCH preserves regoperator identity",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1],
+        description,
+    )
+    check(
+        "binary cursor: FETCH returns the operator OID",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x02'",
+        row,
+    )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))

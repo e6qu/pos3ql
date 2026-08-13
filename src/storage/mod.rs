@@ -130,6 +130,38 @@ pub enum OwnedDatum {
         nbytes: u8,
         digits: [u8; MAX_DEFAULT_TEXT],
     },
+    Date(i32),
+    Timestamp(i64),
+    Timestamptz(i64),
+    Time(i64),
+    Timetz(i64, i32),
+    Interval(crate::sql::types::Interval),
+    Json {
+        jsonb: bool,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    Array {
+        element: crate::sql::types::ArrElem,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    Range {
+        kind: crate::sql::types::RangeKind,
+        multirange: bool,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    Bit {
+        varying: bool,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    Uuid([u8; 16]),
+    Bytea {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Inet(crate::sql::net::NetAddr),
     Cidr(crate::sql::net::NetAddr),
     Macaddr([u8; 6]),
@@ -142,7 +174,10 @@ pub enum OwnedDatum {
     },
 }
 
-pub(crate) const MAX_DEFAULT_TEXT: usize = 48;
+/// Fixed catalog capacity for a parsed default value. It matches the bounded
+/// SQL source capacity, so a supported literal cannot become unrepresentable
+/// merely because its typed form takes a few more bytes.
+pub(crate) const MAX_DEFAULT_TEXT: usize = DEFAULT_EXPR_MAX;
 
 /// The complete default state of one column.
 ///
@@ -229,24 +264,19 @@ impl OwnedDatum {
             // real (f64→f32 is lossless for a value that was already f32).
             Datum::Float4(v) => Self::Float8(f64::from(*v)),
             Datum::Float8(v) => Self::Float8(*v),
-            Datum::Date(_)
-            | Datum::Timestamp(_)
-            | Datum::Timestamptz(_)
-            | Datum::Time(_)
-            | Datum::Timetz(..)
-            | Datum::Interval(_)
-            | Datum::Json { .. }
-            | Datum::Array { .. }
-            | Datum::Range { .. }
-            | Datum::Multirange { .. }
-            | Datum::Bit { .. }
-            | Datum::Uuid(_)
-            | Datum::Bytea(_) => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "defaults of this type are not supported yet (store as text)"
-                ));
-            }
+            Datum::Date(value) => Self::Date(*value),
+            Datum::Timestamp(value) => Self::Timestamp(*value),
+            Datum::Timestamptz(value) => Self::Timestamptz(*value),
+            Datum::Time(value) => Self::Time(*value),
+            Datum::Timetz(time, zone) => Self::Timetz(*time, *zone),
+            Datum::Interval(value) => Self::Interval(*value),
+            Datum::Uuid(value) => Self::Uuid(*value),
+            Datum::Json { text, jsonb } => Self::json(*jsonb, text)?,
+            Datum::Array { element, raw } => Self::array(*element, raw)?,
+            Datum::Range { text, kind } => Self::range(*kind, false, text)?,
+            Datum::Multirange { text, kind } => Self::range(*kind, true, text)?,
+            Datum::Bit { bits, varying } => Self::bit(*varying, bits)?,
+            Datum::Bytea(bytes) => Self::bytea(bytes)?,
             Datum::Inet(n) => Self::Inet(*n),
             Datum::Cidr(n) => Self::Cidr(*n),
             Datum::Macaddr(b) => Self::Macaddr(*b),
@@ -315,6 +345,13 @@ impl OwnedDatum {
             Self::Int4(v) => Datum::Int4(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Float8(v) => Datum::Float8(*v),
+            Self::Date(value) => Datum::Date(*value),
+            Self::Timestamp(value) => Datum::Timestamp(*value),
+            Self::Timestamptz(value) => Datum::Timestamptz(*value),
+            Self::Time(value) => Datum::Time(*value),
+            Self::Timetz(time, zone) => Datum::Timetz(*time, *zone),
+            Self::Interval(value) => Datum::Interval(*value),
+            Self::Uuid(value) => Datum::Uuid(*value),
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
             ),
@@ -334,6 +371,43 @@ impl OwnedDatum {
                 dscale: *dscale,
                 digits: &digits[..*nbytes as usize],
             }),
+            Self::Json { jsonb, len, bytes } => Datum::Json {
+                text: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+                jsonb: *jsonb,
+            },
+            Self::Array {
+                element,
+                len,
+                bytes,
+            } => Datum::Array {
+                element: *element,
+                raw: &bytes[..*len as usize],
+            },
+            Self::Range {
+                kind,
+                multirange,
+                len,
+                bytes,
+            } => {
+                let text =
+                    core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8");
+                if *multirange {
+                    Datum::Multirange { text, kind: *kind }
+                } else {
+                    Datum::Range { text, kind: *kind }
+                }
+            }
+            Self::Bit {
+                varying,
+                len,
+                bytes,
+            } => Datum::Bit {
+                bits: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+                varying: *varying,
+            },
+            Self::Bytea { len, bytes } => Datum::Bytea(&bytes[..*len as usize]),
             Self::Inet(n) => Datum::Inet(*n),
             Self::Cidr(n) => Datum::Cidr(*n),
             Self::Macaddr(b) => Datum::Macaddr(*b),
@@ -350,6 +424,62 @@ impl OwnedDatum {
                     .expect("stored from valid UTF-8"),
             },
         }
+    }
+
+    fn bytes(value: &[u8], what: &str) -> Result<(u8, [u8; MAX_DEFAULT_TEXT]), SqlError> {
+        if value.len() > MAX_DEFAULT_TEXT {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "{} default exceeds the fixed {} byte catalog limit",
+                what,
+                MAX_DEFAULT_TEXT
+            ));
+        }
+        let mut bytes = [0; MAX_DEFAULT_TEXT];
+        bytes[..value.len()].copy_from_slice(value);
+        Ok((value.len() as u8, bytes))
+    }
+
+    fn json(jsonb: bool, text: &str) -> Result<Self, SqlError> {
+        let (len, bytes) = Self::bytes(text.as_bytes(), "JSON")?;
+        Ok(Self::Json { jsonb, len, bytes })
+    }
+
+    fn array(element: crate::sql::types::ArrElem, raw: &[u8]) -> Result<Self, SqlError> {
+        let (len, bytes) = Self::bytes(raw, "array")?;
+        Ok(Self::Array {
+            element,
+            len,
+            bytes,
+        })
+    }
+
+    fn range(
+        kind: crate::sql::types::RangeKind,
+        multirange: bool,
+        text: &str,
+    ) -> Result<Self, SqlError> {
+        let (len, bytes) = Self::bytes(text.as_bytes(), "range")?;
+        Ok(Self::Range {
+            kind,
+            multirange,
+            len,
+            bytes,
+        })
+    }
+
+    fn bit(varying: bool, bits: &str) -> Result<Self, SqlError> {
+        let (len, bytes) = Self::bytes(bits.as_bytes(), "bit string")?;
+        Ok(Self::Bit {
+            varying,
+            len,
+            bytes,
+        })
+    }
+
+    fn bytea(value: &[u8]) -> Result<Self, SqlError> {
+        let (len, bytes) = Self::bytes(value, "bytea")?;
+        Ok(Self::Bytea { len, bytes })
     }
 }
 

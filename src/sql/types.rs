@@ -629,10 +629,10 @@ impl ColType {
             // type name after decode (see the column codec's name handling).
             54 => Self::Enum(Self::ENUM_SLOT_UNRESOLVED),
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
-                Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE))
+                Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE)?)
             }
             c if (MULTIRANGE_CODE_BASE..MULTIRANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
-                Self::Multirange(RangeKind::from_code(c - MULTIRANGE_CODE_BASE))
+                Self::Multirange(RangeKind::from_code(c - MULTIRANGE_CODE_BASE)?)
             }
             c if c >= ARRAY_CODE_BASE => Self::Array(ArrElem::from_code(c - ARRAY_CODE_BASE)?),
             _ => return None,
@@ -1208,15 +1208,16 @@ impl RangeKind {
             Self::Tstz => 5,
         }
     }
-    pub fn from_code(c: u8) -> Self {
-        match c {
+    pub fn from_code(c: u8) -> Option<Self> {
+        Some(match c {
+            0 => Self::Int4,
             1 => Self::Int8,
             2 => Self::Num,
             3 => Self::Date,
             4 => Self::Ts,
             5 => Self::Tstz,
-            _ => Self::Int4,
-        }
+            _ => return None,
+        })
     }
     /// The multirange type name for this range subtype (`int4range` →
     /// `int4multirange`).

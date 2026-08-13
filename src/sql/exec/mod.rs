@@ -12270,20 +12270,37 @@ where
         if explicit[index] {
             continue;
         }
-        if let Some(default) = column.default.constant() {
-            values[index] = default.as_datum();
-        } else if let Some(expression) = defaults[index] {
-            let value = super::eval::eval_full(
-                expression,
-                arena,
-                crate::sql::eval::NO_PARAMS,
-                &NoColumns,
-                &hooks,
-            )?;
-            values[index] = coerce(value, column, storage, txid, arena)?;
-        }
+        values[index] =
+            column_default_value(storage, txid, column, defaults[index], arena, &hooks)?;
     }
     Ok(())
+}
+
+fn column_default_value<'values, 'arena>(
+    storage: &Storage,
+    txid: u32,
+    column: &'values crate::storage::ColumnMeta,
+    expression: Option<&'arena Expr<'arena>>,
+    arena: &'arena Arena,
+    hooks: &super::eval::EvalHooks<'_, 'arena>,
+) -> Result<Datum<'values>, SqlError>
+where
+    'arena: 'values,
+{
+    if let Some(default) = column.default.constant() {
+        return Ok(default.as_datum());
+    }
+    let Some(expression) = expression else {
+        return Ok(Datum::Null);
+    };
+    let value = super::eval::eval_full(
+        expression,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        &NoColumns,
+        hooks,
+    )?;
+    coerce(value, column, storage, txid, arena)
 }
 
 /// What to do with an explicitly supplied value for a column, given the
@@ -13695,6 +13712,10 @@ pub fn update(
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
+    let defaults = match parse_defaults(&def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
 
     let subs = match super::query::subquery_hooks(
         &[statement.where_clause],
@@ -13869,6 +13890,17 @@ pub fn update(
                             if def.columns()[targets[a]].default.is_generated() {
                                 continue;
                             }
+                            if matches!(expression, Expr::DefaultMarker) {
+                                new_values[targets[a]] = column_default_value(
+                                    storage,
+                                    txn.txid,
+                                    &def.columns()[targets[a]],
+                                    defaults[targets[a]],
+                                    arena,
+                                    &hooks,
+                                )?;
+                                continue;
+                            }
                             let v = eval_full(expression, arena, params, &combined, &hooks)?;
                             new_values[targets[a]] =
                                 coerce(v, &def.columns()[targets[a]], storage, txn.txid, arena)?;
@@ -13897,6 +13929,20 @@ pub fn update(
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                     if def.columns()[targets[a]].default.is_generated() {
                         continue; // recomputed from the finished row below
+                    }
+                    if matches!(expression, Expr::DefaultMarker) {
+                        new_values[targets[a]] = match column_default_value(
+                            storage,
+                            txn.txid,
+                            &def.columns()[targets[a]],
+                            defaults[targets[a]],
+                            arena,
+                            &hooks,
+                        ) {
+                            Ok(value) => value,
+                            Err(e) => return sql_fail(e),
+                        };
+                        continue;
                     }
                     let v =
                         match super::eval::eval_full(expression, arena, params, &context, &hooks) {

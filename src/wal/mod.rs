@@ -688,6 +688,11 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
     appended &= buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
     appended &= append_payload(buffer, operation);
     assert!(appended, "record size was checked against buffer capacity");
+    assert_eq!(
+        buffer.len(),
+        mark + total,
+        "WAL payload length must match its typed encoding: {operation:?}"
+    );
 
     let filled = buffer.filled_mut();
     let crc = crc32c(&filled[mark + 4..mark + total]);
@@ -3750,6 +3755,12 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bool(_)) => 1,
         Some(OwnedDatum::Int4(_)) => 4,
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::Date(_)) => 4,
+        Some(OwnedDatum::Timestamp(_))
+        | Some(OwnedDatum::Timestamptz(_))
+        | Some(OwnedDatum::Time(_)) => 8,
+        Some(OwnedDatum::Timetz(..)) => 12,
+        Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Numeric { nbytes, .. }) => 6 + *nbytes as usize,
         Some(OwnedDatum::Inet(_)) | Some(OwnedDatum::Cidr(_)) => 18,
@@ -3757,6 +3768,10 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
         Some(OwnedDatum::Enum { len, .. }) => 11 + *len as usize,
+        Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
+        Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::Array { len, .. }) => 5 + *len as usize,
+        Some(OwnedDatum::Range { len, .. }) => 3 + *len as usize,
     }
 }
 
@@ -3766,8 +3781,8 @@ pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> b
     buffer.append(&scratch[..n])
 }
 
-/// Largest encoded default: enum's tag(1) + slot(2) + sort(8) + len(1) + 48
-/// label bytes is the widest case.
+/// Largest encoded default: an enum's tag, identity, ordering key, length and
+/// bounded label. Array payloads carry less metadata.
 pub(crate) const MAX_DEFAULT_ENCODED: usize = 12 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
@@ -3800,6 +3815,44 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[0] = 5;
             out[1..9].copy_from_slice(&v.to_le_bytes());
             9
+        }
+        Some(OwnedDatum::Date(value)) => {
+            out[0] = 13;
+            out[1..5].copy_from_slice(&value.to_le_bytes());
+            5
+        }
+        Some(OwnedDatum::Timestamp(value)) => {
+            out[0] = 14;
+            out[1..9].copy_from_slice(&value.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::Timestamptz(value)) => {
+            out[0] = 15;
+            out[1..9].copy_from_slice(&value.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::Time(value)) => {
+            out[0] = 16;
+            out[1..9].copy_from_slice(&value.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::Timetz(time, zone)) => {
+            out[0] = 17;
+            out[1..9].copy_from_slice(&time.to_le_bytes());
+            out[9..13].copy_from_slice(&zone.to_le_bytes());
+            13
+        }
+        Some(OwnedDatum::Interval(value)) => {
+            out[0] = 18;
+            out[1..5].copy_from_slice(&value.months.to_le_bytes());
+            out[5..9].copy_from_slice(&value.days.to_le_bytes());
+            out[9..17].copy_from_slice(&value.micros.to_le_bytes());
+            17
+        }
+        Some(OwnedDatum::Uuid(value)) => {
+            out[0] = 19;
+            out[1..17].copy_from_slice(value);
+            17
         }
         Some(OwnedDatum::Text { len, bytes }) => {
             out[0] = 6;
@@ -3855,6 +3908,64 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[11] = *len;
             out[12..12 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             12 + *len as usize
+        }
+        Some(OwnedDatum::Json { jsonb, len, bytes }) => {
+            out[0] = 20;
+            out[1] = u8::from(*jsonb);
+            out[2] = *len;
+            out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            3 + *len as usize
+        }
+        Some(OwnedDatum::Array {
+            element,
+            len,
+            bytes,
+        }) => {
+            out[0] = 21;
+            out[1] = element.code();
+            let (base_code, enum_slot) = match element {
+                crate::sql::types::ArrElem::Domain {
+                    base_code,
+                    enum_slot,
+                    ..
+                } => (*base_code, *enum_slot),
+                _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
+            };
+            out[2] = base_code;
+            out[3..5].copy_from_slice(&enum_slot.to_le_bytes());
+            out[5] = *len;
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
+        }
+        Some(OwnedDatum::Range {
+            kind,
+            multirange,
+            len,
+            bytes,
+        }) => {
+            out[0] = 22;
+            out[1] = kind.code();
+            out[2] = u8::from(*multirange);
+            out[3] = *len;
+            out[4..4 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            4 + *len as usize
+        }
+        Some(OwnedDatum::Bit {
+            varying,
+            len,
+            bytes,
+        }) => {
+            out[0] = 23;
+            out[1] = u8::from(*varying);
+            out[2] = *len;
+            out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            3 + *len as usize
+        }
+        Some(OwnedDatum::Bytea { len, bytes }) => {
+            out[0] = 24;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
         }
     }
 }
@@ -3972,13 +4083,198 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                 bytes,
             })
         }
+        13 => {
+            let bytes = payload.get(*at..*at + 4)?;
+            *at += 4;
+            Some(OwnedDatum::Date(i32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
+        }
+        14..=16 => {
+            let bytes = payload.get(*at..*at + 8)?;
+            *at += 8;
+            let value = i64::from_le_bytes(bytes.try_into().unwrap());
+            Some(match tag {
+                14 => OwnedDatum::Timestamp(value),
+                15 => OwnedDatum::Timestamptz(value),
+                _ => OwnedDatum::Time(value),
+            })
+        }
+        17 => {
+            let bytes = payload.get(*at..*at + 12)?;
+            *at += 12;
+            Some(OwnedDatum::Timetz(
+                i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                i32::from_le_bytes(bytes[8..].try_into().unwrap()),
+            ))
+        }
+        18 => {
+            let bytes = payload.get(*at..*at + 16)?;
+            *at += 16;
+            Some(OwnedDatum::Interval(crate::sql::types::Interval {
+                months: i32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                days: i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                micros: i64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            }))
+        }
+        19 => {
+            let bytes = payload.get(*at..*at + 16)?;
+            *at += 16;
+            Some(OwnedDatum::Uuid(bytes.try_into().unwrap()))
+        }
+        20 => {
+            let jsonb = *payload.get(*at)? != 0;
+            let len = *payload.get(*at + 1)? as usize;
+            *at += 2;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Json {
+                jsonb,
+                len: len as u8,
+                bytes,
+            })
+        }
+        21 => {
+            let code = *payload.get(*at)?;
+            let base_code = *payload.get(*at + 1)?;
+            let enum_slot = u16::from_le_bytes(payload.get(*at + 2..*at + 4)?.try_into().unwrap());
+            let len = *payload.get(*at + 4)? as usize;
+            *at += 5;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            let mut element = crate::sql::types::ArrElem::from_code(code)?;
+            if let crate::sql::types::ArrElem::Domain { slot, .. } = element {
+                crate::sql::types::ColType::from_code(base_code)?;
+                element = crate::sql::types::ArrElem::Domain {
+                    slot,
+                    base_code,
+                    enum_slot,
+                };
+            }
+            Some(OwnedDatum::Array {
+                element,
+                len: len as u8,
+                bytes,
+            })
+        }
+        22 => {
+            let kind = crate::sql::types::RangeKind::from_code(*payload.get(*at)?)?;
+            let multirange = *payload.get(*at + 1)? != 0;
+            let len = *payload.get(*at + 2)? as usize;
+            *at += 3;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Range {
+                kind,
+                multirange,
+                len: len as u8,
+                bytes,
+            })
+        }
+        23 => {
+            let varying = *payload.get(*at)? != 0;
+            let len = *payload.get(*at + 1)? as usize;
+            *at += 2;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Bit {
+                varying,
+                len: len as u8,
+                bytes,
+            })
+        }
+        24 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            Some(OwnedDatum::Bytea {
+                len: len as u8,
+                bytes,
+            })
+        }
         _ => return None,
     })
+}
+
+fn decode_bounded_default_bytes(
+    payload: &[u8],
+    at: &mut usize,
+    len: usize,
+) -> Option<[u8; crate::storage::MAX_DEFAULT_TEXT]> {
+    if len > crate::storage::MAX_DEFAULT_TEXT {
+        return None;
+    }
+    let raw = payload.get(*at..*at + len)?;
+    *at += len;
+    let mut bytes = [0; crate::storage::MAX_DEFAULT_TEXT];
+    bytes[..len].copy_from_slice(raw);
+    Some(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_default_codec_size_and_round_trip_agree() {
+        let mut text = [0u8; crate::storage::MAX_DEFAULT_TEXT];
+        text[..3].copy_from_slice(b"101");
+        let defaults = [
+            None,
+            Some(OwnedDatum::Date(8_767)),
+            Some(OwnedDatum::Interval(crate::sql::types::Interval {
+                months: 1,
+                days: 2,
+                micros: 3,
+            })),
+            Some(OwnedDatum::Uuid([7; 16])),
+            Some(OwnedDatum::Json {
+                jsonb: true,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Array {
+                element: crate::sql::types::ArrElem::Int4,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Range {
+                kind: crate::sql::types::RangeKind::Int4,
+                multirange: false,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Bit {
+                varying: false,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Bytea {
+                len: 3,
+                bytes: text,
+            }),
+        ];
+        for default in defaults {
+            let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
+            let len = encode_default_bytes(&default, &mut encoded);
+            assert_eq!(len, encoded_default_len(&default));
+            let mut at = 0;
+            assert_eq!(decode_default(&encoded[..len], &mut at), Some(default));
+            assert_eq!(at, len);
+        }
+    }
+
+    #[test]
+    fn typed_default_decoder_rejects_invalid_tags_and_lengths() {
+        let mut oversized_bytea = [0u8; MAX_DEFAULT_ENCODED];
+        oversized_bytea[..2].copy_from_slice(&[24, (crate::storage::MAX_DEFAULT_TEXT + 1) as u8]);
+        let mut at = 0;
+        assert_eq!(decode_default(&oversized_bytea, &mut at), None);
+
+        let mut invalid_range = [0u8; MAX_DEFAULT_ENCODED];
+        invalid_range[..4].copy_from_slice(&[22, 42, 0, 0]);
+        let mut at = 0;
+        assert_eq!(decode_default(&invalid_range[..4], &mut at), None);
+    }
 
     #[test]
     fn stored_query_dependency_columns_round_trip_in_wal() {

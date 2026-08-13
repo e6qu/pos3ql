@@ -1356,7 +1356,7 @@ pub fn eval_full<'a>(
         }
         Expr::DefaultMarker => Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
-            "DEFAULT is only allowed in INSERT value lists"
+            "DEFAULT is only allowed as a DML assignment value"
         )),
         Expr::Subquery(_) | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {

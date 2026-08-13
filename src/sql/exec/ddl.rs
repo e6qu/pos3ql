@@ -349,28 +349,6 @@ pub(super) fn resolve_default(
             _ => cast_to(v, ctype, arena)?,
         };
         let v = apply_typmod(v, ctype, type_mod, arena)?;
-        // Fixed-size scalar defaults live inline in the table definition.
-        // Arena-backed values (arrays, temporal values, JSON, bytea, ranges,
-        // and bit strings) retain their source expression and are evaluated
-        // through the ordinary catalog-aware default path per inserted row.
-        if matches!(
-            v,
-            crate::sql::types::Datum::Date(_)
-                | crate::sql::types::Datum::Timestamp(_)
-                | crate::sql::types::Datum::Timestamptz(_)
-                | crate::sql::types::Datum::Time(_)
-                | crate::sql::types::Datum::Timetz(..)
-                | crate::sql::types::Datum::Interval(_)
-                | crate::sql::types::Datum::Json { .. }
-                | crate::sql::types::Datum::Array { .. }
-                | crate::sql::types::Datum::Range { .. }
-                | crate::sql::types::Datum::Multirange { .. }
-                | crate::sql::types::Datum::Bit { .. }
-                | crate::sql::types::Datum::Uuid(_)
-                | crate::sql::types::Datum::Bytea(_)
-        ) {
-            return Ok(ColumnDefault::Expression(store_default_text(default_text)?));
-        }
         return Ok(ColumnDefault::Constant {
             value: OwnedDatum::from_datum(&v)?,
             expression: store_default_text(default_text)?,

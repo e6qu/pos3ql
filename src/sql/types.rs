@@ -2212,5 +2212,9 @@ mod code_roundtrip_tests {
             seen.push((c, t));
         }
         assert_eq!(ColType::from_code(ColType::Record.code()), None);
+        assert_eq!(
+            ColType::from_code(ColType::Enum(0).code()),
+            Some(ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED))
+        );
     }
 }

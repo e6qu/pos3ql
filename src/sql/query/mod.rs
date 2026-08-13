@@ -1197,6 +1197,27 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .map_err(|_| arena_full())?,
         ))
     }
+
+    fn user_type_oid(&self, type_name: &str) -> Option<i32> {
+        let (base, array) = match type_name.strip_suffix("[]") {
+            Some(base) => (base, true),
+            None => (type_name, false),
+        };
+        if let Some(slot) = self.storage.resolve_domain_slot(base, self.txid) {
+            return Some(if array {
+                super::types::oid::domain_array_oid(slot as u16)
+            } else {
+                super::types::oid::domain_oid(slot as u16)
+            });
+        }
+        self.storage.resolve_enum_slot(base, self.txid).map(|slot| {
+            if array {
+                super::types::oid::enum_array_oid(slot as u16)
+            } else {
+                super::types::oid::enum_oid(slot as u16)
+            }
+        })
+    }
 }
 
 fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
@@ -1403,11 +1424,12 @@ fn patch_subquery_column_types<'a>(
                                 && let Some(SelectItem::Expr {
                                     expression: inner, ..
                                 }) = sub.items.first()
+                                && let Some(from) = sub.from
+                                && let Ok(inner_scope) =
+                                    QueryScope::resolve_schema(storage, &from, txid, arena)
+                                && let Ok(witness) =
+                                    subquery_witness(storage, txid, inner, Some(&inner_scope))
                             {
-                                let inner_scope = sub.from.as_ref().and_then(|f| {
-                                    QueryScope::resolve_schema(storage, f, txid, arena).ok()
-                                });
-                                let witness = subquery_witness(inner, inner_scope.as_ref());
                                 let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
                                     array_subquery_column_type(witness)
                                 } else {
@@ -1980,7 +2002,7 @@ fn describe_select<'a>(
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(sel.items, &scope, storage, txid, arena, out)
+            describe_scope_items(sel.items, &scope, None, storage, txid, arena, out)
         }
         None => describe_catalog_items(sel.items, None, storage, txid, out),
     }
@@ -2783,6 +2805,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     {
         let columns = CatalogScopeCols {
             scope: &scope,
+            outer_scope: None,
             storage,
             txid,
         };
@@ -2830,11 +2853,18 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols =
-        match describe_scope_items(statement.items, &scope, storage, txid, arena, &mut columns) {
-            Ok(n) => n,
-            Err(e) => return sql_fail(e),
-        };
+    let n_cols = match describe_scope_items(
+        statement.items,
+        &scope,
+        None,
+        storage,
+        txid,
+        arena,
+        &mut columns,
+    ) {
+        Ok(n) => n,
+        Err(e) => return sql_fail(e),
+    };
     patch_subquery_column_types(
         statement.items,
         Some(&scope),
@@ -4474,6 +4504,7 @@ fn project_row_skipping<'a>(
 pub fn describe_scope_items<'q>(
     items: &[SelectItem<'q>],
     scope: &QueryScope<'q>,
+    outer_scope: Option<&QueryScope<'q>>,
     storage: &Storage,
     txid: u32,
     arena: &'q Arena,
@@ -4526,12 +4557,13 @@ pub fn describe_scope_items<'q>(
                 }
                 // Multi-table type inference: columns resolve via scope.
                 let name = alias.unwrap_or(super::exec::derived_name(expression));
-                let user_type = user_type_cast_description(expression, name, storage, txid);
+                let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (oid, typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
                     None => {
                         let resolver = CatalogScopeCols {
                             scope,
+                            outer_scope,
                             storage,
                             txid,
                         };
@@ -4547,12 +4579,9 @@ pub fn describe_scope_items<'q>(
                 // target's, as RowDescription reports them; anything computed
                 // is -1 — the rule PostgreSQL follows.
                 let type_mod = match expression {
-                    Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                        Ok(ResolvedColumn::Table(t, c)) => {
-                            scope.defs[t].expect("resolved").columns()[c].type_mod
-                        }
-                        _ => -1,
-                    },
+                    Expr::Column { qualifier, name } => {
+                        scope_column_type_mod(scope, outer_scope, *qualifier, name)
+                    }
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
@@ -4603,7 +4632,7 @@ pub fn describe_catalog_items_as<'q>(
                     .expect("described record star has a static shape");
             }
             SelectItem::Expr { expression, alias } => {
-                if let Some(description) = user_type_cast_description(
+                if let Some(description) = user_type_expression_description(
                     expression,
                     alias.unwrap_or(super::exec::derived_name(expression)),
                     storage,
@@ -4675,13 +4704,13 @@ pub fn describe_catalog_items_as<'q>(
 pub fn describe_select_items<'q>(
     items: &[SelectItem<'q>],
     scope: Option<&QueryScope<'q>>,
-    storage: &Storage,
+    storage: &'q Storage,
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let count = match scope {
-        Some(scope) => describe_scope_items(items, scope, storage, txid, arena, out)?,
+        Some(scope) => describe_scope_items(items, scope, None, storage, txid, arena, out)?,
         None => describe_catalog_items(items, None, storage, txid, out)?,
     };
     let mut column = 0;
@@ -4699,8 +4728,12 @@ pub fn describe_select_items<'q>(
                 column += scope.map_or(0, |scope| record_star_width(base, scope));
             }
             SelectItem::Expr { expression, .. } => {
-                if let Some(oid) = subquery_result_type(expression, storage, txid, arena)? {
-                    out[column] = ColDesc::new(out[column].name, oid, -1);
+                if let Some(description) =
+                    subquery_result_type(expression, scope, storage, txid, arena)?
+                {
+                    out[column] =
+                        ColDesc::new(out[column].name, description.type_oid, description.typlen)
+                            .with_type_mod(description.type_mod);
                 }
                 column += 1;
             }
@@ -4709,12 +4742,20 @@ pub fn describe_select_items<'q>(
     Ok(count)
 }
 
-fn subquery_result_type(
-    expression: &Expr<'_>,
-    storage: &Storage,
+#[derive(Clone, Copy)]
+struct SubqueryResultType {
+    type_oid: i32,
+    typlen: i16,
+    type_mod: i32,
+}
+
+fn subquery_result_type<'a>(
+    expression: &Expr<'a>,
+    outer_scope: Option<&QueryScope<'a>>,
+    storage: &'a Storage,
     txid: u32,
-    arena: &Arena,
-) -> Result<Option<i32>, SqlError> {
+    arena: &'a Arena,
+) -> Result<Option<SubqueryResultType>, SqlError> {
     let (select, array) = match expression {
         Expr::Subquery(select) => (select, false),
         Expr::ArraySubquery(select) => (select, true),
@@ -4724,16 +4765,24 @@ fn subquery_result_type(
     let count = match &select.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_select_items(
+            describe_scope_items(
                 select.items,
-                Some(&scope),
+                &scope,
+                outer_scope,
                 storage,
                 txid,
                 arena,
                 &mut columns,
             )?
         }
-        None => describe_select_items(select.items, None, storage, txid, arena, &mut columns)?,
+        None => describe_select_items(
+            select.items,
+            outer_scope,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+        )?,
     };
     if count != 1 {
         return Err(sql_err!(
@@ -4741,9 +4790,14 @@ fn subquery_result_type(
             "subquery must return only one column"
         ));
     }
-    let element_oid = columns[0].type_oid;
+    let element = columns[0];
+    let element_oid = element.type_oid;
     if !array {
-        return Ok(Some(element_oid));
+        return Ok(Some(SubqueryResultType {
+            type_oid: element.type_oid,
+            typlen: element.typlen,
+            type_mod: element.type_mod,
+        }));
     }
     let array_oid = match super::exec::coltype_of_oid(element_oid) {
         Some(ColType::Array(_)) => Some(element_oid),
@@ -4775,7 +4829,13 @@ fn subquery_result_type(
                 "ARRAY subquery result type is not supported"
             )
         })
-        .map(Some)
+        .map(|type_oid| {
+            Some(SubqueryResultType {
+                type_oid,
+                typlen: -1,
+                type_mod: -1,
+            })
+        })
 }
 
 fn user_type_cast_description<'q>(
@@ -4805,6 +4865,272 @@ fn user_type_cast_description<'q>(
     } else {
         ColDesc::new(name, super::types::oid::enum_oid(slot as u16), 4)
     })
+}
+
+/// Catalog-defined casts retain their type boundary even when they are nested
+/// in an anonymous record field. Static expression inference intentionally has
+/// no catalog dependency, so resolving this shape here prevents a valid domain
+/// or enum field from being mistaken for an unknown literal.
+fn user_type_expression_description<'q>(
+    expression: &Expr<'q>,
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    if let Some(description) = user_type_cast_description(expression, name, storage, txid) {
+        return Some(description);
+    }
+    match expression {
+        Expr::Call {
+            name: function,
+            args,
+            ..
+        } if matches!(
+            *function,
+            "coalesce" | "greatest" | "least" | "min" | "max" | "nullif"
+        ) =>
+        {
+            return matching_user_type_description(args, name, storage, txid);
+        }
+        Expr::Call {
+            name: function,
+            args,
+            ..
+        } if matches!(
+            *function,
+            "array_append" | "array_prepend" | "array_replace" | "array_remove" | "trim_array"
+        ) =>
+        {
+            let (array, elements): (&Expr, &[&Expr]) = match *function {
+                "array_append" => (args.first()?, &args[1..]),
+                "array_prepend" => (args.get(1)?, &args[..1]),
+                "array_replace" => (args.first()?, &args[2..]),
+                "array_remove" => (args.first()?, &args[1..]),
+                "trim_array" => (args.first()?, &[]),
+                _ => unreachable!(),
+            };
+            return catalog_array_operation_description(array, elements, name, storage, txid);
+        }
+        Expr::Call {
+            name: "array_cat",
+            args,
+            ..
+        } => {
+            let left = user_type_expression_description(args.first()?, name, storage, txid)?;
+            let right = user_type_expression_description(args.get(1)?, name, storage, txid)?;
+            return (left.type_oid == right.type_oid).then_some(left);
+        }
+        Expr::Call {
+            name: "unnest",
+            args,
+            ..
+        } => {
+            let array = user_type_expression_description(args.first()?, name, storage, txid)?;
+            return catalog_array_element_description(array, name, storage, txid);
+        }
+        Expr::Call {
+            name: function,
+            args,
+            ..
+        } if matches!(
+            *function,
+            "lag" | "lead" | "first_value" | "last_value" | "nth_value"
+        ) =>
+        {
+            return user_type_expression_description(args.first()?, name, storage, txid);
+        }
+        Expr::Call {
+            name: "array_agg",
+            args,
+            ..
+        } => {
+            return user_type_array_description(args, name, storage, txid);
+        }
+        Expr::Call {
+            name: "array_fill",
+            args,
+            ..
+        } => {
+            return user_type_array_description(args.get(..1)?, name, storage, txid);
+        }
+        Expr::Case {
+            whens, otherwise, ..
+        } => {
+            let mut result = None;
+            for value in whens
+                .iter()
+                .map(|(_, value)| *value)
+                .chain(otherwise.iter().copied())
+            {
+                if matches!(value, Expr::Null) {
+                    continue;
+                }
+                let next = user_type_expression_description(value, name, storage, txid)?;
+                if result.is_some_and(|existing: ColDesc| existing.type_oid != next.type_oid) {
+                    return None;
+                }
+                result = Some(next);
+            }
+            return result;
+        }
+        Expr::Array(elements) => {
+            return user_type_array_description(elements, name, storage, txid);
+        }
+        Expr::Subscript { base, .. } => {
+            let array = user_type_expression_description(base, name, storage, txid)?;
+            return catalog_array_element_description(array, name, storage, txid);
+        }
+        Expr::Slice { base, .. } => {
+            let array = user_type_expression_description(base, name, storage, txid)?;
+            let (ctype, _) = super::exec::catalog_column_type(storage, txid, array.type_oid)?;
+            return matches!(ctype, super::types::ColType::Array(_)).then_some(array);
+        }
+        _ => {}
+    }
+    let Expr::Field { base, field } = expression else {
+        return None;
+    };
+    let Expr::Call {
+        name: row, args, ..
+    } = &**base
+    else {
+        return None;
+    };
+    if !row.eq_ignore_ascii_case("row") {
+        return None;
+    }
+    let position = super::exec::RECORD_FIELD_NAMES
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(field))?;
+    user_type_cast_description(args.get(position)?, name, storage, txid)
+}
+
+fn catalog_array_element_description<'q>(
+    array: ColDesc<'q>,
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    let (ctype, _) = super::exec::catalog_column_type(storage, txid, array.type_oid)?;
+    match ctype {
+        super::types::ColType::Array(super::types::ArrElem::Enum(slot)) => {
+            Some(ColDesc::new(name, super::types::oid::enum_oid(slot), 4))
+        }
+        super::types::ColType::Array(super::types::ArrElem::Domain { slot, .. }) => {
+            let domain = storage.domain(slot as usize);
+            Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))
+        }
+        _ => None,
+    }
+}
+
+/// Describes array-polymorphic functions through their catalog-resolved array
+/// argument. Static inference cannot recover user element OIDs from casts, so
+/// the output array is valid only when each supplied element proves it belongs
+/// to that resolved element type.
+fn catalog_array_operation_description<'q>(
+    array_expression: &'q Expr<'q>,
+    element_expressions: &[&'q Expr<'q>],
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    let array = user_type_expression_description(array_expression, name, storage, txid)?;
+    let (ctype, _) = super::exec::catalog_column_type(storage, txid, array.type_oid)?;
+    let super::types::ColType::Array(element) = ctype else {
+        return None;
+    };
+    for expression in element_expressions {
+        if matches!(expression, Expr::Null) {
+            continue;
+        }
+        let value = user_type_expression_description(expression, name, storage, txid)?;
+        let matches = match element {
+            super::types::ArrElem::Enum(slot) => {
+                value.type_oid == super::types::oid::enum_oid(slot)
+            }
+            super::types::ArrElem::Domain { slot, .. } => {
+                value.type_oid == storage.domain(slot as usize).base.oid()
+            }
+            _ => false,
+        };
+        if !matches {
+            return None;
+        }
+    }
+    Some(array)
+}
+
+/// Derives an array descriptor from one catalog-resolved element type. Arrays
+/// of an explicitly cast domain use PostgreSQL's domain-array OID; expressions
+/// that have already coerced a domain to its base type deliberately use that
+/// base array instead.
+fn user_type_array_description<'q>(
+    elements: &[&'q Expr<'q>],
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    let first = elements
+        .iter()
+        .find(|element| !matches!(element, Expr::Null))?;
+    if let Expr::Cast { type_name, .. } = first {
+        let domain_name = type_name.strip_suffix("[]").unwrap_or(type_name);
+        if let Some(slot) = storage.resolve_domain_slot(domain_name, txid)
+            && elements.iter().all(|element| match element {
+                Expr::Null => true,
+                Expr::Cast {
+                    type_name: candidate,
+                    ..
+                } => candidate.eq_ignore_ascii_case(type_name),
+                _ => false,
+            })
+        {
+            return Some(ColDesc::new(
+                name,
+                super::types::oid::domain_array_oid(slot as u16),
+                -1,
+            ));
+        }
+    }
+    let element = user_type_expression_description(first, name, storage, txid)?;
+    for next in elements.iter().filter(|next| !matches!(next, Expr::Null)) {
+        let next = user_type_expression_description(next, name, storage, txid)?;
+        if next.type_oid != element.type_oid {
+            return None;
+        }
+    }
+    let (ctype, _) = super::exec::catalog_column_type(storage, txid, element.type_oid)?;
+    let array_element = super::types::ArrElem::from_coltype(ctype)?;
+    Some(ColDesc::new(
+        name,
+        super::types::ColType::Array(array_element).oid(),
+        -1,
+    ))
+}
+
+/// Resolves an expression family whose result type is the common type of its
+/// arguments. A catalog cast is useful evidence only when every non-null
+/// argument carries that same result type; otherwise normal PostgreSQL
+/// coercion inference remains authoritative.
+fn matching_user_type_description<'q>(
+    arguments: &[&'q Expr<'q>],
+    name: &'q str,
+    storage: &Storage,
+    txid: u32,
+) -> Option<ColDesc<'q>> {
+    let mut result = None;
+    for argument in arguments {
+        if matches!(argument, Expr::Null) {
+            continue;
+        }
+        let description = user_type_expression_description(argument, name, storage, txid)?;
+        if result.is_some_and(|existing: ColDesc| existing.type_oid != description.type_oid) {
+            return None;
+        }
+        result = Some(description);
+    }
+    result
 }
 
 /// Emits one `ColDesc` per field of a `(record).*` expansion against a join
@@ -4930,14 +5256,27 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
 struct CatalogScopeCols<'scope, 'definition, 'storage> {
     scope: &'scope QueryScope<'definition>,
+    outer_scope: Option<&'scope QueryScope<'definition>>,
     storage: &'storage Storage,
     txid: u32,
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        let entry = self.scope.find_column(qualifier, name)?;
-        Ok(self.scope.output_type(entry))
+        match self.scope.find_column(qualifier, name) {
+            Ok(entry) => Ok(self.scope.output_type(entry)),
+            Err(error)
+                if matches!(
+                    error.sqlstate,
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                let outer_scope = self.outer_scope.ok_or(error)?;
+                let entry = outer_scope.find_column(qualifier, name)?;
+                Ok(outer_scope.output_type(entry))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn routine_result(&self, name: &str, arguments: &[ColType]) -> Option<ColType> {
@@ -4949,28 +5288,81 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope.table_index(name).is_ok()
+            || self
+                .outer_scope
+                .is_some_and(|scope| scope.table_index(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
-        self.scope.func_scalar_type(name)
+        self.scope.func_scalar_type(name).or_else(|| {
+            self.outer_scope
+                .and_then(|scope| scope.func_scalar_type(name))
+        })
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        let table = self.scope.table_index(name).ok()?;
-        Some(self.scope.defs[table]?.columns())
+        if let Ok(table) = self.scope.table_index(name) {
+            return Some(self.scope.defs[table]?.columns());
+        }
+        let scope = self.outer_scope?;
+        let table = scope.table_index(name).ok()?;
+        Some(scope.defs[table]?.columns())
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
-        if self.scope.output_type(entry) != ColType::Record {
+        let (scope, entry) = match self.scope.find_column(qualifier, name) {
+            Ok(entry) => (self.scope, entry),
+            Err(error)
+                if matches!(
+                    error.sqlstate,
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                let scope = self.outer_scope?;
+                (scope, scope.find_column(qualifier, name).ok()?)
+            }
+            Err(_) => return None,
+        };
+        if scope.output_type(entry) != ColType::Record {
             return None;
         }
         match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                Some(self.scope.defs[table]?.columns()[column].type_mod)
+                Some(scope.defs[table]?.columns()[column].type_mod)
             }
             _ => None,
         }
+    }
+}
+
+fn scope_column_type_mod<'a>(
+    scope: &QueryScope<'a>,
+    outer_scope: Option<&QueryScope<'a>>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> i32 {
+    let found = match scope.find_column(qualifier, name) {
+        Ok(entry) => Some((scope, entry)),
+        Err(error)
+            if matches!(
+                error.sqlstate,
+                sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+            ) =>
+        {
+            outer_scope.and_then(|scope| {
+                scope
+                    .find_column(qualifier, name)
+                    .ok()
+                    .map(|entry| (scope, entry))
+            })
+        }
+        Err(_) => None,
+    };
+    match found {
+        Some((scope, ResolvedColumn::Table(table, column))) => {
+            scope.defs[table].expect("resolved").columns()[column].type_mod
+        }
+        _ => -1,
     }
 }
 

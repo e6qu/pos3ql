@@ -48,6 +48,13 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Int2Vector(_) => v,
             _ => return Err(cast_unsupported(&v, "int2vector")),
         },
+        ColType::Regtype => match v {
+            Datum::Regtype { .. } => v,
+            Datum::Text(name) => super::regtype_of_name(name)?,
+            Datum::Int4(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
+            Datum::Int8(oid) => super::regtype_of_oid(oid, arena)?,
+            _ => return Err(cast_unsupported(&v, "regtype")),
+        },
         // A value-level cast to an enum: only an already-typed enum value can be
         // produced here. Coercing text to an enum member needs the catalog to
         // validate the label, so it is intercepted in the eval Cast path before

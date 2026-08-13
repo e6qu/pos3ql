@@ -615,7 +615,9 @@ if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; the
   if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then
     ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
   else
-    bad "differential suite"; tail -30 "$WORK/differential.out"
+    bad "differential suite"
+    grep -A 32 -B 2 '^FAIL:' "$WORK/differential.out" | head -80 || true
+    tail -30 "$WORK/differential.out"
   fi
 else
   print -- "SKIP: real PostgreSQL 18 not installed"

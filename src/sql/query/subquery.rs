@@ -84,8 +84,8 @@ impl SubqueryListProbe for ExternalSubqueryList {
 /// wildcard expansion, and giving the IN-operand coercion the true column
 /// type even over an empty set. A set-operation body has no projection
 /// expression at all, so its first column's type is described from the set
-/// tree. Anything unresolvable falls back to text (which leaves the operand
-/// untouched); the row callback still reports a genuine arity error.
+/// tree. The witness is part of coercion semantics, so every accepted result
+/// type must resolve through the catalog before execution begins.
 fn spooled_column_witness(
     select: &Select,
     storage: &Storage,
@@ -93,30 +93,47 @@ fn spooled_column_witness(
     scope: Option<&QueryScope>,
     arena: &Arena,
     item: &Expr,
-) -> Datum<'static> {
+    outer: Option<&dyn ColumnLookup>,
+) -> Result<Datum<'static>, SqlError> {
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        if super::setops::describe_set_body(storage, tree, txid, &mut columns, arena).is_ok() {
-            return type_witness(
-                crate::sql::exec::coltype_of_oid(columns[0].type_oid).unwrap_or(ColType::Text),
-            );
-        }
-        return Datum::Text("");
+        super::setops::describe_set_body(storage, tree, txid, &mut columns, arena)?;
+        return catalog_type_witness(storage, txid, columns[0].type_oid);
     }
     match select.items.first() {
-        Some(SelectItem::Wildcard) => scope
-            .filter(|scope| scope.star_columns() == 1)
-            .map_or(Datum::Text(""), |scope| {
-                type_witness(scope.output_type(scope.star_entry(0)))
-            }),
-        Some(SelectItem::TableWildcard(qualifier)) => scope
-            .and_then(|scope| {
-                let table = scope.table_index(qualifier).ok()?;
-                let def = scope.defs[table]?;
-                (def.n_columns == 1).then(|| type_witness(def.columns()[0].ctype))
-            })
-            .unwrap_or(Datum::Text("")),
-        _ => subquery_witness(item, scope),
+        Some(SelectItem::Wildcard) => {
+            let scope = scope.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "SELECT * with no tables specified is not valid"
+                )
+            })?;
+            if scope.star_columns() != 1 {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery must return only one column"
+                ));
+            }
+            Ok(type_witness(scope.output_type(scope.star_entry(0))))
+        }
+        Some(SelectItem::TableWildcard(qualifier)) => {
+            let scope = scope.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "SELECT * with no tables specified is not valid"
+                )
+            })?;
+            let table = scope.table_index(qualifier)?;
+            let def = scope.defs[table].expect("resolved table wildcard");
+            if def.n_columns != 1 {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery must return only one column"
+                ));
+            }
+            Ok(type_witness(def.columns()[0].ctype))
+        }
+        _ => subquery_witness_with_outer(storage, txid, item, scope, outer),
     }
 }
 
@@ -152,11 +169,29 @@ fn external_in_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .and_then(|from| QueryScope::resolve_schema(storage, from, txid, arena).ok());
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .transpose()?;
     let mut witness = if row_arity > 1 {
         Datum::Record(&[])
     } else {
-        spooled_column_witness(select, storage, txid, own_scope.as_ref(), arena, item)
+        match spooled_column_witness(
+            select,
+            storage,
+            txid,
+            own_scope.as_ref(),
+            arena,
+            item,
+            outer,
+        ) {
+            Ok(witness) => witness,
+            // An outer row can make an otherwise valid correlated projection
+            // impossible to infer before that row is available. `Null` is a
+            // deferred witness, never a replacement type: its eventual value
+            // is compared without coercion and a non-correlated failure stays
+            // an error.
+            Err(_) if outer.is_some() => Datum::Null,
+            Err(error) => return Err(error),
+        }
     };
     // Plain row-valued subqueries have already been rewritten by
     // `row_projected` to emit one record datum. Set-operation bodies cannot
@@ -200,9 +235,7 @@ fn external_in_subquery<'a>(
                 Datum::Record(&*fields)
             };
             if row_arity == 1 && witness.is_null() && !value.is_null() {
-                witness = type_witness(
-                    crate::sql::exec::coltype_of_oid(value.type_oid()).unwrap_or(ColType::Text),
-                );
+                witness = catalog_type_witness(storage, txid, value.type_oid())?;
             }
             storage
                 .with_block_store(|blocks| {
@@ -262,8 +295,17 @@ fn streaming_scalar_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .and_then(|from| QueryScope::resolve_schema(storage, from, txid, arena).ok());
-    let witness = spooled_column_witness(select, storage, txid, own_scope.as_ref(), arena, item);
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .transpose()?;
+    let witness = spooled_column_witness(
+        select,
+        storage,
+        txid,
+        own_scope.as_ref(),
+        arena,
+        item,
+        outer,
+    )?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
@@ -343,8 +385,17 @@ fn streaming_array_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .and_then(|from| QueryScope::resolve_schema(storage, from, txid, arena).ok());
-    let witness = spooled_column_witness(select, storage, txid, own_scope.as_ref(), arena, item);
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .transpose()?;
+    let witness = spooled_column_witness(
+        select,
+        storage,
+        txid,
+        own_scope.as_ref(),
+        arena,
+        item,
+        outer,
+    )?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
@@ -945,11 +996,15 @@ struct ScopeChain<'s, 'd> {
 
 impl ScopeChain<'_, '_> {
     /// True if the name resolves at this scope or any enclosing scope.
-    fn resolves(&self, q: Option<&str>, name: &str) -> bool {
-        if self.scope.is_some_and(|s| s.find_column(q, name).is_ok()) {
+    fn resolves(&self, qualifier: Option<&str>, name: &str) -> bool {
+        if self
+            .scope
+            .is_some_and(|scope| scope.find_column(qualifier, name).is_ok())
+        {
             return true;
         }
-        self.parent.is_some_and(|p| p.resolves(q, name))
+        self.parent
+            .is_some_and(|parent| parent.resolves(qualifier, name))
     }
 }
 
@@ -961,23 +1016,41 @@ fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
     storage: &'a Storage,
     arena: &'a Arena,
-) -> bool {
+) -> Result<bool, SqlError> {
     let select = match node {
         Expr::Subquery(s)
         | Expr::InSubquery { select: s, .. }
         | Expr::Exists(s)
         | Expr::ArraySubquery(s) => s,
-        _ => return false,
+        _ => return Ok(false),
     };
     let scope = select
         .from
         .as_ref()
-        .and_then(|f| QueryScope::resolve_schema(storage, f, 0, arena).ok());
+        .map(|from| correlation_schema(storage, from, arena))
+        .transpose()?
+        .flatten();
     let chain = ScopeChain {
         scope: scope.as_ref(),
         parent: None,
     };
     select_has_outer_ref(select, &chain, storage, arena)
+}
+
+/// A scope that needs an enclosing row cannot be described as a stand-alone
+/// schema. Preserve that state explicitly so correlation analysis can inspect
+/// its outer references; fully static sources still resolve their errors now.
+fn correlation_schema<'a>(
+    storage: &'a Storage,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    arena: &'a Arena,
+) -> Result<Option<QueryScope<'a>>, SqlError> {
+    let references_outer =
+        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.func_args.is_some();
+    if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
+        return Ok(None);
+    }
+    QueryScope::resolve_schema(storage, from, 0, arena).map(Some)
 }
 
 /// Whether any column in this select (WHERE or projection) fails to resolve
@@ -987,50 +1060,54 @@ fn select_has_outer_ref<'a>(
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
-) -> bool {
-    if select.from.as_ref().is_some_and(|from| {
-        table_ref_has_outer_ref(&from.base, chain, storage, arena)
-            || from.joins.iter().any(|join| {
-                table_ref_has_outer_ref(&join.table, chain, storage, arena)
-                    || join
-                        .on
-                        .is_some_and(|on| expr_has_outer_ref(on, chain, storage, arena))
-            })
-    }) {
-        return true;
-    }
-    if select
-        .where_clause
-        .is_some_and(|w| expr_has_outer_ref(w, chain, storage, arena))
-    {
-        return true;
-    }
-    if select
-        .having
-        .is_some_and(|h| expr_has_outer_ref(h, chain, storage, arena))
-    {
-        return true;
-    }
-    if select
-        .group_by
-        .iter()
-        .any(|g| expr_has_outer_ref(g, chain, storage, arena))
-    {
-        return true;
-    }
-    if select
-        .order_by
-        .iter()
-        .any(|o| expr_has_outer_ref(o.expression, chain, storage, arena))
-    {
-        return true;
-    }
-    select.items.iter().any(|it| match it {
-        SelectItem::Expr { expression, .. } => {
-            expr_has_outer_ref(expression, chain, storage, arena)
+) -> Result<bool, SqlError> {
+    if let Some(from) = select.from.as_ref() {
+        if table_ref_has_outer_ref(&from.base, chain, storage, arena)? {
+            return Ok(true);
         }
-        _ => false,
-    })
+        for join in from.joins {
+            if table_ref_has_outer_ref(&join.table, chain, storage, arena)?
+                || join
+                    .on
+                    .map(|on| expr_has_outer_ref(on, chain, storage, arena))
+                    .transpose()?
+                    .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(predicate) = select.where_clause
+        && expr_has_outer_ref(predicate, chain, storage, arena)?
+    {
+        return Ok(true);
+    }
+    if let Some(predicate) = select.having
+        && expr_has_outer_ref(predicate, chain, storage, arena)?
+    {
+        return Ok(true);
+    }
+    for expression in select.group_by {
+        if expr_has_outer_ref(expression, chain, storage, arena)? {
+            return Ok(true);
+        }
+    }
+    for order in select.order_by {
+        if expr_has_outer_ref(order.expression, chain, storage, arena)? {
+            return Ok(true);
+        }
+    }
+    for item in select.items {
+        if match item {
+            SelectItem::Expr { expression, .. } => {
+                expr_has_outer_ref(expression, chain, storage, arena)?
+            }
+            _ => false,
+        } {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a FROM item depends on a column beyond the select's own scope.
@@ -1042,21 +1119,23 @@ fn table_ref_has_outer_ref<'a>(
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
-) -> bool {
-    if table.func_args.is_some_and(|arguments| {
-        arguments
-            .iter()
-            .any(|argument| expr_has_outer_ref(argument, chain, storage, arena))
-    }) {
-        return true;
+) -> Result<bool, SqlError> {
+    if let Some(arguments) = table.func_args {
+        for argument in arguments {
+            if expr_has_outer_ref(argument, chain, storage, arena)? {
+                return Ok(true);
+            }
+        }
     }
     let Some(select) = table.subquery else {
-        return false;
+        return Ok(false);
     };
     let scope = select
         .from
         .as_ref()
-        .and_then(|from| QueryScope::resolve_schema(storage, from, 0, arena).ok());
+        .map(|from| correlation_schema(storage, from, arena))
+        .transpose()?
+        .flatten();
     let child = ScopeChain {
         scope: scope.as_ref(),
         parent: Some(chain),
@@ -1072,14 +1151,16 @@ fn expr_has_outer_ref<'a>(
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
     arena: &'a Arena,
-) -> bool {
+) -> Result<bool, SqlError> {
     match expression {
-        Expr::Column { qualifier, name } => !chain.resolves(*qualifier, name),
+        Expr::Column { qualifier, name } => Ok(!chain.resolves(*qualifier, name)),
         Expr::Subquery(s) | Expr::Exists(s) => {
             let sscope = s
                 .from
                 .as_ref()
-                .and_then(|f| QueryScope::resolve_schema(storage, f, 0, arena).ok());
+                .map(|from| correlation_schema(storage, from, arena))
+                .transpose()?
+                .flatten();
             let child = ScopeChain {
                 scope: sscope.as_ref(),
                 parent: Some(chain),
@@ -1092,23 +1173,25 @@ fn expr_has_outer_ref<'a>(
             let sscope = select
                 .from
                 .as_ref()
-                .and_then(|f| QueryScope::resolve_schema(storage, f, 0, arena).ok());
+                .map(|from| correlation_schema(storage, from, arena))
+                .transpose()?
+                .flatten();
             let child = ScopeChain {
                 scope: sscope.as_ref(),
                 parent: Some(chain),
             };
-            select_has_outer_ref(select, &child, storage, arena)
-                || expr_has_outer_ref(operand, chain, storage, arena)
+            Ok(select_has_outer_ref(select, &child, storage, arena)?
+                || expr_has_outer_ref(operand, chain, storage, arena)?)
         }
         _ => {
             let mut found = false;
-            let _ = walk_children(expression, &mut |c| {
-                if expr_has_outer_ref(c, chain, storage, arena) {
+            walk_children(expression, &mut |child| {
+                if expr_has_outer_ref(child, chain, storage, arena)? {
                     found = true;
                 }
                 Ok(())
-            });
-            found
+            })?;
+            Ok(found)
         }
     }
 }
@@ -1139,7 +1222,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
     let mut corr: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
     let mut n_corr = 0;
     for node in nodes[..n].iter().flatten() {
-        if subquery_node_correlated(node, storage, arena) {
+        if subquery_node_correlated(node, storage, arena)? {
             corr[n_corr] = Some(*node);
             n_corr += 1;
         } else {
@@ -1368,6 +1451,10 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Record => Datum::Record(&[]),
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 | ColType::Oid => Datum::Int4(0),
+        ColType::Regtype => Datum::Regtype {
+            referenced_oid: 0,
+            name: "-",
+        },
         ColType::Int8 => Datum::Int8(0),
         ColType::Time => Datum::Time(0),
         ColType::Timetz => Datum::Timetz(0, 0),
@@ -1422,18 +1509,122 @@ fn type_witness(ct: ColType) -> Datum<'static> {
 }
 
 /// The type witness for a subquery's single result column, inferred from its
-/// projection expression. Falls back to a text witness on any inference error
-/// (harmless — the real evaluation surfaces genuine errors).
-pub(crate) fn subquery_witness(item: &Expr, scope: Option<&QueryScope>) -> Datum<'static> {
+/// projection expression. It is resolved through the same catalog boundary as
+/// a query descriptor, because it determines empty-subquery coercion.
+pub(crate) fn subquery_witness(
+    storage: &Storage,
+    txid: u32,
+    item: &Expr,
+    scope: Option<&QueryScope>,
+) -> Result<Datum<'static>, SqlError> {
+    subquery_witness_with_outer(storage, txid, item, scope, None)
+}
+
+/// Static type lookup for a subquery projection. A correlated projection is
+/// resolved through both its own source and the enclosing row, just like its
+/// runtime evaluation; otherwise an empty result could turn a valid outer
+/// reference into a missing-local-table error.
+fn subquery_witness_with_outer<'scope, 'definition, 'outer, 'row>(
+    storage: &Storage,
+    txid: u32,
+    item: &Expr,
+    scope: Option<&'scope QueryScope<'definition>>,
+    outer: Option<&'outer dyn ColumnLookup<'row>>,
+) -> Result<Datum<'static>, SqlError> {
     let inferred = match scope {
-        Some(s) => crate::sql::exec::infer_type_res(item, &ScopeCols(s)),
-        None => crate::sql::exec::infer_type_res(item, &crate::sql::exec::NoCols),
-    };
-    let ct = inferred
-        .ok()
-        .and_then(|(o, _)| crate::sql::exec::coltype_of_oid(o))
-        .unwrap_or(ColType::Text);
-    type_witness(ct)
+        Some(scope) => match outer {
+            Some(outer) => {
+                crate::sql::exec::infer_type_res(item, &ScopeAndOuterCols { scope, outer })
+            }
+            None => crate::sql::exec::infer_type_res(item, &ScopeCols(scope)),
+        },
+        None => match outer {
+            Some(outer) => crate::sql::exec::infer_type_res(item, &OuterCols(outer)),
+            None => crate::sql::exec::infer_type_res(item, &crate::sql::exec::NoCols),
+        },
+    }?;
+    if inferred.0 == crate::sql::types::oid::UNKNOWN {
+        return Ok(type_witness(ColType::Text));
+    }
+    catalog_type_witness(storage, txid, inferred.0)
+}
+
+struct OuterCols<'reference, 'row>(&'reference dyn ColumnLookup<'row>);
+
+impl crate::sql::exec::ColTypeResolver for OuterCols<'_, '_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        self.0.col_type(qualifier, name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )
+        })
+    }
+}
+
+struct ScopeAndOuterCols<'scope, 'definition, 'outer, 'row> {
+    scope: &'scope QueryScope<'definition>,
+    outer: &'outer dyn ColumnLookup<'row>,
+}
+
+impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        match ScopeCols(self.scope).resolve(qualifier, name) {
+            Ok(ctype) => Ok(ctype),
+            Err(error)
+                if matches!(
+                    error.sqlstate,
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                self.outer.col_type(qualifier, name).ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.scope.table_index(name).is_ok()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.scope.func_scalar_type(name)
+    }
+
+    fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
+        let table = self.scope.table_index(name).ok()?;
+        Some(self.scope.defs[table]?.columns())
+    }
+
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let entry = self.scope.find_column(qualifier, name).ok()?;
+        if self.scope.output_type(entry) != ColType::Record {
+            return None;
+        }
+        match entry {
+            crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
+                Some(self.scope.defs[table]?.columns()[column].type_mod)
+            }
+            crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
+        }
+    }
+}
+
+fn catalog_type_witness(
+    storage: &Storage,
+    txid: u32,
+    type_oid: i32,
+) -> Result<Datum<'static>, SqlError> {
+    crate::sql::exec::catalog_column_type(storage, txid, type_oid)
+        .map(|(ctype, _)| type_witness(ctype))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "subquery result type (oid {}) is not supported",
+                type_oid
+            )
+        })
 }
 
 /// Executes a subquery to a value list: exactly one select item, full
@@ -1550,7 +1741,9 @@ fn run_subquery<'a>(
             .as_ref()
             .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena).ok());
         let witness = match own_scope {
-            Some(ref s) if !wildcard && table_star.is_none() => subquery_witness(item, Some(s)),
+            Some(ref s) if !wildcard && table_star.is_none() => {
+                subquery_witness_with_outer(storage, txid, item, Some(s), outer)?
+            }
             _ => out.first().copied().unwrap_or(Datum::Null),
         };
         return Ok((&*out, any_null, witness));
@@ -1604,7 +1797,11 @@ fn run_subquery<'a>(
                 &hooks,
             )?
             else {
-                return Ok((&[], false, subquery_witness(item, None)));
+                return Ok((
+                    &[],
+                    false,
+                    subquery_witness_with_outer(storage, txid, item, None, outer)?,
+                ));
             };
             let agg_hooks = EvalHooks {
                 aggs: Some((ptrs, values)),
@@ -1616,7 +1813,11 @@ fn run_subquery<'a>(
             };
             let v = eval_full(item, arena, params, &base, &agg_hooks)?;
             let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
-            return Ok((&*out, v.is_null(), subquery_witness(item, None)));
+            return Ok((
+                &*out,
+                v.is_null(),
+                subquery_witness_with_outer(storage, txid, item, None, outer)?,
+            ));
         }
         let base = Chained {
             inner: &crate::sql::eval::NoColumns,
@@ -1625,11 +1826,19 @@ fn run_subquery<'a>(
         if let Some(w) = select.where_clause
             && !where_passes(w, arena, params, &base, &hooks)?
         {
-            return Ok((&[], false, subquery_witness(item, None)));
+            return Ok((
+                &[],
+                false,
+                subquery_witness_with_outer(storage, txid, item, None, outer)?,
+            ));
         }
         let v = eval_full(item, arena, params, &base, &hooks)?;
         let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
-        return Ok((&*out, v.is_null(), subquery_witness(item, None)));
+        return Ok((
+            &*out,
+            v.is_null(),
+            subquery_witness_with_outer(storage, txid, item, None, outer)?,
+        ));
     };
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
 
@@ -1705,7 +1914,11 @@ fn run_subquery<'a>(
         };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
         let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
-        return Ok((&*out, v.is_null(), subquery_witness(item, Some(&scope))));
+        return Ok((
+            &*out,
+            v.is_null(),
+            subquery_witness_with_outer(storage, txid, item, Some(&scope), outer)?,
+        ));
     }
 
     // Plain scan: collect item values (and ORDER BY keys). Two passes (count
@@ -1818,7 +2031,11 @@ fn run_subquery<'a>(
             v
         })
         .map_err(|_| arena_full())?;
-    Ok((&*out, saw_null, subquery_witness(item, Some(&scope))))
+    Ok((
+        &*out,
+        saw_null,
+        subquery_witness_with_outer(storage, txid, item, Some(&scope), outer)?,
+    ))
 }
 
 /// Runs a set-operation query (UNION / INTERSECT / EXCEPT) in subquery position,

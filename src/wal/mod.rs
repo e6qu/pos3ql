@@ -3755,6 +3755,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bool(_)) => 1,
         Some(OwnedDatum::Int4(_)) => 4,
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::Date(_)) => 4,
         Some(OwnedDatum::Timestamp(_))
         | Some(OwnedDatum::Timestamptz(_))
@@ -3810,6 +3811,17 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[0] = 4;
             out[1..9].copy_from_slice(&v.to_le_bytes());
             9
+        }
+        Some(OwnedDatum::Regtype {
+            referenced_oid,
+            len,
+            bytes,
+        }) => {
+            out[0] = 25;
+            out[1..5].copy_from_slice(&referenced_oid.to_le_bytes());
+            out[5] = *len;
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
         }
         Some(OwnedDatum::Float8(v)) => {
             out[0] = 5;
@@ -4191,6 +4203,18 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                 bytes,
             })
         }
+        25 => {
+            let referenced_oid = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().unwrap());
+            let len = *payload.get(*at + 4)? as usize;
+            *at += 5;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Regtype {
+                referenced_oid,
+                len: len as u8,
+                bytes,
+            })
+        }
         _ => return None,
     })
 }
@@ -4227,6 +4251,11 @@ mod tests {
                 micros: 3,
             })),
             Some(OwnedDatum::Uuid([7; 16])),
+            Some(OwnedDatum::Regtype {
+                referenced_oid: 23,
+                len: 3,
+                bytes: text,
+            }),
             Some(OwnedDatum::Json {
                 jsonb: true,
                 len: 3,

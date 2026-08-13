@@ -851,7 +851,8 @@ pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Resu
         && name.eq_ignore_ascii_case("row")
     {
         for arg in *args {
-            if infer_type_res(arg, columns)?.0 == oid::UNKNOWN {
+            if infer_type_res(arg, columns)?.0 == oid::UNKNOWN && !matches!(arg, Expr::Cast { .. })
+            {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "failed to find conversion function from unknown to text"
@@ -879,6 +880,7 @@ pub fn record_field_type(
             .position(|n| n.eq_ignore_ascii_case(field))
         && let Some(arg) = args.get(position)
         && infer_type_res(arg, columns)?.0 == oid::UNKNOWN
+        && !matches!(arg, Expr::Cast { .. })
     {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -1077,6 +1079,17 @@ pub fn typeof_static<'a>(
         ColType::Array(elem) => elem.typeof_name(),
         other => other.name(),
     })
+}
+
+/// The exact static OID reported by `pg_typeof`, including pseudo and catalog
+/// types which do not have a standalone [`ColType`] representation.
+pub fn typeof_static_oid<'a>(
+    expression: &Expr,
+    row: &dyn crate::sql::eval::ColumnLookup<'a>,
+) -> Option<i32> {
+    infer_type_res(expression, &RowCols(row))
+        .ok()
+        .map(|(type_oid, _)| type_oid)
 }
 
 /// Whether two concrete types have a comparison operator, per PostgreSQL:
@@ -1497,6 +1510,9 @@ pub fn infer_type_res(
         Expr::Cast {
             operand, type_name, ..
         } => {
+            if type_name.eq_ignore_ascii_case("regtype") {
+                return Ok((oid::REGTYPE, 4));
+            }
             // `regclass` is oid-based: `'relname'::regclass` yields the relation
             // OID (so `attrelid = 'tbl'::regclass` compares OIDs, as pgx and
             // most tools introspect), while `oid::regclass` renders as the name.
@@ -1609,6 +1625,8 @@ pub fn infer_type_res(
             | "pg_encoding_to_char"
             | "array_to_string"
             | "pg_get_statisticsobjdef_columns" => (oid::TEXT, -1),
+            "pg_typeof" => (oid::REGTYPE, 4),
+            "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
             "pg_table_is_visible"
             | "pg_type_is_visible"
             | "pg_function_is_visible"
@@ -1630,7 +1648,15 @@ pub fn infer_type_res(
             "inet_same_family" => of(ColType::Bool),
             "macaddr8_set7bit" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
+            "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "array_to_json" => of(ColType::Json),
+            "jsonb_set" | "jsonb_set_lax" | "jsonb_insert" | "jsonb_strip_nulls" => {
+                of(ColType::Jsonb)
+            }
+            "json_strip_nulls" => of(ColType::Json),
+            "jsonb_pretty" => of(ColType::Text),
+            "pg_char_to_encoding" => of(ColType::Int4),
+            "pg_table_size" | "pg_database_size" | "pg_tablespace_size" => of(ColType::Int8),
             // Array-manipulation functions keep the array argument's type, but
             // promote its element type to hold a wider new/replacement element
             // (PostgreSQL's polymorphic anyarray/anyelement resolution).

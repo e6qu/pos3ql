@@ -46,4 +46,12 @@ SELECT 'int4'::regtype = 'integer'::regtype;
 SELECT 'nosuch'::regtype;
 SELECT 'serial'::regtype;
 
+-- A declared regtype column keeps its OID-backed identity, including a
+-- literal default and a value written through the row codec.
+CREATE TABLE regtype_values (value regtype DEFAULT 'integer'::regtype);
+INSERT INTO regtype_values DEFAULT VALUES;
+INSERT INTO regtype_values VALUES ('text'::regtype);
+SELECT value, pg_typeof(value) FROM regtype_values ORDER BY value;
+DROP TABLE regtype_values;
+
 DROP TABLE gk;

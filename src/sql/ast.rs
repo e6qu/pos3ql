@@ -921,11 +921,12 @@ pub struct Cte<'a> {
 /// The materialized rows of a recursive CTE, bound during CTE expansion so a
 /// `FROM cte_name` reference resolves to a pre-computed row set instead of an
 /// inline subquery. Rows are projected-encoded; column types are carried as
-/// `(type oid, typlen)` pairs so this stays free of storage-layer types.
+/// `(type oid, typlen, typmod)` triples so schema-only and executing paths
+/// retain the exact RowDescription state without a storage-layer dependency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaterializedCte<'a> {
     pub column_names: &'a [&'a str],
-    pub column_types: &'a [(i32, i16)],
+    pub column_types: &'a [(i32, i16, i32)],
     pub rows: &'a [&'a [u8]],
     pub(crate) external_run: Option<crate::sql::external::ExternalRun>,
 }

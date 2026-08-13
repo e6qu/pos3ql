@@ -98,7 +98,15 @@ pub fn set_query<'a>(
     };
     let mut target = [ColType::Bool; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
-        target[c] = exec::coltype_of_oid(col.type_oid).unwrap_or(ColType::Text);
+        let Some((ctype, _)) = exec::catalog_column_type(storage, txid, col.type_oid) else {
+            return sql_fail(sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-operation column {} type (oid {}) is not supported",
+                c + 1,
+                col.type_oid
+            ));
+        };
+        target[c] = ctype;
     }
 
     if storage.spill_attached() {
@@ -215,7 +223,16 @@ pub(crate) fn set_query_into_rows<'a>(
     let column_count = describe_set_body(storage, body, txid, &mut columns, arena)?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
-        target[column] = exec::coltype_of_oid(desc.type_oid).unwrap_or(ColType::Text);
+        target[column] = exec::catalog_column_type(storage, txid, desc.type_oid)
+            .map(|(ctype, _)| ctype)
+            .ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-operation column {} type (oid {}) is not supported",
+                    column + 1,
+                    desc.type_oid
+                )
+            })?;
     }
     let rows = eval_set_tree(
         body,
@@ -600,7 +617,16 @@ pub(crate) fn external_set_body_into<'a>(
     let column_count = describe_set_body(storage, tree, txid, &mut columns, arena)?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
-        target[column] = exec::coltype_of_oid(columns[column].type_oid).unwrap_or(ColType::Text);
+        target[column] = exec::catalog_column_type(storage, txid, columns[column].type_oid)
+            .map(|(ctype, _)| ctype)
+            .ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-operation column {} type (oid {}) is not supported",
+                    column + 1,
+                    columns[column].type_oid
+                )
+            })?;
     }
     let Some(run) = external_set_tree(
         tree,
@@ -892,7 +918,7 @@ fn describe_leaf<'a>(
         None => super::describe_catalog_items(s.items, None, storage, txid, columns),
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(s.items, &scope, storage, txid, arena, columns)
+            describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)
         }
     }
 }
@@ -1025,7 +1051,18 @@ pub(crate) fn describe_set_body<'a>(
         target[c] = if leaf_col_unknown(storage, leaf0, c, txid, arena) {
             None
         } else {
-            exec::coltype_of_oid(col.type_oid)
+            Some(
+                exec::catalog_column_type(storage, txid, col.type_oid)
+                    .map(|(ctype, _)| ctype)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "set-operation column {} type (oid {}) is not supported",
+                            c + 1,
+                            col.type_oid
+                        )
+                    })?,
+            )
         };
     }
     for leaf in leaves[1..n_leaves].iter() {
@@ -1042,7 +1079,16 @@ pub(crate) fn describe_set_body<'a>(
             if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
                 continue; // an untyped NULL column adopts the running type
             }
-            let lt = exec::coltype_of_oid(lc[c].type_oid).unwrap_or(ColType::Text);
+            let lt = exec::catalog_column_type(storage, txid, lc[c].type_oid)
+                .map(|(ctype, _)| ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "set-operation column {} type (oid {}) is not supported",
+                        c + 1,
+                        lc[c].type_oid
+                    )
+                })?;
             match target[c] {
                 None => target[c] = Some(lt),
                 Some(existing) => match unify_set_type(existing, lt) {
@@ -1104,7 +1150,16 @@ fn materialize_set_body_tied<'a>(
     let n = describe_set_body(storage, tree, txid, &mut columns, arena)?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
-        tgt[c] = exec::coltype_of_oid(columns[c].type_oid).unwrap_or(ColType::Text);
+        tgt[c] = exec::catalog_column_type(storage, txid, columns[c].type_oid)
+            .map(|(ctype, _)| ctype)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-operation column {} type (oid {}) is not supported",
+                    c + 1,
+                    columns[c].type_oid
+                )
+            })?;
     }
     let target = arena
         .alloc_slice_copy(&tgt[..n])

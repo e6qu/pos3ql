@@ -49,7 +49,12 @@ else
 fi
 
 # Real PostgreSQL, hermetic cluster.
-"$PGBIN/initdb" -D "$WORK/pgdata" -U postgres -A trust --encoding=UTF8 --lc-collate=C --lc-ctype=C >/dev/null 2>&1 || { bad initdb; exit 1; }
+if ! "$PGBIN/initdb" -D "$WORK/pgdata" -U postgres -A trust --encoding=UTF8 --lc-collate=C --lc-ctype=C \
+  > "$WORK/initdb.log" 2>&1; then
+  bad initdb
+  cat "$WORK/initdb.log"
+  exit 1
+fi
 SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
 "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC" \
   -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }

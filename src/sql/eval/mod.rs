@@ -105,6 +105,7 @@ pub mod sqlstate {
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const NUMERIC_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
@@ -579,6 +580,10 @@ pub trait CatalogAccess {
         _arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
+    }
+    /// Resolves the exact OID of a visible user-defined scalar or array type.
+    fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
+        None
     }
 }
 
@@ -3752,6 +3757,7 @@ fn session_zone_at(utc_micros: i64) -> i32 {
 pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
     match d {
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
+        Datum::Regtype { name, .. } => Datum::Text(name),
         other => other,
     }
 }
@@ -3759,26 +3765,49 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
 /// type carries renders as the number itself, and 0 as `-` — PostgreSQL's own
 /// fallbacks.
-fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    if o == 0 {
-        return Ok(Datum::Text("-"));
-    }
-    if let Ok(small) = i32::try_from(o)
-        && let Some(ct) = crate::sql::exec::coltype_of_oid_pub(small)
-    {
-        return Ok(Datum::Text(ct.name()));
-    }
-    arena
-        .alloc_str_display(o)
-        .map(Datum::Text)
-        .map_err(|_| arena_full())
+pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let referenced_oid = i32::try_from(o).unwrap_or(i32::MAX);
+    let name = if o == 0 {
+        "-"
+    } else if let Some(name) = regtype_builtin_name(referenced_oid) {
+        name
+    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
+        ctype.name()
+    } else {
+        return arena
+            .alloc_str_display(o)
+            .map(|name| Datum::Regtype {
+                referenced_oid,
+                name,
+            })
+            .map_err(|_| arena_full());
+    };
+    Ok(Datum::Regtype {
+        referenced_oid,
+        name,
+    })
+}
+
+fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
+    use crate::sql::types::oid;
+    Some(match type_oid {
+        oid::REGPROC => "regproc",
+        oid::REGPROCEDURE => "regprocedure",
+        oid::REGOPER => "regoper",
+        oid::REGOPERATOR => "regoperator",
+        oid::REGCLASS => "regclass",
+        oid::REGTYPE => "regtype",
+        oid::REGNAMESPACE => "regnamespace",
+        oid::REGROLE => "regrole",
+        _ => return None,
+    })
 }
 
 /// `'typename'::regtype`: resolves a spelled type name — with any `(...)`
 /// modifier ignored, as PostgreSQL ignores it — to its canonical SQL name.
 /// The serial pseudo-names are not types and are refused (42704), matching
 /// PostgreSQL; `name`, `oid` and the `reg*` identifiers resolve to themselves.
-fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
     let mut base = spelled.trim();
     if let Some(open) = base.find('(') {
         // `varchar(5)` names varchar; the modifier plays no part.
@@ -3845,7 +3874,27 @@ fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
             None => return Err(unknown()),
         },
     };
-    Ok(Datum::Text(canonical))
+    let referenced_oid = match canonical {
+        "timestamp without time zone" => crate::sql::types::oid::TIMESTAMP,
+        "timestamp with time zone" => crate::sql::types::oid::TIMESTAMPTZ,
+        "time without time zone" => crate::sql::types::oid::TIME,
+        "time with time zone" => crate::sql::types::oid::TIMETZ,
+        "regtype" => crate::sql::types::oid::REGTYPE,
+        "regclass" => crate::sql::types::oid::REGCLASS,
+        "regproc" => crate::sql::types::oid::REGPROC,
+        "regprocedure" => crate::sql::types::oid::REGPROCEDURE,
+        "regrole" => crate::sql::types::oid::REGROLE,
+        "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
+        "regoper" => crate::sql::types::oid::REGOPER,
+        "regoperator" => crate::sql::types::oid::REGOPERATOR,
+        _ => ColType::from_sql_name(canonical)
+            .expect("canonical type")
+            .oid(),
+    };
+    Ok(Datum::Regtype {
+        referenced_oid,
+        name: canonical,
+    })
 }
 
 pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
@@ -3910,6 +3959,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
         Datum::Bpchar(_) => "character",
+        Datum::Regtype { .. } => "regtype",
         Datum::Date(_) => "date",
         Datum::Timestamp(_) => "timestamp without time zone",
         Datum::Timestamptz(_) => "timestamp with time zone",

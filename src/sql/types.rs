@@ -107,6 +107,9 @@ pub enum ColType {
     /// PostgreSQL object identity, retaining its catalog and wire metadata
     /// while sharing the engine's four-byte integer datum storage.
     Oid,
+    /// `regtype`: a catalog type reference with OID storage and catalog-name
+    /// text output, not ordinary text.
+    Regtype,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
     /// typlen 4. On disk it keeps the historical 8-byte float8 layout
@@ -222,8 +225,9 @@ impl ColType {
             "float4" | "real" => Self::Float4,
             // `name` and the `reg*` object-identifier types render as text for
             // catalog introspection.
-            "text" | "regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
-            | "regnamespace" | "regoper" | "regoperator" => Self::Text,
+            "text" | "regclass" | "regproc" | "regprocedure" | "regrole" | "regnamespace"
+            | "regoper" | "regoperator" => Self::Text,
+            "regtype" => Self::Regtype,
             "name" => Self::Name,
             "oid" => Self::Oid,
             "varchar" | "character varying" => Self::Varchar,
@@ -258,6 +262,7 @@ impl ColType {
             Self::Int2Vector => oid::INT2VECTOR,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
+            Self::Regtype => oid::REGTYPE,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
@@ -307,9 +312,9 @@ impl ColType {
             | oid::REGOPER
             | oid::REGOPERATOR
             | oid::REGCLASS
-            | oid::REGTYPE
             | oid::REGNAMESPACE
             | oid::REGROLE => Some(Self::Int4),
+            oid::REGTYPE => Some(Self::Regtype),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
             oid::FLOAT8 => Some(Self::Float8),
@@ -412,7 +417,7 @@ impl ColType {
             Self::Bool => 1,
             Self::Int2 => 2,
             Self::Int2Vector => -1,
-            Self::Int4 | Self::Oid | Self::Date | Self::Float4 => 4,
+            Self::Int4 | Self::Oid | Self::Regtype | Self::Date | Self::Float4 => 4,
             Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
@@ -442,6 +447,7 @@ impl ColType {
             Self::Float4 => Self::Float8,
             Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
             Self::Oid => Self::Int4,
+            Self::Regtype => Self::Regtype,
             other => other,
         }
     }
@@ -455,6 +461,7 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::Int4 => "int4",
             Self::Oid => "oid",
+            Self::Regtype => "regtype",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
@@ -506,6 +513,7 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::Int4 => "integer",
             Self::Oid => "oid",
+            Self::Regtype => "regtype",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
@@ -549,6 +557,7 @@ impl ColType {
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
+            Self::Regtype => 58,
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
@@ -600,6 +609,7 @@ impl ColType {
             57 => Self::Void,
             2 => Self::Int4,
             56 => Self::Oid,
+            58 => Self::Regtype,
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
@@ -1281,6 +1291,12 @@ pub enum Datum<'a> {
     /// the stripped form, while output functions, `LIKE`/regex matching, and
     /// `octet_length` see the raw padded form.
     Bpchar(&'a str),
+    /// A `regtype` value: the referenced type OID is its binary representation
+    /// while the catalog-resolved name is its text representation.
+    Regtype {
+        referenced_oid: i32,
+        name: &'a str,
+    },
     /// Days since 2000-01-01.
     Date(i32),
     /// Microseconds since 2000-01-01 (naive).
@@ -1380,6 +1396,7 @@ impl<'a> Datum<'a> {
             Datum::Float8(_) => oid::FLOAT8,
             Datum::Text(_) => oid::TEXT,
             Datum::Bpchar(_) => oid::BPCHAR,
+            Datum::Regtype { .. } => oid::REGTYPE,
             Datum::Date(_) => oid::DATE,
             Datum::Timestamp(_) => oid::TIMESTAMP,
             Datum::Timestamptz(_) => oid::TIMESTAMPTZ,
@@ -1532,7 +1549,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
             // The output function emits the padding — psql shows `hi   `.
-            Datum::Text(s) | Datum::Bpchar(s) => f.write_str(s),
+            Datum::Text(s) | Datum::Bpchar(s) | Datum::Regtype { name: s, .. } => f.write_str(s),
             Datum::Date(d) => f.write_str(super::datetime::format_date(*d).as_str()),
             Datum::Timestamp(t) => {
                 f.write_str(super::datetime::format_timestamp(*t, false).as_str())

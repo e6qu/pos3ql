@@ -972,10 +972,14 @@ fn materialize_recursive<'a>(
             .alloc_slice_copy(&names[..ncols])
             .map_err(|_| arena_full())?
     };
-    let column_types: &'a [(i32, i16)] = {
-        let mut types = [(0i32, 0i16); MAX_PROJ];
+    let column_types: &'a [(i32, i16, i32)] = {
+        let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
         for (i, slot) in types.iter_mut().enumerate().take(ncols) {
-            *slot = (described[i].type_oid, described[i].typlen);
+            *slot = (
+                described[i].type_oid,
+                described[i].typlen,
+                described[i].type_mod,
+            );
         }
         arena
             .alloc_slice_copy(&types[..ncols])

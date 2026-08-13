@@ -16402,6 +16402,9 @@ pub fn apply_cast_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if let ColType::Array(element) = ctype {
+        return apply_array_element_typmod(v, element, type_mod, arena, true);
+    }
     // Decoded once; the arms below match on meaning, so no site here can read
     // the modifier under the wrong encoding.
     let modifier = TypeMod::decode(ctype, type_mod);
@@ -16482,6 +16485,9 @@ pub fn apply_typmod<'a>(
     type_mod: i32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if let ColType::Array(element) = ctype {
+        return apply_array_element_typmod(v, element, type_mod, arena, false);
+    }
     let modifier = TypeMod::decode(ctype, type_mod);
     if modifier == TypeMod::None || v.is_null() {
         return Ok(v);
@@ -16543,6 +16549,53 @@ pub fn apply_typmod<'a>(
         })),
         _ => Ok(v),
     }
+}
+
+/// Applies an array declaration's element modifier while retaining its shape.
+/// PostgreSQL stores `char(3)[]` as an array type with the bpchar modifier;
+/// leaving it on the array boundary loses blank padding and makes binary COPY
+/// differ from scalar `char(3)`.
+fn apply_array_element_typmod<'a>(
+    value: Datum<'a>,
+    element: crate::sql::types::ArrElem,
+    type_mod: i32,
+    arena: &'a Arena,
+    cast: bool,
+) -> Result<Datum<'a>, SqlError> {
+    if type_mod < 0 || TypeMod::decode(element.to_coltype(), type_mod) == TypeMod::None {
+        return Ok(value);
+    }
+    let (actual_element, raw) = match value {
+        Datum::Null => return Ok(Datum::Null),
+        Datum::Array { element, raw } => (element, raw),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "array type modifier requires an array value"
+            ));
+        }
+    };
+    if actual_element != element {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "array element type does not match its modifier"
+        ));
+    }
+    let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+    let count = shape.element_count();
+    let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    for (index, slot) in values.iter_mut().take(count).enumerate() {
+        let member = crate::sql::array::get(raw, element, index).expect("array datum invariant");
+        *slot = if cast {
+            apply_cast_typmod(member, element.to_coltype(), type_mod, arena)?
+        } else {
+            apply_typmod(member, element.to_coltype(), type_mod, arena)?
+        };
+    }
+    Ok(Datum::Array {
+        element,
+        raw: crate::sql::array::build_shaped(&values[..count], shape, arena)?,
+    })
 }
 
 /// Rounds microseconds to `p` (0..=6) fractional-second digits,

@@ -1800,9 +1800,11 @@ fn supported_operator_catalog_aliases_preserve_identity() {
             crate::sql::types::oid::REGTYPE
         ]
     );
-    assert_eq!(
-        data_rows(&run_with(&mut engine, &mut budget, "SELECT '+'::regoper")),
-        ["+"]
+    let ambiguous = run_with(&mut engine, &mut budget, "SELECT '+'::regoper");
+    let ambiguous = String::from_utf8_lossy(&ambiguous);
+    assert!(
+        ambiguous.contains("more than one operator named \"+\""),
+        "{ambiguous}"
     );
     assert_eq!(
         data_rows(&run_with(
@@ -1820,7 +1822,7 @@ fn catalog_alias_casts_keep_their_own_result_names() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "SELECT '+(integer,integer)'::regoperator, '+'::regoper, \
+        "SELECT '+(integer,integer)'::regoperator, NULL::regoper, \
                 'version()'::regprocedure, 'version'::regproc",
     );
     assert_eq!(
@@ -6271,7 +6273,7 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
                  routine_value regproc DEFAULT 'durable_catalog_routine'::regproc, \
                  signature_value regprocedure \
                      DEFAULT 'durable_catalog_routine(integer)'::regprocedure, \
-                 operator_value regoper DEFAULT '+'::regoper, \
+                 operator_value regoper DEFAULT NULL, \
                  operator_signature regoperator \
                      DEFAULT '+(integer,integer)'::regoperator \
              ); \
@@ -6279,7 +6281,7 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
              INSERT INTO durable_catalog_values VALUES ( \
                  'durable_catalog_reference', 'durable_catalog_role', 'durable_catalog_schema', \
                  'durable_catalog_routine', 'durable_catalog_routine(integer)', \
-                 '+', '+(integer,integer)' \
+                 NULL, '+(integer,integer)' \
              )",
         );
         run_with(&mut engine, &mut budget, "CHECKPOINT");
@@ -6300,8 +6302,8 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
     assert_eq!(
         data_rows(&output),
         [
-            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|+|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
-            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|+|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|NULL|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|NULL|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
         ]
     );
     assert_eq!(
@@ -20698,6 +20700,29 @@ fn count_distinct_over_extended_types() {
             "SELECT count(DISTINCT a) FROM (VALUES ('1.2.3.4'::inet),('1.2.3.4'::inet)) t(a)"
         ),
         ["1"]
+    );
+}
+
+#[test]
+fn array_element_typmods_preserve_utf8_padding() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE typmod_array (value char(3)[])",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO typmod_array VALUES (ARRAY['a', 'bé']::char(3)[])",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text FROM typmod_array",
+        )),
+        ["{\"a  \",\"bé \"}"],
     );
 }
 

@@ -1160,6 +1160,7 @@ impl TypeMod {
             return TypeMod::None;
         }
         match ctype {
+            ColType::Array(element) => Self::decode(element.to_coltype(), atttypmod),
             ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bit { .. } => {
                 if atttypmod >= 4 {
                     TypeMod::Length((atttypmod - 4) as usize)

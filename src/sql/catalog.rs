@@ -2296,6 +2296,21 @@ pub(crate) fn operator_oid_by_name(
     } else {
         (written.trim(), None)
     };
+    // `regoper` deliberately has no argument signature. Every evaluator
+    // operator exposed here is overloaded in PostgreSQL's full catalog, so
+    // accepting the single modeled representative would manufacture a false
+    // identity. `regoperator` carries the argument types and resolves below.
+    if !signature
+        && CATALOG_OPERATORS
+            .iter()
+            .any(|operator| operator.name == name)
+    {
+        return Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "more than one operator named \"{}\"",
+            written
+        ));
+    }
     let mut found = None;
     for operator in CATALOG_OPERATORS {
         if operator.name != name

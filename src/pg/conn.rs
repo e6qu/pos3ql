@@ -1988,14 +1988,31 @@ impl Conn {
                 .prepared
                 .iter()
                 .position(|p| p.active && p.name.as_str() == name),
-            b'P' => self
-                .portals
-                .iter()
-                .position(|p| p.active && p.name.as_str() == name)
-                .map(|i| {
-                    portal_formats = self.portals[i].result_formats;
-                    self.portals[i].statement
-                }),
+            b'P' => {
+                let protocol_portal = self
+                    .portals
+                    .iter()
+                    .position(|p| p.active && p.name.as_str() == name)
+                    .map(|i| {
+                        portal_formats = self.portals[i].result_formats;
+                        self.portals[i].statement
+                    });
+                if protocol_portal.is_none() {
+                    // A SQL DECLARE runs through an unnamed protocol portal,
+                    // but PostgreSQL exposes the resulting named SQL cursor to
+                    // Describe Portal.  Its declaration captured the exact
+                    // text RowDescription, which is the only valid metadata
+                    // for the later text FETCH stream.
+                    if let Some(description) = self.cursors.description(name) {
+                        return if self.send.append(description) {
+                            Step::Continue
+                        } else {
+                            Step::Close
+                        };
+                    }
+                }
+                protocol_portal
+            }
             _ => {
                 return ext_err(
                     &mut self.send,

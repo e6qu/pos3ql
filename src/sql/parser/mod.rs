@@ -3859,7 +3859,7 @@ impl<'a> Parser<'a> {
         }
         if name == "double" {
             self.expect_ident("precision")?;
-            return Ok(("float8", -1));
+            name = "float8";
         }
         // `bit varying [(n)]` is the `varbit` type.
         if name == "bit" && self.eat_ident("varying")? {
@@ -3873,19 +3873,14 @@ impl<'a> Parser<'a> {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
-                return Ok((
-                    if name == "timestamp" {
-                        "timestamptz"
-                    } else {
-                        "timetz"
-                    },
-                    -1,
-                ));
-            }
-            if self.eat_ident("without")? {
+                name = if name == "timestamp" {
+                    "timestamptz"
+                } else {
+                    "timetz"
+                };
+            } else if self.eat_ident("without")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
-                return Ok((name, -1));
             }
         }
         let type_mod = if self.peeked == Tok::Op("(") {
@@ -3909,7 +3904,7 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
-            return Ok((array, -1));
+            return Ok((array, type_mod));
         }
         Ok((name, type_mod))
     }
@@ -4863,6 +4858,20 @@ mod tests {
                     panic!()
                 };
                 assert!(d.if_exists);
+            },
+        );
+    }
+
+    #[test]
+    fn multi_word_type_aliases_retain_array_suffixes() {
+        with_parser(
+            "CREATE TABLE type_alias_arrays (values double precision[], moments timestamp with time zone[])",
+            |p| {
+                let Stmt::CreateTable(create) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(create.columns[0].type_name, "float8[]");
+                assert_eq!(create.columns[1].type_name, "timestamptz[]");
             },
         );
     }

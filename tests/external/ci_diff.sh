@@ -367,6 +367,14 @@ else
   bad "COPY binary round-trip"; cat "$WORK/copybin.out"
 fi
 
+# --- generated type fidelity matrix ----------------------------------------
+echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
+  ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
+else
+  bad "accepted-type fidelity matrix"; cat "$WORK/type_fidelity.out"
+fi
+
 # --- LISTEN / NOTIFY (cross-connection; needs two live connections per engine) -
 echo "=== LISTEN / NOTIFY (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/listen_notify_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/listen.out" 2>&1; then

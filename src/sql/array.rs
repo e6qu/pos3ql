@@ -1,7 +1,5 @@
 //! Array values: a rectangular shape and row-encoded elements.
 
-use core::fmt::Write as _;
-
 use crate::mem::arena::Arena;
 use crate::sql_err;
 use crate::storage::rowenc;
@@ -533,7 +531,14 @@ impl<'a> LiteralParser<'a> {
         let bytes = self.text.as_bytes();
         let (value, quoted) = if bytes.get(self.at) == Some(&b'\"') {
             self.at += 1;
-            let mut output = crate::util::StackStr::<1024>::new();
+            // A quoted array member is UTF-8 with byte-level backslash
+            // escapes.  Preserve its original bytes until validating UTF-8:
+            // converting each byte through `char` turns `é` into `Ã©`.
+            let output = self
+                .arena
+                .alloc_slice_with(bytes.len() - self.at, |_| 0u8)
+                .map_err(|_| arena_full())?;
+            let mut output_len = 0;
             loop {
                 let Some(&byte) = bytes.get(self.at) else {
                     return Err(self.bad());
@@ -546,14 +551,18 @@ impl<'a> LiteralParser<'a> {
                             return Err(self.bad());
                         };
                         self.at += 1;
-                        output.write_char(escaped as char).map_err(|_| self.bad())?;
+                        output[output_len] = escaped;
+                        output_len += 1;
                     }
-                    _ => output.write_char(byte as char).map_err(|_| self.bad())?,
+                    _ => {
+                        output[output_len] = byte;
+                        output_len += 1;
+                    }
                 }
             }
             (
                 self.arena
-                    .alloc_str(output.as_str())
+                    .alloc_str(core::str::from_utf8(&output[..output_len]).map_err(|_| self.bad())?)
                     .map_err(|_| arena_full())?,
                 true,
             )
@@ -624,4 +633,19 @@ fn write_level(
         }
     }
     f.write_str("}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::budget::Budget;
+
+    #[test]
+    fn quoted_utf8_elements_preserve_their_source_bytes() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "array UTF-8", 1 << 12).unwrap();
+        let raw = parse_literal("{\"bé\",\"\\\\x\"}", ArrElem::Text, &arena).unwrap();
+        assert_eq!(get(raw, ArrElem::Text, 0), Some(Datum::Text("bé")));
+        assert_eq!(get(raw, ArrElem::Text, 1), Some(Datum::Text("\\x")));
+    }
 }

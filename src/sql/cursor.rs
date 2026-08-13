@@ -200,6 +200,14 @@ impl CursorPool {
         self.find(name).is_some()
     }
 
+    /// The declaration-time RowDescription of a live SQL cursor. PostgreSQL
+    /// exposes an SQL cursor as a describable protocol portal, so drivers can
+    /// install result decoders before their first FETCH.
+    pub fn description(&self, name: &str) -> Option<&[u8]> {
+        let at = self.find(name)?;
+        Some(self.slots[at].description.readable())
+    }
+
     /// Applies one FETCH/MOVE motion: returns the spans of the rows to emit
     /// (in emission order) plus the description bytes, updating the cursor's
     /// position. Backward motion on a non-SCROLL cursor is PostgreSQL's

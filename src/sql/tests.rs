@@ -20329,6 +20329,20 @@ fn copy_query_to_stdout() {
     );
     assert!(text.contains("COPY 2"), "command tag: {text}");
 
+    // Catalog aliases must render their catalog text in query COPY, rather
+    // than leaking their backing OID or degrading to an ordinary integer.
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT '+(integer,integer)'::regoperator AS identity, \
+                NULL::regoperator AS missing) TO STDOUT",
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !message_types(&out).contains(&b'E') && text.contains("+(integer,integer)\t\\N"),
+        "catalog text COPY: {text}"
+    );
+
     // CSV with a header quotes the embedded comma.
     let out = run_with(
         &mut engine,
@@ -20398,6 +20412,17 @@ fn copy_query_to_stdout() {
             && out.windows(b"ready".len()).any(|bytes| bytes == b"ready"),
         "binary catalog-type COPY: {:?}",
         String::from_utf8_lossy(&out)
+    );
+
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT '+(integer,integer)'::regoperator) TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&out).contains(&b'E')
+            && out.windows(4).any(|bytes| bytes == 551_i32.to_be_bytes()),
+        "binary catalog alias COPY: {out:?}"
     );
 
     // A query source is TO-only; FROM STDIN is rejected.

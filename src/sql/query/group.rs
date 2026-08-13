@@ -37,7 +37,12 @@ fn compare_group_rows(
     for (index, &collation) in collations.iter().enumerate() {
         let left = crate::sql::exec::decode_projected_pub(left, index);
         let right = crate::sql::exec::decode_projected_pub(right, index);
-        let ordering = compare_datums_collated(storage, collation, &left, &right)?;
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Less,
+            (false, true) => core::cmp::Ordering::Greater,
+            (false, false) => compare_datums_collated(storage, collation, &left, &right)?,
+        };
         if !ordering.is_eq() {
             return Ok(ordering);
         }

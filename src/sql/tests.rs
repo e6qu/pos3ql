@@ -1538,7 +1538,7 @@ fn default_collation_keeps_group_having_and_text_aggregates_executable() {
     run_with(
         &mut engine,
         &mut budget,
-        "INSERT INTO collation_groups VALUES (1, 'z', 120), (1, 'a', 100), (2, 'm', 90)",
+        "INSERT INTO collation_groups VALUES (1, 'z', 120), (1, 'a', 100), (2, 'm', 90), (NULL, 'q', 1)",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -1547,6 +1547,14 @@ fn default_collation_keeps_group_having_and_text_aggregates_executable() {
             "SELECT group_id, sum(amount) FROM collation_groups GROUP BY group_id HAVING sum(amount) > 100 ORDER BY group_id",
         )),
         ["1|220"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT group_id, count(*) FROM collation_groups GROUP BY group_id ORDER BY group_id",
+        )),
+        ["1|2", "2|1", "NULL|1"]
     );
     assert_eq!(
         data_rows(&run_with(

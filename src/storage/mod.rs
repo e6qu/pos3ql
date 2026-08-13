@@ -123,6 +123,12 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    RegObject {
+        type_oid: i32,
+        referenced_oid: i32,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Float8(f64),
     Text {
         len: u8,
@@ -271,6 +277,19 @@ impl OwnedDatum {
                     bytes,
                 }
             }
+            Datum::RegObject {
+                type_oid,
+                referenced_oid,
+                name,
+            } => {
+                let (len, bytes) = Self::bytes(name.as_bytes(), "catalog object")?;
+                Self::RegObject {
+                    type_oid: *type_oid,
+                    referenced_oid: *referenced_oid,
+                    len,
+                    bytes,
+                }
+            }
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
             Datum::Int4(v) => Self::Int4(*v),
@@ -365,6 +384,17 @@ impl OwnedDatum {
                 len,
                 bytes,
             } => Datum::Regtype {
+                referenced_oid: *referenced_oid,
+                name: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+            },
+            Self::RegObject {
+                type_oid,
+                referenced_oid,
+                len,
+                bytes,
+            } => Datum::RegObject {
+                type_oid: *type_oid,
                 referenced_oid: *referenced_oid,
                 name: core::str::from_utf8(&bytes[..*len as usize])
                     .expect("stored from valid UTF-8"),

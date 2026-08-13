@@ -773,11 +773,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }
     }
 
+    fn role_oid(&self, name: &str) -> Option<i32> {
+        self.storage
+            .find_role_visible(name, self.txid)
+            .map(Storage::role_oid)
+            .or_else(|| super::catalog::predefined_role_oid(name))
+    }
+
     fn schema_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         let Some(name) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
         Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
+    }
+
+    fn schema_oid(&self, name: &str) -> Option<i32> {
+        super::catalog::schema_oid_by_name(self.storage, self.txid, name)
     }
 
     fn has_table_privilege(

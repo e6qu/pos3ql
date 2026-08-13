@@ -122,7 +122,10 @@ fn display_len(value: impl core::fmt::Display) -> usize {
 fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usize {
     match value {
         Datum::Null => 0,
-        Datum::Text(text) | Datum::Bpchar(text) | Datum::Regtype { name: text, .. } => text.len(),
+        Datum::Text(text)
+        | Datum::Bpchar(text)
+        | Datum::Regtype { name: text, .. }
+        | Datum::RegObject { name: text, .. } => text.len(),
         Datum::Bytea(bytes) if render.bytea_escape => bytes
             .iter()
             .map(|byte| match byte {
@@ -155,7 +158,11 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Null => 0,
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
-        Datum::Int4(_) | Datum::Regtype { .. } | Datum::Date(_) | Datum::Float4(_) => 4,
+        Datum::Int4(_)
+        | Datum::Regtype { .. }
+        | Datum::RegObject { .. }
+        | Datum::Date(_)
+        | Datum::Float4(_) => 4,
         Datum::Int8(_)
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
@@ -647,7 +654,10 @@ impl<'b> Responder<'b> {
                 Datum::Null => {
                     m.i32(-1);
                 }
-                Datum::Text(s) | Datum::Bpchar(s) | Datum::Regtype { name: s, .. } => {
+                Datum::Text(s)
+                | Datum::Bpchar(s)
+                | Datum::Regtype { name: s, .. }
+                | Datum::RegObject { name: s, .. } => {
                     m.i32(s.len() as i32);
                     m.bytes(s.as_bytes());
                 }
@@ -836,6 +846,10 @@ impl<'b> Responder<'b> {
                     m.bytes(&x.to_be_bytes());
                 }
                 Datum::Regtype { referenced_oid, .. } => {
+                    m.i32(4);
+                    m.bytes(&referenced_oid.to_be_bytes());
+                }
+                Datum::RegObject { referenced_oid, .. } => {
                     m.i32(4);
                     m.bytes(&referenced_oid.to_be_bytes());
                 }

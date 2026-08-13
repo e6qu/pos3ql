@@ -30,6 +30,7 @@ impl<'a> TryFrom<Datum<'a>> for CatalogOid {
         let oid = match value {
             Datum::Int4(oid) => oid,
             Datum::Int8(oid) => i32::try_from(oid).map_err(|_| ())?,
+            Datum::RegObject { referenced_oid, .. } => referenced_oid,
             _ => return Err(()),
         };
         Ok(Self(oid))
@@ -45,6 +46,7 @@ fn privilege_role_name<'a>(
         Datum::Text(role) => Ok(Some(role)),
         Datum::Int4(oid) => catalog.role_name(oid, arena),
         Datum::Int8(oid) => catalog.role_name(oid as i32, arena),
+        Datum::RegObject { referenced_oid, .. } => catalog.role_name(referenced_oid, arena),
         Datum::Null => Ok(None),
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -81,6 +83,17 @@ fn privilege_object_name<'a>(
                 Ok(Some("pos3ql"))
             } else {
                 catalog.relname(oid as i32, arena)
+            }
+        }
+        Datum::RegObject { referenced_oid, .. } => {
+            if function == "has_type_privilege" {
+                catalog.type_name(referenced_oid, arena)
+            } else if function == "has_schema_privilege" {
+                catalog.schema_name(referenced_oid, arena)
+            } else if function == "has_database_privilege" {
+                Ok(Some("pos3ql"))
+            } else {
+                catalog.relname(referenced_oid, arena)
             }
         }
         Datum::Null => Ok(None),
@@ -637,6 +650,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let col = if args.len() >= 2 {
@@ -662,6 +676,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
@@ -679,6 +694,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(value) => i32::try_from(value).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
                     })?,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -701,6 +717,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let catalog_name = if args.len() >= 2 {
@@ -725,6 +742,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let col = match eval_full(args[1], arena, params, row, hooks)? {
@@ -763,6 +781,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
                     Datum::Int8(oid) => oid as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -779,6 +798,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
                     Datum::Int8(oid) => oid as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -793,7 +813,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Text(_) | Datum::Int4(_) | Datum::Int8(_) => {
+                    Datum::Text(_) | Datum::Int4(_) | Datum::Int8(_) | Datum::RegObject { .. } => {
                         Ok(Datum::Int8(cat.database_size()?))
                     }
                     Datum::Null => Ok(Datum::Null),
@@ -984,6 +1004,16 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(_) => "text",
                     Datum::Bpchar(_) => "character",
                     Datum::Regtype { .. } => "regtype",
+                    Datum::RegObject { type_oid, .. } => match type_oid {
+                        crate::sql::types::oid::REGPROC => "regproc",
+                        crate::sql::types::oid::REGPROCEDURE => "regprocedure",
+                        crate::sql::types::oid::REGOPER => "regoper",
+                        crate::sql::types::oid::REGOPERATOR => "regoperator",
+                        crate::sql::types::oid::REGCLASS => "regclass",
+                        crate::sql::types::oid::REGNAMESPACE => "regnamespace",
+                        crate::sql::types::oid::REGROLE => "regrole",
+                        _ => "regobject",
+                    },
                     Datum::Date(_) => "date",
                     Datum::Timestamp(_) => "timestamp without time zone",
                     Datum::Timestamptz(_) => "timestamp with time zone",

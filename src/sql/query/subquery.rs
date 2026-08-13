@@ -1455,6 +1455,17 @@ fn type_witness(ct: ColType) -> Datum<'static> {
             referenced_oid: 0,
             name: "-",
         },
+        ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole => Datum::RegObject {
+            type_oid: ct.oid(),
+            referenced_oid: 0,
+            name: "-",
+        },
         ColType::Int8 => Datum::Int8(0),
         ColType::Time => Datum::Time(0),
         ColType::Timetz => Datum::Timetz(0, 0),

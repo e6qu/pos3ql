@@ -1184,6 +1184,12 @@ pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
         .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
 }
 
+pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
+    PREDEFINED_ROLES
+        .iter()
+        .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
+}
+
 #[derive(Clone, Copy)]
 enum CatalogOwner {
     Role(usize),
@@ -1560,6 +1566,16 @@ pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Opti
             .visible_schemas(txid)
             .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
             .map(|(_, schema)| schema.name.as_str()),
+    }
+}
+
+pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    match name {
+        "public" => Some(PUBLIC_NS_OID),
+        "pg_catalog" => Some(PG_CATALOG_NS_OID),
+        _ => storage
+            .find_schema_visible(name, txid)
+            .map(|slot| namespace_oid(storage, storage.schema_def(slot).name.as_str())),
     }
 }
 

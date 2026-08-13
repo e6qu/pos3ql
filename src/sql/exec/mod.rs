@@ -11316,6 +11316,10 @@ pub(crate) fn decode_text_input<'a>(
         return crate::sql::eval::regtype_of_name(text);
     }
     let decode_builtin = |ctype| match ctype {
+        target if target.is_reg_object() => {
+            let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+            crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
+        }
         ColType::Enum(slot) => coerce_enum_value(Datum::Text(text), slot, storage, txid, arena),
         ColType::Array(
             element @ (crate::sql::types::ArrElem::Enum(_)
@@ -11395,6 +11399,36 @@ fn decode_binary_field_with_context<'a>(
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena)
                 .map_err(|_| bad())
+        }
+        target @ (ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole) => {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
+            let referenced_oid = i32::from_be_bytes(bytes);
+            match context {
+                BinaryDecodeContext::Plain => {
+                    let name = arena.alloc_str_display(referenced_oid).map_err(|_| bad())?;
+                    Ok(Datum::RegObject {
+                        type_oid: target.oid(),
+                        referenced_oid,
+                        name,
+                    })
+                }
+                BinaryDecodeContext::Catalog { storage, txid } => {
+                    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                    crate::sql::eval::regobject_cast(
+                        Datum::Int4(referenced_oid),
+                        target,
+                        Some(&catalog),
+                        arena,
+                    )
+                    .map_err(|_| bad())
+                }
+            }
         }
         ColType::Int8 => via(oids::INT8),
         ColType::Float4 => via(oids::FLOAT4),
@@ -16237,6 +16271,11 @@ fn coerce<'a>(
     ) = col.ctype
     {
         return coerce_user_type_array(v, element, storage, txid, arena);
+    }
+    if col.ctype.is_reg_object() {
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+        let value = crate::sql::eval::regobject_cast(v, col.ctype, Some(&catalog), arena)?;
+        return apply_typmod(value, col.ctype, col.type_mod, arena);
     }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their

@@ -346,6 +346,10 @@ pub(super) fn resolve_default(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
             ) => super::coerce_user_type_array(v, element, storage, txid, arena)?,
+            target if target.is_reg_object() => {
+                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?
+            }
             _ => cast_to(v, ctype, arena)?,
         };
         let v = apply_typmod(v, ctype, type_mod, arena)?;

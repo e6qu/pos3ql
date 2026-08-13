@@ -1602,6 +1602,74 @@ fn object_resident_set_records_keep_their_structural_fields() {
 }
 
 #[test]
+fn catalog_object_columns_preserve_identity_and_catalog_text() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_object_role; \
+         CREATE SCHEMA catalog_object_schema; \
+         CREATE TABLE catalog_object_reference (id integer); \
+         CREATE TABLE catalog_object_values ( \
+             relation_value regclass DEFAULT 'catalog_object_reference'::regclass, \
+             role_value regrole DEFAULT 'catalog_object_role'::regrole, \
+             schema_value regnamespace DEFAULT 'catalog_object_schema'::regnamespace \
+         ); \
+         INSERT INTO catalog_object_values DEFAULT VALUES; \
+         INSERT INTO catalog_object_values VALUES ( \
+             'catalog_object_reference', 'catalog_object_role', 'catalog_object_schema' \
+         )",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relation_value, role_value, schema_value, \
+                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value) \
+         FROM catalog_object_values ORDER BY relation_value",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "catalog_object_reference|catalog_object_role|catalog_object_schema|regclass|regrole|regnamespace",
+            "catalog_object_reference|catalog_object_role|catalog_object_schema|regclass|regrole|regnamespace",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation_value, role_value, schema_value FROM catalog_object_values",
+        )),
+        [
+            crate::sql::types::oid::REGCLASS,
+            crate::sql::types::oid::REGROLE,
+            crate::sql::types::oid::REGNAMESPACE,
+        ]
+    );
+}
+
+#[test]
+fn regclass_casts_compare_with_catalog_oid_columns() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE regclass_comparison_target (id integer)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relname FROM pg_class \
+         WHERE oid = 'regclass_comparison_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["regclass_comparison_target"],
+        "{output:?}"
+    );
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -4999,10 +5067,12 @@ fn catalog_definitions_do_not_silently_truncate() {
         "SELECT pg_get_indexdef(conindid, 0, true) FROM pg_constraint \
          WHERE contype='p' AND conrelid='long_parent'::regclass",
     ));
+    let index_definition = index_definition
+        .first()
+        .expect("primary-key catalog query must return one definition");
     assert!(
-        index_definition[0].ends_with("deliberately_long_column_name_number_08)"),
-        "index definition was truncated: {}",
-        index_definition[0]
+        index_definition.ends_with("deliberately_long_column_name_number_08)"),
+        "index definition was truncated: {index_definition}",
     );
     let foreign_key_definition = data_rows(&run_with_txn_bytes(
         &mut engine,
@@ -5976,6 +6046,60 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
     assert_eq!(
         row_description_type_oids(&output),
         [
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+}
+
+#[test]
+fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("catalog-object-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE durable_catalog_role; \
+             CREATE SCHEMA durable_catalog_schema; \
+             CREATE TABLE durable_catalog_reference (id integer); \
+             CREATE TABLE durable_catalog_values ( \
+                 relation_value regclass DEFAULT 'durable_catalog_reference'::regclass, \
+                 role_value regrole DEFAULT 'durable_catalog_role'::regrole, \
+                 schema_value regnamespace DEFAULT 'durable_catalog_schema'::regnamespace \
+             ); \
+             INSERT INTO durable_catalog_values DEFAULT VALUES; \
+             INSERT INTO durable_catalog_values VALUES ( \
+                 'durable_catalog_reference', 'durable_catalog_role', 'durable_catalog_schema' \
+             )",
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relation_value, role_value, schema_value, \
+                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value) \
+         FROM durable_catalog_values ORDER BY relation_value",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|regclass|regrole|regnamespace",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|regclass|regrole|regnamespace",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGCLASS,
+            crate::sql::types::oid::REGROLE,
+            crate::sql::types::oid::REGNAMESPACE,
+            crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,
         ]

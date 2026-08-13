@@ -1126,7 +1126,11 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
     let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name);
+    let catalog_object = |t: ColType| t.is_reg_object();
+    let oid_integer = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8);
     (numeric(a) && numeric(b))
+        || (catalog_object(a) && oid_integer(b))
+        || (oid_integer(a) && catalog_object(b))
         || (datetime(a) && datetime(b))
         || (timeofday(a) && timeofday(b))
         || (bit(a) && bit(b))
@@ -1508,21 +1512,12 @@ pub fn infer_type_res(
             }
         }
         Expr::Cast {
-            operand, type_name, ..
+            operand: _,
+            type_name,
+            ..
         } => {
             if type_name.eq_ignore_ascii_case("regtype") {
                 return Ok((oid::REGTYPE, 4));
-            }
-            // `regclass` is oid-based: `'relname'::regclass` yields the relation
-            // OID (so `attrelid = 'tbl'::regclass` compares OIDs, as pgx and
-            // most tools introspect), while `oid::regclass` renders as the name.
-            if type_name.eq_ignore_ascii_case("regclass") {
-                let src = infer_type_res(operand, columns)?.0;
-                return Ok(if src == oid::TEXT || src == oid::UNKNOWN {
-                    of(ColType::Int4)
-                } else {
-                    of(ColType::Text)
-                });
             }
             match ColType::from_sql_name(type_name) {
                 Some(t) => of(t),

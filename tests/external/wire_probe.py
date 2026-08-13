@@ -503,6 +503,41 @@ def test_builtin_function_result_types_and_binary_json():
         and row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x00\x17",
         out,
     )
+    simple_query(
+        s,
+        "CREATE ROLE wire_catalog_role; "
+        "CREATE SCHEMA wire_catalog_schema; "
+        "CREATE TABLE wire_catalog_reference (id integer); "
+        "CREATE TABLE wire_catalog_value ("
+        "  relation_value regclass DEFAULT 'wire_catalog_reference'::regclass, "
+        "  role_value regrole DEFAULT 'wire_catalog_role'::regrole, "
+        "  schema_value regnamespace DEFAULT 'wire_catalog_schema'::regnamespace"
+        "); "
+        "INSERT INTO wire_catalog_value DEFAULT VALUES",
+    )
+    relation_oid = int(
+        first_text_row(
+            simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_catalog_reference'")
+        )
+    )
+    parse = frontend_message(b"P", b"\x00SELECT relation_value FROM wire_catalog_value\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "stored regclass preserves Describe and binary result bytes",
+        description is not None
+        and row_description_type_oids(description) == [2205]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", relation_oid),
+        out,
+    )
     s.close()
 
 
@@ -951,7 +986,8 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE TYPE wire_binary_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
         "CREATE DOMAIN wire_binary_vector AS integer[]; "
-        "CREATE DOMAIN wire_binary_required AS integer NOT NULL",
+        "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
+        "CREATE TABLE wire_binary_regclass (id integer)",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
@@ -963,9 +999,20 @@ def test_catalog_aware_binary_bind_parameters():
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
+    regclass_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
+    )
     cases = [
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("regtype", "SELECT $1::regtype", 2206, struct.pack("!i", 23), "integer", None),
+        (
+            "regclass",
+            "SELECT $1::regclass",
+            2205,
+            struct.pack("!i", regclass_oid),
+            "wire_binary_regclass",
+            None,
+        ),
         ("invalid regtype", "SELECT $1::regtype", 2206, b"\x00", None, "22P03"),
         ("json", "SELECT $1::json", 114, b'{"b": 1, "a": 2}', '{"b": 1, "a": 2}', None),
         ("jsonb", "SELECT $1::jsonb", 3802, b'\x01{"b": 1, "a": 2}', '{"a": 2, "b": 1}', None),
@@ -1094,7 +1141,8 @@ def test_catalog_aware_text_bind_parameters():
         s,
         "CREATE TYPE wire_text_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_text_positive AS integer CHECK (VALUE > 0); "
-        "CREATE DOMAIN wire_text_required AS integer NOT NULL",
+        "CREATE DOMAIN wire_text_required AS integer NOT NULL; "
+        "CREATE TABLE wire_text_regclass (id integer)",
     )
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_state'")))
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_positive'")))
@@ -1107,6 +1155,7 @@ def test_catalog_aware_text_bind_parameters():
         ("integer identity", "SELECT pg_typeof($1)", 23, b"7", "integer", None),
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("regtype", "SELECT $1::regtype", 2206, b"integer", "integer", None),
+        ("regclass", "SELECT $1::regclass", 2205, b"wire_text_regclass", "wire_text_regclass", None),
         ("invalid regtype", "SELECT $1::regtype", 2206, b"not_a_type", None, "42704"),
         ("enum", "SELECT $1::wire_text_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_text_positive", domain_oid, b"7", "7", None),

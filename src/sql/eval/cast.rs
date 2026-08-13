@@ -55,6 +55,42 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Int8(oid) => super::regtype_of_oid(oid, arena)?,
             _ => return Err(cast_unsupported(&v, "regtype")),
         },
+        target @ (ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole) => match v {
+            Datum::RegObject {
+                type_oid,
+                referenced_oid,
+                name,
+            } if type_oid == target.oid() => Datum::RegObject {
+                type_oid,
+                referenced_oid,
+                name,
+            },
+            Datum::Int4(referenced_oid) => Datum::RegObject {
+                type_oid: target.oid(),
+                referenced_oid,
+                name: arena
+                    .alloc_str_display(referenced_oid)
+                    .map_err(|_| arena_full())?,
+            },
+            Datum::Int8(referenced_oid) => {
+                let referenced_oid =
+                    i32::try_from(referenced_oid).map_err(|_| overflow(target.name()))?;
+                Datum::RegObject {
+                    type_oid: target.oid(),
+                    referenced_oid,
+                    name: arena
+                        .alloc_str_display(referenced_oid)
+                        .map_err(|_| arena_full())?,
+                }
+            }
+            _ => return Err(cast_unsupported(&v, target.name())),
+        },
         // A value-level cast to an enum: only an already-typed enum value can be
         // produced here. Coercing text to an enum member needs the catalog to
         // validate the label, so it is intercepted in the eval Cast path before
@@ -80,6 +116,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Int4(
                     parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32,
                 )
+            } else if let Datum::RegObject { referenced_oid, .. } = v {
+                Datum::Int4(referenced_oid)
             } else {
                 let x = to_i64_for_cast(&v, "integer")?;
                 Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
@@ -617,6 +655,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
         Datum::Int2(x) => Ok(i64::from(*x)),
         Datum::Int4(x) => Ok(i64::from(*x)),
         Datum::Int8(x) => Ok(*x),
+        Datum::RegObject { referenced_oid, .. } => Ok(i64::from(*referenced_oid)),
         Datum::Bool(b) => Ok(i64::from(*b)),
         // PostgreSQL rounds a float to the nearest integer, ties to even
         // (`rint`): 0.5→0, 2.5→2, 3.5→4. real widens to f64 first, which is

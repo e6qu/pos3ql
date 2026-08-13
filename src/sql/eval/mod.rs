@@ -448,9 +448,17 @@ pub trait CatalogAccess {
     fn role_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// Resolve a role name to its catalog OID.
+    fn role_oid(&self, _name: &str) -> Option<i32> {
+        None
+    }
     /// Resolve a namespace OID to its catalog name.
     fn schema_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
+    }
+    /// Resolve a namespace name to its catalog OID.
+    fn schema_oid(&self, _name: &str) -> Option<i32> {
+        None
     }
     /// PostgreSQL privilege inquiry functions. `None` represents a missing
     /// object or role, for which PostgreSQL returns NULL in the OID forms.
@@ -1051,47 +1059,10 @@ pub fn eval_full<'a>(
             type_mod,
         } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
-            // `oid::regclass` displays as the relation name (needs catalog
-            // access); other reg-type casts fall through to the generic path.
-            if type_name.eq_ignore_ascii_case("regclass")
-                && let Some(cat) = hooks.catalog
+            if let Some(target) = ColType::from_sql_name(type_name)
+                && target.is_reg_object()
             {
-                match v {
-                    // `oid::regclass` renders as the relation name.
-                    Datum::Int4(_) | Datum::Int8(_) => {
-                        let oid = if let Datum::Int8(x) = v {
-                            x as i32
-                        } else if let Datum::Int4(x) = v {
-                            x
-                        } else {
-                            0
-                        };
-                        if let Some(name) = cat.relname(oid, arena)? {
-                            return Ok(Datum::Text(name));
-                        }
-                    }
-                    // `'relname'::regclass` resolves to the relation's OID, so a
-                    // catalog query's `attrelid = 'tbl'::regclass` compares OIDs
-                    // (pgx and most tools introspect this way).
-                    Datum::Text(name) | Datum::Bpchar(name) => {
-                        let name = name.trim_end_matches(' ');
-                        // regclass input accepts a decimal OID spelling without
-                        // resolving it as a relation name. psql uses this form
-                        // in catalog queries (`'16385'::regclass`).
-                        if let Ok(oid) = name.parse::<i32>() {
-                            return Ok(Datum::Int4(oid));
-                        }
-                        if let Some(oid) = cat.reloid(name) {
-                            return Ok(Datum::Int4(oid));
-                        }
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_TABLE,
-                            "relation \"{}\" does not exist",
-                            name
-                        ));
-                    }
-                    _ => {}
-                }
+                return regobject_cast(v, target, hooks.catalog, arena);
             }
             // `::regtype` resolves a type name to the type and renders its
             // canonical SQL name (`'varchar(5)'::regtype` is `character
@@ -3788,6 +3759,98 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
     })
 }
 
+pub(crate) fn regobject_cast<'a>(
+    value: Datum<'a>,
+    target: ColType,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    if let Datum::RegObject { type_oid, .. } = value
+        && type_oid == target.oid()
+    {
+        return Ok(value);
+    }
+    let object_oid = match value {
+        Datum::Int2(value) => i32::from(value),
+        Datum::Int4(value) => value,
+        Datum::Int8(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
+        Datum::Text(name) | Datum::Bpchar(name) => {
+            let name = name.trim_end_matches(' ');
+            if let Ok(value) = name.parse::<i32>() {
+                value
+            } else {
+                let catalog = catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} input requires catalog access",
+                        target.name()
+                    )
+                })?;
+                match target {
+                    ColType::Regclass => catalog.reloid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "relation \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regrole => catalog.role_oid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "role \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regnamespace => catalog.schema_oid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_SCHEMA_NAME,
+                            "schema \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named {} input is not modeled",
+                            target.name()
+                        ));
+                    }
+                }
+            }
+        }
+        _ => return Err(cast_unsupported(&value, target.name())),
+    };
+    let name = match target {
+        ColType::Regclass => catalog
+            .map(|catalog| catalog.relname(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regrole => catalog
+            .map(|catalog| catalog.role_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regnamespace => catalog
+            .map(|catalog| catalog.schema_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        _ => None,
+    };
+    let name = match name {
+        Some(name) => name,
+        None => arena
+            .alloc_str_display(object_oid)
+            .map_err(|_| arena_full())?,
+    };
+    Ok(Datum::RegObject {
+        type_oid: target.oid(),
+        referenced_oid: object_oid,
+        name,
+    })
+}
+
 fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
     use crate::sql::types::oid;
     Some(match type_oid {
@@ -3960,6 +4023,16 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Text(_) => "text",
         Datum::Bpchar(_) => "character",
         Datum::Regtype { .. } => "regtype",
+        Datum::RegObject { type_oid, .. } => match *type_oid {
+            crate::sql::types::oid::REGPROC => "regproc",
+            crate::sql::types::oid::REGPROCEDURE => "regprocedure",
+            crate::sql::types::oid::REGOPER => "regoper",
+            crate::sql::types::oid::REGOPERATOR => "regoperator",
+            crate::sql::types::oid::REGCLASS => "regclass",
+            crate::sql::types::oid::REGNAMESPACE => "regnamespace",
+            crate::sql::types::oid::REGROLE => "regrole",
+            _ => "regobject",
+        },
         Datum::Date(_) => "date",
         Datum::Timestamp(_) => "timestamp without time zone",
         Datum::Timestamptz(_) => "timestamp with time zone",

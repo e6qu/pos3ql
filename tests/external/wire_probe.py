@@ -329,6 +329,49 @@ def test_binary_cursor_preserves_catalog_identity():
     s.close()
 
 
+def test_binary_portal_preserves_catalog_identity():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(
+        b"P",
+        b"catalog_identity_statement\x00SELECT $1::regoperator AS value\x00"
+        + struct.pack("!hi", 1, 2204),
+    )
+    bind = frontend_message(
+        b"B",
+        b"catalog_identity_portal\x00catalog_identity_statement\x00"
+        + struct.pack("!hhh", 1, 1, 1)
+        + struct.pack("!i", 4)
+        + struct.pack("!i", 551)
+        + struct.pack("!hh", 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pcatalog_identity_portal\x00")
+    execute = frontend_message(b"E", b"catalog_identity_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary portal: Bind retains regoperator result identity",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1],
+        out,
+    )
+    check(
+        "binary portal: Execute returns the bound operator OID",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x02'",
+        row,
+    )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))

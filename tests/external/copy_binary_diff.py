@@ -11,7 +11,8 @@ with psycopg and checks three things against real PostgreSQL:
   3. pos3ql's own binary dump loads back into PostgreSQL to the same rows.
 
 Every supported column type (the scalar / numeric / temporal / uuid / bytea /
-json tower, with NULLs) is exercised. Exit 0 on full agreement, 1 on any diff.
+json / catalog-identity tower, with NULLs) is exercised. Exit 0 on full
+agreement, 1 on any diff.
 
   copy_binary_diff.py --pg PORT --p3 PORT [--host HOST]
 """
@@ -34,7 +35,7 @@ CREATE TABLE cb (
   t text, vc varchar(10), bp char(5), d date, ts timestamp, tz timestamptz,
   tm time, tt timetz, iv interval, j json, jb jsonb, u uuid, by bytea,
   ia int[], ta text[], r4 int4range, nr numrange, mr int4multirange,
-  b5 bit(5), vb varbit, em cb_mood, dp cb_positive)"""
+  b5 bit(5), vb varbit, em cb_mood, dp cb_positive, ro regoperator)"""
 
 INSERT = """INSERT INTO cb VALUES
   (32000, 123456, 9000000000, 1.5, 2.25, 123.456, true, 'héllo', 'abc', 'xy',
@@ -42,13 +43,14 @@ INSERT = """INSERT INTO cb VALUES
    '08:09:10-05', '1 year 2 mons 3 days 04:05:06', '{"a":1}', '{"b": 2}',
    '00112233-4455-6677-8899-aabbccddeeff', '\\xcafe',
    '{1,2,3}', '{a,bb}', '[1,5)', '[1.5,3.5]', '{[1,3),[5,7)}', B'10110', B'101',
-   'happy', 5),
+   'happy', 5, '+(integer,integer)'::regoperator),
   (-1, -123, -9000000000, -0.5, -1.25, -0.001, false, '', 'z', '', '2000-01-01',
    '1999-12-31 23:59:59', '2000-06-01 12:00:00+00', '00:00:00', '23:59:59+14',
    '-5 days', 'null', '[1,2,3]', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '\\x',
-   '{1,NULL,3}', '{}', 'empty', '(1.5,)', '{}', B'00000', B'', 'sad', 1),
+   '{1,NULL,3}', '{}', 'empty', '(1.5,)', '{}', B'00000', B'', 'sad', 1,
+   '+(integer,integer)'::regoperator),
   (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
+   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
 
 def connect(host, port):

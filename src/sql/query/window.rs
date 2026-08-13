@@ -9,11 +9,12 @@
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::sql::ast::{
-    BinaryOp, Expr, FrameBound, FrameUnits, FromClause, OrderBy, Select, SelectItem, TableRef,
-    WindowFrame,
+    BinaryOp, Collation, Expr, FrameBound, FrameUnits, FromClause, OrderBy, Select, SelectItem,
+    TableRef, WindowFrame,
 };
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, eval_full, sqlstate,
+    ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, compare_datums_collated,
+    eval_full, sqlstate,
 };
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
@@ -24,8 +25,8 @@ use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WIN_KEYS, MAX_WINDOWS,
-    Outcome, QueryScope, arena_full, collect_grouped_aggs, keys_equal, merge_correlated,
-    pax_column_demand, project_row, record_star_width, resolve_order_target, rewrite_grouped_expr,
+    Outcome, QueryScope, arena_full, collect_grouped_aggs, merge_correlated, pax_column_demand,
+    project_row, record_star_width, resolve_order_target, rewrite_grouped_expr,
     scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
     window_row,
 };
@@ -297,6 +298,7 @@ fn range_offset_negative(v: &Datum) -> bool {
 /// frame is empty. Bound semantics verified against PostgreSQL 18.4.
 #[allow(clippy::too_many_arguments)]
 fn frame_range<'a>(
+    storage: &Storage,
     frame: &WindowFrame<'a>,
     ord: &[OrderBy<'a>],
     scope: &QueryScope<'a>,
@@ -321,7 +323,13 @@ fn frame_range<'a>(
                     match (va.is_null(), vb.is_null()) {
                         (true, true) => true,
                         (true, false) | (false, true) => false,
-                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                        (false, false) => compare_datums_collated(
+                            storage,
+                            scope.expression_collation(o.expression)?,
+                            &va,
+                            &vb,
+                        )?
+                        .is_eq(),
                     }
                 },
             )
@@ -399,7 +407,12 @@ fn frame_range<'a>(
             if k.is_null() {
                 return Ok(false);
             }
-            let c = compare_datums(&k, &edge)?;
+            let c = compare_datums_collated(
+                storage,
+                scope.expression_collation(o.expression)?,
+                &k,
+                &edge,
+            )?;
             Ok(if towards_smaller {
                 c.is_ge()
             } else {
@@ -413,7 +426,12 @@ fn frame_range<'a>(
                 if k.is_null() {
                     continue;
                 }
-                let c = compare_datums(&k, &edge)?;
+                let c = compare_datums_collated(
+                    storage,
+                    scope.expression_collation(o.expression)?,
+                    &k,
+                    &edge,
+                )?;
                 let inside = if preceding {
                     in_frame(i)?
                 } else {
@@ -434,7 +452,12 @@ fn frame_range<'a>(
                 if k.is_null() {
                     continue;
                 }
-                let c = compare_datums(&k, &edge)?;
+                let c = compare_datums_collated(
+                    storage,
+                    scope.expression_collation(o.expression)?,
+                    &k,
+                    &edge,
+                )?;
                 let inside = if preceding {
                     // Ending PRECEDING: last row at/before the edge.
                     if o.descending { c.is_ge() } else { c.is_le() }
@@ -601,10 +624,46 @@ fn frame_range<'a>(
     Ok(Some((start as usize, end as usize)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn window_keys_equal<'a>(
+    storage: &Storage,
+    expressions: &[&Expr<'a>],
+    scope: &QueryScope<'a>,
+    rows: &[&'a [Datum<'a>]],
+    offsets: &[usize],
+    left: usize,
+    right: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    for expression in expressions {
+        let left_row = window_row(scope, rows[left], offsets);
+        let left_value = eval_full(expression, arena, params, &left_row, hooks)?;
+        let right_row = window_row(scope, rows[right], offsets);
+        let right_value = eval_full(expression, arena, params, &right_row, hooks)?;
+        if !matches!((left_value.is_null(), right_value.is_null()), (true, true))
+            && (left_value.is_null()
+                || right_value.is_null()
+                || !compare_datums_collated(
+                    storage,
+                    scope.expression_collation(expression)?,
+                    &left_value,
+                    &right_value,
+                )?
+                .is_eq())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The current row's peer-group bounds (sorted-partition indices) under the
 /// window ORDER BY; the row alone when there is no ORDER BY.
 #[allow(clippy::too_many_arguments)]
 fn peer_bounds<'a>(
+    storage: &Storage,
     ord: &[OrderBy<'a>],
     scope: &QueryScope<'a>,
     rows: &[&'a [Datum<'a>]],
@@ -630,7 +689,13 @@ fn peer_bounds<'a>(
                     match (va.is_null(), vb.is_null()) {
                         (true, true) => true,
                         (true, false) | (false, true) => false,
-                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                        (false, false) => compare_datums_collated(
+                            storage,
+                            scope.expression_collation(o.expression)?,
+                            &va,
+                            &vb,
+                        )?
+                        .is_eq(),
                     }
                 },
             )
@@ -668,6 +733,7 @@ fn frame_excludes(
 /// a slice indexed by materialized-row order.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn compute_window<'a>(
+    storage: &Storage,
     node: &'a Expr<'a>,
     rows: &[&'a [Datum<'a>]],
     scope: &QueryScope<'a>,
@@ -701,7 +767,8 @@ fn compute_window<'a>(
     for i in 0..n {
         let mut gid = None;
         for g in 0..n_groups {
-            if keys_equal(
+            if window_keys_equal(
+                storage,
                 spec.partition_by,
                 scope,
                 rows,
@@ -761,6 +828,7 @@ fn compute_window<'a>(
                         arena,
                         params,
                         hooks,
+                        storage,
                     )?;
                     if c == core::cmp::Ordering::Greater {
                         part.swap(y - 1, y);
@@ -792,7 +860,13 @@ fn compute_window<'a>(
                             match (va.is_null(), vb.is_null()) {
                                 (true, true) => true,
                                 (true, false) | (false, true) => false,
-                                (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                                (false, false) => compare_datums_collated(
+                                    storage,
+                                    scope.expression_collation(o.expression)?,
+                                    &va,
+                                    &vb,
+                                )?
+                                .is_eq(),
                             }
                         },
                     )
@@ -858,6 +932,7 @@ fn compute_window<'a>(
             // too-short frame).
             for j in 0..m {
                 let range = frame_range(
+                    storage,
                     frame,
                     spec.order_by,
                     scope,
@@ -872,7 +947,18 @@ fn compute_window<'a>(
                 let peers = if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                     (j, j)
                 } else {
-                    peer_bounds(spec.order_by, scope, rows, offs, p, j, arena, params, hooks)?
+                    peer_bounds(
+                        storage,
+                        spec.order_by,
+                        scope,
+                        rows,
+                        offs,
+                        p,
+                        j,
+                        arena,
+                        params,
+                        hooks,
+                    )?
                 };
                 let excluded = |i: usize| frame_excludes(frame.exclusion, j, peers, i);
                 out[p[j]] = match (range, *name) {
@@ -937,7 +1023,13 @@ fn compute_window<'a>(
                                 match (va.is_null(), vb.is_null()) {
                                     (true, true) => true,
                                     (true, false) | (false, true) => false,
-                                    (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                                    (false, false) => compare_datums_collated(
+                                        storage,
+                                        scope.expression_collation(o.expression)?,
+                                        &va,
+                                        &vb,
+                                    )?
+                                    .is_eq(),
                                 }
                             },
                         )
@@ -1031,6 +1123,7 @@ fn compute_window<'a>(
             // frame aggregates zero rows — count 0, sum NULL).
             for j in 0..m {
                 let range = frame_range(
+                    storage,
                     frame,
                     spec.order_by,
                     scope,
@@ -1045,7 +1138,18 @@ fn compute_window<'a>(
                 let peers = if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                     (j, j)
                 } else {
-                    peer_bounds(spec.order_by, scope, rows, offs, p, j, arena, params, hooks)?
+                    peer_bounds(
+                        storage,
+                        spec.order_by,
+                        scope,
+                        rows,
+                        offs,
+                        p,
+                        j,
+                        arena,
+                        params,
+                        hooks,
+                    )?
                 };
                 let mut st = AggState::default();
                 st.init(node)?;
@@ -1058,7 +1162,7 @@ fn compute_window<'a>(
                         st.update(node, arena, params, &r, hooks)?;
                     }
                 }
-                out[p[j]] = st.finish(arena)?;
+                out[p[j]] = st.finish(arena, hooks.catalog)?;
             }
         } else {
             // Aggregate window function. Default frame:
@@ -1073,7 +1177,7 @@ fn compute_window<'a>(
                     let r = window_row(scope, rows[ri], offs);
                     st.update(node, arena, params, &r, hooks)?;
                 }
-                let v = st.finish(arena)?;
+                let v = st.finish(arena, hooks.catalog)?;
                 for &ri in p {
                     out[ri] = v;
                 }
@@ -1094,7 +1198,13 @@ fn compute_window<'a>(
                                     match (va.is_null(), vb.is_null()) {
                                         (true, true) => true,
                                         (true, false) | (false, true) => false,
-                                        (false, false) => compare_datums(&va, &vb)?.is_eq(),
+                                        (false, false) => compare_datums_collated(
+                                            storage,
+                                            scope.expression_collation(o.expression)?,
+                                            &va,
+                                            &vb,
+                                        )?
+                                        .is_eq(),
                                     }
                                 },
                             )
@@ -1112,7 +1222,7 @@ fn compute_window<'a>(
                         let r = window_row(scope, rows[ri], offs);
                         st.update(node, arena, params, &r, hooks)?;
                     }
-                    let v = st.finish(arena)?;
+                    let v = st.finish(arena, hooks.catalog)?;
                     for &ri in &p[j..=e] {
                         out[ri] = v;
                     }
@@ -1126,6 +1236,8 @@ fn compute_window<'a>(
 
 /// Resolves one ORDER BY key's direction given both decoded values.
 fn order_by_key<'a>(
+    storage: &Storage,
+    collation: Collation,
     va: &Datum<'a>,
     vb: &Datum<'a>,
     o: &OrderBy<'a>,
@@ -1147,7 +1259,7 @@ fn order_by_key<'a>(
                 Ordering::Less
             }
         }
-        (false, false) => compare_datums(va, vb)?,
+        (false, false) => compare_datums_collated(storage, collation, va, vb)?,
     };
     Ok(if o.descending && !va.is_null() && !vb.is_null() {
         base.reverse()
@@ -1168,6 +1280,7 @@ fn cmp_order<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    storage: &Storage,
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for o in ord {
@@ -1175,7 +1288,13 @@ fn cmp_order<'a>(
         let va = eval_full(o.expression, arena, params, &ra, hooks)?;
         let rb = window_row(scope, rows[b], offs);
         let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
-        let c = order_by_key(&va, &vb, o)?;
+        let c = order_by_key(
+            storage,
+            scope.expression_collation(o.expression)?,
+            &va,
+            &vb,
+            o,
+        )?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1302,7 +1421,7 @@ pub(crate) fn project_window_rows<'a>(
     // Compute each window function's per-row values.
     let mut win_vals: [&[Datum]; MAX_WINDOWS] = [empty; MAX_WINDOWS];
     for (wi, &node) in win_nodes.iter().enumerate() {
-        win_vals[wi] = compute_window(node, rows, scope, &offs, arena, params, hooks)?;
+        win_vals[wi] = compute_window(storage, node, rows, scope, &offs, arena, params, hooks)?;
     }
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
@@ -1396,20 +1515,22 @@ pub(crate) fn project_window_rows<'a>(
 /// Compares two encoded rows' first `n` columns under SQL equality and order,
 /// NULLs first — the same semantics `keys_equal` uses to partition rows.
 fn compare_encoded_keys(
+    storage: &Storage,
+    collations: &[Collation],
     a: &[u8],
     b: &[u8],
     at: usize,
     n: usize,
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
-    for k in 0..n {
+    for (k, &collation) in collations.iter().enumerate().take(n) {
         let va = crate::sql::exec::decode_projected_pub(a, at + k);
         let vb = crate::sql::exec::decode_projected_pub(b, at + k);
         let c = match (va.is_null(), vb.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
-            (false, false) => compare_datums(&va, &vb)?,
+            (false, false) => compare_datums_collated(storage, collation, &va, &vb)?,
         };
         if c != Ordering::Equal {
             return Ok(c);
@@ -1421,6 +1542,8 @@ fn compare_encoded_keys(
 /// Compares two encoded rows' ORDER BY keys (decoded, honoring each key's
 /// ASC/DESC + NULLS placement), mirroring `cmp_order` for the external runs.
 fn compare_encoded_order<'a>(
+    storage: &Storage,
+    collations: &[Collation],
     a: &[u8],
     b: &[u8],
     at: usize,
@@ -1430,7 +1553,7 @@ fn compare_encoded_order<'a>(
     for (k, o) in ord.iter().enumerate() {
         let va = crate::sql::exec::decode_projected_pub(a, at + k);
         let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = order_by_key(&va, &vb, o)?;
+        let c = order_by_key(storage, collations[k], &va, &vb, o)?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1547,17 +1670,39 @@ pub(crate) fn external_window_into<'a>(
         };
         let n_partition = spec.partition_by.len();
         let n_keys = n_partition + spec.order_by.len();
+        let mut partition_collations = [Collation::None; MAX_WIN_KEYS];
+        let mut order_collations = [Collation::None; MAX_WIN_KEYS];
+        for (index, expression) in spec.partition_by.iter().enumerate() {
+            partition_collations[index] = scope.expression_collation(expression)?;
+        }
+        for (index, order) in spec.order_by.iter().enumerate() {
+            order_collations[index] = scope.expression_collation(order.expression)?;
+        }
         // Sort the source rows by (PARTITION BY keys, ORDER BY keys) so every
         // partition streams back as one contiguous run segment.
         let mut spec_sorter = storage.external_sorter()?;
         spec_sorter.reset();
         let mut spec_compare =
             |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
-                let by_partition = compare_encoded_keys(left, right, 0, n_partition)?;
+                let by_partition = compare_encoded_keys(
+                    storage,
+                    &partition_collations[..n_partition],
+                    left,
+                    right,
+                    0,
+                    n_partition,
+                )?;
                 if !by_partition.is_eq() {
                     return Ok(by_partition);
                 }
-                compare_encoded_order(left, right, n_partition, spec.order_by)
+                compare_encoded_order(
+                    storage,
+                    &order_collations[..spec.order_by.len()],
+                    left,
+                    right,
+                    n_partition,
+                    spec.order_by,
+                )
             };
         let mut position = 0i64;
         scan_source_recycling_with_pax_columns(
@@ -1653,27 +1798,28 @@ pub(crate) fn external_window_into<'a>(
                 .alloc_slice_with(16, |_| 0)
                 .map_err(|_| arena_full())?;
             let mut count = 0usize;
-            let mut finish_partition =
-                |rows: &[&'a [Datum<'a>]], pos_of: &[i64]| -> Result<(), SqlError> {
-                    let out = compute_window(node, rows, scope, &offs, arena, params, hooks)?;
-                    for (r, &pos) in pos_of.iter().enumerate() {
-                        storage
-                            .with_block_store(|blocks| {
-                                win_sorter.push_projected_by(
-                                    blocks,
-                                    3,
-                                    |index| match index {
-                                        0 => Datum::Int8(pos),
-                                        1 => Datum::Int4(wi as i32),
-                                        _ => out[r],
-                                    },
-                                    &mut win_compare,
-                                )
-                            })
-                            .expect("spill-attached block store")?;
-                    }
-                    Ok(())
-                };
+            let mut finish_partition = |rows: &[&'a [Datum<'a>]],
+                                        pos_of: &[i64]|
+             -> Result<(), SqlError> {
+                let out = compute_window(storage, node, rows, scope, &offs, arena, params, hooks)?;
+                for (r, &pos) in pos_of.iter().enumerate() {
+                    storage
+                        .with_block_store(|blocks| {
+                            win_sorter.push_projected_by(
+                                blocks,
+                                3,
+                                |index| match index {
+                                    0 => Datum::Int8(pos),
+                                    1 => Datum::Int4(wi as i32),
+                                    _ => out[r],
+                                },
+                                &mut win_compare,
+                            )
+                        })
+                        .expect("spill-attached block store")?;
+                }
+                Ok(())
+            };
             loop {
                 let keep_scanning = {
                     let Some(context) = spec_reader.context() else {
@@ -1687,7 +1833,15 @@ pub(crate) fn external_window_into<'a>(
                     } = context;
                     let is_new = match previous {
                         None => true,
-                        Some(prior) => !compare_encoded_keys(prior, row, 0, n_partition)?.is_eq(),
+                        Some(prior) => !compare_encoded_keys(
+                            storage,
+                            &partition_collations[..n_partition],
+                            prior,
+                            row,
+                            0,
+                            n_partition,
+                        )?
+                        .is_eq(),
                     };
                     if is_new && count > 0 {
                         finish_partition(&rows[..count], &pos_of[..count])?;
@@ -1756,10 +1910,22 @@ pub(crate) fn external_window_into<'a>(
     // Re-scan the source, projecting each row with its window values read
     // back from the completed run, and sort the projected rows by ORDER BY.
     let width = projected_width(statement.items, scope);
+    let mut statement_order_collations = [Collation::None; MAX_WIN_KEYS];
+    for (index, order) in statement.order_by.iter().enumerate() {
+        let expression = resolve_order_target(order.expression, statement.items, scope, arena)?;
+        statement_order_collations[index] = scope.expression_collation(expression)?;
+    }
     let mut out_sorter = storage.external_sorter()?;
     out_sorter.reset();
     let mut out_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
-        let by_order = compare_encoded_order(left, right, width, statement.order_by)?;
+        let by_order = compare_encoded_order(
+            storage,
+            &statement_order_collations[..statement.order_by.len()],
+            left,
+            right,
+            width,
+            statement.order_by,
+        )?;
         if statement.distinct && by_order.is_eq() {
             Ok(crate::sql::exec::compare_projected_prefix(
                 left, right, width,

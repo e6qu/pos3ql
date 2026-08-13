@@ -3127,6 +3127,11 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
+            let collation = if self.eat_ident("collate")? {
+                self.collation_name()?
+            } else {
+                crate::sql::ast::Collation::Default
+            };
             let mut not_null = false;
             let mut unique = false;
             let mut default = None;
@@ -3158,6 +3163,7 @@ impl<'a> Parser<'a> {
                 name,
                 type_name,
                 type_mod,
+                collation,
                 not_null,
                 unique,
                 primary: false,

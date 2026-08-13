@@ -22,8 +22,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, compare_datums, eval_full,
-    sqlstate,
+    ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, eval_full,
+    resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
@@ -575,6 +575,15 @@ pub(super) fn storage_catalog<'a>(
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn compare_text(
+        &self,
+        collation: super::ast::Collation,
+        left: &str,
+        right: &str,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        self.storage.compare_text(collation, left, right)
+    }
+
     fn call_routine<'a>(
         &self,
         name: &str,
@@ -1375,7 +1384,7 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         .alloc_slice_with(agg_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (i, state) in states[..agg_nodes.len()].iter_mut().enumerate() {
-        values[i] = state.finish(arena)?;
+        values[i] = state.finish(arena, hooks.catalog)?;
     }
     let ptrs: &[*const Expr] = arena
         .alloc_slice_with(agg_nodes.len(), |i| agg_nodes[i].0)
@@ -2159,37 +2168,6 @@ fn window_row<'r, 'a>(
     }
 }
 
-/// Whether two rows have equal tuples over `keys` (NULLs compare equal, as in
-/// window PARTITION BY / peer grouping).
-#[allow(clippy::too_many_arguments)]
-fn keys_equal<'a>(
-    keys: &[&'a Expr<'a>],
-    scope: &QueryScope<'a>,
-    rows: &[&'a [Datum<'a>]],
-    offs: &[usize],
-    a: usize,
-    b: usize,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-) -> Result<bool, SqlError> {
-    for k in keys {
-        let ra = window_row(scope, rows[a], offs);
-        let va = eval_full(k, arena, params, &ra, hooks)?;
-        let rb = window_row(scope, rows[b], offs);
-        let vb = eval_full(k, arena, params, &rb, hooks)?;
-        let eq = match (va.is_null(), vb.is_null()) {
-            (true, true) => true,
-            (true, false) | (false, true) => false,
-            (false, false) => compare_datums(&va, &vb)?.is_eq(),
-        };
-        if !eq {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Collects aggregate-call nodes for a grouped window query: aggregates
 /// outside window functions plus those inside window arguments and keys
 /// (`sum(sum(v)) OVER (...)`: the inner sum aggregates per group).
@@ -2350,6 +2328,10 @@ fn rewrite_grouped_expr<'a>(
             operand: rewrite(operand)?,
             type_name,
             type_mod: *type_mod,
+        }),
+        Expr::Collate { operand, collation } => alloc(Expr::Collate {
+            operand: rewrite(operand)?,
+            collation: *collation,
         }),
         Expr::IsNull { operand, negated } => {
             alloc(Expr::IsNull { operand: rewrite(operand)?, negated: *negated })
@@ -3585,7 +3567,31 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         live = super::exec::sort_dedup_projected(out_rows, width);
     }
     let out_rows = &mut out_rows[..live];
+    let mut order_collations = [super::ast::Collation::None; MAX_PROJ];
+    for (index, order) in statement.order_by.iter().enumerate() {
+        let expression = order_item[index]
+            .and_then(|item| match statement.items[item] {
+                SelectItem::Expr { expression, .. } => Some(expression),
+                _ => None,
+            })
+            .unwrap_or(order.expression);
+        order_collations[index] =
+            match resolved_expression_collation(expression, &super::eval::NoColumns) {
+                Ok(collation) => collation,
+                Err(error) => return sql_fail(error),
+            };
+    }
     if n_order > 0 {
+        for row in out_rows.iter() {
+            for (index, &collation) in order_collations.iter().enumerate().take(n_order) {
+                if let Err(error) = storage.validate_text_collation(
+                    collation,
+                    &super::exec::decode_projected_pub(row, width + index),
+                ) {
+                    return sql_fail(error);
+                }
+            }
+        }
         out_rows.sort_unstable_by(|a, b| {
             for (j, ob) in statement.order_by.iter().enumerate() {
                 let ka = super::exec::decode_projected_pub(a, width + j);
@@ -3607,7 +3613,13 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                         }
                     }
                     (false, false) => {
-                        let c = compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal);
+                        let c = crate::sql::eval::compare_datums_collated(
+                            storage,
+                            order_collations[j],
+                            &ka,
+                            &kb,
+                        )
+                        .expect("validated FROM-less ORDER BY keys compare without error");
                         if ob.descending { c.reverse() } else { c }
                     }
                 };
@@ -3632,7 +3644,14 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // FETCH FIRST ... WITH TIES over a FROM-less SRF result: keep rows tying
     // with the last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
-        end = match materialize::extend_ties(out_rows, width, statement.order_by.len(), end) {
+        end = match materialize::extend_ties(
+            storage,
+            &order_collations[..statement.order_by.len()],
+            out_rows,
+            width,
+            statement.order_by.len(),
+            end,
+        ) {
             Ok(end) => end,
             Err(error) => return sql_fail(error),
         };
@@ -3736,7 +3755,7 @@ fn select_into_rows_mode<'a>(
             let rows_mut = arena
                 .alloc_slice_with(rows.len(), |i| rows[i])
                 .map_err(|_| arena_full())?;
-            setops::sort_set_rows(arena, rows_mut, statement.order_by, &cols[..n])?;
+            setops::sort_set_rows(storage, arena, rows_mut, statement.order_by, &cols[..n])?;
             rows = rows_mut;
         }
         let start = (offset as usize).min(rows.len());
@@ -3749,7 +3768,13 @@ fn select_into_rows_mode<'a>(
         {
             let boundary = rows[end - 1];
             while end < rows.len()
-                && setops::set_rows_tie(boundary, rows[end], statement.order_by, &cols[..n])
+                && setops::set_rows_tie(
+                    storage,
+                    boundary,
+                    rows[end],
+                    statement.order_by,
+                    &cols[..n],
+                )?
             {
                 end += 1;
             }
@@ -4560,6 +4585,7 @@ pub fn describe_scope_items<'q>(
                         ));
                     }
                     out[n] = ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod);
+                    out[n].collation = c.collation;
                     n += 1;
                 }
             }
@@ -4579,6 +4605,7 @@ pub fn describe_scope_items<'q>(
                             }
                             ResolvedColumn::Merged(_) => -1,
                         });
+                    out[n].collation = scope.output_collation(entry);
                     n += 1;
                 }
             }
@@ -4624,6 +4651,11 @@ pub fn describe_scope_items<'q>(
                 };
                 out[n] = ColDesc::new(name, oid, typlen)
                     .with_type_mod(user_type.map_or(type_mod, |description| description.type_mod));
+                if let Some(ctype) = super::exec::coltype_of_oid(oid)
+                    && ctype.is_collatable()
+                {
+                    out[n].collation = scope.expression_collation(expression)?;
+                }
                 n += 1;
             }
         }

@@ -203,6 +203,11 @@ fn predicate_column(
         }
     }
     match expression {
+        // COLLATE changes comparison semantics, not the relation/attribute
+        // identity of a simple predicate.  Keeping the wrapper transparent
+        // here lets the cost model see the same indexed column the executor
+        // will scan.
+        Expr::Collate { operand, .. } => predicate_column(operand, scope),
         Expr::Binary {
             operator: BinaryOp::And,
             left,
@@ -221,6 +226,10 @@ fn predicate_column(
                         constant: &Expr<'_>,
                         operator: BinaryOp|
              -> Option<(usize, usize, BinaryOp)> {
+                let column = match column {
+                    Expr::Collate { operand, .. } => operand,
+                    expression => expression,
+                };
                 let Expr::Column { qualifier, name } = column else {
                     return None;
                 };

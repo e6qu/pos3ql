@@ -12,10 +12,12 @@ use core::hash::{Hash, Hasher};
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::ValueIndexPool;
-use crate::sql::eval::{SqlError, hash_key, sqlstate};
+use crate::sql::ast::Collation;
+use crate::sql::eval::{SqlError, hash_key, hash_key_collated, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 use crate::store::BlockStore;
@@ -545,6 +547,7 @@ pub struct ColumnMeta {
     /// PostgreSQL atttypmod: -1 = none. varchar(n)/char(n) encode `n + 4`;
     /// numeric(p,s) encodes `((p<<16)|s) + 4`. Enforced during coercion.
     pub type_mod: i32,
+    pub collation: Collation,
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,
@@ -641,6 +644,7 @@ impl ColumnMeta {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: Collation::None,
         not_null: false,
         unique: false,
         primary: false,
@@ -2580,6 +2584,14 @@ impl SequenceDef {
 
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
+
+fn hash_table_key(definition: &TableDef, values: &[Datum], columns: &[u16]) -> u64 {
+    let mut collations = [Collation::None; MAX_INDEX_COLS];
+    for (index, column) in columns.iter().enumerate() {
+        collations[index] = definition.columns()[*column as usize].collation;
+    }
+    hash_key_collated(values, columns, &collations[..columns.len()])
+}
 /// Maximum stored source length of a partial-index membership predicate.
 ///
 /// Predicate text is catalog data, not request-owned parser memory. A fixed
@@ -3350,6 +3362,132 @@ pub struct Storage {
     /// in an `Option` so a rebuild can take it out for the duration of a row
     /// walk (which borrows the rest of `self`) and put it back.
     value_indexes: Option<ValueIndexPool>,
+    /// The process-independent locale state selected at engine startup.
+    collation: Option<CollationRuntime>,
+}
+
+struct CollationScratch {
+    left: FixedBuf,
+    right: FixedBuf,
+}
+
+struct CollationRuntime {
+    locale: libc::locale_t,
+    scratch: std::cell::RefCell<CollationScratch>,
+}
+
+impl CollationRuntime {
+    fn new(config: &Config, budget: &mut Budget) -> Result<Self, SqlError> {
+        const LOCALE_NAME_LIMIT: usize = 128;
+        let bytes = config.database_collation_locale.as_bytes();
+        if bytes.len() >= LOCALE_NAME_LIMIT || bytes.contains(&0) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "database_collation_locale is not a valid locale name"
+            ));
+        }
+        let mut name = [0i8; LOCALE_NAME_LIMIT];
+        for (index, byte) in bytes.iter().enumerate() {
+            name[index] = *byte as i8;
+        }
+        // SAFETY: `name` is NUL-terminated and the returned locale is owned
+        // by this runtime until Drop. No process-global locale is changed.
+        let locale =
+            unsafe { libc::newlocale(libc::LC_COLLATE_MASK, name.as_ptr(), core::ptr::null_mut()) };
+        if locale.is_null() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "database collation locale \"{}\" is unavailable",
+                config.database_collation_locale
+            ));
+        }
+        let scratch = CollationScratch {
+            left: FixedBuf::new(
+                budget,
+                "collation left scratch",
+                config.collation_scratch_bytes,
+            )
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::OUT_OF_MEMORY,
+                    "startup memory budget exhausted for collation scratch"
+                )
+            })?,
+            right: FixedBuf::new(
+                budget,
+                "collation right scratch",
+                config.collation_scratch_bytes,
+            )
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::OUT_OF_MEMORY,
+                    "startup memory budget exhausted for collation scratch"
+                )
+            })?,
+        };
+        Ok(Self {
+            locale,
+            scratch: std::cell::RefCell::new(scratch),
+        })
+    }
+
+    fn compare(&self, left: &str, right: &str) -> Result<core::cmp::Ordering, SqlError> {
+        self.validate(left)?;
+        self.validate(right)?;
+        let mut scratch = self.scratch.try_borrow_mut().map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "locale comparison scratch is already in use"
+            )
+        })?;
+        scratch.left.clear();
+        scratch.right.clear();
+        if !scratch.left.append(left.as_bytes())
+            || !scratch.left.append(&[0])
+            || !scratch.right.append(right.as_bytes())
+            || !scratch.right.append(&[0])
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "text value exceeds configured collation scratch capacity"
+            ));
+        }
+        // SAFETY: both buffers are NUL-terminated UTF-8 byte strings held for
+        // the call; `locale` was created by newlocale and remains live.
+        let compared = unsafe {
+            strcoll_l(
+                scratch.left.readable().as_ptr().cast(),
+                scratch.right.readable().as_ptr().cast(),
+                self.locale,
+            )
+        };
+        Ok(compared.cmp(&0))
+    }
+
+    fn validate(&self, value: &str) -> Result<(), SqlError> {
+        if value.len().saturating_add(1) > self.scratch.borrow().left.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "text value exceeds configured collation scratch capacity"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CollationRuntime {
+    fn drop(&mut self) {
+        // SAFETY: locale is owned by this runtime and freed exactly once.
+        unsafe { libc::freelocale(self.locale) };
+    }
+}
+
+unsafe extern "C" {
+    fn strcoll_l(
+        left: *const libc::c_char,
+        right: *const libc::c_char,
+        locale: libc::locale_t,
+    ) -> libc::c_int;
 }
 
 /// Fetches spilled rows back through the cache tiers. The buffers are owned
@@ -3728,15 +3866,16 @@ impl Storage {
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
-        config.max_tables
-            * (size_of::<Table>()
-                + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
-                + size_of::<ViewDef>()
-                + size_of::<RoutineDef>()
-                + size_of::<StoredQueryDependencies>()
-                + size_of::<MatviewDef>()
-                + size_of::<StoredQueryDependencies>()
-                + size_of::<IndexDef>())
+        2 * config.collation_scratch_bytes
+            + config.max_tables
+                * (size_of::<Table>()
+                    + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
+                    + size_of::<ViewDef>()
+                    + size_of::<RoutineDef>()
+                    + size_of::<StoredQueryDependencies>()
+                    + size_of::<MatviewDef>()
+                    + size_of::<StoredQueryDependencies>()
+                    + size_of::<IndexDef>())
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
@@ -3783,6 +3922,7 @@ impl Storage {
                             name: SqlName::parse("").expect("empty name fits"),
                             ctype: ColType::Bool,
                             type_mod: -1,
+                            collation: Collation::None,
                             not_null: false,
                             unique: false,
                             primary: false,
@@ -4087,7 +4227,71 @@ impl Storage {
             replay_table_rewrite: None,
             spill: None,
             value_indexes: Some(value_indexes),
+            collation: None,
         })
+    }
+
+    /// Installs the configured database-default collation before recovery or
+    /// query execution begins.
+    pub fn configure_collation(
+        &mut self,
+        config: &Config,
+        budget: &mut Budget,
+    ) -> Result<(), SqlError> {
+        debug_assert!(self.collation.is_none());
+        self.collation = Some(CollationRuntime::new(config, budget)?);
+        Ok(())
+    }
+
+    /// Compares textual values under a resolved SQL collation identity.
+    pub fn compare_text(
+        &self,
+        collation: Collation,
+        left: &str,
+        right: &str,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        match collation {
+            Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
+                Ok(left.cmp(right))
+            }
+            Collation::Default => self
+                .collation
+                .as_ref()
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "database collation was not initialized before comparison"
+                    )
+                })?
+                .compare(left, right),
+        }
+    }
+
+    /// Validates a value before it enters a sorting comparator, whose callback
+    /// type cannot return SQL errors. The subsequent comparison is therefore
+    /// infallible for capacity purposes and never turns an error into a tie.
+    pub fn validate_text_collation(
+        &self,
+        collation: Collation,
+        value: &Datum<'_>,
+    ) -> Result<(), SqlError> {
+        if collation != Collation::Default {
+            return Ok(());
+        }
+        let value = match value {
+            Datum::Text(value) => *value,
+            Datum::Bpchar(value) => value.trim_end_matches(' '),
+            _ => return Ok(()),
+        };
+        self.collation
+            .as_ref()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "database collation was not initialized before comparison"
+                )
+            })?
+            .validate(value)
     }
 
     /// Committed-catalog schema lookup (ignores uncommitted DDL): journal
@@ -8674,7 +8878,7 @@ impl Storage {
                 if columns.iter().any(|&col| values[col as usize].is_null()) {
                     continue;
                 }
-                out[n_out] = (i, hash_key(&values, columns));
+                out[n_out] = (i, hash_table_key(&table.def, &values, columns));
                 n_out += 1;
             }
             Ok(n_out)
@@ -9016,7 +9220,7 @@ impl Storage {
                 ));
             }
             rowenc::encode(key, &mut output[..len]);
-            Ok((len, hash_key(&values, enforcer.columns())))
+            Ok((len, hash_table_key(&table.def, &values, enforcer.columns())))
         })
     }
 
@@ -13389,6 +13593,7 @@ mod tests {
                 name: SqlName::parse("").unwrap(),
                 ctype: ColType::Bool,
                 type_mod: -1,
+                collation: Collation::None,
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -13407,6 +13612,11 @@ mod tests {
                 name: SqlName::parse(n).unwrap(),
                 ctype: *t,
                 type_mod: -1,
+                collation: if t.is_collatable() {
+                    Collation::Default
+                } else {
+                    Collation::None
+                },
                 not_null: *nn,
                 unique: false,
                 primary: false,

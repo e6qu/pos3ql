@@ -114,34 +114,13 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // The engine's fixed UTF-8 C locale has bytewise ordering. Accept
-            // only PostgreSQL names with the same semantics; locale-aware
-            // collations need first-class collation keys.
             if self.peeked == Tok::Ident("collate") {
                 self.advance()?;
-                let first = self.any_ident("collation name")?;
-                let mut schema = None;
-                let mut name = first;
-                if self.eat_op(".")? {
-                    schema = Some(first);
-                    name = self.any_ident("collation name")?;
-                }
-                let catalog = schema.is_none_or(|value| value.eq_ignore_ascii_case("pg_catalog"));
-                let bytewise = name.eq_ignore_ascii_case("c")
-                    || name.eq_ignore_ascii_case("posix")
-                    || name.eq_ignore_ascii_case("default")
-                    || name.eq_ignore_ascii_case("ucs_basic");
-                if !catalog || !bytewise {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: crate::stack_format!(
-                            96,
-                            "collation \"{}\" is not supported by the C-locale executor",
-                            name
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    });
-                }
+                let collation = self.collation_name()?;
+                left = self.arena_expr(Expr::Collate {
+                    operand: left,
+                    collation,
+                })?;
                 continue;
             }
             // `expression AT TIME ZONE zone` — desugar to the equivalent
@@ -438,6 +417,38 @@ impl<'a> Parser<'a> {
                 left,
                 right,
             })?;
+        }
+    }
+
+    pub(super) fn collation_name(&mut self) -> Result<crate::sql::ast::Collation, ParseError> {
+        let first = self.any_ident("collation name")?;
+        let mut schema = None;
+        let mut name = first;
+        if self.eat_op(".")? {
+            schema = Some(first);
+            name = self.any_ident("collation name")?;
+        }
+        if !schema.is_none_or(|value| value.eq_ignore_ascii_case("pg_catalog")) {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "schema \"{}\" does not exist", schema.unwrap()),
+                sqlstate: sqlstate::INVALID_SCHEMA_NAME,
+            });
+        }
+        if name.eq_ignore_ascii_case("c") {
+            Ok(crate::sql::ast::Collation::C)
+        } else if name.eq_ignore_ascii_case("posix") {
+            Ok(crate::sql::ast::Collation::Posix)
+        } else if name.eq_ignore_ascii_case("default") {
+            Ok(crate::sql::ast::Collation::Default)
+        } else if name.eq_ignore_ascii_case("ucs_basic") {
+            Ok(crate::sql::ast::Collation::UcsBasic)
+        } else {
+            Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "collation \"{}\" does not exist", name),
+                sqlstate: sqlstate::UNDEFINED_OBJECT,
+            })
         }
     }
 

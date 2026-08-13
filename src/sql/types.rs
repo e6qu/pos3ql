@@ -207,6 +207,14 @@ const ARRAY_CODE_BASE: u8 = 80;
 const RANGE_KINDS: u8 = 6;
 
 impl ColType {
+    /// Whether values of this type carry a PostgreSQL collation.
+    ///
+    /// Keeping this on the type prevents each catalog, DDL, and recovery path
+    /// from making its own incomplete list of collatable types.
+    pub const fn is_collatable(self) -> bool {
+        matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name)
+    }
+
     /// Pseudo-types describe executor contracts rather than stored values.
     pub const fn is_pseudo(self) -> bool {
         matches!(self, Self::Void | Self::Record)
@@ -1820,6 +1828,9 @@ pub struct ColDesc<'a> {
     /// declared modifier, a cast's target modifier, `-1` for every computed
     /// expression — matching what PostgreSQL sends.
     pub type_mod: i32,
+    /// The resolved collation identity of a collatable result.  It is internal
+    /// planning metadata, not a RowDescription wire field.
+    pub collation: crate::sql::ast::Collation,
 }
 
 impl<'a> ColDesc<'a> {
@@ -1829,16 +1840,30 @@ impl<'a> ColDesc<'a> {
             type_oid,
             typlen,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
         }
     }
 
     pub fn of_type(name: &'a str, t: ColType) -> Self {
-        Self::new(name, t.oid(), t.typlen())
+        Self {
+            collation: if t.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+            ..Self::new(name, t.oid(), t.typlen())
+        }
     }
 
     /// The same description carrying the column's declared type modifier.
     pub fn with_type_mod(mut self, type_mod: i32) -> Self {
         self.type_mod = type_mod;
+        self
+    }
+
+    /// The collation selected by the source expression or stored column.
+    pub fn with_collation(mut self, collation: crate::sql::ast::Collation) -> Self {
+        self.collation = collation;
         self
     }
 }

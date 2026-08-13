@@ -133,6 +133,11 @@ pub struct Config {
     /// Per-connection staging for one COPY FROM data row (rows may split
     /// across CopyData messages). A row larger than this fails loudly.
     pub copy_line_bytes: usize,
+    /// Locale resolved once for PostgreSQL's `default` collation. It is never
+    /// taken from the process environment during query execution.
+    pub database_collation_locale: String,
+    /// Startup-reserved bytes for each side of one locale comparison.
+    pub collation_scratch_bytes: usize,
 }
 
 impl Config {
@@ -186,6 +191,8 @@ impl Config {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             copy_line_bytes: 256 * KIB,
+            database_collation_locale: "C".to_string(),
+            collation_scratch_bytes: 256 * KIB,
         }
     }
 
@@ -416,6 +423,19 @@ impl Config {
                     config.copy_line_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "database_collation_locale" => {
+                    if value.is_empty() || value.as_bytes().contains(&0) {
+                        return Err(ConfigError::at(
+                            line_no,
+                            "database_collation_locale must be a non-empty locale name".to_string(),
+                        ));
+                    }
+                    config.database_collation_locale = value.to_string();
+                }
+                "collation_scratch_bytes" => {
+                    config.collation_scratch_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
@@ -458,6 +478,12 @@ impl Config {
                     "tls_on requires tls_key_file".to_string(),
                 ));
             }
+        }
+        if config.collation_scratch_bytes == 0 {
+            return Err(ConfigError::at(
+                0,
+                "collation_scratch_bytes must be greater than zero".to_string(),
+            ));
         }
         Ok(config)
     }
@@ -698,6 +724,17 @@ sql_arena_bytes = 4096
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
         assert!(Config::parse("just some words\n").is_err());
+        assert!(Config::parse("database_collation_locale = \n").is_err());
+        assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
+    }
+
+    #[test]
+    fn collation_runtime_configuration_is_explicit() {
+        let config =
+            Config::parse("database_collation_locale = C.UTF-8\ncollation_scratch_bytes = 8KiB\n")
+                .unwrap();
+        assert_eq!(config.database_collation_locale, "C.UTF-8");
+        assert_eq!(config.collation_scratch_bytes, 8 * KIB);
     }
 
     #[test]

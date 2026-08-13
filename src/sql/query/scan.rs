@@ -10,10 +10,11 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    BinaryOp, Expr, FromClause, JoinKind, Select, SelectItem, SetTree, TableRef,
+    BinaryOp, Collation, Expr, FromClause, JoinKind, Select, SelectItem, SetTree, TableRef,
 };
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums, eval_full, hash_key, sqlstate,
+    ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
+    hash_key_collated, sqlstate,
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -355,6 +356,10 @@ fn indexed_candidates<'a>(
         .expect("physical table has definition")
         .columns()[column]
         .ctype;
+    let target_collation = scope.defs[0]
+        .expect("physical table has definition")
+        .columns()[column]
+        .collation;
     let statistics = storage.table_statistics(slot, txid);
     let expected_rows = if statistics.valid && statistics.columns[column].valid {
         let distinct = statistics.columns[column].distinct_values.max(1);
@@ -392,7 +397,7 @@ fn indexed_candidates<'a>(
         if decoded[0].is_null() {
             return Ok(false);
         }
-        let ordering = compare_datums(&decoded[0], &value)?;
+        let ordering = compare_datums_collated(storage, target_collation, &decoded[0], &value)?;
         Ok(match operator {
             BinaryOp::Eq => ordering.is_eq(),
             BinaryOp::Lt => ordering.is_lt(),
@@ -402,7 +407,7 @@ fn indexed_candidates<'a>(
             _ => unreachable!("filtered comparison"),
         })
     };
-    let hash = hash_key(&[value], &[0]);
+    let hash = hash_key_collated(&[value], &[0], &[target_collation]);
     let mut count = 0usize;
     if operator == BinaryOp::Eq {
         let complete = storage.probe_value(slot, &columns, hash, |_| count += 1)?;
@@ -493,6 +498,22 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        match self.scope.find_column(qualifier, name).ok() {
+            Some(ResolvedColumn::Table(table, column)) => self.scope.defs[table]
+                .and_then(|definition| definition.columns().get(column))
+                .map(|column| column.collation)
+                .unwrap_or(crate::sql::ast::Collation::None),
+            Some(ResolvedColumn::Merged(merged)) => self.scope.merged[merged].parts
+                [..self.scope.merged[merged].n_parts]
+                .first()
+                .and_then(|&(table, column)| self.scope.defs[table]?.columns().get(column))
+                .map(|column| column.collation)
+                .unwrap_or(crate::sql::ast::Collation::None),
+            None => crate::sql::ast::Collation::None,
+        }
     }
 
     fn column_domain(
@@ -619,6 +640,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         self.inner
             .column_domain(q, name)
             .or_else(|| self.outer.and_then(|o| o.column_domain(q, name)))
+    }
+
+    fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        let inner = self.inner.collation(q, name);
+        if inner != crate::sql::ast::Collation::None {
+            inner
+        } else {
+            self.outer
+                .map(|outer| outer.collation(q, name))
+                .unwrap_or(crate::sql::ast::Collation::None)
+        }
     }
 
     /// Forwarded like the rest: a wrapper that answered this from the trait
@@ -1137,6 +1169,16 @@ fn hash_join_keys<'a>(
         };
         let pt = scope.defs[probe_t].expect("resolved").columns()[probe_col].ctype;
         let bt = scope.defs[build_t].expect("resolved").columns()[build_col].ctype;
+        let probe_collation = scope.defs[probe_t].expect("resolved").columns()[probe_col].collation;
+        let build_collation = scope.defs[build_t].expect("resolved").columns()[build_col].collation;
+        if probe_collation != build_collation {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::COLLATION_MISMATCH,
+                "collation mismatch between \"{}\" and \"{}\"",
+                probe_collation.name(),
+                build_collation.name()
+            ));
+        }
         if join_key_types_compatible(pt, bt) && npairs < pairs.len() {
             pairs[npairs] = (probe_col, build_col);
             npairs += 1;
@@ -1156,6 +1198,7 @@ pub(crate) struct HashJoinPlan<'a> {
     build_table: usize,
     keys: [(usize, usize); 8],
     key_count: usize,
+    key_collations: [Collation; 8],
     on: Option<&'a Expr<'a>>,
     preserves_probe_rows: bool,
     build_capacity: usize,
@@ -1186,17 +1229,15 @@ pub(crate) fn select_hash_join_plan<'a>(
     if scope.lateral[first_table] || scope.lateral[second_table] {
         return Ok(None);
     }
-    let (probe_table, build_table) = if scope.derived[first_table].is_some()
-        && scope.derived[second_table].is_none()
-        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
+    // Hash rows are fixed-schema base-table rows.
+    if scope.derived[first_table].is_some()
+        || scope.derived[second_table].is_some()
+        || scope.external_runs[first_table].is_some()
+        || scope.external_runs[second_table].is_some()
     {
-        (second_table, first_table)
-    } else {
-        (first_table, second_table)
-    };
-    if scope.derived[probe_table].is_some() {
         return Ok(None);
     }
+    let (probe_table, build_table) = (first_table, second_table);
     let on = join.on.or(scope.join_on[0]);
     let Some((keys, key_count)) =
         hash_join_keys(scope, on, where_clause, probe_table, build_table)?
@@ -1215,11 +1256,17 @@ pub(crate) fn select_hash_join_plan<'a>(
     if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
         return Ok(None);
     }
+    let mut key_collations = [Collation::None; 8];
+    for (index, &(probe_column, _)) in keys.iter().take(key_count).enumerate() {
+        key_collations[index] =
+            scope.defs[probe_table].expect("resolved").columns()[probe_column].collation;
+    }
     Ok(Some(HashJoinPlan {
         probe_table,
         build_table,
         keys,
         key_count,
+        key_collations,
         on,
         preserves_probe_rows: matches!(join.kind, JoinKind::Left),
         build_capacity,
@@ -1385,6 +1432,7 @@ fn scan_source_mode<'a>(
         let build_t = plan.build_table;
         let keys = plan.keys;
         let nkeys = plan.key_count;
+        let key_collations = plan.key_collations;
         let on = plan.on;
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs[build_t].expect("resolved");
@@ -1423,7 +1471,11 @@ fn scan_source_mode<'a>(
                         if n == entries.len() {
                             return Err(arena_full());
                         }
-                        let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                        let hash = hash_key_collated(
+                            &key_vals[..nkeys],
+                            &hash_cols[..nkeys],
+                            &key_collations[..nkeys],
+                        );
                         let bucket = (hash as usize) & (buckets_len - 1);
                         entries[n] = HashEntry {
                             hash,
@@ -1513,7 +1565,11 @@ fn scan_source_mode<'a>(
                     if n == entries.len() {
                         return Err(arena_full());
                     }
-                    let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                    let hash = hash_key_collated(
+                        &key_vals[..nkeys],
+                        &hash_cols[..nkeys],
+                        &key_collations[..nkeys],
+                    );
                     let bucket = (hash as usize) & (buckets_len - 1);
                     entries[n] = HashEntry {
                         hash,
@@ -1567,7 +1623,11 @@ fn scan_source_mode<'a>(
                             }
                             let mut matched_any = false;
                             if !any_null {
-                                let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                                let hash = hash_key_collated(
+                                    &key_vals[..nkeys],
+                                    &hash_cols[..nkeys],
+                                    &key_collations[..nkeys],
+                                );
                                 let mut index = buckets[(hash as usize) & (buckets_len - 1)];
                                 while index != u32::MAX {
                                     let entry = &entries[index as usize];
@@ -1585,7 +1645,9 @@ fn scan_source_mode<'a>(
                                         }
                                         let mut keys_match = true;
                                         for key in 0..nkeys {
-                                            if !compare_datums(
+                                            if !compare_datums_collated(
+                                                storage,
+                                                key_collations[key],
                                                 &build_values[keys[key].1],
                                                 &key_vals[key],
                                             )?
@@ -1719,7 +1781,11 @@ fn scan_source_mode<'a>(
                     }
                     let mut matched_any = false;
                     if !any_null {
-                        let hash = hash_key(&key_vals[..nkeys], &hash_cols[..nkeys]);
+                        let hash = hash_key_collated(
+                            &key_vals[..nkeys],
+                            &hash_cols[..nkeys],
+                            &key_collations[..nkeys],
+                        );
                         let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
                         while idx != u32::MAX {
                             let entry = &entries[idx as usize];
@@ -1735,7 +1801,13 @@ fn scan_source_mode<'a>(
                                 }
                                 let mut matched = true;
                                 for i in 0..nkeys {
-                                    if !compare_datums(&build_buf[keys[i].1], &key_vals[i])?.is_eq()
+                                    if !compare_datums_collated(
+                                        storage,
+                                        key_collations[i],
+                                        &build_buf[keys[i].1],
+                                        &key_vals[i],
+                                    )?
+                                    .is_eq()
                                     {
                                         matched = false;
                                         break;

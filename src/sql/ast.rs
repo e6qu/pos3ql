@@ -12,6 +12,68 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+/// A resolved built-in collation identity.  The parser resolves the spelling
+/// once, so execution cannot accept a `COLLATE` clause and accidentally lose
+/// its semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    None,
+    Default,
+    C,
+    Posix,
+    UcsBasic,
+}
+
+impl Collation {
+    /// Every built-in catalog collation. `None` is an attribute state, not a
+    /// catalog object, so it deliberately cannot appear in this list.
+    pub const BUILTIN: [Self; 4] = [Self::Default, Self::C, Self::Posix, Self::UcsBasic];
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Default => 100,
+            Self::C => 950,
+            Self::Posix => 951,
+            Self::UcsBasic => 12_340,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Default => "default",
+            Self::C => "C",
+            Self::Posix => "POSIX",
+            Self::UcsBasic => "ucs_basic",
+        }
+    }
+
+    pub const fn provider(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Default => "d",
+            Self::C | Self::Posix => "c",
+            Self::UcsBasic => "b",
+        }
+    }
+
+    pub const fn encoding(self) -> i32 {
+        match self {
+            Self::UcsBasic => 6,
+            Self::None | Self::Default | Self::C | Self::Posix => -1,
+        }
+    }
+
+    pub const fn libc_locale(self) -> &'static str {
+        match self {
+            Self::C => "C",
+            Self::Posix => "POSIX",
+            Self::None | Self::Default | Self::UcsBasic => "",
+        }
+    }
+}
+
 /// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
 /// from [`Stmt`] makes the parser's grammar guarantee available to execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -920,13 +982,14 @@ pub struct Cte<'a> {
 
 /// The materialized rows of a recursive CTE, bound during CTE expansion so a
 /// `FROM cte_name` reference resolves to a pre-computed row set instead of an
-/// inline subquery. Rows are projected-encoded; column types are carried as
-/// `(type oid, typlen, typmod)` triples so schema-only and executing paths
-/// retain the exact RowDescription state without a storage-layer dependency.
+/// inline subquery. Rows are projected-encoded; type, typmod, and collation
+/// metadata retain the exact derived-relation state without a storage-layer
+/// dependency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaterializedCte<'a> {
     pub column_names: &'a [&'a str],
     pub column_types: &'a [(i32, i16, i32)],
+    pub column_collations: &'a [Collation],
     pub rows: &'a [&'a [u8]],
     pub(crate) external_run: Option<crate::sql::external::ExternalRun>,
 }
@@ -1307,6 +1370,8 @@ pub struct ColumnDef<'a> {
     /// PostgreSQL atttypmod for the declared type: -1 when no `(...)` modifier.
     /// varchar(n)/char(n) encode `n + 4`; numeric(p,s) encodes `((p<<16)|s)+4`.
     pub type_mod: i32,
+    /// The collation selected by `COLLATE` or the database default.
+    pub collation: Collation,
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,
@@ -1671,6 +1736,12 @@ pub enum Expr<'a> {
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
         type_mod: i32,
     },
+    /// An explicit collation that remains part of expression identity until
+    /// the comparison, ordering, or key path consumes it.
+    Collate {
+        operand: &'a Expr<'a>,
+        collation: Collation,
+    },
     IsNull {
         operand: &'a Expr<'a>,
         negated: bool,
@@ -1867,6 +1938,7 @@ impl Expr<'_> {
             }
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. } => operand.is_constant(),
             Expr::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
             Expr::InList { operand, list, .. } => {
@@ -1938,6 +2010,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. } => operand.contains_call(),
             Expr::Slice { base, lower, upper } => {
@@ -2011,6 +2084,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. } => operand.contains_subquery(),
             Expr::Slice { base, lower, upper } => {
@@ -2125,6 +2199,7 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => None,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. } => operand.contains_nonimmutable_function(),
             Expr::Slice { base, lower, upper } => base
@@ -2202,6 +2277,7 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. } => operand.for_each_column(f),
             Expr::Slice { base, lower, upper } => {
@@ -2290,6 +2366,7 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. } => operand.for_each_column_reference(f),
             Expr::Slice { base, lower, upper } => {

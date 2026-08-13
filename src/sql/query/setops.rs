@@ -9,8 +9,8 @@
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
-use crate::sql::ast::{Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{SequenceAccess, SqlError, compare_datums, sqlstate};
+use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
+use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, Datum};
@@ -125,6 +125,7 @@ pub fn set_query<'a>(
     }
 
     // Materialize and combine the tree.
+    let collations: [Collation; MAX_PROJ] = core::array::from_fn(|index| columns[index].collation);
     let rows = match eval_set_tree(
         body,
         storage,
@@ -133,13 +134,14 @@ pub fn set_query<'a>(
         params,
         sequences,
         &target[..n_cols],
+        &collations[..n_cols],
     ) {
         Ok(r) => r,
         Err(e) => return sql_fail(e),
     };
 
     // ORDER BY (by output column position or name), then LIMIT/OFFSET.
-    if let Err(e) = sort_set_rows(arena, rows, q.order_by, &columns[..n_cols]) {
+    if let Err(e) = sort_set_rows(storage, arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
     let limit = match exec::eval_limit_pub(q.limit, arena, params) {
@@ -159,9 +161,12 @@ pub fn set_query<'a>(
     // output column, so ties compare those columns directly).
     if q.with_ties && limit > 0 && end < rows.len() && end > start {
         let boundary = rows[end - 1];
-        while end < rows.len() && set_rows_tie(boundary, rows[end], q.order_by, &columns[..n_cols])
-        {
-            end += 1;
+        while end < rows.len() {
+            match set_rows_tie(storage, boundary, rows[end], q.order_by, &columns[..n_cols]) {
+                Ok(true) => end += 1,
+                Ok(false) => break,
+                Err(error) => return sql_fail(error),
+            }
         }
     }
     let mut emitted = 0u64;
@@ -234,6 +239,7 @@ pub(crate) fn set_query_into_rows<'a>(
                 )
             })?;
     }
+    let collations: [Collation; MAX_PROJ] = core::array::from_fn(|index| columns[index].collation);
     let rows = eval_set_tree(
         body,
         storage,
@@ -242,8 +248,15 @@ pub(crate) fn set_query_into_rows<'a>(
         params,
         sequences,
         &target[..column_count],
+        &collations[..column_count],
     )?;
-    sort_set_rows(arena, rows, query.order_by, &columns[..column_count])?;
+    sort_set_rows(
+        storage,
+        arena,
+        rows,
+        query.order_by,
+        &columns[..column_count],
+    )?;
     let limit = exec::eval_limit_pub(query.limit, arena, params)?;
     let offset = exec::eval_offset_pub(query.offset, arena, params)?;
     let start = (offset as usize).min(rows.len());
@@ -252,11 +265,12 @@ pub(crate) fn set_query_into_rows<'a>(
         let boundary = rows[end - 1];
         while end < rows.len()
             && set_rows_tie(
+                storage,
                 boundary,
                 rows[end],
                 query.order_by,
                 &columns[..column_count],
-            )
+            )?
         {
             end += 1;
         }
@@ -317,6 +331,8 @@ fn resolve_set_order(
 }
 
 fn compare_set_order(
+    storage: &Storage,
+    columns: &[ColDesc],
     left: &[u8],
     right: &[u8],
     keys: &[(usize, bool, bool)],
@@ -331,7 +347,12 @@ fn compare_set_order(
             (false, true) if nulls_first => core::cmp::Ordering::Greater,
             (false, true) => core::cmp::Ordering::Less,
             (false, false) => {
-                let ordering = compare_datums(&left_value, &right_value)?;
+                let ordering = compare_datums_collated(
+                    storage,
+                    columns[index].collation,
+                    &left_value,
+                    &right_value,
+                )?;
                 if descending {
                     ordering.reverse()
                 } else {
@@ -655,8 +676,15 @@ pub(crate) fn external_set_body_into<'a>(
         let mut reader = storage.external_run_reader()?;
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        let mut compare =
-            |left: &[u8], right: &[u8]| compare_set_order(left, right, &keys[..key_count]);
+        let mut compare = |left: &[u8], right: &[u8]| {
+            compare_set_order(
+                storage,
+                &columns[..column_count],
+                left,
+                right,
+                &keys[..key_count],
+            )
+        };
         push_run(storage, &mut reader, run, &mut sorter, &mut compare)?;
         storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
@@ -676,11 +704,12 @@ pub(crate) fn external_set_body_into<'a>(
             && logical >= window
             && boundary_len > 0
             && set_rows_tie(
+                storage,
                 &context.boundary[..boundary_len],
                 context.row,
                 order_by,
                 &columns[..column_count],
-            );
+            )?;
         if logical >= window && !tied {
             break;
         }
@@ -763,8 +792,9 @@ fn external_set_query<'a>(
             Err(error) => return sql_fail(error),
         };
         sorter.reset();
-        let mut compare =
-            |left: &[u8], right: &[u8]| compare_set_order(left, right, &keys[..key_count]);
+        let mut compare = |left: &[u8], right: &[u8]| {
+            compare_set_order(storage, columns, left, right, &keys[..key_count])
+        };
         if let Err(error) = push_run(storage, &mut reader, run, &mut sorter, &mut compare) {
             return sql_fail(error);
         }
@@ -794,16 +824,20 @@ fn external_set_query<'a>(
     while reader.row().is_some() {
         let keep_scanning = {
             let context = reader.context().expect("current external set row");
-            let tied = query.with_ties
-                && limit > 0
-                && logical >= window
-                && boundary_len > 0
-                && set_rows_tie(
+            let tied = if query.with_ties && limit > 0 && logical >= window && boundary_len > 0 {
+                match set_rows_tie(
+                    storage,
                     &context.boundary[..boundary_len],
                     context.row,
                     query.order_by,
                     columns,
-                );
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                }
+            } else {
+                false
+            };
             if logical >= window && !tied {
                 false
             } else {
@@ -1009,6 +1043,10 @@ fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
 /// Materializes a set tree to self-describing rows, coercing every leaf's rows
 /// to the columns' common `target` types so the combining operators can match
 /// rows by their encoded bytes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set tree evaluation carries statement context"
+)]
 fn eval_set_tree<'a>(
     tree: &'a SetTree<'a>,
     storage: &'a Storage,
@@ -1017,6 +1055,7 @@ fn eval_set_tree<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
+    collations: &[Collation],
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
         SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, sequences, target),
@@ -1026,9 +1065,13 @@ fn eval_set_tree<'a>(
             left,
             right,
         } => {
-            let l = eval_set_tree(left, storage, txid, arena, params, sequences, target)?;
-            let r = eval_set_tree(right, storage, txid, arena, params, sequences, target)?;
-            combine_sets(*operator, *all, l, r, arena)
+            let l = eval_set_tree(
+                left, storage, txid, arena, params, sequences, target, collations,
+            )?;
+            let r = eval_set_tree(
+                right, storage, txid, arena, params, sequences, target, collations,
+            )?;
+            combine_sets(storage, collations, *operator, *all, l, r, arena)
         }
     }
 }
@@ -1109,6 +1152,8 @@ pub(crate) fn describe_set_body<'a>(
                     }
                 },
             }
+            columns[c].collation =
+                crate::sql::eval::unify_implicit_collations(columns[c].collation, lc[c].collation)?;
         }
     }
     // A column that stayed unknown across every branch (all NULL) is text.
@@ -1170,7 +1215,20 @@ fn materialize_set_body_tied<'a>(
     let target = arena
         .alloc_slice_copy(&tgt[..n])
         .map_err(|_| arena_full())?;
-    let rows = eval_set_tree(tree, storage, txid, arena, params, sequences, target)?;
+    let mut collations = [Collation::None; MAX_PROJ];
+    for (index, column) in columns[..n].iter().enumerate() {
+        collations[index] = column.collation;
+    }
+    let rows = eval_set_tree(
+        tree,
+        storage,
+        txid,
+        arena,
+        params,
+        sequences,
+        target,
+        &collations[..n],
+    )?;
     Ok((rows, target, n))
 }
 
@@ -1237,6 +1295,8 @@ fn eval_set_leaf<'a>(
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are
 /// unordered until the final ORDER BY), then merged by equal runs.
 fn combine_sets<'a>(
+    storage: &Storage,
+    collations: &[Collation],
     operator: SetOp,
     all: bool,
     l: &'a mut [&'a [u8]],
@@ -1246,8 +1306,33 @@ fn combine_sets<'a>(
     // UNION ALL preserves order (left rows then right, as scanned); only the
     // distinct set operations sort to merge/dedup.
     if !(operator == SetOp::Union && all) {
-        l.sort_unstable();
-        r.sort_unstable();
+        let mut error = None;
+        crate::mem::arena::stable_sort_via(arena, l, |left, right| {
+            match compare_set_rows(storage, collations, left, right) {
+                Ok(ordering) => ordering,
+                Err(value) => {
+                    error = Some(value);
+                    core::cmp::Ordering::Equal
+                }
+            }
+        })
+        .map_err(|_| arena_full())?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        crate::mem::arena::stable_sort_via(arena, r, |left, right| {
+            match compare_set_rows(storage, collations, left, right) {
+                Ok(ordering) => ordering,
+                Err(value) => {
+                    error = Some(value);
+                    core::cmp::Ordering::Equal
+                }
+            }
+        })
+        .map_err(|_| arena_full())?;
+        if let Some(error) = error {
+            return Err(error);
+        }
     }
     let empty: &[u8] = &[];
     let out = arena
@@ -1271,7 +1356,8 @@ fn combine_sets<'a>(
             let (mut i, mut j) = (0, 0);
             let mut last: Option<&[u8]> = None;
             while i < l.len() || j < r.len() {
-                let take_l = j >= r.len() || (i < l.len() && l[i] <= r[j]);
+                let take_l = j >= r.len()
+                    || (i < l.len() && compare_set_rows(storage, collations, l[i], r[j])?.is_le());
                 let row = if take_l {
                     i += 1;
                     l[i - 1]
@@ -1279,7 +1365,11 @@ fn combine_sets<'a>(
                     j += 1;
                     r[j - 1]
                 };
-                if last != Some(row) {
+                let distinct = match last {
+                    Some(prior) => !compare_set_rows(storage, collations, prior, row)?.is_eq(),
+                    None => true,
+                };
+                if distinct {
                     push(row, 1);
                     last = Some(row);
                 }
@@ -1291,16 +1381,16 @@ fn combine_sets<'a>(
                 // One equal run in l.
                 let row = l[i];
                 let mut cl = 0;
-                while i < l.len() && l[i] == row {
+                while i < l.len() && compare_set_rows(storage, collations, l[i], row)?.is_eq() {
                     cl += 1;
                     i += 1;
                 }
                 // Advance r past smaller values, then count the matching run.
-                while j < r.len() && r[j] < row {
+                while j < r.len() && compare_set_rows(storage, collations, r[j], row)?.is_lt() {
                     j += 1;
                 }
                 let mut chained_row = 0;
-                while j < r.len() && r[j] == row {
+                while j < r.len() && compare_set_rows(storage, collations, r[j], row)?.is_eq() {
                     chained_row += 1;
                     j += 1;
                 }
@@ -1318,13 +1408,43 @@ fn combine_sets<'a>(
     Ok(&mut out[..n])
 }
 
+fn compare_set_rows(
+    storage: &Storage,
+    collations: &[Collation],
+    left: &[u8],
+    right: &[u8],
+) -> Result<core::cmp::Ordering, SqlError> {
+    for (index, &collation) in collations.iter().enumerate() {
+        let left_value = exec::decode_projected_pub(left, index);
+        let right_value = exec::decode_projected_pub(right, index);
+        let ordering = match (left_value.is_null(), right_value.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Less,
+            (false, true) => core::cmp::Ordering::Greater,
+            (false, false) => {
+                compare_datums_collated(storage, collation, &left_value, &right_value)?
+            }
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(core::cmp::Ordering::Equal)
+}
+
 /// Sorts combined set-operation rows by the trailing ORDER BY, which may
 /// reference an output column by 1-based position or by name (from the first
 /// leaf). Other ORDER BY expressions over a set operation are unsupported.
 /// Whether two set-operation output rows tie on every ORDER BY column (the
 /// `WITH TIES` peer test). The ORDER BY has already been validated by
 /// [`sort_set_rows`], so an unresolvable key conservatively counts as no tie.
-pub(crate) fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[ColDesc]) -> bool {
+pub(crate) fn set_rows_tie(
+    storage: &Storage,
+    a: &[u8],
+    b: &[u8],
+    order_by: &[OrderBy],
+    columns: &[ColDesc],
+) -> Result<bool, SqlError> {
     for ob in order_by {
         let index = match ob.expression {
             Expr::Int(n) if *n >= 1 && (*n as usize) <= columns.len() => (*n as usize) - 1,
@@ -1333,25 +1453,28 @@ pub(crate) fn set_rows_tie(a: &[u8], b: &[u8], order_by: &[OrderBy], columns: &[
                 qualifier: None,
             } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
-                None => return false,
+                None => return Ok(false),
             },
-            _ => return false,
+            _ => return Ok(false),
         };
         let va = exec::decode_projected_pub(a, index);
         let vb = exec::decode_projected_pub(b, index);
         let equal = match (va.is_null(), vb.is_null()) {
             (true, true) => true,
-            (false, false) => compare_datums(&va, &vb).is_ok_and(|o| o.is_eq()),
+            (false, false) => {
+                compare_datums_collated(storage, columns[index].collation, &va, &vb)?.is_eq()
+            }
             _ => false,
         };
         if !equal {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 pub(crate) fn sort_set_rows(
+    storage: &Storage,
     arena: &Arena,
     rows: &mut [&[u8]],
     order_by: &[OrderBy],
@@ -1414,19 +1537,21 @@ pub(crate) fn sort_set_rows(
                         core::cmp::Ordering::Less
                     }
                 }
-                (false, false) => match compare_datums(&va, &vb) {
-                    Ok(o) => {
-                        if descending {
-                            o.reverse()
-                        } else {
-                            o
+                (false, false) => {
+                    match compare_datums_collated(storage, columns[index].collation, &va, &vb) {
+                        Ok(o) => {
+                            if descending {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            core::cmp::Ordering::Equal
                         }
                     }
-                    Err(e) => {
-                        err = Some(e);
-                        core::cmp::Ordering::Equal
-                    }
-                },
+                }
             };
             if ord != core::cmp::Ordering::Equal {
                 return ord;

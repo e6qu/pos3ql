@@ -40,9 +40,10 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
                 )
             }
         },
-        Unary { operand, .. } | IsNull { operand, .. } | Cast { operand, .. } => {
-            expr_tables(operand, scope)
-        }
+        Unary { operand, .. }
+        | IsNull { operand, .. }
+        | Cast { operand, .. }
+        | Collate { operand, .. } => expr_tables(operand, scope),
         Binary { left, right, .. } => Some(expr_tables(left, scope)? | expr_tables(right, scope)?),
         Between {
             operand, low, high, ..
@@ -1013,6 +1014,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         IsNull { operand, .. } => postpone_cost(operand, scope, arena),
         Cast { operand, .. } => postpone_cost(operand, scope, arena) + 2,
+        Collate { operand, .. } => postpone_cost(operand, scope, arena),
         Binary {
             operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
             left,

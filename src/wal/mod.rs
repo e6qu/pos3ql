@@ -1339,6 +1339,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             for fk in def.fkeys() {
                 n += 1 + fk.parent_schema.as_str().len();
             }
+            n += def.n_columns;
             n
         }
         WalOp::BeginTableRewrite {
@@ -1753,6 +1754,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= name_bytes(buffer, def.schema.as_str());
             for fk in def.fkeys() {
                 ok &= name_bytes(buffer, fk.parent_schema.as_str());
+            }
+            for column in def.columns() {
+                ok &= buffer.append(&[match column.collation {
+                    crate::sql::ast::Collation::None => 4,
+                    crate::sql::ast::Collation::Default => 0,
+                    crate::sql::ast::Collation::C => 1,
+                    crate::sql::ast::Collation::Posix => 2,
+                    crate::sql::ast::Collation::UcsBasic => 3,
+                }]);
             }
             ok
         }
@@ -2496,6 +2506,17 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     (at == payload.len()).then_some(statistics)
 }
 
+/// WAL records written before collations had their own trailing field still
+/// carry the PostgreSQL default on textual columns. Noncollatable columns have
+/// no collation even in that historical representation.
+fn legacy_collation(ctype: ColType) -> crate::sql::ast::Collation {
+    if ctype.is_collatable() {
+        crate::sql::ast::Collation::Default
+    } else {
+        crate::sql::ast::Collation::None
+    }
+}
+
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
@@ -2519,6 +2540,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     name: SqlName::parse("").ok()?,
                     ctype: ColType::Bool,
                     type_mod: -1,
+                    collation: crate::sql::ast::Collation::None,
                     not_null: false,
                     unique: false,
                     primary: false,
@@ -2571,6 +2593,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
                     type_mod,
+                    collation: legacy_collation(ColType::from_code(meta[0])?),
                     not_null: meta[1] & 1 != 0,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
@@ -2680,6 +2703,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 def.schema = SqlName::parse("public").ok()?;
                 for f in 0..def.n_fkeys {
                     def.fkeys[f].parent_schema = SqlName::parse("public").ok()?;
+                }
+            }
+            if at < payload.len() {
+                let collations = payload.get(at..at + n_cols)?;
+                at += n_cols;
+                for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
+                    column.collation = match code {
+                        0 => crate::sql::ast::Collation::Default,
+                        1 => crate::sql::ast::Collation::C,
+                        2 => crate::sql::ast::Collation::Posix,
+                        3 => crate::sql::ast::Collation::UcsBasic,
+                        4 => crate::sql::ast::Collation::None,
+                        _ => return None,
+                    };
                 }
             }
             (at == payload.len()).then_some(WalOp::CreateTable(def))
@@ -4458,6 +4495,7 @@ mod tests {
                 name: SqlName::parse("").unwrap(),
                 ctype: ColType::Bool,
                 type_mod: -1,
+                collation: crate::sql::ast::Collation::None,
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -4475,6 +4513,7 @@ mod tests {
             name: SqlName::parse("id").unwrap(),
             ctype: ColType::Int4,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             not_null: true,
             unique: true,
             primary: true,
@@ -4489,6 +4528,7 @@ mod tests {
             name: SqlName::parse("v").unwrap(),
             ctype: ColType::Text,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::C,
             not_null: false,
             unique: false,
             primary: false,
@@ -4541,6 +4581,32 @@ mod tests {
         })
         .unwrap();
         seen
+    }
+
+    #[test]
+    fn legacy_table_payload_restores_collation_only_for_textual_columns() {
+        let definition = sample_def();
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "legacy table payload", 4096).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable(definition)
+        ));
+        let legacy_len = payload.len() - definition.n_columns;
+        let WalOp::CreateTable(restored) =
+            decode_op(KIND_CREATE, &payload.readable()[..legacy_len])
+                .expect("legacy table payload decodes")
+        else {
+            panic!("expected table definition");
+        };
+        assert_eq!(
+            restored.columns()[0].collation,
+            crate::sql::ast::Collation::None
+        );
+        assert_eq!(
+            restored.columns()[1].collation,
+            crate::sql::ast::Collation::Default
+        );
     }
 
     #[test]

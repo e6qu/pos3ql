@@ -1143,8 +1143,9 @@ impl Checkpointer {
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
                 }
-                tag @ (Some("col") | Some("col2")) => {
-                    let has_user_type_schema = tag == Some("col2");
+                tag @ (Some("col") | Some("col2") | Some("col3")) => {
+                    let has_user_type_schema = matches!(tag, Some("col2") | Some("col3"));
+                    let has_collation = tag == Some("col3");
                     let Some((_, def, seen, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
@@ -1165,6 +1166,26 @@ impl Checkpointer {
                         )?))
                     };
                     let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
+                    let ctype = ColType::from_code(type_code)
+                        .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?;
+                    let collation = if has_collation {
+                        match parse_field::<u8>(words.next(), "col collation")? {
+                            0 => crate::sql::ast::Collation::Default,
+                            1 => crate::sql::ast::Collation::C,
+                            2 => crate::sql::ast::Collation::Posix,
+                            3 => crate::sql::ast::Collation::UcsBasic,
+                            4 => crate::sql::ast::Collation::None,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "unknown column collation",
+                                ));
+                            }
+                        }
+                    } else if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    };
                     let user_type_schema = if has_user_type_schema {
                         let schema_hex = words.next().ok_or(CheckpointSetupError::Corrupt(
                             "col user type schema missing",
@@ -1196,7 +1217,15 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, if has_user_type_schema { 9 } else { 8 })?;
+                    let name = rest_of(
+                        line,
+                        match (has_user_type_schema, has_collation) {
+                            (true, true) => 10,
+                            (true, false) => 9,
+                            (false, false) => 8,
+                            (false, true) => unreachable!(),
+                        },
+                    )?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -1211,9 +1240,9 @@ impl Checkpointer {
                     def.columns[*seen] = ColumnMeta {
                         name: sql_name(name)?,
                         user_type,
-                        ctype: ColType::from_code(type_code)
-                            .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?,
+                        ctype,
                         type_mod,
+                        collation,
                         not_null: not_null & 1 != 0,
                         unique: not_null & 2 != 0,
                         primary: not_null & 4 != 0,
@@ -3140,13 +3169,20 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col2 {} {} {} {} {} {} {} {} {}",
+                        "col3 {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
+                        match c.collation {
+                            crate::sql::ast::Collation::None => 4,
+                            crate::sql::ast::Collation::Default => 0,
+                            crate::sql::ast::Collation::C => 1,
+                            crate::sql::ast::Collation::Posix => 2,
+                            crate::sql::ast::Collation::UcsBasic => 3,
+                        },
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
                         c.name.as_str()
@@ -5127,6 +5163,7 @@ fn empty_column() -> ColumnMeta {
         name: SqlName::parse("").expect("empty fits"),
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         not_null: false,
         unique: false,
         primary: false,

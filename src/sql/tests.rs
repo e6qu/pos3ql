@@ -21,6 +21,7 @@ fn test_config(name: &str) -> Config {
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;
     config.work_arena_bytes = 1 << 21;
+    config.collation_scratch_bytes = 4 << 10;
     config
 }
 
@@ -1415,6 +1416,115 @@ fn update_and_delete() {
     run_with(&mut e, &mut b, "DELETE FROM t WHERE id = 2");
     let bytes = run_with(&mut e, &mut b, "SELECT id FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1", "3"]);
+}
+
+#[test]
+fn database_default_collation_is_bounded_and_never_substitutes_byte_ordering() {
+    let mut config = test_config("database-default-collation");
+    config.collation_scratch_bytes = 2;
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(&mut engine, &mut budget, "CREATE TABLE t (value text)");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO t VALUES ('ab'), ('Z')",
+    );
+    let default_predicate = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM t WHERE value = 'ab'",
+    );
+    assert_eq!(message_types(&default_predicate).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_predicate).contains("54000"));
+    for statement in [
+        "SELECT value FROM t WHERE value BETWEEN 'aa' AND 'zz'",
+        "SELECT greatest(value, 'Z') FROM t",
+        "SELECT CASE value WHEN 'ab' THEN 1 ELSE 0 END FROM t",
+    ] {
+        let result = run_with(&mut engine, &mut budget, statement);
+        assert_eq!(message_types(&result).last(), Some(&b'E'), "{statement}");
+        assert!(
+            String::from_utf8_lossy(&result).contains("54000"),
+            "{statement}"
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM t WHERE value COLLATE \"C\" = 'ab'",
+        )),
+        ["ab"]
+    );
+    let default_order = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM t ORDER BY value",
+    );
+    assert_eq!(message_types(&default_order).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_order).contains("54000"));
+    let default_group = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value, count(*) FROM t GROUP BY value",
+    );
+    assert_eq!(message_types(&default_group).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_group).contains("54000"));
+    let default_min = run_with(&mut engine, &mut budget, "SELECT min(value) FROM t");
+    assert_eq!(message_types(&default_min).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_min).contains("54000"));
+    let default_aggregate_distinct = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(DISTINCT value) FROM t",
+    );
+    assert_eq!(
+        message_types(&default_aggregate_distinct).last(),
+        Some(&b'E')
+    );
+    assert!(String::from_utf8_lossy(&default_aggregate_distinct).contains("54000"));
+    let default_distinct = run_with(&mut engine, &mut budget, "SELECT DISTINCT value FROM t");
+    assert_eq!(message_types(&default_distinct).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_distinct).contains("54000"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE u (value text UNIQUE)",
+    );
+    run_with(&mut engine, &mut budget, "INSERT INTO u VALUES ('Z')");
+    let default_unique = run_with(&mut engine, &mut budget, "INSERT INTO u VALUES ('ab')");
+    assert_eq!(message_types(&default_unique).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_unique).contains("54000"));
+    let default_join = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT t.value FROM t JOIN u ON t.value = u.value",
+    );
+    assert_eq!(message_types(&default_join).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_join).contains("54000"));
+    let default_window = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT rank() OVER (ORDER BY value) FROM t",
+    );
+    assert_eq!(message_types(&default_window).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_window).contains("54000"));
+    let default_set = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM t UNION SELECT value FROM u",
+    );
+    assert_eq!(message_types(&default_set).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&default_set).contains("54000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value COLLATE \"C\", count(*) FROM t GROUP BY value COLLATE \"C\" ORDER BY 1",
+        )),
+        ["Z|1", "ab|1"]
+    );
 }
 
 #[test]
@@ -5383,7 +5493,7 @@ fn regex_match_operators_and_operator_syntax() {
     assert!(run_txn(&mut e, &mut b, &mut t, "SELECT 'ABC' ~* '^abc'").contains('t'));
     assert!(run_txn(&mut e, &mut b, &mut t, "SELECT 'ABC' ~ '^abc'").contains('f'));
     // Grouping + alternation, and the explicit OPERATOR(...) syntax psql
-    // emits, plus COLLATE (accepted, default collation).
+    // emits, plus an explicit collation.
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut e,
@@ -5400,9 +5510,297 @@ fn regex_match_operators_and_operator_syntax() {
         "SELECT 'a' COLLATE pg_catalog.pg_unicode_fast",
     );
     assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        String::from_utf8_lossy(&unsupported).contains("42704"),
         "{}",
         String::from_utf8_lossy(&unsupported)
+    );
+}
+
+#[test]
+fn collate_is_retained_in_the_expression_tree() {
+    let mut budget = Budget::new(4096);
+    let arena = Arena::new(&mut budget, "collation AST test", 4096).unwrap();
+    let expression = crate::sql::parser::parse_expr("value COLLATE pg_catalog.C", &arena)
+        .expect("valid COLLATE expression");
+    assert!(matches!(
+        expression,
+        crate::sql::ast::Expr::Collate {
+            operand: crate::sql::ast::Expr::Column { name: "value", .. },
+            collation: crate::sql::ast::Collation::C,
+        }
+    ));
+}
+
+#[test]
+fn collatable_builtin_types_expose_the_default_collation() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname, typcollation FROM pg_type \
+             WHERE typname IN ('text', 'varchar', 'bpchar', 'name', 'int4') ORDER BY typname",
+        )),
+        [
+            "bpchar|100",
+            "int4|0",
+            "name|100",
+            "text|100",
+            "varchar|100"
+        ],
+    );
+}
+
+#[test]
+fn column_collation_survives_wal_and_checkpoint_recovery() {
+    let config = test_config("collation-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE collation_values (bytewise text COLLATE \"C\", plain integer)",
+        );
+        assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT attname, attcollation FROM pg_attribute \
+                 WHERE attrelid = 'collation_values'::regclass ORDER BY attnum",
+            )),
+            ["bytewise|950", "plain|0"],
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE INDEX collation_values_bytewise_index ON collation_values (bytewise); \
+                 SELECT indcollation FROM pg_index \
+                 WHERE indexrelid = 'collation_values_bytewise_index'::regclass",
+            )),
+            ["{950}"],
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname, attcollation FROM pg_attribute \
+             WHERE attrelid = 'collation_values'::regclass ORDER BY attnum",
+        )),
+        ["bytewise|950", "plain|0"],
+    );
+}
+
+#[test]
+fn expression_index_collation_is_derived_from_its_text_argument() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (value text COLLATE \"C\"); \
+         CREATE INDEX collation_lower_index ON collation_values (lower(value)); \
+         SELECT indcollation FROM pg_index \
+         WHERE indexrelid = 'collation_lower_index'::regclass",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{950}"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn derived_projection_retains_its_declared_collation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (value text COLLATE \"C\"); \
+         CREATE TABLE posix_values (value text COLLATE \"POSIX\"); \
+         INSERT INTO collation_values VALUES ('a'); \
+         INSERT INTO posix_values VALUES ('a'); \
+         SELECT * FROM (SELECT value FROM collation_values) AS projected \
+         JOIN posix_values ON projected.value = posix_values.value",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn recursive_cte_retains_its_declared_collation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (value text COLLATE \"C\"); \
+         CREATE TABLE posix_values (value text COLLATE \"POSIX\"); \
+         INSERT INTO collation_values VALUES ('a'); \
+         INSERT INTO posix_values VALUES ('a'); \
+         WITH RECURSIVE projected(value) AS ( \
+             SELECT value FROM collation_values \
+             UNION ALL \
+             SELECT value FROM projected WHERE false \
+         ) \
+         SELECT * FROM projected JOIN posix_values \
+         ON projected.value = posix_values.value",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn data_modifying_cte_retains_returning_collation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (value text COLLATE \"C\"); \
+         CREATE TABLE posix_values (value text COLLATE \"POSIX\"); \
+         INSERT INTO collation_values VALUES ('a'); \
+         INSERT INTO posix_values VALUES ('a'); \
+         WITH projected AS ( \
+             UPDATE collation_values SET value = value RETURNING value \
+         ) \
+         SELECT * FROM projected JOIN posix_values \
+         ON projected.value = posix_values.value",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn set_operation_rejects_incompatible_collation_identities() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE c_values (value text COLLATE \"C\"); \
+         CREATE TABLE posix_values (value text COLLATE \"POSIX\"); \
+         SELECT value FROM c_values UNION SELECT value FROM posix_values",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn noncollatable_column_rejects_explicit_collation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE invalid_collation (value integer COLLATE \"C\")",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42804"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn comparison_rejects_conflicting_explicit_collations() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ('a' COLLATE \"C\") = ('a' COLLATE \"POSIX\")",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn collatable_result_expressions_reject_conflicting_explicit_collations() {
+    let (mut engine, mut budget) = test_engine();
+    for sql_text in [
+        "SELECT ('a' COLLATE \"C\" || 'b' COLLATE \"POSIX\") = 'ab'",
+        "SELECT (CASE WHEN true THEN 'a' COLLATE \"C\" ELSE 'b' COLLATE \"POSIX\" END) = 'a'",
+        "SELECT coalesce('a' COLLATE \"C\", 'b' COLLATE \"POSIX\") = 'a'",
+        "SELECT greatest('a' COLLATE \"C\", 'b' COLLATE \"POSIX\") = 'b'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql_text);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42P21"),
+            "{sql_text}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn explicit_collation_overrides_declared_column_collation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (value text COLLATE \"C\"); \
+         INSERT INTO collation_values VALUES ('a'); \
+         SELECT value = ('a' COLLATE \"POSIX\") FROM collation_values",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn hash_join_rejects_conflicting_column_collations() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_left (value text COLLATE \"C\"); \
+         CREATE TABLE collation_right (value text COLLATE \"POSIX\"); \
+         SELECT * FROM collation_left AS left_value \
+         JOIN collation_right AS right_value ON left_value.value = right_value.value",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn comparison_rejects_conflicting_implicit_column_collations() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_values (left_value text COLLATE \"C\", \
+                                        right_value text COLLATE \"POSIX\"); \
+         INSERT INTO collation_values VALUES ('a', 'a'); \
+         SELECT left_value = right_value FROM collation_values",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P21"),
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

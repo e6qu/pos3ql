@@ -50,7 +50,7 @@ pub(super) fn srf_in_expr<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
     match e {
         Expr::Call { name, .. } if is_srf_name(name) => Some(e),
         Expr::Field { base, .. } => srf_in_expr(base),
-        Expr::Cast { operand, .. } => srf_in_expr(operand),
+        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => srf_in_expr(operand),
         Expr::Unary { operand, .. } => srf_in_expr(operand),
         Expr::Binary { left, right, .. } => srf_in_expr(left).or_else(|| srf_in_expr(right)),
         Expr::Call { args, .. } => args.iter().find_map(|a| srf_in_expr(a)),
@@ -373,6 +373,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
     outer: Option<&QueryScope<'a>>,
 ) -> Result<&'a TableDef, SqlError> {
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => describe_set_body(storage, tree, txid, &mut descriptors, arena)?,
         None => match &sub.from {
@@ -436,6 +437,32 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                     );
                                 }
                             }
+                            slot += 1;
+                        }
+                    }
+                }
+                let mut slot = 0usize;
+                for item in sub.items {
+                    match item {
+                        SelectItem::Wildcard => {
+                            for position in 0..ss.star_columns() {
+                                output_collations[slot] =
+                                    ss.output_collation(ss.star_entry(position));
+                                slot += 1;
+                            }
+                        }
+                        SelectItem::TableWildcard(name) => {
+                            let table = ss.table_index(name)?;
+                            for column in ss.defs[table].expect("resolved").columns() {
+                                output_collations[slot] = column.collation;
+                                slot += 1;
+                            }
+                        }
+                        SelectItem::RecordStar(base) => {
+                            slot += record_star_width(base, &ss);
+                        }
+                        SelectItem::Expr { expression, .. } => {
+                            output_collations[slot] = ss.expression_collation(expression)?;
                             slot += 1;
                         }
                     }
@@ -507,6 +534,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         not_null: false,
         unique: false,
         primary: false,
@@ -533,6 +561,14 @@ pub(crate) fn synth_derived_def_outer<'a>(
             name: SqlName::parse(descriptors[i].name)?,
             ctype,
             type_mod: descriptors[i].type_mod,
+            collation: if ctype.is_collatable() {
+                match output_collations[i] {
+                    crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
+                    collation => collation,
+                }
+            } else {
+                crate::sql::ast::Collation::None
+            },
             user_type,
             ..blank
         };
@@ -621,6 +657,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         not_null: false,
         unique: false,
         primary: false,
@@ -745,6 +782,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         columns[i] = ColumnMeta {
             name: col_name,
             ctype: *ctype,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
             ..blank
         };
     }

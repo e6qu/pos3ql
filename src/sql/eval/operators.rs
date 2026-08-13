@@ -4,7 +4,7 @@
 //! only on the value modules, not on `eval_full`.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{BinaryOp, UnaryOp};
+use crate::sql::ast::{BinaryOp, Collation, UnaryOp};
 use crate::sql::numeric::{self, Numeric};
 use crate::sql::types::{Datum, Interval, RangeKind, RecordField};
 use crate::sql::{array, datetime, range};
@@ -19,6 +19,55 @@ use super::{
     jsonb_delete, jsonb_delete_path, like_match, num_factor, out_of_range, overflow, parse_bool,
     parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits,
 };
+
+/// Text comparison is a distinct choke point because byte ordering is correct
+/// only for bytewise collations. The default identity always delegates to the
+/// startup-owned comparator instead of the process-global locale.
+pub(crate) fn compare_text_collated<'a>(
+    operator: BinaryOp,
+    l: Datum<'a>,
+    r: Datum<'a>,
+    l_unknown: bool,
+    r_unknown: bool,
+    collation: Collation,
+    catalog: Option<&dyn super::CatalogAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
+    let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
+    let (left, right) = match (l, r) {
+        (Datum::Text(left), Datum::Text(right)) => (left, right),
+        (Datum::Bpchar(left), Datum::Bpchar(right)) => {
+            (left.trim_end_matches(' '), right.trim_end_matches(' '))
+        }
+        (Datum::Bpchar(left), Datum::Text(right)) => (left.trim_end_matches(' '), right),
+        (Datum::Text(left), Datum::Bpchar(right)) => (left, right.trim_end_matches(' ')),
+        _ => return compare(operator, l, r, false, false),
+    };
+    let ordering = match collation {
+        Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => left.cmp(right),
+        Collation::Default => catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "database collation comparator is unavailable"
+                )
+            })?
+            .compare_text(collation, left, right)?,
+    };
+    let out = match operator {
+        BinaryOp::Eq => ordering.is_eq(),
+        BinaryOp::NotEq => ordering.is_ne(),
+        BinaryOp::Lt => ordering.is_lt(),
+        BinaryOp::LtEq => ordering.is_le(),
+        BinaryOp::Gt => ordering.is_gt(),
+        BinaryOp::GtEq => ordering.is_ge(),
+        _ => unreachable!(),
+    };
+    Ok(Datum::Bool(out))
+}
 
 /// An unknown-type literal facing an array operand takes the array's type, the
 /// way [`coerce_unknown`] gives it the type of a scalar one. It cannot live in
@@ -425,6 +474,59 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
     compare_datums_as("=", l, r)
 }
 
+/// Compares values under a resolved SQL collation.  Text and blank-padded char
+/// share the database comparator; every other type retains its native order.
+pub fn compare_datums_collated(
+    storage: &crate::storage::Storage,
+    collation: Collation,
+    left: &Datum<'_>,
+    right: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let (left, right) = match (left, right) {
+        (Datum::Text(left), Datum::Text(right)) => (*left, *right),
+        (Datum::Bpchar(left), Datum::Bpchar(right)) => {
+            (left.trim_end_matches(' '), right.trim_end_matches(' '))
+        }
+        (Datum::Bpchar(left), Datum::Text(right)) => (left.trim_end_matches(' '), *right),
+        (Datum::Text(left), Datum::Bpchar(right)) => (*left, right.trim_end_matches(' ')),
+        _ => return compare_datums(left, right),
+    };
+    storage.compare_text(collation, left, right)
+}
+
+/// The evaluator-facing form of [`compare_datums_collated`].  Aggregate and
+/// expression execution have a catalog capability rather than a `Storage`
+/// reference, but must retain exactly the same default-collation contract.
+pub fn compare_datums_with_catalog(
+    collation: Collation,
+    catalog: Option<&dyn super::CatalogAccess>,
+    left: &Datum<'_>,
+    right: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let (left, right) = match (left, right) {
+        (Datum::Text(left), Datum::Text(right)) => (*left, *right),
+        (Datum::Bpchar(left), Datum::Bpchar(right)) => {
+            (left.trim_end_matches(' '), right.trim_end_matches(' '))
+        }
+        (Datum::Bpchar(left), Datum::Text(right)) => (left.trim_end_matches(' '), *right),
+        (Datum::Text(left), Datum::Bpchar(right)) => (*left, right.trim_end_matches(' ')),
+        _ => return compare_datums(left, right),
+    };
+    match collation {
+        Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
+            Ok(left.cmp(right))
+        }
+        Collation::Default => catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "database collation comparator is unavailable"
+                )
+            })?
+            .compare_text(collation, left, right),
+    }
+}
+
 /// Hashes a key tuple for the value index (the uniqueness/foreign-key probe
 /// accelerator). The hash MUST agree with [`compare_datums`] equality — equal
 /// values hash equal — so the index never misses a true collision; unequal
@@ -441,6 +543,25 @@ pub fn hash_key(values: &[Datum], columns: &[u16]) -> u64 {
     let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
     for &col in columns {
         hash_datum(&values[col as usize], &mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Hashes a tuple without ever excluding values equal under its SQL collation.
+/// Locale equality has no portable fixed-width transform, so default-collated
+/// text deliberately shares one hash bucket and is rechecked by the caller.
+pub fn hash_key_collated(values: &[Datum], columns: &[u16], collations: &[Collation]) -> u64 {
+    use core::hash::Hasher as _;
+    let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+    for (index, &column) in columns.iter().enumerate() {
+        let datum = &values[column as usize];
+        if collations[index] == Collation::Default
+            && matches!(datum, Datum::Text(_) | Datum::Bpchar(_))
+        {
+            hasher.write(&[0x54]);
+        } else {
+            hash_datum(datum, &mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -1886,5 +2007,15 @@ mod hash_tests {
             assert!(compare_datums(&a, &b).unwrap().is_eq(), "{a:?} == {b:?}");
             assert_eq!(h(a), h(b));
         }
+    }
+
+    #[test]
+    fn default_collation_hash_never_excludes_a_locale_equal_text_pair() {
+        let left = [Datum::Text("a")];
+        let right = [Datum::Text("A")];
+        assert_eq!(
+            hash_key_collated(&left, &[0], &[Collation::Default]),
+            hash_key_collated(&right, &[0], &[Collation::Default]),
+        );
     }
 }

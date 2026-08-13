@@ -105,6 +105,18 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             .map(|i| self.def.columns()[i].ctype)
     }
 
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if let Some(q) = qualifier
+            && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
+        {
+            return crate::sql::ast::Collation::None;
+        }
+        self.def
+            .column_index(name)
+            .map(|index| self.def.columns()[index].collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if let Some(q) = qualifier
             && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
@@ -1086,7 +1098,14 @@ fn find_conflict<'a>(
                             &expressions[..*n_columns],
                             arena,
                         )?;
+                        let collations = crate::sql::exec::constraints::index_key_collations(
+                            def,
+                            &columns[..*n_columns],
+                            &expressions[..*n_columns],
+                        )?;
                         crate::sql::exec::constraints::key_values_equal(
+                            storage,
+                            &collations[..*n_columns],
                             &keys[..*n_columns],
                             &other_keys[..*n_columns],
                             *nulls_not_distinct,
@@ -1144,9 +1163,16 @@ fn find_conflict<'a>(
                             &partial_index.expressions[..partial_index.n_columns],
                             arena,
                         )?;
+                        let collations = crate::sql::exec::constraints::index_key_collations(
+                            def,
+                            &partial_index.columns[..partial_index.n_columns],
+                            &partial_index.expressions[..partial_index.n_columns],
+                        )?;
                         if candidate_member
                             && other_member
                             && crate::sql::exec::constraints::key_values_equal(
+                                storage,
+                                &collations[..partial_index.n_columns],
                                 &candidate_keys[..partial_index.n_columns],
                                 &other_keys[..partial_index.n_columns],
                                 partial_index.nulls_not_distinct,
@@ -7054,6 +7080,11 @@ pub fn create_table_as(
             name: parsed,
             ctype,
             type_mod: columns[i].type_mod,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
             not_null: false,
             unique: false,
             primary: false,

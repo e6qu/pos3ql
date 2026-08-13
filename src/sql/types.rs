@@ -2039,6 +2039,7 @@ mod tests {
             ColType::Cidr,
             ColType::Macaddr,
             ColType::Macaddr8,
+            ColType::Record,
         ];
         for k in [
             RangeKind::Int4,

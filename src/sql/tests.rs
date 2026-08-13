@@ -1776,6 +1776,20 @@ fn unimplemented_operator_catalog_fails_instead_of_looking_empty() {
 }
 
 #[test]
+fn catalog_oid_columns_unify_with_regclass_set_operands() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT classid FROM pg_depend UNION ALL SELECT 'pg_opfamily'::regclass",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::OID]
+    );
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(

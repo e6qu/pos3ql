@@ -4032,11 +4032,11 @@ fn pg_depend<'a>(
     let def = def_of(
         "pg_depend",
         &[
-            ("classid", ColType::Int4),
-            ("objid", ColType::Int4),
+            ("classid", ColType::Oid),
+            ("objid", ColType::Oid),
             ("objsubid", ColType::Int4),
-            ("refclassid", ColType::Int4),
-            ("refobjid", ColType::Int4),
+            ("refclassid", ColType::Oid),
+            ("refobjid", ColType::Oid),
             ("refobjsubid", ColType::Int4),
             ("deptype", ColType::Bpchar),
         ],

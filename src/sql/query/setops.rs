@@ -981,6 +981,12 @@ fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if a == b {
         return Some(a);
     }
+    // Catalog object aliases are OID domains. Set operations erase that
+    // alias, exactly as PostgreSQL does when an OID catalog column meets a
+    // `regclass`/`regproc`-style expression.
+    if (a == ColType::Oid && b.is_reg_object()) || (b == ColType::Oid && a.is_reg_object()) {
+        return Some(ColType::Oid);
+    }
     // The full numeric tower — omitting int2 or real here left `smallint UNION
     // integer` and `real UNION double precision` failing to unify.
     let numeric = |t| {

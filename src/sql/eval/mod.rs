@@ -1291,9 +1291,18 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, &member)?;
                 let r = coerce_unknown(member, &l)?;
-                let collation = resolve_comparison_collation(operand, item, row)?;
-                if compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?.is_eq() {
-                    return Ok(Datum::Bool(!negated));
+                match (&l, &r) {
+                    (Datum::Text(_) | Datum::Bpchar(_), Datum::Text(_) | Datum::Bpchar(_)) => {
+                        let collation = resolve_comparison_collation(operand, item, row)?;
+                        if compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?.is_eq() {
+                            return Ok(Datum::Bool(!negated));
+                        }
+                    }
+                    _ => match membership_eq(&l, &r)? {
+                        Some(true) => return Ok(Datum::Bool(!negated)),
+                        Some(false) => {}
+                        None => saw_null = true,
+                    },
                 }
             }
             Ok(if saw_null {

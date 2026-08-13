@@ -1528,6 +1528,37 @@ fn database_default_collation_is_bounded_and_never_substitutes_byte_ordering() {
 }
 
 #[test]
+fn default_collation_keeps_group_having_and_text_aggregates_executable() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE collation_groups (group_id int, value text, amount int)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO collation_groups VALUES (1, 'z', 120), (1, 'a', 100), (2, 'm', 90)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT group_id, sum(amount) FROM collation_groups GROUP BY group_id HAVING sum(amount) > 100 ORDER BY group_id",
+        )),
+        ["1|220"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT min(value), max(value) FROM collation_groups",
+        )),
+        ["a|z"]
+    );
+}
+
+#[test]
 fn constraint_and_type_errors() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (id int NOT NULL, v text)");

@@ -101,9 +101,15 @@ fn projected_shape<'a>(
 ) -> Result<(u32, StackStr<256>), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
     let count = match scope {
-        Some(scope) => {
-            query::describe_scope_items(statement.items, scope, storage, txid, arena, &mut columns)?
-        }
+        Some(scope) => query::describe_scope_items(
+            statement.items,
+            scope,
+            None,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+        )?,
         None => query::describe_catalog_items(statement.items, None, storage, txid, &mut columns)?,
     };
     let mut width = 0u32;

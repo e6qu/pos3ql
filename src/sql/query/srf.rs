@@ -378,8 +378,15 @@ pub(crate) fn synth_derived_def_outer<'a>(
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
-                let n =
-                    describe_scope_items(sub.items, &ss, storage, txid, arena, &mut descriptors)?;
+                let n = describe_scope_items(
+                    sub.items,
+                    &ss,
+                    outer,
+                    storage,
+                    txid,
+                    arena,
+                    &mut descriptors,
+                )?;
                 // A bare scalar/array subquery item (possibly correlated) has
                 // no static type from the scope and describes as text; infer
                 // its real type from the inner select's projection so the
@@ -415,8 +422,12 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                 let inner_scope = inner_sub.from.as_ref().and_then(|inf| {
                                     QueryScope::resolve_schema(storage, inf, txid, arena).ok()
                                 });
-                                let witness =
-                                    subquery_witness(inner, inner_scope.as_ref().or(Some(&ss)));
+                                let witness = subquery_witness(
+                                    storage,
+                                    txid,
+                                    inner,
+                                    inner_scope.as_ref().or(Some(&ss)),
+                                )?;
                                 if !witness.is_null() {
                                     descriptors[slot] = ColDesc::new(
                                         descriptors[slot].name,
@@ -436,6 +447,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
             None if outer.is_some() => describe_scope_items(
                 sub.items,
                 outer.expect("checked"),
+                None,
                 storage,
                 txid,
                 arena,
@@ -507,18 +519,21 @@ pub(crate) fn synth_derived_def_outer<'a>(
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
-        let ct = crate::sql::exec::coltype_of_oid(descriptors[i].type_oid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "derived table column \"{}\" type (oid {}) is not supported",
-                descriptors[i].name,
-                descriptors[i].type_oid
-            )
-        })?;
+        let (ctype, user_type) =
+            crate::sql::exec::catalog_column_type(storage, txid, descriptors[i].type_oid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "derived table column \"{}\" type (oid {}) is not supported",
+                        descriptors[i].name,
+                        descriptors[i].type_oid
+                    )
+                })?;
         columns[i] = ColumnMeta {
             name: SqlName::parse(descriptors[i].name)?,
-            ctype: ct,
+            ctype,
             type_mod: descriptors[i].type_mod,
+            user_type,
             ..blank
         };
     }

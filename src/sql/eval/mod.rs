@@ -105,6 +105,7 @@ pub mod sqlstate {
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const NUMERIC_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
@@ -447,8 +448,44 @@ pub trait CatalogAccess {
     fn role_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// Resolve a role name to its catalog OID.
+    fn role_oid(&self, _name: &str) -> Option<i32> {
+        None
+    }
     /// Resolve a namespace OID to its catalog name.
     fn schema_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve a namespace name to its catalog OID.
+    fn schema_oid(&self, _name: &str) -> Option<i32> {
+        None
+    }
+    /// Resolve a routine OID to its catalog spelling. `signature` selects the
+    /// regprocedure spelling with argument types rather than regproc's name.
+    fn routine_name<'a>(
+        &self,
+        _oid: i32,
+        _signature: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve a routine catalog spelling to its OID.
+    fn routine_oid(&self, _name: &str, _signature: bool) -> Result<Option<i32>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve an operator OID to its catalog spelling. `signature` selects
+    /// regoperator's argument-bearing spelling rather than regoper's name.
+    fn operator_name<'a>(
+        &self,
+        _oid: i32,
+        _signature: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve an operator catalog spelling to its OID.
+    fn operator_oid(&self, _name: &str, _signature: bool) -> Result<Option<i32>, SqlError> {
         Ok(None)
     }
     /// PostgreSQL privilege inquiry functions. `None` represents a missing
@@ -580,6 +617,10 @@ pub trait CatalogAccess {
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// Resolves the exact OID of a visible user-defined scalar or array type.
+    fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
+        None
+    }
 }
 
 /// A bounded membership source for an `IN (subquery)` result.
@@ -665,13 +706,13 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns) {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
-            // A cast to a user-defined type (enum) cannot fold without the
-            // catalog, which this plan-time check does not carry; defer to
-            // runtime, which resolves and validates it (a genuinely missing
-            // type or bad enum label re-surfaces there).
+            // Catalog-resolved values cannot fold without the catalog this
+            // plan-time check intentionally does not carry. Runtime resolves
+            // and validates them with the query catalog.
             Err(e)
                 if e.sqlstate == sqlstate::UNDEFINED_OBJECT
-                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION =>
+                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION
+                    || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED =>
             {
                 None
             }
@@ -1046,47 +1087,10 @@ pub fn eval_full<'a>(
             type_mod,
         } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
-            // `oid::regclass` displays as the relation name (needs catalog
-            // access); other reg-type casts fall through to the generic path.
-            if type_name.eq_ignore_ascii_case("regclass")
-                && let Some(cat) = hooks.catalog
+            if let Some(target) = ColType::from_sql_name(type_name)
+                && target.is_reg_object()
             {
-                match v {
-                    // `oid::regclass` renders as the relation name.
-                    Datum::Int4(_) | Datum::Int8(_) => {
-                        let oid = if let Datum::Int8(x) = v {
-                            x as i32
-                        } else if let Datum::Int4(x) = v {
-                            x
-                        } else {
-                            0
-                        };
-                        if let Some(name) = cat.relname(oid, arena)? {
-                            return Ok(Datum::Text(name));
-                        }
-                    }
-                    // `'relname'::regclass` resolves to the relation's OID, so a
-                    // catalog query's `attrelid = 'tbl'::regclass` compares OIDs
-                    // (pgx and most tools introspect this way).
-                    Datum::Text(name) | Datum::Bpchar(name) => {
-                        let name = name.trim_end_matches(' ');
-                        // regclass input accepts a decimal OID spelling without
-                        // resolving it as a relation name. psql uses this form
-                        // in catalog queries (`'16385'::regclass`).
-                        if let Ok(oid) = name.parse::<i32>() {
-                            return Ok(Datum::Int4(oid));
-                        }
-                        if let Some(oid) = cat.reloid(name) {
-                            return Ok(Datum::Int4(oid));
-                        }
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_TABLE,
-                            "relation \"{}\" does not exist",
-                            name
-                        ));
-                    }
-                    _ => {}
-                }
+                return regobject_cast(v, target, hooks.catalog, arena);
             }
             // `::regtype` resolves a type name to the type and renders its
             // canonical SQL name (`'varchar(5)'::regtype` is `character
@@ -3752,6 +3756,7 @@ fn session_zone_at(utc_micros: i64) -> i32 {
 pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
     match d {
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
+        Datum::Regtype { name, .. } => Datum::Text(name),
         other => other,
     }
 }
@@ -3759,26 +3764,168 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
 /// type carries renders as the number itself, and 0 as `-` — PostgreSQL's own
 /// fallbacks.
-fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    if o == 0 {
-        return Ok(Datum::Text("-"));
+pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let referenced_oid = i32::try_from(o).unwrap_or(i32::MAX);
+    let name = if o == 0 {
+        "-"
+    } else if let Some(name) = regtype_builtin_name(referenced_oid) {
+        name
+    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
+        ctype.name()
+    } else {
+        return arena
+            .alloc_str_display(o)
+            .map(|name| Datum::Regtype {
+                referenced_oid,
+                name,
+            })
+            .map_err(|_| arena_full());
+    };
+    Ok(Datum::Regtype {
+        referenced_oid,
+        name,
+    })
+}
+
+pub(crate) fn regobject_cast<'a>(
+    value: Datum<'a>,
+    target: ColType,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(Datum::Null);
     }
-    if let Ok(small) = i32::try_from(o)
-        && let Some(ct) = crate::sql::exec::coltype_of_oid_pub(small)
-    {
-        return Ok(Datum::Text(ct.name()));
-    }
-    arena
-        .alloc_str_display(o)
-        .map(Datum::Text)
-        .map_err(|_| arena_full())
+    let object_oid = match value {
+        Datum::RegObject {
+            type_oid,
+            referenced_oid,
+            ..
+        } if type_oid == target.oid() => referenced_oid,
+        Datum::RegObject { .. } => return Err(cast_unsupported(&value, target.name())),
+        Datum::Int2(value) => i32::from(value),
+        Datum::Int4(value) => value,
+        Datum::Int8(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
+        Datum::Text(name) | Datum::Bpchar(name) => {
+            let name = name.trim_end_matches(' ');
+            if let Ok(value) = name.parse::<i32>() {
+                value
+            } else {
+                let catalog = catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} input requires catalog access",
+                        target.name()
+                    )
+                })?;
+                match target {
+                    ColType::Regclass => catalog.reloid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "relation \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regrole => catalog.role_oid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "role \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regnamespace => catalog.schema_oid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_SCHEMA_NAME,
+                            "schema \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regproc | ColType::Regprocedure => catalog
+                        .routine_oid(name, target == ColType::Regprocedure)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "function \"{}\" does not exist",
+                                name
+                            )
+                        })?,
+                    ColType::Regoper | ColType::Regoperator => catalog
+                        .operator_oid(name, target == ColType::Regoperator)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "operator \"{}\" does not exist",
+                                name
+                            )
+                        })?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named {} input is not modeled",
+                            target.name()
+                        ));
+                    }
+                }
+            }
+        }
+        _ => return Err(cast_unsupported(&value, target.name())),
+    };
+    let name = match target {
+        ColType::Regclass => catalog
+            .map(|catalog| catalog.relname(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regrole => catalog
+            .map(|catalog| catalog.role_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regnamespace => catalog
+            .map(|catalog| catalog.schema_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regproc | ColType::Regprocedure => catalog
+            .map(|catalog| catalog.routine_name(object_oid, target == ColType::Regprocedure, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regoper | ColType::Regoperator => catalog
+            .map(|catalog| catalog.operator_name(object_oid, target == ColType::Regoperator, arena))
+            .transpose()?
+            .flatten(),
+        _ => None,
+    };
+    let name = match name {
+        Some(name) => name,
+        None => arena
+            .alloc_str_display(object_oid)
+            .map_err(|_| arena_full())?,
+    };
+    Ok(Datum::RegObject {
+        type_oid: target.oid(),
+        referenced_oid: object_oid,
+        name,
+    })
+}
+
+fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
+    use crate::sql::types::oid;
+    Some(match type_oid {
+        oid::REGPROC => "regproc",
+        oid::REGPROCEDURE => "regprocedure",
+        oid::REGOPER => "regoper",
+        oid::REGOPERATOR => "regoperator",
+        oid::REGCLASS => "regclass",
+        oid::REGTYPE => "regtype",
+        oid::REGNAMESPACE => "regnamespace",
+        oid::REGROLE => "regrole",
+        _ => return None,
+    })
 }
 
 /// `'typename'::regtype`: resolves a spelled type name — with any `(...)`
 /// modifier ignored, as PostgreSQL ignores it — to its canonical SQL name.
 /// The serial pseudo-names are not types and are refused (42704), matching
 /// PostgreSQL; `name`, `oid` and the `reg*` identifiers resolve to themselves.
-fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
+pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
     let mut base = spelled.trim();
     if let Some(open) = base.find('(') {
         // `varchar(5)` names varchar; the modifier plays no part.
@@ -3845,7 +3992,27 @@ fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
             None => return Err(unknown()),
         },
     };
-    Ok(Datum::Text(canonical))
+    let referenced_oid = match canonical {
+        "timestamp without time zone" => crate::sql::types::oid::TIMESTAMP,
+        "timestamp with time zone" => crate::sql::types::oid::TIMESTAMPTZ,
+        "time without time zone" => crate::sql::types::oid::TIME,
+        "time with time zone" => crate::sql::types::oid::TIMETZ,
+        "regtype" => crate::sql::types::oid::REGTYPE,
+        "regclass" => crate::sql::types::oid::REGCLASS,
+        "regproc" => crate::sql::types::oid::REGPROC,
+        "regprocedure" => crate::sql::types::oid::REGPROCEDURE,
+        "regrole" => crate::sql::types::oid::REGROLE,
+        "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
+        "regoper" => crate::sql::types::oid::REGOPER,
+        "regoperator" => crate::sql::types::oid::REGOPERATOR,
+        _ => ColType::from_sql_name(canonical)
+            .expect("canonical type")
+            .oid(),
+    };
+    Ok(Datum::Regtype {
+        referenced_oid,
+        name: canonical,
+    })
 }
 
 pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
@@ -3910,6 +4077,17 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
         Datum::Bpchar(_) => "character",
+        Datum::Regtype { .. } => "regtype",
+        Datum::RegObject { type_oid, .. } => match *type_oid {
+            crate::sql::types::oid::REGPROC => "regproc",
+            crate::sql::types::oid::REGPROCEDURE => "regprocedure",
+            crate::sql::types::oid::REGOPER => "regoper",
+            crate::sql::types::oid::REGOPERATOR => "regoperator",
+            crate::sql::types::oid::REGCLASS => "regclass",
+            crate::sql::types::oid::REGNAMESPACE => "regnamespace",
+            crate::sql::types::oid::REGROLE => "regrole",
+            _ => "regobject",
+        },
         Datum::Date(_) => "date",
         Datum::Timestamp(_) => "timestamp without time zone",
         Datum::Timestamptz(_) => "timestamp with time zone",

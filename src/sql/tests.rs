@@ -1021,6 +1021,29 @@ fn row_description_type_oids(bytes: &[u8]) -> Vec<i32> {
     panic!("response has no RowDescription")
 }
 
+fn row_description_type_modifiers(bytes: &[u8]) -> Vec<i32> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if tag == b'T' {
+            let payload = &bytes[offset + 5..offset + 1 + length];
+            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+            let mut fields = &payload[2..];
+            let mut type_modifiers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name_end = fields.iter().position(|byte| *byte == 0).unwrap();
+                fields = &fields[name_end + 1..];
+                type_modifiers.push(i32::from_be_bytes(fields[12..16].try_into().unwrap()));
+                fields = &fields[18..]; // table OID + attribute number + type metadata
+            }
+            return type_modifiers;
+        }
+        offset += 1 + length;
+    }
+    panic!("response has no RowDescription")
+}
+
 fn row_description_names(bytes: &[u8]) -> Vec<&str> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -1579,6 +1602,272 @@ fn object_resident_set_records_keep_their_structural_fields() {
 }
 
 #[test]
+fn catalog_object_columns_preserve_identity_and_catalog_text() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_object_role; \
+         CREATE SCHEMA catalog_object_schema; \
+         CREATE TABLE catalog_object_reference (id integer); \
+         CREATE TABLE catalog_object_values ( \
+             relation_value regclass DEFAULT 'catalog_object_reference'::regclass, \
+             role_value regrole DEFAULT 'catalog_object_role'::regrole, \
+             schema_value regnamespace DEFAULT 'catalog_object_schema'::regnamespace \
+         ); \
+         INSERT INTO catalog_object_values DEFAULT VALUES; \
+         INSERT INTO catalog_object_values VALUES ( \
+             'catalog_object_reference', 'catalog_object_role', 'catalog_object_schema' \
+         )",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relation_value, role_value, schema_value, \
+                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value) \
+         FROM catalog_object_values ORDER BY relation_value",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "catalog_object_reference|catalog_object_role|catalog_object_schema|regclass|regrole|regnamespace",
+            "catalog_object_reference|catalog_object_role|catalog_object_schema|regclass|regrole|regnamespace",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation_value, role_value, schema_value FROM catalog_object_values",
+        )),
+        [
+            crate::sql::types::oid::REGCLASS,
+            crate::sql::types::oid::REGROLE,
+            crate::sql::types::oid::REGNAMESPACE,
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE catalog_object_reference RENAME TO catalog_object_renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation_value FROM catalog_object_values ORDER BY relation_value",
+        )),
+        ["catalog_object_renamed", "catalog_object_renamed"]
+    );
+}
+
+#[test]
+fn regclass_casts_compare_with_catalog_oid_columns() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE regclass_comparison_target (id integer)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relname FROM pg_class \
+         WHERE oid = 'regclass_comparison_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["regclass_comparison_target"],
+        "{output:?}"
+    );
+}
+
+#[test]
+fn routine_catalog_columns_preserve_regproc_and_regprocedure_identity() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION routine_catalog_reference(value integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT value'; \
+         CREATE TABLE routine_catalog_values ( \
+             routine_value regproc DEFAULT 'routine_catalog_reference'::regproc, \
+             signature_value regprocedure \
+                 DEFAULT 'routine_catalog_reference(integer)'::regprocedure \
+         ); \
+         INSERT INTO routine_catalog_values DEFAULT VALUES; \
+         INSERT INTO routine_catalog_values VALUES ( \
+             'routine_catalog_reference', 'routine_catalog_reference(integer)' \
+         )",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value, pg_typeof(routine_value), \
+                    pg_typeof(signature_value) \
+             FROM routine_catalog_values ORDER BY routine_value",
+        )),
+        [
+            "routine_catalog_reference|routine_catalog_reference(integer)|regproc|regprocedure",
+            "routine_catalog_reference|routine_catalog_reference(integer)|regproc|regprocedure",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value FROM routine_catalog_values",
+        )),
+        [
+            crate::sql::types::oid::REGPROC,
+            crate::sql::types::oid::REGPROCEDURE,
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_catalog_reference(integer) RENAME TO routine_catalog_renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT routine_value, signature_value FROM routine_catalog_values ORDER BY routine_value",
+        )),
+        [
+            "routine_catalog_renamed|routine_catalog_renamed(integer)",
+            "routine_catalog_renamed|routine_catalog_renamed(integer)",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION routine_catalog_overload(value text) RETURNS text LANGUAGE SQL \
+           AS 'SELECT value'; \
+         CREATE FUNCTION routine_catalog_overload(value integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT value'",
+    );
+    let ambiguous = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'routine_catalog_overload'::regproc",
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous).contains("42725"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'routine_catalog_overload(integer)'::regprocedure",
+        )),
+        ["routine_catalog_overload(integer)"]
+    );
+}
+
+#[test]
+fn operator_catalog_exposes_supported_operator_identities() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, oprname, oprleft, oprright, oprcode::oid \
+         FROM pg_operator WHERE oid = 551",
+    );
+    assert_eq!(data_rows(&output), ["551|+|23|23|177"]);
+}
+
+#[test]
+fn supported_operator_catalog_aliases_preserve_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE operator_catalog_values ( \
+             operator_value regoperator DEFAULT '+(integer,integer)'::regoperator \
+         ); \
+         INSERT INTO operator_catalog_values DEFAULT VALUES; \
+         SELECT operator_value, pg_typeof(operator_value) FROM operator_catalog_values",
+    );
+    assert_eq!(data_rows(&output), ["+(integer,integer)|regoperator"]);
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGOPERATOR,
+            crate::sql::types::oid::REGTYPE
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT '+'::regoper")),
+        ["+"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '+(integer,integer)'::regoperator::oid",
+        )),
+        ["551"]
+    );
+}
+
+#[test]
+fn catalog_alias_casts_keep_their_own_result_names() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '+(integer,integer)'::regoperator, '+'::regoper, \
+                'version()'::regprocedure, 'version'::regproc",
+    );
+    assert_eq!(
+        row_description_names(&output),
+        ["regoperator", "regoper", "regprocedure", "regproc"]
+    );
+}
+
+#[test]
+fn catalog_oid_columns_unify_with_regclass_set_operands() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT classid FROM pg_depend UNION ALL SELECT 'pg_opfamily'::regclass",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::OID]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend \
+         UNION ALL \
+         SELECT 'pg_opfamily'::regclass, amopfamily, refclassid, refobjid, deptype \
+         FROM pg_depend d, pg_amop o \
+         WHERE classid = 'pg_amop'::regclass AND objid = o.oid",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::BPCHAR,
+        ]
+    );
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -1888,7 +2177,10 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             0,
         )
         .unwrap_err();
-    assert_eq!(wrong_element_oid.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    assert_eq!(
+        wrong_element_oid.sqlstate,
+        sqlstate::INVALID_BINARY_REPRESENTATION
+    );
     domain_array[8..12].copy_from_slice(&domain_oid.to_be_bytes());
 
     let malformed_array = [
@@ -1907,7 +2199,10 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             0,
         )
         .unwrap_err();
-    assert_eq!(malformed_array.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    assert_eq!(
+        malformed_array.sqlstate,
+        sqlstate::INVALID_BINARY_REPRESENTATION
+    );
 
     let reserved_range_flags = engine
         .decode_binary_parameter(
@@ -1928,7 +2223,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .unwrap_err();
     assert_eq!(
         null_finite_range_bound.sqlstate,
-        sqlstate::BAD_COPY_FILE_FORMAT
+        sqlstate::INVALID_BINARY_REPRESENTATION
     );
 
     let mut record = Vec::new();
@@ -4410,6 +4705,88 @@ fn describe_correlated_scalar_subquery_uses_its_projection_type() {
 }
 
 #[test]
+fn describe_correlated_scalar_subquery_preserves_outer_type_modifier() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE describe_outer_varchar (value varchar(3)); \
+         CREATE TABLE describe_inner_marker (marker int)",
+    );
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT describe_outer_varchar.value) FROM describe_outer_varchar",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&description), [7]);
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT describe_outer_varchar.value FROM describe_inner_marker) FROM describe_outer_varchar",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&description), [7]);
+}
+
+#[test]
+fn describe_scalar_subquery_preserves_the_inner_type_modifier() {
+    let (mut engine, mut budget) = test_engine();
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT 'abc'::varchar(3)) AS value",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&description), [7]);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN scalar_subquery_domain AS varchar(3)",
+    );
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (SELECT 'abc'::scalar_subquery_domain) AS value",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&description), [7]);
+}
+
+#[test]
+fn cursor_fetch_preserves_row_description_type_modifier() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE TABLE cursor_type_modifier (value varchar(3));
+         INSERT INTO cursor_type_modifier VALUES ('abc');
+         DECLARE typed_cursor CURSOR FOR SELECT value FROM cursor_type_modifier;
+         FETCH ALL FROM typed_cursor;
+         COMMIT",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&output), [7]);
+    assert_eq!(data_rows(&output), ["abc"]);
+}
+
+#[test]
 fn json_and_jsonb_types() {
     // Output/normalization/operators verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
@@ -4888,10 +5265,12 @@ fn catalog_definitions_do_not_silently_truncate() {
         "SELECT pg_get_indexdef(conindid, 0, true) FROM pg_constraint \
          WHERE contype='p' AND conrelid='long_parent'::regclass",
     ));
+    let index_definition = index_definition
+        .first()
+        .expect("primary-key catalog query must return one definition");
     assert!(
-        index_definition[0].ends_with("deliberately_long_column_name_number_08)"),
-        "index definition was truncated: {}",
-        index_definition[0]
+        index_definition.ends_with("deliberately_long_column_name_number_08)"),
+        "index definition was truncated: {index_definition}",
     );
     let foreign_key_definition = data_rows(&run_with_txn_bytes(
         &mut engine,
@@ -5831,6 +6210,119 @@ fn data_survives_engine_restart() {
     run_with(&mut e, &mut budget, "INSERT INTO t VALUES (4,'d')");
     let bytes = run_with(&mut e, &mut budget, "SELECT id FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1", "2", "4"]);
+}
+
+#[test]
+fn regtype_columns_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("regtype-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE regtype_values (value regtype DEFAULT 'integer'::regtype); \
+             INSERT INTO regtype_values DEFAULT VALUES; \
+             INSERT INTO regtype_values VALUES ('text'::regtype)",
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value, pg_typeof(value) FROM regtype_values ORDER BY value",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["integer|regtype", "text|regtype"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+}
+
+#[test]
+fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("catalog-object-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE durable_catalog_role; \
+             CREATE SCHEMA durable_catalog_schema; \
+             CREATE TABLE durable_catalog_reference (id integer); \
+             CREATE FUNCTION durable_catalog_routine(value integer) RETURNS integer LANGUAGE SQL \
+                 AS 'SELECT value'; \
+             CREATE TABLE durable_catalog_values ( \
+                 relation_value regclass DEFAULT 'durable_catalog_reference'::regclass, \
+                 role_value regrole DEFAULT 'durable_catalog_role'::regrole, \
+                 schema_value regnamespace DEFAULT 'durable_catalog_schema'::regnamespace, \
+                 routine_value regproc DEFAULT 'durable_catalog_routine'::regproc, \
+                 signature_value regprocedure \
+                     DEFAULT 'durable_catalog_routine(integer)'::regprocedure, \
+                 operator_value regoper DEFAULT '+'::regoper, \
+                 operator_signature regoperator \
+                     DEFAULT '+(integer,integer)'::regoperator \
+             ); \
+             INSERT INTO durable_catalog_values DEFAULT VALUES; \
+             INSERT INTO durable_catalog_values VALUES ( \
+                 'durable_catalog_reference', 'durable_catalog_role', 'durable_catalog_schema', \
+                 'durable_catalog_routine', 'durable_catalog_routine(integer)', \
+                 '+', '+(integer,integer)' \
+             )",
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relation_value, role_value, schema_value, routine_value, signature_value, \
+                operator_value, operator_signature, \
+                pg_typeof(relation_value), pg_typeof(role_value), pg_typeof(schema_value), \
+                pg_typeof(routine_value), pg_typeof(signature_value), \
+                pg_typeof(operator_value), pg_typeof(operator_signature) \
+         FROM durable_catalog_values ORDER BY relation_value",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|+|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
+            "durable_catalog_reference|durable_catalog_role|durable_catalog_schema|durable_catalog_routine|durable_catalog_routine(integer)|+|+(integer,integer)|regclass|regrole|regnamespace|regproc|regprocedure|regoper|regoperator",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGCLASS,
+            crate::sql::types::oid::REGROLE,
+            crate::sql::types::oid::REGNAMESPACE,
+            crate::sql::types::oid::REGPROC,
+            crate::sql::types::oid::REGPROCEDURE,
+            crate::sql::types::oid::REGOPER,
+            crate::sql::types::oid::REGOPERATOR,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
 }
 
 #[test]
@@ -11639,6 +12131,305 @@ fn domains_enforce_and_report() {
          SELECT 0::posint",
     );
     assert!(String::from_utf8_lossy(&bytes).contains("23514"));
+}
+
+#[test]
+fn anonymous_record_field_preserves_catalog_cast_type() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN record_field_domain AS integer; \
+         CREATE TYPE record_field_state AS ENUM ('ready')",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ROW(7::record_field_domain)).f1",
+    );
+    assert_eq!(data_rows(&output), ["7"], "{output:?}");
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::INT4]
+    );
+    let enum_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ROW('ready'::record_field_state)).f1",
+    );
+    assert_eq!(data_rows(&enum_output), ["ready"], "{enum_output:?}");
+    let enum_slot = engine
+        .storage
+        .enum_slot("public", "record_field_state", 0)
+        .unwrap() as u16;
+    assert_eq!(
+        row_description_type_oids(&enum_output),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let expansion_in_scalar = run_with(&mut engine, &mut budget, "SELECT (ROW(1,2)).* + 1");
+    assert!(
+        String::from_utf8_lossy(&expansion_in_scalar).contains("0A000"),
+        "{expansion_in_scalar:?}"
+    );
+}
+
+#[test]
+fn catalog_casts_preserve_type_through_expression_descriptions() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN expression_domain AS integer; \
+         CREATE TYPE expression_state AS ENUM ('ready', 'blocked')",
+    );
+    let domain_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT COALESCE(NULL::expression_domain, 7::expression_domain)",
+    );
+    assert_eq!(data_rows(&domain_output), ["7"], "{domain_output:?}");
+    assert_eq!(
+        row_description_type_oids(&domain_output),
+        [crate::sql::types::oid::INT4]
+    );
+    let enum_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT COALESCE(NULL::expression_state, 'ready'::expression_state)",
+    );
+    assert_eq!(data_rows(&enum_output), ["ready"], "{enum_output:?}");
+    let enum_slot = engine
+        .storage
+        .enum_slot("public", "expression_state", 0)
+        .unwrap() as u16;
+    assert_eq!(
+        row_description_type_oids(&enum_output),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let case_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT CASE WHEN true THEN 'ready'::expression_state ELSE 'blocked'::expression_state END",
+    );
+    assert_eq!(data_rows(&case_output), ["ready"], "{case_output:?}");
+    assert_eq!(
+        row_description_type_oids(&case_output),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let nullable_case_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT CASE WHEN false THEN 'ready'::expression_state ELSE NULL END",
+    );
+    assert_eq!(
+        data_rows(&nullable_case_output),
+        ["NULL"],
+        "{nullable_case_output:?}"
+    );
+    assert_eq!(
+        row_description_type_oids(&nullable_case_output),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let array_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY['ready'::expression_state]",
+    );
+    assert_eq!(data_rows(&array_output), ["{ready}"], "{array_output:?}");
+    assert_eq!(
+        row_description_type_oids(&array_output),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+    let filled_array = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_fill('ready'::expression_state, ARRAY[2])",
+    );
+    assert_eq!(
+        data_rows(&filled_array),
+        ["{ready,ready}"],
+        "{filled_array:?}"
+    );
+    assert_eq!(
+        row_description_type_oids(&filled_array),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+    let domain_array = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY[7::expression_domain]",
+    );
+    assert_eq!(data_rows(&domain_array), ["{7}"], "{domain_array:?}");
+    let domain_slot = engine
+        .storage
+        .domain_slot("public", "expression_domain", 0)
+        .unwrap() as u16;
+    assert_eq!(
+        row_description_type_oids(&domain_array),
+        [crate::sql::types::oid::domain_array_oid(domain_slot)]
+    );
+    let enum_element = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY['ready'::expression_state])[1]",
+    );
+    assert_eq!(data_rows(&enum_element), ["ready"], "{enum_element:?}");
+    assert_eq!(
+        row_description_type_oids(&enum_element),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let enum_slice = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY['ready'::expression_state])[1:1]",
+    );
+    assert_eq!(data_rows(&enum_slice), ["{ready}"], "{enum_slice:?}");
+    assert_eq!(
+        row_description_type_oids(&enum_slice),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+    let appended = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_append(ARRAY['ready'::expression_state], 'blocked'::expression_state)",
+    );
+    assert_eq!(data_rows(&appended), ["{ready,blocked}"], "{appended:?}");
+    assert_eq!(
+        row_description_type_oids(&appended),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+    let concatenated = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_cat(ARRAY['ready'::expression_state], ARRAY['blocked'::expression_state])",
+    );
+    assert_eq!(
+        data_rows(&concatenated),
+        ["{ready,blocked}"],
+        "{concatenated:?}"
+    );
+    assert_eq!(
+        row_description_type_oids(&concatenated),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+    let unnested = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT unnest(ARRAY['ready'::expression_state])",
+    );
+    assert_eq!(data_rows(&unnested), ["ready"], "{unnested:?}");
+    assert_eq!(
+        row_description_type_oids(&unnested),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let lagged = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT lag('ready'::expression_state) OVER ()",
+    );
+    assert_eq!(data_rows(&lagged), ["NULL"], "{lagged:?}");
+    assert_eq!(
+        row_description_type_oids(&lagged),
+        [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let aggregated = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg('ready'::expression_state)",
+    );
+    assert_eq!(data_rows(&aggregated), ["{ready}"], "{aggregated:?}");
+    assert_eq!(
+        row_description_type_oids(&aggregated),
+        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+    );
+}
+
+#[test]
+fn describe_preserves_builtin_function_result_types() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT \
+            jsonb_set('{\"a\": 1}'::jsonb, '{a}', '2'::jsonb), \
+            json_strip_nulls('{\"a\": null}'::json), \
+            current_schemas(true), \
+            pg_char_to_encoding('UTF8'), \
+            pg_database_size('pos3ql')",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::JSONB,
+            crate::sql::types::oid::JSON,
+            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Text).oid(),
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::INT8,
+        ]
+    );
+    let typeof_output = run_with(&mut engine, &mut budget, "SELECT pg_typeof(7)");
+    assert_eq!(data_rows(&typeof_output), ["integer"], "{typeof_output:?}");
+    assert_eq!(
+        row_description_type_oids(&typeof_output),
+        [crate::sql::types::oid::REGTYPE]
+    );
+    let type_comparison = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_typeof(7) = 'integer'::regtype",
+    );
+    assert_eq!(data_rows(&type_comparison), ["t"], "{type_comparison:?}");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE persisted_regtype (value regtype DEFAULT 'integer'::regtype); \
+         INSERT INTO persisted_regtype DEFAULT VALUES; \
+         INSERT INTO persisted_regtype VALUES ('text'::regtype)",
+    );
+    let persisted = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value, pg_typeof(value) FROM persisted_regtype ORDER BY value",
+    );
+    assert_eq!(data_rows(&persisted), ["integer|regtype", "text|regtype"]);
+    assert_eq!(
+        row_description_type_oids(&persisted),
+        [
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+    let arena = Arena::new(&mut budget, "regtype Bind", 256).unwrap();
+    assert_eq!(
+        engine
+            .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"integer", &arena, 0)
+            .unwrap()
+            .to_string(),
+        "integer"
+    );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::REGTYPE,
+                &crate::sql::types::oid::INT4.to_be_bytes(),
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "integer"
+    );
+    let invalid_regtype = engine
+        .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"not_a_type", &arena, 0)
+        .unwrap_err();
+    assert_eq!(invalid_regtype.sqlstate, sqlstate::UNDEFINED_OBJECT);
+    let invalid_binary_regtype = engine
+        .decode_binary_parameter(crate::sql::types::oid::REGTYPE, b"\x00", &arena, 0)
+        .unwrap_err();
+    assert_eq!(
+        invalid_binary_regtype.sqlstate,
+        sqlstate::INVALID_BINARY_REPRESENTATION
+    );
 }
 
 #[test]
@@ -18268,6 +19059,27 @@ fn common_table_expressions() {
         )),
         ["2"]
     );
+    // Empty IN subqueries still need their catalog type for coercion; a domain
+    // over int4 must not degrade to text merely because no row supplies a
+    // runtime datum.
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE DOMAIN cte_integer AS int CHECK (VALUE > 0)",
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE empty_cte_domain (value cte_integer)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH values AS (SELECT value FROM empty_cte_domain) SELECT 1 IN (SELECT value FROM values)",
+        )),
+        ["f"]
+    );
     // A CTE joined against a physical table.
     assert_eq!(
         data_rows(&run_with(
@@ -18307,6 +19119,18 @@ fn common_table_expressions() {
         )),
         ["1", "2", "3"]
     );
+    // The CTE's materialized descriptor must retain the declared varchar
+    // modifier through the outer Describe response.
+    let description = describe_with(
+        &mut e,
+        &mut b,
+        "WITH typed AS (SELECT 'abc'::varchar(3) AS value) SELECT value FROM typed",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [crate::sql::types::oid::VARCHAR]
+    );
+    assert_eq!(row_description_type_modifiers(&description), [7]);
     // The required shape is enforced loudly.
     assert!(
         String::from_utf8_lossy(&run_with(
@@ -18405,6 +19229,30 @@ fn derived_tables() {
             "SELECT (SELECT max(s.v) FROM (SELECT v FROM t) s)"
         )),
         ["40"]
+    );
+
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TYPE derived_state AS ENUM ('ready', 'blocked'); \
+         CREATE DOMAIN derived_count AS integer CHECK (VALUE > 0); \
+         CREATE TABLE typed_source (state derived_state, count derived_count); \
+         INSERT INTO typed_source VALUES ('ready', 7)",
+    );
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        e.storage.enum_slot("public", "derived_state", 0).unwrap() as u16,
+    );
+    let query = "SELECT d.state, d.count FROM (SELECT state, count FROM typed_source) d";
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, query)), ["ready|7"]);
+    assert_eq!(
+        row_description_type_oids(&describe_with(&mut e, &mut b, query)),
+        [enum_oid, crate::sql::types::oid::INT4]
+    );
+    let union = "SELECT d.count FROM (SELECT count FROM typed_source UNION ALL SELECT count FROM typed_source) d";
+    assert_eq!(data_rows(&run_with(&mut e, &mut b, union)), ["7", "7"]);
+    assert_eq!(
+        row_description_type_oids(&describe_with(&mut e, &mut b, union)),
+        [crate::sql::types::oid::INT4]
     );
 }
 
@@ -19190,6 +20038,76 @@ fn correlated_in_subquery() {
 }
 
 #[test]
+fn correlated_subqueries_keep_outer_sources_through_in_and_windows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE qa (x int); CREATE TABLE qb (y int); \
+         INSERT INTO qa VALUES (1),(5),(9); INSERT INTO qb VALUES (3),(7)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT x FROM qa WHERE x = ANY (SELECT y + qa.x - qa.x FROM qb) ORDER BY x",
+        )),
+        Vec::<String>::new()
+    );
+    let empty_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT x, (SELECT qa.x FROM qb WHERE false) FROM qa ORDER BY 1",
+    );
+    assert_eq!(
+        data_rows(&empty_output),
+        ["1|NULL", "5|NULL", "9|NULL"],
+        "{}",
+        String::from_utf8_lossy(&empty_output)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE nw (k text, v int); \
+         INSERT INTO nw VALUES ('a',1),('a',2),('a',3),('a',4), \
+                               ('b',1),('b',2),('b',3),('c',1)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT k, (SELECT nw.k || count(*) OVER () FROM nw z WHERE z.k = nw.k LIMIT 1) \
+         FROM nw ORDER BY k",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "a|a4", "a|a4", "a|a4", "a|a4", "b|b3", "b|b3", "b|b3", "c|c1"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn empty_outer_query_does_not_hide_invalid_subquery_source() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE empty_outer (value integer)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM empty_outer WHERE 1 IN (SELECT value FROM missing_subquery_source)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P01"),
+        "{output:?}"
+    );
+}
+
+#[test]
 fn copy_formats_and_unsupported() {
     // The engine speaks COPY's text, CSV and binary formats. CSV-only options
     // misused in text mode, and binary of a type whose binary codec is not yet
@@ -19445,6 +20363,20 @@ fn copy_query_to_stdout() {
     );
     assert!(text.contains("COPY 2"), "command tag: {text}");
 
+    // Catalog aliases must render their catalog text in query COPY, rather
+    // than leaking their backing OID or degrading to an ordinary integer.
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT '+(integer,integer)'::regoperator AS identity, \
+                NULL::regoperator AS missing) TO STDOUT",
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !message_types(&out).contains(&b'E') && text.contains("+(integer,integer)\t\\N"),
+        "catalog text COPY: {text}"
+    );
+
     // CSV with a header quotes the embedded comma.
     let out = run_with(
         &mut engine,
@@ -19481,6 +20413,50 @@ fn copy_query_to_stdout() {
         out.windows(8)
             .any(|bytes| bytes == [0, 0, 0, 2, 0, 0, 0, 23]),
         "record field body is self-describing: {out:?}"
+    );
+
+    // The result descriptor preserves a domain OID, while its binary send
+    // representation is its base value.  COPY (query) must resolve that OID
+    // through the catalog instead of mistaking it for an unsupported builtin.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE cq_state AS ENUM ('ready', 'blocked'); \
+         CREATE DOMAIN cq_positive AS integer CHECK (VALUE > 0); \
+         CREATE TABLE cq_domain (value cq_positive, values cq_positive[], state cq_state); \
+         INSERT INTO cq_domain VALUES (7, ARRAY[3,5]::cq_positive[], 'ready')",
+    );
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT value, values, state FROM cq_domain) TO STDOUT (FORMAT binary)",
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "cq_positive", 0)
+            .unwrap() as u16,
+    );
+    assert!(
+        !message_types(&out).contains(&b'E')
+            && out.windows(4).any(|bytes| bytes == 7_i32.to_be_bytes())
+            && out
+                .windows(4)
+                .any(|bytes| bytes == domain_oid.to_be_bytes())
+            && out.windows(b"ready".len()).any(|bytes| bytes == b"ready"),
+        "binary catalog-type COPY: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    let out = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT '+(integer,integer)'::regoperator) TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&out).contains(&b'E')
+            && out.windows(4).any(|bytes| bytes == 551_i32.to_be_bytes()),
+        "binary catalog alias COPY: {out:?}"
     );
 
     // A query source is TO-only; FROM STDIN is rejected.

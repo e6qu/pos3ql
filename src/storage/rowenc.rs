@@ -22,6 +22,8 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             // cannot be composite-typed here).
             Datum::Record(_) => unreachable!("record cannot be a stored column value"),
             Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
+            Datum::Regtype { name, .. } => 8 + name.len(),
+            Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) => 4,
@@ -75,6 +77,26 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
         match v {
             Datum::Record(_) => unreachable!("record cannot be a stored column value"),
             Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
+            Datum::Regtype {
+                referenced_oid,
+                name,
+            } => {
+                rest[..4].copy_from_slice(&referenced_oid.to_le_bytes());
+                rest[4..8].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                rest[8..8 + name.len()].copy_from_slice(name.as_bytes());
+                take = 8 + name.len();
+            }
+            Datum::RegObject {
+                type_oid,
+                referenced_oid,
+                name,
+            } => {
+                rest[..4].copy_from_slice(&type_oid.to_le_bytes());
+                rest[4..8].copy_from_slice(&referenced_oid.to_le_bytes());
+                rest[8..12].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                rest[12..12 + name.len()].copy_from_slice(name.as_bytes());
+                take = 12 + name.len();
+            }
             Datum::Bool(b) => {
                 rest[0] = u8::from(*b);
                 take = 1;
@@ -270,6 +292,20 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
+        ColType::Regtype => {
+            let length = bytes.get(4..8).ok_or_else(corrupt)?;
+            Some(8 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+        }
+        ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole => {
+            let length = bytes.get(8..12).ok_or_else(corrupt)?;
+            Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+        }
         ColType::Array(_) | ColType::Bit { .. } => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             let payload = u32::from_le_bytes(length.try_into().unwrap()) as usize;
@@ -343,6 +379,69 @@ pub(crate) fn decode<'a>(
                     Datum::Int4(x)
                 };
                 at += 4;
+            }
+            ColType::Regtype => {
+                let oid = i32::from_le_bytes(
+                    bytes
+                        .get(at..at + 4)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                let length = u32::from_le_bytes(
+                    bytes
+                        .get(at + 4..at + 8)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let raw = bytes.get(at + 8..at + 8 + length).ok_or_else(corrupt)?;
+                let name = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = Datum::Regtype {
+                    referenced_oid: oid,
+                    name,
+                };
+                at += 8 + length;
+            }
+            type_column @ (ColType::Regproc
+            | ColType::Regprocedure
+            | ColType::Regoper
+            | ColType::Regoperator
+            | ColType::Regclass
+            | ColType::Regnamespace
+            | ColType::Regrole) => {
+                let type_oid = i32::from_le_bytes(
+                    bytes
+                        .get(at..at + 4)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                if type_oid != type_column.oid() {
+                    return Err(corrupt());
+                }
+                let referenced_oid = i32::from_le_bytes(
+                    bytes
+                        .get(at + 4..at + 8)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                let length = u32::from_le_bytes(
+                    bytes
+                        .get(at + 8..at + 12)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let raw = bytes.get(at + 12..at + 12 + length).ok_or_else(corrupt)?;
+                let name = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = Datum::RegObject {
+                    type_oid,
+                    referenced_oid,
+                    name,
+                };
+                at += 12 + length;
             }
             ColType::Int8 => {
                 let b = bytes.get(at..at + 8).ok_or_else(corrupt)?;
@@ -565,6 +664,7 @@ mod tests {
             ColType::Int8,
             ColType::Float8,
             ColType::Text,
+            ColType::Regtype,
             ColType::Text,
         ];
         let values = [
@@ -573,13 +673,17 @@ mod tests {
             Datum::Null,
             Datum::Float8(2.5),
             Datum::Text("hello, 世界"),
+            Datum::Regtype {
+                referenced_oid: 23,
+                name: "integer",
+            },
             Datum::Null,
         ];
         let mut buffer = vec![0u8; encoded_len(&values)];
         encode(&values, &mut buffer);
         let mut out = [Datum::Null; MAX_COLUMNS];
         decode(&buffer, &schema, &mut out).unwrap();
-        assert_eq!(&out[..6], &values);
+        assert_eq!(&out[..7], &values);
     }
 
     #[test]

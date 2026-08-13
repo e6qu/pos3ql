@@ -493,6 +493,19 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[4]);
             hasher.write(s.trim_end_matches(' ').as_bytes());
         }
+        Datum::Regtype { referenced_oid, .. } => {
+            hasher.write(&[33]);
+            hasher.write(&referenced_oid.to_le_bytes());
+        }
+        Datum::RegObject {
+            type_oid,
+            referenced_oid,
+            ..
+        } => {
+            hasher.write(&[34]);
+            hasher.write(&type_oid.to_le_bytes());
+            hasher.write(&referenced_oid.to_le_bytes());
+        }
         Datum::Date(v) => {
             hasher.write(&[5]);
             hasher.write(&(*v as i64).to_le_bytes());
@@ -577,6 +590,40 @@ pub(crate) fn compare_datums_as(
         }
         (Datum::Bpchar(a), Datum::Text(b)) => a.trim_end_matches(' ').cmp(*b),
         (Datum::Text(a), Datum::Bpchar(b)) => (*a).cmp(b.trim_end_matches(' ')),
+        (
+            Datum::Regtype {
+                referenced_oid: a, ..
+            },
+            Datum::Regtype {
+                referenced_oid: b, ..
+            },
+        ) => a.cmp(b),
+        (
+            Datum::RegObject {
+                type_oid: at,
+                referenced_oid: a,
+                ..
+            },
+            Datum::RegObject {
+                type_oid: bt,
+                referenced_oid: b,
+                ..
+            },
+        ) if at == bt => a.cmp(b),
+        (Datum::RegObject { referenced_oid, .. }, Datum::Int2(value)) => {
+            referenced_oid.cmp(&i32::from(*value))
+        }
+        (Datum::Int2(value), Datum::RegObject { referenced_oid, .. }) => {
+            i32::from(*value).cmp(referenced_oid)
+        }
+        (Datum::RegObject { referenced_oid, .. }, Datum::Int4(value)) => referenced_oid.cmp(value),
+        (Datum::Int4(value), Datum::RegObject { referenced_oid, .. }) => value.cmp(referenced_oid),
+        (Datum::RegObject { referenced_oid, .. }, Datum::Int8(value)) => {
+            i64::from(*referenced_oid).cmp(value)
+        }
+        (Datum::Int8(value), Datum::RegObject { referenced_oid, .. }) => {
+            value.cmp(&i64::from(*referenced_oid))
+        }
         (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
         (Datum::Timestamp(a), Datum::Timestamp(b))
         | (Datum::Timestamptz(a), Datum::Timestamptz(b))

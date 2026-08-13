@@ -242,8 +242,10 @@ impl<'d> QueryScope<'d> {
     /// `materialize` false = schema only (Describe path).
     fn add_materialized<'a>(
         &mut self,
+        storage: &Storage,
         tref: &'a TableRef<'a>,
         m: &'a MaterializedCte<'a>,
+        txid: u32,
         arena: &'a Arena,
         materialize: bool,
     ) -> Result<(), SqlError>
@@ -279,11 +281,21 @@ impl<'d> QueryScope<'d> {
                 .col_alias
                 .and_then(|a| a.get(i).copied())
                 .unwrap_or(m.column_names[i]);
-            let ctype =
-                crate::sql::exec::coltype_of_oid(m.column_types[i].0).unwrap_or(ColType::Text);
+            let (ctype, user_type) =
+                crate::sql::exec::catalog_column_type(storage, txid, m.column_types[i].0)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "CTE column \"{}\" type (oid {}) is not supported",
+                            name,
+                            m.column_types[i].0
+                        )
+                    })?;
             *slot = ColumnMeta {
                 name: SqlName::parse(name)?,
                 ctype,
+                type_mod: m.column_types[i].2,
+                user_type,
                 ..ColumnMeta::EMPTY
             };
         }
@@ -317,7 +329,7 @@ impl<'d> QueryScope<'d> {
         'a: 'd,
     {
         if let Some(m) = tref.cte {
-            return self.add_materialized(tref, m, arena, true);
+            return self.add_materialized(storage, tref, m, txid, arena, true);
         }
         if tref.func_args.is_some() {
             return self.add_table_func(storage, tref, txid, arena, params, true, outer);
@@ -482,7 +494,7 @@ impl<'d> QueryScope<'d> {
         'a: 'd,
     {
         if let Some(m) = tref.cte {
-            return self.add_materialized(tref, m, arena, false);
+            return self.add_materialized(storage, tref, m, txid, arena, false);
         }
         if tref.func_args.is_some() {
             return self.add_table_func(storage, tref, txid, arena, &[], false, None);

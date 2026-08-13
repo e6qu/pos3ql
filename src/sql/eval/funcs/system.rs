@@ -30,6 +30,7 @@ impl<'a> TryFrom<Datum<'a>> for CatalogOid {
         let oid = match value {
             Datum::Int4(oid) => oid,
             Datum::Int8(oid) => i32::try_from(oid).map_err(|_| ())?,
+            Datum::RegObject { referenced_oid, .. } => referenced_oid,
             _ => return Err(()),
         };
         Ok(Self(oid))
@@ -45,6 +46,7 @@ fn privilege_role_name<'a>(
         Datum::Text(role) => Ok(Some(role)),
         Datum::Int4(oid) => catalog.role_name(oid, arena),
         Datum::Int8(oid) => catalog.role_name(oid as i32, arena),
+        Datum::RegObject { referenced_oid, .. } => catalog.role_name(referenced_oid, arena),
         Datum::Null => Ok(None),
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -81,6 +83,17 @@ fn privilege_object_name<'a>(
                 Ok(Some("pos3ql"))
             } else {
                 catalog.relname(oid as i32, arena)
+            }
+        }
+        Datum::RegObject { referenced_oid, .. } => {
+            if function == "has_type_privilege" {
+                catalog.type_name(referenced_oid, arena)
+            } else if function == "has_schema_privilege" {
+                catalog.schema_name(referenced_oid, arena)
+            } else if function == "has_database_privilege" {
+                Ok(Some("pos3ql"))
+            } else {
+                catalog.relname(referenced_oid, arena)
             }
         }
         Datum::Null => Ok(None),
@@ -637,6 +650,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let col = if args.len() >= 2 {
@@ -662,6 +676,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
@@ -679,6 +694,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(value) => i32::try_from(value).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
                     })?,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -701,6 +717,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let catalog_name = if args.len() >= 2 {
@@ -725,6 +742,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
                 };
                 let col = match eval_full(args[1], arena, params, row, hooks)? {
@@ -763,6 +781,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
                     Datum::Int8(oid) => oid as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -779,6 +798,7 @@ pub(crate) fn dispatch<'a>(
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
                     Datum::Int8(oid) => oid as i32,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Ok(Datum::Null),
                 };
@@ -793,7 +813,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Text(_) | Datum::Int4(_) | Datum::Int8(_) => {
+                    Datum::Text(_) | Datum::Int4(_) | Datum::Int8(_) | Datum::RegObject { .. } => {
                         Ok(Datum::Int8(cat.database_size()?))
                     }
                     Datum::Null => Ok(Datum::Null),
@@ -905,6 +925,10 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_typeof" => {
                 arity(1)?;
+                let regtype = |referenced_oid, name| Datum::Regtype {
+                    referenced_oid,
+                    name,
+                };
                 // A bare column of a domain type reports the domain name (an
                 // expression over it un-domains to the base, handled below).
                 if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
@@ -915,18 +939,24 @@ pub(crate) fn dispatch<'a>(
                         && let Some(cat) = hooks.catalog
                         && let Some(name) = cat.user_array_name(element, arena)?
                     {
-                        return Ok(Datum::Text(name));
+                        return Ok(regtype(element.array_oid(), name));
                     }
-                    return Ok(Datum::Text(
-                        arena.alloc_str(dname.as_str()).map_err(|_| arena_full())?,
-                    ));
+                    if let Some(cat) = hooks.catalog
+                        && let Some(referenced_oid) = cat.user_type_oid(dname.as_str())
+                    {
+                        return Ok(regtype(
+                            referenced_oid,
+                            arena.alloc_str(dname.as_str()).map_err(|_| arena_full())?,
+                        ));
+                    }
                 }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
                 if let crate::sql::ast::Expr::Cast { type_name, .. } = args[0]
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.user_type_name(type_name, arena)?
+                    && let Some(referenced_oid) = cat.user_type_oid(type_name)
                 {
-                    return Ok(Datum::Text(name));
+                    return Ok(regtype(referenced_oid, name));
                 }
                 // PostgreSQL's pg_typeof reports the argument's *static* type —
                 // `current_user` is `name` though the value is plain text. The
@@ -934,12 +964,14 @@ pub(crate) fn dispatch<'a>(
                 // runtime value (same storage type, or NULL); an inconsistent
                 // one — a mis-inferred set-returning function, say — falls
                 // back to the type the value itself carries.
-                if let Some(name) = exec::typeof_static(args[0], row) {
+                if let Some(name) = exec::typeof_static(args[0], row)
+                    && let Some(referenced_oid) = exec::typeof_static_oid(args[0], row)
+                {
                     let consistent = v.is_null()
                         || exec::typeof_static_coltype(args[0], row)
                             .is_some_and(|ct| ct.storage().oid() == v.type_oid());
                     if consistent {
-                        return Ok(Datum::Text(name));
+                        return Ok(regtype(referenced_oid, name));
                     }
                 }
                 // An enum value reports its type name, resolved from the slot.
@@ -947,16 +979,21 @@ pub(crate) fn dispatch<'a>(
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.enum_name(slot, arena)?
                 {
-                    return Ok(Datum::Text(name));
+                    return Ok(regtype(crate::sql::types::oid::enum_oid(slot), name));
                 }
                 if let Datum::Array { element, .. } = v
                     && element.user_type_slot().is_some()
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.user_array_name(element, arena)?
                 {
-                    return Ok(Datum::Text(name));
+                    return Ok(regtype(element.array_oid(), name));
                 }
-                Ok(Datum::Text(match v {
+                let referenced_oid = if v.is_null() {
+                    crate::sql::types::oid::UNKNOWN
+                } else {
+                    v.type_oid()
+                };
+                let name = match v {
                     Datum::Null => "unknown",
                     Datum::Bool(_) => "boolean",
                     Datum::Int2(_) => "smallint",
@@ -966,6 +1003,17 @@ pub(crate) fn dispatch<'a>(
                     Datum::Float8(_) => "double precision",
                     Datum::Text(_) => "text",
                     Datum::Bpchar(_) => "character",
+                    Datum::Regtype { .. } => "regtype",
+                    Datum::RegObject { type_oid, .. } => match type_oid {
+                        crate::sql::types::oid::REGPROC => "regproc",
+                        crate::sql::types::oid::REGPROCEDURE => "regprocedure",
+                        crate::sql::types::oid::REGOPER => "regoper",
+                        crate::sql::types::oid::REGOPERATOR => "regoperator",
+                        crate::sql::types::oid::REGCLASS => "regclass",
+                        crate::sql::types::oid::REGNAMESPACE => "regnamespace",
+                        crate::sql::types::oid::REGROLE => "regrole",
+                        _ => "regobject",
+                    },
                     Datum::Date(_) => "date",
                     Datum::Timestamp(_) => "timestamp without time zone",
                     Datum::Timestamptz(_) => "timestamp with time zone",
@@ -989,7 +1037,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::Macaddr8(_) => "macaddr8",
                     Datum::Record(_) => "record",
                     Datum::Enum { .. } => "enum",
-                }))
+                };
+                Ok(regtype(referenced_oid, name))
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }

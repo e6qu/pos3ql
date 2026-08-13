@@ -106,6 +106,18 @@ def row_description_formats(payload):
     return formats
 
 
+def row_description_type_modifiers(payload):
+    (count,) = struct.unpack("!h", payload[:2])
+    at = 2
+    type_modifiers = []
+    for _ in range(count):
+        end = payload.index(b"\x00", at)
+        at = end + 1
+        type_modifiers.append(struct.unpack("!i", payload[at + 12 : at + 16])[0])
+        at += 18
+    return type_modifiers
+
+
 def start_extended(s, text, max_rows=0):
     parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
     bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -267,6 +279,99 @@ def test_binary_cursor_fetches_binary_rows():
     s.close()
 
 
+def test_binary_cursor_preserves_type_modifier():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    out = simple_query(
+        s,
+        "BEGIN; DECLARE type_modifier_probe BINARY CURSOR FOR "
+        "SELECT 'abc'::varchar(3) AS value; FETCH ALL FROM type_modifier_probe; COMMIT",
+    )
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary cursor: FETCH preserves varchar typmod",
+        description is not None
+        and row_description_type_oids(description) == [1043]
+        and row_description_type_modifiers(description) == [7]
+        and row_description_formats(description) == [1],
+        description,
+    )
+    check("binary cursor: FETCH preserves varchar bytes", row == b"\x00\x01\x00\x00\x00\x03abc", row)
+    s.close()
+
+
+def test_binary_cursor_preserves_catalog_identity():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    out = simple_query(
+        s,
+        "BEGIN; DECLARE catalog_identity_probe BINARY CURSOR FOR "
+        "SELECT '+(integer,integer)'::regoperator AS value; "
+        "FETCH ALL FROM catalog_identity_probe; COMMIT",
+    )
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary cursor: FETCH preserves regoperator identity",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1],
+        description,
+    )
+    check(
+        "binary cursor: FETCH returns the operator OID",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x02'",
+        row,
+    )
+    s.close()
+
+
+def test_binary_portal_preserves_catalog_identity():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(
+        b"P",
+        b"catalog_identity_statement\x00SELECT $1::regoperator AS value\x00"
+        + struct.pack("!hi", 1, 2204),
+    )
+    bind = frontend_message(
+        b"B",
+        b"catalog_identity_portal\x00catalog_identity_statement\x00"
+        + struct.pack("!hhh", 1, 1, 1)
+        + struct.pack("!i", 4)
+        + struct.pack("!i", 551)
+        + struct.pack("!hh", 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pcatalog_identity_portal\x00")
+    execute = frontend_message(b"E", b"catalog_identity_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "binary portal: Bind retains regoperator result identity",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1],
+        out,
+    )
+    check(
+        "binary portal: Execute returns the bound operator OID",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x02'",
+        row,
+    )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))
@@ -339,6 +444,187 @@ def test_bind_rejects_mismatched_result_format_count():
     check(
         "Bind keeps each validated result format",
         row == b"\x00\x02\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x012",
+        out,
+    )
+    s.close()
+
+
+def test_portal_describe_preserves_type_modifier():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(b"P", b"\x00SELECT 'abc'::varchar(3) AS value\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"typed_portal\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1),
+    )
+    describe = frontend_message(b"D", b"Ptyped_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "portal Describe preserves varchar typmod and result format",
+        description is not None
+        and row_description_type_oids(description) == [1043]
+        and row_description_type_modifiers(description) == [7]
+        and row_description_formats(description) == [1],
+        out,
+    )
+    s.close()
+
+
+def test_builtin_function_result_types_and_binary_json():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(
+        b"P",
+        b"\x00SELECT jsonb_set('{\"a\": 1}'::jsonb, '{a}', '2'::jsonb), "
+        b"json_strip_nulls('{\"a\": null}'::json)\x00\x00\x00",
+    )
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 0, 0, 2) + struct.pack("!hh", 1, 1),
+    )
+    describe = frontend_message(b"D", b"P\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "typed JSON functions preserve Describe OIDs and binary formats",
+        description is not None
+        and row_description_type_oids(description) == [3802, 114]
+        and row_description_formats(description) == [1, 1],
+        out,
+    )
+    expected = (
+        b"\x00\x02"
+        + struct.pack("!i", len(b'\x01{\"a\": 2}'))
+        + b'\x01{\"a\": 2}'
+        + struct.pack("!i", len(b"{}"))
+        + b"{}"
+    )
+    check("typed JSON functions preserve binary result bytes", row == expected, row)
+
+    parse = frontend_message(b"P", b"\x00SELECT pg_typeof(7)\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1),
+    )
+    describe = frontend_message(b"D", b"P\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "pg_typeof preserves regtype Describe and binary format",
+        description is not None
+        and row_description_type_oids(description) == [2206]
+        and row_description_formats(description) == [1],
+        out,
+    )
+    check(
+        "pg_typeof preserves referenced OID in binary result",
+        row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x00\x17",
+        row,
+    )
+    simple_query(
+        s,
+        "CREATE TABLE wire_regtype_value (value regtype DEFAULT 'integer'::regtype); "
+        "INSERT INTO wire_regtype_value DEFAULT VALUES",
+    )
+    parse = frontend_message(b"P", b"\x00SELECT value FROM wire_regtype_value\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1),
+    )
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "stored regtype preserves Describe and binary result bytes",
+        description is not None
+        and row_description_type_oids(description) == [2206]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x00\x17",
+        out,
+    )
+    simple_query(
+        s,
+        "CREATE ROLE wire_catalog_role; "
+        "CREATE SCHEMA wire_catalog_schema; "
+        "CREATE TABLE wire_catalog_reference (id integer); "
+        "CREATE TABLE wire_catalog_value ("
+        "  relation_value regclass DEFAULT 'wire_catalog_reference'::regclass, "
+        "  role_value regrole DEFAULT 'wire_catalog_role'::regrole, "
+        "  schema_value regnamespace DEFAULT 'wire_catalog_schema'::regnamespace, "
+        "  operator_value regoperator DEFAULT '+(integer,integer)'::regoperator"
+        "); "
+        "INSERT INTO wire_catalog_value DEFAULT VALUES",
+    )
+    relation_oid = int(
+        first_text_row(
+            simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_catalog_reference'")
+        )
+    )
+    parse = frontend_message(b"P", b"\x00SELECT relation_value FROM wire_catalog_value\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "stored regclass preserves Describe and binary result bytes",
+        description is not None
+        and row_description_type_oids(description) == [2205]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", relation_oid),
+        out,
+    )
+    parse = frontend_message(b"P", b"\x00SELECT operator_value FROM wire_catalog_value\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "stored regoperator preserves Describe and binary result bytes",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 551),
         out,
     )
     s.close()
@@ -789,7 +1075,10 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE TYPE wire_binary_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
         "CREATE DOMAIN wire_binary_vector AS integer[]; "
-        "CREATE DOMAIN wire_binary_required AS integer NOT NULL",
+        "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
+        "CREATE TABLE wire_binary_regclass (id integer); "
+        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
+        "AS 'SELECT value'",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
@@ -801,8 +1090,41 @@ def test_catalog_aware_binary_bind_parameters():
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
+    regclass_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
+    )
+    routine_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_proc WHERE proname = 'wire_binary_routine'"))
+    )
     cases = [
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
+        ("regtype", "SELECT $1::regtype", 2206, struct.pack("!i", 23), "integer", None),
+        (
+            "regclass",
+            "SELECT $1::regclass",
+            2205,
+            struct.pack("!i", regclass_oid),
+            "wire_binary_regclass",
+            None,
+        ),
+        ("regproc", "SELECT $1::regproc", 24, struct.pack("!i", routine_oid), "wire_binary_routine", None),
+        (
+            "regprocedure",
+            "SELECT $1::regprocedure",
+            2202,
+            struct.pack("!i", routine_oid),
+            "wire_binary_routine(integer)",
+            None,
+        ),
+        (
+            "regoperator",
+            "SELECT $1::regoperator",
+            2204,
+            struct.pack("!i", 551),
+            "+(integer,integer)",
+            None,
+        ),
+        ("invalid regtype", "SELECT $1::regtype", 2206, b"\x00", None, "22P03"),
         ("json", "SELECT $1::json", 114, b'{"b": 1, "a": 2}', '{"b": 1, "a": 2}', None),
         ("jsonb", "SELECT $1::jsonb", 3802, b'\x01{"b": 1, "a": 2}', '{"a": 2, "b": 1}', None),
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
@@ -866,6 +1188,15 @@ def test_catalog_aware_binary_bind_parameters():
                 has_sqlstate(messages, state),
                 messages,
             )
+    # A malformed composite body belongs to the binary input value, not the
+    # surrounding COPY format. PostgreSQL exposes that distinction as 22P03.
+    malformed_array = struct.pack("!iii", 1, 1, 23) + struct.pack("!ii", 1, 1) + struct.pack("!i", -2)
+    messages = extended_binary_parameter(s, "SELECT $1::int4[]", 1007, malformed_array)
+    check(
+        "binary Bind malformed structured value has binary-input SQLSTATE",
+        has_sqlstate(messages, "22P03"),
+        messages,
+    )
     record = binary_record(
         [
             (enum_oid, b"ready"),
@@ -921,7 +1252,10 @@ def test_catalog_aware_text_bind_parameters():
         s,
         "CREATE TYPE wire_text_state AS ENUM ('ready', 'blocked'); "
         "CREATE DOMAIN wire_text_positive AS integer CHECK (VALUE > 0); "
-        "CREATE DOMAIN wire_text_required AS integer NOT NULL",
+        "CREATE DOMAIN wire_text_required AS integer NOT NULL; "
+        "CREATE TABLE wire_text_regclass (id integer); "
+        "CREATE FUNCTION wire_text_routine(value integer) RETURNS integer LANGUAGE SQL "
+        "AS 'SELECT value'",
     )
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_state'")))
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_positive'")))
@@ -933,6 +1267,26 @@ def test_catalog_aware_text_bind_parameters():
     cases = [
         ("integer identity", "SELECT pg_typeof($1)", 23, b"7", "integer", None),
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
+        ("regtype", "SELECT $1::regtype", 2206, b"integer", "integer", None),
+        ("regclass", "SELECT $1::regclass", 2205, b"wire_text_regclass", "wire_text_regclass", None),
+        ("regproc", "SELECT $1::regproc", 24, b"wire_text_routine", "wire_text_routine", None),
+        (
+            "regprocedure",
+            "SELECT $1::regprocedure",
+            2202,
+            b"wire_text_routine(integer)",
+            "wire_text_routine(integer)",
+            None,
+        ),
+        (
+            "regoperator",
+            "SELECT $1::regoperator",
+            2204,
+            b"+(integer,integer)",
+            "+(integer,integer)",
+            None,
+        ),
+        ("invalid regtype", "SELECT $1::regtype", 2206, b"not_a_type", None, "42704"),
         ("enum", "SELECT $1::wire_text_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_text_positive", domain_oid, b"7", "7", None),
         ("enum array", "SELECT $1::wire_text_state[]", enum_array_oid, b"{ready,blocked}", "{ready,blocked}", None),

@@ -40,6 +40,38 @@ impl<'a> ColumnLookup<'a> for NoColumns {
     }
 }
 
+fn refresh_catalog_object_names<'a>(
+    storage: &Storage,
+    txid: u32,
+    values: &mut [Datum<'a>],
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    for value in values {
+        let Datum::RegObject {
+            type_oid,
+            referenced_oid,
+            ..
+        } = *value
+        else {
+            continue;
+        };
+        let target = ColType::from_oid(type_oid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "invalid catalog object type OID"
+            )
+        })?;
+        *value = crate::sql::eval::regobject_cast(
+            Datum::Int4(referenced_oid),
+            target,
+            Some(&catalog),
+            arena,
+        )?;
+    }
+    Ok(())
+}
+
 /// A complete value probe over one base table. The rowids are sorted so
 /// taking the cache path does not make result/error order depend on hash-slot
 /// placement.
@@ -1281,6 +1313,8 @@ fn scan_source_mode<'a>(
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
+        storage: &Storage,
+        txid: u32,
         scope: &'s QueryScope<'d>,
         bound: &[Option<BoundRow<'v>>],
         bound_rowids: &'s [Option<u64>],
@@ -1311,6 +1345,7 @@ fn scan_source_mode<'a>(
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
                         def.schema(&mut schema);
                         rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
+                        refresh_catalog_object_names(storage, txid, buffer, arena)?;
                     }
                     values[t] = Some(&buffer[..def.n_columns]);
                 }
@@ -1568,6 +1603,8 @@ fn scan_source_mode<'a>(
                                             bound[build_t] = Some(entry.row);
                                             rowids[build_t] = entry.rowid;
                                             let row = assemble(
+                                                storage,
+                                                txid,
                                                 scope,
                                                 &bound,
                                                 &rowids,
@@ -1613,6 +1650,8 @@ fn scan_source_mode<'a>(
                                 bound[probe_t] = Some(BoundRow::Values(values));
                                 rowids[probe_t] = Some(spilled.rowid);
                                 let row = assemble(
+                                    storage,
+                                    txid,
                                     scope,
                                     &bound,
                                     &rowids,
@@ -1710,6 +1749,8 @@ fn scan_source_mode<'a>(
                                     bound[build_t] = Some(entry.row);
                                     bound_rowids[build_t] = entry.rowid;
                                     let row = assemble(
+                                        storage,
+                                        txid,
                                         scope,
                                         bound,
                                         bound_rowids,
@@ -1757,8 +1798,17 @@ fn scan_source_mode<'a>(
                         let bound_rowids = &mut [None, None];
                         bound[probe_t] = Some(BoundRow::Encoded(bytes));
                         bound_rowids[probe_t] = Some(rowid);
-                        let row =
-                            assemble(scope, bound, bound_rowids, order, 2, decode_buffers, arena)?;
+                        let row = assemble(
+                            storage,
+                            txid,
+                            scope,
+                            bound,
+                            bound_rowids,
+                            order,
+                            2,
+                            decode_buffers,
+                            arena,
+                        )?;
                         if let Some(w) = where_clause {
                             let chained = Chained { inner: &row, outer };
                             if !where_passes(w, arena, params, &chained, hooks)? {
@@ -1783,6 +1833,8 @@ fn scan_source_mode<'a>(
 
     #[allow(clippy::too_many_arguments)]
     fn candidate_passes<'a>(
+        storage: &Storage,
+        txid: u32,
         scope: &QueryScope<'a>,
         bound: &[Option<BoundRow<'a>>],
         bound_rowids: &[Option<u64>],
@@ -1798,6 +1850,8 @@ fn scan_source_mode<'a>(
     ) -> Result<bool, SqlError> {
         if let Some(on) = on {
             let row = assemble(
+                storage,
+                txid,
                 scope,
                 bound,
                 bound_rowids,
@@ -1822,6 +1876,8 @@ fn scan_source_mode<'a>(
             return Ok(true);
         }
         let row = assemble(
+            storage,
+            txid,
             scope,
             bound,
             bound_rowids,
@@ -1846,6 +1902,7 @@ fn scan_source_mode<'a>(
     #[inline(never)]
     fn candidate_matches<'a>(
         storage: &'a Storage,
+        txid: u32,
         scope: &QueryScope<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -1867,6 +1924,8 @@ fn scan_source_mode<'a>(
         bound[order[depth]] = Some(candidate);
         bound_rowids[order[depth]] = rowid;
         if !candidate_passes(
+            storage,
+            txid,
             scope,
             bound,
             bound_rowids,
@@ -1922,6 +1981,8 @@ fn scan_source_mode<'a>(
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
             let row = assemble(
+                storage,
+                txid,
                 scope,
                 bound,
                 bound_rowids,
@@ -1954,6 +2015,7 @@ fn scan_source_mode<'a>(
             ($index:expr, $candidate:expr, $rowid:expr) => {{
                 if !candidate_matches(
                     storage,
+                    txid,
                     scope,
                     arena,
                     params,
@@ -2048,6 +2110,8 @@ fn scan_source_mode<'a>(
                 &from.joins[t - 1].table
             };
             let outer_row = assemble(
+                storage,
+                txid,
                 scope,
                 bound,
                 bound_rowids,
@@ -2506,6 +2570,8 @@ fn scan_source_mode<'a>(
                     if d + 1 == scope.n {
                         // Last level: the row is complete once the left side nulls.
                         let row = assemble(
+                            storage,
+                            txid,
                             scope,
                             bound,
                             bound_rowids,

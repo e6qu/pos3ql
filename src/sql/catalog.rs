@@ -7,7 +7,7 @@
 //! and joins all work against them.
 
 use crate::mem::arena::Arena;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, SqlName, Storage, TableDef};
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
@@ -248,6 +248,87 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_types: "2205",
         argument_count: 1,
         volatility: "s",
+    },
+];
+
+/// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
+/// The resolver deliberately exposes only operations the engine evaluates;
+/// unsupported operator catalog entries remain explicit errors, never fake
+/// catalog rows.
+#[derive(Clone, Copy)]
+struct CatalogOperator {
+    oid: i32,
+    name: &'static str,
+    left: ColType,
+    right: ColType,
+}
+
+const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    CatalogOperator {
+        oid: 96,
+        name: "=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 97,
+        name: "<",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 518,
+        name: "<>",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 521,
+        name: ">",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 523,
+        name: "<=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 525,
+        name: ">=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 514,
+        name: "*",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 528,
+        name: "/",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 530,
+        name: "%",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 551,
+        name: "+",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 555,
+        name: "-",
+        left: ColType::Int4,
+        right: ColType::Int4,
     },
 ];
 
@@ -722,24 +803,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_proc") => pg_proc(storage, txid, arena),
-        (false, "pg_operator") => finish(
-            def_of(
-                "pg_operator",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("oprname", ColType::Name),
-                    ("oprnamespace", ColType::Int4),
-                    ("oprowner", ColType::Int4),
-                    ("oprkind", ColType::Bpchar),
-                    ("oprleft", ColType::Int4),
-                    ("oprright", ColType::Int4),
-                    ("oprcode", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_operator") => pg_operator(arena),
         (false, "pg_opclass") => finish(
             def_of(
                 "pg_opclass",
@@ -763,12 +827,12 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_opfamily",
                 &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("opfmethod", ColType::Int4),
+                    ("tableoid", ColType::Oid),
+                    ("oid", ColType::Oid),
+                    ("opfmethod", ColType::Oid),
                     ("opfname", ColType::Name),
-                    ("opfnamespace", ColType::Int4),
-                    ("opfowner", ColType::Int4),
+                    ("opfnamespace", ColType::Oid),
+                    ("opfowner", ColType::Oid),
                 ],
             ),
             &[],
@@ -778,15 +842,15 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_amop",
                 &[
-                    ("oid", ColType::Int4),
-                    ("amopfamily", ColType::Int4),
-                    ("amoplefttype", ColType::Int4),
-                    ("amoprighttype", ColType::Int4),
+                    ("oid", ColType::Oid),
+                    ("amopfamily", ColType::Oid),
+                    ("amoplefttype", ColType::Oid),
+                    ("amoprighttype", ColType::Oid),
                     ("amopstrategy", ColType::Int4),
                     ("amoppurpose", ColType::Bpchar),
-                    ("amopopr", ColType::Int4),
-                    ("amopmethod", ColType::Int4),
-                    ("amopsortfamily", ColType::Int4),
+                    ("amopopr", ColType::Oid),
+                    ("amopmethod", ColType::Oid),
+                    ("amopsortfamily", ColType::Oid),
                 ],
             ),
             &[],
@@ -796,12 +860,12 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_amproc",
                 &[
-                    ("oid", ColType::Int4),
-                    ("amprocfamily", ColType::Int4),
-                    ("amproclefttype", ColType::Int4),
-                    ("amprocrighttype", ColType::Int4),
+                    ("oid", ColType::Oid),
+                    ("amprocfamily", ColType::Oid),
+                    ("amproclefttype", ColType::Oid),
+                    ("amprocrighttype", ColType::Oid),
                     ("amprocnum", ColType::Int4),
-                    ("amproc", ColType::Int4),
+                    ("amproc", ColType::Oid),
                 ],
             ),
             &[],
@@ -1184,6 +1248,12 @@ pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
         .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
 }
 
+pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
+    PREDEFINED_ROLES
+        .iter()
+        .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
+}
+
 #[derive(Clone, Copy)]
 enum CatalogOwner {
     Role(usize),
@@ -1541,13 +1611,17 @@ fn pg_default_acl<'a>(
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
 /// schema's OID is derived from its registry slot, above the table range.
 const FIRST_SCHEMA_OID: i32 = 80_000;
+const fn namespace_oid_for_slot(slot: usize) -> i32 {
+    FIRST_SCHEMA_OID + slot as i32
+}
+
 fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
     match schema {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         _ => storage
             .find_schema(schema)
-            .map(|slot| FIRST_SCHEMA_OID + slot as i32)
+            .map(namespace_oid_for_slot)
             .unwrap_or(0),
     }
 }
@@ -1560,6 +1634,16 @@ pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Opti
             .visible_schemas(txid)
             .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
             .map(|(_, schema)| schema.name.as_str()),
+    }
+}
+
+pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    match name {
+        "public" => Some(PUBLIC_NS_OID),
+        "pg_catalog" => Some(PG_CATALOG_NS_OID),
+        _ => storage
+            .find_schema_visible(name, txid)
+            .map(namespace_oid_for_slot),
     }
 }
 
@@ -2023,6 +2107,245 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
+    match written.split_once('.') {
+        Some((written_schema, written_name)) => written_schema == schema && written_name == name,
+        None => written == name,
+    }
+}
+
+fn parse_routine_signature<'a>(
+    written: &'a str,
+    arguments: &mut [ColType; MAX_ROUTINE_ARGUMENTS],
+) -> Option<(&'a str, usize)> {
+    let (name, written_arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let written_arguments = written_arguments.trim();
+    if written_arguments.is_empty() {
+        return Some((name.trim(), 0));
+    }
+    let mut count = 0;
+    for written_type in written_arguments.split(',') {
+        let written_type = written_type
+            .trim()
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(written_type.trim());
+        if count == arguments.len() {
+            return None;
+        }
+        arguments[count] = ColType::from_sql_name(written_type)?;
+        count += 1;
+    }
+    Some((name.trim(), count))
+}
+
+fn intrinsic_argument_matches(routine: IntrinsicRoutine, arguments: &[ColType]) -> bool {
+    if routine.argument_count != arguments.len() as i32 {
+        return false;
+    }
+    routine
+        .argument_types
+        .split_ascii_whitespace()
+        .zip(arguments)
+        .all(|(oid, argument)| oid.parse::<i32>().ok() == Some(argument.oid()))
+}
+
+fn routine_signature<'a>(
+    name: &str,
+    arguments: impl Iterator<Item = ColType>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use core::fmt::Write;
+    let mut text = StackStr::<256>::new();
+    write!(text, "{}(", name).map_err(|_| super::eval::arena_full())?;
+    for (index, argument) in arguments.enumerate() {
+        if index != 0 {
+            write!(text, ",").map_err(|_| super::eval::arena_full())?;
+        }
+        write!(text, "{}", argument.name()).map_err(|_| super::eval::arena_full())?;
+    }
+    write!(text, ")").map_err(|_| super::eval::arena_full())?;
+    arena
+        .alloc_str(text.as_str())
+        .map_err(|_| super::eval::arena_full())
+}
+
+/// Resolves the function catalog object types. `regproc` names a routine by
+/// unqualified name; `regprocedure` includes its complete argument signature.
+pub(crate) fn routine_oid_by_name(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+    signature: bool,
+) -> Result<Option<i32>, SqlError> {
+    let mut arguments = [ColType::Bool; MAX_ROUTINE_ARGUMENTS];
+    let (name, argument_count) = if signature {
+        let Some(parsed) = parse_routine_signature(written, &mut arguments) else {
+            return Ok(None);
+        };
+        parsed
+    } else {
+        (written.trim(), 0)
+    };
+    let mut found = None;
+    let mut consider = |oid| -> Result<(), SqlError> {
+        if found.replace(oid).is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "more than one function named \"{}\"",
+                written
+            ));
+        }
+        Ok(())
+    };
+    for routine in INTRINSIC_ROUTINES {
+        if !routine_name_matches(name, "pg_catalog", routine.name)
+            || (signature && !intrinsic_argument_matches(*routine, &arguments[..argument_count]))
+        {
+            continue;
+        }
+        consider(routine.oid)?;
+    }
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine(slot);
+        if !routine.visible_to(txid)
+            || !routine_name_matches(
+                name,
+                routine.schema_for(txid).as_str(),
+                routine.name_for(txid).as_str(),
+            )
+            || (signature
+                && (routine.argument_count != argument_count
+                    || !routine
+                        .arguments()
+                        .iter()
+                        .zip(&arguments[..argument_count])
+                        .all(|(defined, argument)| defined.ctype == *argument)))
+        {
+            continue;
+        }
+        consider(crate::storage::routine_oid(routine))?;
+    }
+    Ok(found)
+}
+
+pub(crate) fn routine_name_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    signature: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        if !signature {
+            return arena
+                .alloc_str(routine.name)
+                .map(Some)
+                .map_err(|_| super::eval::arena_full());
+        }
+        let arguments = routine
+            .argument_types
+            .split_ascii_whitespace()
+            .filter_map(|oid| oid.parse::<i32>().ok())
+            .filter_map(ColType::from_oid);
+        return routine_signature(routine.name, arguments, arena).map(Some);
+    }
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine(slot);
+    let current_name = routine.name_for(txid);
+    let name = current_name.as_str();
+    if !signature {
+        return arena
+            .alloc_str(name)
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
+    routine_signature(
+        name,
+        routine.arguments().iter().map(|argument| argument.ctype),
+        arena,
+    )
+    .map(Some)
+}
+
+fn parse_operator_signature(written: &str) -> Option<(&str, ColType, ColType)> {
+    let (name, arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let (left, right) = arguments.split_once(',')?;
+    let type_of = |name: &str| {
+        ColType::from_sql_name(
+            name.trim()
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(name.trim()),
+        )
+    };
+    Some((name.trim(), type_of(left)?, type_of(right)?))
+}
+
+pub(crate) fn operator_oid_by_name(
+    written: &str,
+    signature: bool,
+) -> Result<Option<i32>, SqlError> {
+    let (name, arguments) = if signature {
+        let Some((name, left, right)) = parse_operator_signature(written) else {
+            return Ok(None);
+        };
+        (name, Some((left, right)))
+    } else {
+        (written.trim(), None)
+    };
+    let mut found = None;
+    for operator in CATALOG_OPERATORS {
+        if operator.name != name
+            || arguments
+                .is_some_and(|(left, right)| operator.left != left || operator.right != right)
+        {
+            continue;
+        }
+        if found.replace(operator.oid).is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "more than one operator named \"{}\"",
+                written
+            ));
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn operator_name_by_oid(
+    oid: i32,
+    signature: bool,
+    arena: &Arena,
+) -> Result<Option<&str>, SqlError> {
+    let Some(operator) = CATALOG_OPERATORS
+        .iter()
+        .find(|operator| operator.oid == oid)
+    else {
+        return Ok(None);
+    };
+    if !signature {
+        return arena
+            .alloc_str(operator.name)
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
+    let mut text = StackStr::<96>::new();
+    use core::fmt::Write;
+    write!(
+        text,
+        "{}({},{})",
+        operator.name,
+        operator.left.name(),
+        operator.right.name()
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    arena
+        .alloc_str(text.as_str())
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
 }
 
 pub fn function_def_text<'a>(
@@ -3864,11 +4187,11 @@ fn pg_depend<'a>(
     let def = def_of(
         "pg_depend",
         &[
-            ("classid", ColType::Int4),
-            ("objid", ColType::Int4),
+            ("classid", ColType::Oid),
+            ("objid", ColType::Oid),
             ("objsubid", ColType::Int4),
-            ("refclassid", ColType::Int4),
-            ("refobjid", ColType::Int4),
+            ("refclassid", ColType::Oid),
+            ("refobjid", ColType::Oid),
             ("refobjsubid", ColType::Int4),
             ("deptype", ColType::Bpchar),
         ],
@@ -4384,6 +4707,42 @@ fn pg_attrdef<'a>(
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_operator<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_operator",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("oprname", ColType::Name),
+            ("oprnamespace", ColType::Oid),
+            ("oprowner", ColType::Oid),
+            ("oprkind", ColType::Bpchar),
+            ("oprleft", ColType::Oid),
+            ("oprright", ColType::Oid),
+            ("oprcode", ColType::Oid),
+        ],
+    );
+    const OPCODES: [i32; 11] = [65, 66, 144, 147, 149, 150, 141, 154, 156, 177, 181];
+    let mut rows: [&[Datum]; CATALOG_OPERATORS.len()] = [&[]; CATALOG_OPERATORS.len()];
+    for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Int4(2617),
+                Datum::Int4(operator.oid),
+                text(operator.name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Bpchar("b"),
+                Datum::Int4(operator.left.oid()),
+                Datum::Int4(operator.right.oid()),
+                Datum::Int4(OPCODES[index]),
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &rows, arena)
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

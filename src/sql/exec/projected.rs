@@ -166,6 +166,8 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Macaddr(_) => 6,
         Datum::Macaddr8(_) => 8,
         Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
+        Datum::Regtype { name, .. } => 8 + name.len(),
+        Datum::RegObject { name, .. } => 12 + name.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::Array { raw, .. } => 8 + raw.len(),
         Datum::Int2Vector(raw) => 4 + raw.len(),
@@ -257,6 +259,28 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[1..5].copy_from_slice(&(str_value.len() as u32).to_le_bytes());
             out[5..5 + str_value.len()].copy_from_slice(str_value.as_bytes());
             5 + str_value.len()
+        }
+        Datum::Regtype {
+            referenced_oid,
+            name,
+        } => {
+            out[0] = 30;
+            out[1..5].copy_from_slice(&referenced_oid.to_le_bytes());
+            out[5..9].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            out[9..9 + name.len()].copy_from_slice(name.as_bytes());
+            9 + name.len()
+        }
+        Datum::RegObject {
+            type_oid,
+            referenced_oid,
+            name,
+        } => {
+            out[0] = 31;
+            out[1..5].copy_from_slice(&type_oid.to_le_bytes());
+            out[5..9].copy_from_slice(&referenced_oid.to_le_bytes());
+            out[9..13].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            out[13..13 + name.len()].copy_from_slice(name.as_bytes());
+            13 + name.len()
         }
         Datum::Date(x) => {
             out[0] = 6;
@@ -466,6 +490,32 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                         .expect("encoded from valid UTF-8"),
                 ),
                 4 + len,
+            )
+        }
+        30 => {
+            let referenced_oid = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            (
+                Datum::Regtype {
+                    referenced_oid,
+                    name: core::str::from_utf8(&bytes[at + 8..at + 8 + len])
+                        .expect("encoded from valid UTF-8"),
+                },
+                8 + len,
+            )
+        }
+        31 => {
+            let type_oid = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let referenced_oid = i32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+            (
+                Datum::RegObject {
+                    type_oid,
+                    referenced_oid,
+                    name: core::str::from_utf8(&bytes[at + 12..at + 12 + len])
+                        .expect("encoded from valid UTF-8"),
+                },
+                12 + len,
             )
         }
         6 => (

@@ -107,6 +107,19 @@ pub enum ColType {
     /// PostgreSQL object identity, retaining its catalog and wire metadata
     /// while sharing the engine's four-byte integer datum storage.
     Oid,
+    /// `regtype`: a catalog type reference with OID storage and catalog-name
+    /// text output, not ordinary text.
+    Regtype,
+    /// PostgreSQL catalog object references. They share the four-byte binary
+    /// representation of an OID but retain their distinct type identities and
+    /// textual output functions.
+    Regproc,
+    Regprocedure,
+    Regoper,
+    Regoperator,
+    Regclass,
+    Regnamespace,
+    Regrole,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
     /// typlen 4. On disk it keeps the historical 8-byte float8 layout
@@ -184,13 +197,12 @@ pub enum ColType {
 /// [`ColType::from_code`] resolved both to the multirange — so a restart
 /// replayed those columns back as the wrong type, losing their values.
 ///
-/// The two moved families are rebased clear of *every* code the old layout
-/// could produce (20..=40), so a column written by a build predating this fix
-/// decodes to `None` — a loud failure — instead of silently coming back as a
-/// different type. Codes outside every assigned span decode to `None` too.
+/// The parameter-free catalog object aliases occupy 59..=65, so arrays start
+/// above that band. A retired code decodes to `None` rather than becoming a
+/// different type.
 const RANGE_CODE_BASE: u8 = 20;
 const MULTIRANGE_CODE_BASE: u8 = 48;
-const ARRAY_CODE_BASE: u8 = 64;
+const ARRAY_CODE_BASE: u8 = 80;
 /// How many `RangeKind`s there are, i.e. the width of each range family's span.
 const RANGE_KINDS: u8 = 6;
 
@@ -198,6 +210,19 @@ impl ColType {
     /// Pseudo-types describe executor contracts rather than stored values.
     pub const fn is_pseudo(self) -> bool {
         matches!(self, Self::Void | Self::Record)
+    }
+
+    pub const fn is_reg_object(self) -> bool {
+        matches!(
+            self,
+            Self::Regproc
+                | Self::Regprocedure
+                | Self::Regoper
+                | Self::Regoperator
+                | Self::Regclass
+                | Self::Regnamespace
+                | Self::Regrole
+        )
     }
 
     /// Maps a SQL type name (already case-folded) to a column type.
@@ -220,10 +245,15 @@ impl ColType {
             "bigint" | "int8" | "bigserial" | "serial8" => Self::Int8,
             "float8" | "float" | "double precision" => Self::Float8,
             "float4" | "real" => Self::Float4,
-            // `name` and the `reg*` object-identifier types render as text for
-            // catalog introspection.
-            "text" | "regtype" | "regclass" | "regproc" | "regprocedure" | "regrole"
-            | "regnamespace" | "regoper" | "regoperator" => Self::Text,
+            "text" => Self::Text,
+            "regtype" => Self::Regtype,
+            "regproc" => Self::Regproc,
+            "regprocedure" => Self::Regprocedure,
+            "regoper" => Self::Regoper,
+            "regoperator" => Self::Regoperator,
+            "regclass" => Self::Regclass,
+            "regnamespace" => Self::Regnamespace,
+            "regrole" => Self::Regrole,
             "name" => Self::Name,
             "oid" => Self::Oid,
             "varchar" | "character varying" => Self::Varchar,
@@ -258,6 +288,14 @@ impl ColType {
             Self::Int2Vector => oid::INT2VECTOR,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
+            Self::Regtype => oid::REGTYPE,
+            Self::Regproc => oid::REGPROC,
+            Self::Regprocedure => oid::REGPROCEDURE,
+            Self::Regoper => oid::REGOPER,
+            Self::Regoperator => oid::REGOPERATOR,
+            Self::Regclass => oid::REGCLASS,
+            Self::Regnamespace => oid::REGNAMESPACE,
+            Self::Regrole => oid::REGROLE,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
@@ -302,14 +340,14 @@ impl ColType {
             oid::INT2VECTOR => Some(Self::Int2Vector),
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
-            oid::REGPROC
-            | oid::REGPROCEDURE
-            | oid::REGOPER
-            | oid::REGOPERATOR
-            | oid::REGCLASS
-            | oid::REGTYPE
-            | oid::REGNAMESPACE
-            | oid::REGROLE => Some(Self::Int4),
+            oid::REGPROC => Some(Self::Regproc),
+            oid::REGPROCEDURE => Some(Self::Regprocedure),
+            oid::REGOPER => Some(Self::Regoper),
+            oid::REGOPERATOR => Some(Self::Regoperator),
+            oid::REGCLASS => Some(Self::Regclass),
+            oid::REGNAMESPACE => Some(Self::Regnamespace),
+            oid::REGROLE => Some(Self::Regrole),
+            oid::REGTYPE => Some(Self::Regtype),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
             oid::FLOAT8 => Some(Self::Float8),
@@ -412,7 +450,18 @@ impl ColType {
             Self::Bool => 1,
             Self::Int2 => 2,
             Self::Int2Vector => -1,
-            Self::Int4 | Self::Oid | Self::Date | Self::Float4 => 4,
+            Self::Int4
+            | Self::Oid
+            | Self::Regtype
+            | Self::Regproc
+            | Self::Regprocedure
+            | Self::Regoper
+            | Self::Regoperator
+            | Self::Regclass
+            | Self::Regnamespace
+            | Self::Regrole
+            | Self::Date
+            | Self::Float4 => 4,
             Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
@@ -442,6 +491,14 @@ impl ColType {
             Self::Float4 => Self::Float8,
             Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
             Self::Oid => Self::Int4,
+            Self::Regtype
+            | Self::Regproc
+            | Self::Regprocedure
+            | Self::Regoper
+            | Self::Regoperator
+            | Self::Regclass
+            | Self::Regnamespace
+            | Self::Regrole => self,
             other => other,
         }
     }
@@ -455,6 +512,14 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::Int4 => "int4",
             Self::Oid => "oid",
+            Self::Regtype => "regtype",
+            Self::Regproc => "regproc",
+            Self::Regprocedure => "regprocedure",
+            Self::Regoper => "regoper",
+            Self::Regoperator => "regoperator",
+            Self::Regclass => "regclass",
+            Self::Regnamespace => "regnamespace",
+            Self::Regrole => "regrole",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
@@ -506,6 +571,14 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::Int4 => "integer",
             Self::Oid => "oid",
+            Self::Regtype => "regtype",
+            Self::Regproc => "regproc",
+            Self::Regprocedure => "regprocedure",
+            Self::Regoper => "regoper",
+            Self::Regoperator => "regoperator",
+            Self::Regclass => "regclass",
+            Self::Regnamespace => "regnamespace",
+            Self::Regrole => "regrole",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
@@ -549,6 +622,14 @@ impl ColType {
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
+            Self::Regtype => 58,
+            Self::Regproc => 59,
+            Self::Regprocedure => 60,
+            Self::Regoper => 61,
+            Self::Regoperator => 62,
+            Self::Regclass => 63,
+            Self::Regnamespace => 64,
+            Self::Regrole => 65,
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
@@ -600,6 +681,14 @@ impl ColType {
             57 => Self::Void,
             2 => Self::Int4,
             56 => Self::Oid,
+            58 => Self::Regtype,
+            59 => Self::Regproc,
+            60 => Self::Regprocedure,
+            61 => Self::Regoper,
+            62 => Self::Regoperator,
+            63 => Self::Regclass,
+            64 => Self::Regnamespace,
+            65 => Self::Regrole,
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
@@ -610,6 +699,7 @@ impl ColType {
             10 => Self::Bytea,
             11 => Self::Numeric,
             12 => Self::Int2,
+            55 => Self::Int2Vector,
             13 => Self::Float4,
             14 => Self::Varchar,
             15 => Self::Bpchar,
@@ -1281,6 +1371,19 @@ pub enum Datum<'a> {
     /// the stripped form, while output functions, `LIKE`/regex matching, and
     /// `octet_length` see the raw padded form.
     Bpchar(&'a str),
+    /// A `regtype` value: the referenced type OID is its binary representation
+    /// while the catalog-resolved name is its text representation.
+    Regtype {
+        referenced_oid: i32,
+        name: &'a str,
+    },
+    /// A non-type catalog object reference. `type_oid` distinguishes the
+    /// reg* aliases; its four-byte binary form is `referenced_oid`.
+    RegObject {
+        type_oid: i32,
+        referenced_oid: i32,
+        name: &'a str,
+    },
     /// Days since 2000-01-01.
     Date(i32),
     /// Microseconds since 2000-01-01 (naive).
@@ -1380,6 +1483,8 @@ impl<'a> Datum<'a> {
             Datum::Float8(_) => oid::FLOAT8,
             Datum::Text(_) => oid::TEXT,
             Datum::Bpchar(_) => oid::BPCHAR,
+            Datum::Regtype { .. } => oid::REGTYPE,
+            Datum::RegObject { type_oid, .. } => *type_oid,
             Datum::Date(_) => oid::DATE,
             Datum::Timestamp(_) => oid::TIMESTAMP,
             Datum::Timestamptz(_) => oid::TIMESTAMPTZ,
@@ -1532,7 +1637,10 @@ impl fmt::Display for Datum<'_> {
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
             // The output function emits the padding — psql shows `hi   `.
-            Datum::Text(s) | Datum::Bpchar(s) => f.write_str(s),
+            Datum::Text(s)
+            | Datum::Bpchar(s)
+            | Datum::Regtype { name: s, .. }
+            | Datum::RegObject { name: s, .. } => f.write_str(s),
             Datum::Date(d) => f.write_str(super::datetime::format_date(*d).as_str()),
             Datum::Timestamp(t) => {
                 f.write_str(super::datetime::format_timestamp(*t, false).as_str())
@@ -1896,8 +2004,17 @@ mod tests {
             ColType::Void,
             ColType::Bool,
             ColType::Int2,
+            ColType::Int2Vector,
             ColType::Int4,
             ColType::Oid,
+            ColType::Regtype,
+            ColType::Regproc,
+            ColType::Regprocedure,
+            ColType::Regoper,
+            ColType::Regoperator,
+            ColType::Regclass,
+            ColType::Regnamespace,
+            ColType::Regrole,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -1990,12 +2107,22 @@ mod code_roundtrip_tests {
             ColType::Void,
             ColType::Bool,
             ColType::Int2,
+            ColType::Int2Vector,
             ColType::Int4,
             ColType::Oid,
+            ColType::Regtype,
+            ColType::Regproc,
+            ColType::Regprocedure,
+            ColType::Regoper,
+            ColType::Regoperator,
+            ColType::Regclass,
+            ColType::Regnamespace,
+            ColType::Regrole,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
             ColType::Text,
+            ColType::Name,
             ColType::Varchar,
             ColType::Bpchar,
             ColType::Date,
@@ -2029,14 +2156,26 @@ mod code_roundtrip_tests {
         }
         for e in [
             ArrElem::Bool,
+            ArrElem::Int2,
             ArrElem::Int4,
             ArrElem::Int8,
+            ArrElem::Float4,
             ArrElem::Float8,
             ArrElem::Text,
+            ArrElem::Name,
+            ArrElem::Varchar,
+            ArrElem::Bpchar,
             ArrElem::Numeric,
             ArrElem::Date,
             ArrElem::Timestamp,
             ArrElem::Timestamptz,
+            ArrElem::Time,
+            ArrElem::Timetz,
+            ArrElem::Interval,
+            ArrElem::Json,
+            ArrElem::Jsonb,
+            ArrElem::Uuid,
+            ArrElem::Bytea,
             ArrElem::Inet,
             ArrElem::Cidr,
             ArrElem::Macaddr,
@@ -2072,5 +2211,10 @@ mod code_roundtrip_tests {
             }
             seen.push((c, t));
         }
+        assert_eq!(ColType::from_code(ColType::Record.code()), None);
+        assert_eq!(
+            ColType::from_code(ColType::Enum(0).code()),
+            Some(ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED))
+        );
     }
 }

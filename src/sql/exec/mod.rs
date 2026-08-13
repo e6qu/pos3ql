@@ -137,7 +137,7 @@ pub use describe::{
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
     infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_type,
     record_shape, register_shape_for, reset_record_shapes, typeof_static, typeof_static_coltype,
-    visit_record_shape as visit_record_shape_pub,
+    typeof_static_oid, visit_record_shape as visit_record_shape_pub,
 };
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
 
@@ -7032,8 +7032,7 @@ pub fn create_table_as(
     };
     def.n_columns = n_cols;
     for i in 0..n_cols {
-        let Some((ctype, user_type)) =
-            materialized_column_type(storage, txn.txid, columns[i].type_oid)
+        let Some((ctype, user_type)) = catalog_column_type(storage, txn.txid, columns[i].type_oid)
         else {
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -7241,7 +7240,7 @@ pub fn create_table_as(
 /// User-defined OID bands carry both their storage representation and their
 /// schema-qualified type identity, so CTAS and materialized views do not
 /// flatten enums/domains or lose their automatically-created array types.
-fn materialized_column_type(
+pub(crate) fn catalog_column_type(
     storage: &Storage,
     txid: u32,
     type_oid: i32,
@@ -11242,7 +11241,17 @@ pub(crate) fn decode_binary_input<'a>(
     arena: &'a Arena,
     txid: u32,
 ) -> Result<Datum<'a>, SqlError> {
-    match resolve_parameter_input_type(storage, oid, txid)? {
+    if oid == crate::sql::types::oid::REGTYPE {
+        let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+            sql_err!(
+                sqlstate::INVALID_BINARY_REPRESENTATION,
+                "invalid binary representation for parameter type OID {}",
+                oid
+            )
+        })?;
+        return crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena);
+    }
+    let decoded = match resolve_parameter_input_type(storage, oid, txid)? {
         ParameterInputType::Builtin(ctype) => {
             decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid)
         }
@@ -11260,7 +11269,29 @@ pub(crate) fn decode_binary_input<'a>(
         ParameterInputType::DomainArray(element) => {
             decode_binary_field_with_catalog(ColType::Array(element), bytes, arena, storage, txid)
         }
-    }
+    };
+    // COPY framing errors are 22P04, but a Bind value is an individual type's
+    // binary input and PostgreSQL reports malformed bytes as 22P03. Keep the
+    // codec shared while preserving the protocol boundary in its error type.
+    decoded.map_err(|error| {
+        if error.sqlstate == sqlstate::BAD_COPY_FILE_FORMAT {
+            sql_err!(
+                sqlstate::INVALID_BINARY_REPRESENTATION,
+                "invalid binary representation for parameter type OID {}",
+                oid
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// Whether a catalog-resolved result type has a PostgreSQL binary send form.
+/// This uses the same typed OID boundary as Bind, so query COPY cannot reject
+/// domains and user arrays merely because their identity is not a built-in
+/// [`ColType`].
+pub(crate) fn binary_output_type_supported(storage: &Storage, oid: i32, txid: u32) -> bool {
+    resolve_parameter_input_type(storage, oid, txid).is_ok()
 }
 
 /// Decodes a UTF-8 text Bind value according to its declared PostgreSQL type.
@@ -11281,7 +11312,14 @@ pub(crate) fn decode_text_input<'a>(
             "invalid byte sequence for encoding \"UTF8\""
         )
     })?;
+    if oid == crate::sql::types::oid::REGTYPE {
+        return crate::sql::eval::regtype_of_name(text);
+    }
     let decode_builtin = |ctype| match ctype {
+        target if target.is_reg_object() => {
+            let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+            crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
+        }
         ColType::Enum(slot) => coerce_enum_value(Datum::Text(text), slot, storage, txid, arena),
         ColType::Array(
             element @ (crate::sql::types::ArrElem::Enum(_)
@@ -11357,6 +11395,41 @@ fn decode_binary_field_with_context<'a>(
         }
         ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
         ColType::Int4 | ColType::Oid => via(oids::INT4),
+        ColType::Regtype => {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
+            crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena)
+                .map_err(|_| bad())
+        }
+        target @ (ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole) => {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
+            let referenced_oid = i32::from_be_bytes(bytes);
+            match context {
+                BinaryDecodeContext::Plain => {
+                    let name = arena.alloc_str_display(referenced_oid).map_err(|_| bad())?;
+                    Ok(Datum::RegObject {
+                        type_oid: target.oid(),
+                        referenced_oid,
+                        name,
+                    })
+                }
+                BinaryDecodeContext::Catalog { storage, txid } => {
+                    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                    crate::sql::eval::regobject_cast(
+                        Datum::Int4(referenced_oid),
+                        target,
+                        Some(&catalog),
+                        arena,
+                    )
+                    .map_err(|_| bad())
+                }
+            }
+        }
         ColType::Int8 => via(oids::INT8),
         ColType::Float4 => via(oids::FLOAT4),
         ColType::Float8 => via(oids::FLOAT8),
@@ -12005,7 +12078,7 @@ pub fn copy_out_query(
     let fmt = copy_fmt_for_columns(&names[..n], options)?;
     if fmt.binary {
         for c in &columns[..n] {
-            if coltype_of_oid(c.type_oid).is_none() {
+            if !binary_output_type_supported(storage, c.type_oid, txid) {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "COPY BINARY cannot send a column of type oid {}",
@@ -16198,6 +16271,11 @@ fn coerce<'a>(
     ) = col.ctype
     {
         return coerce_user_type_array(v, element, storage, txid, arena);
+    }
+    if col.ctype.is_reg_object() {
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+        let value = crate::sql::eval::regobject_cast(v, col.ctype, Some(&catalog), arena)?;
+        return apply_typmod(value, col.ctype, col.type_mod, arena);
     }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their

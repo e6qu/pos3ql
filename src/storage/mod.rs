@@ -118,6 +118,17 @@ pub enum OwnedDatum {
     Bool(bool),
     Int4(i32),
     Int8(i64),
+    Regtype {
+        referenced_oid: i32,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    RegObject {
+        type_oid: i32,
+        referenced_oid: i32,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Float8(f64),
     Text {
         len: u8,
@@ -255,6 +266,30 @@ impl OwnedDatum {
                     "cannot store an int2vector value in a column"
                 ));
             }
+            Datum::Regtype {
+                referenced_oid,
+                name,
+            } => {
+                let (len, bytes) = Self::bytes(name.as_bytes(), "regtype")?;
+                Self::Regtype {
+                    referenced_oid: *referenced_oid,
+                    len,
+                    bytes,
+                }
+            }
+            Datum::RegObject {
+                type_oid,
+                referenced_oid,
+                name,
+            } => {
+                let (len, bytes) = Self::bytes(name.as_bytes(), "catalog object")?;
+                Self::RegObject {
+                    type_oid: *type_oid,
+                    referenced_oid: *referenced_oid,
+                    len,
+                    bytes,
+                }
+            }
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
             Datum::Int4(v) => Self::Int4(*v),
@@ -344,6 +379,26 @@ impl OwnedDatum {
             Self::Bool(b) => Datum::Bool(*b),
             Self::Int4(v) => Datum::Int4(*v),
             Self::Int8(v) => Datum::Int8(*v),
+            Self::Regtype {
+                referenced_oid,
+                len,
+                bytes,
+            } => Datum::Regtype {
+                referenced_oid: *referenced_oid,
+                name: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+            },
+            Self::RegObject {
+                type_oid,
+                referenced_oid,
+                len,
+                bytes,
+            } => Datum::RegObject {
+                type_oid: *type_oid,
+                referenced_oid: *referenced_oid,
+                name: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+            },
             Self::Float8(v) => Datum::Float8(*v),
             Self::Date(value) => Datum::Date(*value),
             Self::Timestamp(value) => Datum::Timestamp(*value),

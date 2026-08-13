@@ -1229,15 +1229,20 @@ pub(crate) fn select_hash_join_plan<'a>(
     if scope.lateral[first_table] || scope.lateral[second_table] {
         return Ok(None);
     }
-    // Hash rows are fixed-schema base-table rows.
-    if scope.derived[first_table].is_some()
-        || scope.derived[second_table].is_some()
-        || scope.external_runs[first_table].is_some()
-        || scope.external_runs[second_table].is_some()
+    // An inner or cross join may build its fixed hash table from a derived
+    // source. Its encoded rows carry a fixed output schema; probing a derived
+    // source would instead require a second materialization lifetime.
+    let (probe_table, build_table) = if scope.derived[first_table].is_some()
+        && scope.derived[second_table].is_none()
+        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
     {
+        (second_table, first_table)
+    } else {
+        (first_table, second_table)
+    };
+    if scope.derived[probe_table].is_some() {
         return Ok(None);
     }
-    let (probe_table, build_table) = (first_table, second_table);
     let on = join.on.or(scope.join_on[0]);
     let Some((keys, key_count)) =
         hash_join_keys(scope, on, where_clause, probe_table, build_table)?

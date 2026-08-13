@@ -511,7 +511,8 @@ def test_builtin_function_result_types_and_binary_json():
         "CREATE TABLE wire_catalog_value ("
         "  relation_value regclass DEFAULT 'wire_catalog_reference'::regclass, "
         "  role_value regrole DEFAULT 'wire_catalog_role'::regrole, "
-        "  schema_value regnamespace DEFAULT 'wire_catalog_schema'::regnamespace"
+        "  schema_value regnamespace DEFAULT 'wire_catalog_schema'::regnamespace, "
+        "  operator_value regoperator DEFAULT '+(integer,integer)'::regoperator"
         "); "
         "INSERT INTO wire_catalog_value DEFAULT VALUES",
     )
@@ -536,6 +537,24 @@ def test_builtin_function_result_types_and_binary_json():
         and row_description_type_oids(description) == [2205]
         and row_description_formats(description) == [1]
         and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", relation_oid),
+        out,
+    )
+    parse = frontend_message(b"P", b"\x00SELECT operator_value FROM wire_catalog_value\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "stored regoperator preserves Describe and binary result bytes",
+        description is not None
+        and row_description_type_oids(description) == [2204]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 551),
         out,
     )
     s.close()

@@ -803,10 +803,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_proc") => pg_proc(storage, txid, arena),
-        (false, "pg_operator") => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "pg_operator catalog is not implemented"
-        )),
+        (false, "pg_operator") => pg_operator(arena),
         (false, "pg_opclass") => finish(
             def_of(
                 "pg_opclass",
@@ -4710,6 +4707,42 @@ fn pg_attrdef<'a>(
         }
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_operator<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_operator",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("oprname", ColType::Name),
+            ("oprnamespace", ColType::Oid),
+            ("oprowner", ColType::Oid),
+            ("oprkind", ColType::Bpchar),
+            ("oprleft", ColType::Oid),
+            ("oprright", ColType::Oid),
+            ("oprcode", ColType::Oid),
+        ],
+    );
+    const OPCODES: [i32; 11] = [65, 66, 144, 147, 149, 150, 141, 154, 156, 177, 181];
+    let mut rows: [&[Datum]; CATALOG_OPERATORS.len()] = [&[]; CATALOG_OPERATORS.len()];
+    for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Int4(2617),
+                Datum::Int4(operator.oid),
+                text(operator.name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Bpchar("b"),
+                Datum::Int4(operator.left.oid()),
+                Datum::Int4(operator.right.oid()),
+                Datum::Int4(OPCODES[index]),
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &rows, arena)
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

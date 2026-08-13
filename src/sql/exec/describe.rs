@@ -882,6 +882,12 @@ pub fn record_field_type(
     field: &str,
     columns: &dyn ColTypeResolver,
 ) -> Result<ColType, SqlError> {
+    if field == "*" {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "row expansion via \"*\" is not supported here"
+        ));
+    }
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only
     // selecting *that* field (star expansion checks every field elsewhere)
     // hits the failure; a typed sibling selects fine.

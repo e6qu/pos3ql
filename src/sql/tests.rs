@@ -1769,10 +1769,15 @@ fn routine_catalog_columns_preserve_regproc_and_regprocedure_identity() {
 }
 
 #[test]
-fn unimplemented_operator_catalog_fails_instead_of_looking_empty() {
+fn operator_catalog_exposes_supported_operator_identities() {
     let (mut engine, mut budget) = test_engine();
-    let output = run_with(&mut engine, &mut budget, "SELECT * FROM pg_operator");
-    assert!(String::from_utf8_lossy(&output).contains("0A000"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, oprname, oprleft, oprright, oprcode::oid \
+         FROM pg_operator WHERE oid = 551",
+    );
+    assert_eq!(data_rows(&output), ["551|+|23|23|177"]);
 }
 
 #[test]
@@ -12136,6 +12141,11 @@ fn anonymous_record_field_preserves_catalog_cast_type() {
     assert_eq!(
         row_description_type_oids(&enum_output),
         [crate::sql::types::oid::enum_oid(enum_slot)]
+    );
+    let expansion_in_scalar = run_with(&mut engine, &mut budget, "SELECT (ROW(1,2)).* + 1");
+    assert!(
+        String::from_utf8_lossy(&expansion_in_scalar).contains("0A000"),
+        "{expansion_in_scalar:?}"
     );
 }
 

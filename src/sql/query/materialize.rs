@@ -804,7 +804,12 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = if n_on > 0 {
         let mut unique = 0usize;
         for i in 0..rows.len() {
-            let mut same = i > 0;
+            if i == 0 {
+                rows[unique] = rows[i];
+                unique += 1;
+                continue;
+            }
+            let mut same = true;
             for j in 0..n_on {
                 let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
                 let kb = crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);

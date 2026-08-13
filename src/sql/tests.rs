@@ -18092,6 +18092,28 @@ enum ExternalRunPhase {
 }
 
 #[test]
+fn distinct_on_without_order_by_keeps_first_row_per_key() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE distinct_on_rows (key integer, value integer); \
+         INSERT INTO distinct_on_rows VALUES (1, 10), (1, 20), (2, 5), (2, 15)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT DISTINCT ON (key) key, value FROM distinct_on_rows",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|10", "2|5"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn external_cold_order_and_distinct_runs_use_object_storage() {
     external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Cold);
 }

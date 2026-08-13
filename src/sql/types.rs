@@ -699,6 +699,7 @@ impl ColType {
             10 => Self::Bytea,
             11 => Self::Numeric,
             12 => Self::Int2,
+            55 => Self::Int2Vector,
             13 => Self::Float4,
             14 => Self::Varchar,
             15 => Self::Bpchar,
@@ -2003,8 +2004,17 @@ mod tests {
             ColType::Void,
             ColType::Bool,
             ColType::Int2,
+            ColType::Int2Vector,
             ColType::Int4,
             ColType::Oid,
+            ColType::Regtype,
+            ColType::Regproc,
+            ColType::Regprocedure,
+            ColType::Regoper,
+            ColType::Regoperator,
+            ColType::Regclass,
+            ColType::Regnamespace,
+            ColType::Regrole,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -2029,7 +2039,6 @@ mod tests {
             ColType::Cidr,
             ColType::Macaddr,
             ColType::Macaddr8,
-            ColType::Record,
         ];
         for k in [
             RangeKind::Int4,
@@ -2097,12 +2106,22 @@ mod code_roundtrip_tests {
             ColType::Void,
             ColType::Bool,
             ColType::Int2,
+            ColType::Int2Vector,
             ColType::Int4,
             ColType::Oid,
+            ColType::Regtype,
+            ColType::Regproc,
+            ColType::Regprocedure,
+            ColType::Regoper,
+            ColType::Regoperator,
+            ColType::Regclass,
+            ColType::Regnamespace,
+            ColType::Regrole,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
             ColType::Text,
+            ColType::Name,
             ColType::Varchar,
             ColType::Bpchar,
             ColType::Date,
@@ -2179,5 +2198,6 @@ mod code_roundtrip_tests {
             }
             seen.push((c, t));
         }
+        assert_eq!(ColType::from_code(ColType::Record.code()), None);
     }
 }

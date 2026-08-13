@@ -1547,13 +1547,17 @@ fn pg_default_acl<'a>(
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
 /// schema's OID is derived from its registry slot, above the table range.
 const FIRST_SCHEMA_OID: i32 = 80_000;
+const fn namespace_oid_for_slot(slot: usize) -> i32 {
+    FIRST_SCHEMA_OID + slot as i32
+}
+
 fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
     match schema {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         _ => storage
             .find_schema(schema)
-            .map(|slot| FIRST_SCHEMA_OID + slot as i32)
+            .map(namespace_oid_for_slot)
             .unwrap_or(0),
     }
 }
@@ -1575,7 +1579,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         _ => storage
             .find_schema_visible(name, txid)
-            .map(|slot| namespace_oid(storage, storage.schema_def(slot).name.as_str())),
+            .map(namespace_oid_for_slot),
     }
 }
 

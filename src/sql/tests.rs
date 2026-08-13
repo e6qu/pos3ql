@@ -1646,6 +1646,19 @@ fn catalog_object_columns_preserve_identity_and_catalog_text() {
             crate::sql::types::oid::REGNAMESPACE,
         ]
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE catalog_object_reference RENAME TO catalog_object_renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation_value FROM catalog_object_values ORDER BY relation_value",
+        )),
+        ["catalog_object_renamed", "catalog_object_renamed"]
+    );
 }
 
 #[test]

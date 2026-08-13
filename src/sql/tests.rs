@@ -1776,6 +1776,40 @@ fn unimplemented_operator_catalog_fails_instead_of_looking_empty() {
 }
 
 #[test]
+fn supported_operator_catalog_aliases_preserve_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE operator_catalog_values ( \
+             operator_value regoperator DEFAULT '+(integer,integer)'::regoperator \
+         ); \
+         INSERT INTO operator_catalog_values DEFAULT VALUES; \
+         SELECT operator_value, pg_typeof(operator_value) FROM operator_catalog_values",
+    );
+    assert_eq!(data_rows(&output), ["+(integer,integer)|regoperator"]);
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGOPERATOR,
+            crate::sql::types::oid::REGTYPE
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT '+'::regoper")),
+        ["+"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '+(integer,integer)'::regoperator::oid",
+        )),
+        ["551"]
+    );
+}
+
+#[test]
 fn catalog_oid_columns_unify_with_regclass_set_operands() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

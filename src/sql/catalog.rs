@@ -251,6 +251,87 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     },
 ];
 
+/// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
+/// The resolver deliberately exposes only operations the engine evaluates;
+/// unsupported operator catalog entries remain explicit errors, never fake
+/// catalog rows.
+#[derive(Clone, Copy)]
+struct CatalogOperator {
+    oid: i32,
+    name: &'static str,
+    left: ColType,
+    right: ColType,
+}
+
+const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    CatalogOperator {
+        oid: 96,
+        name: "=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 97,
+        name: "<",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 518,
+        name: "<>",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 521,
+        name: ">",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 523,
+        name: "<=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 525,
+        name: ">=",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 514,
+        name: "*",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 528,
+        name: "/",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 530,
+        name: "%",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 551,
+        name: "+",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 555,
+        name: "-",
+        left: ColType::Int4,
+        right: ColType::Int4,
+    },
+];
+
 fn catalog_relation_oid(name: &str) -> Option<i32> {
     Some(match name {
         "pg_type" => PG_TYPE_OID,
@@ -2191,6 +2272,83 @@ pub(crate) fn routine_name_by_oid<'a>(
         arena,
     )
     .map(Some)
+}
+
+fn parse_operator_signature(written: &str) -> Option<(&str, ColType, ColType)> {
+    let (name, arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let (left, right) = arguments.split_once(',')?;
+    let type_of = |name: &str| {
+        ColType::from_sql_name(
+            name.trim()
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(name.trim()),
+        )
+    };
+    Some((name.trim(), type_of(left)?, type_of(right)?))
+}
+
+pub(crate) fn operator_oid_by_name(
+    written: &str,
+    signature: bool,
+) -> Result<Option<i32>, SqlError> {
+    let (name, arguments) = if signature {
+        let Some((name, left, right)) = parse_operator_signature(written) else {
+            return Ok(None);
+        };
+        (name, Some((left, right)))
+    } else {
+        (written.trim(), None)
+    };
+    let mut found = None;
+    for operator in CATALOG_OPERATORS {
+        if operator.name != name
+            || arguments
+                .is_some_and(|(left, right)| operator.left != left || operator.right != right)
+        {
+            continue;
+        }
+        if found.replace(operator.oid).is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "more than one operator named \"{}\"",
+                written
+            ));
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn operator_name_by_oid(
+    oid: i32,
+    signature: bool,
+    arena: &Arena,
+) -> Result<Option<&str>, SqlError> {
+    let Some(operator) = CATALOG_OPERATORS
+        .iter()
+        .find(|operator| operator.oid == oid)
+    else {
+        return Ok(None);
+    };
+    if !signature {
+        return arena
+            .alloc_str(operator.name)
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
+    let mut text = StackStr::<96>::new();
+    use core::fmt::Write;
+    write!(
+        text,
+        "{}({},{})",
+        operator.name,
+        operator.left.name(),
+        operator.right.name()
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    arena
+        .alloc_str(text.as_str())
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
 }
 
 pub fn function_def_text<'a>(

@@ -474,6 +474,20 @@ pub trait CatalogAccess {
     fn routine_oid(&self, _name: &str, _signature: bool) -> Result<Option<i32>, SqlError> {
         Ok(None)
     }
+    /// Resolve an operator OID to its catalog spelling. `signature` selects
+    /// regoperator's argument-bearing spelling rather than regoper's name.
+    fn operator_name<'a>(
+        &self,
+        _oid: i32,
+        _signature: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// Resolve an operator catalog spelling to its OID.
+    fn operator_oid(&self, _name: &str, _signature: bool) -> Result<Option<i32>, SqlError> {
+        Ok(None)
+    }
     /// PostgreSQL privilege inquiry functions. `None` represents a missing
     /// object or role, for which PostgreSQL returns NULL in the OID forms.
     fn has_table_privilege(
@@ -3835,6 +3849,15 @@ pub(crate) fn regobject_cast<'a>(
                                 name
                             )
                         })?,
+                    ColType::Regoper | ColType::Regoperator => catalog
+                        .operator_oid(name, target == ColType::Regoperator)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "operator \"{}\" does not exist",
+                                name
+                            )
+                        })?,
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3862,6 +3885,10 @@ pub(crate) fn regobject_cast<'a>(
             .flatten(),
         ColType::Regproc | ColType::Regprocedure => catalog
             .map(|catalog| catalog.routine_name(object_oid, target == ColType::Regprocedure, arena))
+            .transpose()?
+            .flatten(),
+        ColType::Regoper | ColType::Regoperator => catalog
+            .map(|catalog| catalog.operator_name(object_oid, target == ColType::Regoperator, arena))
             .transpose()?
             .flatten(),
         _ => None,

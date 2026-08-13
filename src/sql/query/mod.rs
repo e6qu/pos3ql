@@ -804,6 +804,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::routine_oid_by_name(self.storage, self.txid, name, signature)
     }
 
+    fn operator_name<'a>(
+        &self,
+        oid: i32,
+        signature: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::operator_name_by_oid(oid, signature, arena)
+    }
+
+    fn operator_oid(&self, name: &str, signature: bool) -> Result<Option<i32>, SqlError> {
+        super::catalog::operator_oid_by_name(name, signature)
+    }
+
     fn has_table_privilege(
         &self,
         role: Option<&str>,

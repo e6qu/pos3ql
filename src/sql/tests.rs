@@ -18098,7 +18098,7 @@ fn distinct_on_without_order_by_keeps_first_row_per_key() {
         &mut engine,
         &mut budget,
         "CREATE TABLE distinct_on_rows (key integer, value integer); \
-         INSERT INTO distinct_on_rows VALUES (1, 10), (1, 20), (2, 5), (2, 15)",
+         INSERT INTO distinct_on_rows VALUES (1, 10), (1, 20), (2, 5), (2, 15), (NULL, 30), (NULL, 40)",
     );
     let output = run_with(
         &mut engine,
@@ -18107,9 +18107,20 @@ fn distinct_on_without_order_by_keeps_first_row_per_key() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1|10", "2|5"],
+        ["1|10", "2|5", "NULL|30"],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+    let distinct = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT DISTINCT key FROM distinct_on_rows ORDER BY key",
+    );
+    assert_eq!(
+        data_rows(&distinct),
+        ["1", "2", "NULL"],
+        "{}",
+        String::from_utf8_lossy(&distinct)
     );
 }
 

@@ -849,7 +849,14 @@ pub(crate) fn compare_materialized_key(
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
-    crate::sql::eval::compare_datums_collated(storage, collation, left, right)
+    match (left.is_null(), right.is_null()) {
+        (true, true) => Ok(core::cmp::Ordering::Equal),
+        (true, false) => Ok(core::cmp::Ordering::Greater),
+        (false, true) => Ok(core::cmp::Ordering::Less),
+        (false, false) => {
+            crate::sql::eval::compare_datums_collated(storage, collation, left, right)
+        }
+    }
 }
 
 /// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns

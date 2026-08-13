@@ -189,6 +189,19 @@ else
   print -- "SKIP: COPY BINARY differential (need a psycopg venv at \$POS3QL_VENV)"
 fi
 
+print -- "\n=== accepted-type fidelity matrix ==="
+if [[ -x "$ROOT_VENV/bin/python" ]]; then
+  if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
+       --pg $PG_PORT --p3 $P3_PORT > "$WORK/type-fidelity.out" 2>&1; then
+    ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type-fidelity.out"))"
+  else
+    bad "accepted-type fidelity matrix"
+    cat "$WORK/type-fidelity.out"
+  fi
+else
+  print -- "SKIP: accepted-type fidelity matrix (need a psycopg venv at \$POS3QL_VENV)"
+fi
+
 print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then

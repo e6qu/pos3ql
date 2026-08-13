@@ -1841,6 +1841,30 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
         row_description_type_oids(&output),
         [crate::sql::types::oid::OID]
     );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend \
+         UNION ALL \
+         SELECT 'pg_opfamily'::regclass, amopfamily, refclassid, refobjid, deptype \
+         FROM pg_depend d, pg_amop o \
+         WHERE classid = 'pg_amop'::regclass AND objid = o.oid",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::OID,
+            crate::sql::types::oid::BPCHAR,
+        ]
+    );
 }
 
 #[test]

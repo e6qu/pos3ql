@@ -86,6 +86,7 @@ fn empty_meta() -> ColumnMeta {
         name: SqlName::parse("").expect("empty fits"),
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         not_null: false,
         unique: false,
         primary: false,
@@ -258,10 +259,23 @@ pub(super) fn build_column(
         None => (false, false, 1),
     };
     let auto_increment = serial || is_identity;
+    let collatable = ctype.is_collatable();
+    if !collatable && c.collation != crate::sql::ast::Collation::Default {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "collations are not supported by type {}",
+            ctype.name()
+        ));
+    }
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
         type_mod,
+        collation: if collatable {
+            c.collation
+        } else {
+            crate::sql::ast::Collation::None
+        },
         not_null: c.not_null || auto_increment,
         unique: c.unique,
         primary: c.primary,
@@ -463,9 +477,10 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
                 "cannot use subquery in check constraint"
             ));
         }
-        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
-            validate_check_refs(operand, def, cols)?
-        }
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, cols)?,
         Expr::Binary { left, right, .. } => {
             validate_check_refs(left, def, cols)?;
             validate_check_refs(right, def, cols)?;

@@ -111,6 +111,7 @@ impl From<WalSetupError> for EngineSetupError {
 static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
     column_names: &[],
     column_types: &[],
+    column_collations: &[],
     rows: &[],
     external_run: None,
 };
@@ -708,6 +709,7 @@ impl Engine {
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
         crate::sql::tzif::init_catalog();
         let mut storage = Storage::new(config, budget)?;
+        storage.configure_collation(config, budget)?;
         let mut ckpt = if config.object_store_on {
             Some(Checkpointer::new(config, budget)?)
         } else {
@@ -3639,6 +3641,9 @@ impl Engine {
             let column_types = arena
                 .alloc_slice_copy(&types[..ncols])
                 .map_err(|_| query::arena_full_pub())?;
+            let column_collations = arena
+                .alloc_slice_with(ncols, |index| descs[index].collation)
+                .map_err(|_| query::arena_full_pub())?;
             // Run the DML once, capturing RETURNING rows (projected-encoded).
             const EMPTY: &[u8] = &[];
             let mut store: *mut &[u8] = core::ptr::null_mut();
@@ -3687,6 +3692,7 @@ impl Engine {
                 .alloc(ast::MaterializedCte {
                     column_names,
                     column_types,
+                    column_collations,
                     rows,
                     external_run: None,
                 })

@@ -500,6 +500,7 @@ fn wrap_set_tree_with<'a>(
 static EMPTY_CTE: MaterializedCte<'static> = MaterializedCte {
     column_names: &[],
     column_types: &[],
+    column_collations: &[],
     rows: &[],
     external_run: None,
 };
@@ -616,9 +617,10 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         Expr::InSubquery {
             operand, select, ..
         } => expr_references(operand, name) + select_references(select, name),
-        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
-            expr_references(operand, name)
-        }
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => expr_references(operand, name),
         Expr::Binary { left, right, .. } => {
             expr_references(left, name) + expr_references(right, name)
         }
@@ -985,6 +987,9 @@ fn materialize_recursive<'a>(
             .alloc_slice_copy(&types[..ncols])
             .map_err(|_| arena_full())?
     };
+    let column_collations = arena
+        .alloc_slice_with(ncols, |index| described[index].collation)
+        .map_err(|_| arena_full())?;
 
     if storage.spill_attached() {
         let base = external_recursive_tree(base_tree, storage, txid, arena, params, !union_all)?;
@@ -1001,6 +1006,7 @@ fn materialize_recursive<'a>(
                 .alloc(MaterializedCte {
                     column_names,
                     column_types,
+                    column_collations,
                     rows: &[],
                     external_run: working,
                 })
@@ -1060,6 +1066,7 @@ fn materialize_recursive<'a>(
             .alloc(MaterializedCte {
                 column_names,
                 column_types,
+                column_collations,
                 rows: &[],
                 external_run: all,
             })
@@ -1096,6 +1103,7 @@ fn materialize_recursive<'a>(
             .alloc(MaterializedCte {
                 column_names,
                 column_types,
+                column_collations,
                 rows: working,
                 external_run: None,
             })
@@ -1170,6 +1178,7 @@ fn materialize_recursive<'a>(
         .alloc(MaterializedCte {
             column_names,
             column_types,
+            column_collations,
             rows: all_rows,
             external_run: None,
         })
@@ -1747,9 +1756,10 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
             true
         }
-        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
-            expr_has_subquery(operand)
-        }
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
         Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
         Expr::Call {
             args,

@@ -572,9 +572,10 @@ pub(super) fn walk_children<'a>(
     f: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match expression {
-        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
-            f(operand)
-        }
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => f(operand),
         Expr::Binary { left, right, .. } => {
             f(left)?;
             f(right)

@@ -7,7 +7,7 @@ use crate::mem::arena::Arena;
 use crate::stack_format;
 use crate::util::StackStr;
 
-use super::ast::{BinaryOp, Expr, UnaryOp};
+use super::ast::{BinaryOp, Collation, Expr, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ArrElem, ColType, Datum};
 
@@ -30,8 +30,11 @@ pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring}
 pub(crate) use operators::arithmetic;
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::membership_eq;
-use operators::{binary, coerce_unknown, logic, range_mismatch, unary};
-pub use operators::{compare_datums, hash_key};
+use operators::{binary, coerce_unknown, compare_text_collated, logic, range_mismatch, unary};
+pub use operators::{
+    compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,
+    hash_key_collated,
+};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry
@@ -139,6 +142,7 @@ pub mod sqlstate {
     pub const GROUPING_ERROR: &str = "42803";
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
+    pub const COLLATION_MISMATCH: &str = "42P21";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const WINDOWING_ERROR: &str = "42P20";
     pub const OUT_OF_MEMORY: &str = "53200";
@@ -254,6 +258,13 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// Declared collation of a resolved column.  The default makes synthetic
+    /// scalar contexts explicitly non-collatable instead of guessing from the
+    /// datum after expression identity has already been erased.
+    fn collation(&self, _qualifier: Option<&str>, _name: &str) -> crate::sql::ast::Collation {
+        crate::sql::ast::Collation::None
+    }
+
     /// The domain type name a bare column was declared with, if any — so
     /// `pg_typeof(domain_col)` reports the domain rather than its base type.
     /// Defaults to none (an ordinary base-typed column).
@@ -294,6 +305,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        (**self).collation(qualifier, name)
     }
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
@@ -402,6 +417,20 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Compares text with a resolved database collation. A query executor must
+    /// supply this for the database default; an evaluator without a catalog
+    /// cannot silently substitute a process-global locale.
+    fn compare_text(
+        &self,
+        _collation: Collation,
+        _left: &str,
+        _right: &str,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "database collation comparator is unavailable"
+        ))
+    }
     /// Executes a catalog-resolved scalar SQL routine. `None` means this
     /// catalog has no matching overload, preserving the normal undefined-
     /// function diagnostic at the shared call choke point.
@@ -783,7 +812,10 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             operator: super::ast::UnaryOp::Not,
             operand,
         } => Ok(fold_check(operand, arena)?.map(|b| !b)),
-        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::IsNull { operand, .. } => {
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => {
             fold_check(operand, arena)?;
             Ok(None)
         }
@@ -1060,6 +1092,19 @@ pub fn eval_full<'a>(
             left,
             right,
         } => {
+            let comparison_collation = if matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) {
+                Some(resolve_comparison_collation(left, right, row)?)
+            } else {
+                None
+            };
             let l = eval_full(left, arena, params, row, hooks)?;
             let r = eval_full(right, arena, params, row, hooks)?;
             // `array || NULL` resolution depends on the NULL operand's static
@@ -1079,6 +1124,25 @@ pub fn eval_full<'a>(
             // literal to a member of the enum's type (the generic coercion has
             // no catalog to look up labels). A non-member is 22P02.
             let (l, r) = coerce_enum_literal(l, r, l_unknown, r_unknown, hooks, arena)?;
+            if let Some(collation) = comparison_collation
+                && matches!(
+                    (&l, &r),
+                    (
+                        Datum::Text(_) | Datum::Bpchar(_),
+                        Datum::Text(_) | Datum::Bpchar(_)
+                    )
+                )
+            {
+                return compare_text_collated(
+                    operator,
+                    l,
+                    r,
+                    l_unknown,
+                    r_unknown,
+                    collation,
+                    hooks.catalog,
+                );
+            }
             binary(operator, l, r, l_unknown, r_unknown, arena)
         }
         Expr::Cast {
@@ -1157,6 +1221,7 @@ pub fn eval_full<'a>(
             }
             Ok(v)
         }
+        Expr::Collate { operand, .. } => eval_full(operand, arena, params, row, hooks),
         Expr::IsNull { operand, negated } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             // A row `IS NULL` is true only when *every* field is null, and
@@ -1226,10 +1291,18 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, &member)?;
                 let r = coerce_unknown(member, &l)?;
-                match membership_eq(&l, &r)? {
-                    Some(true) => return Ok(Datum::Bool(!negated)),
-                    Some(false) => {}
-                    None => saw_null = true,
+                match (&l, &r) {
+                    (Datum::Text(_) | Datum::Bpchar(_), Datum::Text(_) | Datum::Bpchar(_)) => {
+                        let collation = resolve_comparison_collation(operand, item, row)?;
+                        if compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?.is_eq() {
+                            return Ok(Datum::Bool(!negated));
+                        }
+                    }
+                    _ => match membership_eq(&l, &r)? {
+                        Some(true) => return Ok(Datum::Bool(!negated)),
+                        Some(false) => {}
+                        None => saw_null = true,
+                    },
                 }
             }
             Ok(if saw_null {
@@ -1253,7 +1326,18 @@ pub fn eval_full<'a>(
             let a = coerce_unknown(v, &lo)?;
             let lo = coerce_unknown(lo, &a)?;
             let hi = coerce_unknown(hi, &a)?;
-            let inside = compare_datums(&a, &lo)?.is_ge() && compare_datums(&a, &hi)?.is_le();
+            let collation = resolve_comparison_collation(operand, low, row)?;
+            let high_collation = resolve_comparison_collation(operand, high, row)?;
+            if collation != high_collation {
+                return Err(sql_err!(
+                    sqlstate::COLLATION_MISMATCH,
+                    "collation mismatch between \"{}\" and \"{}\"",
+                    collation.name(),
+                    high_collation.name()
+                ));
+            }
+            let inside = compare_datums_with_catalog(collation, hooks.catalog, &a, &lo)?.is_ge()
+                && compare_datums_with_catalog(collation, hooks.catalog, &a, &hi)?.is_le();
             Ok(Datum::Bool(inside != negated))
         }
         Expr::Like {
@@ -1333,7 +1417,13 @@ pub fn eval_full<'a>(
                             } else {
                                 let l = coerce_unknown(*s, &c)?;
                                 let r = coerce_unknown(c, &l)?;
-                                compare_datums(&l, &r)?.is_eq()
+                                let collation = resolve_comparison_collation(
+                                    operand.expect("simple CASE has an operand"),
+                                    cond,
+                                    row,
+                                )?;
+                                compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?
+                                    .is_eq()
                             }
                         }
                         None => matches!(
@@ -1862,6 +1952,197 @@ pub fn eval_full<'a>(
             }
         }
     }
+}
+
+pub(crate) fn resolve_comparison_collation<'a>(
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    let left = expression_collation(left, row)?;
+    let right = expression_collation(right, row)?;
+    Ok(merge_derived_collations(left, right)?
+        .map(|collation| collation.value)
+        .unwrap_or(crate::sql::ast::Collation::None))
+}
+
+/// PostgreSQL's collation-combination rule, shared by every expression that
+/// produces a collatable result.
+fn merge_derived_collations(
+    left: Option<DerivedCollation>,
+    right: Option<DerivedCollation>,
+) -> Result<Option<DerivedCollation>, SqlError> {
+    match (left, right) {
+        (Some(left), Some(right))
+            if left.explicit && right.explicit && left.value != right.value =>
+        {
+            Err(sql_err!(
+                sqlstate::COLLATION_MISMATCH,
+                "collation mismatch between \"{}\" and \"{}\"",
+                left.value.name(),
+                right.value.name()
+            ))
+        }
+        (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
+        (Some(_left), Some(right)) if right.explicit => Ok(Some(right)),
+        (Some(left), Some(right))
+            if left.value != crate::sql::ast::Collation::Default
+                && right.value != crate::sql::ast::Collation::Default
+                && left.value != right.value =>
+        {
+            Err(sql_err!(
+                sqlstate::COLLATION_MISMATCH,
+                "collation mismatch between \"{}\" and \"{}\"",
+                left.value.name(),
+                right.value.name()
+            ))
+        }
+        (Some(left), Some(right)) => {
+            Ok(Some(if left.value == crate::sql::ast::Collation::Default {
+                right
+            } else {
+                left
+            }))
+        }
+        (Some(collation), _) | (_, Some(collation)) => Ok(Some(collation)),
+        (None, None) => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DerivedCollation {
+    value: crate::sql::ast::Collation,
+    explicit: bool,
+}
+
+fn expression_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<Option<DerivedCollation>, SqlError> {
+    match expression {
+        Expr::Collate { operand, collation } => {
+            let collatable = static_type(operand, row).is_none_or(ColType::is_collatable);
+            if !collatable {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "collations are not supported by type {}",
+                    static_type(operand, row)
+                        .expect("known noncollatable type")
+                        .name()
+                ));
+            }
+            Ok(Some(DerivedCollation {
+                value: *collation,
+                explicit: true,
+            }))
+        }
+        Expr::Cast {
+            operand, type_name, ..
+        } => match ColType::from_sql_name(type_name) {
+            Some(ctype) if ctype.is_collatable() => expression_collation(operand, row),
+            Some(_) => Ok(None),
+            None => expression_collation(operand, row),
+        },
+        Expr::Column { qualifier, name } => Ok(Some(DerivedCollation {
+            value: row.collation(*qualifier, name),
+            explicit: false,
+        })),
+        Expr::SchemaColumn { table, name, .. } => Ok(Some(DerivedCollation {
+            value: row.collation(Some(table), name),
+            explicit: false,
+        })),
+        Expr::Binary {
+            operator: BinaryOp::Concat,
+            left,
+            right,
+        } => merge_derived_collations(
+            expression_collation(left, row)?,
+            expression_collation(right, row)?,
+        ),
+        Expr::Case {
+            whens, otherwise, ..
+        } => {
+            let mut derived = None;
+            for (_, result) in *whens {
+                derived = merge_derived_collations(derived, expression_collation(result, row)?)?;
+            }
+            if let Some(result) = otherwise {
+                derived = merge_derived_collations(derived, expression_collation(result, row)?)?;
+            }
+            Ok(derived)
+        }
+        Expr::Call { name, args, .. }
+            if name.eq_ignore_ascii_case("coalesce")
+                || name.eq_ignore_ascii_case("greatest")
+                || name.eq_ignore_ascii_case("least")
+                || collation_preserving_call(name) =>
+        {
+            let mut derived = None;
+            for argument in *args {
+                derived = merge_derived_collations(derived, expression_collation(argument, row)?)?;
+            }
+            Ok(derived)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Returns the resolved collation identity of a collatable expression.  This
+/// is the one derivation used by comparison validation and catalog projection,
+/// so expression indexes cannot report a different identity from execution.
+pub(crate) fn resolved_expression_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    Ok(expression_collation(expression, row)?
+        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+}
+
+/// Combines implicit collation identities for a result column.  Set-operation
+/// and CTE description use this exact rule instead of choosing one leaf.
+pub(crate) fn unify_implicit_collations(
+    left: crate::sql::ast::Collation,
+    right: crate::sql::ast::Collation,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    let left = (left != crate::sql::ast::Collation::None).then_some(DerivedCollation {
+        value: left,
+        explicit: false,
+    });
+    let right = (right != crate::sql::ast::Collation::None).then_some(DerivedCollation {
+        value: right,
+        explicit: false,
+    });
+    Ok(merge_derived_collations(left, right)?
+        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+}
+
+/// Text functions whose result retains the input collation.  Non-text calls
+/// deliberately stay absent: a catalog collation OID of zero is meaningful.
+fn collation_preserving_call(name: &str) -> bool {
+    [
+        "lower",
+        "upper",
+        "initcap",
+        "trim",
+        "btrim",
+        "ltrim",
+        "rtrim",
+        "replace",
+        "translate",
+        "regexp_replace",
+        "overlay",
+        "substring",
+        "substr",
+        "left",
+        "right",
+        "lpad",
+        "rpad",
+        "repeat",
+        "concat",
+        "concat_ws",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 /// The wider of two array element types (for `ARRAY[...]` type unification).
@@ -2561,6 +2842,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
+        Expr::Collate { operand, .. } => static_type(operand, row),
         Expr::Array(items) => items
             .first()
             .and_then(|item| static_type(item, row))

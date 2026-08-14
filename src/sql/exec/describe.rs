@@ -9,8 +9,8 @@
 //! here rather than part-way through a scan.
 
 use crate::sql::ast::{Expr, SelectItem};
-use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql::types::{ColDesc, ColType, oid};
+use crate::sql::eval::{ColumnLookup, SqlError, resolved_expression_collation, sqlstate};
+use crate::sql::types::{ColDesc, ColType, Datum, oid};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
@@ -26,6 +26,7 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
     match expression {
         Expr::Column { name, .. } => column_mod(name),
         Expr::Cast { type_mod, .. } => *type_mod,
+        Expr::Collate { operand, .. } => output_type_mod(operand, column_mod),
         _ => -1,
     }
 }
@@ -59,7 +60,11 @@ pub fn describe_items<'q>(
                     ));
                 };
                 for c in def.columns() {
-                    push(ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod))?;
+                    push(
+                        ColDesc::of_type(c.name.as_str(), c.ctype)
+                            .with_type_mod(c.type_mod)
+                            .with_collation(c.collation),
+                    )?;
                 }
             }
             SelectItem::TableWildcard(q) => {
@@ -73,7 +78,11 @@ pub fn describe_items<'q>(
                     ));
                 }
                 for c in def.expect("matched").columns() {
-                    push(ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod))?;
+                    push(
+                        ColDesc::of_type(c.name.as_str(), c.ctype)
+                            .with_type_mod(c.type_mod)
+                            .with_collation(c.collation),
+                    )?;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -99,7 +108,27 @@ pub fn describe_items<'q>(
                     def.and_then(|d| d.columns().iter().find(|c| c.name.as_str() == column))
                         .map_or(-1, |c| c.type_mod)
                 });
-                push(ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod))?;
+                let mut description = ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod);
+                if let (Some(definition), Some(ctype)) = (def, coltype_of_oid(type_oid))
+                    && ctype.is_collatable()
+                {
+                    description.collation = resolved_expression_collation(
+                        expression,
+                        &AliasedDefCols {
+                            definition,
+                            alias: table_alias,
+                        },
+                    )?;
+                } else if matches!(expression, Expr::Collate { .. }) {
+                    description.collation =
+                        resolved_expression_collation(expression, &NoColumnLookup)?;
+                }
+                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable)
+                    && description.collation == crate::sql::ast::Collation::None
+                {
+                    description.collation = crate::sql::ast::Collation::Default;
+                }
+                push(description)?;
             }
         }
     }
@@ -388,6 +417,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
                 .map(ColType::internal_name)
                 .or_else(|| type_name.rsplit('.').next()),
         },
+        Expr::Collate { operand, .. } => name_of(operand),
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
@@ -978,6 +1008,18 @@ impl ColTypeResolver for NoCols {
     }
 }
 
+struct NoColumnLookup;
+
+impl<'a> ColumnLookup<'a> for NoColumnLookup {
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+}
+
 /// A single table's columns.
 pub struct DefCols<'d>(pub &'d TableDef);
 impl ColTypeResolver for DefCols<'_> {
@@ -1013,6 +1055,25 @@ impl ColTypeResolver for DefCols<'_> {
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         (name == self.0.name.as_str()).then(|| self.0.columns())
+    }
+}
+
+impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.resolve(qualifier, name)?;
+        Ok(Datum::Null)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.resolve(qualifier, name).ok()
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.resolve(qualifier, name)
+            .ok()
+            .and_then(|_| self.0.column_index(name))
+            .map(|index| self.0.columns()[index].collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
     }
 }
 
@@ -1055,6 +1116,25 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
             .then(|| self.definition.columns())
+    }
+}
+
+impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.resolve(qualifier, name)?;
+        Ok(Datum::Null)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.resolve(qualifier, name).ok()
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.resolve(qualifier, name)
+            .ok()
+            .and_then(|_| self.definition.column_index(name))
+            .map(|index| self.definition.columns()[index].collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
     }
 }
 
@@ -1529,6 +1609,7 @@ pub fn infer_type_res(
                 }
             }
         }
+        Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
         Expr::Cast {
             operand: _,
             type_name,

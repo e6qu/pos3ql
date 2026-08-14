@@ -7,8 +7,11 @@
 //! one choke point `update`. The window executor reuses it per frame.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, FromClause};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, compare_datums, eval_full, sqlstate};
+use crate::sql::ast::{Collation, Expr, FromClause};
+use crate::sql::eval::{
+    ColumnLookup, EvalHooks, SqlError, compare_datums_with_catalog, eval_full,
+    resolved_expression_collation, sqlstate,
+};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::Datum;
 use crate::sql_err;
@@ -138,7 +141,7 @@ pub(crate) fn fold_aggregates<'a>(
         .alloc_slice_with(agg_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (i, state) in states[..agg_nodes.len()].iter_mut().enumerate() {
-        out[i] = state.finish(arena)?;
+        out[i] = state.finish(arena, hooks.catalog)?;
     }
     Ok(out)
 }
@@ -165,6 +168,7 @@ pub(crate) struct AggState<'a> {
     // integer/numeric inputs, which return numeric (Σx reuses `sum_numeric`).
     sum_sq_numeric: Option<crate::sql::numeric::Numeric<'a>>,
     arg_kind: ArgKind,
+    collation: Collation,
     best: Option<Datum<'a>>,
     bool_acc: Option<bool>,
     // `agg(DISTINCT x)`: non-null argument values are buffered here during the
@@ -191,6 +195,7 @@ pub(crate) struct AggState<'a> {
     elem_hint: Option<crate::sql::types::ArrElem>,
     array_input: bool,
     ord_spec: &'a [crate::sql::ast::OrderBy<'a>],
+    ord_collations: [Collation; MAX_PROJ],
     ord: *mut &'a [u8],
     ord_len: usize,
     ord_cap: usize,
@@ -200,6 +205,8 @@ fn compare_ordered_aggregate_rows(
     left: &[u8],
     right: &[u8],
     specification: &[crate::sql::ast::OrderBy<'_>],
+    collations: &[Collation],
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     comparison_error: &mut Option<SqlError>,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
@@ -223,21 +230,24 @@ fn compare_ordered_aggregate_rows(
                     Ordering::Less
                 }
             }
-            (false, false) => match compare_datums(&left_key, &right_key) {
-                Ok(result) => {
-                    if ordering.descending {
-                        result.reverse()
-                    } else {
-                        result
+            (false, false) => {
+                match compare_datums_with_catalog(collations[index], catalog, &left_key, &right_key)
+                {
+                    Ok(result) => {
+                        if ordering.descending {
+                            result.reverse()
+                        } else {
+                            result
+                        }
+                    }
+                    Err(error) => {
+                        if comparison_error.is_none() {
+                            *comparison_error = Some(error);
+                        }
+                        Ordering::Equal
                     }
                 }
-                Err(error) => {
-                    if comparison_error.is_none() {
-                        *comparison_error = Some(error);
-                    }
-                    Ordering::Equal
-                }
-            },
+            }
         };
         if !result.is_eq() {
             return result;
@@ -359,6 +369,7 @@ impl Default for AggState<'_> {
             sum_yy: 0.0,
             sum_sq_numeric: None,
             arg_kind: ArgKind::None,
+            collation: Collation::None,
             best: None,
             bool_acc: None,
             distinct: false,
@@ -373,6 +384,7 @@ impl Default for AggState<'_> {
             elem_hint: None,
             array_input: false,
             ord_spec: &[],
+            ord_collations: [Collation::None; MAX_PROJ],
             ord: core::ptr::null_mut(),
             ord_len: 0,
             ord_cap: 0,
@@ -558,6 +570,7 @@ impl<'a> AggState<'a> {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
                 tuple[0] = value;
                 for (i, o) in self.ord_spec.iter().enumerate() {
+                    self.ord_collations[i] = resolved_expression_collation(o.expression, row)?;
                     tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
                 }
                 let enc = crate::sql::exec::encode_projected_pub(
@@ -614,6 +627,7 @@ impl<'a> AggState<'a> {
             if value.is_null() {
                 return Ok(());
             }
+            self.collation = resolved_expression_collation(item.expression, row)?;
             return self.push_distinct(value, arena);
         }
         // Two-argument statistical aggregates `agg(Y, X)`: skip a row where
@@ -644,6 +658,7 @@ impl<'a> AggState<'a> {
                 "aggregate requires an argument"
             ));
         };
+        self.collation = resolved_expression_collation(arg, row)?;
         let v = eval_full(arg, arena, params, row, hooks)?;
         if v.is_null() {
             return Ok(());
@@ -654,13 +669,18 @@ impl<'a> AggState<'a> {
             return self.push_distinct(v, arena);
         }
         self.count += 1;
-        self.accumulate(v, arena)
+        self.accumulate(v, arena, hooks.catalog)
     }
 
     /// Fold one non-null value into the running aggregate (the type-specific
     /// arithmetic shared by the streaming and DISTINCT paths). Callers bump
     /// `count` themselves.
-    fn accumulate(&mut self, v: Datum<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fn accumulate(
+        &mut self,
+        v: Datum<'a>,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<(), SqlError> {
         match self.kind {
             AggKind::Count => {}
             AggKind::Sum | AggKind::Avg => match v {
@@ -711,7 +731,7 @@ impl<'a> AggState<'a> {
                 let replace = match &self.best {
                     None => true,
                     Some(b) => {
-                        let ord = compare_datums(&v, b)?;
+                        let ord = compare_datums_with_catalog(self.collation, catalog, &v, b)?;
                         (self.kind == AggKind::Min && ord.is_lt())
                             || (self.kind == AggKind::Max && ord.is_gt())
                     }
@@ -886,6 +906,7 @@ impl<'a> AggState<'a> {
             let mut tuple = [Datum::Null; 1 + MAX_PROJ];
             tuple[0] = Datum::Text(val_str);
             for (i, o) in self.ord_spec.iter().enumerate() {
+                self.ord_collations[i] = resolved_expression_collation(o.expression, row)?;
                 tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
             }
             let enc =
@@ -983,7 +1004,11 @@ impl<'a> AggState<'a> {
     /// Append a non-null value to the DISTINCT buffer, growing it (doubling)
     /// in the arena when full. The prior region becomes dead bump-arena space.
     /// Reduces the buffered `WITHIN GROUP` values for an ordered-set aggregate.
-    fn finish_ordered_set(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    fn finish_ordered_set(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
         let n = self.vals_len;
         if n == 0 {
             return Ok(Datum::Null);
@@ -992,7 +1017,10 @@ impl<'a> AggState<'a> {
         // Stable insertion sort (compare_datums is fallible, so no library sort).
         for i in 1..n {
             let mut j = i;
-            while j > 0 && compare_datums(&values[j - 1], &values[j])?.is_gt() {
+            while j > 0
+                && compare_datums_with_catalog(self.collation, catalog, &values[j - 1], &values[j])?
+                    .is_gt()
+            {
                 values.swap(j - 1, j);
                 j -= 1;
             }
@@ -1004,7 +1032,15 @@ impl<'a> AggState<'a> {
                 let mut i = 0;
                 while i < n {
                     let mut end = i;
-                    while end + 1 < n && compare_datums(&values[end], &values[end + 1])?.is_eq() {
+                    while end + 1 < n
+                        && compare_datums_with_catalog(
+                            self.collation,
+                            catalog,
+                            &values[end],
+                            &values[end + 1],
+                        )?
+                        .is_eq()
+                    {
                         end += 1;
                     }
                     if end - i + 1 > best_run {
@@ -1086,19 +1122,25 @@ impl<'a> AggState<'a> {
     /// Sort the DISTINCT buffer, drop adjacent duplicates, and fold the unique
     /// values through `accumulate` (bumping `count` per unique value). A no-operator
     /// for non-distinct aggregates.
-    fn fold_distinct(&mut self, arena: &'a Arena) -> Result<(), SqlError> {
+    fn fold_distinct(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<(), SqlError> {
         if !self.distinct || self.vals_len == 0 {
             return Ok(());
         }
         let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
         let mut cmp_err: Option<SqlError> = None;
-        vals.sort_unstable_by(|a, b| match compare_datums(a, b) {
-            Ok(o) => o,
-            Err(e) => {
-                if cmp_err.is_none() {
-                    cmp_err = Some(e);
+        vals.sort_unstable_by(|a, b| {
+            match compare_datums_with_catalog(self.collation, catalog, a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    if cmp_err.is_none() {
+                        cmp_err = Some(e);
+                    }
+                    core::cmp::Ordering::Equal
                 }
-                core::cmp::Ordering::Equal
             }
         });
         if let Some(e) = cmp_err {
@@ -1108,11 +1150,11 @@ impl<'a> AggState<'a> {
         for &v in vals.iter() {
             let fresh = match prev {
                 None => true,
-                Some(p) => !compare_datums(&p, &v)?.is_eq(),
+                Some(p) => !compare_datums_with_catalog(self.collation, catalog, &p, &v)?.is_eq(),
             };
             if fresh {
                 self.count += 1;
-                self.accumulate(v, arena)?;
+                self.accumulate(v, arena, catalog)?;
                 prev = Some(v);
             }
         }
@@ -1122,7 +1164,11 @@ impl<'a> AggState<'a> {
     /// string_agg(x ORDER BY k): sort the buffered `[value, keys...]` tuples by
     /// the key columns (honoring ASC/DESC and NULLS placement) and concatenate
     /// the value column into the output buffer.
-    fn fold_ordered(&mut self, arena: &'a Arena) -> Result<(), SqlError> {
+    fn fold_ordered(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<(), SqlError> {
         if !self.ordered || self.ord_len == 0 {
             return Ok(());
         }
@@ -1130,7 +1176,14 @@ impl<'a> AggState<'a> {
         let spec = self.ord_spec;
         let mut cmp_err: Option<SqlError> = None;
         rows.sort_unstable_by(|left, right| {
-            compare_ordered_aggregate_rows(left, right, spec, &mut cmp_err)
+            compare_ordered_aggregate_rows(
+                left,
+                right,
+                spec,
+                &self.ord_collations[..spec.len()],
+                catalog,
+                &mut cmp_err,
+            )
         });
         if let Some(e) = cmp_err {
             return Err(e);
@@ -1150,26 +1203,30 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    pub(crate) fn finish(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
         use crate::sql::numeric::{self as num, Numeric};
         // Ordered-set aggregates reduce their buffered values directly.
         if matches!(
             self.kind,
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode
         ) {
-            return self.finish_ordered_set(arena);
+            return self.finish_ordered_set(arena, catalog);
         }
         if self.kind == AggKind::ArrayAgg {
-            return self.finish_array_agg(arena);
+            return self.finish_array_agg(arena, catalog);
         }
         if let AggKind::JsonAgg { jsonb } = self.kind {
-            return self.finish_json_agg(jsonb, arena);
+            return self.finish_json_agg(jsonb, arena, catalog);
         }
         if let AggKind::JsonObjectAgg { jsonb } = self.kind {
             return self.finish_json_object_agg(jsonb, arena);
         }
-        self.fold_distinct(arena)?;
-        self.fold_ordered(arena)?;
+        self.fold_distinct(arena, catalog)?;
+        self.fold_ordered(arena, catalog)?;
         Ok(match self.kind {
             AggKind::Count => Datum::Int8(self.count as i64),
             // regr_count over an empty group is 0, not NULL.
@@ -1310,8 +1367,12 @@ impl<'a> AggState<'a> {
     /// Builds the `array_agg` result: the buffered values in ORDER BY order
     /// (or scan order), DISTINCT-deduped if requested. Zero rows → NULL (as
     /// PostgreSQL). The element type comes from the first non-null value.
-    fn finish_array_agg(&mut self, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-        let values = self.collect_agg_values(arena)?;
+    fn finish_array_agg(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
+        let values = self.collect_agg_values(arena, catalog)?;
         if values.is_empty() {
             return Ok(Datum::Null);
         }
@@ -1338,8 +1399,13 @@ impl<'a> AggState<'a> {
     /// `json_agg`/`jsonb_agg`: the buffered values (ORDER BY / DISTINCT / scan
     /// order) as a JSON array. Zero rows → NULL. json uses `, ` element
     /// spacing (and `" : "` for nested objects); jsonb the canonical form.
-    fn finish_json_agg(&mut self, jsonb: bool, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-        let values = self.collect_agg_values(arena)?;
+    fn finish_json_agg(
+        &mut self,
+        jsonb: bool,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
+        let values = self.collect_agg_values(arena, catalog)?;
         if values.is_empty() {
             return Ok(Datum::Null);
         }
@@ -1369,7 +1435,11 @@ impl<'a> AggState<'a> {
 
     /// The buffered aggregate values in ORDER BY / DISTINCT / scan order,
     /// shared by `finish_array_agg` and `finish_json_agg`.
-    fn collect_agg_values(&mut self, arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlError> {
+    fn collect_agg_values(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
         if self.ordered {
             if self.ord_len == 0 {
                 return Ok(&[]);
@@ -1378,7 +1448,14 @@ impl<'a> AggState<'a> {
             let spec = self.ord_spec;
             let mut cmp_err: Option<SqlError> = None;
             crate::mem::arena::stable_sort_via(arena, rows, |left, right| {
-                compare_ordered_aggregate_rows(left, right, spec, &mut cmp_err)
+                compare_ordered_aggregate_rows(
+                    left,
+                    right,
+                    spec,
+                    &self.ord_collations[..spec.len()],
+                    catalog,
+                    &mut cmp_err,
+                )
             })
             .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
@@ -1397,22 +1474,33 @@ impl<'a> AggState<'a> {
             }
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
             let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(arena, vals, |a, b| match compare_datums(a, b) {
-                Ok(o) => o,
-                Err(e) => {
-                    if cmp_err.is_none() {
-                        cmp_err = Some(e);
+            crate::mem::arena::stable_sort_via(
+                arena,
+                vals,
+                |a, b| match compare_datums_with_catalog(self.collation, catalog, a, b) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if cmp_err.is_none() {
+                            cmp_err = Some(e);
+                        }
+                        core::cmp::Ordering::Equal
                     }
-                    core::cmp::Ordering::Equal
-                }
-            })
+                },
+            )
             .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
                 return Err(e);
             }
             let mut unique = 0usize;
             for i in 0..vals.len() {
-                let same = i > 0 && compare_datums(&vals[i], &vals[i - 1])?.is_eq();
+                let same = i > 0
+                    && compare_datums_with_catalog(
+                        self.collation,
+                        catalog,
+                        &vals[i],
+                        &vals[i - 1],
+                    )?
+                    .is_eq();
                 if !same {
                     vals[unique] = vals[i];
                     unique += 1;

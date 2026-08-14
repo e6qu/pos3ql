@@ -10,7 +10,7 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arity_err, compare_datums, eval_full, sqlstate, static_type,
+    ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, sqlstate, static_type,
 };
 
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
@@ -111,7 +111,14 @@ pub(crate) fn dispatch<'a>(
                     best = Some(match best {
                         None => v,
                         Some(cur) => {
-                            let ord = compare_datums(&cur, &v)?;
+                            let collation =
+                                crate::sql::eval::resolve_comparison_collation(a, args[0], row)?;
+                            let ord = crate::sql::eval::compare_datums_with_catalog(
+                                collation,
+                                hooks.catalog,
+                                &cur,
+                                &v,
+                            )?;
                             let take_v = if name == "greatest" {
                                 ord.is_lt()
                             } else {
@@ -164,7 +171,18 @@ pub(crate) fn dispatch<'a>(
                     let b2 = crate::sql::eval::coerce_unknown_pub(b, &a2)?;
                     (a2, b2)
                 };
-                if !a.is_null() && !b.is_null() && compare_datums(&a, &b)?.is_eq() {
+                let collation =
+                    crate::sql::eval::resolve_comparison_collation(args[0], args[1], row)?;
+                if !a.is_null()
+                    && !b.is_null()
+                    && crate::sql::eval::compare_datums_with_catalog(
+                        collation,
+                        hooks.catalog,
+                        &a,
+                        &b,
+                    )?
+                    .is_eq()
+                {
                     Ok(Datum::Null)
                 } else {
                     Ok(a)

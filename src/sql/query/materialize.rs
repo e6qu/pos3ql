@@ -10,10 +10,8 @@
 
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
-use crate::sql::ast::{Expr, FromClause, Select, SelectItem};
-use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, eval_full, sqlstate,
-};
+use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryValues, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::{ColType, Datum};
 use crate::storage::Storage;
@@ -306,9 +304,91 @@ struct MaterializationPlan<'a> {
     n_where_correlated: usize,
     where_in_scan: Option<&'a Expr<'a>>,
     order_exprs: [Option<&'a Expr<'a>>; MAX_PROJ],
+    key_collations: [Collation; MAX_PROJ],
     postponed: [bool; MAX_PROJ],
     any_postponed: bool,
     has_srf: bool,
+}
+
+fn projected_collations<'a>(
+    statement: &Select<'a>,
+    scope: &QueryScope<'a>,
+) -> Result<[Collation; MAX_PROJ], SqlError> {
+    let mut collations = [Collation::None; MAX_PROJ];
+    let mut width = 0;
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                collations[width] = scope.expression_collation(expression)?;
+                width += 1;
+            }
+            SelectItem::Wildcard => {
+                for index in 0..scope.star_columns() {
+                    collations[width] = scope.output_collation(scope.star_entry(index));
+                    width += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                let table = scope.table_index(qualifier)?;
+                for column in scope.defs[table].expect("resolved").columns() {
+                    collations[width] = column.collation;
+                    width += 1;
+                }
+            }
+            SelectItem::RecordStar(_) => {}
+        }
+    }
+    Ok(collations)
+}
+
+fn sort_dedup_collated(
+    storage: &Storage,
+    rows: &mut [&[u8]],
+    width: usize,
+    collations: &[Collation],
+) -> Result<usize, SqlError> {
+    for row in rows.iter() {
+        for (index, &collation) in collations.iter().take(width).enumerate() {
+            storage.validate_text_collation(
+                collation,
+                &crate::sql::exec::decode_projected_pub(row, index),
+            )?;
+        }
+    }
+    rows.sort_unstable_by(|left, right| {
+        for (index, &collation) in collations.iter().take(width).enumerate() {
+            let ordering = compare_materialized_key(
+                storage,
+                collation,
+                &crate::sql::exec::decode_projected_pub(left, index),
+                &crate::sql::exec::decode_projected_pub(right, index),
+            )
+            .expect("validated DISTINCT values compare without error");
+            if !ordering.is_eq() {
+                return ordering;
+            }
+        }
+        core::cmp::Ordering::Equal
+    });
+    let mut unique = 0;
+    for index in 0..rows.len() {
+        if index == 0
+            || (0..width).any(|column| {
+                !compare_materialized_key(
+                    storage,
+                    collations[column],
+                    &crate::sql::exec::decode_projected_pub(rows[index - 1], column),
+                    &crate::sql::exec::decode_projected_pub(rows[index], column),
+                )
+                .expect("validated DISTINCT values compare without error")
+                .is_eq()
+            })
+        {
+            rows[unique] = rows[index];
+            unique += 1;
+        }
+    }
+    Ok(unique)
 }
 
 fn prepare_materialization<'a>(
@@ -329,13 +409,11 @@ fn prepare_materialization<'a>(
     )?;
 
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut key_collations = [Collation::None; MAX_PROJ];
     for (key, order) in statement.order_by.iter().enumerate() {
-        order_exprs[key] = Some(resolve_order_target(
-            order.expression,
-            statement.items,
-            scope,
-            arena,
-        )?);
+        let resolved = resolve_order_target(order.expression, statement.items, scope, arena)?;
+        key_collations[key] = scope.expression_collation(resolved)?;
+        order_exprs[key] = Some(resolved);
     }
     for (index, on) in statement.distinct_on.iter().enumerate() {
         let resolved = resolve_order_target(on, statement.items, scope, arena)?;
@@ -346,6 +424,7 @@ fn prepare_materialization<'a>(
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ));
         }
+        key_collations[n_order + index] = scope.expression_collation(resolved)?;
         order_exprs[n_order + index] = Some(resolved);
     }
     let n_keys = n_order + n_on;
@@ -424,6 +503,7 @@ fn prepare_materialization<'a>(
         n_where_correlated,
         where_in_scan,
         order_exprs,
+        key_collations,
         postponed,
         any_postponed,
         has_srf,
@@ -483,6 +563,7 @@ pub(crate) fn materialized_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let visible_collations = projected_collations(statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,
@@ -496,6 +577,7 @@ pub(crate) fn materialized_rows<'a>(
         n_where_correlated,
         where_in_scan,
         order_exprs,
+        key_collations,
         postponed,
         any_postponed,
         has_srf,
@@ -646,7 +728,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        live = crate::sql::exec::sort_dedup_projected(rows, width);
+        live = sort_dedup_collated(storage, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
 
@@ -656,6 +738,14 @@ pub(crate) fn materialized_rows<'a>(
     // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
     // absent so the run dedup below works.
     if n_order > 0 || n_on > 0 {
+        for row in rows.iter() {
+            for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
+                storage.validate_text_collation(
+                    collation,
+                    &crate::sql::exec::decode_projected_pub(row, width + key),
+                )?;
+            }
+        }
         crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
             for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = crate::sql::exec::decode_projected_pub(a, width + k);
@@ -680,7 +770,8 @@ pub(crate) fn materialized_rows<'a>(
                         }
                     }
                     (false, false) => {
-                        let c = compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal);
+                        let c = compare_materialized_key(storage, key_collations[k], &ka, &kb)
+                            .expect("validated materialized sort keys compare without error");
                         if ob.descending { c.reverse() } else { c }
                     }
                 };
@@ -696,7 +787,8 @@ pub(crate) fn materialized_rows<'a>(
                     (true, false) => core::cmp::Ordering::Greater,
                     (false, true) => core::cmp::Ordering::Less,
                     (false, false) => {
-                        compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal)
+                        compare_materialized_key(storage, key_collations[n_order + j], &ka, &kb)
+                            .expect("validated materialized sort keys compare without error")
                     }
                 };
                 if !ord.is_eq() {
@@ -712,19 +804,28 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = if n_on > 0 {
         let mut unique = 0usize;
         for i in 0..rows.len() {
-            let same = i > 0
-                && (0..n_on).all(|j| {
-                    let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
-                    let kb =
-                        crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
-                    match (ka.is_null(), kb.is_null()) {
-                        (true, true) => true,
-                        (true, false) | (false, true) => false,
-                        (false, false) => {
-                            compare_datums(&ka, &kb).map(|o| o.is_eq()).unwrap_or(false)
-                        }
+            if i == 0 {
+                rows[unique] = rows[i];
+                unique += 1;
+                continue;
+            }
+            let mut same = true;
+            for j in 0..n_on {
+                let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
+                let kb = crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
+                let equal = match (ka.is_null(), kb.is_null()) {
+                    (true, true) => true,
+                    (true, false) | (false, true) => false,
+                    (false, false) => {
+                        compare_materialized_key(storage, key_collations[n_order + j], &ka, &kb)?
+                            .is_eq()
                     }
-                });
+                };
+                if !equal {
+                    same = false;
+                    break;
+                }
+            }
             if !same {
                 rows[unique] = rows[i];
                 unique += 1;
@@ -742,21 +843,39 @@ pub(crate) fn materialized_rows<'a>(
     Ok((rows, width, deferred, identities_at))
 }
 
+pub(crate) fn compare_materialized_key(
+    storage: &Storage,
+    collation: Collation,
+    left: &Datum<'_>,
+    right: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (left.is_null(), right.is_null()) {
+        (true, true) => Ok(core::cmp::Ordering::Equal),
+        (true, false) => Ok(core::cmp::Ordering::Greater),
+        (false, true) => Ok(core::cmp::Ordering::Less),
+        (false, false) => {
+            crate::sql::eval::compare_datums_collated(storage, collation, left, right)
+        }
+    }
+}
+
 /// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns
 /// (stored after `width`), with NULLs comparing equal — the `WITH TIES` peer
 /// test, independent of ASC/DESC.
-pub(crate) fn order_keys_equal(
+fn order_keys_equal_collated(
+    storage: &Storage,
+    collations: &[Collation],
     a: &[u8],
     b: &[u8],
     width: usize,
     n_order: usize,
 ) -> Result<bool, SqlError> {
-    for k in 0..n_order {
+    for (k, &collation) in collations.iter().enumerate().take(n_order) {
         let ka = crate::sql::exec::decode_projected_pub(a, width + k);
         let kb = crate::sql::exec::decode_projected_pub(b, width + k);
         let equal = match (ka.is_null(), kb.is_null()) {
             (true, true) => true,
-            (false, false) => compare_datums(&ka, &kb)?.is_eq(),
+            (false, false) => compare_materialized_key(storage, collation, &ka, &kb)?.is_eq(),
             _ => false,
         };
         if !equal {
@@ -766,7 +885,13 @@ pub(crate) fn order_keys_equal(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "external sort comparator receives plan fields explicitly"
+)]
 fn compare_materialized_rows(
+    storage: &Storage,
+    key_collations: &[Collation],
     statement: &Select<'_>,
     width: usize,
     n_order: usize,
@@ -794,7 +919,8 @@ fn compare_materialized_rows(
                 }
             }
             (false, false) => {
-                let compared = compare_datums(&left, &right)?;
+                let compared =
+                    compare_materialized_key(storage, key_collations[key], &left, &right)?;
                 if order.descending {
                     compared.reverse()
                 } else {
@@ -813,7 +939,9 @@ fn compare_materialized_rows(
             (true, true) => core::cmp::Ordering::Equal,
             (true, false) => core::cmp::Ordering::Greater,
             (false, true) => core::cmp::Ordering::Less,
-            (false, false) => compare_datums(&left, &right)?,
+            (false, false) => {
+                compare_materialized_key(storage, key_collations[n_order + index], &left, &right)?
+            }
         };
         if !ordering.is_eq() {
             return Ok(ordering);
@@ -827,6 +955,8 @@ fn compare_materialized_rows(
 }
 
 fn distinct_on_keys_equal(
+    storage: &Storage,
+    collations: &[Collation],
     a: &[u8],
     b: &[u8],
     width: usize,
@@ -838,7 +968,10 @@ fn distinct_on_keys_equal(
         let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
         let equal = match (left.is_null(), right.is_null()) {
             (true, true) => true,
-            (false, false) => compare_datums(&left, &right)?.is_eq(),
+            (false, false) => {
+                compare_materialized_key(storage, collations[n_order + index], &left, &right)?
+                    .is_eq()
+            }
             _ => false,
         };
         if !equal {
@@ -903,7 +1036,15 @@ fn prelock_external_run(
                 if statement.distinct && plan.n_on == 0 {
                     crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
                 } else if plan.n_on > 0 {
-                    distinct_on_keys_equal(row, prior, plan.width, plan.n_order, plan.n_on)?
+                    distinct_on_keys_equal(
+                        storage,
+                        &plan.key_collations[..plan.n_keys],
+                        row,
+                        prior,
+                        plan.width,
+                        plan.n_order,
+                        plan.n_on,
+                    )?
                 } else {
                     false
                 }
@@ -917,7 +1058,14 @@ fn prelock_external_run(
                     && limit > 0
                     && logical_index >= window
                     && boundary_len > 0
-                    && order_keys_equal(&boundary[..boundary_len], row, plan.width, plan.n_order)?;
+                    && order_keys_equal_collated(
+                        storage,
+                        &plan.key_collations[..plan.n_order],
+                        &boundary[..boundary_len],
+                        row,
+                        plan.width,
+                        plan.n_order,
+                    )?;
                 if logical_index >= window && !in_ties {
                     false
                 } else {
@@ -973,7 +1121,16 @@ pub(crate) fn external_materialized_into<'a>(
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
-        compare_materialized_rows(statement, plan.width, plan.n_order, plan.n_on, left, right)
+        compare_materialized_rows(
+            storage,
+            &plan.key_collations[..plan.n_keys],
+            statement,
+            plan.width,
+            plan.n_order,
+            plan.n_on,
+            left,
+            right,
+        )
     };
     let scan = scan_source_recycling_with_pax_columns(
         storage,
@@ -1108,7 +1265,15 @@ pub(crate) fn external_materialized_into<'a>(
                 if statement.distinct && plan.n_on == 0 {
                     crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
                 } else if plan.n_on > 0 {
-                    distinct_on_keys_equal(row, prior, plan.width, plan.n_order, plan.n_on)?
+                    distinct_on_keys_equal(
+                        storage,
+                        &plan.key_collations[..plan.n_keys],
+                        row,
+                        prior,
+                        plan.width,
+                        plan.n_order,
+                        plan.n_on,
+                    )?
                 } else {
                     false
                 }
@@ -1123,7 +1288,14 @@ pub(crate) fn external_materialized_into<'a>(
                     && logical_index >= window
                     && boundary_len > 0
                 {
-                    order_keys_equal(&boundary[..boundary_len], row, plan.width, plan.n_order)?
+                    order_keys_equal_collated(
+                        storage,
+                        &plan.key_collations[..plan.n_order],
+                        &boundary[..boundary_len],
+                        row,
+                        plan.width,
+                        plan.n_order,
+                    )?
                 } else {
                     false
                 };
@@ -1261,6 +1433,8 @@ fn external_materialized_select<'a>(
 /// with `rows[window - 1]` on the ORDER BY keys (`FETCH FIRST ... WITH TIES`).
 /// A `window` at or past the end (or no ORDER BY) is returned clamped.
 pub(crate) fn extend_ties(
+    storage: &Storage,
+    collations: &[Collation],
     rows: &[&[u8]],
     width: usize,
     n_order: usize,
@@ -1271,7 +1445,9 @@ pub(crate) fn extend_ties(
     }
     let boundary = rows[window - 1];
     let mut end = window;
-    while end < rows.len() && order_keys_equal(boundary, rows[end], width, n_order)? {
+    while end < rows.len()
+        && order_keys_equal_collated(storage, collations, boundary, rows[end], width, n_order)?
+    {
         end += 1;
     }
     Ok(end)
@@ -1307,6 +1483,18 @@ pub(crate) fn materialized_select<'a>(
         Ok(x) => x,
         Err(e) => return sql_fail(e),
     };
+    let mut order_collations = [Collation::None; MAX_PROJ];
+    for (index, order) in statement.order_by.iter().enumerate() {
+        let expression = match resolve_order_target(order.expression, statement.items, scope, arena)
+        {
+            Ok(expression) => expression,
+            Err(error) => return sql_fail(error),
+        };
+        order_collations[index] = match scope.expression_collation(expression) {
+            Ok(collation) => collation,
+            Err(error) => return sql_fail(error),
+        };
+    }
     let mut emitted = 0u64;
     if !statement.locking.is_empty() {
         // Acquire the complete returned lock set before serializing the first
@@ -1320,7 +1508,14 @@ pub(crate) fn materialized_select<'a>(
                 let tied = if statement.with_ties {
                     match preflight_boundary {
                         Some(boundary) => {
-                            match order_keys_equal(boundary, row, width, statement.order_by.len()) {
+                            match order_keys_equal_collated(
+                                storage,
+                                &order_collations[..statement.order_by.len()],
+                                boundary,
+                                row,
+                                width,
+                                statement.order_by.len(),
+                            ) {
                                 Ok(tied) => tied,
                                 Err(error) => return sql_fail(error),
                             }
@@ -1369,7 +1564,14 @@ pub(crate) fn materialized_select<'a>(
                 let tied = if statement.with_ties {
                     match boundary {
                         Some(boundary) => {
-                            match order_keys_equal(boundary, row, width, statement.order_by.len()) {
+                            match order_keys_equal_collated(
+                                storage,
+                                &order_collations[..statement.order_by.len()],
+                                boundary,
+                                row,
+                                width,
+                                statement.order_by.len(),
+                            ) {
                                 Ok(tied) => tied,
                                 Err(error) => return sql_fail(error),
                             }
@@ -1441,7 +1643,14 @@ pub(crate) fn materialized_select<'a>(
     // last one on the ORDER BY keys (which ride as hidden columns after
     // `width`). Only meaningful when a row was actually emitted (`limit > 0`).
     if statement.with_ties && limit > 0 {
-        window = match extend_ties(rows, width, statement.order_by.len(), window) {
+        window = match extend_ties(
+            storage,
+            &order_collations[..statement.order_by.len()],
+            rows,
+            width,
+            statement.order_by.len(),
+            window,
+        ) {
             Ok(window) => window,
             Err(error) => return sql_fail(error),
         };

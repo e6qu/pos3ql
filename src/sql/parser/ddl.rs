@@ -1580,6 +1580,7 @@ impl<'a> Parser<'a> {
             name: "",
             type_name: "",
             type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
             not_null: false,
             unique: false,
             primary: false,
@@ -1660,6 +1661,11 @@ impl<'a> Parser<'a> {
             };
             let warnings_before = self.n_warnings;
             let (type_name, type_mod) = self.type_name_mod()?;
+            let collation = if self.eat_ident("collate")? {
+                self.collation_name()?
+            } else {
+                crate::sql::ast::Collation::Default
+            };
             // PostgreSQL resolves a column definition's type twice, so a
             // precision-clamp warning is reported twice per column here where
             // a cast reports it once. Faithfully duplicated.
@@ -1759,6 +1765,7 @@ impl<'a> Parser<'a> {
                 name: col_name,
                 type_name,
                 type_mod,
+                collation,
                 not_null,
                 unique,
                 primary,

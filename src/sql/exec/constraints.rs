@@ -9,7 +9,10 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{ColumnLookup, SqlError, compare_datums, eval, hash_key, sqlstate};
+use crate::sql::eval::{
+    ColumnLookup, SqlError, compare_datums_collated, eval, hash_key_collated,
+    resolved_expression_collation, sqlstate,
+};
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -175,9 +178,14 @@ fn unique_violation(def: &TableDef, name: &ConstraintName) -> SqlError {
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
 /// NULL-equality rule.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "value-index probe context is explicit"
+)]
 fn committed_key_matches(
     storage: &Storage,
     table_index: usize,
+    def: &TableDef,
     schema: &[ColType],
     columns: &[u16],
     values: &[Datum],
@@ -193,12 +201,14 @@ fn committed_key_matches(
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut other = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut other)?;
-        key_equal(columns, values, &other, nulls_not_distinct)
+        key_equal(storage, def, columns, values, &other, nulls_not_distinct)
     })
 }
 
 /// Whether both keys are equal under the index's NULL-equality rule.
 fn key_equal(
+    storage: &Storage,
+    def: &TableDef,
     columns: &[u16],
     values: &[Datum],
     other: &[Datum],
@@ -212,7 +222,14 @@ fn key_equal(
             }
             return Ok(false);
         }
-        if !compare_datums(&values[index], &other[index])?.is_eq() {
+        if !compare_datums_collated(
+            storage,
+            def.columns()[index].collation,
+            &values[index],
+            &other[index],
+        )?
+        .is_eq()
+        {
             return Ok(false);
         }
     }
@@ -220,22 +237,44 @@ fn key_equal(
 }
 
 pub(crate) fn key_values_equal(
+    storage: &Storage,
+    collations: &[crate::sql::ast::Collation],
     values: &[Datum],
     other: &[Datum],
     nulls_not_distinct: bool,
 ) -> Result<bool, SqlError> {
-    for (value, other_value) in values.iter().zip(other) {
+    for (index, (value, other_value)) in values.iter().zip(other).enumerate() {
         if value.is_null() || other_value.is_null() {
             if nulls_not_distinct && value.is_null() && other_value.is_null() {
                 continue;
             }
             return Ok(false);
         }
-        if !compare_datums(value, other_value)?.is_eq() {
+        if !compare_datums_collated(storage, collations[index], value, other_value)?.is_eq() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+pub(crate) fn index_key_collations(
+    def: &TableDef,
+    columns: &[u16],
+    expressions: &[Option<&Expr<'_>>],
+) -> Result<[crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS], SqlError> {
+    let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+    let row = RowCtx {
+        def,
+        values: &[],
+        alias: None,
+    };
+    for (index, expression) in expressions.iter().enumerate() {
+        collations[index] = match expression {
+            Some(expression) => resolved_expression_collation(expression, &row)?,
+            None => def.columns()[columns[index] as usize].collation,
+        };
+    }
+    Ok(collations)
 }
 
 pub(crate) fn index_key_values<'a>(
@@ -289,6 +328,7 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let keys = index_key_values(def, values, columns, expressions, arena)?;
+    let collations = index_key_collations(def, columns, expressions)?;
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }
@@ -300,6 +340,8 @@ fn enforce_expression_index_uniqueness<'a>(
         }
         let other_keys = index_key_values(def, other, columns, expressions, arena)?;
         key_values_equal(
+            storage,
+            &collations[..columns.len()],
             &keys[..columns.len()],
             &other_keys[..columns.len()],
             nulls_not_distinct,
@@ -400,7 +442,11 @@ fn enforce_key_uniqueness(
     let served = if nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         false
     } else {
-        let hash = hash_key(values, columns);
+        let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+        for (index, column) in columns.iter().enumerate() {
+            collations[index] = def.columns()[*column as usize].collation;
+        }
+        let hash = hash_key_collated(values, columns, &collations[..columns.len()]);
         storage.probe_value(table_index, columns, hash, |rowid| {
             if result.is_err() || Some(rowid) == self_rowid {
                 return;
@@ -408,6 +454,7 @@ fn enforce_key_uniqueness(
             match committed_key_matches(
                 storage,
                 table_index,
+                def,
                 schema,
                 columns,
                 values,
@@ -473,7 +520,7 @@ fn committed_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            key_equal(columns, values, &other, nulls_not_distinct)
+            key_equal(storage, def, columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
             return Err(unique_violation(def, name));
@@ -514,7 +561,7 @@ fn pending_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, RowHome::Heap(loc), |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut other)?;
-            key_equal(columns, values, &other, nulls_not_distinct)
+            key_equal(storage, def, columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
             if pending.txid != txid {
@@ -560,7 +607,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     }
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         Ok(index_predicate_matches(def, other, predicate, arena)?
-            && key_equal(columns, values, other, nulls_not_distinct)?)
+            && key_equal(storage, def, columns, values, other, nulls_not_distinct)?)
     };
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -1076,6 +1123,7 @@ fn parent_has_key(
     child_values: &[Datum],
     txid: u32,
 ) -> Result<bool, SqlError> {
+    let parent_definition = storage.table_def(parent_index, txid);
     let mut found = false;
     storage.for_each_row_state(parent_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -1088,7 +1136,15 @@ fn parent_has_key(
             for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
                 let parent = &prow[parent_column as usize];
                 let child = &child_values[child_column as usize];
-                if parent.is_null() || !compare_datums(child, parent)?.is_eq() {
+                if parent.is_null()
+                    || !compare_datums_collated(
+                        storage,
+                        parent_definition.columns()[parent_column as usize].collation,
+                        child,
+                        parent,
+                    )?
+                    .is_eq()
+                {
                     return Ok(false);
                 }
             }
@@ -1151,10 +1207,17 @@ pub(crate) fn apply_fk_parent_actions(
             // An update triggers this key's action only when the key changed.
             if let Some(new_parent) = new_parent {
                 let mut changed = false;
-                for &parent_column in fk.parent_cols() {
+                for (&child_column, &parent_column) in fk.columns().iter().zip(fk.parent_cols()) {
                     let old = &old_parent[parent_column as usize];
                     let new = &new_parent[parent_column as usize];
-                    if datum_changed(old, new)? {
+                    if !compare_datums_collated(
+                        storage,
+                        cdef.columns()[child_column as usize].collation,
+                        old,
+                        new,
+                    )?
+                    .is_eq()
+                    {
                         changed = true;
                         break;
                     }
@@ -1177,7 +1240,13 @@ pub(crate) fn apply_fk_parent_actions(
                     let parent = &old_parent[parent_column as usize];
                     if child.is_null()
                         || parent.is_null()
-                        || !compare_datums(child, parent)?.is_eq()
+                        || !compare_datums_collated(
+                            storage,
+                            cdef.columns()[child_column as usize].collation,
+                            child,
+                            parent,
+                        )?
+                        .is_eq()
                     {
                         return Ok(false);
                     }
@@ -1447,24 +1516,23 @@ pub(crate) fn referenced_key_changed(
             if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
                 continue;
             }
-            for &pc in fk.parent_cols() {
+            for (&child_column, &pc) in fk.columns().iter().zip(fk.parent_cols()) {
                 let i = pc as usize;
                 let (a, b) = (&old[i], &new[i]);
-                if datum_changed(a, b)? {
+                if !compare_datums_collated(
+                    storage,
+                    cdef.columns()[child_column as usize].collation,
+                    a,
+                    b,
+                )?
+                .is_eq()
+                {
                     return Ok(true);
                 }
             }
         }
     }
     Ok(false)
-}
-
-fn datum_changed(old: &Datum, new: &Datum) -> Result<bool, SqlError> {
-    match (old.is_null(), new.is_null()) {
-        (true, true) => Ok(false),
-        (true, false) | (false, true) => Ok(true),
-        (false, false) => compare_datums(old, new).map(|ordering| !ordering.is_eq()),
-    }
 }
 
 #[cfg(test)]

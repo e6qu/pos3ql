@@ -11,7 +11,7 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, SqlName, St
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
-use super::eval::{SqlError, sqlstate};
+use super::eval::{ColumnLookup, SqlError, resolved_expression_collation, sqlstate};
 use super::types::{ColType, Datum, TypeMod};
 
 /// A materialized catalog relation: its shape plus rows in the arena.
@@ -2453,7 +2453,9 @@ pub fn function_def_text<'a>(
 }
 
 pub fn collation_oid_is_visible(oid: i32) -> bool {
-    matches!(oid, 100 | 950 | 951 | 12_340)
+    crate::sql::ast::Collation::BUILTIN
+        .iter()
+        .any(|collation| collation.oid() == oid)
 }
 
 pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bool {
@@ -3152,6 +3154,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             name: SqlName::parse("").unwrap(),
             ctype: ColType::Bool,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             not_null: false,
             unique: false,
             primary: false,
@@ -4464,7 +4467,7 @@ fn pg_index<'a>(
                     Some(expression) => text(expression.as_str(), arena)?,
                     None => Datum::Null,
                 },
-                empty_int_array(arena)?,
+                index_collations(storage, info, txid, arena)?,
                 empty_int_array(arena)?,
             ],
             arena,
@@ -4484,6 +4487,63 @@ fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlE
         element: super::types::ArrElem::Int4,
         raw: super::array::build(&vals[..columns.len()], arena)?,
     })
+}
+
+fn index_collations<'a>(
+    storage: &Storage,
+    info: &IdxInfo,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let table = storage.table_def(info.table_slot, txid);
+    for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
+        let collation = if info.expression_keys[position] {
+            let source = index_expression_source(storage, info, position, txid)
+                .expect("expression index has source");
+            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            resolved_expression_collation(expression, &TableColumnTypes(table))?
+        } else {
+            table.columns()[info.columns[position] as usize].collation
+        };
+        *value = Datum::Int4(collation.oid());
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(&values[..info.n_cols], arena)?,
+    })
+}
+
+/// Type and collation lookup for a stored table definition.  Catalog
+/// projection must derive expression-index metadata from the same source as
+/// executor analysis without pretending that a row is available.
+struct TableColumnTypes<'a>(&'a TableDef);
+
+impl<'a> ColumnLookup<'a> for TableColumnTypes<'_> {
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+
+    fn col_type(&self, _qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0
+            .columns()
+            .iter()
+            .find(|column| column.name.as_str().eq_ignore_ascii_case(name))
+            .map(|column| column.ctype)
+    }
+
+    fn collation(&self, _qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0
+            .columns()
+            .iter()
+            .find(|column| column.name.as_str().eq_ignore_ascii_case(name))
+            .map(|column| column.collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
 }
 
 fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -4562,7 +4622,7 @@ fn pg_attribute<'a>(
                     Datum::Int4(i32::from(c.ctype.typlen())),
                     Datum::Int4(c.type_mod),
                     Datum::Bool(!matches!(c.default, crate::storage::ColumnDefault::None)),
-                    Datum::Int4(0), // attcollation: default (0)
+                    Datum::Int4(c.collation.oid()),
                     text(
                         if c.is_identity && c.identity_always {
                             "a"
@@ -4882,27 +4942,21 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("collencoding", ColType::Int4),
         ],
     );
-    let rows = [
-        (100, "default", "", "", "d", -1),
-        (950, "C", "C", "C", "c", -1),
-        (951, "POSIX", "POSIX", "POSIX", "c", -1),
-        (12_340, "ucs_basic", "", "", "b", 6),
-    ];
     let mut output: [&[Datum]; 4] = [&[]; 4];
-    for (index, (oid, name, collate, ctype, provider, encoding)) in rows.iter().enumerate() {
+    for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
-                Datum::Int4(*oid),
-                Datum::Int4(*oid),
-                text(name, arena)?,
+                Datum::Int4(collation.oid()),
+                Datum::Int4(collation.oid()),
+                text(collation.name(), arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
-                text(collate, arena)?,
-                text(ctype, arena)?,
+                text(collation.libc_locale(), arena)?,
+                text(collation.libc_locale(), arena)?,
                 Datum::Null,
-                Datum::Bpchar(provider),
+                Datum::Bpchar(collation.provider()),
                 Datum::Bool(true),
-                Datum::Int4(*encoding),
+                Datum::Int4(collation.encoding()),
             ],
             arena,
         )?;
@@ -4979,26 +5033,57 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ],
     );
     let types = [
+        ColType::Void,
         ColType::Bool,
+        ColType::Int2,
+        ColType::Int2Vector,
         ColType::Int4,
+        ColType::Oid,
+        ColType::Regtype,
+        ColType::Regproc,
+        ColType::Regprocedure,
+        ColType::Regoper,
+        ColType::Regoperator,
+        ColType::Regclass,
+        ColType::Regnamespace,
+        ColType::Regrole,
         ColType::Int8,
+        ColType::Float4,
         ColType::Float8,
         ColType::Text,
+        ColType::Name,
+        ColType::Varchar,
+        ColType::Bpchar,
         ColType::Date,
         ColType::Timestamp,
         ColType::Timestamptz,
-        ColType::Uuid,
-        ColType::Bytea,
-        ColType::Numeric,
-        ColType::Int2,
-        ColType::Float4,
         ColType::Time,
         ColType::Timetz,
         ColType::Interval,
+        ColType::Json,
+        ColType::Jsonb,
+        ColType::Uuid,
+        ColType::Bytea,
+        ColType::Numeric,
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: true },
+        ColType::Range(super::types::RangeKind::Int4),
+        ColType::Range(super::types::RangeKind::Int8),
+        ColType::Range(super::types::RangeKind::Num),
+        ColType::Range(super::types::RangeKind::Date),
+        ColType::Range(super::types::RangeKind::Ts),
+        ColType::Range(super::types::RangeKind::Tstz),
+        ColType::Multirange(super::types::RangeKind::Int4),
+        ColType::Multirange(super::types::RangeKind::Int8),
+        ColType::Multirange(super::types::RangeKind::Num),
+        ColType::Multirange(super::types::RangeKind::Date),
+        ColType::Multirange(super::types::RangeKind::Ts),
+        ColType::Multirange(super::types::RangeKind::Tstz),
         ColType::Inet,
         ColType::Cidr,
         ColType::Macaddr,
         ColType::Macaddr8,
+        ColType::Record,
     ];
     let category = |t: &ColType| match t {
         ColType::Bool => "B",
@@ -5024,7 +5109,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(t.oid()),
                 text(t.internal_name(), arena)?,
                 Datum::Int4(i32::from(t.typlen())),
-                Datum::Int4(0), // typcollation: none
+                Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
                 Datum::Int4(PG_CATALOG_NS_OID),
                 text("b", arena)?,
                 text(category(t), arena)?,
@@ -6750,6 +6835,11 @@ fn info_columns<'a>(
                 name: SqlName::EMPTY,
                 ctype,
                 type_mod: column.type_mod,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -8108,6 +8198,11 @@ fn info_column_privileges<'a>(
                 name: SqlName::parse(description.name)?,
                 ctype,
                 type_mod: description.type_mod,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -8555,6 +8650,11 @@ fn info_column_type_usage<'a>(
                 name: SqlName::EMPTY,
                 ctype,
                 type_mod: column.type_mod,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -8801,14 +8901,13 @@ fn info_collations<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("pad_attribute", ColType::Text),
         ],
     );
-    let names = ["default", "C", "POSIX", "ucs_basic"];
     let mut output: [&[Datum]; 4] = [&[]; 4];
-    for (index, name) in names.iter().enumerate() {
+    for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
                 text("postgres", arena)?,
                 text("pg_catalog", arena)?,
-                text(name, arena)?,
+                text(collation.name(), arena)?,
                 text("NO PAD", arena)?,
             ],
             arena,
@@ -8831,14 +8930,13 @@ fn info_collation_character_set_applicability<'a>(
             ("character_set_name", ColType::Text),
         ],
     );
-    let names = ["default", "C", "POSIX", "ucs_basic"];
     let mut output: [&[Datum]; 4] = [&[]; 4];
-    for (index, name) in names.iter().enumerate() {
+    for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
                 text("postgres", arena)?,
                 text("pg_catalog", arena)?,
-                text(name, arena)?,
+                text(collation.name(), arena)?,
                 Datum::Null,
                 Datum::Null,
                 text("UTF8", arena)?,

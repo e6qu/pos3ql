@@ -8,8 +8,10 @@
 
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
-use crate::sql::ast::{Expr, FromClause, Select, SelectItem};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, compare_datums, eval_full, sqlstate};
+use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
+use crate::sql::eval::{
+    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval_full, sqlstate,
+};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::stack_format;
@@ -25,6 +27,28 @@ use super::{
     scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
+
+fn compare_group_rows(
+    storage: &Storage,
+    collations: &[Collation],
+    left: &[u8],
+    right: &[u8],
+) -> Result<core::cmp::Ordering, SqlError> {
+    for (index, &collation) in collations.iter().enumerate() {
+        let left = crate::sql::exec::decode_projected_pub(left, index);
+        let right = crate::sql::exec::decode_projected_pub(right, index);
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Less,
+            (false, true) => core::cmp::Ordering::Greater,
+            (false, false) => compare_datums_collated(storage, collation, &left, &right)?,
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(core::cmp::Ordering::Equal)
+}
 
 /// With correlated subqueries in WHERE, the filter cannot run inside
 /// `scan_source` (their values change per row): re-evaluate the correlated
@@ -121,6 +145,11 @@ pub(super) fn groups_for_mask<'a>(
     pax_columns: Option<&super::scan::PaxColumnDemand>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
+    let mut group_collations = [Collation::None; MAX_PROJ];
+    for (index, expression) in statement.group_by.iter().enumerate() {
+        group_collations[index] = scope.expression_collation(expression)?;
+    }
+    let group_collations = &group_collations[..n_keys];
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -133,8 +162,7 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        let mut compare =
-            |a: &[u8], b: &[u8]| Ok(crate::sql::exec::compare_projected_prefix(a, b, n_keys));
+        let mut compare = |a: &[u8], b: &[u8]| compare_group_rows(storage, group_collations, a, b);
         let mut at = 0u32;
         scan_source_recycling_with_pax_columns(
             storage,
@@ -194,6 +222,9 @@ pub(super) fn groups_for_mask<'a>(
                 for v in key_vals[..n_keys].iter_mut() {
                     *v = crate::sql::eval::text_view(*v);
                 }
+                for (value, &collation) in key_vals[..n_keys].iter().zip(group_collations) {
+                    storage.validate_text_collation(collation, value)?;
+                }
                 let row_idx = at;
                 storage
                     .with_block_store(|blocks| {
@@ -236,8 +267,7 @@ pub(super) fn groups_for_mask<'a>(
                 let is_new = match context.previous {
                     None => true,
                     Some(prev) => {
-                        !crate::sql::exec::compare_projected_prefix(prev, context.row, n_keys)
-                            .is_eq()
+                        !compare_group_rows(storage, group_collations, prev, context.row)?.is_eq()
                     }
                 };
                 if is_new {
@@ -319,6 +349,9 @@ pub(super) fn groups_for_mask<'a>(
                     for v in key_vals[..n_keys].iter_mut() {
                         *v = crate::sql::eval::text_view(*v);
                     }
+                    for (value, &collation) in key_vals[..n_keys].iter().zip(group_collations) {
+                        storage.validate_text_collation(collation, value)?;
+                    }
                     keys[at].0 =
                         crate::sql::exec::encode_projected_pub(&key_vals[..n_keys], arena)?;
                     keys[at].1 = at as u32;
@@ -327,11 +360,17 @@ pub(super) fn groups_for_mask<'a>(
                 },
             )?;
         }
-        keys.sort_unstable();
+        keys.sort_unstable_by(|left, right| {
+            compare_group_rows(storage, group_collations, left.0, right.0)
+                .expect("validated group keys compare without error")
+        });
         let ng = {
             let mut g = 0usize;
             for i in 0..keys.len() {
-                if i == 0 || keys[i].0 != keys[i - 1].0 {
+                if i == 0
+                    || !compare_group_rows(storage, group_collations, keys[i].0, keys[i - 1].0)?
+                        .is_eq()
+                {
                     g += 1;
                 }
             }
@@ -343,7 +382,10 @@ pub(super) fn groups_for_mask<'a>(
         {
             let mut g = 0usize;
             for i in 0..keys.len() {
-                if i > 0 && keys[i].0 != keys[i - 1].0 {
+                if i > 0
+                    && !compare_group_rows(storage, group_collations, keys[i].0, keys[i - 1].0)?
+                        .is_eq()
+                {
                     g += 1;
                 }
                 group_of[keys[i].1 as usize] = g as u32;
@@ -479,7 +521,7 @@ pub(super) fn groups_for_mask<'a>(
         }
         let mut agg_vals = [Datum::Null; MAX_AGGS];
         for i in 0..n_aggs {
-            agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena)?;
+            agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena, hooks.catalog)?;
         }
         let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
             [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
@@ -771,6 +813,18 @@ pub(super) fn grouped_rows<'a>(
     let out_rows = &mut out_rows[..live];
 
     if n_order > 0 {
+        let mut order_collations = [Collation::None; MAX_PROJ];
+        for (index, expression) in order_exprs.iter().enumerate().take(n_order) {
+            order_collations[index] = scope.expression_collation(expression.expect("resolved"))?;
+        }
+        for row in out_rows.iter() {
+            for (index, &collation) in order_collations.iter().enumerate().take(n_order) {
+                storage.validate_text_collation(
+                    collation,
+                    &crate::sql::exec::decode_projected_pub(row, width + index),
+                )?;
+            }
+        }
         out_rows.sort_unstable_by(|a, b| {
             for (k, ob) in statement.order_by.iter().enumerate() {
                 let ka = crate::sql::exec::decode_projected_pub(a, width + k);
@@ -795,7 +849,8 @@ pub(super) fn grouped_rows<'a>(
                         }
                     }
                     (false, false) => {
-                        let c = compare_datums(&ka, &kb).unwrap_or(core::cmp::Ordering::Equal);
+                        let c = compare_datums_collated(storage, order_collations[k], &ka, &kb)
+                            .expect("validated grouped ORDER BY keys compare without error");
                         if ob.descending { c.reverse() } else { c }
                     }
                 };
@@ -839,8 +894,26 @@ pub(super) fn grouped_select<'a>(
     // FETCH FIRST ... WITH TIES: extend past the limit while rows tie with the
     // last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
-        end = match super::materialize::extend_ties(out_rows, width, statement.order_by.len(), end)
-        {
+        let mut collations = [Collation::None; MAX_PROJ];
+        for (index, order) in statement.order_by.iter().enumerate() {
+            let expression =
+                match resolve_order_target(order.expression, statement.items, scope, arena) {
+                    Ok(expression) => expression,
+                    Err(error) => return sql_fail(error),
+                };
+            collations[index] = match scope.expression_collation(expression) {
+                Ok(collation) => collation,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        end = match super::materialize::extend_ties(
+            storage,
+            &collations[..statement.order_by.len()],
+            out_rows,
+            width,
+            statement.order_by.len(),
+            end,
+        ) {
             Ok(end) => end,
             Err(error) => return sql_fail(error),
         };
@@ -1059,6 +1132,7 @@ fn ungrouped_column<'e, 'a>(
         | Expr::ArraySubquery(_) => None,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::InSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
         Expr::Binary { left, right, .. } => first(&[left, right]),

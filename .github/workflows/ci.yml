@@ -44,6 +44,9 @@ jobs:
       - name: BUGS.md discipline guard
         run: zsh tools/check-bugs.sh
 
+      - name: External harness liveness guard
+        run: sh tests/external/liveness_test.sh
+
       - name: CI timeout guard
         run: zsh tools/check-ci-timeouts.sh
 

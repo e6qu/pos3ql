@@ -109,6 +109,14 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             .map(|column| self.0.output_type(column))
     }
 
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0
+            .find_column(qualifier, name)
+            .ok()
+            .map(|column| self.0.output_collation(column))
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         match self.0.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => self.0.defs[table]?
@@ -295,6 +303,7 @@ impl<'d> QueryScope<'d> {
                 name: SqlName::parse(name)?,
                 ctype,
                 type_mod: m.column_types[i].2,
+                collation: m.column_collations[i],
                 user_type,
                 ..ColumnMeta::EMPTY
             };
@@ -931,6 +940,31 @@ impl<'d> QueryScope<'d> {
             ResolvedColumn::Table(t, c) => self.defs[t].expect("resolved").columns()[c].ctype,
             ResolvedColumn::Merged(m) => self.merged[m].ctype,
         }
+    }
+
+    /// The declared collation of a join-tree output column.
+    pub(crate) fn output_collation(&self, entry: ResolvedColumn) -> crate::sql::ast::Collation {
+        match entry {
+            ResolvedColumn::Table(table, column) => {
+                self.defs[table].expect("resolved").columns()[column].collation
+            }
+            ResolvedColumn::Merged(merged) => self.merged[merged].parts
+                [..self.merged[merged].n_parts]
+                .first()
+                .map(|&(table, column)| {
+                    self.defs[table].expect("resolved").columns()[column].collation
+                })
+                .unwrap_or(crate::sql::ast::Collation::None),
+        }
+    }
+
+    /// Derives a projection's collation while its source scope is still
+    /// available, before a derived relation turns it into column metadata.
+    pub(crate) fn expression_collation(
+        &self,
+        expression: &Expr<'d>,
+    ) -> Result<crate::sql::ast::Collation, SqlError> {
+        crate::sql::eval::resolved_expression_collation(expression, &ScopeTypes(self))
     }
 
     /// An expression reading a join-tree output column: a qualified column

@@ -8177,6 +8177,17 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     );
     assert_eq!(data_rows(&old_value), ["19"]);
 
+    let delete_return_old = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION allow_old_delete() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';
+         CREATE TRIGGER allow_old_before_delete BEFORE DELETE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION allow_old_delete();
+         DELETE FROM trigger_body_target WHERE id = 1;
+         SELECT count(*) FROM trigger_body_target;",
+    );
+    assert_eq!(data_rows(&delete_return_old), ["0"]);
+
     let rejected = run_with(
         &mut engine,
         &mut budget,

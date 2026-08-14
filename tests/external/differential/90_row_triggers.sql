@@ -21,4 +21,5 @@ INSERT INTO row_trigger_target VALUES (1, 4);
 UPDATE row_trigger_target SET value = 8 WHERE id = 1;
 SELECT id, value, doubled FROM row_trigger_target;
 DELETE FROM row_trigger_target WHERE id = 1;
+SELECT count(*) FROM row_trigger_target;
 SELECT id, observed FROM row_trigger_audit ORDER BY observed;

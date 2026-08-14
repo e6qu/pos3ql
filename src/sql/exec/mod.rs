@@ -6893,10 +6893,9 @@ fn fire_row_triggers<'a>(
             TriggerReturn::Null if before => return Ok(false),
             TriggerReturn::Old if before => {
                 let Some(old) = old else { return Ok(false) };
-                let Some(new) = new.as_deref_mut() else {
-                    return Ok(false);
-                };
-                new.copy_from_slice(old);
+                if let Some(new) = new.as_deref_mut() {
+                    new.copy_from_slice(old);
+                }
             }
             TriggerReturn::New if before && new.is_none() => return Ok(false),
             _ => {}

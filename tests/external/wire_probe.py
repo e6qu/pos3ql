@@ -1066,6 +1066,43 @@ def has_sqlstate(messages, state):
     return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
 
 
+def test_subscription_definition_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    created = simple_query(
+        s,
+        "CREATE SUBSCRIPTION wire_subscription CONNECTION 'host=publisher port=5432' "
+        "PUBLICATION sales WITH (connect = false, slot_name = NONE)",
+    )
+    check(
+        "raw wire: CREATE disabled subscription completes",
+        any(kind == b"C" and payload == b"CREATE SUBSCRIPTION\x00" for kind, payload in created),
+        created,
+    )
+    altered = simple_query(
+        s,
+        "ALTER SUBSCRIPTION wire_subscription CONNECTION 'host=publisher-two port=5433'; "
+        "ALTER SUBSCRIPTION wire_subscription SET PUBLICATION inventory, sales WITH (refresh = false)",
+    )
+    check(
+        "raw wire: ALTER subscription definition completes twice",
+        sum(kind == b"C" and payload == b"ALTER SUBSCRIPTION\x00" for kind, payload in altered) == 2,
+        altered,
+    )
+    catalog = simple_query(
+        s,
+        "SELECT subconninfo || '|' || subpublications::text FROM pg_subscription "
+        "WHERE subname = 'wire_subscription'",
+    )
+    check(
+        "raw wire: ALTER subscription changes catalog definition",
+        first_text_row(catalog) == "host=publisher-two port=5433|{inventory,sales}",
+        catalog,
+    )
+    s.close()
+
+
 def test_catalog_aware_binary_bind_parameters():
     s = connect()
     s.sendall(startup_payload(0))

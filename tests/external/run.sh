@@ -588,6 +588,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
     -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL)" \
     -c "CREATE PUBLICATION subscription_apply_pub FOR TABLE subscription_target" \
+    -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_target" \
     -c "SELECT pg_create_logical_replication_slot('subscription_apply_slot', 'pgoutput')" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher setup"
@@ -627,14 +628,28 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "subscription initial apply (got $(subscription_rows))"
     subscription_diagnostics
   fi
+  if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub_after_alter WITH (refresh = false)" \
+    -c "ALTER SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_rebound sslmode=disable'" \
+    >/dev/null 2>&1; then
+    bad "logical subscription definition alteration"
+  elif ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    -c "INSERT INTO subscription_target VALUES (3, 'after-alter')" >/dev/null 2>&1; then
+    bad "logical subscription post-alter publisher transaction"
+  elif subscription_wait $'1|first\n2|second\n3|after-alter'; then
+    ok "subscription reconnects from its committed altered definition"
+  else
+    bad "subscription post-alter apply (got $(subscription_rows))"
+    subscription_diagnostics
+  fi
   kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
   start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
   SERVER_PID=$START_PID
-  if subscription_wait $'1|first\n2|second'; then
+  if subscription_wait $'1|first\n2|second\n3|after-alter'; then
     if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
-      -c "INSERT INTO subscription_target VALUES (3, 'after-crash')" >/dev/null 2>&1; then
-      bad "logical subscription post-crash publisher transaction"
-    elif subscription_wait $'1|first\n2|second\n3|after-crash'; then
+      -c "INSERT INTO subscription_target VALUES (4, 'after-crash')" >/dev/null 2>&1; then
+    bad "logical subscription post-crash publisher transaction"
+    elif subscription_wait $'1|first\n2|second\n3|after-alter\n4|after-crash'; then
       slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
         -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply_slot'")
       [[ "$slot_lsn" == "t" ]] && ok "subscription crash recovery resumes from durable acknowledgement" \

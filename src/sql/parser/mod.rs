@@ -2869,8 +2869,46 @@ impl<'a> Parser<'a> {
                 AlterSubscriptionAction::Enable
             } else if self.eat_ident("disable")? {
                 AlterSubscriptionAction::Disable
+            } else if self.eat_ident("connection")? {
+                AlterSubscriptionAction::SetConnection(
+                    self.str_literal("subscription connection string")?,
+                )
+            } else if self.eat_ident("set")? {
+                self.expect_ident("publication")?;
+                let mut publications = [""; MAX_LIST];
+                let mut count = 0;
+                loop {
+                    if count == publications.len() {
+                        return Err(self.limit("subscription publications", publications.len()));
+                    }
+                    publications[count] = self.any_ident("publication name")?;
+                    count += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                let refresh = if self.eat_ident("with")? {
+                    self.expect_op("(")?;
+                    self.expect_ident("refresh")?;
+                    let _ = self.eat_op("=")?;
+                    let refresh = self.role_option_boolean()?;
+                    self.expect_op(")")?;
+                    if refresh {
+                        crate::sql::ast::SubscriptionPublicationRefresh::Refresh
+                    } else {
+                        crate::sql::ast::SubscriptionPublicationRefresh::NoRefresh
+                    }
+                } else {
+                    crate::sql::ast::SubscriptionPublicationRefresh::Refresh
+                };
+                AlterSubscriptionAction::SetPublications {
+                    publications: self.arena_slice(&publications[..count])?,
+                    refresh,
+                }
             } else {
-                return Err(self.err_here("expected ENABLE or DISABLE after ALTER SUBSCRIPTION"));
+                return Err(self.err_here(
+                    "expected ENABLE, DISABLE, CONNECTION, or SET PUBLICATION after ALTER SUBSCRIPTION",
+                ));
             };
             return Ok(Stmt::AlterSubscription { name, action });
         }
@@ -4608,6 +4646,42 @@ mod tests {
             };
             assert_eq!(tables, [QualName::bare("orders")]);
             assert!(schemas.is_empty());
+        });
+    }
+
+    #[test]
+    fn alter_subscription_definition_operations_are_typed_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "alter subscription parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "ALTER SUBSCRIPTION apply_changes CONNECTION 'host=127.0.0.2 port=5432'; \
+             ALTER SUBSCRIPTION apply_changes SET PUBLICATION sales, inventory WITH (refresh = false)",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::AlterSubscription { action, .. }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER SUBSCRIPTION CONNECTION did not parse")
+            };
+            assert_eq!(
+                action,
+                crate::sql::ast::AlterSubscriptionAction::SetConnection("host=127.0.0.2 port=5432")
+            );
+            let Some(Stmt::AlterSubscription { action, .. }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER SUBSCRIPTION SET PUBLICATION did not parse")
+            };
+            let crate::sql::ast::AlterSubscriptionAction::SetPublications {
+                publications,
+                refresh,
+            } = action
+            else {
+                panic!("SET PUBLICATION lost its typed publication list")
+            };
+            assert_eq!(publications, ["sales", "inventory"]);
+            assert_eq!(
+                refresh,
+                crate::sql::ast::SubscriptionPublicationRefresh::NoRefresh
+            );
         });
     }
 

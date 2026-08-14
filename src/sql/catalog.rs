@@ -3547,8 +3547,10 @@ fn pg_subscription<'a>(
                 rows.len()
             ));
         }
+        let (connection, subscription_publications, publication_count) =
+            subscription.definition_to(txid);
         let mut publications = [Datum::Null; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
-        for (index, publication) in subscription.publications[..subscription.publication_count]
+        for (index, publication) in subscription_publications[..publication_count]
             .iter()
             .enumerate()
         {
@@ -3556,7 +3558,7 @@ fn pg_subscription<'a>(
         }
         let publications = Datum::Array {
             element: super::types::ArrElem::Text,
-            raw: super::array::build(&publications[..subscription.publication_count], arena)?,
+            raw: super::array::build(&publications[..publication_count], arena)?,
         };
         rows[count] = row(
             &[
@@ -3576,7 +3578,7 @@ fn pg_subscription<'a>(
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Bool(false),
-                text(subscription.connection.as_str(), arena)?,
+                text(connection.as_str(), arena)?,
                 if subscription.slot_name == crate::storage::SqlName::EMPTY {
                     Datum::Null
                 } else {

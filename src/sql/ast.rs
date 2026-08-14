@@ -291,10 +291,10 @@ pub enum Stmt<'a> {
         publications: &'a [&'a str],
         options: SubscriptionOptions<'a>,
     },
-    /// ALTER SUBSCRIPTION name ENABLE | DISABLE.
+    /// ALTER SUBSCRIPTION lifecycle operation.
     AlterSubscription {
         name: &'a str,
-        action: AlterSubscriptionAction,
+        action: AlterSubscriptionAction<'a>,
     },
     /// DROP SUBSCRIPTION [IF EXISTS] name [, ...].
     DropSubscription {
@@ -624,9 +624,22 @@ pub enum SubscriptionSlotName<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlterSubscriptionAction {
+pub enum AlterSubscriptionAction<'a> {
     Enable,
     Disable,
+    SetConnection(&'a str),
+    SetPublications {
+        publications: &'a [&'a str],
+        refresh: SubscriptionPublicationRefresh,
+    },
+}
+
+/// PostgreSQL's SET PUBLICATION refresh choice. A fresh copy is distinct from
+/// a stream-definition change and is never inferred from an omitted option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionPublicationRefresh {
+    Refresh,
+    NoRefresh,
 }
 
 /// The validated state change requested by `ALTER PUBLICATION`.  Membership

@@ -10,5 +10,11 @@ CREATE SUBSCRIPTION archived_changes
 SELECT subname, subenabled, subconninfo, subslotname, subpublications
   FROM pg_subscription
   WHERE subname = 'archived_changes';
+ALTER SUBSCRIPTION archived_changes
+  CONNECTION 'host=publisher-two port=5433';
+ALTER SUBSCRIPTION archived_changes SET PUBLICATION inventory, sales WITH (refresh = false);
+SELECT subname, subenabled, subconninfo, subslotname, subpublications
+  FROM pg_subscription
+  WHERE subname = 'archived_changes';
 DROP SUBSCRIPTION archived_changes;
 SELECT count(*) FROM pg_subscription WHERE subname = 'archived_changes';

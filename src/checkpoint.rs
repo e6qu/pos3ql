@@ -2068,6 +2068,10 @@ impl Checkpointer {
                         })?;
                     storage.commit_routine_create(slot, 0);
                 }
+                Some("trg") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_trigger(storage, line)?;
+                }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
                     let has_links = matches!(tag, Some("sq3") | Some("sq4"));
@@ -3761,6 +3765,52 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (_, trigger) in storage.triggers_with_slots_visible_to(0) {
+            use core::fmt::Write;
+            let table = storage.table_def(usize::from(trigger.table), 0);
+            let function = storage.routine(usize::from(trigger.function));
+            let owner = storage.role(trigger.ownership.owner_to(0) as usize).name;
+            let mut howner = StackStr::<130>::new();
+            let mut hname = StackStr::<130>::new();
+            let mut hschema = StackStr::<130>::new();
+            let mut htable = StackStr::<130>::new();
+            let mut hfunction_schema = StackStr::<130>::new();
+            let mut hfunction = StackStr::<130>::new();
+            for byte in owner.as_str().as_bytes() {
+                let _ = write!(howner, "{byte:02x}");
+            }
+            for byte in trigger.name.as_str().as_bytes() {
+                let _ = write!(hname, "{byte:02x}");
+            }
+            for byte in table.schema.as_str().as_bytes() {
+                let _ = write!(hschema, "{byte:02x}");
+            }
+            for byte in table.name.as_str().as_bytes() {
+                let _ = write!(htable, "{byte:02x}");
+            }
+            for byte in function.schema.as_str().as_bytes() {
+                let _ = write!(hfunction_schema, "{byte:02x}");
+            }
+            for byte in function.name.as_str().as_bytes() {
+                let _ = write!(hfunction, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "trg {} {} {} {} {} {} {} {} {} {}",
+                    trigger.created_at,
+                    howner.as_str(),
+                    hname.as_str(),
+                    hschema.as_str(),
+                    htable.as_str(),
+                    hfunction_schema.as_str(),
+                    hfunction.as_str(),
+                    trigger.timing,
+                    trigger.events,
+                    u8::from(trigger.enabled),
+                ),
+            )?;
+        }
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
         for comment in storage.live_comments() {
@@ -5010,6 +5060,99 @@ fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), Checkp
                 error.message.as_str()
             ))
         })
+}
+
+fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split_ascii_whitespace();
+    if words.next() != Some("trg") {
+        return Err(CheckpointSetupError::Corrupt("trigger record"));
+    }
+    let created_at = parse_field(words.next(), "trigger created_at")?;
+    let owner = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger owner"))?,
+    )?;
+    let name = sql_name(&decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger name"))?,
+    )?)?;
+    let schema = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger table schema"))?,
+    )?;
+    let table_name = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger table"))?,
+    )?;
+    let function_schema = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger function schema"))?,
+    )?;
+    let function_name = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("trigger function"))?,
+    )?;
+    let timing: u8 = parse_field(words.next(), "trigger timing")?;
+    let events: u8 = parse_field(words.next(), "trigger events")?;
+    let enabled = match parse_field::<u8>(words.next(), "trigger enabled")? {
+        0 => false,
+        1 => true,
+        _ => return Err(CheckpointSetupError::Corrupt("trigger enabled")),
+    };
+    if timing > 1 || events == 0 || words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("malformed trigger record"));
+    }
+    let owner = storage
+        .find_role(&owner)
+        .ok_or(CheckpointSetupError::Corrupt(
+            "trigger owner does not exist",
+        ))?;
+    let Some(crate::storage::ResolvedRelation::Table(table)) =
+        storage.resolve_relation(Some(&schema), &table_name, 0)
+    else {
+        return Err(CheckpointSetupError::Corrupt(
+            "trigger table does not exist",
+        ));
+    };
+    let function = storage
+        .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
+        .ok_or(CheckpointSetupError::Corrupt(
+            "trigger function does not exist",
+        ))?;
+    if !matches!(
+        storage.routine(function).kind,
+        crate::storage::RoutineKind::Trigger
+    ) {
+        return Err(CheckpointSetupError::Corrupt(
+            "trigger function is not trigger typed",
+        ));
+    }
+    storage
+        .restore_trigger(
+            created_at,
+            owner as u16,
+            crate::storage::TriggerSpec {
+                name,
+                table,
+                function,
+                timing,
+                events,
+            },
+            enabled,
+        )
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest trigger rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    Ok(())
 }
 
 fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {

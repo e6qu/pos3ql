@@ -99,6 +99,9 @@ const KIND_DROP_SUBSCRIPTION: u8 = 51;
 const KIND_ADVANCE_SUBSCRIPTION: u8 = 52;
 const KIND_SET_SUBSCRIPTION_ENABLED: u8 = 53;
 const KIND_ALTER_SUBSCRIPTION: u8 = 54;
+const KIND_CREATE_TRIGGER: u8 = 55;
+const KIND_DROP_TRIGGER: u8 = 56;
+const KIND_ALTER_TRIGGER: u8 = 57;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -106,7 +109,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_SUBSCRIPTION;
+const LAST_KIND: u8 = KIND_ALTER_TRIGGER;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -417,6 +420,27 @@ pub(crate) enum WalOp<'a> {
         connection: &'a str,
         publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
         publication_count: usize,
+    },
+    CreateTrigger {
+        name: &'a str,
+        table_schema: &'a str,
+        table: &'a str,
+        function_schema: &'a str,
+        function: &'a str,
+        timing: u8,
+        events: u8,
+    },
+    DropTrigger {
+        name: &'a str,
+        table_schema: &'a str,
+        table: &'a str,
+    },
+    AlterTrigger {
+        name: &'a str,
+        table_schema: &'a str,
+        table: &'a str,
+        new_name: &'a str,
+        enabled: bool,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1288,6 +1312,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AdvanceSubscription { .. } => KIND_ADVANCE_SUBSCRIPTION,
         WalOp::SetSubscriptionEnabled { .. } => KIND_SET_SUBSCRIPTION_ENABLED,
         WalOp::AlterSubscription { .. } => KIND_ALTER_SUBSCRIPTION,
+        WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER,
+        WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
+        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1484,6 +1511,37 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .map(|publication| 1 + publication.as_str().len())
                     .sum::<usize>()
         }
+        WalOp::CreateTrigger {
+            name,
+            table_schema,
+            table,
+            function_schema,
+            function,
+            ..
+        } => {
+            1 + name.len()
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+                + 1
+                + function_schema.len()
+                + 1
+                + function.len()
+                + 2
+        }
+        WalOp::DropTrigger {
+            name,
+            table_schema,
+            table,
+        } => 1 + name.len() + 1 + table_schema.len() + 1 + table.len(),
+        WalOp::AlterTrigger {
+            name,
+            table_schema,
+            table,
+            new_name,
+            ..
+        } => 1 + name.len() + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -1662,6 +1720,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     }
                     crate::storage::RoutineKind::Function { .. }
                     | crate::storage::RoutineKind::SetFunction { .. }
+                    | crate::storage::RoutineKind::Trigger
                     | crate::storage::RoutineKind::Procedure => 0,
                 }
         }
@@ -2432,6 +2491,44 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             statistics,
         } => name_bytes(buffer, table) && name_bytes(buffer, schema) && statistics.append(buffer),
+        WalOp::CreateTrigger {
+            name,
+            table_schema,
+            table,
+            function_schema,
+            function,
+            timing,
+            events,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, function_schema)
+                && name_bytes(buffer, function)
+                && buffer.append(&[*timing, *events])
+        }
+        WalOp::DropTrigger {
+            name,
+            table_schema,
+            table,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+        }
+        WalOp::AlterTrigger {
+            name,
+            table_schema,
+            table,
+            new_name,
+            enabled,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, new_name)
+                && buffer.append(&[u8::from(*enabled)])
+        }
     }
 }
 
@@ -3198,6 +3295,54 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 connection,
                 publications,
                 publication_count: count,
+            })
+        }
+        KIND_CREATE_TRIGGER => {
+            let name = take_name(&mut at)?;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let function_schema = take_name(&mut at)?;
+            let function = take_name(&mut at)?;
+            let timing = *payload.get(at)?;
+            let events = *payload.get(at + 1)?;
+            at += 2;
+            (timing <= 1 && events != 0 && at == payload.len()).then_some(WalOp::CreateTrigger {
+                name,
+                table_schema,
+                table,
+                function_schema,
+                function,
+                timing,
+                events,
+            })
+        }
+        KIND_DROP_TRIGGER => {
+            let name = take_name(&mut at)?;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropTrigger {
+                name,
+                table_schema,
+                table,
+            })
+        }
+        KIND_ALTER_TRIGGER => {
+            let name = take_name(&mut at)?;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            let enabled = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::AlterTrigger {
+                name,
+                table_schema,
+                table,
+                new_name,
+                enabled,
             })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
@@ -5019,12 +5164,45 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                20,
+                &WalOp::CreateTrigger {
+                    name: "audit_row",
+                    table_schema: "public",
+                    table: "orders",
+                    function_schema: "public",
+                    function: "audit_order",
+                    timing: 0,
+                    events: 3,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                21,
+                &WalOp::AlterTrigger {
+                    name: "audit_row",
+                    table_schema: "public",
+                    table: "orders",
+                    new_name: "audit_row_disabled",
+                    enabled: false,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                22,
+                &WalOp::DropTrigger {
+                    name: "audit_row_disabled",
+                    table_schema: "public",
+                    table: "orders",
+                },
+            )
+            .unwrap();
             let mut publications =
                 [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
             publications[0] = crate::storage::SqlName::parse("sales").unwrap();
             publications[1] = crate::storage::SqlName::parse("inventory").unwrap();
             wal.append_committed(
-                20,
+                23,
                 &WalOp::AlterSubscription {
                     name: "apply_changes",
                     connection: "host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable",
@@ -5038,7 +5216,7 @@ mod tests {
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 23);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -5116,11 +5294,14 @@ mod tests {
             "index identity: {}",
             seen[18]
         );
-        assert!(seen[19].contains("AlterSubscription"), "{}", seen[19]);
-        assert_eq!(wal.last_lsn(), 20);
+        assert!(seen[19].contains("CreateTrigger"), "{}", seen[19]);
+        assert!(seen[20].contains("AlterTrigger"), "{}", seen[20]);
+        assert!(seen[21].contains("DropTrigger"), "{}", seen[21]);
+        assert!(seen[22].contains("AlterSubscription"), "{}", seen[22]);
+        assert_eq!(wal.last_lsn(), 23);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            21,
+            24,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

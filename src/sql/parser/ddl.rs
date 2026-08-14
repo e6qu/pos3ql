@@ -11,9 +11,10 @@ use super::{
 };
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement, DomainCheck, Expr,
-    PublicationOperations, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
-    RoutineTargetKind, SubscriptionOptions, SubscriptionSlotName,
+    AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
+    CreateTrigger, DomainCheck, Expr, PublicationOperations, RoleOptions, RoutineArgument,
+    RoutineCreateKind, RoutineIdentity, RoutineTargetKind, SubscriptionOptions,
+    SubscriptionSlotName, TriggerEvent, TriggerIdentity, TriggerTiming,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -33,6 +34,26 @@ fn index_expression_source<'a>(expression: &Expr<'a>, text: &'a str) -> &'a str 
 }
 
 impl<'a> Parser<'a> {
+    pub(super) fn alter_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("trigger name")?;
+        self.expect_ident("on")?;
+        let table = self.qual_name("trigger table")?;
+        let action = if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterTriggerAction::Rename(self.col_ident("new trigger name")?)
+        } else if self.eat_ident("enable")? {
+            AlterTriggerAction::Enable
+        } else if self.eat_ident("disable")? {
+            AlterTriggerAction::Disable
+        } else {
+            return Err(self.err_here("expected RENAME, ENABLE, or DISABLE after ALTER TRIGGER"));
+        };
+        Ok(Stmt::AlterTrigger {
+            trigger: TriggerIdentity { name, table },
+            action,
+        })
+    }
+
     pub(super) fn alter_index(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
@@ -99,6 +120,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("subscription")? {
             return self.create_subscription();
         }
+        if self.eat_ident("trigger")? {
+            return self.create_trigger();
+        }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             return self.create_materialized_view();
@@ -128,6 +152,88 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    /// CREATE TRIGGER for the row-level lifecycle this engine can execute
+    /// durably.  Forms whose execution model needs statement transition tables,
+    /// deferred constraint scheduling, or view rewriting are refused here.
+    fn create_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("trigger name")?;
+        let timing = if self.eat_ident("before")? {
+            TriggerTiming::Before
+        } else if self.eat_ident("after")? {
+            TriggerTiming::After
+        } else if self.eat_ident("instead")? {
+            self.expect_ident("of")?;
+            return Err(self.err_here("INSTEAD OF triggers are not supported"));
+        } else {
+            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF for CREATE TRIGGER"));
+        };
+        let mut events = [TriggerEvent::Insert; 3];
+        let mut event_count = 0usize;
+        loop {
+            let event = if self.eat_ident("insert")? {
+                TriggerEvent::Insert
+            } else if self.eat_ident("update")? {
+                TriggerEvent::Update
+            } else if self.eat_ident("delete")? {
+                TriggerEvent::Delete
+            } else if self.eat_ident("truncate")? {
+                return Err(self.err_here("TRUNCATE triggers are not supported"));
+            } else {
+                return Err(self
+                    .err_here("expected INSERT, UPDATE, DELETE, or TRUNCATE for CREATE TRIGGER"));
+            };
+            if events[..event_count].contains(&event) {
+                return Err(self.err_here("trigger event specified more than once"));
+            }
+            events[event_count] = event;
+            event_count += 1;
+            if !self.eat_ident("or")? {
+                break;
+            }
+        }
+        self.expect_ident("on")?;
+        let table = self.qual_name("trigger table")?;
+        if self.eat_ident("for")? {
+            let _ = self.eat_ident("each")?;
+            if self.eat_ident("statement")? {
+                return Err(self.err_here("statement triggers are not supported"));
+            }
+            self.expect_ident("row")?;
+        }
+        if self.eat_ident("when")? {
+            return Err(self.err_here("trigger WHEN conditions are not supported"));
+        }
+        self.expect_ident("execute")?;
+        if !self.eat_ident("function")? {
+            return Err(self.err_here("trigger procedures are not supported; use EXECUTE FUNCTION"));
+        }
+        let function = self.qual_name("trigger function")?;
+        self.expect_op("(")?;
+        let mut arguments = [""; MAX_LIST];
+        let mut argument_count = 0usize;
+        if !self.eat_op(")")? {
+            loop {
+                if argument_count == arguments.len() {
+                    return Err(self.limit("trigger arguments", arguments.len()));
+                }
+                arguments[argument_count] = self.str_literal("trigger argument")?;
+                argument_count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        Ok(Stmt::CreateTrigger(CreateTrigger {
+            name,
+            timing,
+            events: self.arena_slice(&events[..event_count])?,
+            table,
+            function,
+            arguments: self.arena_slice(&arguments[..argument_count])?,
+        }))
     }
 
     /// SQL-language routine definition. Its parsed kind makes omitting a
@@ -167,7 +273,9 @@ impl<'a> Parser<'a> {
         }
         let kind = if function {
             self.expect_ident("returns")?;
-            if self.eat_ident("table")? {
+            if self.eat_ident("trigger")? {
+                RoutineCreateKind::Trigger
+            } else if self.eat_ident("table")? {
                 self.expect_op("(")?;
                 let mut columns = [RoutineArgument {
                     name: "",
@@ -201,7 +309,24 @@ impl<'a> Parser<'a> {
             RoutineCreateKind::Procedure
         };
         self.expect_ident("language")?;
-        self.expect_ident("sql")?;
+        let language = if self.eat_ident("sql")? {
+            crate::sql::ast::RoutineLanguage::Sql
+        } else if self.eat_ident("plpgsql")? {
+            crate::sql::ast::RoutineLanguage::PlPgSql
+        } else {
+            return Err(self.unexpected("supported routine language"));
+        };
+        if matches!(kind, RoutineCreateKind::Trigger)
+            != matches!(language, crate::sql::ast::RoutineLanguage::PlPgSql)
+        {
+            return Err(
+                self.unexpected(if matches!(kind, RoutineCreateKind::Trigger) {
+                    "trigger functions require LANGUAGE plpgsql"
+                } else {
+                    "only trigger functions support LANGUAGE plpgsql"
+                }),
+            );
+        }
         self.expect_ident("as")?;
         let body = self.str_literal("function body")?;
         Ok(Stmt::CreateRoutine(CreateRoutine {
@@ -209,6 +334,7 @@ impl<'a> Parser<'a> {
             or_replace,
             arguments: self.arena_slice(&arguments[..count])?,
             kind,
+            language,
             body,
         }))
     }
@@ -1416,6 +1542,9 @@ impl<'a> Parser<'a> {
                 if_exists,
             });
         }
+        if self.eat_ident("trigger")? {
+            return self.drop_trigger();
+        }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             let (names, if_exists) = self.drop_targets("materialized view name")?;
@@ -1594,6 +1723,43 @@ impl<'a> Parser<'a> {
                 cascade,
             }),
         }
+    }
+
+    pub(super) fn drop_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut triggers = [TriggerIdentity {
+            name: "",
+            table: QualName::bare(""),
+        }; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == triggers.len() {
+                return Err(self.limit("triggers", triggers.len()));
+            }
+            let name = self.col_ident("trigger name")?;
+            self.expect_ident("on")?;
+            triggers[count] = TriggerIdentity {
+                name,
+                table: self.qual_name("trigger table")?,
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        if self.eat_ident("cascade")? {
+            return Err(self.err_here("DROP TRIGGER CASCADE is not supported"));
+        }
+        let _ = self.eat_ident("restrict")?;
+        Ok(Stmt::DropTrigger {
+            triggers: self.arena_slice(&triggers[..count])?,
+            if_exists,
+        })
     }
 
     pub(super) fn alter_routine(

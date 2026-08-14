@@ -2143,6 +2143,16 @@ pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
 pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 
+/// Trigger definitions share the table-sized catalog budget.  A trigger has no
+/// runtime allocation: its target and function are stable catalog slots.
+pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
+
+pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
+    TRIGGER_OID_BASE
+        .checked_add(i32::try_from(trigger.created_at).expect("trigger OID range exhausted"))
+        .expect("trigger OID range exhausted")
+}
+
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
     ROUTINE_OID_BASE
         .checked_add(i32::try_from(routine.created_at).expect("routine OID range exhausted"))
@@ -2176,6 +2186,7 @@ pub(crate) enum RoutineKind {
     Function { result: ColType },
     SetFunction { result: ColType },
     TableFunction,
+    Trigger,
     Procedure,
 }
 
@@ -2184,7 +2195,7 @@ impl RoutineKind {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result),
             Self::TableFunction => Some(ColType::Record),
-            Self::Procedure => None,
+            Self::Trigger | Self::Procedure => None,
         }
     }
 
@@ -2194,7 +2205,10 @@ impl RoutineKind {
 
     pub(crate) const fn catalog_kind(self) -> &'static str {
         match self {
-            Self::Function { .. } | Self::SetFunction { .. } | Self::TableFunction => "f",
+            Self::Function { .. }
+            | Self::SetFunction { .. }
+            | Self::TableFunction
+            | Self::Trigger => "f",
             Self::Procedure => "p",
         }
     }
@@ -2205,6 +2219,7 @@ impl RoutineKind {
             Self::SetFunction { .. } => 2,
             Self::TableFunction => 3,
             Self::Procedure => 1,
+            Self::Trigger => 4,
         }
     }
 
@@ -2213,6 +2228,7 @@ impl RoutineKind {
             0 => Some(Self::Function { result }),
             1 => Some(Self::Procedure),
             2 => Some(Self::SetFunction { result }),
+            4 => Some(Self::Trigger),
             _ => None,
         }
     }
@@ -2222,6 +2238,7 @@ impl RoutineKind {
 enum RoutineCallKind {
     Scalar,
     Set,
+    Trigger,
     Procedure,
 }
 
@@ -2230,6 +2247,7 @@ impl RoutineCallKind {
         match self {
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
             Self::Set => kind.is_set_returning(),
+            Self::Trigger => matches!(kind, RoutineKind::Trigger),
             Self::Procedure => matches!(kind, RoutineKind::Procedure),
         }
     }
@@ -2312,6 +2330,81 @@ impl RoutineDef {
         self.pending_identity
             .filter(|pending| pending.txid == txid)
             .map_or(self.name, |pending| pending.name)
+    }
+}
+
+/// A durable row-trigger definition.  The bit set is valid only when nonzero;
+/// construction remains inside the storage choke point so an empty trigger
+/// event set cannot enter the catalog.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriggerDef {
+    pub(crate) created_at: u64,
+    pub(crate) name: SqlName,
+    pub(crate) table: u16,
+    pub(crate) function: u16,
+    pub(crate) timing: u8,
+    pub(crate) events: u8,
+    pub(crate) enabled: bool,
+    pending_definition: Option<PendingTriggerDefinition>,
+    pub(crate) ownership: Ownership,
+    pub(crate) ddl_state: CatalogDdlState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingTriggerDefinition {
+    pub(crate) txid: u32,
+    pub(crate) name: SqlName,
+    pub(crate) enabled: bool,
+}
+
+/// Separates an unchanged ALTER from a changed definition whose previous
+/// state may itself be absent. An `Option<PendingTriggerDefinition>` alone
+/// cannot encode that distinction safely.
+#[derive(Clone, Copy)]
+pub(crate) enum TriggerAlter {
+    Unchanged,
+    Changed {
+        prior: Option<PendingTriggerDefinition>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TriggerSpec {
+    pub(crate) name: SqlName,
+    pub(crate) table: usize,
+    pub(crate) function: usize,
+    pub(crate) timing: u8,
+    pub(crate) events: u8,
+}
+
+impl TriggerDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        name: SqlName::EMPTY,
+        table: u16::MAX,
+        function: u16::MAX,
+        timing: 0,
+        events: 0,
+        enabled: false,
+        pending_definition: None,
+        ownership: Ownership::BOOTSTRAP,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn name_to(&self, txid: u32) -> SqlName {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+
+    pub(crate) fn enabled_to(&self, txid: u32) -> bool {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.enabled, |pending| pending.enabled)
     }
 }
 
@@ -3527,6 +3620,7 @@ pub struct Storage {
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     routines: FixedVec<RoutineDef>,
+    triggers: FixedVec<TriggerDef>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
@@ -4111,6 +4205,7 @@ impl Storage {
                     + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
+                    + size_of::<TriggerDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<MatviewDef>()
                     + size_of::<StoredQueryDependencies>()
@@ -4222,6 +4317,12 @@ impl Storage {
         for _ in 0..config.max_tables {
             routines
                 .push(RoutineDef::EMPTY)
+                .expect("sized to max_tables");
+        }
+        let mut triggers = FixedVec::new(budget, "triggers", config.max_tables)?;
+        for _ in 0..config.max_tables {
+            triggers
+                .push(TriggerDef::EMPTY)
                 .expect("sized to max_tables");
         }
         let view_dependencies =
@@ -4460,6 +4561,7 @@ impl Storage {
             pending_table_statistics,
             views,
             routines,
+            triggers,
             publications,
             replication_slots,
             subscriptions,
@@ -10198,6 +10300,7 @@ impl Storage {
         self.tables[index].live = false;
         self.tables[index].pending_ddl = None;
         self.tables[index].mark_dirty();
+        self.commit_triggers_for_table(index);
     }
 
     /// Transactional drop: the table stays visible to every other transaction
@@ -12900,6 +13003,10 @@ impl Storage {
         self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Procedure)
     }
 
+    pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
+        self.routine_slot_on_path(name, &[], txid, RoutineCallKind::Trigger)
+    }
+
     fn routine_slot_on_path(
         &self,
         name: &str,
@@ -13094,6 +13201,7 @@ impl Storage {
             }
             RoutineKind::Function { .. }
             | RoutineKind::SetFunction { .. }
+            | RoutineKind::Trigger
             | RoutineKind::Procedure
                 if result_column_count != 0 =>
             {
@@ -13104,6 +13212,7 @@ impl Storage {
             }
             RoutineKind::Function { .. }
             | RoutineKind::SetFunction { .. }
+            | RoutineKind::Trigger
             | RoutineKind::Procedure => {}
         }
         self.require_schema_create(schema.as_str(), txid)?;
@@ -13204,6 +13313,224 @@ impl Storage {
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn triggers_for_table(
+        &self,
+        table: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| {
+                trigger.visible_to(txid) && usize::from(trigger.table) == table
+            })
+    }
+
+    pub(crate) fn triggers_with_slots_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| trigger.visible_to(txid))
+    }
+
+    pub(crate) fn trigger_slot(&self, table: usize, name: &str, txid: u32) -> Option<usize> {
+        self.triggers_for_table(table, txid)
+            .find_map(|(slot, trigger)| (trigger.name_to(txid).as_str() == name).then_some(slot))
+    }
+
+    pub(crate) fn create_trigger(
+        &mut self,
+        spec: TriggerSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if spec.events == 0 || spec.timing > 1 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid trigger definition"
+            ));
+        }
+        if self
+            .trigger_slot(spec.table, spec.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "trigger \"{}\" for relation already exists",
+                spec.name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .triggers
+            .iter()
+            .position(|trigger| trigger.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many triggers (limit {})",
+                self.triggers.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.triggers[slot] = TriggerDef {
+            created_at: self.catalog_seq,
+            name: spec.name,
+            table: u16::try_from(spec.table).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table slot exceeds trigger capacity"
+                )
+            })?,
+            function: u16::try_from(spec.function).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine slot exceeds trigger capacity"
+                )
+            })?,
+            timing: spec.timing,
+            events: spec.events,
+            enabled: true,
+            pending_definition: None,
+            ownership: self.initial_ownership(txid),
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn drop_trigger(&mut self, slot: usize, txid: u32) {
+        self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn alter_trigger(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        enabled: bool,
+        txid: u32,
+    ) -> Result<TriggerAlter, SqlError> {
+        let blocker = self.triggers[slot].pending_definition;
+        if let Some(pending) = blocker
+            && pending.txid != txid
+        {
+            let name = self.triggers[slot].name;
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
+        }
+        let trigger = &mut self.triggers[slot];
+        if trigger.name_to(txid) == name && trigger.enabled_to(txid) == enabled {
+            return Ok(TriggerAlter::Unchanged);
+        }
+        let prior = trigger.pending_definition;
+        trigger.pending_definition = Some(PendingTriggerDefinition {
+            txid,
+            name,
+            enabled,
+        });
+        Ok(TriggerAlter::Changed { prior })
+    }
+
+    pub(crate) fn commit_trigger_alter(&mut self, slot: usize, txid: u32) {
+        let trigger = &mut self.triggers[slot];
+        if let Some(pending) = trigger.pending_definition
+            && pending.txid == txid
+        {
+            trigger.name = pending.name;
+            trigger.enabled = pending.enabled;
+            trigger.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn rollback_trigger_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingTriggerDefinition>,
+    ) {
+        self.triggers[slot].pending_definition = prior;
+    }
+
+    pub(crate) fn commit_trigger_create(&mut self, slot: usize) {
+        self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn restore_trigger(
+        &mut self,
+        created_at: u64,
+        owner: u16,
+        spec: TriggerSpec,
+        enabled: bool,
+    ) -> Result<usize, SqlError> {
+        if self
+            .trigger_slot(spec.table, spec.name.as_str(), 0)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "duplicate trigger in checkpoint"
+            ));
+        }
+        let Some(slot) = self
+            .triggers
+            .iter()
+            .position(|trigger| trigger.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many triggers in checkpoint"
+            ));
+        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.triggers[slot] = TriggerDef {
+            created_at,
+            name: spec.name,
+            table: u16::try_from(spec.table).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table slot exceeds trigger capacity"
+                )
+            })?,
+            function: u16::try_from(spec.function).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine slot exceeds trigger capacity"
+                )
+            })?,
+            timing: spec.timing,
+            events: spec.events,
+            enabled,
+            pending_definition: None,
+            ownership: Ownership {
+                owner,
+                pending: None,
+            },
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn rollback_trigger_create(&mut self, slot: usize) {
+        self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_trigger_drop(&mut self, slot: usize) {
+        self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.commit_drop();
+    }
+
+    /// Triggers are internal relation dependents. A committed table drop
+    /// retires them in the same catalog transition.
+    pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
+        for trigger in self.triggers.iter_mut() {
+            if trigger.ddl_state != CatalogDdlState::Absent && usize::from(trigger.table) == table {
+                trigger.ddl_state = CatalogDdlState::Absent;
+                trigger.pending_definition = None;
+            }
+        }
+    }
+
+    pub(crate) fn rollback_trigger_drop(&mut self, slot: usize, txid: u32) {
+        self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_create_routine(

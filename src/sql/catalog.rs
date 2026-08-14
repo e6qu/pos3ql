@@ -607,24 +607,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
-        (false, "pg_trigger") => finish(
-            def_of(
-                "pg_trigger",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("tgname", ColType::Text),
-                    ("tgrelid", ColType::Int4),
-                    ("tgenabled", ColType::Bpchar),
-                    ("tgisinternal", ColType::Bool),
-                    ("tgconstraint", ColType::Int4),
-                    ("tgfoid", ColType::Int4),
-                    ("tgparentid", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_trigger") => pg_trigger(storage, txid, arena),
         (false, "pg_event_trigger") => finish(
             def_of(
                 "pg_event_trigger",
@@ -2400,6 +2383,9 @@ pub fn function_def_text<'a>(
             }
             write!(definition, ") LANGUAGE sql AS '")
         }
+        crate::storage::RoutineKind::Trigger => {
+            write!(definition, ") RETURNS trigger LANGUAGE sql AS '")
+        }
         crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql AS '"),
     }
     .map_err(|_| super::eval::arena_full())?;
@@ -3650,7 +3636,8 @@ fn pg_class<'a>(
         }
         let toid = table_oid(storage, slot);
         let has_index = indexes.iter().any(|i| i.table_oid == toid);
-        let has_triggers = !table_def.fkeys().is_empty()
+        let has_triggers = storage.triggers_for_table(slot, txid).next().is_some()
+            || !table_def.fkeys().is_empty()
             || foreign_keys
                 .iter()
                 .any(|foreign_key| foreign_key.confrelid == toid);
@@ -4879,6 +4866,55 @@ fn pg_operator<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         )?;
     }
     finish(definition, &rows, arena)
+}
+
+fn pg_trigger<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_trigger",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("tgname", ColType::Name),
+            ("tgrelid", ColType::Oid),
+            ("tgenabled", ColType::Bpchar),
+            ("tgisinternal", ColType::Bool),
+            ("tgconstraint", ColType::Oid),
+            ("tgfoid", ColType::Oid),
+            ("tgparentid", ColType::Oid),
+        ],
+    );
+    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut count = 0usize;
+    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_trigger"));
+        }
+        let table = usize::from(trigger.table);
+        if !storage.table(table).visible_to(txid) {
+            continue;
+        }
+        let function = storage.routine(usize::from(trigger.function));
+        rows[count] = row(
+            &[
+                Datum::Int4(2620),
+                Datum::Int4(crate::storage::trigger_oid(trigger)),
+                text(trigger.name_to(txid).as_str(), arena)?,
+                Datum::Int4(table_oid(storage, table)),
+                Datum::Bpchar(if trigger.enabled_to(txid) { "O" } else { "D" }),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(crate::storage::routine_oid(function)),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

@@ -335,6 +335,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateSubscription { .. }
         | Stmt::AlterSubscription { .. }
         | Stmt::DropSubscription { .. }
+        | Stmt::CreateTrigger(_)
+        | Stmt::AlterTrigger { .. }
+        | Stmt::DropTrigger { .. }
         | Stmt::CreateTableAs { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::DropMaterializedView { .. }
@@ -2122,6 +2125,7 @@ impl Engine {
                     let name = self.storage.table(*slot as usize).def.name;
                     let schema = self.storage.table(*slot as usize).def.schema;
                     self.storage.commit_drop(*slot as usize);
+                    self.storage.commit_triggers_for_table(*slot as usize);
                     // The table's indexes were pending-dropped with it.
                     self.storage
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
@@ -2142,6 +2146,11 @@ impl Engine {
                     self.storage.commit_routine_create(*slot as usize, txn.txid)
                 }
                 DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
+                DdlUndo::TriggerCreated(slot) => self.storage.commit_trigger_create(*slot as usize),
+                DdlUndo::TriggerDropped(slot) => self.storage.commit_trigger_drop(*slot as usize),
+                DdlUndo::TriggerAltered { slot, .. } => {
+                    self.storage.commit_trigger_alter(*slot as usize, txn.txid)
+                }
                 DdlUndo::RoutineIdentityAltered { slot, .. } => self
                     .storage
                     .commit_routine_identity(*slot as usize, txn.txid),
@@ -2366,6 +2375,13 @@ impl Engine {
             DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
             DdlUndo::RoutineDropped(slot) => {
                 self.storage.rollback_routine_drop(slot as usize, txid)
+            }
+            DdlUndo::TriggerCreated(slot) => self.storage.rollback_trigger_create(slot as usize),
+            DdlUndo::TriggerDropped(slot) => {
+                self.storage.rollback_trigger_drop(slot as usize, txid)
+            }
+            DdlUndo::TriggerAltered { slot, prior } => {
+                self.storage.rollback_trigger_alter(slot as usize, prior)
             }
             DdlUndo::RoutineIdentityAltered { slot, prior } => {
                 self.storage.restore_routine_identity(slot as usize, prior)
@@ -5606,6 +5622,28 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateTrigger(trigger) => {
+                exec::create_trigger(&mut self.storage, &mut self.wal, txn, trigger, responder)
+            }
+            Stmt::DropTrigger {
+                triggers,
+                if_exists,
+            } => exec::drop_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                triggers,
+                *if_exists,
+                responder,
+            ),
+            Stmt::AlterTrigger { trigger, action } => exec::alter_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                trigger,
+                *action,
+                responder,
+            ),
             Stmt::CreateTableAs {
                 name,
                 columns,
@@ -6995,6 +7033,99 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let advance = storage.prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
             storage.apply_replication_slot_advance(advance);
+        }
+        WalOp::CreateTrigger {
+            name,
+            table_schema,
+            table,
+            function_schema,
+            function,
+            timing,
+            events,
+        } => {
+            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+                storage.resolve_relation(Some(table_schema), table, 0)
+            else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal trigger targets unknown relation \"{}.{}\"",
+                    table_schema,
+                    table
+                ));
+            };
+            let Some(function_slot) =
+                storage.routine_slot_by_signature(function_schema, function, &[], 0)
+            else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "journal trigger references unknown function \"{}.{}\"",
+                    function_schema,
+                    function
+                ));
+            };
+            if !matches!(
+                storage.routine(function_slot).kind,
+                crate::storage::RoutineKind::Trigger
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "journal trigger function has invalid return type"
+                ));
+            }
+            let slot = storage.create_trigger(
+                crate::storage::TriggerSpec {
+                    name: crate::storage::SqlName::parse(name)?,
+                    table: table_slot,
+                    function: function_slot,
+                    timing,
+                    events,
+                },
+                0,
+            )?;
+            storage.commit_trigger_create(slot);
+        }
+        WalOp::DropTrigger {
+            name,
+            table_schema,
+            table,
+        } => {
+            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+                storage.resolve_relation(Some(table_schema), table, 0)
+            else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal trigger targets unknown relation"
+                ));
+            };
+            if let Some(slot) = storage.trigger_slot(table_slot, name, 0) {
+                storage.drop_trigger(slot, 0);
+                storage.commit_trigger_drop(slot);
+            }
+        }
+        WalOp::AlterTrigger {
+            name,
+            table_schema,
+            table,
+            new_name,
+            enabled,
+        } => {
+            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+                storage.resolve_relation(Some(table_schema), table, 0)
+            else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal trigger targets unknown relation"
+                ));
+            };
+            let slot = storage.trigger_slot(table_slot, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal alters unknown trigger \"{}\"",
+                    name
+                )
+            })?;
+            storage.alter_trigger(slot, crate::storage::SqlName::parse(new_name)?, enabled, 0)?;
+            storage.commit_trigger_alter(slot, 0);
         }
         WalOp::CreateTable(def) => {
             // A journal written before its schema existed cannot occur going

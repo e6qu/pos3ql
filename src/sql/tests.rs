@@ -8041,6 +8041,152 @@ fn typed_routine_owner_changes_preserve_kind_and_overload_identity() {
 }
 
 #[test]
+fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_target (id integer PRIMARY KEY);
+         CREATE FUNCTION keep_row() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER keep_target BEFORE INSERT OR UPDATE ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION keep_row();
+         SELECT tgname, tgenabled FROM pg_trigger;
+         SELECT relhastriggers FROM pg_class WHERE relname = 'trigger_target';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["keep_target|O", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER TRIGGER keep_target ON trigger_target DISABLE;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';
+         ROLLBACK;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';",
+    );
+    assert_eq!(data_rows(&rollback), ["D", "O"]);
+    let created_then_rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE TRIGGER transient_target BEFORE INSERT ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION keep_row();
+         ROLLBACK;
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'transient_target';",
+    );
+    assert_eq!(data_rows(&created_then_rolled_back), ["0"]);
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_target VALUES (1)",
+    );
+    assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+    let conflict = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_target VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+    );
+    assert!(String::from_utf8_lossy(&conflict).contains("0A000"));
+    let after_insert = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION after_null() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+         CREATE TRIGGER observe_insert AFTER INSERT ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION after_null();
+         INSERT INTO trigger_target VALUES (2);
+         SELECT count(*) FROM trigger_target;",
+    );
+    assert_eq!(data_rows(&after_insert), ["2"]);
+    let replace = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE FUNCTION keep_row() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'",
+    );
+    assert!(String::from_utf8_lossy(&replace).contains("0A000"));
+    let create_delete_trigger = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION skip_delete() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+         CREATE TRIGGER keep_delete BEFORE DELETE ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION skip_delete();",
+    );
+    assert!(!String::from_utf8_lossy(&create_delete_trigger).contains("ERROR"));
+    let deleted = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM trigger_target; SELECT count(*) FROM trigger_target;",
+    );
+    assert_eq!(data_rows(&deleted), ["2"]);
+    let blocked = run_with(&mut engine, &mut budget, "DROP FUNCTION keep_row()");
+    assert!(String::from_utf8_lossy(&blocked).contains("2BP01"));
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION keep_row(), skip_delete(), after_null() CASCADE;
+         SELECT count(*) FROM pg_trigger",
+    );
+    assert_eq!(data_rows(&cascaded), ["0"]);
+}
+
+#[test]
+fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
+    let mut config = test_config("trigger-catalog-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("trigger-catalog-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_trigger_target (id integer PRIMARY KEY);
+         CREATE FUNCTION durable_keep() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+         CREATE TRIGGER durable_target BEFORE INSERT ON durable_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION durable_keep();
+         ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;
+         ALTER TRIGGER durable_target_renamed ON durable_trigger_target DISABLE;",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT trigger_catalog.tgname, trigger_catalog.tgenabled, relation_catalog.relhastriggers
+           FROM pg_trigger trigger_catalog
+           JOIN pg_class relation_catalog ON trigger_catalog.tgrelid = relation_catalog.oid
+          WHERE relation_catalog.relname = 'durable_trigger_target';
+         INSERT INTO durable_trigger_target VALUES (1);
+         SELECT count(*) FROM durable_trigger_target;",
+    );
+    assert_eq!(data_rows(&output), ["durable_target_renamed|D|t", "1"]);
+}
+
+#[test]
+fn table_drop_retires_internal_trigger_definitions() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_drop_target (id integer);
+         CREATE FUNCTION trigger_drop_keep() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER trigger_drop_target_row BEFORE INSERT ON trigger_drop_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_drop_keep();
+         DROP TABLE trigger_drop_target;
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'trigger_drop_target_row';",
+    );
+    assert_eq!(data_rows(&output), ["0"]);
+}
+
+#[test]
 fn routine_identity_changes_are_typed_transactional_and_durable() {
     let mut config = test_config("routine-identity");
     config.object_store_on = true;

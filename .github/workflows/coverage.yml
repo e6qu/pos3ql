@@ -54,6 +54,7 @@ jobs:
           - { name: diff, shard: "run:diff" }
           - { name: spilldiff, shard: "run:spilldiff" }
           - { name: spill-correctness, shard: "runtest:overlay,ingest,tls" }
+          - { name: subscription-correctness, shard: "runtest:subscription" }
           - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
           - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
     steps:

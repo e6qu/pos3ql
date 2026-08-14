@@ -2,8 +2,11 @@
 
 pub mod auth;
 pub mod conn;
+pub mod pginput;
 pub mod pgoutput;
+pub mod replication_client;
 pub mod respond;
+pub mod subscription_apply;
 pub mod tls;
 pub mod wire;
 

@@ -606,7 +606,6 @@ pub struct PublicationOperations {
 /// syntax defaults, captured before execution rather than inferred later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionOptions<'a> {
-    pub connect: bool,
     pub enabled: bool,
     pub create_slot: bool,
     pub copy_data: bool,
@@ -614,8 +613,9 @@ pub struct SubscriptionOptions<'a> {
 }
 
 /// The publisher-slot association is distinct from its textual spelling.
-/// `NONE` is the only subscription form pos3ql can manage locally before an
-/// apply client owns publisher communication.
+/// A named slot is an already-created publisher resource. `NONE` describes a
+/// disabled local catalog entry; `Default` preserves omitted PostgreSQL syntax
+/// so execution can reject unimplemented remote slot creation explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionSlotName<'a> {
     Default,

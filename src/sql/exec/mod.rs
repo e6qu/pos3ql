@@ -9,6 +9,10 @@ use crate::mem::arena::Arena;
 use crate::mem::fixed_vec::FixedVec;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
+use crate::pg::{
+    pginput::{OldTuple, Tuple, TupleColumn},
+    subscription_apply::RelationBinding,
+};
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
@@ -5743,9 +5747,6 @@ pub fn drop_publication(
     Ok(Ok(responder.command_complete("DROP PUBLICATION")?))
 }
 
-/// Stores a deliberately disabled subscription. An enabled subscription needs
-/// the bounded pgoutput apply client; accepting it before that client exists
-/// would create a catalog entry that falsely promises replication.
 #[derive(Clone, Copy)]
 pub struct CreateSubscriptionCommand<'a> {
     pub name: &'a str,
@@ -5767,16 +5768,10 @@ pub fn create_subscription(
         publications,
         options,
     } = command;
-    if options.connect || options.enabled || options.create_slot || options.copy_data {
+    if options.create_slot || options.copy_data {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "enabled subscriptions require the pgoutput apply client"
-        ));
-    }
-    if options.slot_name != crate::sql::ast::SubscriptionSlotName::None {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "subscriptions with a publisher slot require the pgoutput apply client"
+            "subscription remote-slot creation and initial copy are not supported"
         ));
     }
     let role = match storage.current_role_slot(txn.txid) {
@@ -5802,6 +5797,37 @@ pub fn create_subscription(
         Ok(connection) => connection,
         Err(error) => return sql_fail(error),
     };
+    let slot_name = match (options.enabled, options.slot_name) {
+        (true, crate::sql::ast::SubscriptionSlotName::Named(slot)) => match SqlName::parse(slot) {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
+        },
+        (true, _) => {
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "enabled subscriptions require an explicit existing slot_name"
+            ));
+        }
+        (false, crate::sql::ast::SubscriptionSlotName::None) => SqlName::EMPTY,
+        (false, _) => {
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "disabled subscriptions require slot_name = NONE"
+            ));
+        }
+    };
+    if options.enabled {
+        let endpoint = match connection.require_endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => return sql_fail(error),
+        };
+        if endpoint.application_name().is_none() {
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "enabled subscriptions require application_name in the connection string"
+            ));
+        }
+    }
     let mut publication_names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
     if publications.len() > publication_names.len() {
         return sql_fail(sql_err!(
@@ -5824,13 +5850,12 @@ pub fn create_subscription(
         }
         publication_names[index] = publication;
     }
-    let slot_name = SqlName::EMPTY;
     let slot = match storage.create_subscription(
         crate::storage::SubscriptionSpec {
             name,
             connection,
             publications: &publication_names[..publications.len()],
-            enabled: false,
+            enabled: options.enabled,
             slot_name,
         },
         txn.txid,
@@ -5854,7 +5879,7 @@ pub fn create_subscription(
             connection: connection.as_str(),
             publications: publication_names,
             publication_count: publications.len(),
-            enabled: false,
+            enabled: options.enabled,
             slot_name: slot_name.as_str(),
         },
     ) {
@@ -5866,6 +5891,72 @@ pub fn create_subscription(
         return sql_fail(error);
     }
     Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
+}
+
+pub fn alter_subscription(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    name: &str,
+    action: crate::sql::ast::AlterSubscriptionAction,
+    responder: &mut Responder,
+) -> Outcome {
+    let (slot, subscription) = match storage.subscription(name, txn.txid) {
+        Some(subscription) => subscription,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "subscription \"{}\" does not exist",
+                name
+            ));
+        }
+    };
+    if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
+        return sql_fail(error);
+    }
+    let enabled = matches!(action, crate::sql::ast::AlterSubscriptionAction::Enable);
+    if enabled {
+        if subscription.slot_name == SqlName::EMPTY {
+            return sql_fail(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot enable a subscription without an existing publisher slot"
+            ));
+        }
+        let endpoint = match subscription.connection.require_endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => return sql_fail(error),
+        };
+        if endpoint.application_name().is_none() {
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "enabled subscriptions require application_name in the connection string"
+            ));
+        }
+    }
+    let prior = match storage.set_subscription_enabled(slot, enabled, txn.txid) {
+        Ok(crate::storage::SubscriptionEnabledChange::Changed { prior }) => prior,
+        Ok(crate::storage::SubscriptionEnabledChange::Unchanged) => {
+            return Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?));
+        }
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetSubscriptionEnabled { name, enabled },
+    ) {
+        storage.restore_subscription_enabled(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionEnabled {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_subscription_enabled(slot, prior);
+        return sql_fail(error);
+    }
+    Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?))
 }
 
 pub fn drop_subscription(
@@ -11335,6 +11426,538 @@ pub fn copy_row_binary(
         None,
         &values[..def.n_columns],
     )
+}
+
+/// Applies one fully-described pgoutput INSERT tuple through the ordinary row
+/// core.  The relation binding was validated before the tuple arrived, so the
+/// only accepted tuple shape is the exact local table shape; unchanged TOAST
+/// is invalid for an INSERT and is never mistaken for NULL.
+pub fn apply_replication_insert(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    binding: RelationBinding,
+    tuple: Tuple<'_>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if tuple.columns().len() != binding.remote_to_local().len() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription INSERT has {} columns, relation has {}",
+            tuple.columns().len(),
+            binding.remote_to_local().len()
+        ));
+    }
+    let table_index = binding.table_slot();
+    storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::RowExclusive,
+        false,
+    )?;
+    let definition = *storage.table_def(table_index, txn.txid);
+    let checks = parse_checks(&definition, arena)?;
+    let values = decode_replication_tuple(storage, txn, binding, tuple, arena, false)?;
+    check_not_null(&definition, &values)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    enforce_row_constraints(
+        storage,
+        table_index,
+        &definition,
+        &schema[..definition.n_columns],
+        &values[..definition.n_columns],
+        None,
+        txn.txid,
+        &checks,
+        arena,
+        &[],
+    )?;
+    store_row(
+        storage,
+        txn,
+        table_index,
+        None,
+        &values[..definition.n_columns],
+    )
+}
+
+/// Decodes a complete pgoutput tuple according to an already verified local
+/// relation binding.  `allow_unchanged_toast` is explicit because it is legal
+/// only while constructing an UPDATE from a previous local row image.
+fn decode_replication_tuple<'a>(
+    storage: &Storage,
+    txn: &TxnState,
+    binding: RelationBinding,
+    tuple: Tuple<'a>,
+    arena: &'a Arena,
+    allow_unchanged_toast: bool,
+) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
+    decode_replication_tuple_for_columns(
+        storage,
+        txn,
+        binding.table_slot(),
+        binding.remote_to_local(),
+        tuple,
+        arena,
+        allow_unchanged_toast,
+    )
+}
+
+fn decode_replication_tuple_for_columns<'a>(
+    storage: &Storage,
+    txn: &TxnState,
+    table_slot: usize,
+    remote_to_local: &[usize],
+    tuple: Tuple<'a>,
+    arena: &'a Arena,
+    allow_unchanged_toast: bool,
+) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
+    if tuple.columns().len() != remote_to_local.len() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription tuple has {} columns, relation has {}",
+            tuple.columns().len(),
+            remote_to_local.len()
+        ));
+    }
+    let definition = storage.table_def(table_slot, txn.txid);
+    let mut values = [Datum::Null; MAX_COLUMNS];
+    for (remote, field) in tuple.columns().iter().enumerate() {
+        let local = remote_to_local[remote];
+        let column = &definition.columns()[local];
+        values[local] = match field {
+            TupleColumn::Null => Datum::Null,
+            TupleColumn::Text(bytes) => {
+                let oid = storage
+                    .declared_column_type(column, txn.txid)?
+                    .replication_oid();
+                coerce(
+                    decode_text_input(storage, oid, bytes, arena, txn.txid)?,
+                    column,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?
+            }
+            TupleColumn::Binary(bytes) => coerce(
+                decode_binary_field_with_catalog(column.ctype, bytes, arena, storage, txn.txid)?,
+                column,
+                storage,
+                txn.txid,
+                arena,
+            )?,
+            TupleColumn::UnchangedToast if allow_unchanged_toast => Datum::Null,
+            TupleColumn::UnchangedToast => {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "subscription tuple contains an unchanged TOAST value outside UPDATE"
+                ));
+            }
+        };
+    }
+    Ok(values)
+}
+
+fn decode_replication_old_tuple<'a>(
+    storage: &Storage,
+    txn: &TxnState,
+    binding: RelationBinding,
+    old: OldTuple<'a>,
+    arena: &'a Arena,
+) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
+    decode_replication_tuple_for_columns(
+        storage,
+        txn,
+        binding.table_slot(),
+        binding.old_remote_to_local(old.identity),
+        old.tuple,
+        arena,
+        false,
+    )
+}
+
+/// Proof that a publisher's replica-identity tuple names exactly one local
+/// visible row.  Only this module constructs it, so apply mutations cannot
+/// accidentally use a missing or ambiguous identity.
+#[derive(Clone, Copy)]
+pub struct ReplicationRow {
+    rowid: u64,
+}
+
+impl ReplicationRow {
+    pub fn rowid(self) -> u64 {
+        self.rowid
+    }
+}
+
+/// Finds exactly one row matching a decoded publisher old image.  NULL equals
+/// NULL here because pgoutput's old tuple is a replica identity, not an SQL
+/// predicate; a second matching image is an unsafe local divergence.
+pub fn locate_replication_row(
+    storage: &Storage,
+    txn: &TxnState,
+    binding: RelationBinding,
+    old: OldTuple<'_>,
+    arena: &Arena,
+) -> Result<ReplicationRow, SqlError> {
+    let expected = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    let table_index = binding.table_slot();
+    let definition = storage.table_def(table_index, txn.txid);
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let mut found = None;
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+        let mut actual = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, &schema[..definition.n_columns], &mut actual)?;
+        let equal =
+            binding
+                .old_remote_to_local(old.identity)
+                .iter()
+                .try_fold(true, |same, &column| {
+                    if !same {
+                        return Ok(false);
+                    }
+                    let left = &expected[column];
+                    let right = &actual[column];
+                    if left.is_null() || right.is_null() {
+                        return Ok(left.is_null() && right.is_null());
+                    }
+                    compare_datums(left, right).map(|ordering| ordering.is_eq())
+                })?;
+        if equal && found.replace(rowid).is_some() {
+            return Err(sql_err!(
+                sqlstate::CARDINALITY_VIOLATION,
+                "subscription replica identity matches more than one local row"
+            ));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    found.map(|rowid| ReplicationRow { rowid }).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription replica identity does not match a local row"
+        )
+    })
+}
+
+/// Applies a pgoutput DELETE through the ordinary row-lock, foreign-key, and
+/// pending-version path.  The caller supplies the publisher old tuple; the
+/// exact-row proof prevents a replica identity from turning into a broad
+/// local delete.
+pub fn apply_replication_delete(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    binding: RelationBinding,
+    old: OldTuple<'_>,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<(), SqlError> {
+    let row = locate_replication_row(storage, txn, binding, old, arena)?;
+    let table_index = binding.table_slot();
+    match storage.acquire_row_lock(
+        table_index,
+        row.rowid(),
+        txn.txid,
+        crate::sql::ast::LockStrength::Update,
+        crate::sql::ast::LockWait::Wait,
+    )? {
+        crate::sql::lock::LockDecision::Acquired => {}
+        crate::sql::lock::LockDecision::Waiting => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "subscription delete is waiting for a row lock"
+            ));
+        }
+        crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
+    }
+    let definition = *storage.table_def(table_index, txn.txid);
+    let old_values = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    if table_is_referenced(
+        storage,
+        definition.schema.as_str(),
+        definition.name.as_str(),
+        txn.txid,
+    ) {
+        apply_fk_parent_actions(
+            storage,
+            txn,
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            &old_values[..definition.n_columns],
+            None,
+            arena,
+            &[],
+            seq_session,
+            MAX_FK_CASCADE_DEPTH,
+        )?;
+    }
+    let prior =
+        storage.write_pending(table_index, row.rowid(), txn.txid, txn.command_id(), None)?;
+    if let Err(error) = txn.touch(table_index as u32, row.rowid(), prior) {
+        storage.restore_pending(table_index, row.rowid(), txn.txid, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Applies a pgoutput UPDATE through the same constraints, foreign-key
+/// actions, and pending-version path as SQL UPDATE.  An unchanged-TOAST field
+/// is copied only from the uniquely locked local row; it can never be
+/// reinterpreted as a NULL or as a value from a different replica identity.
+pub fn apply_replication_update(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    binding: RelationBinding,
+    old: OldTuple<'_>,
+    new: Tuple<'_>,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<(), SqlError> {
+    let row = locate_replication_row(storage, txn, binding, old, arena)?;
+    let table_index = binding.table_slot();
+    match storage.acquire_row_lock(
+        table_index,
+        row.rowid(),
+        txn.txid,
+        crate::sql::ast::LockStrength::Update,
+        crate::sql::ast::LockWait::Wait,
+    )? {
+        crate::sql::lock::LockDecision::Acquired => {}
+        crate::sql::lock::LockDecision::Waiting => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "subscription update is waiting for a row lock"
+            ));
+        }
+        crate::sql::lock::LockDecision::Skipped => unreachable!("apply update waits for its row"),
+    }
+    let definition = *storage.table_def(table_index, txn.txid);
+    let state = storage
+        .row_state(table_index, row.rowid())?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription replica identity disappeared before update"
+            )
+        })?;
+    let home = storage
+        .visible_row_home(table_index, row.rowid(), state, txn.txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription replica identity is no longer visible before update"
+            )
+        })?;
+    let bytes = storage.row_bytes(table_index, row.rowid(), home, arena)?;
+    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "subscription update row exceeds the apply arena"
+        )
+    })?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let mut old_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
+    let mut new_values = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+    for (remote, field) in new.columns().iter().enumerate() {
+        if matches!(field, TupleColumn::UnchangedToast) {
+            let local = binding.remote_to_local()[remote];
+            new_values[local] = old_values[local];
+        }
+    }
+    let checks = parse_checks(&definition, arena)?;
+    let generated = parse_generated(&definition, arena)?;
+    compute_generated(
+        &definition,
+        &generated,
+        &mut new_values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
+    check_not_null(&definition, &new_values)?;
+    enforce_row_constraints(
+        storage,
+        table_index,
+        &definition,
+        &schema[..definition.n_columns],
+        &new_values[..definition.n_columns],
+        Some(row.rowid()),
+        txn.txid,
+        &checks,
+        arena,
+        &[],
+    )?;
+    store_row(
+        storage,
+        txn,
+        table_index,
+        Some(row.rowid()),
+        &new_values[..definition.n_columns],
+    )?;
+    if referenced_key_changed(
+        storage,
+        definition.schema.as_str(),
+        definition.name.as_str(),
+        &old_values[..definition.n_columns],
+        &new_values[..definition.n_columns],
+        txn.txid,
+    )? {
+        apply_fk_parent_actions(
+            storage,
+            txn,
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            &old_values[..definition.n_columns],
+            Some(&new_values[..definition.n_columns]),
+            arena,
+            &[],
+            seq_session,
+            MAX_FK_CASCADE_DEPTH,
+        )?;
+    }
+    Ok(())
+}
+
+/// Applies one pgoutput TRUNCATE set transactionally.  The publisher supplies
+/// the complete cascade closure, which must also be closed under local foreign
+/// keys; accepting a partial closure would leave replicas observably divergent.
+pub fn apply_replication_truncate(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    tables: &[usize],
+    cascade: bool,
+    restart_identity: bool,
+) -> Result<(), SqlError> {
+    if tables.is_empty() || tables.len() > crate::sql::txn::MAX_TRUNCATE_TABLES {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "subscription TRUNCATE has {} tables, maximum is {}",
+            tables.len(),
+            crate::sql::txn::MAX_TRUNCATE_TABLES
+        ));
+    }
+    if tables
+        .iter()
+        .enumerate()
+        .any(|(index, table)| tables[..index].contains(table))
+    {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription TRUNCATE repeats a local table"
+        ));
+    }
+    for &table in tables {
+        storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        )?;
+    }
+    for other in 0..storage.table_count() {
+        if !storage.table(other).visible_to(txn.txid) || tables.contains(&other) {
+            continue;
+        }
+        let other_def = storage.table_def(other, txn.txid);
+        if other_def.fkeys().iter().any(|fk| {
+            tables.iter().any(|&table| {
+                let def = storage.table_def(table, txn.txid);
+                def.schema.as_str() == fk.parent_schema.as_str()
+                    && def.name.as_str() == fk.parent.as_str()
+            })
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription TRUNCATE omits a locally referencing table"
+            ));
+        }
+    }
+    for &table in tables {
+        let mut rowids = [0_u64; 4096];
+        loop {
+            let mut count = 0;
+            storage.for_each_row_state(table, &mut |rowid, state| {
+                use core::ops::ControlFlow;
+                if storage
+                    .visible_row_home(table, rowid, state, txn.txid)?
+                    .is_none()
+                {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if count == rowids.len() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                rowids[count] = rowid;
+                count += 1;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if count == 0 {
+                break;
+            }
+            for &rowid in &rowids[..count] {
+                let prior =
+                    storage.write_pending(table, rowid, txn.txid, txn.command_id(), None)?;
+                if let Err(error) = txn.touch(table as u32, rowid, prior) {
+                    storage.restore_pending(table, rowid, txn.txid, prior);
+                    return Err(error);
+                }
+            }
+        }
+        if restart_identity {
+            let definition = *storage.table_def(table, txn.txid);
+            for column in 0..definition.n_columns {
+                if !definition.columns()[column].auto_increment {
+                    continue;
+                }
+                if let Some(sequence) = storage.generated_sequence_slot(
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    definition.columns()[column].name.as_str(),
+                    txn.txid,
+                ) {
+                    let start = storage.sequence_for(sequence, txn.txid).start_value;
+                    let prior = storage.reset_sequence_value(sequence, txn.txid, start);
+                    if let Err(error) =
+                        txn.record_ddl(crate::sql::txn::DdlUndo::OwnedSequenceReset {
+                            sequence: sequence as u32,
+                            prior,
+                        })
+                    {
+                        storage.restore_sequence_value(sequence, prior);
+                        return Err(error);
+                    }
+                } else {
+                    let prior = storage.table(table).serial_last[column];
+                    txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
+                        table: table as u32,
+                        column: column as u16,
+                        prior,
+                    })?;
+                    let table_state = storage.table_mut(table);
+                    table_state.serial_last[column] = 0;
+                    table_state.serial_dirty = true;
+                }
+            }
+        }
+    }
+    let mut truncated = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
+    for (index, &table) in tables.iter().enumerate() {
+        truncated[index] = table as u16;
+    }
+    txn.record_truncate(crate::sql::txn::TruncateEvent {
+        command_id: txn.command_id(),
+        tables: truncated,
+        table_count: tables.len(),
+        cascade,
+        restart_identity,
+    })
 }
 
 /// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's

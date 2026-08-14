@@ -1137,8 +1137,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let mut connect = true;
         let mut options = SubscriptionOptions {
-            connect: true,
             enabled: true,
             create_slot: true,
             copy_data: true,
@@ -1158,7 +1158,7 @@ impl<'a> Parser<'a> {
                     if core::mem::replace(&mut seen_connect, true) {
                         return Err(self.err_here("duplicate subscription option connect"));
                     }
-                    options.connect = value;
+                    connect = value;
                 } else if key.eq_ignore_ascii_case("enabled") {
                     let value = self.subscription_bool_option(key)?;
                     if core::mem::replace(&mut seen_enabled, true) {
@@ -1198,7 +1198,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(",")?;
             }
-            if !options.connect {
+            if !connect {
                 if (seen_enabled && options.enabled)
                     || (seen_create_slot && options.create_slot)
                     || (seen_copy_data && options.copy_data)

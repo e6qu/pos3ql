@@ -16,6 +16,7 @@ use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::ValueIndexPool;
+use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
 use crate::sql::ast::Collation;
 use crate::sql::eval::{SqlError, hash_key, hash_key_collated, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
@@ -39,7 +40,10 @@ pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
 /// before durable catalog state is changed, so truncation and NUL bytes cannot
 /// become a deferred runtime connection failure.
 #[derive(Clone, Copy)]
-pub(crate) struct SubscriptionConnInfo(StackStr<SUBSCRIPTION_CONNINFO_BYTES>);
+pub(crate) struct SubscriptionConnInfo {
+    text: StackStr<SUBSCRIPTION_CONNINFO_BYTES>,
+    endpoint: Option<ConnectionInfo>,
+}
 
 impl SubscriptionConnInfo {
     pub(crate) fn parse(value: &str) -> Result<Self, SqlError> {
@@ -57,12 +61,65 @@ impl SubscriptionConnInfo {
                 SUBSCRIPTION_CONNINFO_BYTES
             ));
         }
-        Ok(Self(value))
+        crate::pg::replication_client::validate_connection_syntax(value.as_str())
+            .map_err(subscription_conninfo_error)?;
+        // A disabled PostgreSQL subscription may contain connection settings
+        // that this server never opens. Keep its validated catalog spelling;
+        // an enabled subscription must prove a usable bounded endpoint below.
+        let endpoint = ConnectionInfo::parse(value.as_str()).ok();
+        Ok(Self {
+            text: value,
+            endpoint,
+        })
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.text.as_str()
     }
+
+    /// The typed publisher endpoint, when this conninfo is usable by the
+    /// bounded replication client.
+    pub(crate) fn endpoint(&self) -> Option<ConnectionInfo> {
+        self.endpoint
+    }
+
+    pub(crate) fn require_endpoint(&self) -> Result<ConnectionInfo, SqlError> {
+        self.endpoint.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "enabled subscription connection string requires a numeric host, port, user, dbname, and sslmode"
+            )
+        })
+    }
+}
+
+fn subscription_conninfo_error(error: ConnectionInfoError) -> SqlError {
+    let message = match error {
+        ConnectionInfoError::Missing(field) => {
+            return sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "subscription connection string requires {}",
+                field
+            );
+        }
+        ConnectionInfoError::Duplicate => "subscription connection string repeats an option",
+        ConnectionInfoError::InvalidValue => {
+            "subscription connection string contains an invalid value"
+        }
+        ConnectionInfoError::InvalidPort => "subscription connection string has an invalid port",
+        ConnectionInfoError::NonNumericHost => {
+            "subscription connection string requires a numeric host address"
+        }
+        ConnectionInfoError::UnsupportedOption => {
+            "subscription connection string contains an unsupported option"
+        }
+        ConnectionInfoError::UnsupportedSslMode => {
+            "subscription connection string has an unsupported sslmode"
+        }
+        ConnectionInfoError::Limit => "subscription connection string value exceeds its limit",
+        ConnectionInfoError::Syntax => "subscription connection string has invalid syntax",
+    };
+    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "{}", message)
 }
 
 /// Rows handed from the durable merge cursor to the executor. The fixed batch
@@ -1862,9 +1919,32 @@ pub(crate) struct SubscriptionDef {
     pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
     pub enabled: bool,
+    pending_enabled: Option<PendingSubscriptionEnabled>,
     pub slot_name: SqlName,
+    /// The latest publisher transaction durably applied locally.  This is
+    /// advanced only after the same local commit has reached the WAL/object
+    /// store durability boundary.
+    pub confirmed_lsn: u64,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
+}
+
+/// One transaction-private subscription lifecycle change.  Keeping the owner
+/// and intended state together prevents a pending catalog value from being
+/// mistaken for a committed setting by another transaction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSubscriptionEnabled {
+    txid: u32,
+    enabled: bool,
+}
+
+/// Result of requesting a transactional subscription lifecycle state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SubscriptionEnabledChange {
+    Unchanged,
+    Changed {
+        prior: Option<PendingSubscriptionEnabled>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1879,6 +1959,34 @@ pub(crate) struct SubscriptionSpec<'a> {
 impl SubscriptionDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn enabled_to(&self, txid: u32) -> bool {
+        self.pending_enabled
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.enabled, |pending| pending.enabled)
+    }
+}
+
+/// A validated subscription acknowledgement ready to be included in the
+/// local transaction that applied its publisher changes.  The creation stamp
+/// prevents a dropped-and-reused catalog slot from advancing the wrong
+/// subscription after a delayed worker event.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionAdvance {
+    slot: usize,
+    created_at: u64,
+    name: SqlName,
+    confirmed_lsn: u64,
+}
+
+impl SubscriptionAdvance {
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub(crate) fn confirmed_lsn(&self) -> u64 {
+        self.confirmed_lsn
     }
 }
 
@@ -4107,12 +4215,16 @@ impl Storage {
                 .push(SubscriptionDef {
                     created_at: 0,
                     name: SqlName::EMPTY,
-                    connection: SubscriptionConnInfo::parse("disabled")
-                        .expect("static subscription placeholder is valid"),
+                    connection: SubscriptionConnInfo::parse(
+                        "host=127.0.0.1 port=1 user=disabled dbname=disabled sslmode=disable",
+                    )
+                    .expect("static subscription placeholder is valid"),
                     publications: [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS],
                     publication_count: 0,
                     enabled: false,
+                    pending_enabled: None,
                     slot_name: SqlName::EMPTY,
+                    confirmed_lsn: 0,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -10561,7 +10673,9 @@ impl Storage {
             publications,
             publication_count: spec.publications.len(),
             enabled: spec.enabled,
+            pending_enabled: None,
             slot_name: spec.slot_name,
+            confirmed_lsn: 0,
             ownership: Ownership {
                 owner: owner as u16,
                 pending: None,
@@ -10628,6 +10742,98 @@ impl Storage {
 
     pub(crate) fn rollback_subscription_drop(&mut self, slot: usize, txid: u32) {
         self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.rollback_drop(txid);
+    }
+
+    /// Stages an enablement change only after proving no concurrent catalog
+    /// operation owns this subscription.  `None` is a real no-op, not an
+    /// alternative execution path: the requested visible state already holds.
+    pub(crate) fn set_subscription_enabled(
+        &mut self,
+        slot: usize,
+        enabled: bool,
+        txid: u32,
+    ) -> Result<SubscriptionEnabledChange, SqlError> {
+        self.ensure_subscription_changeable(slot, txid)?;
+        let subscription = &mut self.subscriptions[slot];
+        if subscription.enabled_to(txid) == enabled {
+            return Ok(SubscriptionEnabledChange::Unchanged);
+        }
+        let prior = subscription.pending_enabled;
+        subscription.pending_enabled = Some(PendingSubscriptionEnabled { txid, enabled });
+        Ok(SubscriptionEnabledChange::Changed { prior })
+    }
+
+    fn ensure_subscription_changeable(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let subscription = &self.subscriptions[slot];
+        let blocker = subscription
+            .ddl_state
+            .pending_txid()
+            .or_else(|| subscription.pending_enabled.map(|pending| pending.txid))
+            .or_else(|| subscription.ownership.pending.map(|pending| pending.txid))
+            .filter(|owner| *owner != txid);
+        if let Some(blocker) = blocker {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, subscription.name.as_str()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_subscription_enabled(&mut self, slot: usize, txid: u32) {
+        let subscription = &mut self.subscriptions[slot];
+        if let Some(pending) = subscription.pending_enabled
+            && pending.txid == txid
+        {
+            subscription.enabled = pending.enabled;
+            subscription.pending_enabled = None;
+        }
+    }
+
+    pub(crate) fn restore_subscription_enabled(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingSubscriptionEnabled>,
+    ) {
+        self.subscriptions[slot].pending_enabled = prior;
+    }
+
+    /// Validates one monotonically advancing, committed publisher position.
+    /// Returning `None` makes re-delivery after a lost acknowledgement
+    /// explicitly idempotent; callers must not apply that remote transaction
+    /// again.
+    pub(crate) fn subscription_advance(
+        &self,
+        name: &str,
+        confirmed_lsn: u64,
+        txid: u32,
+    ) -> Result<Option<SubscriptionAdvance>, SqlError> {
+        let (slot, subscription) = self.subscription(name, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "subscription \"{}\" does not exist",
+                name
+            )
+        })?;
+        if confirmed_lsn <= subscription.confirmed_lsn {
+            return Ok(None);
+        }
+        Ok(Some(SubscriptionAdvance {
+            slot,
+            created_at: subscription.created_at,
+            name: subscription.name,
+            confirmed_lsn,
+        }))
+    }
+
+    pub(crate) fn apply_subscription_advance(&mut self, advance: SubscriptionAdvance) {
+        let subscription = self
+            .subscriptions
+            .get_mut(advance.slot)
+            .filter(|subscription| {
+                subscription.ddl_state == CatalogDdlState::Present
+                    && subscription.created_at == advance.created_at
+                    && subscription.name == advance.name
+            })
+            .expect("validated subscription must remain live until its WAL commit");
+        subscription.confirmed_lsn = advance.confirmed_lsn;
     }
 
     pub fn create_publication(

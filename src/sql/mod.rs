@@ -60,6 +60,19 @@ use types::{ColDesc, ColType, Datum};
 
 type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError> + 'a;
 
+/// Complete durable input for binding one startup-reserved subscription worker.
+/// Values are copied out of the catalog so the reactor never holds a catalog
+/// borrow while it drives a network socket or applies a remote transaction.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionRuntime {
+    pub name: SqlName,
+    pub endpoint: crate::pg::replication_client::ConnectionInfo,
+    pub publications: [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
+    pub publication_count: usize,
+    pub slot: SqlName,
+    pub confirmed_lsn: u64,
+}
+
 #[derive(Debug)]
 pub enum EngineSetupError {
     Budget(BudgetError),
@@ -603,6 +616,151 @@ fn publication_selects(
 }
 
 impl Engine {
+    pub(crate) fn subscription_runtime(&self, slot: usize) -> Option<SubscriptionRuntime> {
+        self.storage
+            .subscriptions_with_slots_visible_to(0)
+            .find(|(index, _subscription)| *index == slot)
+            .filter(|(_, subscription)| {
+                subscription.enabled_to(0) && subscription.slot_name != SqlName::EMPTY
+            })
+            .and_then(|(_, subscription)| {
+                subscription
+                    .connection
+                    .endpoint()
+                    .map(|endpoint| SubscriptionRuntime {
+                        name: subscription.name,
+                        endpoint,
+                        publications: subscription.publications,
+                        publication_count: subscription.publication_count,
+                        slot: subscription.slot_name,
+                        confirmed_lsn: subscription.confirmed_lsn,
+                    })
+            })
+    }
+    /// Returns the startup-bounded endpoint retained for a durable
+    /// subscription.  The apply worker consumes this typed value directly;
+    /// it never reparses catalog text at connection time.
+    pub fn subscription_endpoint(
+        &self,
+        name: &str,
+    ) -> Option<crate::pg::replication_client::ConnectionInfo> {
+        self.storage
+            .subscription(name, 0)
+            .and_then(|(_, subscription)| subscription.connection.endpoint())
+    }
+
+    pub fn subscription_confirmed_lsn(&self, name: &str) -> Option<u64> {
+        self.storage
+            .subscription(name, 0)
+            .map(|(_, subscription)| subscription.confirmed_lsn)
+    }
+
+    /// Opens the local transaction that will receive one publisher commit.
+    /// The worker uses the ordinary engine transaction and durability path;
+    /// replication cannot create a second, weaker write path.
+    pub fn begin_subscription_apply(&mut self, txn: &mut TxnState, guc: &GucState) {
+        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        txn.begin_command();
+        // pgoutput messages form one remote transaction, not independent SQL
+        // statements.  Each later row operation must therefore see every
+        // earlier local change from that same remote commit.
+        self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+    }
+
+    /// Couples a publisher commit position to the active local transaction.
+    /// `false` means the position was already committed locally, so a replayed
+    /// remote transaction must be skipped before it can mutate rows.
+    pub fn stage_subscription_advance(
+        &mut self,
+        txn: &mut TxnState,
+        name: &str,
+        confirmed_lsn: u64,
+    ) -> Result<bool, SqlError> {
+        if !txn.is_active() {
+            return Err(sql_err!(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "subscription progress requires an active apply transaction"
+            ));
+        }
+        let Some(advance) = self
+            .storage
+            .subscription_advance(name, confirmed_lsn, txn.txid)?
+        else {
+            return Ok(false);
+        };
+        txn.record_subscription_advance(advance)?;
+        Ok(true)
+    }
+
+    /// Registers a publisher relation descriptor before any of its tuples can
+    /// enter the ordinary local write path.
+    pub fn register_subscription_relation(
+        &self,
+        relations: &mut crate::pg::subscription_apply::RelationMap,
+        txn: &TxnState,
+        relation: crate::pg::pginput::Relation<'_>,
+    ) -> Result<(), SqlError> {
+        relations.register(&self.storage, txn.txid, relation)
+    }
+
+    pub fn apply_subscription_insert(
+        &mut self,
+        txn: &mut TxnState,
+        binding: crate::pg::subscription_apply::RelationBinding,
+        tuple: crate::pg::pginput::Tuple<'_>,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        exec::apply_replication_insert(&mut self.storage, txn, binding, tuple, arena)
+    }
+
+    pub fn apply_subscription_delete(
+        &mut self,
+        txn: &mut TxnState,
+        binding: crate::pg::subscription_apply::RelationBinding,
+        old: crate::pg::pginput::OldTuple<'_>,
+        arena: &Arena,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        exec::apply_replication_delete(
+            &mut self.storage,
+            txn,
+            binding,
+            old,
+            arena,
+            guc.seq_session(),
+        )
+    }
+
+    pub fn apply_subscription_update(
+        &mut self,
+        txn: &mut TxnState,
+        binding: crate::pg::subscription_apply::RelationBinding,
+        old: crate::pg::pginput::OldTuple<'_>,
+        new: crate::pg::pginput::Tuple<'_>,
+        arena: &Arena,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        exec::apply_replication_update(
+            &mut self.storage,
+            txn,
+            binding,
+            old,
+            new,
+            arena,
+            guc.seq_session(),
+        )
+    }
+
+    pub fn apply_subscription_truncate(
+        &mut self,
+        txn: &mut TxnState,
+        tables: &[usize],
+        cascade: bool,
+        restart_identity: bool,
+    ) -> Result<(), SqlError> {
+        exec::apply_replication_truncate(&mut self.storage, txn, tables, cascade, restart_identity)
+    }
+
     pub(crate) fn coerce_parameter_null<'a>(
         &self,
         oid: i32,
@@ -1846,6 +2004,21 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        for advance in txn.subscription_advances() {
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::AdvanceSubscription {
+                    name: advance.name(),
+                    confirmed_lsn: advance.confirmed_lsn(),
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         // Keep the publication object inside its startup-reserved buffer.
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
@@ -1995,6 +2168,9 @@ impl Engine {
                 DdlUndo::SubscriptionDropped(slot) => {
                     self.storage.commit_subscription_drop(*slot as usize)
                 }
+                DdlUndo::SubscriptionEnabled { slot, .. } => self
+                    .storage
+                    .commit_subscription_enabled(*slot as usize, txn.txid),
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2113,6 +2289,9 @@ impl Engine {
                 }
             }
         }
+        for &advance in txn.subscription_advances() {
+            self.storage.apply_subscription_advance(advance);
+        }
         let mut index_result = Ok(());
         for &(table, rewrote_rows) in &altered_tables[..altered_count] {
             self.storage.finish_table_def_commit(table, rewrote_rows);
@@ -2212,6 +2391,9 @@ impl Engine {
             DdlUndo::SubscriptionDropped(slot) => {
                 self.storage.rollback_subscription_drop(slot as usize, txid)
             }
+            DdlUndo::SubscriptionEnabled { slot, prior } => self
+                .storage
+                .restore_subscription_enabled(slot as usize, prior),
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
                 self.storage.rollback_matview_drop(slot as usize, txid);
@@ -2356,6 +2538,7 @@ impl Engine {
         txn.rewind_truncates(mark.truncates);
         txn.rewind_ddl(mark.ddl);
         txn.rewind_statistics(mark.statistics);
+        txn.rewind_subscription_advances(mark.subscription_advances);
         txn.rewind_notifications(
             mark.notifications,
             mark.notification_payload,
@@ -2387,6 +2570,7 @@ impl Engine {
         txn.rewind_truncates(sp.truncate_mark);
         txn.rewind_ddl(sp.ddl_mark);
         txn.rewind_statistics(sp.statistics_mark);
+        txn.rewind_subscription_advances(sp.subscription_advance_mark);
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         self.storage.rollback_locks_to(txn.txid, sp.lock_mark);
         txn.rollback_savepoints_after(index);
@@ -5400,10 +5584,14 @@ impl Engine {
                 },
                 responder,
             ),
-            Stmt::AlterSubscription { .. } => Ok(Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "ALTER SUBSCRIPTION requires the pgoutput apply client"
-            ))),
+            Stmt::AlterSubscription { name, action } => exec::alter_subscription(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
             Stmt::DropSubscription { names, if_exists } => exec::drop_subscription(
                 &mut self.storage,
                 &mut self.wal,
@@ -7028,10 +7216,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             enabled,
             slot_name,
         } => {
+            let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
+            if enabled {
+                connection.require_endpoint()?;
+            }
             let slot = storage.create_subscription(
                 crate::storage::SubscriptionSpec {
                     name: crate::storage::SqlName::parse(name)?,
-                    connection: crate::storage::SubscriptionConnInfo::parse(connection)?,
+                    connection,
                     publications: &publications[..publication_count],
                     enabled,
                     slot_name: crate::storage::SqlName::parse(slot_name)?,
@@ -7044,6 +7236,29 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropSubscription { name } => {
             if let Some(slot) = storage.drop_subscription(name, 0)? {
                 storage.commit_subscription_drop(slot);
+            }
+        }
+        WalOp::AdvanceSubscription {
+            name,
+            confirmed_lsn,
+        } => {
+            if let Some(advance) = storage.subscription_advance(name, confirmed_lsn, 0)? {
+                storage.apply_subscription_advance(advance);
+            }
+        }
+        WalOp::SetSubscriptionEnabled { name, enabled } => {
+            let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal subscription state change for unknown subscription \"{}\"",
+                    name
+                )
+            })?;
+            if matches!(
+                storage.set_subscription_enabled(slot, enabled, 0)?,
+                crate::storage::SubscriptionEnabledChange::Changed { .. }
+            ) {
+                storage.commit_subscription_enabled(slot, 0);
             }
         }
         WalOp::RenameIndex {

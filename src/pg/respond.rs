@@ -520,9 +520,10 @@ impl<'b> Responder<'b> {
     }
 
     /// CopyBothResponse enters PostgreSQL's replication COPY mode. Logical
-    /// replication carries binary payloads, but has no relation columns.
+    /// replication has no relation columns; pgoutput's binary envelopes are
+    /// carried inside later CopyData frames.
     pub fn copy_both_response(&mut self) -> Result<(), WireFull> {
-        self.copy_response(wire::MSG_COPY_BOTH_RESPONSE, 0, true)
+        self.copy_response(wire::MSG_COPY_BOTH_RESPONSE, 0, false)
     }
 
     fn copy_response(&mut self, kind: u8, n_columns: usize, binary: bool) -> Result<(), WireFull> {
@@ -1385,11 +1386,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_both_response_is_binary_and_columnless() {
+    fn copy_both_response_matches_postgresqls_zero_column_format() {
         let mut budget = Budget::new(1 << 16);
         let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
         Responder::new(&mut buffer).copy_both_response().unwrap();
-        assert_eq!(buffer.readable(), &[b'W', 0, 0, 0, 7, 1, 0, 0]);
+        assert_eq!(buffer.readable(), &[b'W', 0, 0, 0, 7, 0, 0, 0]);
     }
 
     #[test]

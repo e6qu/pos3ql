@@ -172,18 +172,14 @@ case "$SHARD" in
 "")
     if [ -n "$POS3QL_VENV" ] && [ -x "$PGBIN/pg_ctl" ]; then
         run_differential
-        # run.sh adds the durability and cold-start paths but needs docker and
-        # MinIO, which a local machine may not have running; it counts when it
-        # runs and is reported when it does not, rather than being silently
-        # absent from a number that claims to cover both layers. (The CI
-        # shards run it strictly — see the run:* arm.)
-        if POS3QL_BIN="$BIN" zsh tests/external/run.sh > "$TMP/run.log" 2>&1; then
-            tail -2 "$TMP/run.log"
-        else
-            echo "NOTE: tests/external/run.sh did not pass in full; its FAIL lines:"
-            grep '^FAIL' "$TMP/run.log" || echo "      (none — it exited before any check, likely docker/MinIO)"
-            tail -2 "$TMP/run.log"
+        # run.sh adds durability and cold-start coverage.  When its required
+        # local services are present, a failed check must fail coverage too.
+        if ! POS3QL_BIN="$BIN" zsh tests/external/run.sh > "$TMP/run.log" 2>&1; then
+            tail -20 "$TMP/run.log"
+            echo "FAIL: tests/external/run.sh did not pass"
+            exit 1
         fi
+        tail -2 "$TMP/run.log"
         # The external suites drive the *server binary* as a subprocess; if
         # they produced no profile beyond the in-process tests', the external
         # layer contributed nothing and the combined figure would read as a

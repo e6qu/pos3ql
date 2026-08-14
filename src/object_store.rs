@@ -17,6 +17,7 @@ use crate::util::StackStr;
 
 pub mod http;
 pub(crate) mod sim;
+pub(crate) mod tls;
 
 /// A strong object generation token returned by the provider.
 ///

@@ -14,15 +14,15 @@ use crate::storage::ColumnMeta;
 /// The value crosses the wire only after this parser boundary, so downstream
 /// encoders cannot accidentally receive an unsupported version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ProtocolVersion(u8);
+pub struct ProtocolVersion(u8);
 
 impl ProtocolVersion {
-    pub(crate) const V1: Self = Self(1);
-    pub(crate) const V2: Self = Self(2);
-    pub(crate) const V3: Self = Self(3);
-    pub(crate) const V4: Self = Self(4);
+    pub const V1: Self = Self(1);
+    pub const V2: Self = Self(2);
+    pub const V3: Self = Self(3);
+    pub const V4: Self = Self(4);
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "1" => Some(Self::V1),
             "2" => Some(Self::V2),

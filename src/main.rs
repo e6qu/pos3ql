@@ -22,10 +22,13 @@ fn run() -> Result<(), String> {
     } else {
         0
     };
-    let server_bytes = Reactor::budget_bytes(config.max_connections as usize + 1 + block_read_slots)
+    let server_bytes = Reactor::budget_bytes(
+        config.max_connections as usize + 2 + block_read_slots + config.max_subscriptions,
+    )
         + 128 // canned refusal message scratch
         + (config.max_connections as usize) * 8
-        + block_read_slots * core::mem::size_of::<Option<i32>>();
+        + block_read_slots * core::mem::size_of::<Option<i32>>()
+        + Server::extra_budget_bytes(&config);
     let plan = config.memory_plan(
         server_bytes,
         pos3ql::sql::Engine::extra_budget_bytes(&config),
@@ -52,9 +55,11 @@ fn run() -> Result<(), String> {
     let mut server =
         Server::new(&config, &mut budget).map_err(|e| format!("startup failed: {e}"))?;
 
-    // The TLS pool covers the object-store client and, when server TLS is on,
-    // up to max_connections concurrent server-side sessions.
+    // The TLS pool covers the object-store client, every startup-bounded
+    // outbound subscription worker, and, when server TLS is on, every
+    // concurrent server-side session.
     let tls_budget = config.tls_pool_bytes
+        + Server::extra_tls_pool_bytes(&config)
         + if config.tls_on {
             config.max_connections as usize * pos3ql::pg::tls::SERVER_SESSION_BYTES
         } else {

@@ -14809,6 +14809,146 @@ fn merge_insert(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn finish_insert_row<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    table_index: usize,
+    definition: &TableDef,
+    values: &mut [Datum<'a>; MAX_COLUMNS],
+    generated: &constraints::ParsedDefaults<'a>,
+    statement: &Insert<'a>,
+    arbiter: &Arbiter,
+    checks: &ParsedChecks<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<Result<bool, SqlError>, WireFull> {
+    if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
+        return Ok(Err(error));
+    }
+    if !match fire_row_triggers(
+        storage,
+        txn,
+        table_index,
+        definition,
+        1,
+        true,
+        None,
+        Some(&mut values[..definition.n_columns]),
+        arena,
+        seq_session,
+        responder,
+        txn.txid,
+    ) {
+        Ok(run) => run,
+        Err(error) => return Ok(Err(error)),
+    } {
+        return Ok(Ok(false));
+    }
+    if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
+        return Ok(Err(error));
+    }
+    if let Err(error) = check_not_null(definition, values) {
+        return Ok(Err(error));
+    }
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    match handle_conflict(
+        storage,
+        txn,
+        table_index,
+        definition,
+        &schema[..definition.n_columns],
+        &values[..definition.n_columns],
+        &statement.on_conflict,
+        arbiter,
+        checks,
+        arena,
+        params,
+    ) {
+        Ok(ConflictOutcome::Store) => {}
+        Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
+        Ok(ConflictOutcome::Updated(row_bytes)) => {
+            if !statement.returning.is_empty()
+                && let Err(error) = emit_conflict_returning(
+                    storage,
+                    txn.txid,
+                    definition,
+                    row_bytes,
+                    statement.returning,
+                    arena,
+                    params,
+                    responder,
+                    capture,
+                )?
+            {
+                return Ok(Err(error));
+            }
+            return Ok(Ok(true));
+        }
+        Err(error) => return Ok(Err(error)),
+    }
+    if let Err(error) = enforce_row_constraints(
+        storage,
+        table_index,
+        definition,
+        &schema[..definition.n_columns],
+        &values[..definition.n_columns],
+        None,
+        txn.txid,
+        checks,
+        arena,
+        params,
+    ) {
+        return Ok(Err(error));
+    }
+    if let Err(error) = store_row(
+        storage,
+        txn,
+        table_index,
+        None,
+        &values[..definition.n_columns],
+    ) {
+        return Ok(Err(error));
+    }
+    if let Err(error) = fire_row_triggers(
+        storage,
+        txn,
+        table_index,
+        definition,
+        1,
+        false,
+        None,
+        Some(&mut values[..definition.n_columns]),
+        arena,
+        seq_session,
+        responder,
+        txn.txid,
+    ) {
+        return Ok(Err(error));
+    }
+    if !statement.returning.is_empty()
+        && let Err(error) = emit_projected(
+            storage,
+            txn.txid,
+            definition,
+            None,
+            &values[..definition.n_columns],
+            statement.returning,
+            arena,
+            params,
+            responder,
+            capture,
+        )?
+    {
+        return Ok(Err(error));
+    }
+    Ok(Ok(true))
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -15061,140 +15201,26 @@ pub fn insert<'a>(
             ) {
                 return sql_fail(e);
             }
-            if let Err(e) = compute_generated(
-                &def,
-                &generated_exprs,
-                &mut values,
-                storage,
-                txn.txid,
-                arena,
-            ) {
-                return sql_fail(e);
-            }
-            if !match fire_row_triggers(
+            match finish_insert_row(
                 storage,
                 txn,
                 table_index,
                 &def,
-                1,
-                true,
-                None,
-                Some(&mut values[..def.n_columns]),
-                arena,
-                seq_session,
-                responder,
-                txn.txid,
-            ) {
-                Ok(run) => run,
-                Err(error) => return sql_fail(error),
-            } {
-                continue;
-            }
-            if let Err(e) = compute_generated(
-                &def,
-                &generated_exprs,
                 &mut values,
-                storage,
-                txn.txid,
-                arena,
-            ) {
-                return sql_fail(e);
-            }
-            if let Err(e) = check_not_null(&def, &values) {
-                return sql_fail(e);
-            }
-            {
-                let mut sch = [ColType::Bool; MAX_COLUMNS];
-                def.schema(&mut sch);
-                match handle_conflict(
-                    storage,
-                    txn,
-                    table_index,
-                    &def,
-                    &sch[..def.n_columns],
-                    &values[..def.n_columns],
-                    &statement.on_conflict,
-                    &arbiter,
-                    &checks,
-                    arena,
-                    params,
-                ) {
-                    Ok(ConflictOutcome::Store) => {}
-                    Ok(ConflictOutcome::Skip) => continue,
-                    Ok(ConflictOutcome::Updated(row_bytes)) => {
-                        inserted += 1;
-                        if !statement.returning.is_empty()
-                            && let Err(e) = emit_conflict_returning(
-                                storage,
-                                txn.txid,
-                                &def,
-                                row_bytes,
-                                statement.returning,
-                                arena,
-                                params,
-                                responder,
-                                &mut capture,
-                            )?
-                        {
-                            return sql_fail(e);
-                        }
-                        continue;
-                    }
-                    Err(e) => return sql_fail(e),
-                }
-            }
-            let mut schema_buf = [ColType::Bool; MAX_COLUMNS];
-            def.schema(&mut schema_buf);
-            if let Err(e) = enforce_row_constraints(
-                storage,
-                table_index,
-                &def,
-                &schema_buf[..def.n_columns],
-                &values[..def.n_columns],
-                None,
-                txn.txid,
+                &generated_exprs,
+                statement,
+                &arbiter,
                 &checks,
                 arena,
                 params,
-            ) {
-                return sql_fail(e);
-            }
-            if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
-                return sql_fail(e);
-            }
-            if let Err(error) = fire_row_triggers(
-                storage,
-                txn,
-                table_index,
-                &def,
-                1,
-                false,
-                None,
-                Some(&mut values[..def.n_columns]),
-                arena,
                 seq_session,
                 responder,
-                txn.txid,
-            ) {
-                return sql_fail(error);
+                &mut capture,
+            )? {
+                Ok(true) => inserted += 1,
+                Ok(false) => {}
+                Err(error) => return sql_fail(error),
             }
-            if !statement.returning.is_empty()
-                && let Err(e) = emit_projected(
-                    storage,
-                    txn.txid,
-                    &def,
-                    None,
-                    &values[..def.n_columns],
-                    statement.returning,
-                    arena,
-                    params,
-                    responder,
-                    &mut capture,
-                )?
-            {
-                return sql_fail(e);
-            }
-            inserted += 1;
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
         if !capturing {
@@ -15321,141 +15347,26 @@ pub fn insert<'a>(
         ) {
             return sql_fail(e);
         }
-        // Generated columns are computed last, from the now-filled row.
-        if let Err(e) = compute_generated(
-            &def,
-            &generated_exprs,
-            &mut values,
-            storage,
-            txn.txid,
-            arena,
-        ) {
-            return sql_fail(e);
-        }
-        if !match fire_row_triggers(
+        match finish_insert_row(
             storage,
             txn,
             table_index,
             &def,
-            1,
-            true,
-            None,
-            Some(&mut values[..def.n_columns]),
-            arena,
-            seq_session,
-            responder,
-            txn.txid,
-        ) {
-            Ok(run) => run,
-            Err(error) => return sql_fail(error),
-        } {
-            continue;
-        }
-        if let Err(e) = compute_generated(
-            &def,
-            &generated_exprs,
             &mut values,
-            storage,
-            txn.txid,
-            arena,
-        ) {
-            return sql_fail(e);
-        }
-        if let Err(e) = check_not_null(&def, &values) {
-            return sql_fail(e);
-        }
-        {
-            let mut sch = [ColType::Bool; MAX_COLUMNS];
-            def.schema(&mut sch);
-            match handle_conflict(
-                storage,
-                txn,
-                table_index,
-                &def,
-                &sch[..def.n_columns],
-                &values[..def.n_columns],
-                &statement.on_conflict,
-                &arbiter,
-                &checks,
-                arena,
-                params,
-            ) {
-                Ok(ConflictOutcome::Store) => {}
-                Ok(ConflictOutcome::Skip) => continue,
-                Ok(ConflictOutcome::Updated(row_bytes)) => {
-                    inserted += 1;
-                    if !statement.returning.is_empty()
-                        && let Err(e) = emit_conflict_returning(
-                            storage,
-                            txn.txid,
-                            &def,
-                            row_bytes,
-                            statement.returning,
-                            arena,
-                            params,
-                            responder,
-                            &mut capture,
-                        )?
-                    {
-                        return sql_fail(e);
-                    }
-                    continue;
-                }
-                Err(e) => return sql_fail(e),
-            }
-        }
-        let mut schema_buf = [ColType::Bool; MAX_COLUMNS];
-        def.schema(&mut schema_buf);
-        if let Err(e) = enforce_row_constraints(
-            storage,
-            table_index,
-            &def,
-            &schema_buf[..def.n_columns],
-            &values[..def.n_columns],
-            None,
-            txn.txid,
+            &generated_exprs,
+            statement,
+            &arbiter,
             &checks,
             arena,
             params,
-        ) {
-            return sql_fail(e);
-        }
-        if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
-            return sql_fail(e);
-        }
-        if let Err(error) = fire_row_triggers(
-            storage,
-            txn,
-            table_index,
-            &def,
-            1,
-            false,
-            None,
-            Some(&mut values[..def.n_columns]),
-            arena,
             seq_session,
             responder,
-            txn.txid,
-        ) {
-            return sql_fail(error);
+            &mut capture,
+        )? {
+            Ok(true) => inserted += 1,
+            Ok(false) => {}
+            Err(error) => return sql_fail(error),
         }
-        if !statement.returning.is_empty()
-            && let Err(e) = emit_projected(
-                storage,
-                txn.txid,
-                &def,
-                None,
-                &values[..def.n_columns],
-                statement.returning,
-                arena,
-                params,
-                responder,
-                &mut capture,
-            )?
-        {
-            return sql_fail(e);
-        }
-        inserted += 1;
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
     if !capturing {

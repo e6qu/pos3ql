@@ -8198,6 +8198,21 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     );
     assert!(String::from_utf8_lossy(&foreign_key_rejected).contains("23503"));
 
+    let insert_select = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_body_source (id integer, value integer);
+         CREATE TABLE trigger_body_select_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION normalize_insert_select() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.value := NEW.value + 1; RETURN NEW; END';
+         CREATE TRIGGER normalize_insert_select_before BEFORE INSERT ON trigger_body_select_target
+           FOR EACH ROW EXECUTE FUNCTION normalize_insert_select();
+         INSERT INTO trigger_body_source VALUES (1, 4), (2, 9);
+         INSERT INTO trigger_body_select_target SELECT id, value FROM trigger_body_source;
+         SELECT id, value FROM trigger_body_select_target ORDER BY id;",
+    );
+    assert_eq!(data_rows(&insert_select), ["1|5", "2|10"]);
+
     let old_value = run_with(
         &mut engine,
         &mut budget,

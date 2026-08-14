@@ -42,7 +42,7 @@ mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
-    Chained, PaxColumnDemand, pax_column_demand, scan_source_recycling_with_pax_columns,
+    Chained, PaxReadDemand, pax_column_demand, scan_source_recycling_with_pax_columns,
     scan_source_with_pax_columns,
 };
 
@@ -3029,7 +3029,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             params,
             &hooks,
             None,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut |row| {
                 if emitted >= limit {
                     return Ok(false);
@@ -4388,7 +4388,7 @@ fn select_into_rows_mode<'a>(
             params,
             &hooks,
             outer,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut visit,
         )
     } else {
@@ -4402,7 +4402,7 @@ fn select_into_rows_mode<'a>(
             params,
             &hooks,
             outer,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut visit,
         )
     }
@@ -4413,13 +4413,15 @@ fn streaming_pax_columns<'a>(
     from: &'a FromClause<'a>,
     items: &'a [SelectItem<'a>],
     where_clause: Option<&'a Expr<'a>>,
-) -> Option<PaxColumnDemand> {
+) -> PaxReadDemand {
     let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
     let mut count = 0usize;
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                return PaxReadDemand::full_row();
+            }
         };
         expressions[count] = expression;
         count += 1;
@@ -5522,7 +5524,7 @@ pub fn first_from_match<'a>(
         params,
         &hooks,
         Some(target),
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |jr| {
             let chained_row = Chained {
                 inner: jr,

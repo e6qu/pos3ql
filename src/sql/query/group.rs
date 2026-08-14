@@ -142,7 +142,7 @@ pub(super) fn groups_for_mask<'a>(
     order_exprs: &[Option<&'a Expr<'a>>],
     width: usize,
     n_order: usize,
-    pax_columns: Option<&super::scan::PaxColumnDemand>,
+    pax_demand: super::PaxReadDemand,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     let mut group_collations = [Collation::None; MAX_PROJ];
@@ -174,7 +174,7 @@ pub(super) fn groups_for_mask<'a>(
             params,
             hooks,
             outer,
-            pax_columns,
+            pax_demand,
             &mut |row| {
                 if !row_passes_correlated_where(
                     correlated,
@@ -301,7 +301,7 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 hooks,
                 outer,
-                pax_columns,
+                pax_demand,
                 &mut |row| {
                     if !row_passes_correlated_where(
                         correlated,
@@ -481,30 +481,12 @@ pub(super) fn groups_for_mask<'a>(
         };
         if recycling_safe {
             scan_source_recycling_with_pax_columns(
-                storage,
-                scope,
-                from,
-                txid,
-                scan_where,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
+                storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
                 &mut visit,
             )?;
         } else {
             scan_source_with_pax_columns(
-                storage,
-                scope,
-                from,
-                txid,
-                scan_where,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
+                storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
                 &mut visit,
             )?;
         }
@@ -686,7 +668,7 @@ pub(super) fn grouped_rows<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -774,7 +756,7 @@ pub(super) fn grouped_rows<'a>(
             order_exprs,
             width,
             n_order,
-            pax_columns.as_ref(),
+            pax_columns,
         )?;
         per_set[si] = rows;
         total += rows.len();

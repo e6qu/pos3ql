@@ -520,7 +520,7 @@ fn materialization_pax_columns<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
-) -> Option<super::scan::PaxColumnDemand> {
+) -> super::scan::PaxReadDemand {
     let mut expressions = [&Expr::Null; MAX_PROJ * 2 + 1];
     let mut count = 0usize;
     for item in statement.items {
@@ -529,7 +529,9 @@ fn materialization_pax_columns<'a>(
                 expressions[count] = expression;
                 count += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => return None,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                return super::scan::PaxReadDemand::full_row();
+            }
         }
     }
     if let Some(predicate) = statement.where_clause {
@@ -602,7 +604,7 @@ pub(crate) fn materialized_rows<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             for_each_materialized_projection(
                 storage,
@@ -656,7 +658,7 @@ pub(crate) fn materialized_rows<'a>(
             params,
             hooks,
             outer,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut |row| {
                 for_each_materialized_projection(
                     storage,
@@ -1142,7 +1144,7 @@ pub(crate) fn external_materialized_into<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             let mark = arena.mark();
             let result = for_each_materialized_projection(

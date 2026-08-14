@@ -979,7 +979,7 @@ fn subquery_exists<'a>(
         params,
         &hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |_| {
             found = true;
             Ok(false) // stop at the first row
@@ -1968,7 +1968,7 @@ fn run_subquery<'a>(
         params,
         &hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |_| {
             count += 1;
             Ok(true)
@@ -1991,7 +1991,7 @@ fn run_subquery<'a>(
         params,
         &hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             let chained_row = Chained { inner: row, outer };
             vals[at] = eval_full(item, arena, params, &chained_row, &hooks)?;

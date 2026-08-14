@@ -73,6 +73,24 @@ fn refresh_catalog_object_names<'a>(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{PaxColumnDemand, PaxReadDemand};
+
+    #[test]
+    fn selected_columns_require_a_proof() {
+        let mut proof = PaxColumnDemand::empty();
+        proof.observe(1, 3);
+
+        assert_eq!(PaxReadDemand::full_row().selected_mask(1), None);
+        assert_eq!(PaxReadDemand::selected(proof).selected_mask(0), Some(0));
+        assert_eq!(
+            PaxReadDemand::selected(proof).selected_mask(1),
+            Some(1 << 3)
+        );
+    }
+}
+
 /// A complete value probe over one base table. The rowids are sorted so
 /// taking the cache path does not make result/error order depend on hash-slot
 /// placement.
@@ -96,8 +114,40 @@ enum BoundRow<'a> {
 /// structure: every source must have a complete proof before PAX may omit a
 /// column from its decoded row.
 #[derive(Clone, Copy)]
-pub(crate) struct PaxColumnDemand {
+struct PaxColumnDemand {
     masks: [u64; MAX_JOIN_TABLES],
+}
+
+/// The only two legal physical read modes for a source scan.
+///
+/// The selected state exists only after the query walker has proved the
+/// complete set of observable base fields. Full-row state is explicit for
+/// whole-row or derived expressions; it is never an absent proof.
+#[derive(Clone, Copy)]
+pub(super) struct PaxReadDemand {
+    selected: bool,
+    columns: PaxColumnDemand,
+}
+
+impl PaxReadDemand {
+    pub(super) const fn full_row() -> Self {
+        Self {
+            selected: false,
+            columns: PaxColumnDemand::empty(),
+        }
+    }
+
+    fn selected(columns: PaxColumnDemand) -> Self {
+        Self {
+            selected: true,
+            columns,
+        }
+    }
+
+    /// The selected PAX fields for `table`, if this scan has a proof.
+    fn selected_mask(self, table: usize) -> Option<u64> {
+        self.selected.then(|| self.columns.mask(table))
+    }
 }
 
 impl PaxColumnDemand {
@@ -124,15 +174,17 @@ impl PaxColumnDemand {
 /// can observe a row shape this scan does not own (a derived row or whole-row
 /// value). Correlated nested queries contribute their outer-column references
 /// to this scan's proof and retain their own independent inner proof.
-pub(crate) fn pax_column_demand(
+pub(super) fn pax_column_demand(
     scope: &QueryScope,
     from: &FromClause,
     expressions: &[&Expr],
-) -> Option<PaxColumnDemand> {
+) -> PaxReadDemand {
     if scope.n == 0 || scope.defs[..scope.n].iter().any(Option::is_none) {
-        return None;
+        return PaxReadDemand::full_row();
     }
     pax_column_demand_bounded(scope, from, expressions)
+        .map(PaxReadDemand::selected)
+        .unwrap_or_else(PaxReadDemand::full_row)
 }
 
 #[inline(never)]
@@ -1006,11 +1058,9 @@ fn combine_external_match_runs(
         .expect("external match map has a block store")
 }
 
-/// Source scan with optional complete per-source PAX demand masks.
-/// Omitted columns are represented as NULL and therefore this is valid only
-/// when the caller has proved they cannot be observed downstream.
+/// Source scan with an explicit complete-row or proven-column PAX read mode.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_source_with_pax_columns<'a>(
+pub(super) fn scan_source_with_pax_columns<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
@@ -1020,7 +1070,7 @@ pub(crate) fn scan_source_with_pax_columns<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    pax_columns: Option<&PaxColumnDemand>,
+    pax_demand: PaxReadDemand,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
@@ -1034,16 +1084,15 @@ pub(crate) fn scan_source_with_pax_columns<'a>(
         hooks,
         outer,
         false,
-        pax_columns,
+        pax_demand,
         f,
     )
 }
 
-/// Recycling scan with optional complete per-source PAX demand masks.
-/// Omitted columns are represented as NULL and therefore this is valid only
-/// when the caller has proved they cannot be observed downstream.
+/// Recycling source scan with an explicit complete-row or proven-column PAX
+/// read mode.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
+pub(super) fn scan_source_recycling_with_pax_columns<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
@@ -1053,7 +1102,7 @@ pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    pax_columns: Option<&PaxColumnDemand>,
+    pax_demand: PaxReadDemand,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     scan_source_mode(
@@ -1067,7 +1116,7 @@ pub(crate) fn scan_source_recycling_with_pax_columns<'a>(
         hooks,
         outer,
         true,
-        pax_columns,
+        pax_demand,
         f,
     )
 }
@@ -1290,7 +1339,7 @@ fn scan_source_mode<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     recycle_rows: bool,
-    pax_columns: Option<&PaxColumnDemand>,
+    pax_demand: PaxReadDemand,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
@@ -1429,7 +1478,7 @@ fn scan_source_mode<'a>(
         plan: HashJoinPlan<'a>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
-        pax_columns: Option<&PaxColumnDemand>,
+        pax_demand: PaxReadDemand,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<(), SqlError> {
         use core::ops::ControlFlow;
@@ -1524,7 +1573,7 @@ fn scan_source_mode<'a>(
                 for &bytes in rows {
                     insert_derived!(bytes);
                 }
-            } else if let Some(demand) = pax_columns.map(|demand| demand.mask(build_t))
+            } else if let Some(demand) = pax_demand.selected_mask(build_t)
                 && storage.spill_rows_are_unshadowed(build_slot)
             {
                 storage.for_each_spilled_row_batch(
@@ -1598,7 +1647,7 @@ fn scan_source_mode<'a>(
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             probe_def.schema(&mut probe_schema);
             let probe_schema = &probe_schema[..probe_def.n_columns];
-            if let Some(demand) = pax_columns.map(|demand| demand.mask(probe_t))
+            if let Some(demand) = pax_demand.selected_mask(probe_t)
                 && storage.spill_rows_are_unshadowed(probe_slot)
             {
                 let mut stopped = false;
@@ -2053,7 +2102,7 @@ fn scan_source_mode<'a>(
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
-        pax_columns: Option<&PaxColumnDemand>,
+        pax_demand: PaxReadDemand,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         if depth == scope.n {
@@ -2134,7 +2183,7 @@ fn scan_source_mode<'a>(
                         indexed,
                         decode_buffers,
                         recycle_rows,
-                        pax_columns,
+                        pax_demand,
                         f,
                     )
                 }
@@ -2146,7 +2195,7 @@ fn scan_source_mode<'a>(
                     $slot,
                     arena,
                     recycle_rows,
-                    pax_columns.map(|demand| demand.mask(order[depth])),
+                    pax_demand.selected_mask(order[depth]),
                     &mut |rows| {
                         for spilled in rows {
                             check_timeout()?;
@@ -2404,7 +2453,7 @@ fn scan_source_mode<'a>(
                 indexed,
                 decode_buffers,
                 recycle_rows,
-                pax_columns,
+                pax_demand,
                 f,
             )? {
                 return Ok(false);
@@ -2558,7 +2607,7 @@ fn scan_source_mode<'a>(
             hash_plan,
             decode_buffers,
             recycle_rows,
-            pax_columns,
+            pax_demand,
             f,
         )?;
         return Ok(());
@@ -2595,7 +2644,7 @@ fn scan_source_mode<'a>(
             indexed.as_ref(),
             decode_buffers,
             recycle_rows,
-            pax_columns,
+            pax_demand,
             f,
         )?;
     }
@@ -2685,7 +2734,7 @@ fn scan_source_mode<'a>(
                         indexed.as_ref(),
                         decode_buffers,
                         recycle_rows,
-                        pax_columns,
+                        pax_demand,
                         f,
                     )
                 };
@@ -2748,7 +2797,7 @@ fn scan_source_mode<'a>(
                         return Ok(());
                     }
                 }
-            } else if let Some(demand) = pax_columns.map(|demand| demand.mask(d))
+            } else if let Some(demand) = pax_demand.selected_mask(d)
                 && storage.spill_rows_are_unshadowed(scope.slots[d])
             {
                 let mut index = 0usize;

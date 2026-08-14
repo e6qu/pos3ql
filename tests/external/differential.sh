@@ -70,7 +70,10 @@ cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = ${POS3QL_DIFF_OBJECT_STORE:-off}
-max_tables = 64
+# The curated corpus deliberately retains its trigger targets and audit tables
+# before sqllogictest creates its 64-table schema. Reserve that complete,
+# fixed catalog at startup; never rely on a later allocation to continue it.
+max_tables = 128
 table_rows = 8192
 max_value_indexes = 64
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}

@@ -2912,6 +2912,9 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::AlterSubscription { name, action });
         }
+        if self.eat_ident("trigger")? {
+            return self.alter_trigger();
+        }
         if self.eat_ident("index")? {
             return self.alter_index();
         }
@@ -4681,6 +4684,67 @@ mod tests {
             assert_eq!(
                 refresh,
                 crate::sql::ast::SubscriptionPublicationRefresh::NoRefresh
+            );
+        });
+    }
+
+    #[test]
+    fn row_trigger_lifecycle_is_typed_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "trigger parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER audit_change BEFORE INSERT OR UPDATE OR DELETE ON public.orders \
+             FOR EACH ROW EXECUTE FUNCTION audit_row('audit'); \
+             ALTER TRIGGER audit_change ON public.orders DISABLE; \
+             DROP TRIGGER IF EXISTS audit_change ON public.orders",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreateTrigger(trigger)) = parser.next_stmt().unwrap() else {
+                panic!("CREATE TRIGGER did not parse")
+            };
+            assert_eq!(trigger.name, "audit_change");
+            assert_eq!(trigger.timing, crate::sql::ast::TriggerTiming::Before);
+            assert_eq!(
+                trigger.events,
+                [
+                    crate::sql::ast::TriggerEvent::Insert,
+                    crate::sql::ast::TriggerEvent::Update,
+                    crate::sql::ast::TriggerEvent::Delete,
+                ]
+            );
+            assert_eq!(
+                trigger.table,
+                QualName {
+                    schema: Some("public"),
+                    name: "orders"
+                }
+            );
+            assert_eq!(trigger.function, QualName::bare("audit_row"));
+            assert_eq!(trigger.arguments, ["audit"]);
+            let Some(Stmt::AlterTrigger { trigger, action }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER TRIGGER did not parse")
+            };
+            assert_eq!(trigger.name, "audit_change");
+            assert_eq!(action, crate::sql::ast::AlterTriggerAction::Disable);
+            let Some(Stmt::DropTrigger {
+                triggers,
+                if_exists,
+            }) = parser.next_stmt().unwrap()
+            else {
+                panic!("DROP TRIGGER did not parse")
+            };
+            assert!(if_exists);
+            assert_eq!(
+                triggers,
+                [crate::sql::ast::TriggerIdentity {
+                    name: "audit_change",
+                    table: QualName {
+                        schema: Some("public"),
+                        name: "orders"
+                    },
+                }]
             );
         });
     }

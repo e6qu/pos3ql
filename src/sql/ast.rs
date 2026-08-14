@@ -301,6 +301,21 @@ pub enum Stmt<'a> {
         names: &'a [&'a str],
         if_exists: bool,
     },
+    /// A row trigger definition.  Its timing, event set, target relation and
+    /// function identity are separate typed fields so execution cannot
+    /// reinterpret a trigger as a different DML event.
+    CreateTrigger(CreateTrigger<'a>),
+    /// ALTER TRIGGER has only identity/enabled-state operations; the typed
+    /// action keeps those distinct from a definition replacement.
+    AlterTrigger {
+        trigger: TriggerIdentity<'a>,
+        action: AlterTriggerAction<'a>,
+    },
+    /// DROP TRIGGER [IF EXISTS] name ON table.
+    DropTrigger {
+        triggers: &'a [TriggerIdentity<'a>],
+        if_exists: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -632,6 +647,49 @@ pub enum AlterSubscriptionAction<'a> {
         publications: &'a [&'a str],
         refresh: SubscriptionPublicationRefresh,
     },
+}
+
+/// The instant at which a row trigger observes a DML change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// One DML operation a trigger can observe.  The parser collects one or more
+/// of these into a non-empty fixed list, rather than exposing a boolean soup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// The table-qualified identity PostgreSQL uses for ALTER/DROP TRIGGER.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriggerIdentity<'a> {
+    pub name: &'a str,
+    pub table: QualName<'a>,
+}
+
+/// A parsed row-trigger definition.  Statement, constraint, transition-table,
+/// and INSTEAD OF forms have distinct semantics and are rejected by the parser
+/// until they have a complete durable execution model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTrigger<'a> {
+    pub name: &'a str,
+    pub timing: TriggerTiming,
+    pub events: &'a [TriggerEvent],
+    pub table: QualName<'a>,
+    pub function: QualName<'a>,
+    pub arguments: &'a [&'a str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterTriggerAction<'a> {
+    Rename(&'a str),
+    Enable,
+    Disable,
 }
 
 /// PostgreSQL's SET PUBLICATION refresh choice. A fresh copy is distinct from
@@ -1339,7 +1397,16 @@ pub struct CreateRoutine<'a> {
     pub or_replace: bool,
     pub arguments: &'a [RoutineArgument<'a>],
     pub kind: RoutineCreateKind<'a>,
+    pub language: RoutineLanguage,
     pub body: &'a str,
+}
+
+/// The parser accepts only languages whose execution contract is represented
+/// by the routine kind; callers never receive an unchecked language string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineLanguage {
+    Sql,
+    PlPgSql,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,6 +1418,7 @@ pub enum RoutineCreateKind<'a> {
     TableFunction {
         columns: &'a [RoutineArgument<'a>],
     },
+    Trigger,
     Procedure,
 }
 

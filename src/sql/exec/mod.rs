@@ -24,8 +24,9 @@ use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
 
 use super::ast::{
-    AlterAction, AlterTable, CreateRoutine, CreateTable, Delete, DropTable, Expr, Insert,
-    LikeClause, Overriding, QualName, SelectItem, Update,
+    AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
+    Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, TriggerEvent,
+    TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
@@ -6454,6 +6455,349 @@ pub struct CreateViewCommand<'a> {
     pub raw_path: &'a str,
 }
 
+/// The first trigger-function subset is deliberately closed: a typed
+/// transition return is accepted, while statements that could imply hidden
+/// side effects are rejected until their execution contract is present.
+#[derive(Clone, Copy)]
+enum TriggerReturn {
+    New,
+    Old,
+    Null,
+}
+
+fn parse_row_trigger_body(body: &str) -> Result<TriggerReturn, SqlError> {
+    let mut tokens = [""; 4];
+    let mut count = 0usize;
+    for token in body.split(|character: char| character.is_ascii_whitespace() || character == ';') {
+        if token.is_empty() {
+            continue;
+        }
+        if count == tokens.len() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "trigger function body is not supported"
+            ));
+        }
+        tokens[count] = token;
+        count += 1;
+    }
+    let valid = matches!(
+        &tokens[..count],
+        [begin, return_keyword, transition, end]
+            if begin.eq_ignore_ascii_case("begin")
+                && return_keyword.eq_ignore_ascii_case("return")
+                && (transition.eq_ignore_ascii_case("new")
+                    || transition.eq_ignore_ascii_case("old")
+                    || transition.eq_ignore_ascii_case("null"))
+                && end.eq_ignore_ascii_case("end")
+    );
+    if !valid {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "trigger function body is not supported"
+        ));
+    }
+    if tokens[2].eq_ignore_ascii_case("new") {
+        Ok(TriggerReturn::New)
+    } else if tokens[2].eq_ignore_ascii_case("old") {
+        Ok(TriggerReturn::Old)
+    } else {
+        Ok(TriggerReturn::Null)
+    }
+}
+
+fn fire_row_triggers<'a>(
+    storage: &Storage,
+    table: usize,
+    event: u8,
+    before: bool,
+    old: Option<&[Datum<'a>]>,
+    new: Option<&mut [Datum<'a>]>,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    let mut new = new;
+    for (_, trigger) in storage.triggers_for_table(table, txid) {
+        if !trigger.enabled_to(txid)
+            || trigger.timing != u8::from(!before)
+            || trigger.events & event == 0
+        {
+            continue;
+        }
+        match parse_row_trigger_body(storage.routine(usize::from(trigger.function)).body.as_str())?
+        {
+            TriggerReturn::Null if before => return Ok(false),
+            TriggerReturn::Old if before => {
+                let Some(old) = old else { return Ok(false) };
+                let Some(new) = new.as_deref_mut() else {
+                    return Ok(false);
+                };
+                new.copy_from_slice(old);
+            }
+            TriggerReturn::New if before && new.is_none() => return Ok(false),
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+pub fn create_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    trigger: &CreateTrigger<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match resolve_dml_table(storage, &trigger.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    if !trigger.arguments.is_empty() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "trigger arguments are not supported"
+        ));
+    }
+    let function = if let Some(schema) = trigger.function.schema {
+        storage.routine_slot_by_signature(schema, trigger.function.name, &[], txn.txid)
+    } else {
+        storage.trigger_slot_for_call(trigger.function.name, txn.txid)
+    };
+    let Some(function) = function else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function \"{}\" does not exist",
+            trigger.function.name
+        ));
+    };
+    if !matches!(
+        storage.routine(function).kind,
+        crate::storage::RoutineKind::Trigger
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "function \"{}\" must return type trigger",
+            trigger.function.name
+        ));
+    }
+    let events = trigger.events.iter().fold(0u8, |mask, event| {
+        mask | match event {
+            TriggerEvent::Insert => 1,
+            TriggerEvent::Update => 2,
+            TriggerEvent::Delete => 4,
+        }
+    });
+    let timing = match trigger.timing {
+        TriggerTiming::Before => 0,
+        TriggerTiming::After => 1,
+    };
+    let name = match SqlName::parse(trigger.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let table_schema = storage.table_def(table, txn.txid).schema;
+    let table_name = storage.table_def(table, txn.txid).name;
+    let function_schema = storage.routine(function).schema_for(txn.txid);
+    let function_name = storage.routine(function).name_for(txn.txid);
+    let slot = match storage.create_trigger(
+        crate::storage::TriggerSpec {
+            name,
+            table,
+            function,
+            timing,
+            events,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    let staged = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateTrigger {
+            name: trigger.name,
+            table_schema: table_schema.as_str(),
+            table: table_name.as_str(),
+            function_schema: function_schema.as_str(),
+            function: function_name.as_str(),
+            timing,
+            events,
+        },
+    );
+    if let Err(error) = staged {
+        storage.rollback_trigger_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerCreated(slot as u32)) {
+        storage.rollback_trigger_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TRIGGER")?;
+    sql_ok()
+}
+
+pub fn drop_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    triggers: &[super::ast::TriggerIdentity<'_>],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for trigger in triggers {
+        let table = match resolve_dml_table(storage, &trigger.table, txn.txid) {
+            Ok(table) => table,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = storage.require_owner(
+            storage.table_access_object(table, txn.txid),
+            txn.txid,
+            "table",
+        ) {
+            return sql_fail(error);
+        }
+        let Some(slot) = storage.trigger_slot(table, trigger.name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "trigger \"{}\" for relation \"{}\" does not exist, skipping",
+                        trigger.name,
+                        trigger.table.name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "trigger \"{}\" for relation \"{}\" does not exist",
+                trigger.name,
+                trigger.table.name
+            ));
+        };
+        let schema = storage.table_def(table, txn.txid).schema;
+        let name = storage.table_def(table, txn.txid).name;
+        storage.drop_trigger(slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropTrigger {
+                name: trigger.name,
+                table_schema: schema.as_str(),
+                table: name.as_str(),
+            },
+        ) {
+            storage.rollback_trigger_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32)) {
+            storage.rollback_trigger_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP TRIGGER")?;
+    sql_ok()
+}
+
+pub fn alter_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    identity: &super::ast::TriggerIdentity<'_>,
+    action: super::ast::AlterTriggerAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match resolve_dml_table(storage, &identity.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.trigger_slot(table, identity.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "trigger \"{}\" for relation \"{}\" does not exist",
+            identity.name,
+            identity.table.name
+        ));
+    };
+    let trigger = storage
+        .triggers_for_table(table, txn.txid)
+        .find_map(|(index, trigger)| (index == slot).then_some(*trigger))
+        .expect("resolved trigger remains visible");
+    let (new_name, enabled) = match action {
+        super::ast::AlterTriggerAction::Rename(name) => {
+            let name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            if storage
+                .trigger_slot(table, name.as_str(), txn.txid)
+                .is_some_and(|other| other != slot)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "trigger \"{}\" for relation already exists",
+                    name.as_str()
+                ));
+            }
+            (name, trigger.enabled_to(txn.txid))
+        }
+        super::ast::AlterTriggerAction::Enable => (trigger.name_to(txn.txid), true),
+        super::ast::AlterTriggerAction::Disable => (trigger.name_to(txn.txid), false),
+    };
+    let prior = match storage.alter_trigger(slot, new_name, enabled, txn.txid) {
+        Ok(crate::storage::TriggerAlter::Changed { prior }) => prior,
+        Ok(crate::storage::TriggerAlter::Unchanged) => {
+            responder.command_complete("ALTER TRIGGER")?;
+            return sql_ok();
+        }
+        Err(error) => return sql_fail(error),
+    };
+    let schema = storage.table_def(table, txn.txid).schema;
+    let table_name = storage.table_def(table, txn.txid).name;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::AlterTrigger {
+            name: identity.name,
+            table_schema: schema.as_str(),
+            table: table_name.as_str(),
+            new_name: new_name.as_str(),
+            enabled,
+        },
+    ) {
+        storage.rollback_trigger_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_trigger_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER TRIGGER")?;
+    sql_ok()
+}
+
 pub fn create_routine(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -6462,6 +6806,14 @@ pub fn create_routine(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
+        && routine.language != RoutineLanguage::PlPgSql
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "trigger functions require LANGUAGE plpgsql"
+        ));
+    }
     let schema = match storage.creation_schema(routine.name.schema, routine.name.name, txn.txid) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
@@ -6518,6 +6870,15 @@ pub fn create_routine(
             result_column_count = columns.len();
             crate::storage::RoutineKind::TableFunction
         }
+        super::ast::RoutineCreateKind::Trigger => {
+            if !routine.arguments.is_empty() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "trigger functions cannot have declared arguments"
+                ));
+            }
+            crate::storage::RoutineKind::Trigger
+        }
         super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
     let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
@@ -6572,6 +6933,16 @@ pub fn create_routine(
         }
         let prior = storage.routine(replaced_slot);
         let prior_kind = prior.kind;
+        if matches!(prior_kind, crate::storage::RoutineKind::Trigger)
+            && storage
+                .triggers_with_slots_visible_to(txn.txid)
+                .any(|(_, trigger)| usize::from(trigger.function) == replaced_slot)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "replacing a trigger function with dependent triggers is not supported"
+            ));
+        }
         let same_result_contract = prior_kind == kind
             && (!matches!(kind, crate::storage::RoutineKind::TableFunction)
                 || (prior.result_column_count == result_column_count
@@ -6617,6 +6988,11 @@ pub fn create_routine(
             if let Err(error) =
                 super::query::parse_routine_function_program(routine.body, arena, returns_void)
             {
+                return sql_fail(error);
+            }
+        }
+        crate::storage::RoutineKind::Trigger => {
+            if let Err(error) = parse_row_trigger_body(routine.body) {
                 return sql_fail(error);
             }
         }
@@ -6704,6 +7080,7 @@ pub fn create_routine(
         crate::storage::RoutineKind::Function { .. }
         | crate::storage::RoutineKind::SetFunction { .. }
         | crate::storage::RoutineKind::TableFunction => "CREATE FUNCTION",
+        crate::storage::RoutineKind::Trigger => "CREATE FUNCTION",
         crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
     })?;
     sql_ok()
@@ -6908,7 +7285,7 @@ pub fn drop_routine(
     let DropRoutineCommand {
         routines,
         if_exists,
-        cascade: _,
+        cascade,
         kind,
     } = command;
     for identity in routines {
@@ -6968,6 +7345,50 @@ pub fn drop_routine(
             return sql_fail(error);
         }
         let routine = *storage.routine(slot);
+        if storage
+            .triggers_with_slots_visible_to(txn.txid)
+            .any(|(_, trigger)| usize::from(trigger.function) == slot)
+            && !cascade
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop function {} because trigger objects depend on it",
+                routine.name_for(txn.txid).as_str()
+            ));
+        }
+        loop {
+            let dependency = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                |(trigger_slot, trigger)| {
+                    (usize::from(trigger.function) == slot).then_some((trigger_slot, *trigger))
+                },
+            );
+            let Some((trigger_slot, trigger)) = dependency else {
+                break;
+            };
+            let (table_schema, table_name) = {
+                let table = storage.table_def(usize::from(trigger.table), txn.txid);
+                (table.schema, table.name)
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::DropTrigger {
+                    name: trigger.name_to(txn.txid).as_str(),
+                    table_schema: table_schema.as_str(),
+                    table: table_name.as_str(),
+                },
+            ) {
+                return sql_fail(error);
+            }
+            storage.drop_trigger(trigger_slot, txn.txid);
+            if let Err(error) =
+                txn.record_ddl(super::txn::DdlUndo::TriggerDropped(trigger_slot as u32))
+            {
+                storage.rollback_trigger_drop(trigger_slot, txn.txid);
+                return sql_fail(error);
+            }
+        }
         let lsn = storage.bump_lsn();
         let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
         for (index, argument) in routine.arguments().iter().enumerate() {
@@ -14024,6 +14445,17 @@ pub fn insert(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    if statement.on_conflict.is_some()
+        && storage
+            .triggers_for_table(table_index, txn.txid)
+            .next()
+            .is_some()
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "INSERT ON CONFLICT with row triggers is not supported"
+        ));
+    }
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -14234,6 +14666,20 @@ pub fn insert(
             ) {
                 return sql_fail(e);
             }
+            if !match fire_row_triggers(
+                storage,
+                table_index,
+                1,
+                true,
+                None,
+                Some(&mut values[..def.n_columns]),
+                txn.txid,
+            ) {
+                Ok(run) => run,
+                Err(error) => return sql_fail(error),
+            } {
+                continue;
+            }
             if let Err(e) = check_not_null(&def, &values) {
                 return sql_fail(e);
             }
@@ -14295,6 +14741,17 @@ pub fn insert(
             }
             if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
                 return sql_fail(e);
+            }
+            if let Err(error) = fire_row_triggers(
+                storage,
+                table_index,
+                1,
+                false,
+                None,
+                Some(&mut values[..def.n_columns]),
+                txn.txid,
+            ) {
+                return sql_fail(error);
             }
             if !statement.returning.is_empty()
                 && let Err(e) = emit_projected(
@@ -14450,6 +14907,20 @@ pub fn insert(
         ) {
             return sql_fail(e);
         }
+        if !match fire_row_triggers(
+            storage,
+            table_index,
+            1,
+            true,
+            None,
+            Some(&mut values[..def.n_columns]),
+            txn.txid,
+        ) {
+            Ok(run) => run,
+            Err(error) => return sql_fail(error),
+        } {
+            continue;
+        }
         if let Err(e) = check_not_null(&def, &values) {
             return sql_fail(e);
         }
@@ -14511,6 +14982,17 @@ pub fn insert(
         }
         if let Err(e) = store_row(storage, txn, table_index, None, &values[..def.n_columns]) {
             return sql_fail(e);
+        }
+        if let Err(error) = fire_row_triggers(
+            storage,
+            table_index,
+            1,
+            false,
+            None,
+            Some(&mut values[..def.n_columns]),
+            txn.txid,
+        ) {
+            return sql_fail(error);
         }
         if !statement.returning.is_empty()
             && let Err(e) = emit_projected(
@@ -14999,6 +15481,20 @@ pub fn update(
             ) {
                 return sql_fail(e);
             }
+            if !match fire_row_triggers(
+                storage,
+                table_index,
+                2,
+                true,
+                Some(&values[..def.n_columns]),
+                Some(&mut new_values[..def.n_columns]),
+                txn.txid,
+            ) {
+                Ok(run) => run,
+                Err(error) => return sql_fail(error),
+            } {
+                continue;
+            }
             if let Err(e) = check_not_null(&def, &new_values) {
                 return sql_fail(e);
             }
@@ -15091,6 +15587,25 @@ pub fn update(
             {
                 return sql_fail(e);
             }
+        }
+        let mut old_transition = [Datum::Null; MAX_COLUMNS];
+        if let Err(error) = rowenc::decode(row_bytes, schema, &mut old_transition) {
+            return sql_fail(error);
+        }
+        let mut new_transition = [Datum::Null; MAX_COLUMNS];
+        if let Err(error) = rowenc::decode(new_bytes, schema, &mut new_transition) {
+            return sql_fail(error);
+        }
+        if let Err(error) = fire_row_triggers(
+            storage,
+            table_index,
+            2,
+            false,
+            Some(&old_transition[..def.n_columns]),
+            Some(&mut new_transition[..def.n_columns]),
+            txn.txid,
+        ) {
+            return sql_fail(error);
         }
         if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
@@ -15246,9 +15761,13 @@ pub fn delete(
         }
     }
     let referenced = table_is_referenced(storage, def.schema.as_str(), def.name.as_str(), txn.txid);
+    let has_triggers = storage
+        .triggers_for_table(table_index, txn.txid)
+        .next()
+        .is_some();
     for i in 0..scratch.len() {
         let (rowid, old_home) = scratch[i];
-        if !statement.returning.is_empty() || referenced {
+        if !statement.returning.is_empty() || referenced || has_triggers {
             // The cascade below mutates storage, so the row image is decoded
             // from an arena-owned copy.
             let fetched = match storage.row_bytes(table_index, rowid, old_home, arena) {
@@ -15267,6 +15786,20 @@ pub fn delete(
             let mut old_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(old_copy, schema, &mut old_values) {
                 return sql_fail(e);
+            }
+            if !match fire_row_triggers(
+                storage,
+                table_index,
+                4,
+                true,
+                Some(&old_values[..def.n_columns]),
+                None,
+                txn.txid,
+            ) {
+                Ok(run) => run,
+                Err(error) => return sql_fail(error),
+            } {
+                continue;
             }
             // Apply each referencing key's ON DELETE action (NO ACTION /
             // RESTRICT block; CASCADE / SET NULL / SET DEFAULT rewrite the
@@ -15312,6 +15845,27 @@ pub fn delete(
                 }
             }
             Err(e) => return sql_fail(e),
+        }
+        if has_triggers {
+            let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                Ok(bytes) => bytes,
+                Err(error) => return sql_fail(error),
+            };
+            let mut old_transition = [Datum::Null; MAX_COLUMNS];
+            if let Err(error) = rowenc::decode(old_bytes, schema, &mut old_transition) {
+                return sql_fail(error);
+            }
+            if let Err(error) = fire_row_triggers(
+                storage,
+                table_index,
+                4,
+                false,
+                Some(&old_transition[..def.n_columns]),
+                None,
+                txn.txid,
+            ) {
+                return sql_fail(error);
+            }
         }
     }
     let tag = stack_format!(48, "DELETE {}", scratch.len());

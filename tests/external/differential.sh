@@ -228,9 +228,11 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   wait "$P3_PID" 2>/dev/null
   rm -rf "$WORK/p3data"
   SLT_CONF="$WORK/p3-slt.conf"
-  cp "$WORK/p3.conf" "$SLT_CONF"
   if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
+    sed '/^object_store_prefix = /d' "$WORK/p3.conf" > "$SLT_CONF"
     print -- "object_store_prefix = ${DIFF_OBJECT_PREFIX}slt/" >> "$SLT_CONF"
+  else
+    cp "$WORK/p3.conf" "$SLT_CONF"
   fi
   "${POS3QL_BIN:-./target/release/pos3ql}" --config "$SLT_CONF" > "$WORK/p3.log" 2>&1 &
   P3_PID=$!

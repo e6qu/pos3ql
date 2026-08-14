@@ -8240,6 +8240,14 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         ["0"]
     );
 
+    let unsupported_body = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION unsupported_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN DELETE FROM trigger_body_audit; RETURN NULL; END'",
+    );
+    assert!(String::from_utf8_lossy(&unsupported_body).contains("0A000"));
+
     let unsupported = run_with(
         &mut engine,
         &mut budget,

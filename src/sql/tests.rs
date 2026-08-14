@@ -8153,14 +8153,20 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            'BEGIN INSERT INTO trigger_body_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
          CREATE TRIGGER audit_before_write BEFORE INSERT OR UPDATE ON trigger_body_target
            FOR EACH ROW EXECUTE FUNCTION audit_trigger_body();
+         CREATE TABLE trigger_body_after (id integer, observed integer);
+         CREATE FUNCTION observe_after_write() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_after VALUES (NEW.id, NEW.value); RETURN NULL; END';
+         CREATE TRIGGER observe_after_write_trigger AFTER INSERT OR UPDATE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION observe_after_write();
          INSERT INTO trigger_body_target (id, value) VALUES (1, 4);
          UPDATE trigger_body_target SET value = 8 WHERE id = 1;
          SELECT id, value, doubled FROM trigger_body_target;
-         SELECT id, observed FROM trigger_body_audit ORDER BY observed;",
+         SELECT id, observed FROM trigger_body_audit ORDER BY observed;
+         SELECT id, observed FROM trigger_body_after ORDER BY observed;",
     );
     assert_eq!(
         data_rows(&output),
-        ["1|9|18", "1|5", "1|9"],
+        ["1|9|18", "1|5", "1|9", "1|5", "1|9"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -8181,12 +8187,17 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         &mut engine,
         &mut budget,
         "CREATE FUNCTION allow_old_delete() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';
+         CREATE FUNCTION observe_after_delete() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_after VALUES (OLD.id, -OLD.value); RETURN NULL; END';
          CREATE TRIGGER allow_old_before_delete BEFORE DELETE ON trigger_body_target
            FOR EACH ROW EXECUTE FUNCTION allow_old_delete();
+         CREATE TRIGGER observe_after_delete_trigger AFTER DELETE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION observe_after_delete();
          DELETE FROM trigger_body_target WHERE id = 1;
-         SELECT count(*) FROM trigger_body_target;",
+         SELECT count(*) FROM trigger_body_target;
+         SELECT observed FROM trigger_body_after ORDER BY observed;",
     );
-    assert_eq!(data_rows(&delete_return_old), ["0"]);
+    assert_eq!(data_rows(&delete_return_old), ["0", "-19", "5", "9", "19"]);
 
     let rejected = run_with(
         &mut engine,

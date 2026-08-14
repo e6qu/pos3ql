@@ -8148,7 +8148,7 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
              CHECK (value > 0)
          );
          CREATE FUNCTION normalize_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN NEW.value := NEW.value + 1; RETURN NEW; END';
+           'BEGIN NeW.value := NEW.value + 1; RETURN NEW; END';
          CREATE TRIGGER normalize_before_write BEFORE INSERT OR UPDATE ON trigger_body_target
            FOR EACH ROW EXECUTE FUNCTION normalize_trigger_body();
          CREATE TABLE trigger_body_audit (id integer, observed integer);

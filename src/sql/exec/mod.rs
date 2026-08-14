@@ -6645,9 +6645,10 @@ fn parse_trigger_assignment(statement: &str) -> Option<TriggerAssignment<'_>> {
     let (target, expression) = (&statement[..offset], &statement[offset + 2..]);
     let target = target.trim();
     let expression = expression.trim();
-    let column = target
-        .strip_prefix("NEW.")
-        .or_else(|| target.strip_prefix("new."))?;
+    let (record, column) = target.split_once('.')?;
+    if !record.eq_ignore_ascii_case("new") {
+        return None;
+    }
     (!column.is_empty()
         && !expression.is_empty()
         && column

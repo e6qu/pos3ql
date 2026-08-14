@@ -37,6 +37,8 @@ FAIL=0
 #              (POS3QL_TORTURE_ROUNDS / POS3QL_TORTURE_SEED size one run,
 #              so CI can split the depth across seeds)
 #   tls        the durability cycle over HTTPS
+#   subscription a real PostgreSQL logical publisher, transactional apply,
+#              acknowledgement, and subscriber crash recovery
 #   diff       the plain differential suite against PostgreSQL
 #   spilldiff  the forced-spill differential suite against PostgreSQL
 SELECTED_GROUPS=${POS3QL_RUN_GROUPS:-all}
@@ -138,6 +140,9 @@ sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
 table_rows = 8192
+max_subscriptions = 2
+subscription_relation_capacity = 16
+subscription_arena_bytes = 256KiB
 # A full scan of spilled rows stages them in the statement work arena (the
 # streaming read path is a later stage); size it for the spilled dataset.
 work_arena_bytes = 192MiB
@@ -559,6 +564,98 @@ else
 fi
 
 fi # torture
+
+if want subscription; then
+
+step "logical subscription apply from a real PostgreSQL publisher"
+SUB_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
+SUB_PG_PORT=15496
+if [[ -x "$SUB_PGBIN/postgres" ]]; then
+  if ! "$SUB_PGBIN/initdb" -D "$WORK/subscription-pgdata" -U postgres -A trust \
+    --encoding=UTF8 --lc-collate=C --lc-ctype=C > "$WORK/subscription-initdb.log" 2>&1; then
+    bad "logical subscription publisher initialization"
+    tail -20 "$WORK/subscription-initdb.log"
+  else
+  SUB_PG_SOCK=$(mktemp -d /tmp/pos3ql-subscription-pgsock.XXXX)
+  if ! "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" \
+    -o "-p $SUB_PG_PORT -k $SUB_PG_SOCK -c listen_addresses=127.0.0.1 -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4" \
+    -l "$WORK/subscription-pg.log" start >/dev/null; then
+    bad "logical subscription publisher start"
+    tail -20 "$WORK/subscription-pg.log"
+    rm -rf "$SUB_PG_SOCK"
+  else
+  SUB_PSQL="$SUB_PGBIN/psql"
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL)" \
+    -c "CREATE PUBLICATION subscription_apply_pub FOR TABLE subscription_target" \
+    -c "SELECT pg_create_logical_replication_slot('subscription_apply_slot', 'pgoutput')" \
+    >/dev/null 2>&1; then
+    bad "logical subscription publisher setup"
+  elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL)" \
+    -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub WITH (create_slot = false, copy_data = false, slot_name = subscription_apply_slot)" \
+    >/dev/null 2>&1; then
+    bad "logical subscription subscriber setup"
+  elif ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    -c "BEGIN; INSERT INTO subscription_target VALUES (1, 'first'), (2, 'second'); COMMIT" \
+    >/dev/null 2>&1; then
+    bad "logical subscription publisher transaction"
+  else
+  subscription_rows() {
+    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+      -c "SELECT id, body FROM subscription_target ORDER BY id" 2>&1
+  }
+  subscription_wait() { # <expected rows>
+    local expected=$1 actual=""
+    for _ in {1..100}; do
+      actual=$(subscription_rows)
+      [[ "$actual" == "$expected" ]] && return 0
+      sleep 0.1
+    done
+    print -- "$actual"
+    return 1
+  }
+  subscription_diagnostics() {
+    print -- "--- pos3ql subscription server log ---"
+    tail -100 "$WORK/server.log"
+    print -- "--- PostgreSQL publisher log ---"
+    tail -100 "$WORK/subscription-pg.log"
+  }
+  if subscription_wait $'1|first\n2|second'; then
+    ok "subscription applies one PostgreSQL transaction atomically"
+  else
+    bad "subscription initial apply (got $(subscription_rows))"
+    subscription_diagnostics
+  fi
+  kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  SERVER_PID=$START_PID
+  if subscription_wait $'1|first\n2|second'; then
+    if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+      -c "INSERT INTO subscription_target VALUES (3, 'after-crash')" >/dev/null 2>&1; then
+      bad "logical subscription post-crash publisher transaction"
+    elif subscription_wait $'1|first\n2|second\n3|after-crash'; then
+      slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
+        -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply_slot'")
+      [[ "$slot_lsn" == "t" ]] && ok "subscription crash recovery resumes from durable acknowledgement" \
+        || bad "subscription publisher acknowledgement was not durable (got $slot_lsn)"
+    else
+      bad "subscription post-crash apply (got $(subscription_rows))"
+    fi
+  else
+    bad "subscription local WAL recovery (got $(subscription_rows))"
+    subscription_diagnostics
+  fi
+  fi
+  "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" stop -m immediate >/dev/null
+  rm -rf "$SUB_PG_SOCK"
+  fi
+  fi
+else
+  bad "logical subscription apply needs POS3QL_PGBIN with a PostgreSQL publisher"
+fi
+
+fi # subscription
 
 if want tls; then
 

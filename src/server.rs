@@ -19,6 +19,9 @@ const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
 /// First reactor token for durable block-store in-flight GET sockets.
 const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
+/// First token reserved for outbound logical-subscription workers.  The
+/// bounded subscription count is checked against this disjoint range at setup.
+const SUBSCRIPTION_TOKEN_BASE: u64 = u64::MAX - 1_000_000;
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -57,6 +60,7 @@ pub struct Server {
     shutdown_read: i32,
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
+    subscriptions: FixedVec<SubscriptionWorker>,
 }
 
 struct Slot {
@@ -64,6 +68,15 @@ struct Slot {
     generation: u32,
     want_read: bool,
     want_write: bool,
+}
+
+struct SubscriptionWorker {
+    client: crate::pg::replication_client::ReplicationClient,
+    apply: crate::pg::subscription_apply::SubscriptionApply,
+    name: Option<crate::storage::SqlName>,
+    registered_fd: Option<i32>,
+    want_write: bool,
+    retry_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -98,6 +111,27 @@ impl From<BudgetError> for ServerSetupError {
 }
 
 impl Server {
+    /// TLS-pool capacity for the complete fixed outbound subscription worker
+    /// set.  The workers are allocated at startup even when their catalog
+    /// entries are disabled, so enabling one cannot grow runtime memory.
+    pub fn extra_tls_pool_bytes(config: &Config) -> usize {
+        config.max_subscriptions * crate::object_store::tls::CLIENT_SESSION_BYTES
+    }
+
+    pub fn extra_budget_bytes(config: &Config) -> usize {
+        config.max_subscriptions * core::mem::size_of::<SubscriptionWorker>()
+            + config.max_subscriptions
+                * (crate::pg::replication_client::ReplicationClient::budget_bytes(
+                    crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS,
+                    config.subscription_receive_bytes,
+                    config.subscription_send_bytes,
+                ) + crate::pg::subscription_apply::SubscriptionApply::budget_bytes(
+                    config.subscription_relation_capacity,
+                    config.txn_rows,
+                    config.subscription_arena_bytes,
+                ))
+    }
+
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, ServerSetupError> {
         let max_conns = config.max_connections as usize;
         let listener = bind_listener(&config.listen_addr)
@@ -115,13 +149,16 @@ impl Server {
             unused_mut,
             reason = "the Linux epoll backend records fixed read/write interest"
         )]
-        let mut reactor =
-            Reactor::new(budget, max_conns + 1 + block_read_slots).map_err(|e| match e {
-                crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
-                crate::io::reactor::ReactorSetupError::Os(io) => {
-                    ServerSetupError::Io("create kqueue", io)
-                }
-            })?;
+        let mut reactor = Reactor::new(
+            budget,
+            max_conns + 2 + block_read_slots + config.max_subscriptions,
+        )
+        .map_err(|e| match e {
+            crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
+            crate::io::reactor::ReactorSetupError::Os(io) => {
+                ServerSetupError::Io("create kqueue", io)
+            }
+        })?;
         reactor
             .register_read(listener.as_raw_fd(), LISTENER_TOKEN)
             .map_err(|e| ServerSetupError::Io("register listener", e))?;
@@ -129,6 +166,13 @@ impl Server {
         let mut slots = FixedVec::new(budget, "conn_slots", max_conns)?;
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
+        let mut subscriptions =
+            FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
+        let subscription_tls =
+            crate::object_store::tls::build_client_config(&config.subscription_tls_ca_file)
+                .map_err(|error| {
+                    ServerSetupError::Io("subscription TLS", std::io::Error::other(error))
+                })?;
         for _ in 0..block_read_slots {
             block_read_fds
                 .push(None)
@@ -144,6 +188,37 @@ impl Server {
                 })
                 .expect("sized to max_conns");
             free.push(i).expect("sized to max_conns");
+        }
+        for _ in 0..config.max_subscriptions {
+            subscriptions
+                .push(SubscriptionWorker {
+                    client: crate::pg::replication_client::ReplicationClient::new_unbound(
+                        budget,
+                        crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS,
+                        config.subscription_receive_bytes,
+                        config.subscription_send_bytes,
+                        Some(&subscription_tls),
+                    )
+                    .map_err(|error| {
+                        ServerSetupError::Io(
+                            "allocate subscription worker",
+                            std::io::Error::other(error),
+                        )
+                    })?,
+                    apply: crate::pg::subscription_apply::SubscriptionApply::new(
+                        budget,
+                        crate::storage::SqlName::EMPTY,
+                        config.subscription_relation_capacity,
+                        config.txn_rows,
+                        config.subscription_arena_bytes,
+                        0,
+                    )?,
+                    name: None,
+                    registered_fd: None,
+                    want_write: false,
+                    retry_at: None,
+                })
+                .expect("sized to max_subscriptions");
         }
 
         let mut cancel_key = [0u8; 16];
@@ -254,6 +329,7 @@ impl Server {
             tls_config,
             shutdown_read: pipe_fds[0],
             block_read_fds,
+            subscriptions,
         })
     }
 
@@ -278,6 +354,7 @@ impl Server {
     /// takes a final checkpoint, and returns cleanly.
     pub fn run(&mut self) -> std::io::Result<()> {
         self.engine.enable_async_block_reads();
+        self.reconcile_subscriptions()?;
         // Checkpoint beats run eagerly while healthy and back off for one
         // second after an object-store failure.
         let mut beat_backoff = Duration::ZERO;
@@ -319,11 +396,14 @@ impl Server {
                     self.accept_pending();
                 } else if let Some(slot) = self.block_slot(event.token) {
                     self.advance_block_io(slot)?;
+                } else if let Some(subscription) = self.subscription_slot(event.token) {
+                    self.advance_subscription(subscription, event.readable, event.writable)?;
                 } else {
                     self.dispatch(event.token, event.readable, event.writable);
                 }
             }
             self.pump_replication_streams();
+            self.reconcile_subscriptions()?;
             // A lock timeout can be the event that woke the reactor, with no
             // socket readiness and no lock-generation change.
             self.wake_lock_waiters();
@@ -583,6 +663,151 @@ impl Server {
     fn block_slot(&self, token: u64) -> Option<usize> {
         let slot = BLOCK_IO_TOKEN.checked_sub(token)? as usize;
         (slot < self.block_read_fds.len()).then_some(slot)
+    }
+
+    fn subscription_slot(&self, token: u64) -> Option<usize> {
+        let slot = token.checked_sub(SUBSCRIPTION_TOKEN_BASE)? as usize;
+        (slot < self.subscriptions.len()).then_some(slot)
+    }
+
+    fn subscription_token(slot: usize) -> u64 {
+        SUBSCRIPTION_TOKEN_BASE + slot as u64
+    }
+
+    fn unbind_subscription(&mut self, slot: usize) {
+        let worker = &mut self.subscriptions[slot];
+        if let Some(fd) = worker.registered_fd.take() {
+            let _ = self.reactor.deregister(fd);
+        }
+        worker.apply.stop(&mut self.engine);
+        worker.client.unbind();
+        worker.apply.unbind();
+        worker.name = None;
+        worker.want_write = false;
+    }
+
+    /// Binds exactly the fixed worker matching each committed enabled catalog
+    /// slot.  Failed connects use an explicit retry delay; disabled/dropped
+    /// catalog state removes the reactor interest and cannot keep a live
+    /// publisher socket behind it.
+    fn reconcile_subscriptions(&mut self) -> std::io::Result<()> {
+        let now = std::time::Instant::now();
+        for slot in 0..self.subscriptions.len() {
+            let runtime = self.engine.subscription_runtime(slot);
+            let bound = self.subscriptions[slot].name;
+            match (runtime, bound) {
+                (None, Some(_)) => self.unbind_subscription(slot),
+                (None, None) => {}
+                (Some(runtime), Some(name)) if name == runtime.name => {
+                    self.sync_subscription_interest(slot)?;
+                }
+                (Some(runtime), _) => {
+                    if self.subscriptions[slot]
+                        .retry_at
+                        .is_some_and(|deadline| deadline > now)
+                    {
+                        continue;
+                    }
+                    if self.subscriptions[slot].name.is_some() {
+                        self.unbind_subscription(slot);
+                    }
+                    let worker = &mut self.subscriptions[slot];
+                    worker
+                        .apply
+                        .bind(runtime.name, runtime.confirmed_lsn)
+                        .map_err(|_| std::io::Error::other("bind subscription apply"))?;
+                    let setup = crate::pg::replication_client::ReplicationClientSetup {
+                        endpoint: runtime.endpoint,
+                        slot: runtime.slot,
+                        publications: &runtime.publications[..runtime.publication_count],
+                        start_lsn: runtime.confirmed_lsn,
+                        protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+                    };
+                    match worker.client.bind(setup) {
+                        Ok(()) => {
+                            worker.name = Some(runtime.name);
+                            worker.retry_at = None;
+                            let fd = worker.client.raw_fd();
+                            self.reactor
+                                .register_read(fd, Self::subscription_token(slot))?;
+                            worker.registered_fd = Some(fd);
+                            self.sync_subscription_interest(slot)?;
+                        }
+                        Err(_) => {
+                            worker.apply.unbind();
+                            worker.client.unbind();
+                            worker.retry_at = Some(now + Duration::from_secs(1));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_subscription_interest(&mut self, slot: usize) -> std::io::Result<()> {
+        let worker = &mut self.subscriptions[slot];
+        let Some(fd) = worker.registered_fd else {
+            return Ok(());
+        };
+        let wanted = worker.client.wants_write();
+        if wanted != worker.want_write {
+            self.reactor
+                .set_write_interest(fd, Self::subscription_token(slot), wanted)?;
+            worker.want_write = wanted;
+        }
+        Ok(())
+    }
+
+    fn advance_subscription(
+        &mut self,
+        slot: usize,
+        readable: bool,
+        writable: bool,
+    ) -> std::io::Result<()> {
+        let worker = &mut self.subscriptions[slot];
+        let mut failed = false;
+        if writable && worker.client.writable().is_err() {
+            failed = true;
+        }
+        if !failed && readable {
+            let mut acknowledgement = None;
+            if worker
+                .client
+                .readable(
+                    |frame| match worker.apply.receive(&mut self.engine, frame) {
+                        Ok(crate::pg::subscription_apply::ApplyResult::None) => Ok(()),
+                        Ok(crate::pg::subscription_apply::ApplyResult::Acknowledge {
+                            flushed_lsn,
+                            reply_requested,
+                        }) => {
+                            acknowledgement = Some((flushed_lsn, reply_requested));
+                            Ok(())
+                        }
+                        Err(_) => Err(crate::pg::replication_client::ClientError::PublisherError),
+                    },
+                )
+                .is_err()
+            {
+                failed = true;
+            }
+            if let Some((flushed_lsn, reply_requested)) = acknowledgement
+                && worker
+                    .client
+                    .acknowledge(flushed_lsn, reply_requested)
+                    .is_err()
+            {
+                failed = true;
+            }
+        }
+        if failed {
+            self.unbind_subscription(slot);
+            self.subscriptions[slot].retry_at =
+                Some(std::time::Instant::now() + Duration::from_secs(1));
+        } else {
+            self.sync_subscription_interest(slot)?;
+        }
+        Ok(())
     }
 
     /// Retries parked protocol messages after a transaction released row

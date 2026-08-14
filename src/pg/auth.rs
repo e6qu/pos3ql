@@ -41,7 +41,7 @@ impl ScramServer {
 }
 
 /// PBKDF2-HMAC-SHA256 with a single block (dkLen = 32), i.e. RFC 5802 Hi.
-fn hi(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+pub(crate) fn hi(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut msg = [0u8; 64];
     let n = salt.len().min(60);
     msg[..n].copy_from_slice(&salt[..n]);

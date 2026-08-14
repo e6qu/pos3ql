@@ -110,8 +110,7 @@ fn parse_port(port: &str) -> Result<(), &'static str> {
     }
 }
 
-#[path = "tls.rs"]
-pub(crate) mod tls;
+use crate::object_store::tls;
 
 pub struct HttpClient {
     host_header: String,

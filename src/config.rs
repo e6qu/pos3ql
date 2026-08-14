@@ -64,6 +64,18 @@ pub struct Config {
     pub max_replication_slots: usize,
     /// Fixed number of durable logical replication subscriptions.
     pub max_subscriptions: usize,
+    /// Fixed receive buffer for each outbound pgoutput subscription worker.
+    pub subscription_receive_bytes: usize,
+    /// Fixed send buffer for each outbound pgoutput subscription worker.
+    pub subscription_send_bytes: usize,
+    /// Fixed per-worker tuple/conversion arena, reclaimed only at a remote
+    /// transaction boundary.
+    pub subscription_arena_bytes: usize,
+    /// Relation descriptors retained per outbound pgoutput worker.
+    pub subscription_relation_capacity: usize,
+    /// Additional roots for outbound PostgreSQL publisher TLS; the common
+    /// rustls trust set is always present.
+    pub subscription_tls_ca_file: String,
     /// Open SQL cursors per connection (DECLARE ... CURSOR).
     pub max_cursors: usize,
     /// Bytes of materialized rows one cursor may hold.
@@ -123,7 +135,8 @@ pub struct Config {
     /// endpoints); empty = the compiled-in Mozilla roots alone.
     pub object_store_tls_ca_file: String,
     /// Byte budget for the isolated TLS component's allocations (the object
-    /// client and, when `tls_on`, every server-side session).
+    /// client; every configured outbound subscription worker; and, when
+    /// `tls_on`, every server-side session).
     pub tls_pool_bytes: usize,
     /// Server-side TLS: answer the SSLRequest probe with `S` and negotiate TLS
     /// for the client connection. Requires `tls_cert_file` and `tls_key_file`.
@@ -167,6 +180,11 @@ impl Config {
             max_tables: 32,
             max_replication_slots: 16,
             max_subscriptions: 16,
+            subscription_receive_bytes: 64 * KIB,
+            subscription_send_bytes: 16 * KIB,
+            subscription_arena_bytes: MIB,
+            subscription_relation_capacity: 64,
+            subscription_tls_ca_file: String::new(),
             max_cursors: 4,
             cursor_bytes: 256 * 1024,
             table_rows: 8192,
@@ -240,6 +258,23 @@ impl Config {
                     config.max_subscriptions =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "subscription_receive_bytes" => {
+                    config.subscription_receive_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "subscription_send_bytes" => {
+                    config.subscription_send_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "subscription_arena_bytes" => {
+                    config.subscription_arena_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "subscription_relation_capacity" => {
+                    config.subscription_relation_capacity =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "subscription_tls_ca_file" => config.subscription_tls_ca_file = value.to_string(),
                 "auth" => {
                     if !matches!(value, "trust" | "password" | "scram-sha-256") {
                         return Err(ConfigError::at(
@@ -490,6 +525,16 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "collation_scratch_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if config.subscription_receive_bytes == 0
+            || config.subscription_send_bytes == 0
+            || config.subscription_arena_bytes == 0
+            || config.subscription_relation_capacity == 0
+        {
+            return Err(ConfigError::at(
+                0,
+                "subscription worker capacities must be greater than zero".to_string(),
             ));
         }
         Ok(config)

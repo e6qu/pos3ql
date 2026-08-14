@@ -1,0 +1,487 @@
+//! Startup-bounded relation identity for logical-subscription apply.
+//!
+//! A pgoutput relation identifier is connection-local.  This map binds it to
+//! one verified local table definition before any tuple reaches row mutation.
+
+use crate::mem::arena::Arena;
+use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::fixed_vec::FixedVec;
+use crate::pg::pginput::{CopyData, Message, Relation, ReplicaIdentity};
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::guc::GucState;
+use crate::sql::txn::TxnState;
+use crate::sql_err;
+use crate::storage::{MAX_COLUMNS, SqlName, Storage};
+
+#[derive(Clone, Copy)]
+pub struct RelationBinding {
+    relation_id: u32,
+    table_slot: usize,
+    remote_to_local: [usize; MAX_COLUMNS],
+    column_count: usize,
+    key_remote_to_local: [usize; MAX_COLUMNS],
+    key_count: usize,
+}
+
+impl RelationBinding {
+    pub fn relation_id(&self) -> u32 {
+        self.relation_id
+    }
+
+    pub fn table_slot(&self) -> usize {
+        self.table_slot
+    }
+
+    pub fn remote_to_local(&self) -> &[usize] {
+        &self.remote_to_local[..self.column_count]
+    }
+
+    pub fn old_remote_to_local(&self, identity: ReplicaIdentity) -> &[usize] {
+        match identity {
+            ReplicaIdentity::Key => &self.key_remote_to_local[..self.key_count],
+            ReplicaIdentity::Old => self.remote_to_local(),
+        }
+    }
+}
+
+/// Fixed, connection-local relation bindings for one apply worker.
+pub struct RelationMap {
+    bindings: FixedVec<RelationBinding>,
+}
+
+impl RelationMap {
+    pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
+        Ok(Self {
+            bindings: FixedVec::new(budget, "subscription_relations", capacity)?,
+        })
+    }
+
+    /// Validates the remote relation against the subscribed local table and
+    /// records its current connection-local identifier.  A changed relation
+    /// message replaces its prior mapping atomically; incompatible schemas
+    /// fail before any data message can be applied.
+    pub fn register(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        relation: Relation<'_>,
+    ) -> Result<(), SqlError> {
+        let table_slot = storage
+            .find_visible(relation.namespace, relation.name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "subscription relation \"{}.{}\" does not exist locally",
+                    relation.namespace,
+                    relation.name
+                )
+            })?;
+        let definition = storage.table_def(table_slot, txid);
+        if relation.columns().len() != definition.n_columns {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "subscription relation \"{}.{}\" has {} columns, local table has {}",
+                relation.namespace,
+                relation.name,
+                relation.columns().len(),
+                definition.n_columns
+            ));
+        }
+        let mut remote_to_local = [usize::MAX; MAX_COLUMNS];
+        let mut key_remote_to_local = [usize::MAX; MAX_COLUMNS];
+        let mut key_count = 0;
+        for (remote, column) in relation.columns().iter().enumerate() {
+            let local = definition.column_index(column.name).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "subscription relation \"{}.{}\" has no local column \"{}\"",
+                    relation.namespace,
+                    relation.name,
+                    column.name
+                )
+            })?;
+            if remote_to_local[..remote].contains(&local) {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "subscription relation \"{}.{}\" repeats column \"{}\"",
+                    relation.namespace,
+                    relation.name,
+                    column.name
+                ));
+            }
+            let local_column = &definition.columns()[local];
+            let local_type = storage
+                .declared_column_type(local_column, txid)?
+                .replication_oid();
+            if column.type_oid != local_type as u32 || column.type_modifier != local_column.type_mod
+            {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "subscription relation \"{}.{}\" column \"{}\" does not match local type",
+                    relation.namespace,
+                    relation.name,
+                    column.name
+                ));
+            }
+            remote_to_local[remote] = local;
+            if column.key {
+                key_remote_to_local[key_count] = local;
+                key_count += 1;
+            }
+        }
+        let binding = RelationBinding {
+            relation_id: relation.id,
+            table_slot,
+            remote_to_local,
+            column_count: relation.columns().len(),
+            key_remote_to_local,
+            key_count,
+        };
+        if let Some(existing) = self
+            .bindings
+            .iter_mut()
+            .find(|existing| existing.relation_id == relation.id)
+        {
+            *existing = binding;
+            return Ok(());
+        }
+        self.bindings.push(binding).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription relation cache exceeds {} entries",
+                self.bindings.capacity()
+            )
+        })
+    }
+
+    pub fn binding(&self, relation_id: u32) -> Result<RelationBinding, SqlError> {
+        self.bindings
+            .iter()
+            .copied()
+            .find(|binding| binding.relation_id == relation_id)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "subscription data references unknown relation {}",
+                    relation_id
+                )
+            })
+    }
+
+    pub fn clear(&mut self) {
+        self.bindings.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteTransaction {
+    Idle,
+    Applying { final_lsn: u64 },
+    Skipping { final_lsn: u64 },
+}
+
+/// Result of applying one receive frame.  The replication transport may emit
+/// a status update only for this proof, which is produced after the local
+/// commit and durable subscription frontier succeed together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyResult {
+    None,
+    Acknowledge {
+        flushed_lsn: u64,
+        reply_requested: bool,
+    },
+}
+
+/// Startup-bounded, single-subscription pgoutput apply state.  It owns the
+/// local transaction, relation cache, and scratch arena so a remote commit is
+/// either entirely applied and durable or entirely rolled back.
+pub struct SubscriptionApply {
+    name: SqlName,
+    txn: TxnState,
+    guc: GucState,
+    relations: RelationMap,
+    arena: Arena,
+    remote: RemoteTransaction,
+    confirmed_lsn: u64,
+}
+
+impl SubscriptionApply {
+    pub const fn budget_bytes(
+        relation_capacity: usize,
+        txn_rows: usize,
+        arena_bytes: usize,
+    ) -> usize {
+        relation_capacity * core::mem::size_of::<RelationBinding>()
+            + TxnState::budget_bytes(txn_rows)
+            + arena_bytes
+    }
+
+    pub fn new(
+        budget: &mut Budget,
+        name: SqlName,
+        relation_capacity: usize,
+        txn_rows: usize,
+        arena_bytes: usize,
+        confirmed_lsn: u64,
+    ) -> Result<Self, BudgetError> {
+        Ok(Self {
+            name,
+            txn: TxnState::new(budget, txn_rows)?,
+            guc: GucState::new(),
+            relations: RelationMap::new(budget, relation_capacity)?,
+            arena: Arena::new(budget, "subscription_apply_arena", arena_bytes)?,
+            remote: RemoteTransaction::Idle,
+            confirmed_lsn,
+        })
+    }
+
+    pub fn confirmed_lsn(&self) -> u64 {
+        self.confirmed_lsn
+    }
+
+    /// Rebinds a preallocated worker after its former transport has stopped.
+    /// The worker must be idle, so no transaction, row lock, relation mapping,
+    /// or arena reference can cross a subscription identity change.
+    pub fn bind(&mut self, name: SqlName, confirmed_lsn: u64) -> Result<(), SqlError> {
+        if self.remote != RemoteTransaction::Idle || self.txn.is_active() {
+            return Err(Self::protocol_error(
+                "subscription worker cannot change binding during a remote transaction",
+            ));
+        }
+        self.name = name;
+        self.confirmed_lsn = confirmed_lsn;
+        self.relations.clear();
+        self.arena.reset();
+        Ok(())
+    }
+
+    pub fn unbind(&mut self) {
+        debug_assert_eq!(self.remote, RemoteTransaction::Idle);
+        debug_assert!(!self.txn.is_active());
+        self.name = SqlName::EMPTY;
+        self.confirmed_lsn = 0;
+        self.relations.clear();
+        self.arena.reset();
+    }
+
+    /// Stops a worker at a transport boundary.  Losing a publisher connection
+    /// must roll back its incomplete remote transaction before the fixed slot
+    /// can be rebound and replayed from the durable acknowledgement frontier.
+    pub fn stop(&mut self, engine: &mut crate::sql::Engine) {
+        self.abort(engine);
+    }
+
+    fn protocol_error(message: &'static str) -> SqlError {
+        sql_err!(sqlstate::PROTOCOL_VIOLATION, "{message}")
+    }
+
+    fn abort(&mut self, engine: &mut crate::sql::Engine) {
+        if self.txn.is_active() {
+            engine.rollback_txn(&mut self.txn, &self.guc);
+        }
+        self.remote = RemoteTransaction::Idle;
+        self.arena.reset();
+    }
+
+    fn apply_message(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        frame_end_lsn: u64,
+        message: Message<'_>,
+    ) -> Result<ApplyResult, SqlError> {
+        match message {
+            Message::Begin { final_lsn, .. } => {
+                if self.remote != RemoteTransaction::Idle {
+                    return Err(Self::protocol_error(
+                        "subscription received BEGIN before the prior transaction committed",
+                    ));
+                }
+                self.arena.reset();
+                if final_lsn <= self.confirmed_lsn {
+                    self.remote = RemoteTransaction::Skipping { final_lsn };
+                } else {
+                    engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                    self.remote = RemoteTransaction::Applying { final_lsn };
+                }
+                Ok(ApplyResult::None)
+            }
+            Message::Commit {
+                commit_lsn,
+                end_lsn,
+            } => match self.remote {
+                // XLogData's walEnd is the publisher's current WAL frontier,
+                // which may be ahead of this transaction's commit end.
+                RemoteTransaction::Applying { final_lsn }
+                    if commit_lsn == final_lsn && end_lsn <= frame_end_lsn =>
+                {
+                    if !engine.stage_subscription_advance(
+                        &mut self.txn,
+                        self.name.as_str(),
+                        end_lsn,
+                    )? {
+                        return Err(Self::protocol_error(
+                            "subscription received a non-monotonic commit after apply began",
+                        ));
+                    }
+                    engine.commit_txn(&mut self.txn, &self.guc)?;
+                    self.confirmed_lsn = end_lsn;
+                    self.remote = RemoteTransaction::Idle;
+                    self.arena.reset();
+                    Ok(ApplyResult::Acknowledge {
+                        flushed_lsn: end_lsn,
+                        reply_requested: false,
+                    })
+                }
+                RemoteTransaction::Skipping { final_lsn }
+                    if commit_lsn == final_lsn && end_lsn <= self.confirmed_lsn =>
+                {
+                    self.remote = RemoteTransaction::Idle;
+                    self.arena.reset();
+                    Ok(ApplyResult::Acknowledge {
+                        flushed_lsn: self.confirmed_lsn,
+                        reply_requested: false,
+                    })
+                }
+                _ => Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "subscription COMMIT is not valid for the active apply transaction (commit end {}, frame end {})",
+                    end_lsn,
+                    frame_end_lsn
+                )),
+            },
+            Message::Relation(relation) => {
+                engine.register_subscription_relation(&mut self.relations, &self.txn, relation)?;
+                Ok(ApplyResult::None)
+            }
+            Message::Insert { relation_id, new } => {
+                if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
+                    return Ok(ApplyResult::None);
+                }
+                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                    return Err(Self::protocol_error(
+                        "subscription INSERT is outside BEGIN/COMMIT",
+                    ));
+                }
+                engine.apply_subscription_insert(
+                    &mut self.txn,
+                    self.relations.binding(relation_id)?,
+                    new,
+                    &self.arena,
+                )?;
+                Ok(ApplyResult::None)
+            }
+            Message::Update {
+                relation_id,
+                old,
+                new,
+            } => {
+                if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
+                    return Ok(ApplyResult::None);
+                }
+                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                    return Err(Self::protocol_error(
+                        "subscription UPDATE is outside BEGIN/COMMIT",
+                    ));
+                }
+                let old = old.ok_or_else(|| {
+                    Self::protocol_error("subscription UPDATE lacks a replica identity tuple")
+                })?;
+                engine.apply_subscription_update(
+                    &mut self.txn,
+                    self.relations.binding(relation_id)?,
+                    old,
+                    new,
+                    &self.arena,
+                    &self.guc,
+                )?;
+                Ok(ApplyResult::None)
+            }
+            Message::Delete { relation_id, old } => {
+                if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
+                    return Ok(ApplyResult::None);
+                }
+                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                    return Err(Self::protocol_error(
+                        "subscription DELETE is outside BEGIN/COMMIT",
+                    ));
+                }
+                engine.apply_subscription_delete(
+                    &mut self.txn,
+                    self.relations.binding(relation_id)?,
+                    old,
+                    &self.arena,
+                    &self.guc,
+                )?;
+                Ok(ApplyResult::None)
+            }
+            // Relation carries the complete OID/type-modifier contract used by
+            // row application.  A Type frame contains no relation membership
+            // or row state, so its successful typed decode has no local state
+            // transition to make.
+            Message::Type { .. } => Ok(ApplyResult::None),
+            Message::Truncate(truncate) => {
+                if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
+                    return Ok(ApplyResult::None);
+                }
+                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                    return Err(Self::protocol_error(
+                        "subscription TRUNCATE is outside BEGIN/COMMIT",
+                    ));
+                }
+                let mut tables = [0_usize; crate::sql::txn::MAX_TRUNCATE_TABLES];
+                if truncate.relation_ids().len() > tables.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "subscription TRUNCATE has {} tables, maximum is {}",
+                        truncate.relation_ids().len(),
+                        tables.len()
+                    ));
+                }
+                for (index, &relation_id) in truncate.relation_ids().iter().enumerate() {
+                    tables[index] = self.relations.binding(relation_id)?.table_slot();
+                }
+                engine.apply_subscription_truncate(
+                    &mut self.txn,
+                    &tables[..truncate.relation_ids().len()],
+                    truncate.cascade,
+                    truncate.restart_identity,
+                )?;
+                Ok(ApplyResult::None)
+            }
+        }
+    }
+
+    /// Consumes one fully decoded receive frame.  A failed frame aborts the
+    /// active local transaction before it escapes, so reconnect/replay starts
+    /// at the last acknowledged durable position.
+    pub fn receive(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        frame: CopyData<'_>,
+    ) -> Result<ApplyResult, SqlError> {
+        let result = match frame {
+            CopyData::XLogData {
+                end_lsn, message, ..
+            } => self.apply_message(engine, end_lsn, message),
+            CopyData::PrimaryKeepalive {
+                end_lsn,
+                reply_requested,
+            } => {
+                if end_lsn < self.confirmed_lsn {
+                    Err(Self::protocol_error(
+                        "publisher keepalive regressed behind acknowledged subscription progress",
+                    ))
+                } else {
+                    Ok(ApplyResult::Acknowledge {
+                        flushed_lsn: self.confirmed_lsn,
+                        reply_requested,
+                    })
+                }
+            }
+        };
+        if result.is_err() {
+            self.abort(engine);
+        }
+        result
+    }
+}

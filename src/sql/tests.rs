@@ -623,17 +623,27 @@ fn role_membership_controls_set_role_and_catalog_rows() {
 #[test]
 fn dropping_a_role_removes_memberships_transactionally() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let created = run_with(
         &mut engine,
         &mut budget,
         "CREATE ROLE dropped_parent; \
          CREATE ROLE dropped_member; \
          GRANT dropped_parent TO dropped_member",
     );
-    run_with(
+    assert!(
+        String::from_utf8_lossy(&created).contains("GRANT ROLE"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let created = run_with(
         &mut engine,
         &mut budget,
         "BEGIN; DROP ROLE dropped_member; ROLLBACK",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("DROP ROLE"),
+        "{}",
+        String::from_utf8_lossy(&created)
     );
     assert_eq!(
         data_rows(&run_with(
@@ -16628,21 +16638,25 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SUBSCRIPTION live_changes CONNECTION 'host=publisher' PUBLICATION changes",
+        "CREATE SUBSCRIPTION live_changes CONNECTION \
+         'host=publisher port=5432' \
+         PUBLICATION changes",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("pgoutput apply client"),
+        String::from_utf8_lossy(&rejected).contains("remote-slot creation and initial copy"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
     let named_slot = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SUBSCRIPTION named_slot_changes CONNECTION 'host=publisher' \
+        "CREATE SUBSCRIPTION named_slot_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION changes WITH (connect = false)",
     );
     assert!(
-        String::from_utf8_lossy(&named_slot).contains("publisher slot require the pgoutput"),
+        String::from_utf8_lossy(&named_slot)
+            .contains("disabled subscriptions require slot_name = NONE"),
         "{}",
         String::from_utf8_lossy(&named_slot)
     );
@@ -16661,7 +16675,8 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
         &mut engine,
         &mut budget,
         "BEGIN; \
-         CREATE SUBSCRIPTION archived_changes CONNECTION 'host=publisher port=5432' \
+         CREATE SUBSCRIPTION archived_changes CONNECTION \
+         'host=publisher port=5432' \
          PUBLICATION sales, inventory \
          WITH (connect = false, slot_name = NONE); \
          COMMIT",
@@ -16674,6 +16689,10 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
              FROM pg_subscription",
         )),
         ["archived_changes|f|host=publisher port=5432|NULL|{sales,inventory}"]
+    );
+    assert!(
+        engine.subscription_endpoint("archived_changes").is_none(),
+        "a disabled subscription keeps its PostgreSQL conninfo without claiming a local client endpoint"
     );
     run_with(
         &mut engine,
@@ -16729,14 +16748,16 @@ fn subscriptions_use_a_named_startup_capacity() {
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE SUBSCRIPTION first_subscription CONNECTION 'host=publisher' \
+        "CREATE SUBSCRIPTION first_subscription CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION first_publication \
          WITH (connect = false, slot_name = NONE)",
     );
     let second = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SUBSCRIPTION second_subscription CONNECTION 'host=publisher' \
+        "CREATE SUBSCRIPTION second_subscription CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION second_publication \
          WITH (connect = false, slot_name = NONE)",
     );
@@ -16744,6 +16765,450 @@ fn subscriptions_use_a_named_startup_capacity() {
         String::from_utf8_lossy(&second).contains("too many subscriptions (limit 1)"),
         "{}",
         String::from_utf8_lossy(&second)
+    );
+}
+
+#[test]
+fn enabled_subscription_has_one_complete_durable_worker_description() {
+    let config = test_config("enabled-subscription-runtime");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = publisher_slot)",
+    );
+    let runtime = engine
+        .subscription_runtime(0)
+        .expect("enabled subscription has a complete worker binding");
+    assert_eq!(runtime.name.as_str(), "apply_changes");
+    assert_eq!(runtime.slot.as_str(), "publisher_slot");
+    assert_eq!(
+        runtime.publications[..runtime.publication_count],
+        [SqlName::parse("changes").unwrap()]
+    );
+    assert_eq!(runtime.endpoint.application_name(), Some("apply_changes"));
+    assert_eq!(runtime.confirmed_lsn, 0);
+}
+
+#[test]
+fn alter_subscription_enablement_is_transactional_and_replayed() {
+    let config = test_config("alter-subscription-enable");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = publisher_slot)",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("CREATE SUBSCRIPTION"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER SUBSCRIPTION apply_changes DISABLE; \
+             SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'; \
+             ROLLBACK; SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'"
+        )),
+        ["f", "t"]
+    );
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER SUBSCRIPTION apply_changes DISABLE; \
+             SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'; \
+             COMMIT; SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'",
+    );
+    assert_eq!(
+        data_rows(&changed),
+        ["f", "f"],
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 27);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'"
+        )),
+        ["f"]
+    );
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "ALTER SUBSCRIPTION apply_changes ENABLE",
+    );
+    drop(replayed);
+    let mut final_budget = Budget::new(1 << 27);
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT subenabled FROM pg_subscription WHERE subname = 'apply_changes'"
+        )),
+        ["t"]
+    );
+}
+
+#[test]
+fn subscription_enablement_has_one_transactional_catalog_owner() {
+    let config = test_config("alter-subscription-concurrency");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = publisher_slot)",
+    );
+    let slot = engine
+        .storage
+        .subscription("apply_changes", 0)
+        .expect("subscription exists")
+        .0;
+    let guc = GucState::new();
+    let mut first = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    engine.begin_subscription_apply(&mut first, &guc);
+    assert!(matches!(
+        engine
+            .storage
+            .set_subscription_enabled(slot, false, first.txid)
+            .unwrap(),
+        crate::storage::SubscriptionEnabledChange::Changed { prior: None }
+    ));
+    let mut second = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    engine.begin_subscription_apply(&mut second, &guc);
+    let error = engine
+        .storage
+        .set_subscription_enabled(slot, true, second.txid)
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+    assert!(
+        engine
+            .storage
+            .subscription("apply_changes", second.txid)
+            .expect("subscription remains visible")
+            .1
+            .enabled_to(second.txid)
+    );
+    engine.storage.restore_subscription_enabled(slot, None);
+    engine.rollback_txn(&mut first, &guc);
+    engine.rollback_txn(&mut second, &guc);
+}
+
+#[test]
+fn subscription_progress_is_transactional_durable_and_idempotent() {
+    let config = test_config("subscription-progress-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    let guc = GucState::new();
+    let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    engine.begin_subscription_apply(&mut txn, &guc);
+    assert!(
+        engine
+            .stage_subscription_advance(&mut txn, "apply_changes", 41)
+            .unwrap()
+    );
+    engine.commit_txn(&mut txn, &guc).unwrap();
+    assert_eq!(
+        engine
+            .storage
+            .subscription("apply_changes", 0)
+            .expect("subscription remains visible")
+            .1
+            .confirmed_lsn,
+        41
+    );
+    engine.begin_subscription_apply(&mut txn, &guc);
+    assert!(
+        !engine
+            .stage_subscription_advance(&mut txn, "apply_changes", 41)
+            .unwrap()
+    );
+    engine.rollback_txn(&mut txn, &guc);
+    drop(engine);
+
+    let mut replay_budget = Budget::new(1 << 27);
+    let replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        replayed
+            .storage
+            .subscription("apply_changes", 0)
+            .expect("WAL replay restores the subscription")
+            .1
+            .confirmed_lsn,
+        41,
+        "the acknowledgement frontier is recovered with the local transaction"
+    );
+}
+
+#[test]
+fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
+    use crate::pg::pginput::copy_data;
+    use crate::pg::subscription_apply::{ApplyResult, SubscriptionApply};
+
+    fn frame(end_lsn: u64, plugin: &[u8]) -> [u8; 256] {
+        let mut frame = [0_u8; 256];
+        frame[0] = b'w';
+        frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
+        frame[25..25 + plugin.len()].copy_from_slice(plugin);
+        frame
+    }
+    fn receive(
+        apply: &mut SubscriptionApply,
+        engine: &mut Engine,
+        end_lsn: u64,
+        plugin: &[u8],
+    ) -> ApplyResult {
+        let bytes = frame(end_lsn, plugin);
+        let parsed = copy_data(&bytes[..25 + plugin.len()])
+            .unwrap_or_else(|error| panic!("invalid test pgoutput frame {error:?}: {plugin:?}"));
+        apply.receive(engine, parsed).unwrap()
+    }
+
+    let config = test_config("pgoutput-apply");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replicated (id int PRIMARY KEY, body text); \
+         CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        SqlName::parse("apply_changes").unwrap(),
+        8,
+        config.txn_rows,
+        1 << 16,
+        engine.subscription_confirmed_lsn("apply_changes").unwrap(),
+    )
+    .unwrap();
+    let relation = [
+        b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b'r', b'e', b'p', b'l', b'i',
+        b'c', b'a', b't', b'e', b'd', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0, 23, 255, 255, 255,
+        255, 0, b'b', b'o', b'd', b'y', 0, 0, 0, 0, 25, 255, 255, 255, 255,
+    ];
+    assert_eq!(
+        receive(&mut apply, &mut engine, 1, &relation),
+        ApplyResult::None
+    );
+    let mut begin = [0_u8; 21];
+    begin[0] = b'B';
+    begin[8] = 40;
+    begin[20] = 1;
+    receive(&mut apply, &mut engine, 40, &begin);
+    let insert = [
+        b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 5, b'f', b'i', b'r',
+        b's', b't',
+    ];
+    receive(&mut apply, &mut engine, 40, &insert);
+    let mut commit = [0_u8; 26];
+    commit[0] = b'C';
+    commit[9] = 40;
+    commit[17] = 41;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 41, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 41,
+            reply_requested: false
+        }
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        )),
+        ["1|first"]
+    );
+    assert_eq!(apply.confirmed_lsn(), 41);
+
+    begin[8] = 80;
+    begin[20] = 2;
+    receive(&mut apply, &mut engine, 80, &begin);
+    let update = [
+        b'U', 0, 0, 0, 1, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0, 1,
+        b'1', b't', 0, 0, 0, 6, b's', b'e', b'c', b'o', b'n', b'd',
+    ];
+    receive(&mut apply, &mut engine, 80, &update);
+    commit[9] = 80;
+    commit[17] = 81;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 81, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 81,
+            reply_requested: false
+        }
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        )),
+        ["1|second"]
+    );
+
+    begin[8] = 100;
+    begin[20] = 3;
+    receive(&mut apply, &mut engine, 100, &begin);
+    let delete = [b'D', 0, 0, 0, 1, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1'];
+    receive(&mut apply, &mut engine, 100, &delete);
+    commit[9] = 100;
+    commit[17] = 101;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 101, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 101,
+            reply_requested: false
+        }
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        ))
+        .is_empty()
+    );
+
+    // TRUNCATE is a row-set operation on the same local transaction as prior
+    // pgoutput changes; it must include rows inserted earlier in that remote
+    // transaction and advance only with its COMMIT.
+    begin[8] = 110;
+    begin[20] = 4;
+    receive(&mut apply, &mut engine, 110, &begin);
+    let temporary_insert = [
+        b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'2', b't', 0, 0, 0, 9, b't', b'e', b'm',
+        b'p', b'o', b'r', b'a', b'r', b'y',
+    ];
+    receive(&mut apply, &mut engine, 110, &temporary_insert);
+    let truncate = [b'T', 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    receive(&mut apply, &mut engine, 110, &truncate);
+    commit[9] = 110;
+    commit[17] = 111;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 111, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 111,
+            reply_requested: false
+        }
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        ))
+        .is_empty()
+    );
+
+    // A replayed remote transaction is parsed but cannot write a duplicate
+    // local row; it returns the already durable acknowledgement frontier.
+    begin[8] = 40;
+    begin[20] = 1;
+    receive(&mut apply, &mut engine, 40, &begin);
+    receive(&mut apply, &mut engine, 40, &insert);
+    commit[9] = 40;
+    commit[17] = 41;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 41, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 111,
+            reply_requested: false
+        }
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        ))
+        .is_empty()
+    );
+
+    // BEGIN and COMMIT name the same publisher commit.  A mismatched pair is
+    // not a different way to acknowledge a local write: it rolls the whole
+    // local transaction back and leaves the durable frontier unchanged.
+    begin[8] = 120;
+    begin[20] = 5;
+    receive(&mut apply, &mut engine, 120, &begin);
+    let rejected_insert = [
+        b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'2', b't', 0, 0, 0, 8, b'r', b'e', b'j',
+        b'e', b'c', b't', b'e', b'd',
+    ];
+    receive(&mut apply, &mut engine, 120, &rejected_insert);
+    commit[9] = 119;
+    commit[17] = 121;
+    let bytes = frame(121, &commit);
+    let parsed = copy_data(&bytes[..25 + commit.len()]).unwrap();
+    assert!(apply.receive(&mut engine, parsed).is_err());
+    assert_eq!(apply.confirmed_lsn(), 111);
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        ))
+        .is_empty()
+    );
+
+    begin[8] = 120;
+    begin[20] = 6;
+    receive(&mut apply, &mut engine, 120, &begin);
+    let durable_insert = [
+        b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'2', b't', 0, 0, 0, 7, b'd', b'u', b'r',
+        b'a', b'b', b'l', b'e',
+    ];
+    receive(&mut apply, &mut engine, 120, &durable_insert);
+    commit[9] = 120;
+    commit[17] = 121;
+    assert_eq!(
+        receive(&mut apply, &mut engine, 121, &commit),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 121,
+            reply_requested: false
+        }
+    );
+    drop(apply);
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 27);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT * FROM replicated"
+        )),
+        ["2|durable"]
+    );
+    assert_eq!(
+        replayed.subscription_confirmed_lsn("apply_changes"),
+        Some(121),
+        "a restart cannot replay committed rows without their matching acknowledgement frontier"
     );
 }
 

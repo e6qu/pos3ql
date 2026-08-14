@@ -96,6 +96,8 @@ const KIND_ALTER_DOMAIN_IDENTITY: u8 = 48;
 const KIND_RENAME_INDEX: u8 = 49;
 const KIND_CREATE_SUBSCRIPTION: u8 = 50;
 const KIND_DROP_SUBSCRIPTION: u8 = 51;
+const KIND_ADVANCE_SUBSCRIPTION: u8 = 52;
+const KIND_SET_SUBSCRIPTION_ENABLED: u8 = 53;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -103,7 +105,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_SUBSCRIPTION;
+const LAST_KIND: u8 = KIND_SET_SUBSCRIPTION_ENABLED;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -397,6 +399,17 @@ pub(crate) enum WalOp<'a> {
     },
     DropSubscription {
         name: &'a str,
+    },
+    /// The confirmed publisher position paired with the local transaction
+    /// that applied it.  Recovery must replay it after the transaction's row
+    /// images, never from a transport-side acknowledgement alone.
+    AdvanceSubscription {
+        name: &'a str,
+        confirmed_lsn: u64,
+    },
+    SetSubscriptionEnabled {
+        name: &'a str,
+        enabled: bool,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1265,6 +1278,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::RenamePublication { .. } => KIND_RENAME_PUBLICATION,
         WalOp::CreateSubscription { .. } => KIND_CREATE_SUBSCRIPTION,
         WalOp::DropSubscription { .. } => KIND_DROP_SUBSCRIPTION,
+        WalOp::AdvanceSubscription { .. } => KIND_ADVANCE_SUBSCRIPTION,
+        WalOp::SetSubscriptionEnabled { .. } => KIND_SET_SUBSCRIPTION_ENABLED,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1444,6 +1459,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + slot_name.len()
         }
         WalOp::DropSubscription { name } => 1 + name.len(),
+        WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8,
+        WalOp::SetSubscriptionEnabled { name, .. } => 1 + name.len() + 1,
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -1964,6 +1981,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, slot_name)
         }
         WalOp::DropSubscription { name } => name_bytes(buffer, name),
+        WalOp::AdvanceSubscription {
+            name,
+            confirmed_lsn,
+        } => name_bytes(buffer, name) && buffer.append(&confirmed_lsn.to_le_bytes()),
+        WalOp::SetSubscriptionEnabled { name, enabled } => {
+            name_bytes(buffer, name) && buffer.append(&[u8::from(*enabled)])
+        }
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
@@ -3093,6 +3117,25 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_SUBSCRIPTION => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSubscription { name })
+        }
+        KIND_ADVANCE_SUBSCRIPTION => {
+            let name = take_name(&mut at)?;
+            let confirmed_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            (at == payload.len()).then_some(WalOp::AdvanceSubscription {
+                name,
+                confirmed_lsn,
+            })
+        }
+        KIND_SET_SUBSCRIPTION_ENABLED => {
+            let name = take_name(&mut at)?;
+            let enabled = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetSubscriptionEnabled { name, enabled })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
         KIND_COMMIT => {

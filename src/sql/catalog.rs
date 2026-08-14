@@ -3568,7 +3568,7 @@ fn pg_subscription<'a>(
                 Datum::Int4(Storage::role_oid(
                     subscription.ownership.owner_to(txid) as usize
                 )),
-                Datum::Bool(subscription.enabled),
+                Datum::Bool(subscription.enabled_to(txid)),
                 Datum::Bool(false),
                 text("f", arena)?,
                 text("d", arena)?,

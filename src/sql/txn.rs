@@ -40,6 +40,7 @@ pub struct Savepoint {
     pub notify_mark: usize,
     pub notify_payload_mark: usize,
     pub listen_mark: usize,
+    pub subscription_advance_mark: usize,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -57,6 +58,7 @@ pub(crate) struct StatementMark {
     pub notifications: usize,
     pub notification_payload: usize,
     pub listen_ops: usize,
+    pub subscription_advances: usize,
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
@@ -137,6 +139,9 @@ pub struct TxnState {
     /// LISTEN/UNLISTEN performed in this transaction, applied to the shared
     /// registry at commit (discarded on rollback).
     pending_listen_ops: FixedVec<crate::sql::notify::ListenOp>,
+    /// Publisher positions staged with the local transaction that applied
+    /// them.  They are journaled immediately before the transaction marker.
+    subscription_advances: FixedVec<crate::storage::SubscriptionAdvance>,
 }
 
 /// How to undo one DDL statement.
@@ -185,6 +190,10 @@ pub(crate) enum DdlUndo {
     },
     SubscriptionCreated(u32),
     SubscriptionDropped(u32),
+    SubscriptionEnabled {
+        slot: u32,
+        prior: Option<crate::storage::PendingSubscriptionEnabled>,
+    },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.
@@ -277,6 +286,7 @@ pub(crate) enum DdlUndo {
 /// transaction-versioned inbound foreign key takes one undo entry.
 pub const MAX_TXN_DDL: usize = 64;
 pub const MAX_TXN_ANALYZE: usize = 64;
+const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StatisticsUndo {
@@ -284,6 +294,22 @@ pub(crate) struct StatisticsUndo {
 }
 
 impl TxnState {
+    pub const fn budget_bytes(capacity: usize) -> usize {
+        capacity * core::mem::size_of::<(u32, u64, PriorPending)>()
+            + MAX_TXN_DDL * core::mem::size_of::<TruncateEvent>()
+            + MAX_TRUNCATE_WAL_TABLE_BYTES
+            + MAX_TXN_DDL * core::mem::size_of::<DdlUndo>()
+            + MAX_TXN_ANALYZE * core::mem::size_of::<StatisticsUndo>()
+            + MAX_SAVEPOINTS * core::mem::size_of::<Savepoint>()
+            + crate::sql::notify::PER_TXN
+                * core::mem::size_of::<crate::sql::notify::BufferedNotify>()
+            + crate::sql::notify::PER_TXN_PAYLOAD_BYTES
+            + crate::sql::notify::LISTEN_OPS_PER_TXN
+                * core::mem::size_of::<crate::sql::notify::ListenOp>()
+            + SUBSCRIPTION_ADVANCES_PER_TXN
+                * core::mem::size_of::<crate::storage::SubscriptionAdvance>()
+    }
+
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             mode: TxnMode::Idle,
@@ -319,6 +345,11 @@ impl TxnState {
                 budget,
                 "txn_pending_listen_ops",
                 crate::sql::notify::LISTEN_OPS_PER_TXN,
+            )?,
+            subscription_advances: FixedVec::new(
+                budget,
+                "txn_subscription_advances",
+                SUBSCRIPTION_ADVANCES_PER_TXN,
             )?,
         })
     }
@@ -493,6 +524,35 @@ impl TxnState {
         &self.pending_listen_ops
     }
 
+    /// An apply transaction belongs to exactly one subscription. A later
+    /// frontier for that subscription replaces the prior one before WAL is
+    /// staged; a second identity is a protocol-boundary error.
+    pub(crate) fn record_subscription_advance(
+        &mut self,
+        advance: crate::storage::SubscriptionAdvance,
+    ) -> Result<(), SqlError> {
+        if let Some(existing) = self.subscription_advances.iter_mut().next() {
+            if existing.name() == advance.name() {
+                *existing = advance;
+                return Ok(());
+            }
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one local transaction cannot apply multiple subscriptions"
+            ));
+        }
+        self.subscription_advances.push(advance).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one local transaction cannot apply multiple subscriptions"
+            )
+        })
+    }
+
+    pub(crate) fn subscription_advances(&self) -> &[crate::storage::SubscriptionAdvance] {
+        &self.subscription_advances
+    }
+
     /// Discards this transaction's buffered notifications and listen ops (at
     /// commit after they are applied, and at rollback).
     pub fn clear_pending_notifications(&mut self) {
@@ -540,6 +600,7 @@ impl TxnState {
             notify_mark: self.pending_notifies.len(),
             notify_payload_mark: self.notify_payloads.mark(),
             listen_mark: self.pending_listen_ops.len(),
+            subscription_advance_mark: self.subscription_advances.len(),
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -562,6 +623,7 @@ impl TxnState {
             notifications: self.pending_notifies.len(),
             notification_payload: self.notify_payloads.mark(),
             listen_ops: self.pending_listen_ops.len(),
+            subscription_advances: self.subscription_advances.len(),
         }
     }
 
@@ -635,6 +697,12 @@ impl TxnState {
         }
     }
 
+    pub(crate) fn rewind_subscription_advances(&mut self, mark: usize) {
+        while self.subscription_advances.len() > mark {
+            self.subscription_advances.pop();
+        }
+    }
+
     pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
@@ -667,5 +735,6 @@ impl TxnState {
         self.pending_notifies.clear();
         self.notify_payloads.clear();
         self.pending_listen_ops.clear();
+        self.subscription_advances.clear();
     }
 }

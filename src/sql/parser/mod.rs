@@ -2863,6 +2863,17 @@ impl<'a> Parser<'a> {
         if self.eat_ident("publication")? {
             return self.alter_publication();
         }
+        if self.eat_ident("subscription")? {
+            let name = self.any_ident("subscription name")?;
+            let action = if self.eat_ident("enable")? {
+                AlterSubscriptionAction::Enable
+            } else if self.eat_ident("disable")? {
+                AlterSubscriptionAction::Disable
+            } else {
+                return Err(self.err_here("expected ENABLE or DISABLE after ALTER SUBSCRIPTION"));
+            };
+            return Ok(Stmt::AlterSubscription { name, action });
+        }
         if self.eat_ident("index")? {
             return self.alter_index();
         }

@@ -13,7 +13,7 @@ use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
     AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement, DomainCheck, Expr,
     PublicationOperations, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
-    RoutineTargetKind,
+    RoutineTargetKind, SubscriptionOptions, SubscriptionSlotName,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -95,6 +95,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("publication")? {
             return self.create_publication();
+        }
+        if self.eat_ident("subscription")? {
+            return self.create_subscription();
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
@@ -1117,6 +1120,130 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn create_subscription(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("subscription name")?;
+        self.expect_ident("connection")?;
+        let connection = self.str_literal("subscription connection string")?;
+        self.expect_ident("publication")?;
+        let mut names = [""; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == names.len() {
+                return Err(self.limit("subscription publications", names.len()));
+            }
+            names[count] = self.any_ident("publication name")?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let mut options = SubscriptionOptions {
+            connect: true,
+            enabled: true,
+            create_slot: true,
+            copy_data: true,
+            slot_name: SubscriptionSlotName::Default,
+        };
+        if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            let mut seen_connect = false;
+            let mut seen_enabled = false;
+            let mut seen_create_slot = false;
+            let mut seen_copy_data = false;
+            let mut seen_slot_name = false;
+            loop {
+                let key = self.any_ident("subscription option")?;
+                if key.eq_ignore_ascii_case("connect") {
+                    let value = self.subscription_bool_option(key)?;
+                    if core::mem::replace(&mut seen_connect, true) {
+                        return Err(self.err_here("duplicate subscription option connect"));
+                    }
+                    options.connect = value;
+                } else if key.eq_ignore_ascii_case("enabled") {
+                    let value = self.subscription_bool_option(key)?;
+                    if core::mem::replace(&mut seen_enabled, true) {
+                        return Err(self.err_here("duplicate subscription option enabled"));
+                    }
+                    options.enabled = value;
+                } else if key.eq_ignore_ascii_case("create_slot") {
+                    let value = self.subscription_bool_option(key)?;
+                    if core::mem::replace(&mut seen_create_slot, true) {
+                        return Err(self.err_here("duplicate subscription option create_slot"));
+                    }
+                    options.create_slot = value;
+                } else if key.eq_ignore_ascii_case("copy_data") {
+                    let value = self.subscription_bool_option(key)?;
+                    if core::mem::replace(&mut seen_copy_data, true) {
+                        return Err(self.err_here("duplicate subscription option copy_data"));
+                    }
+                    options.copy_data = value;
+                } else if key.eq_ignore_ascii_case("slot_name") {
+                    if core::mem::replace(&mut seen_slot_name, true) {
+                        return Err(self.err_here("duplicate subscription option slot_name"));
+                    }
+                    self.expect_op("=")?;
+                    options.slot_name = if self.eat_ident("none")? {
+                        SubscriptionSlotName::None
+                    } else if let Tok::Str(value) = self.peeked {
+                        self.advance()?;
+                        SubscriptionSlotName::Named(value)
+                    } else {
+                        SubscriptionSlotName::Named(self.any_ident("subscription slot name")?)
+                    };
+                } else {
+                    return Err(self.err_here("subscription option is not implemented"));
+                }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+            if !options.connect {
+                if (seen_enabled && options.enabled)
+                    || (seen_create_slot && options.create_slot)
+                    || (seen_copy_data && options.copy_data)
+                {
+                    return Err(self.err_here(
+                        "connect = false requires enabled, create_slot, and copy_data to be false",
+                    ));
+                }
+                options.enabled = false;
+                options.create_slot = false;
+                options.copy_data = false;
+            }
+        }
+        if options.slot_name == SubscriptionSlotName::None
+            && (options.enabled || options.create_slot)
+        {
+            return Err(
+                self.err_here("slot_name = NONE requires enabled and create_slot to be false")
+            );
+        }
+        Ok(Stmt::CreateSubscription {
+            name,
+            connection,
+            publications: self.arena_slice(&names[..count])?,
+            options,
+        })
+    }
+
+    fn subscription_bool_option(&mut self, option: &str) -> Result<bool, ParseError> {
+        if !self.eat_op("=")? {
+            return Ok(true);
+        }
+        self.subscription_bool(option)
+    }
+
+    fn subscription_bool(&mut self, _option: &str) -> Result<bool, ParseError> {
+        let value = match self.peeked {
+            Tok::Ident("true" | "on") | Tok::Str("true" | "on" | "1") => true,
+            Tok::Ident("false" | "off") | Tok::Str("false" | "off" | "0") => false,
+            _ => return Err(self.err_here("subscription option requires a boolean value")),
+        };
+        self.advance()?;
+        Ok(value)
+    }
+
     /// `ALTER PUBLICATION name { SET (publish = ...) | { ADD | SET | DROP }
     /// TABLE table [, ...] }`.  The AST retains the operation distinction so
     /// execution cannot accidentally turn ADD or DROP into replacement.
@@ -1275,6 +1402,17 @@ impl<'a> Parser<'a> {
             }
             return Ok(Stmt::DropPublication {
                 names: self.arena_slice(&publication_names[..names.len()])?,
+                if_exists,
+            });
+        }
+        if self.eat_ident("subscription")? {
+            let (names, if_exists) = self.drop_targets("subscription name")?;
+            let mut subscription_names: [&str; MAX_LIST] = [""; MAX_LIST];
+            for (index, name) in names.iter().enumerate() {
+                subscription_names[index] = name.name;
+            }
+            return Ok(Stmt::DropSubscription {
+                names: self.arena_slice(&subscription_names[..names.len()])?,
                 if_exists,
             });
         }

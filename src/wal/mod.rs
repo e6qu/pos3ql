@@ -94,6 +94,8 @@ const KIND_DROP_ROUTINE: u8 = 46;
 const KIND_ALTER_ROUTINE_IDENTITY: u8 = 47;
 const KIND_ALTER_DOMAIN_IDENTITY: u8 = 48;
 const KIND_RENAME_INDEX: u8 = 49;
+const KIND_CREATE_SUBSCRIPTION: u8 = 50;
+const KIND_DROP_SUBSCRIPTION: u8 = 51;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -101,7 +103,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_RENAME_INDEX;
+const LAST_KIND: u8 = KIND_DROP_SUBSCRIPTION;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -383,6 +385,18 @@ pub(crate) enum WalOp<'a> {
     RenamePublication {
         name: &'a str,
         new_name: &'a str,
+    },
+    CreateSubscription {
+        name: &'a str,
+        owner: u16,
+        connection: &'a str,
+        publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
+        publication_count: usize,
+        enabled: bool,
+        slot_name: &'a str,
+    },
+    DropSubscription {
+        name: &'a str,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1249,6 +1263,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION,
         WalOp::SetPublicationOwner { .. } => KIND_SET_PUBLICATION_OWNER,
         WalOp::RenamePublication { .. } => KIND_RENAME_PUBLICATION,
+        WalOp::CreateSubscription { .. } => KIND_CREATE_SUBSCRIPTION,
+        WalOp::DropSubscription { .. } => KIND_DROP_SUBSCRIPTION,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1406,6 +1422,28 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + name.len() + 1 + 1 + 1 + table_count * 2 + schema_count,
         WalOp::SetPublicationOwner { name, .. } => 1 + name.len() + 2,
         WalOp::RenamePublication { name, new_name } => 1 + name.len() + 1 + new_name.len(),
+        WalOp::CreateSubscription {
+            name,
+            connection,
+            publications,
+            publication_count,
+            slot_name,
+            ..
+        } => {
+            1 + name.len()
+                + 2
+                + 2
+                + connection.len()
+                + 1
+                + publications[..*publication_count]
+                    .iter()
+                    .map(|name| 1 + name.as_str().len())
+                    .sum::<usize>()
+                + 1
+                + 1
+                + slot_name.len()
+        }
+        WalOp::DropSubscription { name } => 1 + name.len(),
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -1903,6 +1941,29 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::RenamePublication { name, new_name } => {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
+        WalOp::CreateSubscription {
+            name,
+            owner,
+            connection,
+            publications,
+            publication_count,
+            enabled,
+            slot_name,
+        } => {
+            connection.len() <= u16::MAX as usize
+                && *publication_count <= crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS
+                && name_bytes(buffer, name)
+                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&(connection.len() as u16).to_le_bytes())
+                && buffer.append(connection.as_bytes())
+                && buffer.append(&[*publication_count as u8])
+                && publications[..*publication_count]
+                    .iter()
+                    .all(|publication| name_bytes(buffer, publication.as_str()))
+                && buffer.append(&[u8::from(*enabled)])
+                && name_bytes(buffer, slot_name)
+        }
+        WalOp::DropSubscription { name } => name_bytes(buffer, name),
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
         WalOp::CreateReplicationSlot { name, restart_lsn } => {
             name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
@@ -2992,6 +3053,46 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenamePublication { name, new_name })
+        }
+        KIND_CREATE_SUBSCRIPTION => {
+            let name = take_name(&mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let connection_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let connection = core::str::from_utf8(payload.get(at..at + connection_len)?).ok()?;
+            at += connection_len;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            if count > crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS {
+                return None;
+            }
+            let mut publications =
+                [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+            for publication in &mut publications[..count] {
+                *publication = crate::storage::SqlName::parse(take_name(&mut at)?).ok()?;
+            }
+            let enabled = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let slot_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::CreateSubscription {
+                name,
+                owner,
+                connection,
+                publications,
+                publication_count: count,
+                enabled,
+                slot_name,
+            })
+        }
+        KIND_DROP_SUBSCRIPTION => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropSubscription { name })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
         KIND_COMMIT => {

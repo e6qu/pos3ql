@@ -319,6 +319,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
         | Stmt::DropPublication { .. }
+        | Stmt::CreateSubscription { .. }
+        | Stmt::AlterSubscription { .. }
+        | Stmt::DropSubscription { .. }
         | Stmt::CreateTableAs { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::DropMaterializedView { .. }
@@ -1986,6 +1989,12 @@ impl Engine {
                 DdlUndo::PublicationRenamed { slot, .. } => self
                     .storage
                     .commit_publication_rename(*slot as usize, txn.txid),
+                DdlUndo::SubscriptionCreated(slot) => {
+                    self.storage.commit_subscription_create(*slot as usize)
+                }
+                DdlUndo::SubscriptionDropped(slot) => {
+                    self.storage.commit_subscription_drop(*slot as usize)
+                }
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2197,6 +2206,12 @@ impl Engine {
             DdlUndo::PublicationRenamed { slot, prior } => self
                 .storage
                 .rollback_publication_rename(slot as usize, prior),
+            DdlUndo::SubscriptionCreated(slot) => {
+                self.storage.rollback_subscription_create(slot as usize)
+            }
+            DdlUndo::SubscriptionDropped(slot) => {
+                self.storage.rollback_subscription_drop(slot as usize, txid)
+            }
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
                 self.storage.rollback_matview_drop(slot as usize, txid);
@@ -5368,6 +5383,35 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateSubscription {
+                name,
+                connection,
+                publications,
+                options,
+            } => exec::create_subscription(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::CreateSubscriptionCommand {
+                    name,
+                    connection,
+                    publications,
+                    options: *options,
+                },
+                responder,
+            ),
+            Stmt::AlterSubscription { .. } => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "ALTER SUBSCRIPTION requires the pgoutput apply client"
+            ))),
+            Stmt::DropSubscription { names, if_exists } => exec::drop_subscription(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                responder,
+            ),
             Stmt::CreateTableAs {
                 name,
                 columns,
@@ -6974,6 +7018,33 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             storage.rename_publication(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
             storage.commit_publication_rename(slot, 0);
+        }
+        WalOp::CreateSubscription {
+            name,
+            owner,
+            connection,
+            publications,
+            publication_count,
+            enabled,
+            slot_name,
+        } => {
+            let slot = storage.create_subscription(
+                crate::storage::SubscriptionSpec {
+                    name: crate::storage::SqlName::parse(name)?,
+                    connection: crate::storage::SubscriptionConnInfo::parse(connection)?,
+                    publications: &publications[..publication_count],
+                    enabled,
+                    slot_name: crate::storage::SqlName::parse(slot_name)?,
+                },
+                0,
+            )?;
+            storage.restore_subscription_owner(slot, owner);
+            storage.commit_subscription_create(slot);
+        }
+        WalOp::DropSubscription { name } => {
+            if let Some(slot) = storage.drop_subscription(name, 0)? {
+                storage.commit_subscription_drop(slot);
+            }
         }
         WalOp::RenameIndex {
             schema,

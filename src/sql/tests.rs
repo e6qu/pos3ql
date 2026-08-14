@@ -8134,7 +8134,10 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
 
 #[test]
 fn row_trigger_new_assignments_are_typed_and_rechecked() {
-    let (mut engine, mut budget) = test_engine();
+    let mut config = test_config("row-trigger-body");
+    config.max_tables = 16;
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -8170,6 +8173,30 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+
+    let foreign_key = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_body_parent (id integer PRIMARY KEY);
+         INSERT INTO trigger_body_parent VALUES (1), (2);
+         CREATE TABLE trigger_body_child (
+           id integer PRIMARY KEY,
+           parent_id integer REFERENCES trigger_body_parent(id)
+         );
+         CREATE FUNCTION advance_parent() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.parent_id := NEW.parent_id + 1; RETURN NEW; END';
+         CREATE TRIGGER advance_parent_before_insert BEFORE INSERT ON trigger_body_child
+           FOR EACH ROW EXECUTE FUNCTION advance_parent();
+         INSERT INTO trigger_body_child VALUES (1, 1);
+         SELECT parent_id FROM trigger_body_child;",
+    );
+    assert_eq!(data_rows(&foreign_key), ["2"]);
+    let foreign_key_rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_body_child VALUES (2, 2)",
+    );
+    assert!(String::from_utf8_lossy(&foreign_key_rejected).contains("23503"));
 
     let old_value = run_with(
         &mut engine,
@@ -8257,7 +8284,11 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            FOR EACH ROW EXECUTE FUNCTION after_mutation();
          INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
     );
-    assert!(String::from_utf8_lossy(&unsupported).contains("0A000"));
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported)
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

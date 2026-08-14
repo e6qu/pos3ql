@@ -5743,6 +5743,180 @@ pub fn drop_publication(
     Ok(Ok(responder.command_complete("DROP PUBLICATION")?))
 }
 
+/// Stores a deliberately disabled subscription. An enabled subscription needs
+/// the bounded pgoutput apply client; accepting it before that client exists
+/// would create a catalog entry that falsely promises replication.
+#[derive(Clone, Copy)]
+pub struct CreateSubscriptionCommand<'a> {
+    pub name: &'a str,
+    pub connection: &'a str,
+    pub publications: &'a [&'a str],
+    pub options: crate::sql::ast::SubscriptionOptions<'a>,
+}
+
+pub fn create_subscription(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    command: CreateSubscriptionCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let CreateSubscriptionCommand {
+        name,
+        connection,
+        publications,
+        options,
+    } = command;
+    if options.connect || options.enabled || options.create_slot || options.copy_data {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enabled subscriptions require the pgoutput apply client"
+        ));
+    }
+    if options.slot_name != crate::sql::ast::SubscriptionSlotName::None {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "subscriptions with a publisher slot require the pgoutput apply client"
+        ));
+    }
+    let role = match storage.current_role_slot(txn.txid) {
+        Some(role) => role,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
+    };
+    if !storage.role(role).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create subscriptions"
+        ));
+    }
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let connection = match crate::storage::SubscriptionConnInfo::parse(connection) {
+        Ok(connection) => connection,
+        Err(error) => return sql_fail(error),
+    };
+    let mut publication_names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+    if publications.len() > publication_names.len() {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many publications in subscription (limit {})",
+            publication_names.len()
+        ));
+    }
+    for (index, publication) in publications.iter().enumerate() {
+        let publication = match SqlName::parse(publication) {
+            Ok(publication) => publication,
+            Err(error) => return sql_fail(error),
+        };
+        if publication_names[..index].contains(&publication) {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "publication \"{}\" is listed more than once",
+                publication.as_str()
+            ));
+        }
+        publication_names[index] = publication;
+    }
+    let slot_name = SqlName::EMPTY;
+    let slot = match storage.create_subscription(
+        crate::storage::SubscriptionSpec {
+            name,
+            connection,
+            publications: &publication_names[..publications.len()],
+            enabled: false,
+            slot_name,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let owner = storage
+        .subscription(name.as_str(), txn.txid)
+        .expect("new subscription is visible to its creating transaction")
+        .1
+        .ownership
+        .owner_to(txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateSubscription {
+            name: name.as_str(),
+            owner,
+            connection: connection.as_str(),
+            publications: publication_names,
+            publication_count: publications.len(),
+            enabled: false,
+            slot_name: slot_name.as_str(),
+        },
+    ) {
+        storage.rollback_subscription_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionCreated(slot as u32)) {
+        storage.rollback_subscription_create(slot);
+        return sql_fail(error);
+    }
+    Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
+}
+
+pub fn drop_subscription(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    names: &[&str],
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some((slot, _)) = storage.subscription(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "subscription \"{}\" does not exist, skipping", name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "subscription \"{}\" does not exist",
+                name
+            ));
+        };
+        if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
+            return sql_fail(error);
+        }
+        let Some(slot) = (match storage.drop_subscription(name, txn.txid) {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
+        }) else {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "subscription disappeared before DROP SUBSCRIPTION completed"
+            ));
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropSubscription { name }) {
+            storage.rollback_subscription_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionDropped(slot as u32)) {
+            storage.rollback_subscription_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    Ok(Ok(responder.command_complete("DROP SUBSCRIPTION")?))
+}
+
 /// Applies one fully parsed publication definition change.  The storage layer
 /// stages it by transaction id; WAL carries the complete resulting definition
 /// so recovery has no dependence on the prior catalog image.

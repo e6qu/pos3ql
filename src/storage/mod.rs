@@ -30,6 +30,41 @@ pub(crate) use rowenc::MAX_COLUMNS;
 /// instead of permitting an unencodable 256th member.
 pub(crate) const MAX_PUBLICATION_TABLES: usize = u8::MAX as usize;
 
+/// A subscription's publication list is part of its startup-bounded durable
+/// state, rather than an unbounded connection-side string.
+pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = 16;
+pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
+
+/// A bounded, nonempty connection-info value. SQL and WAL must construct this
+/// before durable catalog state is changed, so truncation and NUL bytes cannot
+/// become a deferred runtime connection failure.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionConnInfo(StackStr<SUBSCRIPTION_CONNINFO_BYTES>);
+
+impl SubscriptionConnInfo {
+    pub(crate) fn parse(value: &str) -> Result<Self, SqlError> {
+        if value.is_empty() || value.as_bytes().contains(&0) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "subscription connection string must be nonempty and contain no NUL byte"
+            ));
+        }
+        let value = StackStr::from_str(value);
+        if value.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription connection string exceeds {} bytes",
+                SUBSCRIPTION_CONNINFO_BYTES
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// Rows handed from the durable merge cursor to the executor. The fixed batch
 /// boundary lets one resident SST block feed a bounded scan step rather than
 /// crossing the storage/executor seam once per row.
@@ -1816,6 +1851,37 @@ pub(crate) struct ReplicationSlotDef {
     pub live: bool,
 }
 
+/// A logical-replication subscription. Connection information and publication
+/// names are retained as separate typed fields so the later apply client never
+/// has to reparse SQL source or infer an omitted publication list.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionDef {
+    pub created_at: u64,
+    pub name: SqlName,
+    pub connection: SubscriptionConnInfo,
+    pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+    pub publication_count: usize,
+    pub enabled: bool,
+    pub slot_name: SqlName,
+    pub ownership: Ownership,
+    pub ddl_state: CatalogDdlState,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionSpec<'a> {
+    pub name: SqlName,
+    pub connection: SubscriptionConnInfo,
+    pub publications: &'a [SqlName],
+    pub enabled: bool,
+    pub slot_name: SqlName,
+}
+
+impl SubscriptionDef {
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+}
+
 /// A validated slot acknowledgement, ready to become durable.
 ///
 /// Constructing this proof checks the live slot and its monotonic cursor before
@@ -3303,6 +3369,7 @@ pub struct Storage {
     routines: FixedVec<RoutineDef>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
+    subscriptions: FixedVec<SubscriptionDef>,
     view_dependencies: FixedVec<StoredQueryDependencies>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -3889,6 +3956,7 @@ impl Storage {
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<IndexDef>())
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
+            + config.max_subscriptions * size_of::<SubscriptionDef>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
@@ -4032,6 +4100,23 @@ impl Storage {
                     live: false,
                 })
                 .expect("sized to max_replication_slots");
+        }
+        let mut subscriptions = FixedVec::new(budget, "subscriptions", config.max_subscriptions)?;
+        for _ in 0..config.max_subscriptions {
+            subscriptions
+                .push(SubscriptionDef {
+                    created_at: 0,
+                    name: SqlName::EMPTY,
+                    connection: SubscriptionConnInfo::parse("disabled")
+                        .expect("static subscription placeholder is valid"),
+                    publications: [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS],
+                    publication_count: 0,
+                    enabled: false,
+                    slot_name: SqlName::EMPTY,
+                    ownership: Ownership::BOOTSTRAP,
+                    ddl_state: CatalogDdlState::Absent,
+                })
+                .expect("sized to max_subscriptions");
         }
         let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
         for _ in 0..config.max_tables {
@@ -4212,6 +4297,7 @@ impl Storage {
             routines,
             publications,
             replication_slots,
+            subscriptions,
             view_dependencies,
             matviews,
             matview_dependencies,
@@ -10402,6 +10488,146 @@ impl Storage {
         {
             slot.active = false;
         }
+    }
+
+    pub(crate) fn subscriptions_with_slots_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &SubscriptionDef)> {
+        self.subscriptions
+            .iter()
+            .enumerate()
+            .filter(move |(_, subscription)| subscription.visible_to(txid))
+    }
+
+    pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, &SubscriptionDef)> {
+        self.subscriptions_with_slots_visible_to(txid)
+            .find(|(_, subscription)| subscription.name.as_str() == name)
+    }
+
+    pub(crate) fn create_subscription(
+        &mut self,
+        spec: SubscriptionSpec<'_>,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let owner = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if spec.publications.is_empty() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "CREATE SUBSCRIPTION requires at least one publication"
+            ));
+        }
+        if spec.publications.len() > MAX_SUBSCRIPTION_PUBLICATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many publications in subscription (limit {})",
+                MAX_SUBSCRIPTION_PUBLICATIONS
+            ));
+        }
+        if self
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.visible_to(txid) && subscription.name == spec.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "subscription \"{}\" already exists",
+                spec.name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .subscriptions
+            .iter()
+            .position(|subscription| subscription.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many subscriptions (limit {})",
+                self.subscriptions.len()
+            ));
+        };
+        let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
+        publications[..spec.publications.len()].copy_from_slice(spec.publications);
+        self.catalog_seq += 1;
+        self.subscriptions[slot] = SubscriptionDef {
+            created_at: self.catalog_seq,
+            name: spec.name,
+            connection: spec.connection,
+            publications,
+            publication_count: spec.publications.len(),
+            enabled: spec.enabled,
+            slot_name: spec.slot_name,
+            ownership: Ownership {
+                owner: owner as u16,
+                pending: None,
+            },
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn drop_subscription(
+        &mut self,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        let Some(slot) = self.subscriptions.iter().position(|subscription| {
+            subscription.visible_to(txid) && subscription.name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.drop_by(txid);
+        Ok(Some(slot))
+    }
+
+    pub(crate) fn require_subscription_owner(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let owner = self.subscriptions[slot].ownership.owner_to(txid) as usize;
+        if self.role(role).attributes_to(txid).superuser || role == owner {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of subscription {}",
+            self.subscriptions[slot].name.as_str()
+        ))
+    }
+
+    pub(crate) fn commit_subscription_create(&mut self, slot: usize) {
+        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn restore_subscription_owner(&mut self, slot: usize, owner: u16) {
+        self.subscriptions[slot].ownership = Ownership {
+            owner,
+            pending: None,
+        };
+    }
+
+    pub(crate) fn commit_subscription_drop(&mut self, slot: usize) {
+        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_subscription_create(&mut self, slot: usize) {
+        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn rollback_subscription_drop(&mut self, slot: usize, txid: u32) {
+        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub fn create_publication(

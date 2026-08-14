@@ -95,7 +95,7 @@ CREATE SCHEMA	partial	37_schemas.sql
 CREATE SEQUENCE	complete	54_sequence.sql
 CREATE SERVER	missing	-
 CREATE STATISTICS	missing	-
-CREATE SUBSCRIPTION	missing	-
+CREATE SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 CREATE TABLE	partial	14_surface.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
 CREATE TABLESPACE	missing	-
@@ -144,7 +144,7 @@ DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql
 DROP SERVER	missing	-
 DROP STATISTICS	missing	-
-DROP SUBSCRIPTION	missing	-
+DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 DROP TABLE	complete	14_surface.sql
 DROP TABLESPACE	missing	-
 DROP TEXT SEARCH CONFIGURATION	missing	-

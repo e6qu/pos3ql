@@ -16621,6 +16621,133 @@ fn publications_are_transactional_and_catalog_visible() {
 }
 
 #[test]
+fn disabled_subscriptions_are_durable_catalog_objects() {
+    let config = test_config("subscription-catalog-replay");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION live_changes CONNECTION 'host=publisher' PUBLICATION changes",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("pgoutput apply client"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let named_slot = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION named_slot_changes CONNECTION 'host=publisher' \
+         PUBLICATION changes WITH (connect = false)",
+    );
+    assert!(
+        String::from_utf8_lossy(&named_slot).contains("publisher slot require the pgoutput"),
+        "{}",
+        String::from_utf8_lossy(&named_slot)
+    );
+    let contradictory = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION contradictory_changes CONNECTION 'host=publisher' \
+         PUBLICATION changes WITH (connect = false, enabled = true)",
+    );
+    assert!(
+        String::from_utf8_lossy(&contradictory).contains("connect = false requires"),
+        "{}",
+        String::from_utf8_lossy(&contradictory)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE SUBSCRIPTION archived_changes CONNECTION 'host=publisher port=5432' \
+         PUBLICATION sales, inventory \
+         WITH (connect = false, slot_name = NONE); \
+         COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT subname, subenabled, subconninfo, subslotname, subpublications \
+             FROM pg_subscription",
+        )),
+        ["archived_changes|f|host=publisher port=5432|NULL|{sales,inventory}"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP SUBSCRIPTION archived_changes; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_subscription",
+        )),
+        ["1"]
+    );
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 27);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT subname, subenabled, subconninfo, subslotname, subpublications \
+             FROM pg_subscription",
+        )),
+        ["archived_changes|f|host=publisher port=5432|NULL|{sales,inventory}"],
+        "the fixed subscription state and its publication identities survive WAL replay"
+    );
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "DROP SUBSCRIPTION archived_changes",
+    );
+    drop(replayed);
+    let mut dropped_budget = Budget::new(1 << 27);
+    let mut dropped = Engine::new(&config, &mut dropped_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut dropped,
+            &mut dropped_budget,
+            "SELECT count(*) FROM pg_subscription",
+        )),
+        ["0"],
+        "DROP SUBSCRIPTION survives WAL replay rather than reviving catalog state"
+    );
+}
+
+#[test]
+fn subscriptions_use_a_named_startup_capacity() {
+    let mut config = test_config("subscription-capacity");
+    config.max_subscriptions = 1;
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION first_subscription CONNECTION 'host=publisher' \
+         PUBLICATION first_publication \
+         WITH (connect = false, slot_name = NONE)",
+    );
+    let second = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION second_subscription CONNECTION 'host=publisher' \
+         PUBLICATION second_publication \
+         WITH (connect = false, slot_name = NONE)",
+    );
+    assert!(
+        String::from_utf8_lossy(&second).contains("too many subscriptions (limit 1)"),
+        "{}",
+        String::from_utf8_lossy(&second)
+    );
+}
+
+#[test]
 fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
     let config = test_config("publication-alter-replay");
     let mut budget = Budget::new(1 << 27);

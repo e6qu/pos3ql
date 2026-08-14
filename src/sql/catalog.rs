@@ -349,6 +349,7 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
         "pg_extension" => 3079,
         "pg_default_acl" => 826,
         "pg_replication_slots" => 121,
+        "pg_subscription" => 6107,
         "pg_transform" => 3576,
         _ => return None,
     })
@@ -578,37 +579,7 @@ pub fn synthesize<'a>(
         (false, "pg_publication_namespace") => pg_publication_namespace(storage, txid, arena),
         (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
         (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
-        (false, "pg_subscription") => finish(
-            def_of(
-                "pg_subscription",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("subdbid", ColType::Int4),
-                    ("subskiplsn", ColType::Text),
-                    ("subname", ColType::Name),
-                    ("subowner", ColType::Int4),
-                    ("subenabled", ColType::Bool),
-                    ("subbinary", ColType::Bool),
-                    ("substream", ColType::Bpchar),
-                    ("subtwophasestate", ColType::Bpchar),
-                    ("subdisableonerr", ColType::Bool),
-                    ("subpasswordrequired", ColType::Bool),
-                    ("subrunasowner", ColType::Bool),
-                    ("subfailover", ColType::Bool),
-                    ("subconninfo", ColType::Text),
-                    ("subslotname", ColType::Name),
-                    ("subsynccommit", ColType::Text),
-                    (
-                        "subpublications",
-                        ColType::Array(super::types::ArrElem::Text),
-                    ),
-                    ("suborigin", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_subscription") => pg_subscription(storage, txid, arena),
         (false, "pg_subscription_rel") => finish(
             def_of(
                 "pg_subscription_rel",
@@ -3526,6 +3497,94 @@ fn pg_replication_slots<'a>(
                 Datum::Null,
                 text(restart_lsn.as_str(), arena)?,
                 text(confirmed_lsn.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_subscription<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_subscription",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("subdbid", ColType::Int4),
+            ("subskiplsn", ColType::Text),
+            ("subname", ColType::Name),
+            ("subowner", ColType::Int4),
+            ("subenabled", ColType::Bool),
+            ("subbinary", ColType::Bool),
+            ("substream", ColType::Bpchar),
+            ("subtwophasestate", ColType::Bpchar),
+            ("subdisableonerr", ColType::Bool),
+            ("subpasswordrequired", ColType::Bool),
+            ("subrunasowner", ColType::Bool),
+            ("subfailover", ColType::Bool),
+            ("subconninfo", ColType::Text),
+            ("subslotname", ColType::Name),
+            ("subsynccommit", ColType::Text),
+            (
+                "subpublications",
+                ColType::Array(super::types::ArrElem::Text),
+            ),
+            ("suborigin", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_subscription exceeds {} rows",
+                rows.len()
+            ));
+        }
+        let mut publications = [Datum::Null; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+        for (index, publication) in subscription.publications[..subscription.publication_count]
+            .iter()
+            .enumerate()
+        {
+            publications[index] = text(publication.as_str(), arena)?;
+        }
+        let publications = Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(&publications[..subscription.publication_count], arena)?,
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(6107),
+                Datum::Int4(FIRST_USER_OID + 95_000 + subscription.created_at as i32),
+                Datum::Int4(5),
+                Datum::Null,
+                text(subscription.name.as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(
+                    subscription.ownership.owner_to(txid) as usize
+                )),
+                Datum::Bool(subscription.enabled),
+                Datum::Bool(false),
+                text("f", arena)?,
+                text("d", arena)?,
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text(subscription.connection.as_str(), arena)?,
+                if subscription.slot_name == crate::storage::SqlName::EMPTY {
+                    Datum::Null
+                } else {
+                    text(subscription.slot_name.as_str(), arena)?
+                },
+                text("off", arena)?,
+                publications,
+                text("any", arena)?,
             ],
             arena,
         )?;

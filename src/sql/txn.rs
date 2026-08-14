@@ -183,6 +183,8 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingPublicationName>,
     },
+    SubscriptionCreated(u32),
+    SubscriptionDropped(u32),
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.

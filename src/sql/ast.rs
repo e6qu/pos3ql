@@ -282,6 +282,25 @@ pub enum Stmt<'a> {
         names: &'a [&'a str],
         if_exists: bool,
     },
+    /// CREATE SUBSCRIPTION name CONNECTION 'conninfo' PUBLICATION name [, ...].
+    /// Option states are carried explicitly so execution cannot conflate a
+    /// PostgreSQL default with an option the client supplied.
+    CreateSubscription {
+        name: &'a str,
+        connection: &'a str,
+        publications: &'a [&'a str],
+        options: SubscriptionOptions<'a>,
+    },
+    /// ALTER SUBSCRIPTION name ENABLE | DISABLE.
+    AlterSubscription {
+        name: &'a str,
+        action: AlterSubscriptionAction,
+    },
+    /// DROP SUBSCRIPTION [IF EXISTS] name [, ...].
+    DropSubscription {
+        names: &'a [&'a str],
+        if_exists: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -580,6 +599,34 @@ pub struct PublicationOperations {
     pub update: bool,
     pub delete: bool,
     pub truncate: bool,
+}
+
+/// The creation options that determine whether a subscriber must make a
+/// remote connection or create a publisher slot. The defaults are PostgreSQL
+/// syntax defaults, captured before execution rather than inferred later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionOptions<'a> {
+    pub connect: bool,
+    pub enabled: bool,
+    pub create_slot: bool,
+    pub copy_data: bool,
+    pub slot_name: SubscriptionSlotName<'a>,
+}
+
+/// The publisher-slot association is distinct from its textual spelling.
+/// `NONE` is the only subscription form pos3ql can manage locally before an
+/// apply client owns publisher communication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionSlotName<'a> {
+    Default,
+    None,
+    Named(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterSubscriptionAction {
+    Enable,
+    Disable,
 }
 
 /// The validated state change requested by `ALTER PUBLICATION`.  Membership

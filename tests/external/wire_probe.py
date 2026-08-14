@@ -1066,6 +1066,32 @@ def has_sqlstate(messages, state):
     return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
 
 
+def test_row_trigger_body_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_trigger_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_trigger_audit (id integer, observed integer); "
+        "CREATE FUNCTION wire_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN NEW.value := NEW.value + 1; INSERT INTO wire_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END'; "
+        "CREATE TRIGGER wire_trigger BEFORE INSERT ON wire_trigger_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_trigger_fn(); "
+        "INSERT INTO wire_trigger_target VALUES (1, 4)",
+    )
+    check("raw wire: trigger body setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: trigger assignment is visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_trigger_target")) == "5",
+    )
+    check(
+        "raw wire: trigger-side insert is visible",
+        first_text_row(simple_query(s, "SELECT observed FROM wire_trigger_audit")) == "5",
+    )
+    s.close()
+
+
 def test_subscription_definition_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

@@ -6736,41 +6736,49 @@ fn detached_trigger_row<'a>(
     Ok(row)
 }
 
+struct TriggerExecContext<'s, 'a, 'b> {
+    storage: &'s mut Storage,
+    txn: &'s mut TxnState,
+    arena: &'a Arena,
+    seq_session: &'s crate::sql::guc::SeqSession,
+    responder: &'s mut Responder<'b>,
+}
+
 fn fire_row_triggers<'a>(
-    storage: &mut Storage,
-    txn: &mut TxnState,
+    context: TriggerExecContext<'_, 'a, '_>,
     table: usize,
     definition: &TableDef,
     event: u8,
     before: bool,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
-    arena: &'a Arena,
-    seq_session: &crate::sql::guc::SeqSession,
-    responder: &mut Responder,
-    txid: u32,
 ) -> Result<bool, SqlError> {
     let mut new = new;
     let mut trigger_at = 0usize;
     loop {
         let Some(trigger) = ({
-            storage
-                .triggers_for_table(table, txid)
+            context
+                .storage
+                .triggers_for_table(table, context.txn.txid)
                 .nth(trigger_at)
                 .map(|(_, trigger)| *trigger)
         }) else {
             break;
         };
         trigger_at += 1;
-        if !trigger.enabled_to(txid)
+        if !trigger.enabled_to(context.txn.txid)
             || trigger.timing != u8::from(!before)
             || trigger.events & event == 0
         {
             continue;
         }
         let source = {
-            let body = storage.routine(usize::from(trigger.function)).body.as_str();
-            arena.alloc_str(body).map_err(|_| {
+            let body = context
+                .storage
+                .routine(usize::from(trigger.function))
+                .body
+                .as_str();
+            context.arena.alloc_str(body).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "trigger body exceeds the statement arena"
@@ -6807,13 +6815,16 @@ fn fire_row_triggers<'a>(
                 // survive only in this statement.  Copy the expression into
                 // the statement arena before parsing so evaluated text values
                 // cannot retain a catalog borrow.
-                let source = arena.alloc_str(assignment.expression).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger expression exceeds the statement arena"
-                    )
-                })?;
-                let expression = super::parser::parse_expr(source, arena)?;
+                let source = context
+                    .arena
+                    .alloc_str(assignment.expression)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "trigger expression exceeds the statement arena"
+                        )
+                    })?;
+                let expression = super::parser::parse_expr(source, context.arena)?;
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -6821,23 +6832,29 @@ fn fire_row_triggers<'a>(
                 };
                 let value = eval_full(
                     expression,
-                    arena,
+                    context.arena,
                     crate::sql::eval::NO_PARAMS,
                     &transition,
                     &NO_HOOKS,
                 )?;
-                let value = coerce(value, &definition.columns()[column], storage, txid, arena)?;
+                let value = coerce(
+                    value,
+                    &definition.columns()[column],
+                    context.storage,
+                    context.txn.txid,
+                    context.arena,
+                )?;
                 new.as_deref_mut().expect("checked NEW image")[column] = value;
             }
         }
         for statement in program.inserts[..program.insert_count].iter().flatten() {
-            let source = arena.alloc_str(statement).map_err(|_| {
+            let source = context.arena.alloc_str(statement).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "trigger statement exceeds the statement arena"
                 )
             })?;
-            let mut parser = super::parser::Parser::new(source, arena)
+            let mut parser = super::parser::Parser::new(source, context.arena)
                 .map_err(|error| super::parse_error_to_sql(&error))?;
             let statement = match parser
                 .next_stmt()
@@ -6864,21 +6881,21 @@ fn fire_row_triggers<'a>(
                 old,
                 new: new.as_deref(),
             };
-            txn.enter_trigger_sql()?;
-            let outcome = responder.without_command_complete(|responder| {
+            context.txn.enter_trigger_sql()?;
+            let outcome = context.responder.without_command_complete(|responder| {
                 insert(
-                    storage,
-                    txn,
+                    context.storage,
+                    context.txn,
                     &statement,
-                    arena,
+                    context.arena,
                     crate::sql::eval::NO_PARAMS,
-                    seq_session,
+                    context.seq_session,
                     responder,
                     None,
                     Some(&transition),
                 )
             });
-            txn.leave_trigger_sql();
+            context.txn.leave_trigger_sql();
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => return Err(error),
@@ -14829,18 +14846,19 @@ fn finish_insert_row<'a>(
         return Ok(Err(error));
     }
     if !match fire_row_triggers(
-        storage,
-        txn,
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+        },
         table_index,
         definition,
         1,
         true,
         None,
         Some(&mut values[..definition.n_columns]),
-        arena,
-        seq_session,
-        responder,
-        txn.txid,
     ) {
         Ok(run) => run,
         Err(error) => return Ok(Err(error)),
@@ -14914,18 +14932,19 @@ fn finish_insert_row<'a>(
         return Ok(Err(error));
     }
     if let Err(error) = fire_row_triggers(
-        storage,
-        txn,
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+        },
         table_index,
         definition,
         1,
         false,
         None,
         Some(&mut values[..definition.n_columns]),
-        arena,
-        seq_session,
-        responder,
-        txn.txid,
     ) {
         return Ok(Err(error));
     }
@@ -15715,7 +15734,7 @@ pub fn update(
                     )
                 })
         })() {
-            Ok(b) => &*b,
+            Ok(b) => b,
             Err(error) => return sql_fail(error),
         };
         let new_bytes = {
@@ -15848,18 +15867,19 @@ pub fn update(
                 Err(error) => return sql_fail(error),
             };
             if !match fire_row_triggers(
-                storage,
-                txn,
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                },
                 table_index,
                 &def,
                 2,
                 true,
                 Some(old_transition),
                 Some(new_values),
-                arena,
-                seq_session,
-                responder,
-                txn.txid,
             ) {
                 Ok(run) => run,
                 Err(error) => return sql_fail(error),
@@ -15871,7 +15891,7 @@ pub fn update(
             {
                 return sql_fail(e);
             }
-            if let Err(e) = check_not_null(&def, &new_values) {
+            if let Err(e) = check_not_null(&def, new_values) {
                 return sql_fail(e);
             }
             if let Err(e) = enforce_row_constraints(
@@ -15973,18 +15993,19 @@ pub fn update(
             return sql_fail(error);
         }
         if let Err(error) = fire_row_triggers(
-            storage,
-            txn,
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+            },
             table_index,
             &def,
             2,
             false,
             Some(&old_transition[..def.n_columns]),
             Some(&mut new_transition[..def.n_columns]),
-            arena,
-            seq_session,
-            responder,
-            txn.txid,
         ) {
             return sql_fail(error);
         }
@@ -16169,18 +16190,19 @@ pub fn delete(
                 return sql_fail(e);
             }
             if !match fire_row_triggers(
-                storage,
-                txn,
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                },
                 table_index,
                 &def,
                 4,
                 true,
                 Some(&old_values[..def.n_columns]),
                 None,
-                arena,
-                seq_session,
-                responder,
-                txn.txid,
             ) {
                 Ok(run) => run,
                 Err(error) => return sql_fail(error),
@@ -16253,18 +16275,19 @@ pub fn delete(
                 }
             }
             if let Err(error) = fire_row_triggers(
-                storage,
-                txn,
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                },
                 table_index,
                 &def,
                 4,
                 false,
                 Some(&old_transition[..def.n_columns]),
                 None,
-                arena,
-                seq_session,
-                responder,
-                txn.txid,
             ) {
                 return sql_fail(error);
             }

@@ -5898,7 +5898,7 @@ pub fn alter_subscription(
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
     name: &str,
-    action: crate::sql::ast::AlterSubscriptionAction,
+    action: crate::sql::ast::AlterSubscriptionAction<'_>,
     responder: &mut Responder,
 ) -> Outcome {
     let (slot, subscription) = match storage.subscription(name, txn.txid) {
@@ -5914,49 +5914,179 @@ pub fn alter_subscription(
     if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
         return sql_fail(error);
     }
-    let enabled = matches!(action, crate::sql::ast::AlterSubscriptionAction::Enable);
-    if enabled {
-        if subscription.slot_name == SqlName::EMPTY {
-            return sql_fail(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "cannot enable a subscription without an existing publisher slot"
-            ));
+    match action {
+        crate::sql::ast::AlterSubscriptionAction::Enable
+        | crate::sql::ast::AlterSubscriptionAction::Disable => {
+            let enabled = matches!(action, crate::sql::ast::AlterSubscriptionAction::Enable);
+            if enabled {
+                if subscription.slot_name == SqlName::EMPTY {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "cannot enable a subscription without an existing publisher slot"
+                    ));
+                }
+                let (connection, _, _) = storage.subscription_definition_to(slot, txn.txid);
+                if let Err(error) = validate_enabled_subscription(connection) {
+                    return sql_fail(error);
+                }
+            }
+            let prior = match storage.set_subscription_enabled(slot, enabled, txn.txid) {
+                Ok(crate::storage::SubscriptionEnabledChange::Changed { prior }) => prior,
+                Ok(crate::storage::SubscriptionEnabledChange::Unchanged) => {
+                    return Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?));
+                }
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetSubscriptionEnabled { name, enabled },
+            ) {
+                storage.restore_subscription_enabled(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionEnabled {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_subscription_enabled(slot, prior);
+                return sql_fail(error);
+            }
         }
-        let endpoint = match subscription.connection.require_endpoint() {
-            Ok(endpoint) => endpoint,
-            Err(error) => return sql_fail(error),
-        };
-        if endpoint.application_name().is_none() {
-            return sql_fail(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "enabled subscriptions require application_name in the connection string"
-            ));
+        crate::sql::ast::AlterSubscriptionAction::SetConnection(connection) => {
+            let connection = match crate::storage::SubscriptionConnInfo::parse(connection) {
+                Ok(connection) => connection,
+                Err(error) => return sql_fail(error),
+            };
+            if subscription.enabled_to(txn.txid)
+                && let Err(error) = validate_enabled_subscription(connection)
+            {
+                return sql_fail(error);
+            }
+            let (_, publications, publication_count) =
+                storage.subscription_definition_to(slot, txn.txid);
+            if let Err(error) = alter_subscription_definition(
+                storage,
+                wal,
+                txn,
+                slot,
+                name,
+                connection,
+                &publications[..publication_count],
+            ) {
+                return sql_fail(error);
+            }
+        }
+        crate::sql::ast::AlterSubscriptionAction::SetPublications {
+            publications,
+            refresh,
+        } => {
+            if matches!(
+                refresh,
+                crate::sql::ast::SubscriptionPublicationRefresh::Refresh
+            ) {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "ALTER SUBSCRIPTION SET PUBLICATION requires WITH (refresh = false); initial table synchronization is not supported"
+                ));
+            }
+            let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+            if publications.is_empty() {
+                return sql_fail(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subscription publication list must not be empty"
+                ));
+            }
+            if publications.len() > names.len() {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many publications in subscription (limit {})",
+                    names.len()
+                ));
+            }
+            for (index, publication) in publications.iter().enumerate() {
+                let publication = match SqlName::parse(publication) {
+                    Ok(publication) => publication,
+                    Err(error) => return sql_fail(error),
+                };
+                if names[..index].contains(&publication) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "publication \"{}\" is listed more than once",
+                        publication.as_str()
+                    ));
+                }
+                names[index] = publication;
+            }
+            let (connection, _, _) = storage.subscription_definition_to(slot, txn.txid);
+            if let Err(error) = alter_subscription_definition(
+                storage,
+                wal,
+                txn,
+                slot,
+                name,
+                connection,
+                &names[..publications.len()],
+            ) {
+                return sql_fail(error);
+            }
         }
     }
-    let prior = match storage.set_subscription_enabled(slot, enabled, txn.txid) {
-        Ok(crate::storage::SubscriptionEnabledChange::Changed { prior }) => prior,
-        Ok(crate::storage::SubscriptionEnabledChange::Unchanged) => {
-            return Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?));
-        }
-        Err(error) => return sql_fail(error),
-    };
+    Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?))
+}
+
+fn validate_enabled_subscription(
+    connection: crate::storage::SubscriptionConnInfo,
+) -> Result<(), SqlError> {
+    let endpoint = connection.require_endpoint()?;
+    if endpoint.application_name().is_none() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "enabled subscriptions require application_name in the connection string"
+        ));
+    }
+    Ok(())
+}
+
+fn alter_subscription_definition(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    slot: usize,
+    name: &str,
+    connection: crate::storage::SubscriptionConnInfo,
+    publications: &[SqlName],
+) -> Result<(), SqlError> {
+    let change = storage.set_subscription_definition(slot, connection, publications, txn.txid)?;
+    if !change.changed {
+        return Ok(());
+    }
+    let prior = change.prior;
+    let (connection, publications, publication_count) =
+        storage.subscription_definition_to(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,
         lsn,
-        &WalOp::SetSubscriptionEnabled { name, enabled },
+        &WalOp::AlterSubscription {
+            name,
+            connection: connection.as_str(),
+            publications,
+            publication_count,
+        },
     ) {
-        storage.restore_subscription_enabled(slot, prior);
-        return sql_fail(error);
+        storage.restore_subscription_definition(slot, prior);
+        return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionEnabled {
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionDefinitionChanged {
         slot: slot as u32,
         prior,
     }) {
-        storage.restore_subscription_enabled(slot, prior);
-        return sql_fail(error);
+        storage.restore_subscription_definition(slot, prior);
+        return Err(error);
     }
-    Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?))
+    Ok(())
 }
 
 pub fn drop_subscription(

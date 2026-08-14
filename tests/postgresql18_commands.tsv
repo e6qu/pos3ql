@@ -44,7 +44,7 @@ ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
 ALTER SERVER	missing	-
 ALTER STATISTICS	missing	-
-ALTER SUBSCRIPTION	missing	-
+ALTER SUBSCRIPTION	partial	98_subscription.sql (connection and publication definition lifecycle)
 ALTER SYSTEM	missing	-
 ALTER TABLE	partial	45_alter_column.sql
 ALTER TABLESPACE	missing	-

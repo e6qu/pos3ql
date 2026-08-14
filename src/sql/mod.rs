@@ -2171,6 +2171,9 @@ impl Engine {
                 DdlUndo::SubscriptionEnabled { slot, .. } => self
                     .storage
                     .commit_subscription_enabled(*slot as usize, txn.txid),
+                DdlUndo::SubscriptionDefinitionChanged { slot, .. } => self
+                    .storage
+                    .commit_subscription_definition(*slot as usize, txn.txid),
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -2394,6 +2397,9 @@ impl Engine {
             DdlUndo::SubscriptionEnabled { slot, prior } => self
                 .storage
                 .restore_subscription_enabled(slot as usize, prior),
+            DdlUndo::SubscriptionDefinitionChanged { slot, prior } => self
+                .storage
+                .restore_subscription_definition(slot as usize, prior),
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
                 self.storage.rollback_matview_drop(slot as usize, txid);
@@ -7218,7 +7224,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
             if enabled {
-                connection.require_endpoint()?;
+                validate_recovered_enabled_subscription(connection)?;
             }
             let slot = storage.create_subscription(
                 crate::storage::SubscriptionSpec {
@@ -7247,18 +7253,50 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             }
         }
         WalOp::SetSubscriptionEnabled { name, enabled } => {
-            let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
+            let (slot, subscription) = storage.subscription(name, 0).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "journal subscription state change for unknown subscription \"{}\"",
                     name
                 )
             })?;
+            if enabled {
+                validate_recovered_enabled_subscription(subscription.connection)?;
+            }
             if matches!(
                 storage.set_subscription_enabled(slot, enabled, 0)?,
                 crate::storage::SubscriptionEnabledChange::Changed { .. }
             ) {
                 storage.commit_subscription_enabled(slot, 0);
+            }
+        }
+        WalOp::AlterSubscription {
+            name,
+            connection,
+            publications,
+            publication_count,
+        } => {
+            let (slot, subscription) = storage.subscription(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal subscription definition change for unknown subscription \"{}\"",
+                    name
+                )
+            })?;
+            let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
+            if subscription.enabled_to(0) {
+                validate_recovered_enabled_subscription(connection)?;
+            }
+            if storage
+                .set_subscription_definition(
+                    slot,
+                    connection,
+                    &publications[..publication_count],
+                    0,
+                )?
+                .changed
+            {
+                storage.commit_subscription_definition(slot, 0);
             }
         }
         WalOp::RenameIndex {
@@ -7863,6 +7901,19 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
     }
     storage.set_lsn(lsn);
+    Ok(())
+}
+
+fn validate_recovered_enabled_subscription(
+    connection: crate::storage::SubscriptionConnInfo,
+) -> Result<(), SqlError> {
+    let endpoint = connection.require_endpoint()?;
+    if endpoint.application_name().is_none() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "enabled subscriptions require application_name in the connection string"
+        ));
+    }
     Ok(())
 }
 

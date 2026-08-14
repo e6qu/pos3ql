@@ -12,6 +12,14 @@ pub struct StackStr<const N: usize> {
     truncated: bool,
 }
 
+impl<const N: usize> PartialEq for StackStr<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.truncated == other.truncated && self.as_str() == other.as_str()
+    }
+}
+
+impl<const N: usize> Eq for StackStr<N> {}
+
 impl<const N: usize> fmt::Debug for StackStr<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.as_str(), f)
@@ -108,6 +116,14 @@ mod tests {
         write!(s, "aé€x").unwrap(); // 1 + 2 + 3 + 1 bytes
         assert_eq!(s.as_str(), "aé");
         assert!(s.is_truncated());
+    }
+
+    #[test]
+    fn equality_uses_the_value_not_unused_capacity() {
+        let mut reused = StackStr::<8>::from_str("long");
+        reused.clear();
+        reused.write_str("ok").unwrap();
+        assert_eq!(reused, StackStr::from_str("ok"));
     }
 
     #[test]

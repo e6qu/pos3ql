@@ -1918,6 +1918,7 @@ pub(crate) struct SubscriptionDef {
     pub connection: SubscriptionConnInfo,
     pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
+    pending_definition: Option<PendingSubscriptionDefinition>,
     pub enabled: bool,
     pending_enabled: Option<PendingSubscriptionEnabled>,
     pub slot_name: SqlName,
@@ -1936,6 +1937,35 @@ pub(crate) struct SubscriptionDef {
 pub(crate) struct PendingSubscriptionEnabled {
     txid: u32,
     enabled: bool,
+}
+
+/// One transaction-private replacement for a subscription's stream identity.
+/// Keeping connection and publication names together prevents a worker from
+/// combining one committed half with one staged half.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingSubscriptionDefinition {
+    txid: u32,
+    connection: SubscriptionConnInfo,
+    publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+    publication_count: usize,
+}
+
+impl core::fmt::Debug for PendingSubscriptionDefinition {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PendingSubscriptionDefinition")
+            .field("txid", &self.txid)
+            .field("publication_count", &self.publication_count)
+            .finish()
+    }
+}
+
+/// Result of staging a subscription stream definition. The fixed-size undo
+/// image stays a field, rather than inflating a control-flow enum variant.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionDefinitionChange {
+    pub(crate) changed: bool,
+    pub(crate) prior: Option<PendingSubscriptionDefinition>,
 }
 
 /// Result of requesting a transactional subscription lifecycle state.
@@ -1965,6 +1995,28 @@ impl SubscriptionDef {
         self.pending_enabled
             .filter(|pending| pending.txid == txid)
             .map_or(self.enabled, |pending| pending.enabled)
+    }
+
+    pub(crate) fn definition_to(
+        &self,
+        txid: u32,
+    ) -> (
+        SubscriptionConnInfo,
+        [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+        usize,
+    ) {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(
+                (self.connection, self.publications, self.publication_count),
+                |pending| {
+                    (
+                        pending.connection,
+                        pending.publications,
+                        pending.publication_count,
+                    )
+                },
+            )
     }
 }
 
@@ -4221,6 +4273,7 @@ impl Storage {
                     .expect("static subscription placeholder is valid"),
                     publications: [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS],
                     publication_count: 0,
+                    pending_definition: None,
                     enabled: false,
                     pending_enabled: None,
                     slot_name: SqlName::EMPTY,
@@ -10672,6 +10725,7 @@ impl Storage {
             connection: spec.connection,
             publications,
             publication_count: spec.publications.len(),
+            pending_definition: None,
             enabled: spec.enabled,
             pending_enabled: None,
             slot_name: spec.slot_name,
@@ -10769,6 +10823,7 @@ impl Storage {
             .ddl_state
             .pending_txid()
             .or_else(|| subscription.pending_enabled.map(|pending| pending.txid))
+            .or_else(|| subscription.pending_definition.map(|pending| pending.txid))
             .or_else(|| subscription.ownership.pending.map(|pending| pending.txid))
             .filter(|owner| *owner != txid);
         if let Some(blocker) = blocker {
@@ -10793,6 +10848,91 @@ impl Storage {
         prior: Option<PendingSubscriptionEnabled>,
     ) {
         self.subscriptions[slot].pending_enabled = prior;
+    }
+
+    pub(crate) fn set_subscription_definition(
+        &mut self,
+        slot: usize,
+        connection: SubscriptionConnInfo,
+        publications: &[SqlName],
+        txid: u32,
+    ) -> Result<SubscriptionDefinitionChange, SqlError> {
+        self.ensure_subscription_changeable(slot, txid)?;
+        if publications.is_empty() || publications.len() > MAX_SUBSCRIPTION_PUBLICATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription publication list exceeds its fixed capacity"
+            ));
+        }
+        let subscription = &mut self.subscriptions[slot];
+        let current_connection = subscription
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(subscription.connection, |pending| pending.connection);
+        let (current_publications, current_count) = subscription
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(
+                (subscription.publications, subscription.publication_count),
+                |pending| (pending.publications, pending.publication_count),
+            );
+        if current_connection.as_str() == connection.as_str()
+            && current_count == publications.len()
+            && current_publications[..current_count] == *publications
+        {
+            return Ok(SubscriptionDefinitionChange {
+                changed: false,
+                prior: subscription.pending_definition,
+            });
+        }
+        let mut names = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
+        names[..publications.len()].copy_from_slice(publications);
+        let prior = subscription.pending_definition;
+        subscription.pending_definition = Some(PendingSubscriptionDefinition {
+            txid,
+            connection,
+            publications: names,
+            publication_count: publications.len(),
+        });
+        Ok(SubscriptionDefinitionChange {
+            changed: true,
+            prior,
+        })
+    }
+
+    /// Returns the definition visible to `txid`. A definition change is one
+    /// atomic catalog value: callers cannot combine a staged connection with
+    /// committed publication membership.
+    pub(crate) fn subscription_definition_to(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> (
+        SubscriptionConnInfo,
+        [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+        usize,
+    ) {
+        self.subscriptions[slot].definition_to(txid)
+    }
+
+    pub(crate) fn commit_subscription_definition(&mut self, slot: usize, txid: u32) {
+        let subscription = &mut self.subscriptions[slot];
+        if let Some(pending) = subscription.pending_definition
+            && pending.txid == txid
+        {
+            subscription.connection = pending.connection;
+            subscription.publications = pending.publications;
+            subscription.publication_count = pending.publication_count;
+            subscription.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn restore_subscription_definition(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingSubscriptionDefinition>,
+    ) {
+        self.subscriptions[slot].pending_definition = prior;
     }
 
     /// Validates one monotonically advancing, committed publisher position.

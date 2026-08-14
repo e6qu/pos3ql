@@ -1209,7 +1209,7 @@ fn reset_session_authorization_survives_a_dropped_authenticated_role() {
 #[test]
 fn default_privileges_apply_additively_and_replay_from_wal() {
     let config = test_config("default-acl-wal-replay");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -16708,7 +16708,7 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
         ["1"]
     );
     drop(engine);
-    let mut replay_budget = Budget::new(1 << 27);
+    let mut replay_budget = Budget::new(1 << 29);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -16860,6 +16860,97 @@ fn alter_subscription_enablement_is_transactional_and_replayed() {
         )),
         ["t"]
     );
+}
+
+#[test]
+fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_owner() {
+    let mut config = test_config("alter-subscription-definition");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("alter-subscription-definition-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = publisher_slot)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             ALTER SUBSCRIPTION apply_changes CONNECTION \
+             'host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable'; \
+             ALTER SUBSCRIPTION apply_changes SET PUBLICATION sales, inventory WITH (refresh = false); \
+             SELECT subconninfo, subpublications FROM pg_subscription WHERE subname = 'apply_changes'; \
+             ROLLBACK; \
+             SELECT subconninfo, subpublications FROM pg_subscription WHERE subname = 'apply_changes'",
+        )),
+        [
+            "host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable|{sales,inventory}",
+            "host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable|{changes}",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable'; \
+         ALTER SUBSCRIPTION apply_changes SET PUBLICATION sales, inventory WITH (refresh = false); \
+         COMMIT",
+    );
+    let runtime = engine.subscription_runtime(0).unwrap();
+    assert_eq!(runtime.endpoint.host(), "127.0.0.2");
+    assert_eq!(runtime.endpoint.port(), 5433);
+    assert_eq!(
+        runtime.publications[..runtime.publication_count],
+        [
+            SqlName::parse("sales").unwrap(),
+            SqlName::parse("inventory").unwrap()
+        ]
+    );
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes CONNECTION 'host=publisher port=5432'",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("requires a numeric host"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+    let unsupported_refresh = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes SET PUBLICATION sales",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported_refresh).contains("requires WITH (refresh = false)"),
+        "{}",
+        String::from_utf8_lossy(&unsupported_refresh)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT subconninfo, subpublications FROM pg_subscription WHERE subname = 'apply_changes'",
+        )),
+        [
+            "host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable|{sales,inventory}"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]

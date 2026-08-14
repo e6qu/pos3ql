@@ -37,7 +37,7 @@ pub enum SslMode {
 /// only accepted boundary between SQL's connection literal and the wire
 /// client, so omitted endpoint fields cannot acquire process/environment
 /// defaults later.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
     host: StackStr<45>,
     port: u16,

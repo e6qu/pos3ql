@@ -8133,6 +8133,112 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
 }
 
 #[test]
+fn row_trigger_new_assignments_are_typed_and_rechecked() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_body_target (
+             id integer PRIMARY KEY,
+             value integer NOT NULL,
+             doubled integer GENERATED ALWAYS AS (value * 2) STORED,
+             CHECK (value > 0)
+         );
+         CREATE FUNCTION normalize_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.value := NEW.value + 1; RETURN NEW; END';
+         CREATE TRIGGER normalize_before_write BEFORE INSERT OR UPDATE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION normalize_trigger_body();
+         CREATE TABLE trigger_body_audit (id integer, observed integer);
+         CREATE FUNCTION audit_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
+         CREATE TRIGGER audit_before_write BEFORE INSERT OR UPDATE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION audit_trigger_body();
+         INSERT INTO trigger_body_target (id, value) VALUES (1, 4);
+         UPDATE trigger_body_target SET value = 8 WHERE id = 1;
+         SELECT id, value, doubled FROM trigger_body_target;
+         SELECT id, observed FROM trigger_body_audit ORDER BY observed;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|9|18", "1|5", "1|9"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let old_value = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION preserve_old() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.value := OLD.value + 10; RETURN NEW; END';
+         CREATE TRIGGER preserve_before_update BEFORE UPDATE ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION preserve_old();
+         UPDATE trigger_body_target SET value = 1 WHERE id = 1;
+         SELECT value FROM trigger_body_target;",
+    );
+    assert_eq!(data_rows(&old_value), ["19"]);
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_body_target (id, value) VALUES (3, -2)",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("23514"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM trigger_body_audit WHERE id = 3"
+        )),
+        ["0"]
+    );
+
+    let recursive_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_body_recursive (id integer);
+         CREATE FUNCTION recurse_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_recursive VALUES (NEW.id); RETURN NEW; END';
+         CREATE TRIGGER recurse_before_insert BEFORE INSERT ON trigger_body_recursive
+           FOR EACH ROW EXECUTE FUNCTION recurse_trigger_body();
+        ",
+    );
+    assert!(!String::from_utf8_lossy(&recursive_setup).contains("ERROR"));
+    let recursive = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_body_recursive VALUES (1)",
+    );
+    assert!(String::from_utf8_lossy(&recursive).contains("54000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM trigger_body_recursive"
+        )),
+        ["0"]
+    );
+
+    let unsupported = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION after_mutation() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.value := 2; RETURN NEW; END';
+         CREATE TRIGGER after_mutation_trigger AFTER INSERT ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION after_mutation();
+         INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
+    );
+    assert!(String::from_utf8_lossy(&unsupported).contains("0A000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM trigger_body_target WHERE id = 2"
+        )),
+        ["0"]
+    );
+}
+
+#[test]
 fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     let mut config = test_config("trigger-catalog-recovery");
     config.object_store_on = true;
@@ -8144,12 +8250,13 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE durable_trigger_target (id integer PRIMARY KEY);
-         CREATE FUNCTION durable_keep() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+        "CREATE TABLE durable_trigger_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE durable_trigger_audit (id integer, observed integer);
+         CREATE FUNCTION durable_keep() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.value := NEW.value + 1; INSERT INTO durable_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
          CREATE TRIGGER durable_target BEFORE INSERT ON durable_trigger_target
            FOR EACH ROW EXECUTE FUNCTION durable_keep();
-         ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;
-         ALTER TRIGGER durable_target_renamed ON durable_trigger_target DISABLE;",
+         ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
     assert!(engine.checkpoint().unwrap());
@@ -8164,10 +8271,11 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
            FROM pg_trigger trigger_catalog
            JOIN pg_class relation_catalog ON trigger_catalog.tgrelid = relation_catalog.oid
           WHERE relation_catalog.relname = 'durable_trigger_target';
-         INSERT INTO durable_trigger_target VALUES (1);
-         SELECT count(*) FROM durable_trigger_target;",
+         INSERT INTO durable_trigger_target VALUES (1, 1);
+         SELECT value FROM durable_trigger_target;
+         SELECT observed FROM durable_trigger_audit;",
     );
-    assert_eq!(data_rows(&output), ["durable_target_renamed|D|t", "1"]);
+    assert_eq!(data_rows(&output), ["durable_target_renamed|O|t", "2", "2"]);
 }
 
 #[test]

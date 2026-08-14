@@ -25,7 +25,7 @@ use crate::wal::{Wal, WalOp};
 
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
-    Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, TriggerEvent,
+    Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, Stmt, TriggerEvent,
     TriggerTiming, Update,
 };
 use super::eval::{
@@ -6465,66 +6465,431 @@ enum TriggerReturn {
     Null,
 }
 
-fn parse_row_trigger_body(body: &str) -> Result<TriggerReturn, SqlError> {
-    let mut tokens = [""; 4];
-    let mut count = 0usize;
-    for token in body.split(|character: char| character.is_ascii_whitespace() || character == ';') {
-        if token.is_empty() {
-            continue;
-        }
-        if count == tokens.len() {
+#[derive(Clone, Copy)]
+struct TriggerAssignment<'a> {
+    column: &'a str,
+    expression: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerProgram<'a> {
+    assignments: [Option<TriggerAssignment<'a>>; MAX_COLUMNS],
+    assignment_count: usize,
+    inserts: [Option<&'a str>; MAX_COLUMNS],
+    insert_count: usize,
+    result: TriggerReturn,
+}
+
+/// A trigger has two explicitly named transition images.  Keeping them as a
+/// `ColumnLookup` makes `OLD.column` and `NEW.column` ordinary typed
+/// expressions instead of text substituted into a nested SQL statement.
+struct TriggerTransition<'d, 's, 'v> {
+    definition: &'d TableDef,
+    old: Option<&'s [Datum<'v>]>,
+    new: Option<&'s [Datum<'v>]>,
+}
+
+impl<'v> ColumnLookup<'v> for TriggerTransition<'_, '_, 'v> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        let Some(qualifier) = qualifier else {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "trigger function body is not supported"
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
             ));
-        }
-        tokens[count] = token;
-        count += 1;
+        };
+        let values = if qualifier.eq_ignore_ascii_case("old") {
+            self.old
+        } else if qualifier.eq_ignore_ascii_case("new") {
+            self.new
+        } else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                qualifier
+            ));
+        };
+        let Some(values) = values else {
+            return Ok(Datum::Null);
+        };
+        let Some(column) = self.definition.column_index(name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ));
+        };
+        Ok(values[column])
     }
-    let valid = matches!(
-        &tokens[..count],
-        [begin, return_keyword, transition, end]
-            if begin.eq_ignore_ascii_case("begin")
-                && return_keyword.eq_ignore_ascii_case("return")
-                && (transition.eq_ignore_ascii_case("new")
-                    || transition.eq_ignore_ascii_case("old")
-                    || transition.eq_ignore_ascii_case("null"))
-                && end.eq_ignore_ascii_case("end")
-    );
-    if !valid {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "trigger function body is not supported"
-        ));
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+            .then(|| self.definition.column_index(name))
+            .flatten()
+            .map(|column| self.definition.columns()[column].ctype)
     }
-    if tokens[2].eq_ignore_ascii_case("new") {
-        Ok(TriggerReturn::New)
-    } else if tokens[2].eq_ignore_ascii_case("old") {
-        Ok(TriggerReturn::Old)
-    } else {
-        Ok(TriggerReturn::Null)
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+            .then(|| self.definition.column_index(name))
+            .flatten()
+            .map(|column| self.definition.columns()[column].collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+            .then(|| self.definition.column_index(name))
+            .flatten()
+            .and_then(|column| self.definition.columns()[column].user_type.map(|identity| identity.name))
     }
 }
 
+fn unsupported_trigger_body() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "trigger function body is not supported"
+    )
+}
+
+fn strip_trigger_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let prefix = text.get(..keyword.len())?;
+    if prefix.eq_ignore_ascii_case(keyword)
+        && text[keyword.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| character.is_ascii_whitespace())
+    {
+        Some(&text[keyword.len()..])
+    } else {
+        None
+    }
+}
+
+fn trigger_statements<'a>(
+    body: &'a str,
+    mut visit: impl FnMut(&'a str) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let body = body.trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim_end();
+    let Some(body) = strip_trigger_keyword(body, "begin") else {
+        return Err(unsupported_trigger_body());
+    };
+    let body = body.trim();
+    let Some((prefix, suffix)) =
+        body.rsplit_once(|character: char| character.is_ascii_whitespace())
+    else {
+        return Err(unsupported_trigger_body());
+    };
+    if !suffix.eq_ignore_ascii_case("end") {
+        return Err(unsupported_trigger_body());
+    }
+    let body = prefix;
+    let mut start = 0;
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (offset, character) in body.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            ';' if depth == 0 => {
+                let statement = body[start..offset].trim();
+                if !statement.is_empty() {
+                    visit(statement)?;
+                }
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(unsupported_trigger_body());
+    }
+    let statement = body[start..].trim();
+    if !statement.is_empty() {
+        visit(statement)?;
+    }
+    Ok(())
+}
+
+fn parse_trigger_assignment(statement: &str) -> Option<TriggerAssignment<'_>> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut assignment = None;
+    for (offset, character) in statement.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            ':' if depth == 0 && statement[offset..].starts_with(":=") => {
+                assignment = Some(offset);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let offset = assignment?;
+    let (target, expression) = (&statement[..offset], &statement[offset + 2..]);
+    let target = target.trim();
+    let expression = expression.trim();
+    let column = target
+        .strip_prefix("NEW.")
+        .or_else(|| target.strip_prefix("new."))?;
+    (!column.is_empty()
+        && !expression.is_empty()
+        && column
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(TriggerAssignment { column, expression })
+}
+
+fn parse_row_trigger_body(body: &str) -> Result<TriggerProgram<'_>, SqlError> {
+    let mut program = TriggerProgram {
+        assignments: [None; MAX_COLUMNS],
+        assignment_count: 0,
+        inserts: [None; MAX_COLUMNS],
+        insert_count: 0,
+        result: TriggerReturn::Null,
+    };
+    let mut saw_return = false;
+    trigger_statements(body, |statement| {
+        let words: [&str; 2] = {
+            let mut words = statement.split_ascii_whitespace();
+            [words.next().unwrap_or(""), words.next().unwrap_or("")]
+        };
+        if words[0].eq_ignore_ascii_case("return") {
+            if saw_return
+                || words[1].is_empty()
+                || statement.split_ascii_whitespace().nth(2).is_some()
+            {
+                return Err(unsupported_trigger_body());
+            }
+            program.result = if words[1].eq_ignore_ascii_case("new") {
+                TriggerReturn::New
+            } else if words[1].eq_ignore_ascii_case("old") {
+                TriggerReturn::Old
+            } else if words[1].eq_ignore_ascii_case("null") {
+                TriggerReturn::Null
+            } else {
+                return Err(unsupported_trigger_body());
+            };
+            saw_return = true;
+            return Ok(());
+        }
+        if saw_return {
+            return Err(unsupported_trigger_body());
+        }
+        if strip_trigger_keyword(statement, "insert").is_some() {
+            if program.insert_count == MAX_COLUMNS {
+                return Err(unsupported_trigger_body());
+            }
+            program.inserts[program.insert_count] = Some(statement);
+            program.insert_count += 1;
+            return Ok(());
+        }
+        if program.insert_count != 0 || program.assignment_count == MAX_COLUMNS {
+            return Err(unsupported_trigger_body());
+        }
+        let Some(assignment) = parse_trigger_assignment(statement) else {
+            return Err(unsupported_trigger_body());
+        };
+        program.assignments[program.assignment_count] = Some(assignment);
+        program.assignment_count += 1;
+        Ok(())
+    })?;
+    if !saw_return {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(program)
+}
+
+fn detached_trigger_row<'a>(
+    values: &[Datum<'_>],
+    arena: &'a Arena,
+) -> Result<&'a mut [Datum<'a>], SqlError> {
+    let encoded = encode_projected_pub(values, arena)?;
+    let row = arena
+        .alloc_slice_with(values.len(), |_| Datum::Null)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "trigger row exceeds the statement arena"
+            )
+        })?;
+    for (index, value) in row.iter_mut().enumerate() {
+        *value = decode_projected_pub(encoded, index);
+    }
+    Ok(row)
+}
+
 fn fire_row_triggers<'a>(
-    storage: &Storage,
+    storage: &mut Storage,
+    txn: &mut TxnState,
     table: usize,
+    definition: &TableDef,
     event: u8,
     before: bool,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
+    arena: &'a Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     txid: u32,
 ) -> Result<bool, SqlError> {
     let mut new = new;
-    for (_, trigger) in storage.triggers_for_table(table, txid) {
+    let mut trigger_at = 0usize;
+    loop {
+        let Some(trigger) = ({
+            storage
+                .triggers_for_table(table, txid)
+                .nth(trigger_at)
+                .map(|(_, trigger)| *trigger)
+        }) else {
+            break;
+        };
+        trigger_at += 1;
         if !trigger.enabled_to(txid)
             || trigger.timing != u8::from(!before)
             || trigger.events & event == 0
         {
             continue;
         }
-        match parse_row_trigger_body(storage.routine(usize::from(trigger.function)).body.as_str())?
-        {
+        let source = {
+            let body = storage.routine(usize::from(trigger.function)).body.as_str();
+            arena.alloc_str(body).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger body exceeds the statement arena"
+                )
+            })?
+        };
+        let program = parse_row_trigger_body(source)?;
+        if program.assignment_count != 0 {
+            if !before || new.is_none() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "NEW assignments require a BEFORE INSERT or UPDATE trigger"
+                ));
+            }
+            for assignment in program.assignments[..program.assignment_count]
+                .iter()
+                .flatten()
+            {
+                let Some(column) = definition.column_index(assignment.column) else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        assignment.column
+                    ));
+                };
+                if definition.columns()[column].default.is_generated() {
+                    return Err(sql_err!(
+                        sqlstate::GENERATED_ALWAYS,
+                        "cannot assign to generated column \"{}\"",
+                        assignment.column
+                    ));
+                }
+                // The catalog owns the routine text, while a row image may
+                // survive only in this statement.  Copy the expression into
+                // the statement arena before parsing so evaluated text values
+                // cannot retain a catalog borrow.
+                let source = arena.alloc_str(assignment.expression).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "trigger expression exceeds the statement arena"
+                    )
+                })?;
+                let expression = super::parser::parse_expr(source, arena)?;
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let value = eval_full(
+                    expression,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &transition,
+                    &NO_HOOKS,
+                )?;
+                let value = coerce(value, &definition.columns()[column], storage, txid, arena)?;
+                new.as_deref_mut().expect("checked NEW image")[column] = value;
+            }
+        }
+        for statement in program.inserts[..program.insert_count].iter().flatten() {
+            let source = arena.alloc_str(statement).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger statement exceeds the statement arena"
+                )
+            })?;
+            let mut parser = super::parser::Parser::new(source, arena)
+                .map_err(|error| super::parse_error_to_sql(&error))?;
+            let statement = match parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+            {
+                Some(Stmt::Insert(insert)) if insert.returning.is_empty() => insert,
+                Some(Stmt::Insert(_)) => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "trigger-side INSERT RETURNING is not supported"
+                    ));
+                }
+                _ => return Err(unsupported_trigger_body()),
+            };
+            if parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+                .is_some()
+            {
+                return Err(unsupported_trigger_body());
+            }
+            let transition = TriggerTransition {
+                definition,
+                old,
+                new: new.as_deref(),
+            };
+            txn.enter_trigger_sql()?;
+            let outcome = responder.without_command_complete(|responder| {
+                insert(
+                    storage,
+                    txn,
+                    &statement,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    seq_session,
+                    responder,
+                    None,
+                    Some(&transition),
+                )
+            });
+            txn.leave_trigger_sql();
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "trigger-side INSERT response exceeded the output buffer"
+                    ));
+                }
+            }
+        }
+        match program.result {
             TriggerReturn::Null if before => return Ok(false),
             TriggerReturn::Old if before => {
                 let Some(old) = old else { return Ok(false) };
@@ -6991,11 +7356,41 @@ pub fn create_routine(
                 return sql_fail(error);
             }
         }
-        crate::storage::RoutineKind::Trigger => {
-            if let Err(error) = parse_row_trigger_body(routine.body) {
-                return sql_fail(error);
+        crate::storage::RoutineKind::Trigger => match parse_row_trigger_body(routine.body) {
+            Ok(program) => {
+                for assignment in program.assignments[..program.assignment_count]
+                    .iter()
+                    .flatten()
+                {
+                    if let Err(error) = super::parser::parse_expr(assignment.expression, arena) {
+                        return sql_fail(error);
+                    }
+                }
+                for statement in program.inserts[..program.insert_count].iter().flatten() {
+                    let mut parser = match super::parser::Parser::new(statement, arena) {
+                        Ok(parser) => parser,
+                        Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+                    };
+                    match parser.next_stmt() {
+                        Ok(Some(Stmt::Insert(insert))) if insert.returning.is_empty() => {}
+                        Ok(Some(Stmt::Insert(_))) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "trigger-side INSERT RETURNING is not supported"
+                            ));
+                        }
+                        Ok(_) => return sql_fail(unsupported_trigger_body()),
+                        Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+                    }
+                    match parser.next_stmt() {
+                        Ok(None) => {}
+                        Ok(Some(_)) => return sql_fail(unsupported_trigger_body()),
+                        Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+                    }
+                }
             }
-        }
+            Err(error) => return sql_fail(error),
+        },
         crate::storage::RoutineKind::Procedure => {
             let mut parser = match super::parser::Parser::new(routine.body, arena) {
                 Ok(parser) => parser,
@@ -13671,7 +14066,7 @@ fn encode_range_binary(
 fn compute_generated<'a>(
     def: &TableDef,
     generated: &constraints::ParsedDefaults<'a>,
-    values: &mut [Datum<'a>; MAX_COLUMNS],
+    values: &mut [Datum<'a>],
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -13679,7 +14074,8 @@ fn compute_generated<'a>(
     if !generated.iter().any(|g| g.is_some()) {
         return Ok(());
     }
-    let snapshot: [Datum<'a>; MAX_COLUMNS] = *values;
+    let mut snapshot = [Datum::Null; MAX_COLUMNS];
+    snapshot[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
     let context = RowCtx {
         def,
         values: &snapshot[..def.n_columns],
@@ -14413,16 +14809,25 @@ fn merge_insert(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn insert(
+pub fn insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    statement: &Insert,
-    arena: &Arena,
-    params: &[Datum],
+    statement: &Insert<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
+    let no_columns = NoColumns;
+    let value_scope: &dyn ColumnLookup<'a> = transition.unwrap_or(&no_columns);
+    if transition.is_some() && statement.select.is_some() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "trigger-side INSERT ... SELECT is not supported"
+        ));
+    }
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -14668,17 +15073,32 @@ pub fn insert(
             }
             if !match fire_row_triggers(
                 storage,
+                txn,
                 table_index,
+                &def,
                 1,
                 true,
                 None,
                 Some(&mut values[..def.n_columns]),
+                arena,
+                seq_session,
+                responder,
                 txn.txid,
             ) {
                 Ok(run) => run,
                 Err(error) => return sql_fail(error),
             } {
                 continue;
+            }
+            if let Err(e) = compute_generated(
+                &def,
+                &generated_exprs,
+                &mut values,
+                storage,
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &values) {
                 return sql_fail(e);
@@ -14744,11 +15164,16 @@ pub fn insert(
             }
             if let Err(error) = fire_row_triggers(
                 storage,
+                txn,
                 table_index,
+                &def,
                 1,
                 false,
                 None,
                 Some(&mut values[..def.n_columns]),
+                arena,
+                seq_session,
+                responder,
                 txn.txid,
             ) {
                 return sql_fail(error);
@@ -14849,11 +15274,11 @@ pub fn insert(
                 if matches!(expression, Expr::DefaultMarker) || ignore[targets[i]] {
                     continue; // filled from the default / identity below
                 }
-                let v = match super::eval::eval_full(expression, arena, params, &NoColumns, &hooks)
-                {
-                    Ok(v) => v,
-                    Err(e) => return sql_fail(e),
-                };
+                let v =
+                    match super::eval::eval_full(expression, arena, params, &value_scope, &hooks) {
+                        Ok(v) => v,
+                        Err(e) => return sql_fail(e),
+                    };
                 let col = &def.columns()[targets[i]];
                 match coerce(v, col, storage, txn.txid, arena) {
                     Ok(v) => values[targets[i]] = v,
@@ -14909,17 +15334,32 @@ pub fn insert(
         }
         if !match fire_row_triggers(
             storage,
+            txn,
             table_index,
+            &def,
             1,
             true,
             None,
             Some(&mut values[..def.n_columns]),
+            arena,
+            seq_session,
+            responder,
             txn.txid,
         ) {
             Ok(run) => run,
             Err(error) => return sql_fail(error),
         } {
             continue;
+        }
+        if let Err(e) = compute_generated(
+            &def,
+            &generated_exprs,
+            &mut values,
+            storage,
+            txn.txid,
+            arena,
+        ) {
+            return sql_fail(e);
         }
         if let Err(e) = check_not_null(&def, &values) {
             return sql_fail(e);
@@ -14985,11 +15425,16 @@ pub fn insert(
         }
         if let Err(error) = fire_row_triggers(
             storage,
+            txn,
             table_index,
+            &def,
             1,
             false,
             None,
             Some(&mut values[..def.n_columns]),
+            arena,
+            seq_session,
+            responder,
             txn.txid,
         ) {
             return sql_fail(error);
@@ -15347,18 +15792,20 @@ pub fn update(
         // borrow ends before the heap is appended to.
         // An arena-owned copy of the old row bytes: the referential-action
         // pass below needs the old values after storage mutates.
-        let fetched = match storage.row_bytes(table_index, rowid, home, arena) {
-            Ok(b) => b,
-            Err(e) => return sql_fail(e),
-        };
-        let row_bytes = match arena.alloc_slice_copy(fetched) {
+        let row_bytes = match (|| {
+            let fetched = storage.row_bytes(table_index, rowid, home, arena)?;
+            arena
+                .alloc_slice_copy(fetched)
+                .map(|bytes| &*bytes)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "updated rows exceed the statement arena"
+                    )
+                })
+        })() {
             Ok(b) => &*b,
-            Err(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "updated rows exceed the statement arena"
-                ));
-            }
+            Err(error) => return sql_fail(error),
         };
         let new_bytes = {
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -15481,19 +15928,37 @@ pub fn update(
             ) {
                 return sql_fail(e);
             }
+            let old_transition = match detached_trigger_row(&values[..def.n_columns], arena) {
+                Ok(values) => values,
+                Err(error) => return sql_fail(error),
+            };
+            let new_values = match detached_trigger_row(&new_values[..def.n_columns], arena) {
+                Ok(values) => values,
+                Err(error) => return sql_fail(error),
+            };
             if !match fire_row_triggers(
                 storage,
+                txn,
                 table_index,
+                &def,
                 2,
                 true,
-                Some(&values[..def.n_columns]),
-                Some(&mut new_values[..def.n_columns]),
+                Some(old_transition),
+                Some(new_values),
+                arena,
+                seq_session,
+                responder,
                 txn.txid,
             ) {
                 Ok(run) => run,
                 Err(error) => return sql_fail(error),
             } {
                 continue;
+            }
+            if let Err(e) =
+                compute_generated(&def, &generated_exprs, new_values, storage, txn.txid, arena)
+            {
+                return sql_fail(e);
             }
             if let Err(e) = check_not_null(&def, &new_values) {
                 return sql_fail(e);
@@ -15598,11 +16063,16 @@ pub fn update(
         }
         if let Err(error) = fire_row_triggers(
             storage,
+            txn,
             table_index,
+            &def,
             2,
             false,
             Some(&old_transition[..def.n_columns]),
             Some(&mut new_transition[..def.n_columns]),
+            arena,
+            seq_session,
+            responder,
             txn.txid,
         ) {
             return sql_fail(error);
@@ -15789,11 +16259,16 @@ pub fn delete(
             }
             if !match fire_row_triggers(
                 storage,
+                txn,
                 table_index,
+                &def,
                 4,
                 true,
                 Some(&old_values[..def.n_columns]),
                 None,
+                arena,
+                seq_session,
+                responder,
                 txn.txid,
             ) {
                 Ok(run) => run,
@@ -15847,21 +16322,37 @@ pub fn delete(
             Err(e) => return sql_fail(e),
         }
         if has_triggers {
-            let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
-                Ok(bytes) => bytes,
-                Err(error) => return sql_fail(error),
-            };
             let mut old_transition = [Datum::Null; MAX_COLUMNS];
-            if let Err(error) = rowenc::decode(old_bytes, schema, &mut old_transition) {
-                return sql_fail(error);
+            {
+                let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return sql_fail(error),
+                };
+                let old_bytes = match arena.alloc_slice_copy(old_bytes) {
+                    Ok(bytes) => &*bytes,
+                    Err(_) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "deleted row exceeds the statement arena"
+                        ));
+                    }
+                };
+                if let Err(error) = rowenc::decode(old_bytes, schema, &mut old_transition) {
+                    return sql_fail(error);
+                }
             }
             if let Err(error) = fire_row_triggers(
                 storage,
+                txn,
                 table_index,
+                &def,
                 4,
                 false,
                 Some(&old_transition[..def.n_columns]),
                 None,
+                arena,
+                seq_session,
+                responder,
                 txn.txid,
             ) {
                 return sql_fail(error);

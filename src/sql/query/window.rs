@@ -47,7 +47,7 @@ fn window_pax_columns<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     win_nodes: &[&'a Expr<'a>],
-) -> Option<super::PaxColumnDemand> {
+) -> super::PaxReadDemand {
     let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_WINDOWS + 3];
     let mut count = 0usize;
     for item in statement.items {
@@ -57,7 +57,7 @@ fn window_pax_columns<'a>(
                 count += 1;
             }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
-                return None;
+                return super::PaxReadDemand::full_row();
             }
         }
     }
@@ -1349,7 +1349,7 @@ pub(crate) fn project_window_rows<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -1383,7 +1383,7 @@ pub(crate) fn project_window_rows<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,
@@ -1715,7 +1715,7 @@ pub(crate) fn external_window_into<'a>(
             params,
             hooks,
             outer,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut |row| {
                 if !row_passes_correlated_where(
                     correlated,
@@ -1956,7 +1956,7 @@ pub(crate) fn external_window_into<'a>(
         params,
         hooks,
         outer,
-        pax_columns.as_ref(),
+        pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
                 correlated,

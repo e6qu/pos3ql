@@ -119,7 +119,7 @@ pub(crate) fn fold_aggregates<'a>(
             params,
             hooks,
             outer_arg,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut visit,
         )?;
     } else {
@@ -133,7 +133,7 @@ pub(crate) fn fold_aggregates<'a>(
             params,
             hooks,
             outer_arg,
-            pax_columns.as_ref(),
+            pax_columns,
             &mut visit,
         )?;
     }

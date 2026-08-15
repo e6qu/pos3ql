@@ -1074,11 +1074,16 @@ def test_row_trigger_body_over_raw_wire():
         s,
         "CREATE TABLE wire_trigger_target (id integer PRIMARY KEY, value integer); "
         "CREATE TABLE wire_trigger_audit (id integer, observed integer); "
+        "CREATE TABLE wire_trigger_side (id integer PRIMARY KEY, value integer); "
+        "INSERT INTO wire_trigger_side VALUES (1, 10), (2, 20); "
         "CREATE FUNCTION wire_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS "
-        "'BEGIN NEW.value := NEW.value + 1; INSERT INTO wire_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END'; "
+        "'BEGIN NEW.value := NEW.value + 1; "
+        "IF NEW.id = 1 THEN UPDATE wire_trigger_side SET value = NEW.value WHERE id = NEW.id; "
+        "ELSE DELETE FROM wire_trigger_side WHERE id = NEW.id; END IF; "
+        "INSERT INTO wire_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END'; "
         "CREATE TRIGGER wire_trigger BEFORE INSERT ON wire_trigger_target "
         "FOR EACH ROW EXECUTE FUNCTION wire_trigger_fn(); "
-        "INSERT INTO wire_trigger_target VALUES (1, 4)",
+        "INSERT INTO wire_trigger_target VALUES (1, 4), (2, 4)",
     )
     check("raw wire: trigger body setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
     check(
@@ -1088,6 +1093,11 @@ def test_row_trigger_body_over_raw_wire():
     check(
         "raw wire: trigger-side insert is visible",
         first_text_row(simple_query(s, "SELECT observed FROM wire_trigger_audit")) == "5",
+    )
+    check(
+        "raw wire: trigger-side update and delete are visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_trigger_side WHERE id = 1")) == "5"
+        and first_text_row(simple_query(s, "SELECT count(*) FROM wire_trigger_side WHERE id = 2")) == "0",
     )
     s.close()
 

@@ -2344,6 +2344,8 @@ pub(crate) struct TriggerDef {
     pub(crate) function: u16,
     pub(crate) timing: u8,
     pub(crate) events: u8,
+    pub(crate) update_columns: u64,
+    pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) enabled: bool,
     pending_definition: Option<PendingTriggerDefinition>,
     pub(crate) ownership: Ownership,
@@ -2375,6 +2377,23 @@ pub(crate) struct TriggerSpec {
     pub(crate) function: usize,
     pub(crate) timing: u8,
     pub(crate) events: u8,
+    pub(crate) update_columns: u64,
+    pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
+}
+
+/// Maximum source length of a durable row-trigger `WHEN` predicate.
+pub(crate) const TRIGGER_WHEN_MAX: usize = CHECK_SQL_MAX;
+
+pub(crate) fn trigger_when_stackstr(source: &str) -> Result<StackStr<TRIGGER_WHEN_MAX>, SqlError> {
+    let value = StackStr::from_str(source);
+    if value.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger WHEN predicate exceeds {} bytes",
+            TRIGGER_WHEN_MAX
+        ));
+    }
+    Ok(value)
 }
 
 impl TriggerDef {
@@ -2385,6 +2404,8 @@ impl TriggerDef {
         function: u16::MAX,
         timing: 0,
         events: 0,
+        update_columns: 0,
+        when: None,
         enabled: false,
         pending_definition: None,
         ownership: Ownership::BOOTSTRAP,
@@ -13393,6 +13414,8 @@ impl Storage {
             })?,
             timing: spec.timing,
             events: spec.events,
+            update_columns: spec.update_columns,
+            when: spec.when,
             enabled: true,
             pending_definition: None,
             ownership: self.initial_ownership(txid),
@@ -13499,6 +13522,8 @@ impl Storage {
             })?,
             timing: spec.timing,
             events: spec.events,
+            update_columns: spec.update_columns,
+            when: spec.when,
             enabled,
             pending_definition: None,
             ownership: Ownership {

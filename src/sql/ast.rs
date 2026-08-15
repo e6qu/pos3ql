@@ -680,7 +680,12 @@ pub struct CreateTrigger<'a> {
     pub name: &'a str,
     pub timing: TriggerTiming,
     pub events: &'a [TriggerEvent],
+    /// Empty means every UPDATE; otherwise this trigger fires only for an
+    /// UPDATE whose SET list names at least one listed column.
+    pub update_columns: &'a [&'a str],
     pub table: QualName<'a>,
+    /// Parser-validated source retained for the bounded durable catalog form.
+    pub when: Option<&'a str>,
     pub function: QualName<'a>,
     pub arguments: &'a [&'a str],
 }

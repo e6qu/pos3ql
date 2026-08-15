@@ -8631,6 +8631,38 @@ fn trigger_program_locals_scope_insert_select() {
 }
 
 #[test]
+fn trigger_program_locals_scope_conflict_update() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_conflict_driver (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_conflict_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_conflict_driver VALUES (1, 5);
+         INSERT INTO trigger_conflict_target VALUES (1, 10);
+         CREATE FUNCTION trigger_conflict_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              INSERT INTO trigger_conflict_target VALUES (NEW.id, NEW.value)
+                ON CONFLICT (id) DO UPDATE
+                   SET value = excluded.value + step
+                 WHERE step = 2 AND OLD.value = 5 AND NEW.value = 7;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_conflict_after AFTER UPDATE ON trigger_conflict_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_conflict_program();
+         UPDATE trigger_conflict_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_conflict_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|9"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_when_and_update_of_are_typed_and_selective() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

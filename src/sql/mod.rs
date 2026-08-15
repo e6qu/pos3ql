@@ -4001,6 +4001,7 @@ impl Engine {
                     capture,
                     None,
                     None,
+                    None,
                     exec::InsertSource::Statement,
                 )
             }

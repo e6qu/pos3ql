@@ -244,3 +244,21 @@ CREATE TRIGGER trigger_insert_select_before BEFORE UPDATE ON trigger_insert_sele
   FOR EACH ROW EXECUTE FUNCTION trigger_insert_select_program();
 UPDATE trigger_insert_select_driver SET value = 7 WHERE id = 1;
 SELECT id, value FROM trigger_insert_select_target ORDER BY id;
+
+CREATE TABLE trigger_conflict_driver (id integer PRIMARY KEY, value integer);
+CREATE TABLE trigger_conflict_target (id integer PRIMARY KEY, value integer);
+INSERT INTO trigger_conflict_driver VALUES (1, 5);
+INSERT INTO trigger_conflict_target VALUES (1, 10);
+CREATE FUNCTION trigger_conflict_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE step integer := NEW.value - OLD.value;
+   BEGIN
+     INSERT INTO trigger_conflict_target VALUES (NEW.id, NEW.value)
+       ON CONFLICT (id) DO UPDATE
+          SET value = excluded.value + step
+        WHERE step = 2 AND OLD.value = 5 AND NEW.value = 7;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_conflict_after AFTER UPDATE ON trigger_conflict_driver
+  FOR EACH ROW EXECUTE FUNCTION trigger_conflict_program();
+UPDATE trigger_conflict_driver SET value = 7 WHERE id = 1;
+SELECT id, value FROM trigger_conflict_target ORDER BY id;

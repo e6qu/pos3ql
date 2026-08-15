@@ -649,11 +649,69 @@ pub enum AlterSubscriptionAction<'a> {
     },
 }
 
-/// The instant at which a row trigger observes a DML change.
+/// The instant at which a trigger observes a DML change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerTiming {
     Before,
     After,
+}
+
+/// PostgreSQL's trigger granularity. The parser records the SQL default
+/// explicitly, so execution never infers row behavior from omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerLevel {
+    Row,
+    Statement,
+}
+
+impl TriggerLevel {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Row => 0,
+            Self::Statement => 1,
+        }
+    }
+
+    pub(crate) const fn from_code(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Row),
+            1 => Some(Self::Statement),
+            _ => None,
+        }
+    }
+}
+
+/// A non-empty, known trigger event set. Only the durable decoder constructs
+/// this from bytes; catalog state cannot carry an unknown event bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriggerEvents(u8);
+
+impl TriggerEvents {
+    pub(crate) const INSERT: u8 = 1;
+    pub(crate) const UPDATE: u8 = 2;
+    pub(crate) const DELETE: u8 = 4;
+    pub(crate) const TRUNCATE: u8 = 8;
+    const ALL: u8 = Self::INSERT | Self::UPDATE | Self::DELETE | Self::TRUNCATE;
+
+    pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
+        if bits != 0 && bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub(crate) const fn contains(self, event: u8) -> bool {
+        self.0 & event != 0
+    }
+
+    pub(crate) const fn has_truncate(self) -> bool {
+        self.contains(Self::TRUNCATE)
+    }
 }
 
 /// One DML operation a trigger can observe.  The parser collects one or more
@@ -663,6 +721,7 @@ pub enum TriggerEvent {
     Insert,
     Update,
     Delete,
+    Truncate,
 }
 
 /// The table-qualified identity PostgreSQL uses for ALTER/DROP TRIGGER.
@@ -672,13 +731,13 @@ pub struct TriggerIdentity<'a> {
     pub table: QualName<'a>,
 }
 
-/// A parsed row-trigger definition.  Statement, constraint, transition-table,
-/// and INSTEAD OF forms have distinct semantics and are rejected by the parser
-/// until they have a complete durable execution model.
+/// A parsed trigger definition. Constraint, transition-table, and INSTEAD OF
+/// forms retain distinct semantics and are rejected until supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateTrigger<'a> {
     pub name: &'a str,
     pub timing: TriggerTiming,
+    pub level: TriggerLevel,
     pub events: &'a [TriggerEvent],
     /// Empty means every UPDATE; otherwise this trigger fires only for an
     /// UPDATE whose SET list names at least one listed column.

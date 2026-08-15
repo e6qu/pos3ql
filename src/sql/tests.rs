@@ -8090,7 +8090,11 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
         &mut budget,
         "INSERT INTO trigger_target VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
     );
-    assert!(String::from_utf8_lossy(&conflict).contains("0A000"));
+    assert!(
+        !String::from_utf8_lossy(&conflict).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&conflict)
+    );
     let after_insert = run_with(
         &mut engine,
         &mut budget,
@@ -8406,6 +8410,149 @@ fn row_trigger_when_and_update_of_are_typed_and_selective() {
         String::from_utf8_lossy(&invalid_transition).contains("record \"OLD\" is not assigned"),
         "{}",
         String::from_utf8_lossy(&invalid_transition)
+    );
+}
+
+#[test]
+fn statement_triggers_default_once_and_cover_truncate() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE statement_trigger_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE statement_trigger_audit (event text);
+         CREATE FUNCTION statement_trigger_note() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO statement_trigger_audit VALUES (''fired''); RETURN NULL; END';
+         CREATE TRIGGER statement_insert BEFORE INSERT ON statement_trigger_target
+           EXECUTE FUNCTION statement_trigger_note();
+         CREATE TRIGGER statement_update AFTER UPDATE OF value ON statement_trigger_target
+           FOR EACH STATEMENT EXECUTE FUNCTION statement_trigger_note();
+         CREATE TRIGGER statement_truncate AFTER TRUNCATE ON statement_trigger_target
+           FOR EACH STATEMENT EXECUTE FUNCTION statement_trigger_note();
+         INSERT INTO statement_trigger_target VALUES (1, 1), (2, 2);
+         UPDATE statement_trigger_target SET value = value;
+         TRUNCATE statement_trigger_target;
+         SELECT count(*) FROM statement_trigger_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         INSERT INTO statement_trigger_target VALUES (3, 3);
+         ROLLBACK;
+         SELECT count(*) FROM statement_trigger_audit;",
+    );
+    assert_eq!(
+        data_rows(&rolled_back),
+        ["3"],
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+
+    let unavailable = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRIGGER statement_bad BEFORE INSERT ON statement_trigger_target
+           FOR EACH STATEMENT WHEN (NEW.value > 0)
+           EXECUTE FUNCTION statement_trigger_note();
+         INSERT INTO statement_trigger_target VALUES (3, 3)",
+    );
+    assert!(
+        String::from_utf8_lossy(&unavailable).contains("record \"NEW\" is not assigned"),
+        "{}",
+        String::from_utf8_lossy(&unavailable)
+    );
+}
+
+#[test]
+fn on_conflict_runs_attempted_insert_and_conflicting_update_row_triggers() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE conflict_trigger_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE conflict_trigger_audit (event text, value integer);
+         CREATE FUNCTION conflict_before_insert() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO conflict_trigger_audit VALUES (''insert'', NEW.value); RETURN NEW; END';
+         CREATE FUNCTION conflict_before_update() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO conflict_trigger_audit VALUES (''before-update'', NEW.value); RETURN NEW; END';
+         CREATE FUNCTION conflict_after_update() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO conflict_trigger_audit VALUES (''after-update'', NEW.value); RETURN NEW; END';
+         CREATE TRIGGER conflict_insert BEFORE INSERT ON conflict_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION conflict_before_insert();
+         CREATE TRIGGER conflict_update BEFORE UPDATE OF value ON conflict_trigger_target
+           FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION conflict_before_update();
+         CREATE TRIGGER conflict_after AFTER UPDATE OF value ON conflict_trigger_target
+           FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION conflict_after_update();
+         INSERT INTO conflict_trigger_target VALUES (1, 1);
+         INSERT INTO conflict_trigger_target VALUES (1, 2) ON CONFLICT DO NOTHING;
+         INSERT INTO conflict_trigger_target VALUES (1, 3)
+           ON CONFLICT (id) DO UPDATE SET value = excluded.value;
+         SELECT event, value FROM conflict_trigger_audit ORDER BY value, event;
+         SELECT value FROM conflict_trigger_target;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "insert|1",
+            "insert|2",
+            "after-update|3",
+            "before-update|3",
+            "insert|3",
+            "3",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn statement_trigger_catalog_checkpoint_and_recovery_preserve_level() {
+    let mut config = test_config("statement-trigger-catalog-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("statement-trigger-catalog-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_statement_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_statement_audit (event text);
+         CREATE FUNCTION durable_statement_note() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO durable_statement_audit VALUES (''fired''); RETURN NULL; END';
+         CREATE TRIGGER durable_statement_insert BEFORE INSERT ON durable_statement_target
+           EXECUTE FUNCTION durable_statement_note();
+         CREATE TRIGGER durable_statement_truncate AFTER TRUNCATE ON durable_statement_target
+           FOR EACH STATEMENT EXECUTE FUNCTION durable_statement_note();",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO durable_statement_target VALUES (1), (2);
+         TRUNCATE durable_statement_target;
+         SELECT count(*) FROM durable_statement_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["2"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

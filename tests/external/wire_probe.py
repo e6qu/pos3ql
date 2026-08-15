@@ -1102,6 +1102,38 @@ def test_row_trigger_body_over_raw_wire():
     s.close()
 
 
+def test_statement_and_conflict_triggers_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_statement_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_statement_audit (event text, value integer); "
+        "CREATE FUNCTION wire_statement_note() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_statement_audit VALUES (''statement'', 0); RETURN NULL; END'; "
+        "CREATE FUNCTION wire_conflict_note() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_statement_audit VALUES (''update'', NEW.value); RETURN NEW; END'; "
+        "CREATE TRIGGER wire_statement_insert BEFORE INSERT ON wire_statement_target "
+        "FOR EACH STATEMENT EXECUTE FUNCTION wire_statement_note(); "
+        "CREATE TRIGGER wire_conflict_update BEFORE UPDATE OF value ON wire_statement_target "
+        "FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION wire_conflict_note(); "
+        "INSERT INTO wire_statement_target VALUES (1, 1), (2, 2); "
+        "INSERT INTO wire_statement_target VALUES (1, 5) "
+        "ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+    )
+    check("raw wire: statement and conflict trigger setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: statement trigger fires once and conflict update fires",
+        first_text_row(simple_query(s, "SELECT count(*) FROM wire_statement_audit")) == "3",
+    )
+    check(
+        "raw wire: conflict row trigger changes the durable target",
+        first_text_row(simple_query(s, "SELECT value FROM wire_statement_target WHERE id = 1")) == "5",
+    )
+    s.close()
+
+
 def test_subscription_definition_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

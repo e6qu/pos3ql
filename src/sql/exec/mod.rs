@@ -26,7 +26,7 @@ use crate::wal::{Wal, WalOp};
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
     Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, Stmt, TriggerEvent,
-    TriggerTiming, Update,
+    TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
@@ -1264,6 +1264,9 @@ fn handle_conflict<'a>(
     checks: &ParsedChecks,
     arena: &'a Arena,
     params: &[Datum],
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<ConflictOutcome<'a>, SqlError> {
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
@@ -1285,8 +1288,9 @@ fn handle_conflict<'a>(
         return Ok(ConflictOutcome::Skip); // DO NOTHING
     };
     // DO UPDATE: recompute the conflicting row, `excluded` = the proposed row.
-    let new_bytes = {
-        let mut existing = [Datum::Null; MAX_COLUMNS];
+    let mut existing = [Datum::Null; MAX_COLUMNS];
+    let mut new_values = [Datum::Null; MAX_COLUMNS];
+    {
         let state = *storage
             .table(table_index)
             .rows
@@ -1296,6 +1300,12 @@ fn handle_conflict<'a>(
             .visible_row_home(table_index, rowid, state, txn.txid)?
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "conflict row exceeds the statement arena"
+            )
+        })?;
         rowenc::decode(bytes, schema, &mut existing)?;
         let context = ExcludedCtx {
             def,
@@ -1331,7 +1341,6 @@ fn handle_conflict<'a>(
         {
             return Ok(ConflictOutcome::Skip); // WHERE excluded this row
         }
-        let mut new_values = [Datum::Null; MAX_COLUMNS];
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
         for (name, expression) in assigns {
             let Some(target) = def.column_index(name) else {
@@ -1345,29 +1354,54 @@ fn handle_conflict<'a>(
             let v = eval_full(expression, arena, params, &context, &hooks)?;
             new_values[target] = coerce(v, &def.columns()[target], storage, txn.txid, arena)?;
         }
-        check_not_null(def, &new_values)?;
-        enforce_row_constraints(
+    }
+    let mut updated_columns = 0u64;
+    for (name, _) in assigns {
+        let column = def.column_index(name).expect("validated above");
+        updated_columns |= 1u64 << column;
+    }
+    let generated = parse_generated(def, arena)?;
+    if !fire_row_triggers(
+        TriggerExecContext {
             storage,
-            table_index,
-            def,
-            schema,
-            &new_values[..def.n_columns],
-            Some(rowid),
-            txn.txid,
-            checks,
+            txn,
             arena,
-            params,
-        )?;
-        let len = rowenc::encoded_len(&new_values[..def.n_columns]);
-        let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "updated row exceeds the arena"
-            )
-        })?;
-        rowenc::encode(&new_values[..def.n_columns], out);
-        &*out
-    };
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        def,
+        2,
+        true,
+        updated_columns,
+        Some(&existing[..def.n_columns]),
+        Some(&mut new_values[..def.n_columns]),
+    )? {
+        return Ok(ConflictOutcome::Skip);
+    }
+    compute_generated(def, &generated, &mut new_values, storage, txn.txid, arena)?;
+    check_not_null(def, &new_values)?;
+    enforce_row_constraints(
+        storage,
+        table_index,
+        def,
+        schema,
+        &new_values[..def.n_columns],
+        Some(rowid),
+        txn.txid,
+        checks,
+        arena,
+        params,
+    )?;
+    let len = rowenc::encoded_len(&new_values[..def.n_columns]);
+    let new_bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "updated row exceeds the arena"
+        )
+    })?;
+    rowenc::encode(&new_values[..def.n_columns], new_bytes);
     let (new_loc, slice) = storage.heap.append(new_bytes.len())?;
     slice.copy_from_slice(new_bytes);
     let prior = storage.write_pending(
@@ -1381,6 +1415,23 @@ fn handle_conflict<'a>(
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        def,
+        2,
+        false,
+        updated_columns,
+        Some(&existing[..def.n_columns]),
+        Some(&mut new_values[..def.n_columns]),
+    )?;
     Ok(ConflictOutcome::Updated(new_bytes))
 }
 
@@ -7402,8 +7453,9 @@ fn fire_row_triggers<'a>(
         };
         trigger_at += 1;
         if !trigger.enabled_to(context.txn.txid)
+            || !matches!(trigger.level, TriggerLevel::Row)
             || trigger.timing != u8::from(!before)
-            || trigger.events & event == 0
+            || !trigger.events.contains(event)
             || (event == 2
                 && trigger.update_columns != 0
                 && trigger.update_columns & updated_columns == 0)
@@ -7478,6 +7530,99 @@ fn fire_row_triggers<'a>(
     Ok(true)
 }
 
+/// Executes each matching statement trigger once. Statement images are absent
+/// by construction, so an OLD/NEW field reference fails at the same typed
+/// transition boundary as an invalid row event.
+fn fire_statement_triggers<'a>(
+    mut context: TriggerExecContext<'_, 'a, '_>,
+    table: usize,
+    definition: &TableDef,
+    event: u8,
+    before: bool,
+    updated_columns: u64,
+) -> Result<(), SqlError> {
+    let mut trigger_at = 0usize;
+    loop {
+        let Some(trigger) = ({
+            context
+                .storage
+                .triggers_for_table(table, context.txn.txid)
+                .nth(trigger_at)
+                .map(|(_, trigger)| *trigger)
+        }) else {
+            break;
+        };
+        trigger_at += 1;
+        if !trigger.enabled_to(context.txn.txid)
+            || !matches!(trigger.level, TriggerLevel::Statement)
+            || trigger.timing != u8::from(!before)
+            || !trigger.events.contains(event)
+            || (event == 2
+                && trigger.update_columns != 0
+                && trigger.update_columns & updated_columns == 0)
+        {
+            continue;
+        }
+        if let Some(when) = trigger.when {
+            let source = context.arena.alloc_str(when.as_str()).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger WHEN predicate exceeds the statement arena"
+                )
+            })?;
+            let condition = super::parser::parse_expr(source, context.arena)?;
+            match eval_full(
+                condition,
+                context.arena,
+                crate::sql::eval::NO_PARAMS,
+                &TriggerTransition {
+                    definition,
+                    old: None,
+                    new: None,
+                },
+                &NO_HOOKS,
+            )? {
+                Datum::Bool(true) => {}
+                Datum::Bool(false) | Datum::Null => continue,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "trigger WHEN condition must be type boolean"
+                    ));
+                }
+            }
+        }
+        let source = {
+            let body = context
+                .storage
+                .routine(usize::from(trigger.function))
+                .body
+                .as_str();
+            context.arena.alloc_str(body).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger body exceeds the statement arena"
+                )
+            })?
+        };
+        let program = parse_trigger_program(source, context.arena)?;
+        let mut no_new = None;
+        if execute_trigger_block(
+            &mut context,
+            definition,
+            None,
+            &mut no_new,
+            before,
+            program.body,
+        )?
+        .is_none()
+        {
+            return Err(unsupported_trigger_body());
+        }
+    }
+    Ok(())
+}
+
 pub fn create_trigger(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -7529,12 +7674,16 @@ pub fn create_trigger(
             TriggerEvent::Insert => 1,
             TriggerEvent::Update => 2,
             TriggerEvent::Delete => 4,
+            TriggerEvent::Truncate => 8,
         }
     });
+    let events = crate::sql::ast::TriggerEvents::from_bits(events)
+        .expect("parser constructs a non-empty known trigger event list");
     let timing = match trigger.timing {
         TriggerTiming::Before => 0,
         TriggerTiming::After => 1,
     };
+    let level = trigger.level;
     let definition = storage.table_def(table, txn.txid);
     let mut update_columns = 0u64;
     for name in trigger.update_columns {
@@ -7569,6 +7718,7 @@ pub fn create_trigger(
             table,
             function,
             timing,
+            level,
             events,
             update_columns,
             when,
@@ -7589,6 +7739,7 @@ pub fn create_trigger(
             function_schema: function_schema.as_str(),
             function: function_name.as_str(),
             timing,
+            level,
             events,
             update_columns,
             when: when.as_ref().map(|value| value.as_str()),
@@ -15438,6 +15589,9 @@ fn finish_insert_row<'a>(
         checks,
         arena,
         params,
+        seq_session,
+        responder,
+        scratch,
     ) {
         Ok(ConflictOutcome::Store) => {}
         Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
@@ -15565,17 +15719,6 @@ pub fn insert<'a>(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
-    if statement.on_conflict.is_some()
-        && storage
-            .triggers_for_table(table_index, txn.txid)
-            .next()
-            .is_some()
-    {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "INSERT ON CONFLICT with row triggers is not supported"
-        ));
-    }
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -15590,6 +15733,60 @@ pub fn insert<'a>(
         },
         None => Arbiter::Any,
     };
+    let conflict_update_columns = match statement.on_conflict.and_then(|conflict| conflict.update) {
+        Some(assignments) => {
+            let mut columns = 0u64;
+            for (name, _) in assignments {
+                let Some(column) = def.column_index(name) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        def.name.as_str()
+                    ));
+                };
+                columns |= 1u64 << column;
+            }
+            Some(columns)
+        }
+        None => None,
+    };
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        1,
+        true,
+        0,
+    ) {
+        return sql_fail(error);
+    }
+    if let Some(updated_columns) = conflict_update_columns
+        && let Err(error) = fire_statement_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            table_index,
+            &def,
+            2,
+            true,
+            updated_columns,
+        )
+    {
+        return sql_fail(error);
+    }
 
     // Column list → target indices.
     let mut targets = [0usize; MAX_COLUMNS];
@@ -15798,6 +15995,42 @@ pub fn insert<'a>(
                 Err(error) => return sql_fail(error),
             }
         }
+        if let Some(updated_columns) = conflict_update_columns
+            && let Err(error) = fire_statement_triggers(
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                    scratch: scratch as *mut _,
+                },
+                table_index,
+                &def,
+                2,
+                false,
+                updated_columns,
+            )
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) = fire_statement_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            table_index,
+            &def,
+            1,
+            false,
+            0,
+        ) {
+            return sql_fail(error);
+        }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
         if !capturing {
             responder.command_complete(tag.as_str())?;
@@ -15944,6 +16177,42 @@ pub fn insert<'a>(
             Ok(false) => {}
             Err(error) => return sql_fail(error),
         }
+    }
+    if let Some(updated_columns) = conflict_update_columns
+        && let Err(error) = fire_statement_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            table_index,
+            &def,
+            2,
+            false,
+            updated_columns,
+        )
+    {
+        return sql_fail(error);
+    }
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        1,
+        false,
+        0,
+    ) {
+        return sql_fail(error);
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
     if !capturing {
@@ -16168,6 +16437,23 @@ pub fn update<'a>(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        2,
+        true,
+        updated_columns,
+    ) {
+        return sql_fail(error);
+    }
 
     let subs = match super::query::subquery_hooks(
         &[statement.where_clause],
@@ -16608,6 +16894,23 @@ pub fn update<'a>(
         }
         updated += 1;
     }
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        2,
+        false,
+        updated_columns,
+    ) {
+        return sql_fail(error);
+    }
     let tag = stack_format!(48, "UPDATE {}", updated);
     if !capturing {
         responder.command_complete(tag.as_str())?;
@@ -16656,6 +16959,23 @@ pub fn delete<'a>(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        4,
+        true,
+        0,
+    ) {
+        return sql_fail(error);
+    }
 
     let subs = match super::query::subquery_hooks(
         &[statement.where_clause],
@@ -16879,6 +17199,23 @@ pub fn delete<'a>(
             }
         }
     }
+    if let Err(error) = fire_statement_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        &def,
+        4,
+        false,
+        0,
+    ) {
+        return sql_fail(error);
+    }
     let tag = stack_format!(48, "DELETE {}", scratch.len());
     if !capturing {
         responder.command_complete(tag.as_str())?;
@@ -16893,9 +17230,16 @@ pub fn delete<'a>(
 /// tables in transitively, with a NOTICE per addition. RESTART IDENTITY
 /// resets each serial column's sequence, transactionally (an undo entry
 /// restores the prior position on rollback).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "statement-trigger dispatch needs the normal bounded DML execution context"
+)]
 pub fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     tables: &[QualName],
     restart_identity: bool,
     cascade: bool,
@@ -16992,6 +17336,26 @@ pub fn truncate(
             return sql_fail(error);
         }
     }
+    for &table_index in &list[..n] {
+        let definition = *storage.table_def(table_index, txn.txid);
+        if let Err(error) = fire_statement_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            table_index,
+            &definition,
+            8,
+            true,
+            0,
+        ) {
+            return sql_fail(error);
+        }
+    }
     // Remove every visible row, transactionally.
     for &table_index in &list[..n] {
         let mut rowids: [u64; 4096] = [0; 4096];
@@ -17066,6 +17430,26 @@ pub fn truncate(
                 t.serial_last[c] = 0;
                 t.serial_dirty = true;
             }
+        }
+    }
+    for &table_index in &list[..n] {
+        let definition = *storage.table_def(table_index, txn.txid);
+        if let Err(error) = fire_statement_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            table_index,
+            &definition,
+            8,
+            false,
+            0,
+        ) {
+            return sql_fail(error);
         }
     }
     let mut truncated_tables = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];

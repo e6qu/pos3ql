@@ -66,3 +66,24 @@ UPDATE row_trigger_qualification_target SET note = 1 WHERE id = 1;
 UPDATE row_trigger_qualification_target SET value = 2 WHERE id = 1;
 UPDATE row_trigger_qualification_target SET value = 7 WHERE id = 1;
 SELECT id, value FROM row_trigger_qualification_audit;
+
+CREATE TABLE statement_trigger_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE statement_trigger_audit (event text, value integer);
+CREATE FUNCTION statement_trigger_note() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO statement_trigger_audit VALUES (''statement'', 0); RETURN NULL; END';
+CREATE FUNCTION statement_conflict_note() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO statement_trigger_audit VALUES (''update'', NEW.value); RETURN NEW; END';
+CREATE TRIGGER statement_insert BEFORE INSERT ON statement_trigger_target
+  EXECUTE FUNCTION statement_trigger_note();
+CREATE TRIGGER statement_update AFTER UPDATE OF value ON statement_trigger_target
+  FOR EACH STATEMENT EXECUTE FUNCTION statement_trigger_note();
+CREATE TRIGGER statement_truncate AFTER TRUNCATE ON statement_trigger_target
+  FOR EACH STATEMENT EXECUTE FUNCTION statement_trigger_note();
+CREATE TRIGGER statement_conflict_update BEFORE UPDATE OF value ON statement_trigger_target
+  FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION statement_conflict_note();
+INSERT INTO statement_trigger_target VALUES (1, 1), (2, 2);
+UPDATE statement_trigger_target SET value = value + 1;
+INSERT INTO statement_trigger_target VALUES (1, 9)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value;
+TRUNCATE statement_trigger_target;
+SELECT event, value FROM statement_trigger_audit ORDER BY value, event;

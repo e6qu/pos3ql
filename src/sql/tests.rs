@@ -8957,6 +8957,62 @@ fn statement_trigger_catalog_checkpoint_and_recovery_preserve_level() {
 }
 
 #[test]
+fn transition_dml_scope_survives_checkpoint_and_recovery() {
+    let mut config = test_config("transition-dml-scope-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("transition-dml-scope-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_transition_dml_driver (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE durable_transition_dml_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION durable_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE durable_transition_dml_target
+                 SET value = durable_transition_dml_target.value + changed_rows.delta
+                FROM changed_rows
+               WHERE durable_transition_dml_target.id = changed_rows.id;
+              DELETE FROM durable_transition_dml_target
+                USING changed_rows
+               WHERE durable_transition_dml_target.id = changed_rows.id
+                 AND changed_rows.delta = 9;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER durable_transition_dml_after AFTER UPDATE ON durable_transition_dml_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION durable_transition_dml_program();
+         INSERT INTO durable_transition_dml_driver VALUES (1, 3), (2, 9);
+         INSERT INTO durable_transition_dml_target VALUES (1, 10), (2, 20);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "UPDATE durable_transition_dml_driver SET delta = delta;
+         SELECT id, value FROM durable_transition_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|13"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     let mut config = test_config("trigger-catalog-recovery");
     config.object_store_on = true;

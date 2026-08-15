@@ -1,0 +1,65 @@
+# PostgreSQL transition relations are statement-local typed relations, not
+# text substitutions. Keep all three DML shapes in the SQLLogicTest replay.
+
+statement ok
+CREATE TABLE slt_transition_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE TABLE slt_transition_audit (kind text, id integer, value integer)
+
+statement ok
+CREATE FUNCTION slt_transition_insert() RETURNS trigger LANGUAGE plpgsql AS
+'BEGIN INSERT INTO slt_transition_audit SELECT ''insert'', id, value FROM inserted_rows; RETURN NULL; END'
+
+statement ok
+CREATE FUNCTION slt_transition_update() RETURNS trigger LANGUAGE plpgsql AS
+'BEGIN INSERT INTO slt_transition_audit SELECT ''update-old'', id, value FROM old_rows; INSERT INTO slt_transition_audit SELECT ''update-new'', id, value FROM new_rows; RETURN NULL; END'
+
+statement ok
+CREATE FUNCTION slt_transition_delete() RETURNS trigger LANGUAGE plpgsql AS
+'BEGIN INSERT INTO slt_transition_audit SELECT ''delete'', id, value FROM deleted_rows; RETURN NULL; END'
+
+statement ok
+CREATE TRIGGER slt_transition_insert AFTER INSERT ON slt_transition_target
+REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_transition_insert()
+
+statement ok
+CREATE TRIGGER slt_transition_update AFTER UPDATE ON slt_transition_target
+REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_transition_update()
+
+statement ok
+CREATE TRIGGER slt_transition_delete AFTER DELETE ON slt_transition_target
+REFERENCING OLD TABLE AS deleted_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_transition_delete()
+
+statement ok
+INSERT INTO slt_transition_target VALUES (1, 10), (2, 20)
+
+statement ok
+UPDATE slt_transition_target SET value = value + 1 WHERE id = 1
+
+statement ok
+DELETE FROM slt_transition_target WHERE id = 2
+
+query TII rowsort
+SELECT kind, id, value FROM slt_transition_audit ORDER BY kind, id, value
+----
+delete 2 20
+insert 1 10
+insert 2 20
+update-new 1 11
+update-old 1 10
+
+statement ok
+DROP TABLE slt_transition_target
+
+statement ok
+DROP TABLE slt_transition_audit
+
+statement ok
+DROP FUNCTION slt_transition_delete()
+
+statement ok
+DROP FUNCTION slt_transition_update()
+
+statement ok
+DROP FUNCTION slt_transition_insert()

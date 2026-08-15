@@ -154,6 +154,30 @@ pub fn expand_ctes_exec<'a>(
     )
 }
 
+/// Binds executor-owned relations into a query as typed materialized sources.
+/// Trigger transition tables use this path: their rows already belong to the
+/// statement arena and must never be rendered back into SQL text.
+pub(crate) fn bind_materialized_relations<'a>(
+    select: &'a Select<'a>,
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let context = Subst {
+        ctes: &[],
+        materialized: relations,
+        storage,
+        txid,
+        depth: 0,
+        path: None,
+        dependencies: None,
+        authorization_role: None,
+        qualifier: None,
+    };
+    subst_select(select, context, arena)
+}
+
 /// Expands a `WITH` list into a data-modifying main statement. The returned
 /// AST borrows only the statement arena and materialized CTE rows, never the
 /// catalog borrow used while resolving names. That separation is what permits

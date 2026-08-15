@@ -14,7 +14,7 @@ use crate::sql::ast::{
     AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
     CreateTrigger, DomainCheck, Expr, PublicationOperations, RoleOptions, RoutineArgument,
     RoutineCreateKind, RoutineIdentity, RoutineTargetKind, SubscriptionOptions,
-    SubscriptionSlotName, TriggerEvent, TriggerIdentity, TriggerTiming,
+    SubscriptionSlotName, TriggerEvent, TriggerIdentity, TriggerTiming, TriggerTransitionTables,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -207,6 +207,38 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("on")?;
         let table = self.qual_name("trigger table")?;
+        let transition_tables = if self.eat_ident("referencing")? {
+            let mut old = None;
+            let mut new = None;
+            loop {
+                if self.eat_ident("old")? {
+                    self.expect_ident("table")?;
+                    let _ = self.eat_ident("as")?;
+                    if old.replace(self.col_ident("OLD TABLE name")?).is_some() {
+                        return Err(self.err_here("OLD TABLE specified more than once"));
+                    }
+                } else if self.eat_ident("new")? {
+                    self.expect_ident("table")?;
+                    let _ = self.eat_ident("as")?;
+                    if new.replace(self.col_ident("NEW TABLE name")?).is_some() {
+                        return Err(self.err_here("NEW TABLE specified more than once"));
+                    }
+                } else {
+                    break;
+                }
+            }
+            match (old, new) {
+                (Some(old), Some(new)) if old.eq_ignore_ascii_case(new) => {
+                    return Err(self.err_here("OLD TABLE and NEW TABLE names must differ"));
+                }
+                (Some(old), Some(new)) => TriggerTransitionTables::OldNew { old, new },
+                (Some(old), None) => TriggerTransitionTables::Old(old),
+                (None, Some(new)) => TriggerTransitionTables::New(new),
+                (None, None) => return Err(self.err_here("expected OLD TABLE or NEW TABLE")),
+            }
+        } else {
+            TriggerTransitionTables::None
+        };
         let level = if self.eat_ident("for")? {
             let _ = self.eat_ident("each")?;
             if self.eat_ident("statement")? {
@@ -223,10 +255,44 @@ impl<'a> Parser<'a> {
         {
             return Err(self.err_here("TRUNCATE triggers must be FOR EACH STATEMENT"));
         }
+        if !matches!(transition_tables, TriggerTransitionTables::None) {
+            if !matches!(timing, TriggerTiming::After)
+                || !matches!(level, crate::sql::ast::TriggerLevel::Statement)
+            {
+                return Err(self.err_here(
+                    "transition tables are only valid for AFTER FOR EACH STATEMENT triggers",
+                ));
+            }
+            if events[..event_count].contains(&TriggerEvent::Truncate) {
+                return Err(self.err_here("TRUNCATE triggers cannot have transition tables"));
+            }
+            if transition_tables.old().is_some()
+                && !events[..event_count]
+                    .iter()
+                    .any(|event| matches!(event, TriggerEvent::Update | TriggerEvent::Delete))
+            {
+                return Err(self.err_here("OLD TABLE requires UPDATE or DELETE"));
+            }
+            if transition_tables.new_table().is_some()
+                && !events[..event_count]
+                    .iter()
+                    .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
+            {
+                return Err(self.err_here("NEW TABLE requires INSERT or UPDATE"));
+            }
+            if update_column_count != 0 {
+                return Err(
+                    self.err_here("UPDATE OF column lists cannot be used with transition tables")
+                );
+            }
+        }
         let when = self
             .eat_ident("when")?
             .then(|| self.check_text())
             .transpose()?;
+        if when.is_some() && matches!(level, crate::sql::ast::TriggerLevel::Statement) {
+            return Err(self.err_here("statement triggers cannot have WHEN conditions"));
+        }
         self.expect_ident("execute")?;
         if !self.eat_ident("function")? {
             return Err(self.err_here("trigger procedures are not supported; use EXECUTE FUNCTION"));
@@ -255,6 +321,7 @@ impl<'a> Parser<'a> {
             events: self.arena_slice(&events[..event_count])?,
             update_columns: self.arena_slice(&update_columns[..update_column_count])?,
             table,
+            transition_tables,
             when,
             function,
             arguments: self.arena_slice(&arguments[..argument_count])?,

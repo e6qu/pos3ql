@@ -4885,6 +4885,8 @@ fn pg_trigger<'a>(
             ("tgconstraint", ColType::Oid),
             ("tgfoid", ColType::Oid),
             ("tgparentid", ColType::Oid),
+            ("tgoldtable", ColType::Name),
+            ("tgnewtable", ColType::Name),
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
@@ -4898,6 +4900,14 @@ fn pg_trigger<'a>(
             continue;
         }
         let function = storage.routine(usize::from(trigger.function));
+        let (old_table, new_table) = match &trigger.transition_tables {
+            crate::storage::TriggerTransitionTables::None => ("", ""),
+            crate::storage::TriggerTransitionTables::Old(old) => (old.as_str(), ""),
+            crate::storage::TriggerTransitionTables::New(new) => ("", new.as_str()),
+            crate::storage::TriggerTransitionTables::OldNew { old, new } => {
+                (old.as_str(), new.as_str())
+            }
+        };
         rows[count] = row(
             &[
                 Datum::Int4(2620),
@@ -4909,6 +4919,8 @@ fn pg_trigger<'a>(
                 Datum::Int4(0),
                 Datum::Int4(crate::storage::routine_oid(function)),
                 Datum::Int4(0),
+                text(old_table, arena)?,
+                text(new_table, arena)?,
             ],
             arena,
         )?;

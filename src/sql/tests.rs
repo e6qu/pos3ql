@@ -8354,8 +8354,6 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     for source in [
         "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
-        "CREATE FUNCTION reject_trigger_insert_select() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO trigger_body_audit SELECT id, value FROM trigger_body_dml; RETURN NEW; END'",
         "CREATE FUNCTION reject_trigger_update_from() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN UPDATE trigger_body_dml SET value = 1 FROM trigger_body_audit WHERE trigger_body_dml.id = trigger_body_audit.id; RETURN NEW; END'",
         "CREATE FUNCTION reject_trigger_delete_using() RETURNS trigger LANGUAGE plpgsql AS
@@ -8461,13 +8459,180 @@ fn statement_triggers_default_once_and_cover_truncate() {
         &mut budget,
         "CREATE TRIGGER statement_bad BEFORE INSERT ON statement_trigger_target
            FOR EACH STATEMENT WHEN (NEW.value > 0)
-           EXECUTE FUNCTION statement_trigger_note();
-         INSERT INTO statement_trigger_target VALUES (3, 3)",
+           EXECUTE FUNCTION statement_trigger_note()",
     );
     assert!(
-        String::from_utf8_lossy(&unavailable).contains("record \"NEW\" is not assigned"),
+        String::from_utf8_lossy(&unavailable).contains("statement triggers cannot have WHEN"),
         "{}",
         String::from_utf8_lossy(&unavailable)
+    );
+}
+
+#[test]
+fn after_statement_trigger_reads_typed_new_transition_table() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE transition_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE transition_audit (id integer, value integer);
+         CREATE FUNCTION transition_new_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO transition_audit SELECT id, value FROM inserted_rows; RETURN NULL; END';
+         CREATE TRIGGER transition_after_insert AFTER INSERT ON transition_target
+           REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION transition_new_rows();
+         INSERT INTO transition_target VALUES (1, 10), (2, 20);
+         SELECT id, value FROM transition_audit ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|10", "2|20"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn after_statement_trigger_reads_old_and_new_transition_tables() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE transition_change_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE transition_change_audit (kind text, id integer, value integer);
+         INSERT INTO transition_change_target VALUES (1, 10), (2, 20);
+         CREATE FUNCTION transition_changed_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              INSERT INTO transition_change_audit SELECT ''old'', id, value FROM old_rows;
+              INSERT INTO transition_change_audit SELECT ''new'', id, value FROM new_rows;
+              RETURN NULL;
+            END';
+         CREATE FUNCTION transition_deleted_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO transition_change_audit SELECT ''deleted'', id, value FROM deleted_rows; RETURN NULL; END';
+         CREATE TRIGGER transition_after_update AFTER UPDATE ON transition_change_target
+           REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION transition_changed_rows();
+         CREATE TRIGGER transition_after_delete AFTER DELETE ON transition_change_target
+           REFERENCING OLD TABLE AS deleted_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION transition_deleted_rows();
+         UPDATE transition_change_target SET value = value + 1;
+         DELETE FROM transition_change_target WHERE id = 2;
+         SELECT kind, id, value FROM transition_change_audit ORDER BY kind, id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "deleted|2|21",
+            "new|1|11",
+            "new|2|21",
+            "old|1|10",
+            "old|2|20"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn on_conflict_update_populates_statement_transition_tables() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE conflict_transition_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE conflict_transition_audit (kind text, id integer, value integer);
+         INSERT INTO conflict_transition_target VALUES (1, 10);
+         CREATE FUNCTION conflict_transition_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO conflict_transition_audit SELECT ''old'', id, value FROM old_rows;
+                  INSERT INTO conflict_transition_audit SELECT ''new'', id, value FROM new_rows; RETURN NULL; END';
+         CREATE TRIGGER conflict_transition_update AFTER UPDATE ON conflict_transition_target
+           REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION conflict_transition_rows();
+         INSERT INTO conflict_transition_target VALUES (1, 20)
+           ON CONFLICT (id) DO UPDATE SET value = excluded.value;
+         SELECT kind, id, value FROM conflict_transition_audit ORDER BY kind;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["new|1|20", "old|1|10"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn transition_table_definition_survives_checkpoint_and_recovery() {
+    let mut config = test_config("transition-table-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("transition-table-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_transition_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_transition_audit (id integer);
+         CREATE FUNCTION durable_transition_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO durable_transition_audit SELECT id FROM inserted_rows; RETURN NULL; END';
+         CREATE TRIGGER durable_transition_insert AFTER INSERT ON durable_transition_target
+           REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION durable_transition_rows();",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO durable_transition_target VALUES (1), (2);
+         SELECT id FROM durable_transition_audit ORDER BY id;
+         SELECT tgoldtable, tgnewtable FROM pg_trigger WHERE tgname = 'durable_transition_insert';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "2", "|inserted_rows"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn transition_table_trigger_rollback_restores_catalog_and_execution_state() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rollback_transition_target (id integer PRIMARY KEY);
+         CREATE TABLE rollback_transition_audit (id integer);
+         CREATE FUNCTION rollback_transition_rows() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO rollback_transition_audit SELECT id FROM inserted_rows; RETURN NULL; END'",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE TRIGGER rollback_transition_insert AFTER INSERT ON rollback_transition_target
+           REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION rollback_transition_rows();
+         ROLLBACK",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO rollback_transition_target VALUES (1);
+         SELECT count(*) FROM rollback_transition_audit;
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'rollback_transition_insert';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -10035,6 +10200,109 @@ fn merge_statement() {
             "SELECT v, n FROM tgt WHERE id=10"
         )),
         ["x|99"]
+    );
+}
+
+#[test]
+fn merge_runs_each_action_trigger_lifecycle() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_trigger_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE merge_trigger_source (id integer, value integer);
+         CREATE TABLE merge_trigger_audit (event text);
+         INSERT INTO merge_trigger_target VALUES (1, 1), (2, 2);
+         INSERT INTO merge_trigger_source VALUES (1, 10), (2, 20), (3, 30);
+         CREATE FUNCTION merge_before_insert() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''before insert''); RETURN NEW; END';
+         CREATE FUNCTION merge_after_insert() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''after insert''); RETURN NEW; END';
+         CREATE FUNCTION merge_before_update() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''before update''); RETURN NEW; END';
+         CREATE FUNCTION merge_after_update() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''after update''); RETURN NEW; END';
+         CREATE FUNCTION merge_before_delete() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''before delete''); RETURN OLD; END';
+         CREATE FUNCTION merge_after_delete() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''after delete''); RETURN OLD; END';
+         CREATE FUNCTION merge_after_statement() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_trigger_audit VALUES (''after statement''); RETURN NULL; END';
+         CREATE TRIGGER merge_before_insert_trigger BEFORE INSERT ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_before_insert();
+         CREATE TRIGGER merge_after_insert_trigger AFTER INSERT ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_after_insert();
+         CREATE TRIGGER merge_before_update_trigger BEFORE UPDATE OF value ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_before_update();
+         CREATE TRIGGER merge_after_update_trigger AFTER UPDATE OF value ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_after_update();
+         CREATE TRIGGER merge_before_delete_trigger BEFORE DELETE ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_before_delete();
+         CREATE TRIGGER merge_after_delete_trigger AFTER DELETE ON merge_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION merge_after_delete();
+         CREATE TRIGGER merge_after_statement_trigger AFTER INSERT OR UPDATE OR DELETE ON merge_trigger_target
+           FOR EACH STATEMENT EXECUTE FUNCTION merge_after_statement();
+         MERGE INTO merge_trigger_target t USING merge_trigger_source s ON t.id = s.id
+           WHEN MATCHED AND s.id = 2 THEN DELETE
+           WHEN MATCHED THEN UPDATE SET value = s.value
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value);
+         SELECT event FROM merge_trigger_audit ORDER BY event;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "after delete",
+            "after insert",
+            "after statement",
+            "after statement",
+            "after statement",
+            "after update",
+            "before delete",
+            "before insert",
+            "before update",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn merge_statement_triggers_receive_action_transition_tables() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_transition_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE merge_transition_source (id integer, value integer);
+         CREATE TABLE merge_transition_audit (kind text, id integer, value integer);
+         INSERT INTO merge_transition_target VALUES (1, 1), (2, 2);
+         INSERT INTO merge_transition_source VALUES (1, 10), (2, 20), (3, 30);
+         CREATE FUNCTION merge_transition_insert() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_transition_audit SELECT ''insert'', id, value FROM inserted; RETURN NULL; END';
+         CREATE FUNCTION merge_transition_update() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_transition_audit SELECT ''old'', id, value FROM old_rows;
+                  INSERT INTO merge_transition_audit SELECT ''new'', id, value FROM new_rows; RETURN NULL; END';
+         CREATE FUNCTION merge_transition_delete() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO merge_transition_audit SELECT ''delete'', id, value FROM deleted; RETURN NULL; END';
+         CREATE TRIGGER merge_transition_insert_trigger AFTER INSERT ON merge_transition_target
+           REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION merge_transition_insert();
+         CREATE TRIGGER merge_transition_update_trigger AFTER UPDATE ON merge_transition_target
+           REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION merge_transition_update();
+         CREATE TRIGGER merge_transition_delete_trigger AFTER DELETE ON merge_transition_target
+           REFERENCING OLD TABLE AS deleted FOR EACH STATEMENT EXECUTE FUNCTION merge_transition_delete();
+         MERGE INTO merge_transition_target t USING merge_transition_source s ON t.id = s.id
+           WHEN MATCHED AND s.id = 2 THEN DELETE
+           WHEN MATCHED THEN UPDATE SET value = s.value
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value);
+         SELECT kind, id, value FROM merge_transition_audit ORDER BY kind, id;",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["delete|2|2", "insert|3|30", "new|1|10", "old|1|1"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

@@ -731,8 +731,35 @@ pub struct TriggerIdentity<'a> {
     pub table: QualName<'a>,
 }
 
-/// A parsed trigger definition. Constraint, transition-table, and INSTEAD OF
-/// forms retain distinct semantics and are rejected until supported.
+/// The named relations exposed by an AFTER statement trigger.  This is an
+/// algebraic state rather than two independently optional names, so a durable
+/// trigger cannot carry duplicate aliases or an empty transition declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTransitionTables<'a> {
+    None,
+    Old(&'a str),
+    New(&'a str),
+    OldNew { old: &'a str, new: &'a str },
+}
+
+impl<'a> TriggerTransitionTables<'a> {
+    pub(crate) const fn old(self) -> Option<&'a str> {
+        match self {
+            Self::Old(old) | Self::OldNew { old, .. } => Some(old),
+            Self::None | Self::New(_) => None,
+        }
+    }
+
+    pub(crate) const fn new_table(self) -> Option<&'a str> {
+        match self {
+            Self::New(new) | Self::OldNew { new, .. } => Some(new),
+            Self::None | Self::Old(_) => None,
+        }
+    }
+}
+
+/// A parsed trigger definition. Constraint and INSTEAD OF forms retain
+/// distinct semantics and are rejected until supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateTrigger<'a> {
     pub name: &'a str,
@@ -743,6 +770,7 @@ pub struct CreateTrigger<'a> {
     /// UPDATE whose SET list names at least one listed column.
     pub update_columns: &'a [&'a str],
     pub table: QualName<'a>,
+    pub transition_tables: TriggerTransitionTables<'a>,
     /// Parser-validated source retained for the bounded durable catalog form.
     pub when: Option<&'a str>,
     pub function: QualName<'a>,

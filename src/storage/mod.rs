@@ -2333,7 +2333,69 @@ impl RoutineDef {
     }
 }
 
-/// A durable row-trigger definition.  The bit set is valid only when nonzero;
+/// A durable trigger transition-relation declaration.  The variants preserve
+/// the names as one validated state instead of allowing independently optional
+/// aliases to drift into an invalid catalog record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerTransitionTables {
+    None,
+    Old(SqlName),
+    New(SqlName),
+    OldNew { old: SqlName, new: SqlName },
+}
+
+impl TriggerTransitionTables {
+    pub(crate) fn from_names(old: Option<&str>, new: Option<&str>) -> Option<Self> {
+        match (old, new) {
+            (None, None) => Some(Self::None),
+            (Some(old), None) => Some(Self::Old(SqlName::parse(old).ok()?)),
+            (None, Some(new)) => Some(Self::New(SqlName::parse(new).ok()?)),
+            (Some(old), Some(new)) if old.eq_ignore_ascii_case(new) => None,
+            (Some(old), Some(new)) => Some(Self::OldNew {
+                old: SqlName::parse(old).ok()?,
+                new: SqlName::parse(new).ok()?,
+            }),
+        }
+    }
+
+    pub(crate) const fn old(self) -> Option<SqlName> {
+        match self {
+            Self::Old(old) | Self::OldNew { old, .. } => Some(old),
+            Self::None | Self::New(_) => None,
+        }
+    }
+
+    pub(crate) const fn new_table(self) -> Option<SqlName> {
+        match self {
+            Self::New(new) | Self::OldNew { new, .. } => Some(new),
+            Self::None | Self::Old(_) => None,
+        }
+    }
+
+    pub(crate) const fn is_valid_for(
+        self,
+        timing: u8,
+        level: crate::sql::ast::TriggerLevel,
+        events: crate::sql::ast::TriggerEvents,
+    ) -> bool {
+        match self {
+            Self::None => true,
+            Self::Old(_) | Self::New(_) | Self::OldNew { .. } => {
+                timing == 1
+                    && matches!(level, crate::sql::ast::TriggerLevel::Statement)
+                    && !events.has_truncate()
+                    && (self.old().is_none()
+                        || events.contains(crate::sql::ast::TriggerEvents::UPDATE)
+                        || events.contains(crate::sql::ast::TriggerEvents::DELETE))
+                    && (self.new_table().is_none()
+                        || events.contains(crate::sql::ast::TriggerEvents::INSERT)
+                        || events.contains(crate::sql::ast::TriggerEvents::UPDATE))
+            }
+        }
+    }
+}
+
+/// A durable trigger definition. The bit set is valid only when nonzero;
 /// construction remains inside the storage choke point so an empty trigger
 /// event set cannot enter the catalog.
 #[derive(Debug, Clone, Copy)]
@@ -2346,6 +2408,7 @@ pub(crate) struct TriggerDef {
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
+    pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) enabled: bool,
     pending_definition: Option<PendingTriggerDefinition>,
@@ -2380,6 +2443,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
+    pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
 }
 
@@ -2408,6 +2472,7 @@ impl TriggerDef {
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
         update_columns: 0,
+        transition_tables: TriggerTransitionTables::None,
         when: None,
         enabled: false,
         pending_definition: None,
@@ -13375,6 +13440,13 @@ impl Storage {
         if spec.timing > 1
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
                 && spec.events.has_truncate())
+            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
+                && spec.when.is_some())
+            || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
+                && spec.update_columns != 0)
+            || !spec
+                .transition_tables
+                .is_valid_for(spec.timing, spec.level, spec.events)
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -13422,6 +13494,7 @@ impl Storage {
             level: spec.level,
             events: spec.events,
             update_columns: spec.update_columns,
+            transition_tables: spec.transition_tables,
             when: spec.when,
             enabled: true,
             pending_definition: None,
@@ -13492,6 +13565,22 @@ impl Storage {
         spec: TriggerSpec,
         enabled: bool,
     ) -> Result<usize, SqlError> {
+        if spec.timing > 1
+            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
+                && spec.events.has_truncate())
+            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
+                && spec.when.is_some())
+            || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
+                && spec.update_columns != 0)
+            || !spec
+                .transition_tables
+                .is_valid_for(spec.timing, spec.level, spec.events)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid trigger definition in checkpoint"
+            ));
+        }
         if self
             .trigger_slot(spec.table, spec.name.as_str(), 0)
             .is_some()
@@ -13531,6 +13620,7 @@ impl Storage {
             level: spec.level,
             events: spec.events,
             update_columns: spec.update_columns,
+            transition_tables: spec.transition_tables,
             when: spec.when,
             enabled,
             pending_definition: None,

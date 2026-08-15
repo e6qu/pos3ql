@@ -87,3 +87,24 @@ INSERT INTO statement_trigger_target VALUES (1, 9)
   ON CONFLICT (id) DO UPDATE SET value = excluded.value;
 TRUNCATE statement_trigger_target;
 SELECT event, value FROM statement_trigger_audit ORDER BY value, event;
+
+CREATE TABLE transition_trigger_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE transition_trigger_audit (kind text, id integer, value integer);
+CREATE FUNCTION transition_trigger_update() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN
+     INSERT INTO transition_trigger_audit SELECT ''old'', id, value FROM old_rows;
+     INSERT INTO transition_trigger_audit SELECT ''new'', id, value FROM new_rows;
+     RETURN NULL;
+   END';
+CREATE FUNCTION transition_trigger_delete() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO transition_trigger_audit SELECT ''delete'', id, value FROM deleted_rows; RETURN NULL; END';
+CREATE TRIGGER transition_trigger_update_after AFTER UPDATE ON transition_trigger_target
+  REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT
+  EXECUTE FUNCTION transition_trigger_update();
+CREATE TRIGGER transition_trigger_delete_after AFTER DELETE ON transition_trigger_target
+  REFERENCING OLD TABLE AS deleted_rows FOR EACH STATEMENT
+  EXECUTE FUNCTION transition_trigger_delete();
+INSERT INTO transition_trigger_target VALUES (1, 10), (2, 20);
+UPDATE transition_trigger_target SET value = value + 1;
+DELETE FROM transition_trigger_target WHERE id = 2;
+SELECT kind, id, value FROM transition_trigger_audit ORDER BY kind, id;

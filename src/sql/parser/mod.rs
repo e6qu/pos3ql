@@ -4750,6 +4750,44 @@ mod tests {
     }
 
     #[test]
+    fn transition_table_trigger_is_typed_and_illegal_forms_fail_at_parse_boundary() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "transition trigger parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER audit_change AFTER UPDATE ON public.orders \
+             REFERENCING OLD TABLE AS old_orders NEW TABLE AS new_orders \
+             FOR EACH STATEMENT EXECUTE FUNCTION audit_statement()",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreateTrigger(trigger)) = parser.next_stmt().unwrap() else {
+                panic!("CREATE TRIGGER did not parse")
+            };
+            assert_eq!(
+                trigger.transition_tables,
+                crate::sql::ast::TriggerTransitionTables::OldNew {
+                    old: "old_orders",
+                    new: "new_orders",
+                }
+            );
+        });
+        for source in [
+            "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena =
+                Arena::new(&mut budget, "invalid transition trigger parser", 1 << 18).unwrap();
+            let mut parser = Parser::new(source, &arena).unwrap();
+            assert!(parser.next_stmt().is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn publication_schema_targets_are_typed_without_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "publication schema parser", 1 << 18).unwrap();

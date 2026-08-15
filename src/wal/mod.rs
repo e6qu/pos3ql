@@ -431,6 +431,8 @@ pub(crate) enum WalOp<'a> {
         level: crate::sql::ast::TriggerLevel,
         events: crate::sql::ast::TriggerEvents,
         update_columns: u64,
+        old_table: Option<&'a str>,
+        new_table: Option<&'a str>,
         when: Option<&'a str>,
     },
     DropTrigger {
@@ -1520,6 +1522,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             function_schema,
             function,
+            old_table,
+            new_table,
             when,
             ..
         } => {
@@ -1532,7 +1536,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + function_schema.len()
                 + 1
                 + function.len()
-                + 13
+                + 15
+                + old_table.map_or(0, str::len)
+                + new_table.map_or(0, str::len)
                 + when.map_or(0, str::len)
         }
         WalOp::DropTrigger {
@@ -2506,6 +2512,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             level,
             events,
             update_columns,
+            old_table,
+            new_table,
             when,
         } => {
             let when_len = when.map_or(0usize, |value| value.len() + 1);
@@ -2516,6 +2524,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, function)
                 && buffer.append(&[*timing, level.code(), events.bits()])
                 && buffer.append(&update_columns.to_le_bytes())
+                && name_bytes(buffer, old_table.unwrap_or(""))
+                && name_bytes(buffer, new_table.unwrap_or(""))
                 && u16::try_from(when_len)
                     .ok()
                     .is_some_and(|length| buffer.append(&length.to_le_bytes()))
@@ -3322,9 +3332,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let events = crate::sql::ast::TriggerEvents::from_bits(*payload.get(at + 2)?)?;
             at += 3;
             let update_columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            let when_len =
-                u16::from_le_bytes(payload.get(at + 8..at + 10)?.try_into().ok()?) as usize;
-            at += 10;
+            at += 8;
+            let old_table = take_name(&mut at)?;
+            let new_table = take_name(&mut at)?;
+            let old_table = (!old_table.is_empty()).then_some(old_table);
+            let new_table = (!new_table.is_empty()).then_some(new_table);
+            let when_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
             let when = if when_len == 0 {
                 None
             } else {
@@ -3336,6 +3350,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (timing <= 1
                 && (matches!(level, crate::sql::ast::TriggerLevel::Statement)
                     || !events.has_truncate())
+                && crate::storage::TriggerTransitionTables::from_names(old_table, new_table)
+                    .is_some_and(|tables| {
+                        tables.is_valid_for(timing, level, events)
+                            && (matches!(tables, crate::storage::TriggerTransitionTables::None)
+                                || update_columns == 0)
+                    })
                 && at == payload.len())
             .then_some(WalOp::CreateTrigger {
                 name,
@@ -3347,6 +3367,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 level,
                 events,
                 update_columns,
+                old_table,
+                new_table,
                 when,
             })
         }
@@ -5011,11 +5033,46 @@ mod tests {
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
                 update_columns: 0,
+                old_table: None,
+                new_table: None,
                 when: None,
             },
         ));
         let incomplete_payload = &payload.readable()[..payload.len() - 10];
         assert!(decode_op(KIND_CREATE_TRIGGER, incomplete_payload).is_none());
+    }
+
+    #[test]
+    fn create_trigger_payload_retains_transition_table_aliases() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "transition trigger payload", 1024).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTrigger {
+                name: "audit_statement",
+                table_schema: "public",
+                table: "orders",
+                function_schema: "public",
+                function: "audit_orders",
+                timing: 1,
+                level: crate::sql::ast::TriggerLevel::Statement,
+                events: crate::sql::ast::TriggerEvents::from_bits(2).unwrap(),
+                update_columns: 0,
+                old_table: Some("old_orders"),
+                new_table: Some("new_orders"),
+                when: None,
+            },
+        ));
+        let Some(WalOp::CreateTrigger {
+            old_table,
+            new_table,
+            ..
+        }) = decode_op(KIND_CREATE_TRIGGER, payload.readable())
+        else {
+            panic!("transition trigger did not decode");
+        };
+        assert_eq!(old_table, Some("old_orders"));
+        assert_eq!(new_table, Some("new_orders"));
     }
 
     #[test]
@@ -5233,6 +5290,8 @@ mod tests {
                     level: crate::sql::ast::TriggerLevel::Row,
                     events: crate::sql::ast::TriggerEvents::from_bits(3).unwrap(),
                     update_columns: 3,
+                    old_table: None,
+                    new_table: None,
                     when: Some("NEW.total > OLD.total"),
                 },
             )

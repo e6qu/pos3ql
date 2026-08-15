@@ -26,7 +26,7 @@ use crate::wal::{Wal, WalOp};
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
     Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, Stmt, TriggerEvent,
-    TriggerLevel, TriggerTiming, Update,
+    TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
@@ -1267,6 +1267,7 @@ fn handle_conflict<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     scratch: &mut FixedVec<(u64, RowHome)>,
+    transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<ConflictOutcome<'a>, SqlError> {
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
@@ -1432,6 +1433,10 @@ fn handle_conflict<'a>(
         Some(&existing[..def.n_columns]),
         Some(&mut new_values[..def.n_columns]),
     )?;
+    if let Some(transition_capture) = transition_capture {
+        transition_capture.push_old(&existing[..def.n_columns], arena)?;
+        transition_capture.push_new(&new_values[..def.n_columns], arena)?;
+    }
     Ok(ConflictOutcome::Updated(new_bytes))
 }
 
@@ -6872,9 +6877,7 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
         return Err(unsupported_trigger_body());
     }
     match statement {
-        Some(Stmt::Insert(statement))
-            if statement.returning.is_empty() && statement.select.is_none() =>
-        {
+        Some(Stmt::Insert(statement)) if statement.returning.is_empty() => {
             Ok(TriggerDml::Insert(statement))
         }
         Some(Stmt::Update(statement))
@@ -7195,6 +7198,7 @@ fn execute_trigger_block<'a>(
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
     before: bool,
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     block: TriggerBlock<'a>,
 ) -> Result<Option<TriggerReturn>, SqlError> {
     for statement in block.statements {
@@ -7262,6 +7266,7 @@ fn execute_trigger_block<'a>(
                         responder,
                         None,
                         Some(&transition),
+                        transition_relations,
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -7412,6 +7417,7 @@ fn execute_trigger_block<'a>(
                             old,
                             new,
                             before,
+                            transition_relations,
                             branch.block,
                         )? {
                             return Ok(Some(result));
@@ -7511,6 +7517,7 @@ fn fire_row_triggers<'a>(
             old,
             &mut new,
             before,
+            None,
             program.body,
         )? {
             Some(result) => match result {
@@ -7530,16 +7537,132 @@ fn fire_row_triggers<'a>(
     Ok(true)
 }
 
-/// Executes each matching statement trigger once. Statement images are absent
-/// by construction, so an OLD/NEW field reference fails at the same typed
-/// transition boundary as an invalid row event.
-fn fire_statement_triggers<'a>(
+/// Statement triggers have no `OLD`/`NEW` image; their declared transition
+/// relations are bound only after the statement has produced its row sets.
+#[derive(Clone, Copy)]
+struct TransitionRows<'a> {
+    old: &'a [&'a [u8]],
+    new: &'a [&'a [u8]],
+}
+
+/// Pre-sized transition row slots. Each DML path derives capacity from its
+/// candidate count, so capture cannot grow a pool; encoded rows live in the
+/// fixed statement arena and exhaustion is a named error.
+struct TransitionCapture<'a> {
+    old: *mut &'a [u8],
+    old_capacity: usize,
+    old_len: usize,
+    new: *mut &'a [u8],
+    new_capacity: usize,
+    new_len: usize,
+}
+
+impl<'a> TransitionCapture<'a> {
+    fn new(arena: &'a Arena, old_capacity: usize, new_capacity: usize) -> Result<Self, SqlError> {
+        let old = arena
+            .alloc_slice_with(old_capacity, |_| &[][..])
+            .map_err(|_| super::query::arena_full_pub())?;
+        let new = arena
+            .alloc_slice_with(new_capacity, |_| &[][..])
+            .map_err(|_| super::query::arena_full_pub())?;
+        Ok(Self {
+            old: old.as_mut_ptr(),
+            old_capacity,
+            old_len: 0,
+            new: new.as_mut_ptr(),
+            new_capacity,
+            new_len: 0,
+        })
+    }
+
+    fn push_old(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
+        if self.old_len == self.old_capacity {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "OLD TABLE exceeds its pre-sized statement capture"
+            ));
+        }
+        let row = encode_projected_pub(values, arena)?;
+        // The destination was allocated from this statement arena and no slice
+        // into it is exposed before `rows` creates the immutable relation.
+        unsafe { self.old.add(self.old_len).write(row) };
+        self.old_len += 1;
+        Ok(())
+    }
+
+    fn push_new(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
+        if self.new_len == self.new_capacity {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "NEW TABLE exceeds its pre-sized statement capture"
+            ));
+        }
+        let row = encode_projected_pub(values, arena)?;
+        // See `push_old`: the raw pointer is confined to collection, before
+        // any transition relation borrows the backing allocation.
+        unsafe { self.new.add(self.new_len).write(row) };
+        self.new_len += 1;
+        Ok(())
+    }
+
+    fn rows(&self) -> TransitionRows<'a> {
+        // Both arrays originate in the statement arena and outlive every
+        // trigger program invoked by this statement.
+        TransitionRows {
+            old: unsafe { core::slice::from_raw_parts(self.old, self.old_len) },
+            new: unsafe { core::slice::from_raw_parts(self.new, self.new_len) },
+        }
+    }
+}
+
+fn transition_relation<'a>(
+    definition: &TableDef,
+    rows: &'a [&'a [u8]],
+    arena: &'a Arena,
+) -> Result<&'a crate::sql::ast::MaterializedCte<'a>, SqlError> {
+    let mut names = [""; MAX_COLUMNS];
+    for (column, name) in names.iter_mut().enumerate().take(definition.n_columns) {
+        *name = arena
+            .alloc_str(definition.columns()[column].name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    let names = arena
+        .alloc_slice_copy(&names[..definition.n_columns])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let types = arena
+        .alloc_slice_with(definition.n_columns, |column| {
+            let meta = &definition.columns()[column];
+            (meta.ctype.oid(), meta.ctype.typlen(), meta.type_mod)
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let collations = arena
+        .alloc_slice_with(definition.n_columns, |column| {
+            definition.columns()[column].collation
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    arena
+        .alloc(crate::sql::ast::MaterializedCte {
+            column_names: names,
+            column_types: types,
+            column_collations: collations,
+            rows,
+            external_run: None,
+        })
+        .map(|relation| &*relation)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+/// Executes each matching statement trigger once. Transition relations are
+/// constructed from the completed statement images and are only bound for the
+/// aliases declared by that trigger.
+fn fire_statement_triggers_with_rows<'a>(
     mut context: TriggerExecContext<'_, 'a, '_>,
     table: usize,
     definition: &TableDef,
     event: u8,
     before: bool,
     updated_columns: u64,
+    rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let mut trigger_at = 0usize;
     loop {
@@ -7563,35 +7686,10 @@ fn fire_statement_triggers<'a>(
         {
             continue;
         }
-        if let Some(when) = trigger.when {
-            let source = context.arena.alloc_str(when.as_str()).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "trigger WHEN predicate exceeds the statement arena"
-                )
-            })?;
-            let condition = super::parser::parse_expr(source, context.arena)?;
-            match eval_full(
-                condition,
-                context.arena,
-                crate::sql::eval::NO_PARAMS,
-                &TriggerTransition {
-                    definition,
-                    old: None,
-                    new: None,
-                },
-                &NO_HOOKS,
-            )? {
-                Datum::Bool(true) => {}
-                Datum::Bool(false) | Datum::Null => continue,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "trigger WHEN condition must be type boolean"
-                    ));
-                }
-            }
-        }
+        debug_assert!(
+            trigger.when.is_none(),
+            "statement WHEN was rejected at creation"
+        );
         let source = {
             let body = context
                 .storage
@@ -7606,6 +7704,37 @@ fn fire_statement_triggers<'a>(
             })?
         };
         let program = parse_trigger_program(source, context.arena)?;
+        let mut relations = [("", None); 2];
+        let mut relation_count = 0;
+        if let Some(rows) = rows {
+            if let Some(name) = trigger.transition_tables.old() {
+                relations[relation_count] = (
+                    context
+                        .arena
+                        .alloc_str(name.as_str())
+                        .map_err(|_| super::query::arena_full_pub())?,
+                    Some(transition_relation(definition, rows.old, context.arena)?),
+                );
+                relation_count += 1;
+            }
+            if let Some(name) = trigger.transition_tables.new_table() {
+                relations[relation_count] = (
+                    context
+                        .arena
+                        .alloc_str(name.as_str())
+                        .map_err(|_| super::query::arena_full_pub())?,
+                    Some(transition_relation(definition, rows.new, context.arena)?),
+                );
+                relation_count += 1;
+            }
+        }
+        let relations = context
+            .arena
+            .alloc_slice_with(relation_count, |index| {
+                let (name, relation) = relations[index];
+                (name, relation.expect("transition relation initialized"))
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
         let mut no_new = None;
         if execute_trigger_block(
             &mut context,
@@ -7613,6 +7742,7 @@ fn fire_statement_triggers<'a>(
             None,
             &mut no_new,
             before,
+            (!relations.is_empty()).then_some(&*relations),
             program.body,
         )?
         .is_none()
@@ -7621,6 +7751,43 @@ fn fire_statement_triggers<'a>(
         }
     }
     Ok(())
+}
+
+fn fire_statement_triggers<'a>(
+    context: TriggerExecContext<'_, 'a, '_>,
+    table: usize,
+    definition: &TableDef,
+    event: u8,
+    before: bool,
+    updated_columns: u64,
+) -> Result<(), SqlError> {
+    fire_statement_triggers_with_rows(
+        context,
+        table,
+        definition,
+        event,
+        before,
+        updated_columns,
+        None,
+    )
+}
+
+fn statement_transition_capture_required(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    event: u8,
+) -> bool {
+    storage.triggers_for_table(table, txid).any(|(_, trigger)| {
+        trigger.enabled_to(txid)
+            && matches!(trigger.level, TriggerLevel::Statement)
+            && trigger.timing == 1
+            && trigger.events.contains(event)
+            && !matches!(
+                trigger.transition_tables,
+                crate::storage::TriggerTransitionTables::None
+            )
+    })
 }
 
 pub fn create_trigger(
@@ -7704,6 +7871,18 @@ pub fn create_trigger(
         },
         None => None,
     };
+    let transition_tables = match crate::storage::TriggerTransitionTables::from_names(
+        trigger.transition_tables.old(),
+        trigger.transition_tables.new_table(),
+    ) {
+        Some(tables) => tables,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "trigger transition table names must differ"
+            ));
+        }
+    };
     let name = match SqlName::parse(trigger.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -7721,6 +7900,7 @@ pub fn create_trigger(
             level,
             events,
             update_columns,
+            transition_tables,
             when,
         },
         txn.txid,
@@ -7742,6 +7922,8 @@ pub fn create_trigger(
             level,
             events,
             update_columns,
+            old_table: trigger.transition_tables.old(),
+            new_table: trigger.transition_tables.new_table(),
             when: when.as_ref().map(|value| value.as_str()),
         },
     );
@@ -14980,7 +15162,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
 pub fn merge(
     storage: &mut Storage,
     txn: &mut TxnState,
-    _scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut FixedVec<(u64, RowHome)>,
     statement: &crate::sql::ast::Merge,
     arena: &Arena,
     params: &[Datum],
@@ -15017,6 +15199,55 @@ pub fn merge(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    let mut merge_update_columns = 0u64;
+    for when in statement.whens {
+        if let MergeAction::Update(assignments) = when.action {
+            for (name, _) in assignments {
+                let Some(column) = def.column_index(name) else {
+                    return sql_fail(undefined_column(name));
+                };
+                merge_update_columns |= 1u64 << column;
+            }
+        }
+    }
+    let merge_events = statement.whens.iter().fold(0u8, |events, when| {
+        events
+            | match when.action {
+                MergeAction::Insert { .. } => TriggerEvents::INSERT,
+                MergeAction::Update(_) => TriggerEvents::UPDATE,
+                MergeAction::Delete => TriggerEvents::DELETE,
+                MergeAction::DoNothing => 0,
+            }
+    });
+    for event in [
+        TriggerEvents::INSERT,
+        TriggerEvents::UPDATE,
+        TriggerEvents::DELETE,
+    ] {
+        if merge_events & event != 0
+            && let Err(error) = fire_statement_triggers(
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                    scratch: scratch as *mut _,
+                },
+                table_index,
+                &def,
+                event,
+                true,
+                if event == TriggerEvents::UPDATE {
+                    merge_update_columns
+                } else {
+                    0
+                },
+            )
+        {
+            return sql_fail(error);
+        }
+    }
     let target_alias = statement.target_alias.unwrap_or(statement.target.name);
     let source_alias = statement
         .source
@@ -15109,7 +15340,20 @@ pub fn merge(
             return sql_fail(e);
         }
     }
-
+    let mut insert_transitions = if merge_events & TriggerEvents::INSERT != 0
+        && statement_transition_capture_required(
+            storage,
+            table_index,
+            txn.txid,
+            TriggerEvents::INSERT,
+        ) {
+        match TransitionCapture::new(arena, 0, n_source) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     // Collect the target rows once (rowid + decoded values), plus an affected
     // flag per row for the cardinality check.
     let mut target_schema = [ColType::Bool; MAX_COLUMNS];
@@ -15181,6 +15425,37 @@ pub fn merge(
             target_vals[j] = owned;
         }
     }
+    // A matched target row can be acted on at most once by MERGE's cardinality
+    // rule, so target cardinality is the exact bounded capture capacity for
+    // UPDATE and DELETE transition relations.
+    let mut update_transitions = if merge_events & TriggerEvents::UPDATE != 0
+        && statement_transition_capture_required(
+            storage,
+            table_index,
+            txn.txid,
+            TriggerEvents::UPDATE,
+        ) {
+        match TransitionCapture::new(arena, n_target, n_target) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let mut delete_transitions = if merge_events & TriggerEvents::DELETE != 0
+        && statement_transition_capture_required(
+            storage,
+            table_index,
+            txn.txid,
+            TriggerEvents::DELETE,
+        ) {
+        match TransitionCapture::new(arena, n_target, 0) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
 
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
@@ -15234,6 +15509,28 @@ pub fn merge(
                         if affected[j] {
                             return sql_fail(merge_cardinality());
                         }
+                        if !match fire_row_triggers(
+                            TriggerExecContext {
+                                storage,
+                                txn,
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch: scratch as *mut _,
+                            },
+                            table_index,
+                            &def,
+                            TriggerEvents::DELETE,
+                            true,
+                            0,
+                            Some(target_vals[j]),
+                            None,
+                        ) {
+                            Ok(run) => run,
+                            Err(error) => return sql_fail(error),
+                        } {
+                            break;
+                        }
                         affected[j] = true;
                         match storage.write_pending(
                             table_index,
@@ -15250,6 +15547,30 @@ pub fn merge(
                             }
                             Err(e) => return sql_fail(e),
                         }
+                        if let Err(error) = fire_row_triggers(
+                            TriggerExecContext {
+                                storage,
+                                txn,
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch: scratch as *mut _,
+                            },
+                            table_index,
+                            &def,
+                            TriggerEvents::DELETE,
+                            false,
+                            0,
+                            Some(target_vals[j]),
+                            None,
+                        ) {
+                            return sql_fail(error);
+                        }
+                        if let Some(transitions) = delete_transitions.as_mut()
+                            && let Err(error) = transitions.push_old(target_vals[j], arena)
+                        {
+                            return sql_fail(error);
+                        }
                         affected_count += 1;
                     }
                     MergeAction::Update(assignments) => {
@@ -15258,10 +15579,12 @@ pub fn merge(
                         }
                         let mut new_values = [Datum::Null; MAX_COLUMNS];
                         new_values[..def.n_columns].copy_from_slice(target_vals[j]);
+                        let mut action_update_columns = 0u64;
                         for (name, expression) in assignments.iter() {
                             let Some(ci) = def.column_index(name) else {
                                 return sql_fail(undefined_column(name));
                             };
+                            action_update_columns |= 1u64 << ci;
                             let v = match eval(expression, arena, params, &lookup) {
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
@@ -15270,6 +15593,38 @@ pub fn merge(
                                 Ok(v) => new_values[ci] = v,
                                 Err(e) => return sql_fail(e),
                             }
+                        }
+                        if let Err(e) = compute_generated(
+                            &def,
+                            &generated,
+                            &mut new_values,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            return sql_fail(e);
+                        }
+                        if !match fire_row_triggers(
+                            TriggerExecContext {
+                                storage,
+                                txn,
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch: scratch as *mut _,
+                            },
+                            table_index,
+                            &def,
+                            TriggerEvents::UPDATE,
+                            true,
+                            action_update_columns,
+                            Some(target_vals[j]),
+                            Some(&mut new_values[..def.n_columns]),
+                        ) {
+                            Ok(run) => run,
+                            Err(error) => return sql_fail(error),
+                        } {
+                            break;
                         }
                         if let Err(e) = compute_generated(
                             &def,
@@ -15330,6 +15685,35 @@ pub fn merge(
                             }
                             Err(e) => return sql_fail(e),
                         }
+                        if let Err(error) = fire_row_triggers(
+                            TriggerExecContext {
+                                storage,
+                                txn,
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch: scratch as *mut _,
+                            },
+                            table_index,
+                            &def,
+                            TriggerEvents::UPDATE,
+                            false,
+                            action_update_columns,
+                            Some(target_vals[j]),
+                            Some(&mut new_values[..def.n_columns]),
+                        ) {
+                            return sql_fail(error);
+                        }
+                        if let Some(transitions) = update_transitions.as_mut() {
+                            if let Err(error) = transitions.push_old(target_vals[j], arena) {
+                                return sql_fail(error);
+                            }
+                            if let Err(error) =
+                                transitions.push_new(&new_values[..def.n_columns], arena)
+                            {
+                                return sql_fail(error);
+                            }
+                        }
                         affected[j] = true;
                         affected_count += 1;
                     }
@@ -15365,7 +15749,7 @@ pub fn merge(
                         values,
                         default_values,
                     } => {
-                        if let Err(e) = merge_insert(
+                        match merge_insert(
                             storage,
                             txn,
                             table_index,
@@ -15380,10 +15764,14 @@ pub fn merge(
                             arena,
                             params,
                             &checks,
+                            responder,
+                            scratch,
+                            insert_transitions.as_mut(),
                         ) {
-                            return sql_fail(e);
+                            Ok(true) => affected_count += 1,
+                            Ok(false) => {}
+                            Err(error) => return sql_fail(error),
                         }
-                        affected_count += 1;
                     }
                     _ => {
                         return sql_fail(sql_err!(
@@ -15394,6 +15782,47 @@ pub fn merge(
                 }
                 break;
             }
+        }
+    }
+    for event in [
+        TriggerEvents::INSERT,
+        TriggerEvents::UPDATE,
+        TriggerEvents::DELETE,
+    ] {
+        if merge_events & event != 0
+            && let Err(error) = fire_statement_triggers_with_rows(
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                    scratch: scratch as *mut _,
+                },
+                table_index,
+                &def,
+                event,
+                false,
+                if event == TriggerEvents::UPDATE {
+                    merge_update_columns
+                } else {
+                    0
+                },
+                match event {
+                    TriggerEvents::INSERT => {
+                        insert_transitions.as_ref().map(TransitionCapture::rows)
+                    }
+                    TriggerEvents::UPDATE => {
+                        update_transitions.as_ref().map(TransitionCapture::rows)
+                    }
+                    TriggerEvents::DELETE => {
+                        delete_transitions.as_ref().map(TransitionCapture::rows)
+                    }
+                    _ => None,
+                },
+            )
+        {
+            return sql_fail(error);
         }
     }
     responder.command_complete(stack_format!(32, "MERGE {}", affected_count).as_str())?;
@@ -15413,7 +15842,7 @@ fn merge_cardinality() -> SqlError {
 /// clause (values evaluated with the source row in scope), fills defaults and
 /// generated columns, and stores it.
 #[allow(clippy::too_many_arguments)]
-fn merge_insert(
+fn merge_insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
@@ -15425,10 +15854,13 @@ fn merge_insert(
     generated: &constraints::ParsedDefaults,
     defaults: &constraints::ParsedDefaults,
     seq_session: &crate::sql::guc::SeqSession,
-    arena: &Arena,
-    params: &[Datum],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
     checks: &ParsedChecks,
-) -> Result<(), SqlError> {
+    responder: &mut Responder,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    transition_capture: Option<&mut TransitionCapture<'a>>,
+) -> Result<bool, SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if columns.is_empty() {
@@ -15508,6 +15940,26 @@ fn merge_insert(
     )?;
     let mut row_arr = row;
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
+    if !fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        def,
+        TriggerEvents::INSERT,
+        true,
+        0,
+        None,
+        Some(&mut row_arr[..def.n_columns]),
+    )? {
+        return Ok(false);
+    }
+    compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -15523,7 +15975,28 @@ fn merge_insert(
         arena,
         params,
     )?;
-    store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])
+    store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])?;
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        table_index,
+        def,
+        TriggerEvents::INSERT,
+        false,
+        0,
+        None,
+        Some(&mut row_arr[..def.n_columns]),
+    )?;
+    if let Some(transition_capture) = transition_capture {
+        transition_capture.push_new(&row_arr[..def.n_columns], arena)?;
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -15542,6 +16015,8 @@ fn finish_insert_row<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    transition_capture: Option<&mut TransitionCapture<'a>>,
+    conflict_transition_capture: Option<&mut TransitionCapture<'a>>,
     scratch: &mut FixedVec<(u64, RowHome)>,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
@@ -15592,6 +16067,7 @@ fn finish_insert_row<'a>(
         seq_session,
         responder,
         scratch,
+        conflict_transition_capture,
     ) {
         Ok(ConflictOutcome::Store) => {}
         Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
@@ -15657,6 +16133,11 @@ fn finish_insert_row<'a>(
     ) {
         return Ok(Err(error));
     }
+    if let Some(transition_capture) = transition_capture
+        && let Err(error) = transition_capture.push_new(&values[..definition.n_columns], arena)
+    {
+        return Ok(Err(error));
+    }
     if !statement.returning.is_empty()
         && let Err(error) = emit_projected(
             storage,
@@ -15688,15 +16169,10 @@ pub fn insert<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     transition: Option<&dyn ColumnLookup<'a>>,
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
 ) -> Outcome {
     let no_columns = NoColumns;
     let value_scope: &dyn ColumnLookup<'a> = transition.unwrap_or(&no_columns);
-    if transition.is_some() && statement.select.is_some() {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "trigger-side INSERT ... SELECT is not supported"
-        ));
-    }
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -15830,6 +16306,15 @@ pub fn insert<'a>(
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
     if let Some(sel) = statement.select {
+        let sel = match transition_relations {
+            Some(relations) => match super::query::bind_materialized_relations(
+                sel, relations, storage, txn.txid, arena,
+            ) {
+                Ok(select) => select,
+                Err(error) => return sql_fail(error),
+            },
+            None => sel,
+        };
         // Pass 1: count. A "dry" sequence evaluator resolves names (so errors
         // still surface) but does not advance any generator — the real advance
         // happens once, in the encoding pass.
@@ -15892,6 +16377,33 @@ pub fn insert<'a>(
         let generated_exprs = match parse_generated(&def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
+        };
+        let mut transition_capture = if statement_transition_capture_required(
+            storage,
+            table_index,
+            txn.txid,
+            TriggerEvents::INSERT,
+        ) {
+            match TransitionCapture::new(arena, 0, count) {
+                Ok(capture) => Some(capture),
+                Err(error) => return sql_fail(error),
+            }
+        } else {
+            None
+        };
+        let mut conflict_transition_capture = if conflict_update_columns.is_some()
+            && statement_transition_capture_required(
+                storage,
+                table_index,
+                txn.txid,
+                TriggerEvents::UPDATE,
+            ) {
+            match TransitionCapture::new(arena, count, count) {
+                Ok(capture) => Some(capture),
+                Err(error) => return sql_fail(error),
+            }
+        } else {
+            None
         };
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
@@ -15988,6 +16500,8 @@ pub fn insert<'a>(
                 seq_session,
                 responder,
                 &mut capture,
+                transition_capture.as_mut(),
+                conflict_transition_capture.as_mut(),
                 scratch,
             )? {
                 Ok(true) => inserted += 1,
@@ -15996,7 +16510,7 @@ pub fn insert<'a>(
             }
         }
         if let Some(updated_columns) = conflict_update_columns
-            && let Err(error) = fire_statement_triggers(
+            && let Err(error) = fire_statement_triggers_with_rows(
                 TriggerExecContext {
                     storage,
                     txn,
@@ -16010,11 +16524,14 @@ pub fn insert<'a>(
                 2,
                 false,
                 updated_columns,
+                conflict_transition_capture
+                    .as_ref()
+                    .map(TransitionCapture::rows),
             )
         {
             return sql_fail(error);
         }
-        if let Err(error) = fire_statement_triggers(
+        if let Err(error) = fire_statement_triggers_with_rows(
             TriggerExecContext {
                 storage,
                 txn,
@@ -16028,6 +16545,7 @@ pub fn insert<'a>(
             1,
             false,
             0,
+            transition_capture.as_ref().map(TransitionCapture::rows),
         ) {
             return sql_fail(error);
         }
@@ -16047,6 +16565,33 @@ pub fn insert<'a>(
     let generated_exprs = match parse_generated(&def, arena) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
+    };
+    let mut transition_capture = if statement_transition_capture_required(
+        storage,
+        table_index,
+        txn.txid,
+        TriggerEvents::INSERT,
+    ) {
+        match TransitionCapture::new(arena, 0, statement.rows.len()) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let mut conflict_transition_capture = if conflict_update_columns.is_some()
+        && statement_transition_capture_required(
+            storage,
+            table_index,
+            txn.txid,
+            TriggerEvents::UPDATE,
+        ) {
+        match TransitionCapture::new(arena, statement.rows.len(), statement.rows.len()) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
     };
     let mut inserted = 0u64;
     for row_exprs in statement.rows {
@@ -16171,6 +16716,8 @@ pub fn insert<'a>(
             seq_session,
             responder,
             &mut capture,
+            transition_capture.as_mut(),
+            conflict_transition_capture.as_mut(),
             scratch,
         )? {
             Ok(true) => inserted += 1,
@@ -16179,7 +16726,7 @@ pub fn insert<'a>(
         }
     }
     if let Some(updated_columns) = conflict_update_columns
-        && let Err(error) = fire_statement_triggers(
+        && let Err(error) = fire_statement_triggers_with_rows(
             TriggerExecContext {
                 storage,
                 txn,
@@ -16193,11 +16740,14 @@ pub fn insert<'a>(
             2,
             false,
             updated_columns,
+            conflict_transition_capture
+                .as_ref()
+                .map(TransitionCapture::rows),
         )
     {
         return sql_fail(error);
     }
-    if let Err(error) = fire_statement_triggers(
+    if let Err(error) = fire_statement_triggers_with_rows(
         TriggerExecContext {
             storage,
             txn,
@@ -16211,6 +16761,7 @@ pub fn insert<'a>(
         1,
         false,
         0,
+        transition_capture.as_ref().map(TransitionCapture::rows),
     ) {
         return sql_fail(error);
     }
@@ -16551,6 +17102,20 @@ pub fn update<'a>(
         }
     }
 
+    let mut transition_capture = if statement_transition_capture_required(
+        storage,
+        table_index,
+        txn.txid,
+        TriggerEvents::UPDATE,
+    ) {
+        match TransitionCapture::new(arena, scratch.len(), scratch.len()) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match super::query::describe_catalog_items_as(
@@ -16872,6 +17437,16 @@ pub fn update<'a>(
         ) {
             return sql_fail(error);
         }
+        if let Some(transition_capture) = transition_capture.as_mut() {
+            if let Err(error) = transition_capture.push_old(&old_transition[..def.n_columns], arena)
+            {
+                return sql_fail(error);
+            }
+            if let Err(error) = transition_capture.push_new(&new_transition[..def.n_columns], arena)
+            {
+                return sql_fail(error);
+            }
+        }
         if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(storage.heap.get(new_loc), schema, &mut new_values) {
@@ -16894,7 +17469,7 @@ pub fn update<'a>(
         }
         updated += 1;
     }
-    if let Err(error) = fire_statement_triggers(
+    if let Err(error) = fire_statement_triggers_with_rows(
         TriggerExecContext {
             storage,
             txn,
@@ -16908,6 +17483,7 @@ pub fn update<'a>(
         2,
         false,
         updated_columns,
+        transition_capture.as_ref().map(TransitionCapture::rows),
     ) {
         return sql_fail(error);
     }
@@ -17064,6 +17640,19 @@ pub fn delete<'a>(
             Err(e) => return sql_fail(e),
         }
     }
+    let mut transition_capture = if statement_transition_capture_required(
+        storage,
+        table_index,
+        txn.txid,
+        TriggerEvents::DELETE,
+    ) {
+        match TransitionCapture::new(arena, scratch.len(), 0) {
+            Ok(capture) => Some(capture),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     let referenced = table_is_referenced(storage, def.schema.as_str(), def.name.as_str(), txn.txid);
     let has_triggers = storage
         .triggers_for_table(table_index, txn.txid)
@@ -17197,9 +17786,15 @@ pub fn delete<'a>(
             ) {
                 return sql_fail(error);
             }
+            if let Some(transition_capture) = transition_capture.as_mut()
+                && let Err(error) =
+                    transition_capture.push_old(&old_transition[..def.n_columns], arena)
+            {
+                return sql_fail(error);
+            }
         }
     }
-    if let Err(error) = fire_statement_triggers(
+    if let Err(error) = fire_statement_triggers_with_rows(
         TriggerExecContext {
             storage,
             txn,
@@ -17213,6 +17808,7 @@ pub fn delete<'a>(
         4,
         false,
         0,
+        transition_capture.as_ref().map(TransitionCapture::rows),
     ) {
         return sql_fail(error);
     }

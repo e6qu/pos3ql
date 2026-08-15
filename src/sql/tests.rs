@@ -8726,7 +8726,13 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
         "CREATE TABLE durable_transition_target (id integer PRIMARY KEY);
          CREATE TABLE durable_transition_audit (id integer);
          CREATE FUNCTION durable_transition_rows() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO durable_transition_audit SELECT id FROM inserted_rows; RETURN NULL; END';
+           'DECLARE inserted_count integer;
+            BEGIN
+              SELECT count(*) INTO inserted_count FROM inserted_rows;
+              PERFORM 1 FROM inserted_rows;
+              INSERT INTO durable_transition_audit VALUES (inserted_count);
+              RETURN NULL;
+            END';
          CREATE TRIGGER durable_transition_insert AFTER INSERT ON durable_transition_target
            REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT
            EXECUTE FUNCTION durable_transition_rows();",
@@ -8746,7 +8752,7 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1", "2", "|inserted_rows"],
+        ["2", "|inserted_rows"],
         "{}",
         String::from_utf8_lossy(&output)
     );

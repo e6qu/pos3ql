@@ -63,3 +63,37 @@ DROP FUNCTION slt_transition_update()
 
 statement ok
 DROP FUNCTION slt_transition_insert()
+
+statement ok
+CREATE TABLE slt_local_query_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE TABLE slt_local_query_audit (changed integer)
+
+statement ok
+CREATE FUNCTION slt_local_query_program() RETURNS trigger LANGUAGE plpgsql AS
+'DECLARE changed_count integer; BEGIN SELECT count(*) INTO changed_count FROM changed_rows; PERFORM 1 FROM changed_rows WHERE value > 0; INSERT INTO slt_local_query_audit VALUES (changed_count); RETURN NULL; END'
+
+statement ok
+CREATE TRIGGER slt_local_query_after AFTER UPDATE ON slt_local_query_target
+REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_local_query_program()
+
+statement ok
+INSERT INTO slt_local_query_target VALUES (1, 10), (2, 20)
+
+statement ok
+UPDATE slt_local_query_target SET value = value + 1
+
+query I rowsort
+SELECT changed FROM slt_local_query_audit
+----
+2
+
+statement ok
+DROP TABLE slt_local_query_target
+
+statement ok
+DROP TABLE slt_local_query_audit
+
+statement ok
+DROP FUNCTION slt_local_query_program()

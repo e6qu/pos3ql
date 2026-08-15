@@ -135,3 +135,44 @@ INSERT INTO transition_trigger_target VALUES (1, 10), (2, 20);
 UPDATE transition_trigger_target SET value = value + 1;
 DELETE FROM transition_trigger_target WHERE id = 2;
 SELECT kind, id, value FROM transition_trigger_audit ORDER BY kind, id;
+
+CREATE TABLE trigger_local_query_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE trigger_local_query_source (id integer PRIMARY KEY, delta integer);
+CREATE TABLE trigger_local_query_audit (value integer);
+INSERT INTO trigger_local_query_target VALUES (1, 5);
+INSERT INTO trigger_local_query_source VALUES (1, 3);
+CREATE FUNCTION trigger_local_query_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE change integer := NEW.value - OLD.value;
+           selected_delta integer;
+   BEGIN
+     SELECT source.delta INTO selected_delta
+       FROM trigger_local_query_source source WHERE source.id = NEW.id;
+     selected_delta := selected_delta + 1;
+     PERFORM 1 FROM trigger_local_query_source source
+       WHERE source.id = NEW.id AND selected_delta = source.delta + 1;
+     INSERT INTO trigger_local_query_audit VALUES (selected_delta);
+     NEW.value := NEW.value + change + selected_delta;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_local_query_before BEFORE UPDATE ON trigger_local_query_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_local_query_program();
+UPDATE trigger_local_query_target SET value = 7 WHERE id = 1;
+SELECT value FROM trigger_local_query_target;
+SELECT value FROM trigger_local_query_audit;
+
+CREATE TABLE trigger_local_transition_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE trigger_local_transition_audit (changed integer);
+CREATE FUNCTION trigger_local_transition_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE changed_count integer;
+   BEGIN
+     SELECT count(*) INTO changed_count FROM changed_rows;
+     PERFORM 1 FROM changed_rows WHERE value > 0;
+     INSERT INTO trigger_local_transition_audit VALUES (changed_count);
+     RETURN NULL;
+   END';
+CREATE TRIGGER trigger_local_transition_after AFTER UPDATE ON trigger_local_transition_target
+  REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+  EXECUTE FUNCTION trigger_local_transition_program();
+INSERT INTO trigger_local_transition_target VALUES (1, 2), (2, 3);
+UPDATE trigger_local_transition_target SET value = value + 1;
+SELECT changed FROM trigger_local_transition_audit;

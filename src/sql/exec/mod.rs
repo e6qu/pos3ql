@@ -6563,14 +6563,17 @@ struct TriggerProgram<'a> {
 /// A trigger has two explicitly named transition images.  Keeping them as a
 /// `ColumnLookup` makes `OLD.column` and `NEW.column` ordinary typed
 /// expressions instead of text substituted into a nested SQL statement.
-struct TriggerTransition<'d, 's, 'v> {
+pub(crate) struct TriggerTransition<'d, 's, 'v> {
     definition: &'d TableDef,
     old: Option<&'s [Datum<'v>]>,
     new: Option<&'s [Datum<'v>]>,
 }
 
-impl<'v> ColumnLookup<'v> for TriggerTransition<'_, '_, 'v> {
-    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's, 'stored>
+where
+    'stored: 'value,
+{
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         let Some(qualifier) = qualifier else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
@@ -6636,6 +6639,58 @@ struct TriggerDmlScope<'t, 'r, 'v, 'd> {
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.transition.lookup(qualifier, name)
+        } else {
+            self.row.lookup(qualifier, name)
+        }
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.transition.col_type(qualifier, name)
+        } else {
+            self.row.col_type(qualifier, name)
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.transition.collation(qualifier, name)
+        } else {
+            self.row.collation(qualifier, name)
+        }
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.transition.column_domain(qualifier, name)
+        } else {
+            self.row.column_domain(qualifier, name)
+        }
+    }
+}
+
+/// A joined trigger DML probe combines a freshly decoded target row with the
+/// trigger's transition images. The transition implementation can be
+/// reborrowed for this probe, so no storage-backed datum crosses into the
+/// subsequent mutable DML phase.
+struct JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv> {
+    row: &'r RowCtx<'rs, 'rv, 'rd>,
+    transition: &'t TriggerTransition<'td, 'ts, 'tv>,
+}
+
+impl<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv, 'value> ColumnLookup<'value>
+    for JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv>
+where
+    'rv: 'value,
+    'tv: 'value,
+{
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
             self.transition.lookup(qualifier, name)
@@ -6880,14 +6935,10 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
         Some(Stmt::Insert(statement)) if statement.returning.is_empty() => {
             Ok(TriggerDml::Insert(statement))
         }
-        Some(Stmt::Update(statement))
-            if statement.returning.is_empty() && statement.from.is_none() =>
-        {
+        Some(Stmt::Update(statement)) if statement.returning.is_empty() => {
             Ok(TriggerDml::Update(statement))
         }
-        Some(Stmt::Delete(statement))
-            if statement.returning.is_empty() && statement.using.is_none() =>
-        {
+        Some(Stmt::Delete(statement)) if statement.returning.is_empty() => {
             Ok(TriggerDml::Delete(statement))
         }
         _ => Err(unsupported_trigger_body()),
@@ -7309,7 +7360,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(&transition),
+                        Some(transition),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -7361,7 +7412,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(&transition),
+                        Some(transition),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -16908,7 +16959,7 @@ fn emit_projected(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn update<'a>(
+pub(crate) fn update<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowHome)>,
@@ -16918,11 +16969,11 @@ pub fn update<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<&dyn ColumnLookup<'a>>,
+    transition: Option<TriggerTransition<'_, '_, 'a>>,
 ) -> Outcome {
-    if transition.is_some() && statement.from.is_some() {
-        return sql_fail(unsupported_trigger_body());
-    }
+    let transition_lookup = transition
+        .as_ref()
+        .map(|transition| transition as &dyn ColumnLookup<'a>);
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -17027,19 +17078,36 @@ pub fn update<'a>(
         sequences: None,
     };
     let collect = if let Some(from) = statement.from {
-        collect_join_matches(
-            storage,
-            table_index,
-            &def,
-            statement.alias,
-            schema,
-            from,
-            statement.where_clause,
-            arena,
-            params,
-            txn.txid,
-            scratch,
-        )
+        if let Some(transition) = transition.as_ref() {
+            collect_join_matches_with_transition(
+                storage,
+                table_index,
+                &def,
+                statement.alias,
+                schema,
+                from,
+                statement.where_clause,
+                arena,
+                params,
+                txn.txid,
+                scratch,
+                transition,
+            )
+        } else {
+            collect_join_matches(
+                storage,
+                table_index,
+                &def,
+                statement.alias,
+                schema,
+                from,
+                statement.where_clause,
+                arena,
+                params,
+                txn.txid,
+                scratch,
+            )
+        }
     } else {
         collect_matches(
             storage,
@@ -17052,7 +17120,7 @@ pub fn update<'a>(
             params,
             &hooks,
             scratch,
-            transition,
+            transition_lookup,
         )
     };
     if let Err(e) = collect {
@@ -17179,6 +17247,14 @@ pub fn update<'a>(
                     sequences: Some(&sequences),
                     ..super::eval::NO_HOOKS
                 };
+                let joined_scope = transition.as_ref().map(|transition| JoinedTriggerDmlScope {
+                    row: &context,
+                    transition,
+                });
+                let joined_target: &dyn ColumnLookup<'_> = joined_scope
+                    .as_ref()
+                    .map(|scope| scope as &dyn ColumnLookup<'_>)
+                    .unwrap_or(&context);
                 let mut set_err: Option<SqlError> = None;
                 let r = super::query::first_from_match(
                     storage,
@@ -17188,7 +17264,7 @@ pub fn update<'a>(
                     &observed[..statement.assignments.len()],
                     arena,
                     params,
-                    &context,
+                    joined_target,
                     &mut |combined| {
                         for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                             // A generated target's `= DEFAULT` is a no-op here; it
@@ -17250,7 +17326,7 @@ pub fn update<'a>(
                         };
                         continue;
                     }
-                    let value = if let Some(transition) = transition {
+                    let value = if let Some(transition) = transition_lookup {
                         let scope = TriggerDmlScope {
                             row: &context,
                             transition,
@@ -17495,7 +17571,7 @@ pub fn update<'a>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn delete<'a>(
+pub(crate) fn delete<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowHome)>,
@@ -17505,11 +17581,11 @@ pub fn delete<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<&dyn ColumnLookup<'a>>,
+    transition: Option<TriggerTransition<'_, '_, 'a>>,
 ) -> Outcome {
-    if transition.is_some() && statement.using.is_some() {
-        return sql_fail(unsupported_trigger_body());
-    }
+    let transition_lookup = transition
+        .as_ref()
+        .map(|transition| transition as &dyn ColumnLookup<'a>);
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -17574,19 +17650,36 @@ pub fn delete<'a>(
         sequences: None,
     };
     let collect = if let Some(using) = statement.using {
-        collect_join_matches(
-            storage,
-            table_index,
-            &def,
-            statement.alias,
-            schema,
-            using,
-            statement.where_clause,
-            arena,
-            params,
-            txn.txid,
-            scratch,
-        )
+        if let Some(transition) = transition.as_ref() {
+            collect_join_matches_with_transition(
+                storage,
+                table_index,
+                &def,
+                statement.alias,
+                schema,
+                using,
+                statement.where_clause,
+                arena,
+                params,
+                txn.txid,
+                scratch,
+                transition,
+            )
+        } else {
+            collect_join_matches(
+                storage,
+                table_index,
+                &def,
+                statement.alias,
+                schema,
+                using,
+                statement.where_clause,
+                arena,
+                params,
+                txn.txid,
+                scratch,
+            )
+        }
     } else {
         collect_matches(
             storage,
@@ -17599,7 +17692,7 @@ pub fn delete<'a>(
             params,
             &hooks,
             scratch,
-            transition,
+            transition_lookup,
         )
     };
     if let Err(e) = collect {
@@ -19754,6 +19847,69 @@ fn collect_join_matches<'a>(
                 arena,
                 params,
                 &context,
+                &mut |_| Ok(()),
+            )
+        })?;
+        if found {
+            scratch.push((rowid, loc)).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement touches more than {} rows",
+                    scratch.capacity()
+                )
+            })?;
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(())
+}
+
+/// Trigger-program variant of `collect_join_matches`. Its transition source
+/// is universally reborrowable, keeping the immutable joined probe scoped to
+/// each target row before the executor takes its mutable storage borrow.
+#[allow(clippy::too_many_arguments)]
+fn collect_join_matches_with_transition<'a>(
+    storage: &Storage,
+    table_index: usize,
+    def: &TableDef,
+    alias: Option<&str>,
+    schema: &[ColType],
+    from: &super::ast::FromClause<'a>,
+    where_clause: Option<&Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    txid: u32,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    transition: &TriggerTransition<'_, '_, 'a>,
+) -> Result<(), SqlError> {
+    scratch.clear();
+    storage.record_serializable_read(txid, table_index);
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let found = storage.with_row_bytes(table_index, rowid, loc, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            let context = RowCtx {
+                def,
+                values: &values[..def.n_columns],
+                alias,
+            };
+            let scope = JoinedTriggerDmlScope {
+                row: &context,
+                transition,
+            };
+            super::query::first_from_match(
+                storage,
+                from,
+                txid,
+                where_clause,
+                &[],
+                arena,
+                params,
+                &scope,
                 &mut |_| Ok(()),
             )
         })?;

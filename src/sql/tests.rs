@@ -8302,6 +8302,43 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     );
     assert_eq!(data_rows(&trigger_dml), ["1|6"]);
 
+    let joined_trigger_dml = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_join_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_join_source (id integer, delta integer, enabled boolean);
+         CREATE TABLE trigger_join_driver (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_join_target VALUES (1, 10), (2, 20);
+         INSERT INTO trigger_join_source VALUES (1, 2, true), (2, 3, true);
+         INSERT INTO trigger_join_driver VALUES (1, 5);
+         CREATE FUNCTION joined_trigger_dml() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE trigger_join_target
+                 SET value = trigger_join_target.value + trigger_join_source.delta + NEW.value - OLD.value
+                FROM trigger_join_source
+               WHERE trigger_join_target.id = trigger_join_source.id
+                 AND trigger_join_source.enabled
+                 AND OLD.id = NEW.id;
+              DELETE FROM trigger_join_target
+                    USING trigger_join_source
+               WHERE trigger_join_target.id = trigger_join_source.id
+                 AND trigger_join_source.delta = 3
+                 AND OLD.value = 5
+                 AND NEW.value = 7;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER joined_trigger_dml_after AFTER UPDATE ON trigger_join_driver
+           FOR EACH ROW EXECUTE FUNCTION joined_trigger_dml();
+         UPDATE trigger_join_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_join_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&joined_trigger_dml),
+        ["1|14"],
+        "{}",
+        String::from_utf8_lossy(&joined_trigger_dml)
+    );
+
     let branches = run_with(
         &mut engine,
         &mut budget,
@@ -8351,21 +8388,17 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         ["0"]
     );
 
-    for source in [
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
         "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
-        "CREATE FUNCTION reject_trigger_update_from() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN UPDATE trigger_body_dml SET value = 1 FROM trigger_body_audit WHERE trigger_body_dml.id = trigger_body_audit.id; RETURN NEW; END'",
-        "CREATE FUNCTION reject_trigger_delete_using() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN DELETE FROM trigger_body_dml USING trigger_body_audit WHERE trigger_body_dml.id = trigger_body_audit.id; RETURN NEW; END'",
-    ] {
-        let rejected = run_with(&mut engine, &mut budget, source);
-        assert!(
-            String::from_utf8_lossy(&rejected).contains("0A000"),
-            "{}",
-            String::from_utf8_lossy(&rejected)
-        );
-    }
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
 }
 
 #[test]
@@ -8754,7 +8787,21 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
            FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION durable_keep();
          CREATE TRIGGER durable_target_update BEFORE UPDATE OF value ON durable_trigger_target
            FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION durable_update_qualification();
-         ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;",
+         ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;
+         CREATE TABLE durable_join_driver (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION durable_join_trigger() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE durable_join_target
+                 SET value = durable_join_target.value + durable_join_source.delta + NEW.value - OLD.value
+                FROM durable_join_source
+               WHERE durable_join_target.id = durable_join_source.id AND OLD.id = NEW.id;
+              DELETE FROM durable_join_target USING durable_join_source
+               WHERE durable_join_target.id = durable_join_source.id
+                 AND durable_join_source.delta = 3 AND OLD.value = 5 AND NEW.value = 7;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_join_after AFTER UPDATE ON durable_join_driver
+           FOR EACH ROW EXECUTE FUNCTION durable_join_trigger();",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
     assert!(engine.checkpoint().unwrap());
@@ -8776,6 +8823,11 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
          SELECT id, observed FROM durable_trigger_audit ORDER BY id, observed;
          SELECT id, value FROM durable_trigger_side ORDER BY id;",
     );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     assert_eq!(
         data_rows(&output),
         [
@@ -8788,6 +8840,23 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
             "2|5",
             "1|2",
         ]
+    );
+    let joined = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "CREATE TABLE durable_join_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE durable_join_source (id integer, delta integer);
+         INSERT INTO durable_join_target VALUES (1, 10), (2, 20);
+         INSERT INTO durable_join_source VALUES (1, 2), (2, 3);
+         INSERT INTO durable_join_driver VALUES (1, 5);
+         UPDATE durable_join_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM durable_join_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&joined),
+        ["1|14"],
+        "{}",
+        String::from_utf8_lossy(&joined)
     );
 }
 

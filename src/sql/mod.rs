@@ -4000,6 +4000,7 @@ impl Engine {
                     responder,
                     capture,
                     None,
+                    None,
                 )
             }
             Stmt::Update(update) => {
@@ -7051,6 +7052,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             level,
             events,
             update_columns,
+            old_table,
+            new_table,
             when,
         } => {
             let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
@@ -7091,6 +7094,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     level,
                     events,
                     update_columns,
+                    transition_tables: crate::storage::TriggerTransitionTables::from_names(
+                        old_table, new_table,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_OBJECT_DEFINITION,
+                            "journal trigger has duplicate transition table names"
+                        )
+                    })?,
                     when: when
                         .map(crate::storage::trigger_when_stackstr)
                         .transpose()?,

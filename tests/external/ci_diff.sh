@@ -404,7 +404,7 @@ fi
 # the read-only query blocks.
 if [[ "$RUN_SLT" == 1 ]]; then
   # The curated corpora intentionally leave some objects alive. Give the
-  # sqllogictest files the full bounded catalog: one file creates 64 primary-key
+  # SQLLogicTest files the full bounded catalog: one file creates 64 primary-key
   # tables, exactly matching both configured pools.
   echo "=== restart pos3ql (fresh table space for sqllogictest) ==="
   restart_p3_fresh || exit 1
@@ -413,6 +413,7 @@ if [[ "$RUN_SLT" == 1 ]]; then
        --max-unsupported "$SLT_UNSUPPORTED_BUDGET" \
        --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
+       "$EXT"/sqllogictest/*.test \
        > "$WORK/slt.out" 2>&1; then
     ok "sqllogictest replay ($(grep '^TOTAL' "$WORK/slt.out"))"
   else bad "sqllogictest replay"; tail -40 "$WORK/slt.out"; fi

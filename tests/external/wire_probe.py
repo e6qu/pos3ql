@@ -1062,6 +1062,28 @@ def first_text_row(messages):
     return row[6 : 6 + length].decode() if length >= 0 and len(row) == 6 + length else None
 
 
+def text_row_fields(payload):
+    """Decode one text-format DataRow without assuming a one-column result."""
+    if len(payload) < 2:
+        return None
+    (count,) = struct.unpack("!h", payload[:2])
+    at = 2
+    fields = []
+    for _ in range(count):
+        if at + 4 > len(payload):
+            return None
+        (length,) = struct.unpack("!i", payload[at : at + 4])
+        at += 4
+        if length == -1:
+            fields.append(None)
+            continue
+        if length < 0 or at + length > len(payload):
+            return None
+        fields.append(payload[at : at + length].decode())
+        at += length
+    return fields if at == len(payload) else None
+
+
 def has_sqlstate(messages, state):
     return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
 
@@ -1412,6 +1434,31 @@ def test_catalog_aware_text_bind_parameters():
                 has_sqlstate(messages, state),
                 messages,
             )
+    s.close()
+
+
+def test_transition_tables_over_raw_simple_query():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_transition_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_transition_audit (id integer, value integer); "
+        "CREATE FUNCTION wire_transition_rows() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_transition_audit SELECT id, value FROM inserted_rows; RETURN NULL; END'; "
+        "CREATE TRIGGER wire_transition_insert AFTER INSERT ON wire_transition_target "
+        "REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT "
+        "EXECUTE FUNCTION wire_transition_rows(); "
+        "INSERT INTO wire_transition_target VALUES (1, 10), (2, 20)",
+    )
+    check("raw Query creates and executes a transition-table trigger", not any(m[0] == b"E" for m in setup), setup)
+    rows = [
+        text_row_fields(payload)
+        for kind, payload in simple_query(s, "SELECT id, value FROM wire_transition_audit ORDER BY id")
+        if kind == b"D"
+    ]
+    check("raw Query transition relation rows", rows == [["1", "10"], ["2", "20"]], rows)
     s.close()
 
 

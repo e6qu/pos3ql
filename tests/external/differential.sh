@@ -222,7 +222,7 @@ print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ===
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then
   # The curated corpus deliberately retains trigger targets and audit tables,
-  # while sqllogictest owns a complete 64-table catalog. A durable run needs
+  # while SQLLogicTest owns a complete 64-table catalog. A durable run needs
   # a new object prefix as well as a new local cache for independent state.
   kill "$P3_PID" 2>/dev/null
   wait "$P3_PID" 2>/dev/null
@@ -253,6 +253,7 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg $PG_PORT --p3 $P3_PORT \
        --limit "$SLT_LIMIT" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
+       "$EXT"/sqllogictest/*.test \
        > "$WORK/slt.out" 2>&1; then
     ok "sqllogictest differential ($(grep '^TOTAL' "$WORK/slt.out"))"
   else

@@ -3776,6 +3776,8 @@ impl Checkpointer {
             let mut htable = StackStr::<130>::new();
             let mut hfunction_schema = StackStr::<130>::new();
             let mut hfunction = StackStr::<130>::new();
+            let mut hold_table = StackStr::<130>::new();
+            let mut hnew_table = StackStr::<130>::new();
             let mut hwhen = StackStr::<{ crate::storage::TRIGGER_WHEN_MAX * 2 }>::new();
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(howner, "{byte:02x}");
@@ -3795,6 +3797,16 @@ impl Checkpointer {
             for byte in function.name.as_str().as_bytes() {
                 let _ = write!(hfunction, "{byte:02x}");
             }
+            if let Some(old) = trigger.transition_tables.old() {
+                for byte in old.as_str().as_bytes() {
+                    let _ = write!(hold_table, "{byte:02x}");
+                }
+            }
+            if let Some(new) = trigger.transition_tables.new_table() {
+                for byte in new.as_str().as_bytes() {
+                    let _ = write!(hnew_table, "{byte:02x}");
+                }
+            }
             if let Some(when) = trigger.when {
                 for byte in when.as_str().as_bytes() {
                     let _ = write!(hwhen, "{byte:02x}");
@@ -3803,7 +3815,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
                     howner.as_str(),
                     hname.as_str(),
@@ -3815,6 +3827,16 @@ impl Checkpointer {
                     trigger.level.code(),
                     trigger.events.bits(),
                     trigger.update_columns,
+                    if trigger.transition_tables.old().is_some() {
+                        hold_table.as_str()
+                    } else {
+                        "-"
+                    },
+                    if trigger.transition_tables.new_table().is_some() {
+                        hnew_table.as_str()
+                    } else {
+                        "-"
+                    },
                     if trigger.when.is_some() {
                         hwhen.as_str()
                     } else {
@@ -5119,6 +5141,27 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         crate::sql::ast::TriggerEvents::from_bits(parse_field(words.next(), "trigger events")?)
             .ok_or(CheckpointSetupError::Corrupt("trigger events"))?;
     let update_columns: u64 = parse_field(words.next(), "trigger update columns")?;
+    let old_table = match words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger old table"))?
+    {
+        "-" => None,
+        value => Some(decode_hex_name(value)?),
+    };
+    let new_table = match words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger new table"))?
+    {
+        "-" => None,
+        value => Some(decode_hex_name(value)?),
+    };
+    let transition_tables = crate::storage::TriggerTransitionTables::from_names(
+        old_table.as_deref(),
+        new_table.as_deref(),
+    )
+    .ok_or(CheckpointSetupError::Corrupt(
+        "duplicate trigger transition table names",
+    ))?;
     let when = match words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("trigger when"))?
@@ -5140,6 +5183,11 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     };
     if timing > 1
         || (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
+        || !transition_tables.is_valid_for(timing, level, events)
+        || (!matches!(
+            transition_tables,
+            crate::storage::TriggerTransitionTables::None
+        ) && update_columns != 0)
         || words.next().is_some()
     {
         return Err(CheckpointSetupError::Corrupt("malformed trigger record"));
@@ -5181,6 +5229,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 level,
                 events,
                 update_columns,
+                transition_tables,
                 when,
             },
             enabled,

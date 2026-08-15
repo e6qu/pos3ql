@@ -70,6 +70,29 @@ CREATE TRIGGER row_trigger_loop_before BEFORE INSERT ON row_trigger_loop_target
 INSERT INTO row_trigger_loop_target VALUES (1, 10);
 SELECT id, value FROM row_trigger_loop_target;
 
+CREATE TABLE row_trigger_structured_loop_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION row_trigger_structured_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE item integer := 0; total integer := 0; stop integer := 0;
+   BEGIN
+     WHILE item < 5 LOOP
+       item := item + 1;
+       CONTINUE WHEN item = 2;
+       total := total + item;
+     END LOOP;
+     LOOP
+       stop := stop + 1;
+       CONTINUE WHEN stop = 1;
+       total := total + stop;
+       EXIT WHEN stop = 3;
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_structured_loop_before BEFORE INSERT ON row_trigger_structured_loop_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_structured_loop();
+INSERT INTO row_trigger_structured_loop_target VALUES (1, 0);
+SELECT id, value FROM row_trigger_structured_loop_target;
+
 CREATE TABLE row_trigger_join_target (id integer PRIMARY KEY, value integer);
 CREATE TABLE row_trigger_join_source (id integer, delta integer, enabled boolean);
 CREATE TABLE row_trigger_join_driver (id integer PRIMARY KEY, value integer);

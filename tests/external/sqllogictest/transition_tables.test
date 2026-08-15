@@ -90,6 +90,31 @@ statement ok
 DROP FUNCTION slt_trigger_numeric_loop_program()
 
 statement ok
+CREATE TABLE slt_trigger_structured_loop_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE FUNCTION slt_trigger_structured_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+'DECLARE item integer := 0; total integer := 0; stop integer := 0; BEGIN WHILE item < 5 LOOP item := item + 1; CONTINUE WHEN item = 2; total := total + item; END LOOP; LOOP stop := stop + 1; CONTINUE WHEN stop = 1; total := total + stop; EXIT WHEN stop = 3; END LOOP; NEW.value := total; RETURN NEW; END'
+
+statement ok
+CREATE TRIGGER slt_trigger_structured_loop_before BEFORE INSERT ON slt_trigger_structured_loop_target
+FOR EACH ROW EXECUTE FUNCTION slt_trigger_structured_loop_program()
+
+statement ok
+INSERT INTO slt_trigger_structured_loop_target VALUES (1, 0)
+
+query II
+SELECT id, value FROM slt_trigger_structured_loop_target
+----
+1 18
+
+statement ok
+DROP TABLE slt_trigger_structured_loop_target
+
+statement ok
+DROP FUNCTION slt_trigger_structured_loop_program()
+
+statement ok
 CREATE TABLE slt_local_query_target (id integer PRIMARY KEY, value integer)
 
 statement ok

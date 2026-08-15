@@ -8547,6 +8547,41 @@ fn trigger_program_numeric_for_loop_propagates_exit_and_continue() {
         "{}",
         String::from_utf8_lossy(&reverse)
     );
+
+    let structured = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_structured_loop_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_structured_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer := 0;
+                    total integer := 0;
+                    stop integer := 0;
+            BEGIN
+              WHILE item < 5 LOOP
+                item := item + 1;
+                CONTINUE WHEN item = 2;
+                total := total + item;
+              END LOOP;
+              LOOP
+                stop := stop + 1;
+                CONTINUE WHEN stop = 1;
+                total := total + stop;
+                EXIT WHEN stop = 3;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_structured_loop_before BEFORE INSERT ON trigger_structured_loop_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_structured_loop_program();
+         INSERT INTO trigger_structured_loop_target VALUES (1, 0);
+         SELECT value FROM trigger_structured_loop_target;",
+    );
+    assert_eq!(
+        data_rows(&structured),
+        ["18"],
+        "{}",
+        String::from_utf8_lossy(&structured)
+    );
 }
 
 #[test]

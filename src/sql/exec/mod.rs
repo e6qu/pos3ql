@@ -6641,6 +6641,8 @@ enum TriggerStatement<'a> {
     Dml(TriggerDml<'a>),
     If(TriggerIf<'a>),
     For(TriggerFor<'a>),
+    While(TriggerWhile<'a>),
+    Loop(TriggerBlock<'a>),
     LoopControl(TriggerLoopControl<'a>),
     Return(TriggerReturn),
 }
@@ -6671,6 +6673,12 @@ enum TriggerForSource<'a> {
 struct TriggerFor<'a> {
     target: SqlName,
     source: TriggerForSource<'a>,
+    block: TriggerBlock<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerWhile<'a> {
+    condition: &'a Expr<'a>,
     block: TriggerBlock<'a>,
 }
 
@@ -6910,6 +6918,11 @@ fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
         ("elsif", "then")
     } else if strip_trigger_keyword(statement, "for").is_some() {
         ("for", "loop")
+    } else if strip_trigger_keyword(statement, "while").is_some() {
+        ("while", "loop")
+    } else if let Some(rest) = strip_trigger_keyword(statement, "loop") {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then_some(("LOOP", rest));
     } else if strip_trigger_keyword(statement, "else").is_some() {
         let rest = strip_trigger_keyword(statement, "else")?.trim();
         return (!rest.is_empty()).then_some(("ELSE", rest));
@@ -7391,6 +7404,27 @@ fn parse_trigger_for_header<'a>(
     )))
 }
 
+fn parse_trigger_while_header<'a>(
+    segment: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(condition) = strip_trigger_keyword(segment, "while") else {
+        return Ok(None);
+    };
+    let Some(condition) = trigger_tail(condition, "loop") else {
+        return Err(unsupported_trigger_body());
+    };
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(Some(super::parser::parse_expr(condition, arena)?))
+}
+
+fn is_trigger_loop_header(segment: &str) -> bool {
+    segment.trim().eq_ignore_ascii_case("loop")
+}
+
 fn parse_trigger_loop_control<'a>(
     segment: &'a str,
     arena: &'a Arena,
@@ -7641,6 +7675,18 @@ fn parse_trigger_block<'a>(
                 source,
                 block,
             })
+        } else if let Some(condition) = parse_trigger_while_header(segment, arena)? {
+            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth + 1)?;
+            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+                return Err(unsupported_trigger_body());
+            }
+            TriggerStatement::While(TriggerWhile { condition, block })
+        } else if is_trigger_loop_header(segment) {
+            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth + 1)?;
+            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+                return Err(unsupported_trigger_body());
+            }
+            TriggerStatement::Loop(block)
         } else {
             parse_trigger_statement(segment, arena, loop_depth)?
         };
@@ -8875,6 +8921,55 @@ fn execute_trigger_block<'a>(
                     }
                 }
             }
+            TriggerStatement::While(program) => loop {
+                if !trigger_condition(
+                    program.condition,
+                    definition,
+                    old,
+                    new.as_deref(),
+                    locals,
+                    &local_values[..locals.len()],
+                    context.arena,
+                )? {
+                    break;
+                }
+                match execute_trigger_block(
+                    context,
+                    definition,
+                    old,
+                    new,
+                    before,
+                    transition_relations,
+                    locals,
+                    local_values,
+                    program.block,
+                )? {
+                    Some(TriggerFlow::Return(result)) => {
+                        return Ok(Some(TriggerFlow::Return(result)));
+                    }
+                    Some(TriggerFlow::Exit) => break,
+                    Some(TriggerFlow::Continue) | None => {}
+                }
+            },
+            TriggerStatement::Loop(block) => loop {
+                match execute_trigger_block(
+                    context,
+                    definition,
+                    old,
+                    new,
+                    before,
+                    transition_relations,
+                    locals,
+                    local_values,
+                    block,
+                )? {
+                    Some(TriggerFlow::Return(result)) => {
+                        return Ok(Some(TriggerFlow::Return(result)));
+                    }
+                    Some(TriggerFlow::Exit) => break,
+                    Some(TriggerFlow::Continue) | None => {}
+                }
+            },
             TriggerStatement::If(program) => {
                 for branch in program.branches {
                     let selected = match branch.condition {

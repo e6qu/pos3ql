@@ -8282,13 +8282,47 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         ["0"]
     );
 
-    let unsupported_body = run_with(
+    let trigger_dml = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FUNCTION unsupported_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN DELETE FROM trigger_body_audit; RETURN NULL; END'",
+        "CREATE TABLE trigger_body_dml (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_body_dml VALUES (1, 10), (2, 20);
+         CREATE FUNCTION trigger_update_delete() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN UPDATE trigger_body_dml SET value = NEW.value + 1 WHERE id = NEW.value - 4;
+                  DELETE FROM trigger_body_dml WHERE id = NEW.value - 3;
+                  RETURN NEW; END';
+         CREATE TRIGGER trigger_update_delete_after AFTER INSERT ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_update_delete();
+         INSERT INTO trigger_body_target (id, value) VALUES (4, 4);
+         SELECT id, value FROM trigger_body_dml ORDER BY id;",
     );
-    assert!(String::from_utf8_lossy(&unsupported_body).contains("0A000"));
+    assert_eq!(data_rows(&trigger_dml), ["1|6"]);
+
+    let branches = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_body_branch_target (value integer);
+         CREATE TABLE trigger_body_branch_audit (value integer);
+         CREATE FUNCTION branch_trigger_body() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN IF NEW.value > 5 THEN
+                    INSERT INTO trigger_body_branch_audit VALUES (1);
+                  ELSIF NEW.value = 5 THEN
+                    INSERT INTO trigger_body_branch_audit VALUES (2);
+                  ELSE
+                    BEGIN INSERT INTO trigger_body_branch_audit VALUES (3); END;
+                  END IF;
+                  RETURN NEW; END';
+         CREATE TRIGGER branch_trigger_before_insert BEFORE INSERT ON trigger_body_branch_target
+           FOR EACH ROW EXECUTE FUNCTION branch_trigger_body();
+         INSERT INTO trigger_body_branch_target VALUES (7), (5), (2);
+         SELECT value FROM trigger_body_branch_audit ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&branches),
+        ["1", "2", "3"],
+        "{}",
+        String::from_utf8_lossy(&branches)
+    );
 
     let unsupported = run_with(
         &mut engine,
@@ -8312,6 +8346,24 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         )),
         ["0"]
     );
+
+    for source in [
+        "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
+        "CREATE FUNCTION reject_trigger_insert_select() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_body_audit SELECT id, value FROM trigger_body_dml; RETURN NEW; END'",
+        "CREATE FUNCTION reject_trigger_update_from() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN UPDATE trigger_body_dml SET value = 1 FROM trigger_body_audit WHERE trigger_body_dml.id = trigger_body_audit.id; RETURN NEW; END'",
+        "CREATE FUNCTION reject_trigger_delete_using() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN DELETE FROM trigger_body_dml USING trigger_body_audit WHERE trigger_body_dml.id = trigger_body_audit.id; RETURN NEW; END'",
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, source);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("0A000"),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
 }
 
 #[test]
@@ -8328,8 +8380,19 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
         &mut budget,
         "CREATE TABLE durable_trigger_target (id integer PRIMARY KEY, value integer);
          CREATE TABLE durable_trigger_audit (id integer, observed integer);
+         CREATE TABLE durable_trigger_side (id integer PRIMARY KEY, value integer);
+         INSERT INTO durable_trigger_side VALUES (1, 10), (2, 20);
          CREATE FUNCTION durable_keep() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN NEW.value := NEW.value + 1; INSERT INTO durable_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
+           'BEGIN
+              NEW.value := NEW.value + 1;
+              IF NEW.id = 1 THEN
+                BEGIN UPDATE durable_trigger_side SET value = NEW.value WHERE id = NEW.id; END;
+              ELSE
+                DELETE FROM durable_trigger_side WHERE id = NEW.id;
+              END IF;
+              INSERT INTO durable_trigger_audit VALUES (NEW.id, NEW.value);
+              RETURN NEW;
+            END';
          CREATE TRIGGER durable_target BEFORE INSERT ON durable_trigger_target
            FOR EACH ROW EXECUTE FUNCTION durable_keep();
          ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;",
@@ -8347,11 +8410,22 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
            FROM pg_trigger trigger_catalog
            JOIN pg_class relation_catalog ON trigger_catalog.tgrelid = relation_catalog.oid
           WHERE relation_catalog.relname = 'durable_trigger_target';
-         INSERT INTO durable_trigger_target VALUES (1, 1);
-         SELECT value FROM durable_trigger_target;
-         SELECT observed FROM durable_trigger_audit;",
+         INSERT INTO durable_trigger_target VALUES (1, 1), (2, 4);
+         SELECT id, value FROM durable_trigger_target ORDER BY id;
+         SELECT id, observed FROM durable_trigger_audit ORDER BY id;
+         SELECT id, value FROM durable_trigger_side ORDER BY id;",
     );
-    assert_eq!(data_rows(&output), ["durable_target_renamed|O|t", "2", "2"]);
+    assert_eq!(
+        data_rows(&output),
+        [
+            "durable_target_renamed|O|t",
+            "1|2",
+            "2|5",
+            "1|2",
+            "2|5",
+            "1|2",
+        ]
+    );
 }
 
 #[test]

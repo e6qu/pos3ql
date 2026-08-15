@@ -3992,6 +3992,7 @@ impl Engine {
                 exec::insert(
                     storage,
                     txn,
+                    scratch,
                     insert,
                     arena,
                     params,
@@ -4052,6 +4053,7 @@ impl Engine {
                     guc.seq_session(),
                     responder,
                     capture,
+                    None,
                 )
             }
             Stmt::Delete(delete) => {
@@ -4104,6 +4106,7 @@ impl Engine {
                     guc.seq_session(),
                     responder,
                     capture,
+                    None,
                 )
             }
             _ => Ok(Err(sql_err!(

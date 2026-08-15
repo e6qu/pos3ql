@@ -33,3 +33,22 @@ DELETE FROM row_trigger_target WHERE id = 1;
 SELECT count(*) FROM row_trigger_target;
 SELECT id, observed FROM row_trigger_audit ORDER BY observed;
 SELECT id, observed FROM row_trigger_after ORDER BY observed;
+
+CREATE TABLE row_trigger_program_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE row_trigger_program_side (id integer PRIMARY KEY, value integer);
+CREATE TABLE row_trigger_program_audit (value integer);
+INSERT INTO row_trigger_program_side VALUES (1, 10), (2, 20);
+CREATE FUNCTION row_trigger_program() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN IF NEW.value > 5 THEN
+           UPDATE row_trigger_program_side SET value = NEW.value WHERE id = NEW.id;
+         ELSIF NEW.value = 5 THEN
+           DELETE FROM row_trigger_program_side WHERE id = NEW.value - 3;
+         ELSE
+           BEGIN INSERT INTO row_trigger_program_audit VALUES (NEW.value); END;
+         END IF;
+         RETURN NEW; END';
+CREATE TRIGGER row_trigger_program_before BEFORE INSERT ON row_trigger_program_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_program();
+INSERT INTO row_trigger_program_target VALUES (1, 7), (2, 5), (3, 2);
+SELECT id, value FROM row_trigger_program_side ORDER BY id;
+SELECT value FROM row_trigger_program_audit;

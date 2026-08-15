@@ -1518,6 +1518,23 @@ def test_typed_trigger_query_program_over_raw_simple_query():
         first_text_row(simple_query(s, "SELECT value FROM wire_local_target")) == "13"
         and first_text_row(simple_query(s, "SELECT value FROM wire_local_audit")) == "4",
     )
+    loop_setup = simple_query(
+        s,
+        "CREATE TABLE wire_loop_target (id integer PRIMARY KEY, value integer); "
+        "CREATE FUNCTION wire_loop_program() RETURNS trigger LANGUAGE plpgsql AS "
+        "'DECLARE item integer; total integer := 0; BEGIN "
+        "FOR item IN REVERSE 5..1 BY 2 LOOP "
+        "CONTINUE WHEN item = 3; total := total + item; EXIT WHEN item = 1; END LOOP; "
+        "NEW.value := NEW.value + total; RETURN NEW; END'; "
+        "CREATE TRIGGER wire_loop_before BEFORE INSERT ON wire_loop_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_loop_program(); "
+        "INSERT INTO wire_loop_target VALUES (1, 10)",
+    )
+    check("raw wire: numeric trigger loop setup succeeds", not any(kind == b"E" for kind, _ in loop_setup), loop_setup)
+    check(
+        "raw wire: numeric trigger loop control flow is visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_loop_target")) == "16",
+    )
     s.close()
 
 

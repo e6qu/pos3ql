@@ -53,6 +53,23 @@ INSERT INTO row_trigger_program_target VALUES (1, 7), (2, 5), (3, 2);
 SELECT id, value FROM row_trigger_program_side ORDER BY id;
 SELECT value FROM row_trigger_program_audit;
 
+CREATE TABLE row_trigger_loop_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION row_trigger_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE item integer; total integer := 0;
+   BEGIN
+     FOR item IN REVERSE 5..1 BY 2 LOOP
+       CONTINUE WHEN item = 3;
+       total := total + item;
+       EXIT WHEN item = 1;
+     END LOOP;
+     NEW.value := NEW.value + total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_loop_before BEFORE INSERT ON row_trigger_loop_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_loop();
+INSERT INTO row_trigger_loop_target VALUES (1, 10);
+SELECT id, value FROM row_trigger_loop_target;
+
 CREATE TABLE row_trigger_join_target (id integer PRIMARY KEY, value integer);
 CREATE TABLE row_trigger_join_source (id integer, delta integer, enabled boolean);
 CREATE TABLE row_trigger_join_driver (id integer PRIMARY KEY, value integer);
@@ -135,6 +152,25 @@ INSERT INTO transition_trigger_target VALUES (1, 10), (2, 20);
 UPDATE transition_trigger_target SET value = value + 1;
 DELETE FROM transition_trigger_target WHERE id = 2;
 SELECT kind, id, value FROM transition_trigger_audit ORDER BY kind, id;
+
+CREATE TABLE transition_trigger_loop_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE transition_trigger_loop_audit (value integer);
+CREATE FUNCTION transition_trigger_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE item integer;
+   BEGIN
+     FOR item IN SELECT value FROM changed_rows ORDER BY value LOOP
+       CONTINUE WHEN item = 2;
+       INSERT INTO transition_trigger_loop_audit VALUES (item);
+       EXIT WHEN item = 3;
+     END LOOP;
+     RETURN NULL;
+   END';
+CREATE TRIGGER transition_trigger_loop_after AFTER UPDATE ON transition_trigger_loop_target
+  REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+  EXECUTE FUNCTION transition_trigger_loop();
+INSERT INTO transition_trigger_loop_target VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+UPDATE transition_trigger_loop_target SET value = value;
+SELECT value FROM transition_trigger_loop_audit ORDER BY value;
 
 CREATE TABLE trigger_local_query_target (id integer PRIMARY KEY, value integer);
 CREATE TABLE trigger_local_query_source (id integer PRIMARY KEY, delta integer);

@@ -1121,6 +1121,33 @@ def test_row_trigger_body_over_raw_wire():
         first_text_row(simple_query(s, "SELECT value FROM wire_trigger_side WHERE id = 1")) == "5"
         and first_text_row(simple_query(s, "SELECT count(*) FROM wire_trigger_side WHERE id = 2")) == "0",
     )
+    joined = simple_query(
+        s,
+        "CREATE TABLE wire_trigger_join_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_trigger_join_source (id integer, delta integer); "
+        "CREATE TABLE wire_trigger_join_driver (id integer PRIMARY KEY, value integer); "
+        "INSERT INTO wire_trigger_join_target VALUES (1, 10), (2, 20); "
+        "INSERT INTO wire_trigger_join_source VALUES (1, 2), (2, 3); "
+        "INSERT INTO wire_trigger_join_driver VALUES (1, 5); "
+        "CREATE FUNCTION wire_trigger_join_fn() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN UPDATE wire_trigger_join_target "
+        "SET value = wire_trigger_join_target.value + wire_trigger_join_source.delta + NEW.value - OLD.value "
+        "FROM wire_trigger_join_source "
+        "WHERE wire_trigger_join_target.id = wire_trigger_join_source.id AND OLD.id = NEW.id; "
+        "DELETE FROM wire_trigger_join_target USING wire_trigger_join_source "
+        "WHERE wire_trigger_join_target.id = wire_trigger_join_source.id "
+        "AND wire_trigger_join_source.delta = 3 AND OLD.value = 5 AND NEW.value = 7; "
+        "RETURN NEW; END'; "
+        "CREATE TRIGGER wire_trigger_join AFTER UPDATE ON wire_trigger_join_driver "
+        "FOR EACH ROW EXECUTE FUNCTION wire_trigger_join_fn(); "
+        "UPDATE wire_trigger_join_driver SET value = 7 WHERE id = 1",
+    )
+    check("raw wire: joined trigger DML setup succeeds", not any(kind == b"E" for kind, _ in joined), joined)
+    check(
+        "raw wire: joined trigger DML preserves typed OLD/NEW",
+        first_text_row(simple_query(s, "SELECT id || ':' || value FROM wire_trigger_join_target ORDER BY id"))
+        == "1:14",
+    )
     s.close()
 
 

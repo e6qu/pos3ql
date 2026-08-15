@@ -53,6 +53,33 @@ INSERT INTO row_trigger_program_target VALUES (1, 7), (2, 5), (3, 2);
 SELECT id, value FROM row_trigger_program_side ORDER BY id;
 SELECT value FROM row_trigger_program_audit;
 
+CREATE TABLE row_trigger_join_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE row_trigger_join_source (id integer, delta integer, enabled boolean);
+CREATE TABLE row_trigger_join_driver (id integer PRIMARY KEY, value integer);
+INSERT INTO row_trigger_join_target VALUES (1, 10), (2, 20);
+INSERT INTO row_trigger_join_source VALUES (1, 2, true), (2, 3, true);
+INSERT INTO row_trigger_join_driver VALUES (1, 5);
+CREATE FUNCTION row_trigger_join_program() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN
+     UPDATE row_trigger_join_target
+        SET value = row_trigger_join_target.value + row_trigger_join_source.delta + NEW.value - OLD.value
+       FROM row_trigger_join_source
+      WHERE row_trigger_join_target.id = row_trigger_join_source.id
+        AND row_trigger_join_source.enabled
+        AND OLD.id = NEW.id;
+     DELETE FROM row_trigger_join_target
+           USING row_trigger_join_source
+      WHERE row_trigger_join_target.id = row_trigger_join_source.id
+        AND row_trigger_join_source.delta = 3
+        AND OLD.value = 5
+        AND NEW.value = 7;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_join_after AFTER UPDATE ON row_trigger_join_driver
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_join_program();
+UPDATE row_trigger_join_driver SET value = 7 WHERE id = 1;
+SELECT id, value FROM row_trigger_join_target ORDER BY id;
+
 CREATE TABLE row_trigger_qualification_target (id integer PRIMARY KEY, value integer, note integer);
 CREATE TABLE row_trigger_qualification_audit (id integer, value integer);
 CREATE FUNCTION row_trigger_qualification() RETURNS trigger LANGUAGE plpgsql AS

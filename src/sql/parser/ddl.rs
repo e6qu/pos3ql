@@ -171,10 +171,24 @@ impl<'a> Parser<'a> {
         };
         let mut events = [TriggerEvent::Insert; 3];
         let mut event_count = 0usize;
+        let mut update_columns = [""; MAX_LIST];
+        let mut update_column_count = 0usize;
         loop {
             let event = if self.eat_ident("insert")? {
                 TriggerEvent::Insert
             } else if self.eat_ident("update")? {
+                if self.eat_ident("of")? {
+                    loop {
+                        if update_column_count == update_columns.len() {
+                            return Err(self.limit("UPDATE OF columns", update_columns.len()));
+                        }
+                        update_columns[update_column_count] = self.col_ident("UPDATE OF column")?;
+                        update_column_count += 1;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
+                    }
+                }
                 TriggerEvent::Update
             } else if self.eat_ident("delete")? {
                 TriggerEvent::Delete
@@ -202,9 +216,10 @@ impl<'a> Parser<'a> {
             }
             self.expect_ident("row")?;
         }
-        if self.eat_ident("when")? {
-            return Err(self.err_here("trigger WHEN conditions are not supported"));
-        }
+        let when = self
+            .eat_ident("when")?
+            .then(|| self.check_text())
+            .transpose()?;
         self.expect_ident("execute")?;
         if !self.eat_ident("function")? {
             return Err(self.err_here("trigger procedures are not supported; use EXECUTE FUNCTION"));
@@ -230,7 +245,9 @@ impl<'a> Parser<'a> {
             name,
             timing,
             events: self.arena_slice(&events[..event_count])?,
+            update_columns: self.arena_slice(&update_columns[..update_column_count])?,
             table,
+            when,
             function,
             arguments: self.arena_slice(&arguments[..argument_count])?,
         }))

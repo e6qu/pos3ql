@@ -429,6 +429,8 @@ pub(crate) enum WalOp<'a> {
         function: &'a str,
         timing: u8,
         events: u8,
+        update_columns: u64,
+        when: Option<&'a str>,
     },
     DropTrigger {
         name: &'a str,
@@ -1517,6 +1519,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             function_schema,
             function,
+            when,
             ..
         } => {
             1 + name.len()
@@ -1528,7 +1531,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + function_schema.len()
                 + 1
                 + function.len()
-                + 2
+                + 12
+                + when.map_or(0, str::len)
         }
         WalOp::DropTrigger {
             name,
@@ -2499,13 +2503,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             function,
             timing,
             events,
+            update_columns,
+            when,
         } => {
+            let when_len = when.map_or(0usize, |value| value.len() + 1);
             name_bytes(buffer, name)
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, function_schema)
                 && name_bytes(buffer, function)
                 && buffer.append(&[*timing, *events])
+                && buffer.append(&update_columns.to_le_bytes())
+                && u16::try_from(when_len)
+                    .ok()
+                    .is_some_and(|length| buffer.append(&length.to_le_bytes()))
+                && when.is_none_or(|value| buffer.append(value.as_bytes()))
         }
         WalOp::DropTrigger {
             name,
@@ -3306,6 +3318,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let timing = *payload.get(at)?;
             let events = *payload.get(at + 1)?;
             at += 2;
+            let update_columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            let when_len =
+                u16::from_le_bytes(payload.get(at + 8..at + 10)?.try_into().ok()?) as usize;
+            at += 10;
+            let when = if when_len == 0 {
+                None
+            } else {
+                let length = when_len - 1;
+                let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                at += length;
+                Some(value)
+            };
             (timing <= 1 && events != 0 && at == payload.len()).then_some(WalOp::CreateTrigger {
                 name,
                 table_schema,
@@ -3314,6 +3338,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 function,
                 timing,
                 events,
+                update_columns,
+                when,
             })
         }
         KIND_DROP_TRIGGER => {
@@ -4962,6 +4988,28 @@ mod tests {
     }
 
     #[test]
+    fn create_trigger_payload_requires_typed_qualification() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "trigger payload", 1024).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTrigger {
+                name: "audit_row",
+                table_schema: "public",
+                table: "orders",
+                function_schema: "public",
+                function: "audit_order",
+                timing: 0,
+                events: 1,
+                update_columns: 0,
+                when: None,
+            },
+        ));
+        let incomplete_payload = &payload.readable()[..payload.len() - 10];
+        assert!(decode_op(KIND_CREATE_TRIGGER, incomplete_payload).is_none());
+    }
+
+    #[test]
     fn roundtrip_all_ops() {
         let dir = temp_dir("roundtrip");
         let config = test_config(&dir);
@@ -5174,6 +5222,8 @@ mod tests {
                     function: "audit_order",
                     timing: 0,
                     events: 3,
+                    update_columns: 3,
+                    when: Some("NEW.total > OLD.total"),
                 },
             )
             .unwrap();

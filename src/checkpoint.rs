@@ -3776,6 +3776,7 @@ impl Checkpointer {
             let mut htable = StackStr::<130>::new();
             let mut hfunction_schema = StackStr::<130>::new();
             let mut hfunction = StackStr::<130>::new();
+            let mut hwhen = StackStr::<{ crate::storage::TRIGGER_WHEN_MAX * 2 }>::new();
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(howner, "{byte:02x}");
             }
@@ -3794,10 +3795,15 @@ impl Checkpointer {
             for byte in function.name.as_str().as_bytes() {
                 let _ = write!(hfunction, "{byte:02x}");
             }
+            if let Some(when) = trigger.when {
+                for byte in when.as_str().as_bytes() {
+                    let _ = write!(hwhen, "{byte:02x}");
+                }
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
                     howner.as_str(),
                     hname.as_str(),
@@ -3807,6 +3813,12 @@ impl Checkpointer {
                     hfunction.as_str(),
                     trigger.timing,
                     trigger.events,
+                    trigger.update_columns,
+                    if trigger.when.is_some() {
+                        hwhen.as_str()
+                    } else {
+                        "-"
+                    },
                     u8::from(trigger.enabled),
                 ),
             )?;
@@ -5100,6 +5112,21 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     )?;
     let timing: u8 = parse_field(words.next(), "trigger timing")?;
     let events: u8 = parse_field(words.next(), "trigger events")?;
+    let update_columns: u64 = parse_field(words.next(), "trigger update columns")?;
+    let when = match words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger when"))?
+    {
+        "-" => None,
+        value => Some(
+            crate::storage::trigger_when_stackstr(&decode_hex_name(value)?).map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest trigger rejected: {}",
+                    error.message.as_str()
+                ))
+            })?,
+        ),
+    };
     let enabled = match parse_field::<u8>(words.next(), "trigger enabled")? {
         0 => false,
         1 => true,
@@ -5143,6 +5170,8 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 function,
                 timing,
                 events,
+                update_columns,
+                when,
             },
             enabled,
         )

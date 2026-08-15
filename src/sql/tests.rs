@@ -8367,6 +8367,49 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
 }
 
 #[test]
+fn row_trigger_when_and_update_of_are_typed_and_selective() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_qualification_target (id integer PRIMARY KEY, value integer, note integer);
+         CREATE TABLE trigger_qualification_audit (id integer, value integer);
+         CREATE FUNCTION trigger_qualification_audit() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_qualification_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
+         CREATE TRIGGER trigger_qualification_before
+           BEFORE UPDATE OF value ON trigger_qualification_target
+           FOR EACH ROW WHEN (NEW.value > OLD.value)
+           EXECUTE FUNCTION trigger_qualification_audit();
+         INSERT INTO trigger_qualification_target VALUES (1, 3, 0);
+         UPDATE trigger_qualification_target SET note = 1 WHERE id = 1;
+         UPDATE trigger_qualification_target SET value = 2 WHERE id = 1;
+         UPDATE trigger_qualification_target SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_qualification_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|7"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let invalid_transition = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRIGGER trigger_qualification_invalid
+           BEFORE INSERT ON trigger_qualification_target
+           FOR EACH ROW WHEN (OLD.value IS NULL)
+           EXECUTE FUNCTION trigger_qualification_audit();
+         INSERT INTO trigger_qualification_target VALUES (2, 1, 0)",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid_transition).contains("record \"OLD\" is not assigned"),
+        "{}",
+        String::from_utf8_lossy(&invalid_transition)
+    );
+}
+
+#[test]
 fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     let mut config = test_config("trigger-catalog-recovery");
     config.object_store_on = true;
@@ -8393,8 +8436,12 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
               INSERT INTO durable_trigger_audit VALUES (NEW.id, NEW.value);
               RETURN NEW;
             END';
+         CREATE FUNCTION durable_update_qualification() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO durable_trigger_audit VALUES (NEW.id, -NEW.value); RETURN NEW; END';
          CREATE TRIGGER durable_target BEFORE INSERT ON durable_trigger_target
-           FOR EACH ROW EXECUTE FUNCTION durable_keep();
+           FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION durable_keep();
+         CREATE TRIGGER durable_target_update BEFORE UPDATE OF value ON durable_trigger_target
+           FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION durable_update_qualification();
          ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
@@ -8411,16 +8458,20 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
            JOIN pg_class relation_catalog ON trigger_catalog.tgrelid = relation_catalog.oid
           WHERE relation_catalog.relname = 'durable_trigger_target';
          INSERT INTO durable_trigger_target VALUES (1, 1), (2, 4);
+         UPDATE durable_trigger_target SET value = 1 WHERE id = 1;
+         UPDATE durable_trigger_target SET value = 10 WHERE id = 1;
          SELECT id, value FROM durable_trigger_target ORDER BY id;
-         SELECT id, observed FROM durable_trigger_audit ORDER BY id;
+         SELECT id, observed FROM durable_trigger_audit ORDER BY id, observed;
          SELECT id, value FROM durable_trigger_side ORDER BY id;",
     );
     assert_eq!(
         data_rows(&output),
         [
             "durable_target_renamed|O|t",
-            "1|2",
+            "durable_target_update|O|t",
+            "1|10",
             "2|5",
+            "1|-10",
             "1|2",
             "2|5",
             "1|2",

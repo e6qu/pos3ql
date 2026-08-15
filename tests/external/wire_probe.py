@@ -1082,7 +1082,7 @@ def test_row_trigger_body_over_raw_wire():
         "ELSE DELETE FROM wire_trigger_side WHERE id = NEW.id; END IF; "
         "INSERT INTO wire_trigger_audit VALUES (NEW.id, NEW.value); RETURN NEW; END'; "
         "CREATE TRIGGER wire_trigger BEFORE INSERT ON wire_trigger_target "
-        "FOR EACH ROW EXECUTE FUNCTION wire_trigger_fn(); "
+        "FOR EACH ROW WHEN (NEW.value > 0) EXECUTE FUNCTION wire_trigger_fn(); "
         "INSERT INTO wire_trigger_target VALUES (1, 4), (2, 4)",
     )
     check("raw wire: trigger body setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)

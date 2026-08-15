@@ -6522,10 +6522,10 @@ impl<'v> ColumnLookup<'v> for TriggerTransition<'_, '_, 'v> {
                 name
             ));
         };
-        let values = if qualifier.eq_ignore_ascii_case("old") {
-            self.old
+        let (transition, values) = if qualifier.eq_ignore_ascii_case("old") {
+            ("OLD", self.old)
         } else if qualifier.eq_ignore_ascii_case("new") {
-            self.new
+            ("NEW", self.new)
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -6534,7 +6534,11 @@ impl<'v> ColumnLookup<'v> for TriggerTransition<'_, '_, 'v> {
             ));
         };
         let Some(values) = values else {
-            return Ok(Datum::Null);
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "record \"{}\" is not assigned yet",
+                transition
+            ));
         };
         let Some(column) = self.definition.column_index(name) else {
             return Err(sql_err!(
@@ -7370,12 +7374,17 @@ fn execute_trigger_block<'a>(
     Ok(None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row-transition dispatch carries the complete typed firing context"
+)]
 fn fire_row_triggers<'a>(
     mut context: TriggerExecContext<'_, 'a, '_>,
     table: usize,
     definition: &TableDef,
     event: u8,
     before: bool,
+    updated_columns: u64,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
 ) -> Result<bool, SqlError> {
@@ -7395,8 +7404,40 @@ fn fire_row_triggers<'a>(
         if !trigger.enabled_to(context.txn.txid)
             || trigger.timing != u8::from(!before)
             || trigger.events & event == 0
+            || (event == 2
+                && trigger.update_columns != 0
+                && trigger.update_columns & updated_columns == 0)
         {
             continue;
+        }
+        if let Some(when) = trigger.when {
+            let source = context.arena.alloc_str(when.as_str()).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger WHEN predicate exceeds the statement arena"
+                )
+            })?;
+            let condition = super::parser::parse_expr(source, context.arena)?;
+            match eval_full(
+                condition,
+                context.arena,
+                crate::sql::eval::NO_PARAMS,
+                &TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                },
+                &NO_HOOKS,
+            )? {
+                Datum::Bool(true) => {}
+                Datum::Bool(false) | Datum::Null => continue,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "trigger WHEN condition must be type boolean"
+                    ));
+                }
+            }
         }
         let source = {
             let body = context
@@ -7494,6 +7535,26 @@ pub fn create_trigger(
         TriggerTiming::Before => 0,
         TriggerTiming::After => 1,
     };
+    let definition = storage.table_def(table, txn.txid);
+    let mut update_columns = 0u64;
+    for name in trigger.update_columns {
+        let Some(column) = definition.column_index(name) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                name,
+                trigger.table.name
+            ));
+        };
+        update_columns |= 1u64 << column;
+    }
+    let when = match trigger.when {
+        Some(source) => match crate::storage::trigger_when_stackstr(source) {
+            Ok(source) => Some(source),
+            Err(error) => return sql_fail(error),
+        },
+        None => None,
+    };
     let name = match SqlName::parse(trigger.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -7509,6 +7570,8 @@ pub fn create_trigger(
             function,
             timing,
             events,
+            update_columns,
+            when,
         },
         txn.txid,
     ) {
@@ -7527,6 +7590,8 @@ pub fn create_trigger(
             function: function_name.as_str(),
             timing,
             events,
+            update_columns,
+            when: when.as_ref().map(|value| value.as_str()),
         },
     );
     if let Err(error) = staged {
@@ -15344,6 +15409,7 @@ fn finish_insert_row<'a>(
         definition,
         1,
         true,
+        0,
         None,
         Some(&mut values[..definition.n_columns]),
     ) {
@@ -15431,6 +15497,7 @@ fn finish_insert_row<'a>(
         definition,
         1,
         false,
+        0,
         None,
         Some(&mut values[..definition.n_columns]),
     ) {
@@ -16068,6 +16135,7 @@ pub fn update<'a>(
 
     // Resolve assignment targets once.
     let mut targets = [0usize; MAX_COLUMNS];
+    let mut updated_columns = 0u64;
     for (i, (name, _)) in statement.assignments.iter().enumerate() {
         let Some(col) = def.column_index(name) else {
             return sql_fail(sql_err!(
@@ -16078,6 +16146,7 @@ pub fn update<'a>(
             ));
         };
         targets[i] = col;
+        updated_columns |= 1u64 << col;
     }
     // A generated column can only be updated to DEFAULT (which recomputes it).
     for (a, (_, expression)) in statement.assignments.iter().enumerate() {
@@ -16383,6 +16452,7 @@ pub fn update<'a>(
                 &def,
                 2,
                 true,
+                updated_columns,
                 Some(old_transition),
                 Some(new_values),
             ) {
@@ -16510,6 +16580,7 @@ pub fn update<'a>(
             &def,
             2,
             false,
+            updated_columns,
             Some(&old_transition[..def.n_columns]),
             Some(&mut new_transition[..def.n_columns]),
         ) {
@@ -16713,6 +16784,7 @@ pub fn delete<'a>(
                 &def,
                 4,
                 true,
+                0,
                 Some(&old_values[..def.n_columns]),
                 None,
             ) {
@@ -16799,6 +16871,7 @@ pub fn delete<'a>(
                 &def,
                 4,
                 false,
+                0,
                 Some(&old_transition[..def.n_columns]),
                 None,
             ) {

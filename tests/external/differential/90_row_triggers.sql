@@ -52,3 +52,17 @@ CREATE TRIGGER row_trigger_program_before BEFORE INSERT ON row_trigger_program_t
 INSERT INTO row_trigger_program_target VALUES (1, 7), (2, 5), (3, 2);
 SELECT id, value FROM row_trigger_program_side ORDER BY id;
 SELECT value FROM row_trigger_program_audit;
+
+CREATE TABLE row_trigger_qualification_target (id integer PRIMARY KEY, value integer, note integer);
+CREATE TABLE row_trigger_qualification_audit (id integer, value integer);
+CREATE FUNCTION row_trigger_qualification() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO row_trigger_qualification_audit VALUES (NEW.id, NEW.value); RETURN NEW; END';
+CREATE TRIGGER row_trigger_qualification_before
+  BEFORE UPDATE OF value ON row_trigger_qualification_target
+  FOR EACH ROW WHEN (NEW.value > OLD.value)
+  EXECUTE FUNCTION row_trigger_qualification();
+INSERT INTO row_trigger_qualification_target VALUES (1, 3, 0);
+UPDATE row_trigger_qualification_target SET note = 1 WHERE id = 1;
+UPDATE row_trigger_qualification_target SET value = 2 WHERE id = 1;
+UPDATE row_trigger_qualification_target SET value = 7 WHERE id = 1;
+SELECT id, value FROM row_trigger_qualification_audit;

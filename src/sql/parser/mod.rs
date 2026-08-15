@@ -317,6 +317,27 @@ pub fn parse_expr<'a>(
     Ok(expression)
 }
 
+/// Parses one complete PostgreSQL type spelling for a procedural local.
+/// Keeping this at the parser boundary prevents trigger programs from
+/// hand-normalizing aliases or silently losing a typmod.
+pub(crate) fn parse_type_name<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a str, i32), super::eval::SqlError> {
+    let to_sql = |m: &str| super::eval::SqlError {
+        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        message: crate::stack_format!(192, "invalid type name: {}", m),
+    };
+    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    let parsed = parser
+        .type_name_mod()
+        .map_err(|e| to_sql(e.message.as_str()))?;
+    if parser.peeked != Tok::Eof {
+        return Err(to_sql("trailing tokens after type name"));
+    }
+    Ok(parsed)
+}
+
 impl<'a> Parser<'a> {
     pub fn new(text: &'a str, arena: &'a Arena) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(text, arena);

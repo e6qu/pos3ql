@@ -25,8 +25,8 @@ use crate::wal::{Wal, WalOp};
 
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
-    Insert, LikeClause, Overriding, QualName, RoutineLanguage, SelectItem, Stmt, TriggerEvent,
-    TriggerEvents, TriggerLevel, TriggerTiming, Update,
+    Insert, LikeClause, Overriding, QualName, RoutineLanguage, Select, SelectItem, Stmt,
+    TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
@@ -6525,6 +6525,26 @@ struct TriggerAssignment<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct TriggerLocalAssignment<'a> {
+    name: SqlName,
+    expression: &'a Expr<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerLocalDecl<'a> {
+    name: SqlName,
+    ctype: ColType,
+    type_mod: i32,
+    initial: Option<&'a Expr<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerSelectInto<'a> {
+    query: &'a Select<'a>,
+    targets: &'a [SqlName],
+}
+
+#[derive(Clone, Copy)]
 enum TriggerDml<'a> {
     Insert(Insert<'a>),
     Update(Update<'a>),
@@ -6534,6 +6554,9 @@ enum TriggerDml<'a> {
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
     Assign(TriggerAssignment<'a>),
+    LocalAssign(TriggerLocalAssignment<'a>),
+    SelectInto(TriggerSelectInto<'a>),
+    Perform(&'a Select<'a>),
     Dml(TriggerDml<'a>),
     If(TriggerIf<'a>),
     Return(TriggerReturn),
@@ -6557,6 +6580,7 @@ struct TriggerBlock<'a> {
 
 #[derive(Clone, Copy)]
 struct TriggerProgram<'a> {
+    locals: &'a [TriggerLocalDecl<'a>],
     body: TriggerBlock<'a>,
 }
 
@@ -6918,6 +6942,204 @@ fn parse_trigger_assignment<'a>(
     Ok(Some(TriggerAssignment { column, expression }))
 }
 
+fn parse_trigger_local_assignment<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerLocalAssignment<'a>>, SqlError> {
+    let Some(offset) = trigger_top_level_keyword(statement, ":=") else {
+        return Ok(None);
+    };
+    let name = statement[..offset].trim();
+    let expression = statement[offset + 2..].trim();
+    if name.is_empty() || expression.is_empty() || name.contains('.') {
+        return Ok(None);
+    }
+    Ok(Some(TriggerLocalAssignment {
+        name: SqlName::parse(name)?,
+        expression: super::parser::parse_expr(expression, arena)?,
+    }))
+}
+
+fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (offset, character) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0
+                && text
+                    .get(offset..offset + keyword.len())
+                    .is_some_and(|word| word.eq_ignore_ascii_case(keyword)) =>
+            {
+                let before = text[..offset].chars().next_back();
+                let after = text[offset + keyword.len()..].chars().next();
+                if before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    && after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_trigger_local<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<TriggerLocalDecl<'a>, SqlError> {
+    let initial = trigger_top_level_keyword(statement, ":=")
+        .map(|offset| (offset, 2))
+        .or_else(|| trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7)))
+        .or_else(|| trigger_top_level_keyword(statement, "=").map(|offset| (offset, 1)));
+    let (declaration, initial) = if let Some((offset, width)) = initial {
+        let expression = statement[offset + width..].trim();
+        if expression.is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        (
+            statement[..offset].trim(),
+            Some(super::parser::parse_expr(expression, arena)?),
+        )
+    } else {
+        (statement.trim(), None)
+    };
+    let Some(split) = declaration.find(char::is_whitespace) else {
+        return Err(unsupported_trigger_body());
+    };
+    let name = SqlName::parse(declaration[..split].trim())?;
+    let type_source = declaration[split..].trim();
+    if type_source.is_empty() {
+        return Err(unsupported_trigger_body());
+    }
+    let (type_name, type_mod) = super::parser::parse_type_name(type_source, arena)?;
+    let Some(ctype) = ColType::from_sql_name(type_name) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            type_name
+        ));
+    };
+    if ctype.is_pseudo() {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "trigger local \"{}\" has pseudo-type {}",
+            name.as_str(),
+            type_name
+        ));
+    }
+    Ok(TriggerLocalDecl {
+        name,
+        ctype,
+        type_mod,
+        initial,
+    })
+}
+
+fn parse_trigger_select_into<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerSelectInto<'a>>, SqlError> {
+    if strip_trigger_keyword(statement, "select").is_none() {
+        return Ok(None);
+    }
+    let Some(into_at) = trigger_top_level_keyword(statement, "into") else {
+        return Ok(None);
+    };
+    let after_into = &statement[into_at + 4..];
+    let clause_at = [
+        "from", "where", "group", "having", "order", "limit", "offset", "fetch",
+    ]
+    .into_iter()
+    .filter_map(|keyword| trigger_top_level_keyword(after_into, keyword))
+    .min();
+    let (target_source, tail) = clause_at
+        .map(|at| (&after_into[..at], &after_into[at..]))
+        .unwrap_or((after_into, ""));
+    let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
+    let mut count = 0usize;
+    for target in target_source.split(',') {
+        if count == targets.len() || target.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        targets[count] = SqlName::parse(target.trim())?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(unsupported_trigger_body());
+    }
+    let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
+    use core::fmt::Write as _;
+    let _ = write!(source, "{} {}", statement[..into_at].trim_end(), tail);
+    if source.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger SELECT INTO exceeds the routine SQL limit"
+        ));
+    }
+    let source = arena.alloc_str(source.as_str()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger SELECT INTO exceeds the statement arena"
+        )
+    })?;
+    let query = super::parser::parse_query(source, arena)?;
+    let targets = arena.alloc_slice_copy(&targets[..count]).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger SELECT INTO targets exceed the statement arena"
+        )
+    })?;
+    Ok(Some(TriggerSelectInto {
+        query,
+        targets: &*targets,
+    }))
+}
+
+fn parse_trigger_perform<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "perform") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(unsupported_trigger_body());
+    }
+    if strip_trigger_keyword(body, "select").is_some() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "PERFORM takes a query body without SELECT"
+        ));
+    }
+    let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
+    use core::fmt::Write as _;
+    let _ = write!(source, "SELECT {}", body);
+    if source.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger PERFORM exceeds the routine SQL limit"
+        ));
+    }
+    let source = arena.alloc_str(source.as_str()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger PERFORM exceeds the statement arena"
+        )
+    })?;
+    Ok(Some(super::parser::parse_query(source, arena)?))
+}
+
 fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(source, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
@@ -6987,6 +7209,15 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
+    }
+    if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
+        return Ok(TriggerStatement::LocalAssign(assignment));
+    }
+    if let Some(select_into) = parse_trigger_select_into(segment, arena)? {
+        return Ok(TriggerStatement::SelectInto(select_into));
+    }
+    if let Some(query) = parse_trigger_perform(segment, arena)? {
+        return Ok(TriggerStatement::Perform(query));
     }
     if strip_trigger_keyword(segment, "insert").is_some()
         || strip_trigger_keyword(segment, "update").is_some()
@@ -7148,8 +7379,52 @@ fn parse_trigger_program<'a>(
     arena: &'a Arena,
 ) -> Result<TriggerProgram<'a>, SqlError> {
     let body = body.trim().strip_suffix(';').unwrap_or(body.trim()).trim();
-    let Some(body) = strip_trigger_keyword(body, "begin") else {
-        return Err(unsupported_trigger_body());
+    let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
+        let Some(begin_at) = trigger_top_level_keyword(declarations, "begin") else {
+            return Err(unsupported_trigger_body());
+        };
+        let declaration_source = declarations[..begin_at].trim();
+        let (segments, count) = split_trigger_statements(declaration_source)?;
+        let mut locals = [None; MAX_COLUMNS];
+        let mut local_count = 0usize;
+        for declaration in segments[..count].iter().filter_map(|segment| *segment) {
+            let local = parse_trigger_local(declaration, arena)?;
+            if locals[..local_count]
+                .iter()
+                .flatten()
+                .any(|prior: &TriggerLocalDecl<'_>| prior.name == local.name)
+            {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "duplicate declaration of trigger local \"{}\"",
+                    local.name.as_str()
+                ));
+            }
+            if local_count == locals.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger program has too many local variables"
+                ));
+            }
+            locals[local_count] = Some(local);
+            local_count += 1;
+        }
+        let locals = arena
+            .alloc_slice_with(local_count, |index| {
+                locals[index].expect("local initialized")
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger locals exceed the statement arena"
+                )
+            })?;
+        (&*locals, declarations[begin_at + 5..].trim())
+    } else {
+        (
+            &[][..],
+            strip_trigger_keyword(body, "begin").ok_or_else(unsupported_trigger_body)?,
+        )
     };
     let (segments, count) = split_trigger_statements(body)?;
     let mut at = 0;
@@ -7164,7 +7439,7 @@ fn parse_trigger_program<'a>(
     if !has_return {
         return Err(unsupported_trigger_body());
     }
-    Ok(TriggerProgram { body })
+    Ok(TriggerProgram { locals, body })
 }
 
 #[cfg(test)]
@@ -7231,6 +7506,76 @@ fn detached_trigger_row<'a>(
     Ok(row)
 }
 
+struct TriggerLocalScope<'t, 'a> {
+    locals: &'t [TriggerLocalDecl<'a>],
+    values: &'t [Datum<'a>],
+    transition: &'t TriggerTransition<'t, 't, 'a>,
+}
+
+impl<'a> TriggerLocalScope<'_, 'a> {
+    fn local_index(&self, name: &str) -> Option<usize> {
+        self.locals
+            .iter()
+            .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
+    }
+}
+
+impl<'a> ColumnLookup<'a> for TriggerLocalScope<'_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            return self.transition.lookup(qualifier, name);
+        }
+        if qualifier.is_none()
+            && let Some(index) = self.local_index(name)
+        {
+            return Ok(self.values[index]);
+        }
+        self.transition.lookup(qualifier, name)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            return self.transition.col_type(qualifier, name);
+        }
+        (qualifier.is_none())
+            .then(|| self.local_index(name))
+            .flatten()
+            .map(|index| self.locals[index].ctype)
+            .or_else(|| self.transition.col_type(qualifier, name))
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            return self.transition.collation(qualifier, name);
+        }
+        if qualifier.is_none() && self.local_index(name).is_some() {
+            crate::sql::ast::Collation::None
+        } else {
+            self.transition.collation(qualifier, name)
+        }
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            return self.transition.column_domain(qualifier, name);
+        }
+        if qualifier.is_none() && self.local_index(name).is_some() {
+            None
+        } else {
+            self.transition.column_domain(qualifier, name)
+        }
+    }
+}
+
+fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let encoded = encode_projected_pub(&[value], arena)?;
+    Ok(decode_projected_pub(encoded, 0))
+}
+
 struct TriggerExecContext<'s, 'a, 'b> {
     storage: &'s mut Storage,
     txn: &'s mut TxnState,
@@ -7243,6 +7588,50 @@ struct TriggerExecContext<'s, 'a, 'b> {
     scratch: *mut FixedVec<(u64, RowHome)>,
 }
 
+fn initialize_trigger_locals<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    definition: &TableDef,
+    old: Option<&[Datum<'a>]>,
+    new: Option<&[Datum<'a>]>,
+    locals: &[TriggerLocalDecl<'a>],
+    values: &mut [Datum<'a>; MAX_COLUMNS],
+) -> Result<(), SqlError> {
+    for (index, local) in locals.iter().enumerate() {
+        values[index] = Datum::Null;
+        let Some(initial) = local.initial else {
+            continue;
+        };
+        let transition = TriggerTransition {
+            definition,
+            old,
+            new,
+        };
+        let scope = TriggerLocalScope {
+            locals: &locals[..=index],
+            values: &values[..=index],
+            transition: &transition,
+        };
+        let value = eval_full(
+            initial,
+            context.arena,
+            crate::sql::eval::NO_PARAMS,
+            &scope,
+            &NO_HOOKS,
+        )?;
+        values[index] = apply_typmod(
+            cast_to(value, local.ctype, context.arena)?,
+            local.ctype,
+            local.type_mod,
+            context.arena,
+        )?;
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger block carries the complete typed firing context"
+)]
 fn execute_trigger_block<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     definition: &TableDef,
@@ -7250,6 +7639,8 @@ fn execute_trigger_block<'a>(
     new: &mut Option<&mut [Datum<'a>]>,
     before: bool,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    locals: &[TriggerLocalDecl<'a>],
+    local_values: &mut [Datum<'a>; MAX_COLUMNS],
     block: TriggerBlock<'a>,
 ) -> Result<Option<TriggerReturn>, SqlError> {
     for statement in block.statements {
@@ -7281,11 +7672,16 @@ fn execute_trigger_block<'a>(
                     old,
                     new: new.as_deref(),
                 };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
                 let value = eval_full(
                     assignment.expression,
                     context.arena,
                     crate::sql::eval::NO_PARAMS,
-                    &transition,
+                    &scope,
                     &NO_HOOKS,
                 )?;
                 let value = coerce(
@@ -7297,11 +7693,167 @@ fn execute_trigger_block<'a>(
                 )?;
                 new.as_deref_mut().expect("checked NEW image")[column] = value;
             }
+            TriggerStatement::LocalAssign(assignment) => {
+                let Some(index) = locals
+                    .iter()
+                    .position(|local| local.name == assignment.name)
+                else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "trigger local \"{}\" does not exist",
+                        assignment.name.as_str()
+                    ));
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
+                let local = locals[index];
+                local_values[index] = apply_typmod(
+                    cast_to(
+                        eval_full(
+                            assignment.expression,
+                            context.arena,
+                            crate::sql::eval::NO_PARAMS,
+                            &scope,
+                            &NO_HOOKS,
+                        )?,
+                        local.ctype,
+                        context.arena,
+                    )?,
+                    local.ctype,
+                    local.type_mod,
+                    context.arena,
+                )?;
+            }
+            TriggerStatement::SelectInto(statement) => {
+                let mut targets = [0usize; MAX_COLUMNS];
+                for (index, target) in statement.targets.iter().enumerate() {
+                    let Some(local) = locals.iter().position(|local| local.name == *target) else {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "trigger local \"{}\" does not exist",
+                            target.as_str()
+                        ));
+                    };
+                    targets[index] = local;
+                }
+                let query = match transition_relations {
+                    Some(relations) => super::query::bind_materialized_relations(
+                        statement.query,
+                        relations,
+                        context.storage,
+                        context.txn.txid,
+                        context.arena,
+                    )?,
+                    None => statement.query,
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
+                let sequence = crate::sql::sequence::SeqEval::new(
+                    context.storage,
+                    context.seq_session,
+                    context.txn.txid,
+                );
+                let mut selected = [Datum::Null; MAX_COLUMNS];
+                let mut found = false;
+                super::query::select_into_rows(
+                    context.storage,
+                    context.txn.txid,
+                    query,
+                    context.arena,
+                    crate::sql::eval::NO_PARAMS,
+                    Some(&scope),
+                    Some(&sequence),
+                    &mut |values| {
+                        if values.len() != statement.targets.len() {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "query returned {} columns but SELECT INTO expects {}",
+                                values.len(),
+                                statement.targets.len()
+                            ));
+                        }
+                        if !found {
+                            for (index, value) in values.iter().copied().enumerate() {
+                                selected[index] = detached_trigger_datum(value, context.arena)?;
+                            }
+                            found = true;
+                        }
+                        Ok(())
+                    },
+                )?;
+                for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
+                    let local = locals[target];
+                    local_values[target] = apply_typmod(
+                        cast_to(selected[index], local.ctype, context.arena)?,
+                        local.ctype,
+                        local.type_mod,
+                        context.arena,
+                    )?;
+                }
+            }
+            TriggerStatement::Perform(query) => {
+                let query = match transition_relations {
+                    Some(relations) => super::query::bind_materialized_relations(
+                        query,
+                        relations,
+                        context.storage,
+                        context.txn.txid,
+                        context.arena,
+                    )?,
+                    None => query,
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
+                let sequence = crate::sql::sequence::SeqEval::new(
+                    context.storage,
+                    context.seq_session,
+                    context.txn.txid,
+                );
+                super::query::select_into_rows(
+                    context.storage,
+                    context.txn.txid,
+                    query,
+                    context.arena,
+                    crate::sql::eval::NO_PARAMS,
+                    Some(&scope),
+                    Some(&sequence),
+                    &mut |_| Ok(()),
+                )?;
+            }
             TriggerStatement::Dml(TriggerDml::Insert(statement)) => {
                 let transition = TriggerTransition {
                     definition,
                     old,
                     new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
                 };
                 let scratch = unsafe { &mut *context.scratch };
                 context.txn.enter_trigger_sql()?;
@@ -7316,7 +7868,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(&transition),
+                        Some(&scope),
                         transition_relations,
                     )
                 });
@@ -7444,10 +7996,14 @@ fn execute_trigger_block<'a>(
                             condition,
                             context.arena,
                             crate::sql::eval::NO_PARAMS,
-                            &TriggerTransition {
-                                definition,
-                                old,
-                                new: new.as_deref(),
+                            &TriggerLocalScope {
+                                locals,
+                                values: &local_values[..locals.len()],
+                                transition: &TriggerTransition {
+                                    definition,
+                                    old,
+                                    new: new.as_deref(),
+                                },
                             },
                             &NO_HOOKS,
                         )? {
@@ -7469,6 +8025,8 @@ fn execute_trigger_block<'a>(
                             new,
                             before,
                             transition_relations,
+                            locals,
+                            local_values,
                             branch.block,
                         )? {
                             return Ok(Some(result));
@@ -7562,6 +8120,15 @@ fn fire_row_triggers<'a>(
             })?
         };
         let program = parse_trigger_program(source, context.arena)?;
+        let mut local_values = [Datum::Null; MAX_COLUMNS];
+        initialize_trigger_locals(
+            &context,
+            definition,
+            old,
+            new.as_deref(),
+            program.locals,
+            &mut local_values,
+        )?;
         match execute_trigger_block(
             &mut context,
             definition,
@@ -7569,6 +8136,8 @@ fn fire_row_triggers<'a>(
             &mut new,
             before,
             None,
+            program.locals,
+            &mut local_values,
             program.body,
         )? {
             Some(result) => match result {
@@ -7787,6 +8356,15 @@ fn fire_statement_triggers_with_rows<'a>(
             })
             .map_err(|_| super::query::arena_full_pub())?;
         let mut no_new = None;
+        let mut local_values = [Datum::Null; MAX_COLUMNS];
+        initialize_trigger_locals(
+            &context,
+            definition,
+            None,
+            None,
+            program.locals,
+            &mut local_values,
+        )?;
         if execute_trigger_block(
             &mut context,
             definition,
@@ -7794,6 +8372,8 @@ fn fire_statement_triggers_with_rows<'a>(
             &mut no_new,
             before,
             (!relations.is_empty()).then_some(&*relations),
+            program.locals,
+            &mut local_values,
             program.body,
         )?
         .is_none()

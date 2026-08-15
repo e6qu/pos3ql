@@ -1489,6 +1489,38 @@ def test_transition_tables_over_raw_simple_query():
     s.close()
 
 
+def test_typed_trigger_query_program_over_raw_simple_query():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_local_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_local_source (id integer PRIMARY KEY, delta integer); "
+        "CREATE TABLE wire_local_audit (value integer); "
+        "INSERT INTO wire_local_target VALUES (1, 5); "
+        "INSERT INTO wire_local_source VALUES (1, 3); "
+        "CREATE FUNCTION wire_local_program() RETURNS trigger LANGUAGE plpgsql AS "
+        "'DECLARE change integer := NEW.value - OLD.value; selected_delta integer; "
+        "BEGIN SELECT source.delta INTO selected_delta FROM wire_local_source source "
+        "WHERE source.id = NEW.id; selected_delta := selected_delta + 1; "
+        "PERFORM 1 FROM wire_local_source source WHERE source.id = NEW.id "
+        "AND selected_delta = source.delta + 1; "
+        "INSERT INTO wire_local_audit VALUES (selected_delta); "
+        "NEW.value := NEW.value + change + selected_delta; RETURN NEW; END'; "
+        "CREATE TRIGGER wire_local_before BEFORE UPDATE ON wire_local_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_local_program(); "
+        "UPDATE wire_local_target SET value = 7 WHERE id = 1",
+    )
+    check("raw wire: typed trigger query program setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: typed trigger query program updates NEW and local audit",
+        first_text_row(simple_query(s, "SELECT value FROM wire_local_target")) == "13"
+        and first_text_row(simple_query(s, "SELECT value FROM wire_local_audit")) == "4",
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

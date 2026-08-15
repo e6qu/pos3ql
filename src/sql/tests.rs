@@ -8402,6 +8402,125 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
 }
 
 #[test]
+fn trigger_program_locals_select_into_and_perform_are_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_query_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_query_source (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE trigger_query_audit (value integer);
+         INSERT INTO trigger_query_target VALUES (1, 5);
+         INSERT INTO trigger_query_source VALUES (1, 3);
+         CREATE FUNCTION trigger_query_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE change integer := NEW.value - OLD.value;
+                    selected_id integer;
+                    selected_delta integer;
+            BEGIN
+              SELECT source.id, source.delta INTO selected_id, selected_delta
+                FROM trigger_query_source source
+              WHERE source.id = NEW.id;
+              selected_delta := selected_delta + selected_id + 1;
+              INSERT INTO trigger_query_audit VALUES (selected_delta);
+              PERFORM 1 FROM trigger_query_source source
+               WHERE source.id = NEW.id AND selected_delta = source.delta + selected_id + 1;
+              NEW.value := NEW.value + change + selected_delta;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_query_before BEFORE UPDATE ON trigger_query_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_query_program();
+         UPDATE trigger_query_target SET value = 7 WHERE id = 1;
+         SELECT value FROM trigger_query_target;
+         SELECT value FROM trigger_query_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["14", "5"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_locals_defaults_and_empty_select_into_are_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_local_default_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_local_default_audit (value integer);
+         INSERT INTO trigger_local_default_target VALUES (1, 10);
+         CREATE FUNCTION trigger_local_default_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE seeded integer DEFAULT 2;
+                    increment integer = seeded + 3;
+                    missing integer := 99;
+            BEGIN
+              SELECT value INTO missing FROM trigger_local_default_target WHERE id = 0;
+              IF missing IS NULL THEN
+                missing := increment;
+              END IF;
+              INSERT INTO trigger_local_default_audit VALUES (missing);
+              NEW.value := NEW.value + increment + missing;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_local_default_before BEFORE UPDATE ON trigger_local_default_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_local_default_program();
+         UPDATE trigger_local_default_target SET value = 11 WHERE id = 1;
+         SELECT value FROM trigger_local_default_target;
+         SELECT value FROM trigger_local_default_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["21", "5"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_bad_perform() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN PERFORM SELECT 1; RETURN NEW; END'",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
+fn statement_trigger_select_into_reads_typed_transition_relations() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_transition_query_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_transition_query_audit (changed integer);
+         INSERT INTO trigger_transition_query_target VALUES (1, 2), (2, 3);
+         CREATE FUNCTION trigger_transition_query_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE changed_count integer;
+            BEGIN
+              SELECT count(*) INTO changed_count FROM changed_rows;
+              PERFORM 1 FROM changed_rows WHERE value > 0;
+              INSERT INTO trigger_transition_query_audit VALUES (changed_count);
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_transition_query_after AFTER UPDATE ON trigger_transition_query_target
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_transition_query_program();
+         UPDATE trigger_transition_query_target SET value = value + 1;
+         SELECT changed FROM trigger_transition_query_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_when_and_update_of_are_typed_and_selective() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -8608,7 +8727,13 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
         "CREATE TABLE durable_transition_target (id integer PRIMARY KEY);
          CREATE TABLE durable_transition_audit (id integer);
          CREATE FUNCTION durable_transition_rows() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO durable_transition_audit SELECT id FROM inserted_rows; RETURN NULL; END';
+           'DECLARE inserted_count integer;
+            BEGIN
+              SELECT count(*) INTO inserted_count FROM inserted_rows;
+              PERFORM 1 FROM inserted_rows;
+              INSERT INTO durable_transition_audit VALUES (inserted_count);
+              RETURN NULL;
+            END';
          CREATE TRIGGER durable_transition_insert AFTER INSERT ON durable_transition_target
            REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT
            EXECUTE FUNCTION durable_transition_rows();",
@@ -8628,7 +8753,7 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1", "2", "|inserted_rows"],
+        ["2", "|inserted_rows"],
         "{}",
         String::from_utf8_lossy(&output)
     );

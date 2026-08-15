@@ -65,6 +65,31 @@ statement ok
 DROP FUNCTION slt_transition_insert()
 
 statement ok
+CREATE TABLE slt_trigger_numeric_loop_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE FUNCTION slt_trigger_numeric_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+'DECLARE item integer; total integer := 0; BEGIN FOR item IN REVERSE 5..1 BY 2 LOOP CONTINUE WHEN item = 3; total := total + item; EXIT WHEN item = 1; END LOOP; NEW.value := NEW.value + total; RETURN NEW; END'
+
+statement ok
+CREATE TRIGGER slt_trigger_numeric_loop_before BEFORE INSERT ON slt_trigger_numeric_loop_target
+FOR EACH ROW EXECUTE FUNCTION slt_trigger_numeric_loop_program()
+
+statement ok
+INSERT INTO slt_trigger_numeric_loop_target VALUES (1, 10)
+
+query II
+SELECT id, value FROM slt_trigger_numeric_loop_target
+----
+1 16
+
+statement ok
+DROP TABLE slt_trigger_numeric_loop_target
+
+statement ok
+DROP FUNCTION slt_trigger_numeric_loop_program()
+
+statement ok
 CREATE TABLE slt_local_query_target (id integer PRIMARY KEY, value integer)
 
 statement ok
@@ -97,6 +122,41 @@ DROP TABLE slt_local_query_audit
 
 statement ok
 DROP FUNCTION slt_local_query_program()
+
+statement ok
+CREATE TABLE slt_trigger_query_loop_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE TABLE slt_trigger_query_loop_audit (value integer)
+
+statement ok
+CREATE FUNCTION slt_trigger_query_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+'DECLARE item integer; BEGIN FOR item IN SELECT value FROM changed_rows ORDER BY value LOOP CONTINUE WHEN item = 2; INSERT INTO slt_trigger_query_loop_audit VALUES (item); EXIT WHEN item = 3; END LOOP; RETURN NULL; END'
+
+statement ok
+CREATE TRIGGER slt_trigger_query_loop_after AFTER UPDATE ON slt_trigger_query_loop_target
+REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_trigger_query_loop_program()
+
+statement ok
+INSERT INTO slt_trigger_query_loop_target VALUES (1, 1), (2, 2), (3, 3), (4, 4)
+
+statement ok
+UPDATE slt_trigger_query_loop_target SET value = value
+
+query I rowsort
+SELECT value FROM slt_trigger_query_loop_audit
+----
+1
+3
+
+statement ok
+DROP TABLE slt_trigger_query_loop_target
+
+statement ok
+DROP TABLE slt_trigger_query_loop_audit
+
+statement ok
+DROP FUNCTION slt_trigger_query_loop_program()
 
 statement ok
 CREATE TABLE slt_transition_dml_driver (id integer PRIMARY KEY, delta integer)

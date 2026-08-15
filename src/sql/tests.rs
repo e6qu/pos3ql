@@ -8490,6 +8490,159 @@ fn trigger_program_locals_defaults_and_empty_select_into_are_typed() {
 }
 
 #[test]
+fn trigger_program_numeric_for_loop_propagates_exit_and_continue() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_for_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer;
+                    total integer := 0;
+            BEGIN
+              FOR item IN 1..5 LOOP
+                IF item = 3 THEN
+                  CONTINUE;
+                END IF;
+                total := total + item;
+                EXIT WHEN item = 4;
+              END LOOP;
+              NEW.value := NEW.value + total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_for_before BEFORE INSERT ON trigger_for_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_for_program();
+         INSERT INTO trigger_for_target VALUES (1, 10);
+         SELECT value FROM trigger_for_target;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["17"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let reverse = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_reverse_for_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_reverse_for_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer;
+                    total integer := 0;
+            BEGIN
+              FOR item IN REVERSE 5..1 BY 2 LOOP
+                total := total * 10 + item;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_reverse_for_before BEFORE INSERT ON trigger_reverse_for_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_reverse_for_program();
+         INSERT INTO trigger_reverse_for_target VALUES (1, 0);
+         SELECT value FROM trigger_reverse_for_target;",
+    );
+    assert_eq!(
+        data_rows(&reverse),
+        ["531"],
+        "{}",
+        String::from_utf8_lossy(&reverse)
+    );
+}
+
+#[test]
+fn statement_trigger_for_query_materializes_transition_rows_before_dml() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_transition_driver (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_for_transition_audit (value integer);
+         CREATE FUNCTION trigger_for_transition_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer;
+            BEGIN
+              FOR item IN SELECT value FROM changed_rows ORDER BY value LOOP
+                CONTINUE WHEN item = 2;
+                INSERT INTO trigger_for_transition_audit VALUES (item);
+                EXIT WHEN item = 3;
+              END LOOP;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_for_transition_after AFTER UPDATE ON trigger_for_transition_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_for_transition_program();
+         INSERT INTO trigger_for_transition_driver VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+         UPDATE trigger_for_transition_driver SET value = value;
+         SELECT value FROM trigger_for_transition_audit ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "3"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_for_loop_validates_control_and_query_shape() {
+    let (mut engine, mut budget) = test_engine();
+    let exit_outside_loop = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_exit_outside_loop() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN EXIT; RETURN NEW; END'",
+    );
+    assert!(
+        String::from_utf8_lossy(&exit_outside_loop).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&exit_outside_loop)
+    );
+
+    let wrong_width = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_width_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_for_width_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer;
+            BEGIN
+              FOR item IN SELECT NEW.id, NEW.value LOOP
+                PERFORM item;
+              END LOOP;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_for_width_before BEFORE INSERT ON trigger_for_width_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_for_width_program();
+         INSERT INTO trigger_for_width_target VALUES (1, 2);",
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_width).contains("FOR query must return exactly one column"),
+        "{}",
+        String::from_utf8_lossy(&wrong_width)
+    );
+
+    let nonpositive_step = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_step_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_for_step_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer;
+            BEGIN
+              FOR item IN 1..3 BY 0 LOOP
+                NEW.value := item;
+              END LOOP;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_for_step_before BEFORE INSERT ON trigger_for_step_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_for_step_program();
+         INSERT INTO trigger_for_step_target VALUES (1, 2);",
+    );
+    assert!(
+        String::from_utf8_lossy(&nonpositive_step).contains("22023"),
+        "{}",
+        String::from_utf8_lossy(&nonpositive_step)
+    );
+}
+
+#[test]
 fn statement_trigger_select_into_reads_typed_transition_relations() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -9035,8 +9188,14 @@ fn transition_dml_scope_survives_checkpoint_and_recovery() {
         &mut budget,
         "CREATE TABLE durable_transition_dml_driver (id integer PRIMARY KEY, delta integer);
          CREATE TABLE durable_transition_dml_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE durable_transition_dml_audit (value integer);
          CREATE FUNCTION durable_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN
+           'DECLARE item integer;
+            BEGIN
+              FOR item IN SELECT delta FROM changed_rows ORDER BY delta LOOP
+                CONTINUE WHEN item = 9;
+                INSERT INTO durable_transition_dml_audit VALUES (item);
+              END LOOP;
               UPDATE durable_transition_dml_target
                  SET value = durable_transition_dml_target.value + changed_rows.delta
                 FROM changed_rows
@@ -9067,11 +9226,12 @@ fn transition_dml_scope_survives_checkpoint_and_recovery() {
         &mut restarted,
         &mut restarted_budget,
         "UPDATE durable_transition_dml_driver SET delta = delta;
-         SELECT id, value FROM durable_transition_dml_target ORDER BY id;",
+         SELECT id, value FROM durable_transition_dml_target ORDER BY id;
+         SELECT value FROM durable_transition_dml_audit ORDER BY value;",
     );
     assert_eq!(
         data_rows(&output),
-        ["1|13"],
+        ["1|13", "3"],
         "{}",
         String::from_utf8_lossy(&output)
     );

@@ -8521,6 +8521,83 @@ fn statement_trigger_select_into_reads_typed_transition_relations() {
 }
 
 #[test]
+fn statement_trigger_dml_binds_transition_relations_for_update_and_delete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_transition_dml_driver (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE trigger_transition_dml_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_transition_dml_driver VALUES (1, 3), (2, 9);
+         INSERT INTO trigger_transition_dml_target VALUES (1, 10), (2, 20);
+         CREATE FUNCTION trigger_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE trigger_transition_dml_target
+                 SET value = trigger_transition_dml_target.value + changed_rows.delta
+                FROM changed_rows
+               WHERE trigger_transition_dml_target.id = changed_rows.id;
+              DELETE FROM trigger_transition_dml_target
+                USING changed_rows
+               WHERE trigger_transition_dml_target.id = changed_rows.id
+                 AND changed_rows.delta = 9;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_transition_dml_after AFTER UPDATE ON trigger_transition_dml_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_transition_dml_program();
+         UPDATE trigger_transition_dml_driver SET delta = delta;
+         SELECT id, value FROM trigger_transition_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|13"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_locals_scope_joined_update_and_delete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_local_dml_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_local_dml_source (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE trigger_local_dml_driver (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_local_dml_target VALUES (1, 10), (2, 20);
+         INSERT INTO trigger_local_dml_source VALUES (1, 3), (2, 4);
+         INSERT INTO trigger_local_dml_driver VALUES (1, 5);
+         CREATE FUNCTION trigger_local_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              UPDATE trigger_local_dml_target
+                 SET value = trigger_local_dml_target.value + trigger_local_dml_source.delta + step
+                FROM trigger_local_dml_source
+               WHERE trigger_local_dml_target.id = trigger_local_dml_source.id
+                 AND trigger_local_dml_source.id = NEW.id
+                 AND step = 2;
+              DELETE FROM trigger_local_dml_target
+                    USING trigger_local_dml_source
+               WHERE trigger_local_dml_target.id = trigger_local_dml_source.id
+                 AND trigger_local_dml_source.id = 2
+                 AND step = 2;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_local_dml_after AFTER UPDATE ON trigger_local_dml_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_local_dml_program();
+         UPDATE trigger_local_dml_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_local_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|15"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_when_and_update_of_are_typed_and_selective() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

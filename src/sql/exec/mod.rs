@@ -6551,6 +6551,8 @@ enum TriggerDml<'a> {
     Delete(Delete<'a>),
 }
 
+static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
+
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
     Assign(TriggerAssignment<'a>),
@@ -6658,14 +6660,16 @@ where
 
 struct TriggerDmlScope<'t, 'r, 'v, 'd> {
     row: &'r RowCtx<'r, 'v, 'd>,
-    transition: &'t dyn ColumnLookup<'v>,
+    outer: &'t dyn ColumnLookup<'v>,
 }
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.lookup(qualifier, name)
+            self.outer.lookup(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.lookup(None, name)
         } else {
             self.row.lookup(qualifier, name)
         }
@@ -6674,7 +6678,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.col_type(qualifier, name)
+            self.outer.col_type(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.col_type(None, name)
         } else {
             self.row.col_type(qualifier, name)
         }
@@ -6683,7 +6689,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.collation(qualifier, name)
+            self.outer.collation(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.collation(None, name)
         } else {
             self.row.collation(qualifier, name)
         }
@@ -6692,7 +6700,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.column_domain(qualifier, name)
+            self.outer.column_domain(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.column_domain(None, name)
         } else {
             self.row.column_domain(qualifier, name)
         }
@@ -6703,21 +6713,23 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
 /// trigger's transition images. The transition implementation can be
 /// reborrowed for this probe, so no storage-backed datum crosses into the
 /// subsequent mutable DML phase.
-struct JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv> {
+struct JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'v> {
     row: &'r RowCtx<'rs, 'rv, 'rd>,
-    transition: &'t TriggerTransition<'td, 'ts, 'tv>,
+    outer: &'t dyn ColumnLookup<'v>,
 }
 
-impl<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv, 'value> ColumnLookup<'value>
-    for JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv>
+impl<'t, 'r, 'rd, 'rs, 'rv, 'v, 'value> ColumnLookup<'value>
+    for JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'v>
 where
     'rv: 'value,
-    'tv: 'value,
+    'v: 'value,
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.lookup(qualifier, name)
+            self.outer.lookup(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.lookup(None, name)
         } else {
             self.row.lookup(qualifier, name)
         }
@@ -6726,7 +6738,9 @@ where
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.col_type(qualifier, name)
+            self.outer.col_type(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.col_type(None, name)
         } else {
             self.row.col_type(qualifier, name)
         }
@@ -6735,7 +6749,9 @@ where
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.collation(qualifier, name)
+            self.outer.collation(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.collation(None, name)
         } else {
             self.row.collation(qualifier, name)
         }
@@ -6744,7 +6760,9 @@ where
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.column_domain(qualifier, name)
+            self.outer.column_domain(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.column_domain(None, name)
         } else {
             self.row.column_domain(qualifier, name)
         }
@@ -7885,6 +7903,33 @@ fn execute_trigger_block<'a>(
                 }
             }
             TriggerStatement::Dml(TriggerDml::Update(statement)) => {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Update(statement))
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "trigger UPDATE expansion exceeds the statement arena"
+                                )
+                            })?;
+                        let super::ast::Stmt::Update(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                                crate::sql::eval::NO_PARAMS,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("UPDATE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 let saved = context
                     .arena
@@ -7901,6 +7946,11 @@ fn execute_trigger_block<'a>(
                     old,
                     new: new.as_deref(),
                 };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
                 let outcome = context.responder.without_command_complete(|responder| {
                     update(
                         context.storage,
@@ -7912,7 +7962,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(transition),
+                        Some(&scope),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -7937,6 +7987,33 @@ fn execute_trigger_block<'a>(
                 }
             }
             TriggerStatement::Dml(TriggerDml::Delete(statement)) => {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Delete(statement))
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "trigger DELETE expansion exceeds the statement arena"
+                                )
+                            })?;
+                        let super::ast::Stmt::Delete(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                                crate::sql::eval::NO_PARAMS,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("DELETE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 let saved = context
                     .arena
@@ -7953,6 +8030,11 @@ fn execute_trigger_block<'a>(
                     old,
                     new: new.as_deref(),
                 };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
                 let outcome = context.responder.without_command_complete(|responder| {
                     delete(
                         context.storage,
@@ -7964,7 +8046,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(transition),
+                        Some(&scope),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -16789,7 +16871,7 @@ fn finish_insert_row<'a>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn insert<'a>(
+pub fn insert<'a, 'scope>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowHome)>,
@@ -16799,11 +16881,10 @@ pub fn insert<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<&dyn ColumnLookup<'a>>,
+    transition: Option<&'scope dyn ColumnLookup<'a>>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
 ) -> Outcome {
-    let no_columns = NoColumns;
-    let value_scope: &dyn ColumnLookup<'a> = transition.unwrap_or(&no_columns);
+    let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -17549,11 +17630,9 @@ pub(crate) fn update<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<TriggerTransition<'_, '_, 'a>>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
-    let transition_lookup = transition
-        .as_ref()
-        .map(|transition| transition as &dyn ColumnLookup<'a>);
+    let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -17658,7 +17737,7 @@ pub(crate) fn update<'a>(
         sequences: None,
     };
     let collect = if let Some(from) = statement.from {
-        if let Some(transition) = transition.as_ref() {
+        if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
@@ -17671,7 +17750,7 @@ pub(crate) fn update<'a>(
                 params,
                 txn.txid,
                 scratch,
-                transition,
+                outer,
             )
         } else {
             collect_join_matches(
@@ -17700,7 +17779,7 @@ pub(crate) fn update<'a>(
             params,
             &hooks,
             scratch,
-            transition_lookup,
+            outer_lookup,
         )
     };
     if let Err(e) = collect {
@@ -17827,9 +17906,9 @@ pub(crate) fn update<'a>(
                     sequences: Some(&sequences),
                     ..super::eval::NO_HOOKS
                 };
-                let joined_scope = transition.as_ref().map(|transition| JoinedTriggerDmlScope {
+                let joined_scope = outer.map(|outer| JoinedTriggerDmlScope {
                     row: &context,
-                    transition,
+                    outer,
                 });
                 let joined_target: &dyn ColumnLookup<'_> = joined_scope
                     .as_ref()
@@ -17906,10 +17985,10 @@ pub(crate) fn update<'a>(
                         };
                         continue;
                     }
-                    let value = if let Some(transition) = transition_lookup {
+                    let value = if let Some(outer) = outer_lookup {
                         let scope = TriggerDmlScope {
                             row: &context,
-                            transition,
+                            outer,
                         };
                         super::eval::eval_full(expression, arena, params, &scope, &hooks)
                     } else {
@@ -18161,11 +18240,9 @@ pub(crate) fn delete<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<TriggerTransition<'_, '_, 'a>>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
-    let transition_lookup = transition
-        .as_ref()
-        .map(|transition| transition as &dyn ColumnLookup<'a>);
+    let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -18230,7 +18307,7 @@ pub(crate) fn delete<'a>(
         sequences: None,
     };
     let collect = if let Some(using) = statement.using {
-        if let Some(transition) = transition.as_ref() {
+        if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
@@ -18243,7 +18320,7 @@ pub(crate) fn delete<'a>(
                 params,
                 txn.txid,
                 scratch,
-                transition,
+                outer,
             )
         } else {
             collect_join_matches(
@@ -18272,7 +18349,7 @@ pub(crate) fn delete<'a>(
             params,
             &hooks,
             scratch,
-            transition_lookup,
+            outer_lookup,
         )
     };
     if let Err(e) = collect {
@@ -20315,7 +20392,7 @@ fn row_matches_values<'a>(
     let value = if let Some(transition) = transition {
         let scope = TriggerDmlScope {
             row: &context,
-            transition,
+            outer: transition,
         };
         super::eval::eval_full(w, arena, params, &scope, hooks)?
     } else {
@@ -20460,7 +20537,7 @@ fn collect_join_matches_with_transition<'a>(
     params: &[Datum<'a>],
     txid: u32,
     scratch: &mut FixedVec<(u64, RowHome)>,
-    transition: &TriggerTransition<'_, '_, 'a>,
+    outer: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
     scratch.clear();
     storage.record_serializable_read(txid, table_index);
@@ -20479,7 +20556,7 @@ fn collect_join_matches_with_transition<'a>(
             };
             let scope = JoinedTriggerDmlScope {
                 row: &context,
-                transition,
+                outer,
             };
             super::query::first_from_match(
                 storage,

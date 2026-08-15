@@ -428,7 +428,8 @@ pub(crate) enum WalOp<'a> {
         function_schema: &'a str,
         function: &'a str,
         timing: u8,
-        events: u8,
+        level: crate::sql::ast::TriggerLevel,
+        events: crate::sql::ast::TriggerEvents,
         update_columns: u64,
         when: Option<&'a str>,
     },
@@ -1531,7 +1532,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + function_schema.len()
                 + 1
                 + function.len()
-                + 12
+                + 13
                 + when.map_or(0, str::len)
         }
         WalOp::DropTrigger {
@@ -2502,6 +2503,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             function_schema,
             function,
             timing,
+            level,
             events,
             update_columns,
             when,
@@ -2512,7 +2514,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, function_schema)
                 && name_bytes(buffer, function)
-                && buffer.append(&[*timing, *events])
+                && buffer.append(&[*timing, level.code(), events.bits()])
                 && buffer.append(&update_columns.to_le_bytes())
                 && u16::try_from(when_len)
                     .ok()
@@ -3316,8 +3318,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let function_schema = take_name(&mut at)?;
             let function = take_name(&mut at)?;
             let timing = *payload.get(at)?;
-            let events = *payload.get(at + 1)?;
-            at += 2;
+            let level = crate::sql::ast::TriggerLevel::from_code(*payload.get(at + 1)?)?;
+            let events = crate::sql::ast::TriggerEvents::from_bits(*payload.get(at + 2)?)?;
+            at += 3;
             let update_columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             let when_len =
                 u16::from_le_bytes(payload.get(at + 8..at + 10)?.try_into().ok()?) as usize;
@@ -3330,13 +3333,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += length;
                 Some(value)
             };
-            (timing <= 1 && events != 0 && at == payload.len()).then_some(WalOp::CreateTrigger {
+            (timing <= 1
+                && (matches!(level, crate::sql::ast::TriggerLevel::Statement)
+                    || !events.has_truncate())
+                && at == payload.len())
+            .then_some(WalOp::CreateTrigger {
                 name,
                 table_schema,
                 table,
                 function_schema,
                 function,
                 timing,
+                level,
                 events,
                 update_columns,
                 when,
@@ -5000,7 +5008,8 @@ mod tests {
                 function_schema: "public",
                 function: "audit_order",
                 timing: 0,
-                events: 1,
+                level: crate::sql::ast::TriggerLevel::Row,
+                events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
                 update_columns: 0,
                 when: None,
             },
@@ -5221,7 +5230,8 @@ mod tests {
                     function_schema: "public",
                     function: "audit_order",
                     timing: 0,
-                    events: 3,
+                    level: crate::sql::ast::TriggerLevel::Row,
+                    events: crate::sql::ast::TriggerEvents::from_bits(3).unwrap(),
                     update_columns: 3,
                     when: Some("NEW.total > OLD.total"),
                 },

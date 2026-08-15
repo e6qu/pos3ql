@@ -3803,7 +3803,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
                     howner.as_str(),
                     hname.as_str(),
@@ -3812,7 +3812,8 @@ impl Checkpointer {
                     hfunction_schema.as_str(),
                     hfunction.as_str(),
                     trigger.timing,
-                    trigger.events,
+                    trigger.level.code(),
+                    trigger.events.bits(),
                     trigger.update_columns,
                     if trigger.when.is_some() {
                         hwhen.as_str()
@@ -5111,7 +5112,12 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             .ok_or(CheckpointSetupError::Corrupt("trigger function"))?,
     )?;
     let timing: u8 = parse_field(words.next(), "trigger timing")?;
-    let events: u8 = parse_field(words.next(), "trigger events")?;
+    let level =
+        crate::sql::ast::TriggerLevel::from_code(parse_field(words.next(), "trigger level")?)
+            .ok_or(CheckpointSetupError::Corrupt("trigger level"))?;
+    let events =
+        crate::sql::ast::TriggerEvents::from_bits(parse_field(words.next(), "trigger events")?)
+            .ok_or(CheckpointSetupError::Corrupt("trigger events"))?;
     let update_columns: u64 = parse_field(words.next(), "trigger update columns")?;
     let when = match words
         .next()
@@ -5132,7 +5138,10 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         1 => true,
         _ => return Err(CheckpointSetupError::Corrupt("trigger enabled")),
     };
-    if timing > 1 || events == 0 || words.next().is_some() {
+    if timing > 1
+        || (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
+        || words.next().is_some()
+    {
         return Err(CheckpointSetupError::Corrupt("malformed trigger record"));
     }
     let owner = storage
@@ -5169,6 +5178,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 table,
                 function,
                 timing,
+                level,
                 events,
                 update_columns,
                 when,

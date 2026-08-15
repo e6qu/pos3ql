@@ -154,9 +154,7 @@ impl<'a> Parser<'a> {
         self.create_table()
     }
 
-    /// CREATE TRIGGER for the row-level lifecycle this engine can execute
-    /// durably.  Forms whose execution model needs statement transition tables,
-    /// deferred constraint scheduling, or view rewriting are refused here.
+    /// CREATE TRIGGER forms with a complete durable execution model.
     fn create_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.col_ident("trigger name")?;
         let timing = if self.eat_ident("before")? {
@@ -169,7 +167,7 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF for CREATE TRIGGER"));
         };
-        let mut events = [TriggerEvent::Insert; 3];
+        let mut events = [TriggerEvent::Insert; 4];
         let mut event_count = 0usize;
         let mut update_columns = [""; MAX_LIST];
         let mut update_column_count = 0usize;
@@ -193,7 +191,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("delete")? {
                 TriggerEvent::Delete
             } else if self.eat_ident("truncate")? {
-                return Err(self.err_here("TRUNCATE triggers are not supported"));
+                TriggerEvent::Truncate
             } else {
                 return Err(self
                     .err_here("expected INSERT, UPDATE, DELETE, or TRUNCATE for CREATE TRIGGER"));
@@ -209,12 +207,21 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("on")?;
         let table = self.qual_name("trigger table")?;
-        if self.eat_ident("for")? {
+        let level = if self.eat_ident("for")? {
             let _ = self.eat_ident("each")?;
             if self.eat_ident("statement")? {
-                return Err(self.err_here("statement triggers are not supported"));
+                crate::sql::ast::TriggerLevel::Statement
+            } else {
+                self.expect_ident("row")?;
+                crate::sql::ast::TriggerLevel::Row
             }
-            self.expect_ident("row")?;
+        } else {
+            crate::sql::ast::TriggerLevel::Statement
+        };
+        if matches!(level, crate::sql::ast::TriggerLevel::Row)
+            && events[..event_count].contains(&TriggerEvent::Truncate)
+        {
+            return Err(self.err_here("TRUNCATE triggers must be FOR EACH STATEMENT"));
         }
         let when = self
             .eat_ident("when")?
@@ -244,6 +251,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateTrigger(CreateTrigger {
             name,
             timing,
+            level,
             events: self.arena_slice(&events[..event_count])?,
             update_columns: self.arena_slice(&update_columns[..update_column_count])?,
             table,

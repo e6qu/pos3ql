@@ -2343,7 +2343,8 @@ pub(crate) struct TriggerDef {
     pub(crate) table: u16,
     pub(crate) function: u16,
     pub(crate) timing: u8,
-    pub(crate) events: u8,
+    pub(crate) level: crate::sql::ast::TriggerLevel,
+    pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) enabled: bool,
@@ -2376,7 +2377,8 @@ pub(crate) struct TriggerSpec {
     pub(crate) table: usize,
     pub(crate) function: usize,
     pub(crate) timing: u8,
-    pub(crate) events: u8,
+    pub(crate) level: crate::sql::ast::TriggerLevel,
+    pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
 }
@@ -2403,7 +2405,8 @@ impl TriggerDef {
         table: u16::MAX,
         function: u16::MAX,
         timing: 0,
-        events: 0,
+        level: crate::sql::ast::TriggerLevel::Row,
+        events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
         update_columns: 0,
         when: None,
         enabled: false,
@@ -13369,7 +13372,10 @@ impl Storage {
         spec: TriggerSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if spec.events == 0 || spec.timing > 1 {
+        if spec.timing > 1
+            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
+                && spec.events.has_truncate())
+        {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid trigger definition"
@@ -13413,6 +13419,7 @@ impl Storage {
                 )
             })?,
             timing: spec.timing,
+            level: spec.level,
             events: spec.events,
             update_columns: spec.update_columns,
             when: spec.when,
@@ -13521,6 +13528,7 @@ impl Storage {
                 )
             })?,
             timing: spec.timing,
+            level: spec.level,
             events: spec.events,
             update_columns: spec.update_columns,
             when: spec.when,

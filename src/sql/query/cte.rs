@@ -150,6 +150,7 @@ pub fn expand_ctes_exec<'a>(
         arena,
         params,
         dml_mats,
+        &[],
         |context| subst_select(sel, context, arena),
     )
 }
@@ -191,6 +192,34 @@ pub fn expand_dml_ctes<'a>(
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
 ) -> Result<&'a Stmt<'a>, SqlError> {
+    expand_dml_ctes_with_relations(statement, with, storage, txid, arena, params, dml_mats, &[])
+}
+
+/// Binds executor-owned relations into a data-modifying statement. Unlike a
+/// data-modifying CTE result, these relations are visible directly to the
+/// statement's `FROM` or `USING` clause.
+pub(crate) fn bind_dml_materialized_relations<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    relations: &[(&'a str, &'a MaterializedCte<'a>)],
+) -> Result<&'a Stmt<'a>, SqlError> {
+    expand_dml_ctes_with_relations(statement, &[], storage, txid, arena, params, &[], relations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_dml_ctes_with_relations<'a>(
+    statement: &'a Stmt<'a>,
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    relations: &[(&'a str, &'a MaterializedCte<'a>)],
+) -> Result<&'a Stmt<'a>, SqlError> {
     let placeholder = match statement {
         Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
         _ => &EMPTY_SELECT,
@@ -203,6 +232,7 @@ pub fn expand_dml_ctes<'a>(
         arena,
         params,
         dml_mats,
+        relations,
         |context| {
             let expanded = match statement {
                 Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
@@ -371,6 +401,7 @@ fn with_exec_context<'a, 's, R>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    relations: &[(&'a str, &'a MaterializedCte<'a>)],
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
     if with.len() > crate::sql::parser::MAX_CTES {
@@ -385,6 +416,21 @@ fn with_exec_context<'a, 's, R>(
     let mut materialized: [(&'a str, &'a MaterializedCte<'a>); crate::sql::parser::MAX_CTES] =
         [("", &EMPTY_CTE); crate::sql::parser::MAX_CTES];
     let mut nm = 0;
+    for &(name, relation) in relations {
+        if nm == materialized.len()
+            || materialized[..nm]
+                .iter()
+                .any(|(existing, _)| *existing == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "WITH query name \"{}\" specified more than once",
+                name
+            ));
+        }
+        materialized[nm] = (name, relation);
+        nm += 1;
+    }
     for cte in with {
         if resolved[..n].iter().any(|(name, _, _)| *name == cte.name)
             || materialized[..nm].iter().any(|(name, _)| *name == cte.name)

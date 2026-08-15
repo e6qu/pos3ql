@@ -1200,21 +1200,38 @@ fn find_conflict<'a>(
 }
 
 /// Column lookup for ON CONFLICT DO UPDATE: `excluded.<col>` resolves to the
-/// row proposed by INSERT; every other reference resolves to the existing
-/// (conflicting) row.
-struct ExcludedCtx<'s, 'v, 'd> {
-    def: &'d TableDef,
-    existing: &'s [Datum<'v>],
-    excluded: &'s [Datum<'v>],
+/// proposed row, target columns to the conflicting row, and trigger scope
+/// names to the arena-owned outer snapshot.
+struct ExcludedCtx<'o, 's, 'e, 'x, 'v> {
+    def: TableDef,
+    existing: &'e [Datum<'v>],
+    excluded: &'x [Datum<'v>],
+    outer: Option<&'o TriggerDmlSnapshot<'s>>,
 }
 
-impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
+impl<'o, 's, 'e, 'x, 'v> ColumnLookup<'v> for ExcludedCtx<'o, 's, 'e, 'x, 'v>
+where
+    's: 'v,
+{
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
-        let src = if qualifier == Some("excluded") {
+        let src = if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded")) {
             self.excluded
+        } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+            || (qualifier.is_none() && self.def.column_index(name).is_none())
+        {
+            return self
+                .outer
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                })?
+                .lookup(qualifier, name);
         } else {
             if let Some(q) = qualifier
-                && !crate::sql::eval::qualifier_answers_single(self.def, q)
+                && !crate::sql::eval::qualifier_answers_single(&self.def, q)
             {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
@@ -1234,10 +1251,58 @@ impl<'v> ColumnLookup<'v> for ExcludedCtx<'_, 'v, '_> {
         }
     }
 
-    fn col_type(&self, _qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        self.def
-            .column_index(name)
-            .map(|i| self.def.columns()[i].ctype)
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.outer.and_then(|outer| outer.col_type(qualifier, name))
+        } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded"))
+            || self.def.column_index(name).is_some()
+        {
+            self.def
+                .column_index(name)
+                .map(|i| self.def.columns()[i].ctype)
+        } else {
+            self.outer.and_then(|outer| outer.col_type(qualifier, name))
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.outer
+                .map(|outer| outer.collation(qualifier, name))
+                .unwrap_or(crate::sql::ast::Collation::None)
+        } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded"))
+            || self.def.column_index(name).is_some()
+        {
+            self.def
+                .column_index(name)
+                .map(|i| self.def.columns()[i].collation)
+                .unwrap_or(crate::sql::ast::Collation::None)
+        } else {
+            self.outer
+                .map(|outer| outer.collation(qualifier, name))
+                .unwrap_or(crate::sql::ast::Collation::None)
+        }
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        {
+            self.outer
+                .and_then(|outer| outer.column_domain(qualifier, name))
+        } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded"))
+            || self.def.column_index(name).is_some()
+        {
+            self.def.column_index(name).and_then(|i| {
+                self.def.columns()[i]
+                    .user_type
+                    .map(|identity| identity.name)
+            })
+        } else {
+            self.outer
+                .and_then(|outer| outer.column_domain(qualifier, name))
+        }
     }
 }
 
@@ -1252,23 +1317,27 @@ enum ConflictOutcome<'a> {
 /// Applies an ON CONFLICT clause to one candidate row, against the arbiter
 /// already resolved once for the statement.
 #[allow(clippy::too_many_arguments)]
-fn handle_conflict<'a>(
+fn handle_conflict<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
     def: &TableDef,
     schema: &[ColType],
-    values: &[Datum],
-    on_conflict: &Option<super::ast::OnConflict>,
+    values: &[Datum<'a>],
+    on_conflict: &Option<super::ast::OnConflict<'a>>,
     arbiter: &Arbiter,
     checks: &ParsedChecks,
     arena: &'a Arena,
-    params: &[Datum],
+    params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     scratch: &mut FixedVec<(u64, RowHome)>,
+    outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
-) -> Result<ConflictOutcome<'a>, SqlError> {
+) -> Result<ConflictOutcome<'a>, SqlError>
+where
+    'snapshot: 'a,
+{
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
@@ -1309,9 +1378,10 @@ fn handle_conflict<'a>(
         })?;
         rowenc::decode(bytes, schema, &mut existing)?;
         let context = ExcludedCtx {
-            def,
+            def: *def,
             existing: &existing[..def.n_columns],
             excluded: values,
+            outer,
         };
         let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
         let mut subquery_expression_count = 0usize;
@@ -6551,6 +6621,17 @@ enum TriggerDml<'a> {
     Delete(Delete<'a>),
 }
 
+static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
+
+/// The INSERT source is either evaluated by the ordinary executor or already
+/// encoded by a trigger's short-lived read phase. The latter has no reference
+/// to storage, so the subsequent write phase cannot overlap a source borrow.
+#[derive(Clone, Copy)]
+pub enum InsertSource<'a> {
+    Statement,
+    MaterializedSelect(&'a [&'a [u8]]),
+}
+
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
     Assign(TriggerAssignment<'a>),
@@ -6658,14 +6739,16 @@ where
 
 struct TriggerDmlScope<'t, 'r, 'v, 'd> {
     row: &'r RowCtx<'r, 'v, 'd>,
-    transition: &'t dyn ColumnLookup<'v>,
+    outer: &'t dyn ColumnLookup<'v>,
 }
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.lookup(qualifier, name)
+            self.outer.lookup(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.lookup(None, name)
         } else {
             self.row.lookup(qualifier, name)
         }
@@ -6674,7 +6757,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.col_type(qualifier, name)
+            self.outer.col_type(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.col_type(None, name)
         } else {
             self.row.col_type(qualifier, name)
         }
@@ -6683,7 +6768,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.collation(qualifier, name)
+            self.outer.collation(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.collation(None, name)
         } else {
             self.row.collation(qualifier, name)
         }
@@ -6692,7 +6779,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.column_domain(qualifier, name)
+            self.outer.column_domain(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.column_domain(None, name)
         } else {
             self.row.column_domain(qualifier, name)
         }
@@ -6703,21 +6792,23 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
 /// trigger's transition images. The transition implementation can be
 /// reborrowed for this probe, so no storage-backed datum crosses into the
 /// subsequent mutable DML phase.
-struct JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv> {
+struct JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'v> {
     row: &'r RowCtx<'rs, 'rv, 'rd>,
-    transition: &'t TriggerTransition<'td, 'ts, 'tv>,
+    outer: &'t dyn ColumnLookup<'v>,
 }
 
-impl<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv, 'value> ColumnLookup<'value>
-    for JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'td, 'ts, 'tv>
+impl<'t, 'r, 'rd, 'rs, 'rv, 'v, 'value> ColumnLookup<'value>
+    for JoinedTriggerDmlScope<'t, 'r, 'rd, 'rs, 'rv, 'v>
 where
     'rv: 'value,
-    'tv: 'value,
+    'v: 'value,
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.lookup(qualifier, name)
+            self.outer.lookup(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.lookup(None, name)
         } else {
             self.row.lookup(qualifier, name)
         }
@@ -6726,7 +6817,9 @@ where
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.col_type(qualifier, name)
+            self.outer.col_type(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.col_type(None, name)
         } else {
             self.row.col_type(qualifier, name)
         }
@@ -6735,7 +6828,9 @@ where
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.collation(qualifier, name)
+            self.outer.collation(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.collation(None, name)
         } else {
             self.row.collation(qualifier, name)
         }
@@ -6744,7 +6839,9 @@ where
     fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.transition.column_domain(qualifier, name)
+            self.outer.column_domain(qualifier, name)
+        } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
+            self.outer.column_domain(None, name)
         } else {
             self.row.column_domain(qualifier, name)
         }
@@ -7520,8 +7617,11 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     }
 }
 
-impl<'a> ColumnLookup<'a> for TriggerLocalScope<'_, 'a> {
-    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored>
+where
+    'stored: 'value,
+{
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
             return self.transition.lookup(qualifier, name);
@@ -7571,9 +7671,199 @@ impl<'a> ColumnLookup<'a> for TriggerLocalScope<'_, 'a> {
     }
 }
 
+fn materialize_trigger_insert_source<'result, 'query>(
+    storage: &'query Storage,
+    select: &'query Select<'query>,
+    query_arena: &'query Arena,
+    result_arena: &'result Arena,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    scope: &TriggerLocalScope<'_, 'result>,
+) -> Result<&'result [&'result [u8]], SqlError>
+where
+    'result: 'query,
+{
+    let mut count = 0usize;
+    {
+        let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+        super::query::select_into_rows_recycling(
+            storage,
+            txid,
+            select,
+            query_arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(&dry),
+            &mut |_| {
+                count += 1;
+                Ok(())
+            },
+        )?;
+    }
+    const EMPTY: &[u8] = &[];
+    let rows = result_arena
+        .alloc_slice_with(count, |_| EMPTY)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut at = 0usize;
+    {
+        let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        super::query::select_into_rows(
+            storage,
+            txid,
+            select,
+            query_arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(&live),
+            &mut |values| {
+                rows[at] = encode_projected_pub(values, result_arena)?;
+                at += 1;
+                Ok(())
+            },
+        )?;
+    }
+    Ok(&*rows)
+}
+
 fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let encoded = encode_projected_pub(&[value], arena)?;
     Ok(decode_projected_pub(encoded, 0))
+}
+
+/// A detached trigger scope used after a nested DML read phase has ended.
+///
+/// It prevents an immutable storage borrow from crossing into a conflict
+/// update's mutable write phase.
+#[derive(Clone, Copy)]
+pub(crate) struct TriggerDmlSnapshot<'a> {
+    definition: &'a TableDef,
+    locals: &'a [TriggerLocalDecl<'a>],
+    values: &'a [Datum<'a>],
+    old: Option<&'a [Datum<'a>]>,
+    new: Option<&'a [Datum<'a>]>,
+}
+
+impl TriggerDmlSnapshot<'_> {
+    fn local_index(&self, name: &str) -> Option<usize> {
+        self.locals
+            .iter()
+            .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
+    }
+}
+
+impl<'stored, 'value> ColumnLookup<'value> for TriggerDmlSnapshot<'stored>
+where
+    'stored: 'value,
+{
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
+        if let Some(qualifier) = qualifier {
+            let (record, values) = if qualifier.eq_ignore_ascii_case("old") {
+                ("OLD", self.old)
+            } else if qualifier.eq_ignore_ascii_case("new") {
+                ("NEW", self.new)
+            } else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                ));
+            };
+            let Some(values) = values else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "record \"{}\" is not assigned yet",
+                    record
+                ));
+            };
+            let Some(column) = self.definition.column_index(name) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ));
+            };
+            return Ok(values[column]);
+        }
+        if let Some(index) = self.local_index(name) {
+            return Ok(self.values[index]);
+        }
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if qualifier.is_none() {
+            return self.local_index(name).map(|index| self.locals[index].ctype);
+        }
+        self.definition
+            .column_index(name)
+            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .map(|column| self.definition.columns()[column].ctype)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.definition
+            .column_index(name)
+            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .map(|column| self.definition.columns()[column].collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
+    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+        self.definition
+            .column_index(name)
+            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .and_then(|column| self.definition.columns()[column].user_type.map(|identity| identity.name))
+    }
+}
+
+fn snapshot_trigger_dml_scope<'a>(
+    definition: &TableDef,
+    locals: &[TriggerLocalDecl<'a>],
+    local_values: &[Datum<'a>],
+    old: Option<&[Datum<'a>]>,
+    new: Option<&[Datum<'a>]>,
+    arena: &'a Arena,
+) -> Result<&'a TriggerDmlSnapshot<'a>, SqlError> {
+    let definition = arena
+        .alloc(*definition)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let locals = arena
+        .alloc_slice_copy(locals)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let values = arena
+        .alloc_slice_with(local_values.len(), |_| Datum::Null)
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = detached_trigger_datum(local_values[index], arena)?;
+    }
+    let copy_record = |record: Option<&[Datum<'a>]>| -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let copy = arena
+            .alloc_slice_with(record.len(), |_| Datum::Null)
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (index, value) in copy.iter_mut().enumerate() {
+            *value = detached_trigger_datum(record[index], arena)?;
+        }
+        Ok(Some(&*copy))
+    };
+    let old = copy_record(old)?;
+    let new = copy_record(new)?;
+    arena
+        .alloc(TriggerDmlSnapshot {
+            definition: &*definition,
+            locals: &*locals,
+            values: &*values,
+            old,
+            new,
+        })
+        .map(|snapshot| &*snapshot)
+        .map_err(|_| super::query::arena_full_pub())
 }
 
 struct TriggerExecContext<'s, 'a, 'b> {
@@ -7855,6 +8145,41 @@ fn execute_trigger_block<'a>(
                     values: &local_values[..locals.len()],
                     transition: &transition,
                 };
+                let prepared_select = match statement.select {
+                    Some(select) => {
+                        let select = match transition_relations {
+                            Some(relations) => super::query::bind_materialized_relations(
+                                select,
+                                relations,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                            )?,
+                            None => select,
+                        };
+                        Some(materialize_trigger_insert_source(
+                            context.storage,
+                            select,
+                            context.arena,
+                            context.arena,
+                            context.txn.txid,
+                            context.seq_session,
+                            &scope,
+                        )?)
+                    }
+                    None => None,
+                };
+                let conflict_scope = match statement.on_conflict {
+                    Some(_) => Some(snapshot_trigger_dml_scope(
+                        definition,
+                        locals,
+                        &local_values[..locals.len()],
+                        old,
+                        new.as_deref(),
+                        context.arena,
+                    )?),
+                    None => None,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 context.txn.enter_trigger_sql()?;
                 let outcome = context.responder.without_command_complete(|responder| {
@@ -7870,6 +8195,9 @@ fn execute_trigger_block<'a>(
                         None,
                         Some(&scope),
                         transition_relations,
+                        conflict_scope,
+                        prepared_select
+                            .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -7885,6 +8213,33 @@ fn execute_trigger_block<'a>(
                 }
             }
             TriggerStatement::Dml(TriggerDml::Update(statement)) => {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Update(statement))
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "trigger UPDATE expansion exceeds the statement arena"
+                                )
+                            })?;
+                        let super::ast::Stmt::Update(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                                crate::sql::eval::NO_PARAMS,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("UPDATE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 let saved = context
                     .arena
@@ -7901,6 +8256,11 @@ fn execute_trigger_block<'a>(
                     old,
                     new: new.as_deref(),
                 };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
                 let outcome = context.responder.without_command_complete(|responder| {
                     update(
                         context.storage,
@@ -7912,7 +8272,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(transition),
+                        Some(&scope),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -7937,6 +8297,33 @@ fn execute_trigger_block<'a>(
                 }
             }
             TriggerStatement::Dml(TriggerDml::Delete(statement)) => {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Delete(statement))
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "trigger DELETE expansion exceeds the statement arena"
+                                )
+                            })?;
+                        let super::ast::Stmt::Delete(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                                crate::sql::eval::NO_PARAMS,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("DELETE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 let saved = context
                     .arena
@@ -7953,6 +8340,11 @@ fn execute_trigger_block<'a>(
                     old,
                     new: new.as_deref(),
                 };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    transition: &transition,
+                };
                 let outcome = context.responder.without_command_complete(|responder| {
                     delete(
                         context.storage,
@@ -7964,7 +8356,7 @@ fn execute_trigger_block<'a>(
                         context.seq_session,
                         responder,
                         None,
-                        Some(transition),
+                        Some(&scope),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -16631,7 +17023,7 @@ fn merge_insert<'a>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn finish_insert_row<'a>(
+fn finish_insert_row<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
@@ -16649,7 +17041,11 @@ fn finish_insert_row<'a>(
     transition_capture: Option<&mut TransitionCapture<'a>>,
     conflict_transition_capture: Option<&mut TransitionCapture<'a>>,
     scratch: &mut FixedVec<(u64, RowHome)>,
-) -> Result<Result<bool, SqlError>, WireFull> {
+    outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
+) -> Result<Result<bool, SqlError>, WireFull>
+where
+    'snapshot: 'a,
+{
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
         return Ok(Err(error));
     }
@@ -16698,6 +17094,7 @@ fn finish_insert_row<'a>(
         seq_session,
         responder,
         scratch,
+        outer,
         conflict_transition_capture,
     ) {
         Ok(ConflictOutcome::Store) => {}
@@ -16789,7 +17186,7 @@ fn finish_insert_row<'a>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn insert<'a>(
+pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut FixedVec<(u64, RowHome)>,
@@ -16799,11 +17196,15 @@ pub fn insert<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<&dyn ColumnLookup<'a>>,
+    transition: Option<&'scope dyn ColumnLookup<'a>>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
-) -> Outcome {
-    let no_columns = NoColumns;
-    let value_scope: &dyn ColumnLookup<'a> = transition.unwrap_or(&no_columns);
+    conflict_outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
+    source: InsertSource<'a>,
+) -> Outcome
+where
+    'snapshot: 'a,
+{
+    let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -16937,69 +17338,71 @@ pub fn insert<'a>(
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
     if let Some(sel) = statement.select {
-        let sel = match transition_relations {
-            Some(relations) => match super::query::bind_materialized_relations(
-                sel, relations, storage, txn.txid, arena,
-            ) {
-                Ok(select) => select,
-                Err(error) => return sql_fail(error),
-            },
-            None => sel,
-        };
-        // Pass 1: count. A "dry" sequence evaluator resolves names (so errors
-        // still surface) but does not advance any generator — the real advance
-        // happens once, in the encoding pass.
-        let mut count = 0usize;
-        {
-            let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows_recycling(
-                storage,
-                txn.txid,
-                sel,
-                arena,
-                params,
-                None,
-                Some(&dry),
-                &mut |_| {
-                    count += 1;
+        let (rows_bytes, count): (&[&[u8]], usize) =
+            if let InsertSource::MaterializedSelect(rows) = source {
+                (rows, rows.len())
+            } else {
+                let sel = match transition_relations {
+                    Some(relations) => match super::query::bind_materialized_relations(
+                        sel, relations, storage, txn.txid, arena,
+                    ) {
+                        Ok(select) => select,
+                        Err(error) => return sql_fail(error),
+                    },
+                    None => sel,
+                };
+                let mut count = 0usize;
+                {
+                    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
+                    if let Err(e) = super::query::select_into_rows_recycling(
+                        storage,
+                        txn.txid,
+                        sel,
+                        arena,
+                        params,
+                        None,
+                        Some(&dry),
+                        &mut |_| {
+                            count += 1;
+                            Ok(())
+                        },
+                    ) {
+                        return sql_fail(e);
+                    }
+                }
+                let empty: &[u8] = &[];
+                let rows: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "INSERT ... SELECT result exceeds the statement arena"
+                        ));
+                    }
+                };
+                let mut at = 0usize;
+                let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
+                    rows[at] = encode_projected_pub(vals, arena)?;
+                    at += 1;
                     Ok(())
-                },
-            ) {
-                return sql_fail(e);
-            }
-        }
-        // Pass 2: encode each projected row to self-describing arena bytes.
-        let empty: &[u8] = &[];
-        let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
-            Ok(r) => r,
-            Err(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "INSERT ... SELECT result exceeds the statement arena"
-                ));
-            }
-        };
-        let mut at = 0usize;
-        let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
-            rows_bytes[at] = encode_projected_pub(vals, arena)?;
-            at += 1;
-            Ok(())
-        };
-        {
-            let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows(
-                storage,
-                txn.txid,
-                sel,
-                arena,
-                params,
-                None,
-                Some(&live),
-                &mut fill,
-            ) {
-                return sql_fail(e);
-            }
-        }
+                };
+                {
+                    let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    if let Err(e) = super::query::select_into_rows(
+                        storage,
+                        txn.txid,
+                        sel,
+                        arena,
+                        params,
+                        None,
+                        Some(&live),
+                        &mut fill,
+                    ) {
+                        return sql_fail(e);
+                    }
+                }
+                (&*rows, count)
+            };
 
         let default_exprs = match parse_defaults(&def, arena) {
             Ok(d) => d,
@@ -17134,6 +17537,7 @@ pub fn insert<'a>(
                 transition_capture.as_mut(),
                 conflict_transition_capture.as_mut(),
                 scratch,
+                conflict_outer,
             )? {
                 Ok(true) => inserted += 1,
                 Ok(false) => {}
@@ -17185,6 +17589,12 @@ pub fn insert<'a>(
             responder.command_complete(tag.as_str())?;
         }
         return sql_ok();
+    }
+    if matches!(source, InsertSource::MaterializedSelect(_)) {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "materialized INSERT source requires INSERT ... SELECT"
+        ));
     }
 
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
@@ -17350,6 +17760,7 @@ pub fn insert<'a>(
             transition_capture.as_mut(),
             conflict_transition_capture.as_mut(),
             scratch,
+            conflict_outer,
         )? {
             Ok(true) => inserted += 1,
             Ok(false) => {}
@@ -17549,11 +17960,9 @@ pub(crate) fn update<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<TriggerTransition<'_, '_, 'a>>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
-    let transition_lookup = transition
-        .as_ref()
-        .map(|transition| transition as &dyn ColumnLookup<'a>);
+    let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -17658,7 +18067,7 @@ pub(crate) fn update<'a>(
         sequences: None,
     };
     let collect = if let Some(from) = statement.from {
-        if let Some(transition) = transition.as_ref() {
+        if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
@@ -17671,7 +18080,7 @@ pub(crate) fn update<'a>(
                 params,
                 txn.txid,
                 scratch,
-                transition,
+                outer,
             )
         } else {
             collect_join_matches(
@@ -17700,7 +18109,7 @@ pub(crate) fn update<'a>(
             params,
             &hooks,
             scratch,
-            transition_lookup,
+            outer_lookup,
         )
     };
     if let Err(e) = collect {
@@ -17827,9 +18236,9 @@ pub(crate) fn update<'a>(
                     sequences: Some(&sequences),
                     ..super::eval::NO_HOOKS
                 };
-                let joined_scope = transition.as_ref().map(|transition| JoinedTriggerDmlScope {
+                let joined_scope = outer.map(|outer| JoinedTriggerDmlScope {
                     row: &context,
-                    transition,
+                    outer,
                 });
                 let joined_target: &dyn ColumnLookup<'_> = joined_scope
                     .as_ref()
@@ -17906,10 +18315,10 @@ pub(crate) fn update<'a>(
                         };
                         continue;
                     }
-                    let value = if let Some(transition) = transition_lookup {
+                    let value = if let Some(outer) = outer_lookup {
                         let scope = TriggerDmlScope {
                             row: &context,
-                            transition,
+                            outer,
                         };
                         super::eval::eval_full(expression, arena, params, &scope, &hooks)
                     } else {
@@ -18161,11 +18570,9 @@ pub(crate) fn delete<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
-    transition: Option<TriggerTransition<'_, '_, 'a>>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
-    let transition_lookup = transition
-        .as_ref()
-        .map(|transition| transition as &dyn ColumnLookup<'a>);
+    let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -18230,7 +18637,7 @@ pub(crate) fn delete<'a>(
         sequences: None,
     };
     let collect = if let Some(using) = statement.using {
-        if let Some(transition) = transition.as_ref() {
+        if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
@@ -18243,7 +18650,7 @@ pub(crate) fn delete<'a>(
                 params,
                 txn.txid,
                 scratch,
-                transition,
+                outer,
             )
         } else {
             collect_join_matches(
@@ -18272,7 +18679,7 @@ pub(crate) fn delete<'a>(
             params,
             &hooks,
             scratch,
-            transition_lookup,
+            outer_lookup,
         )
     };
     if let Err(e) = collect {
@@ -20315,7 +20722,7 @@ fn row_matches_values<'a>(
     let value = if let Some(transition) = transition {
         let scope = TriggerDmlScope {
             row: &context,
-            transition,
+            outer: transition,
         };
         super::eval::eval_full(w, arena, params, &scope, hooks)?
     } else {
@@ -20460,7 +20867,7 @@ fn collect_join_matches_with_transition<'a>(
     params: &[Datum<'a>],
     txid: u32,
     scratch: &mut FixedVec<(u64, RowHome)>,
-    transition: &TriggerTransition<'_, '_, 'a>,
+    outer: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
     scratch.clear();
     storage.record_serializable_read(txid, table_index);
@@ -20479,7 +20886,7 @@ fn collect_join_matches_with_transition<'a>(
             };
             let scope = JoinedTriggerDmlScope {
                 row: &context,
-                transition,
+                outer,
             };
             super::query::first_from_match(
                 storage,

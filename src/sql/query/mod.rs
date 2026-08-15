@@ -47,7 +47,7 @@ use scan::{
 };
 
 mod scope;
-pub(crate) use cte::bind_materialized_relations;
+pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};
 pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;

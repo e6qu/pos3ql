@@ -97,3 +97,77 @@ DROP TABLE slt_local_query_audit
 
 statement ok
 DROP FUNCTION slt_local_query_program()
+
+statement ok
+CREATE TABLE slt_transition_dml_driver (id integer PRIMARY KEY, delta integer)
+
+statement ok
+CREATE TABLE slt_transition_dml_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE FUNCTION slt_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+'BEGIN UPDATE slt_transition_dml_target SET value = slt_transition_dml_target.value + changed_rows.delta FROM changed_rows WHERE slt_transition_dml_target.id = changed_rows.id; DELETE FROM slt_transition_dml_target USING changed_rows WHERE slt_transition_dml_target.id = changed_rows.id AND changed_rows.delta = 9; RETURN NULL; END'
+
+statement ok
+CREATE TRIGGER slt_transition_dml_after AFTER UPDATE ON slt_transition_dml_driver
+REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT EXECUTE FUNCTION slt_transition_dml_program()
+
+statement ok
+INSERT INTO slt_transition_dml_driver VALUES (1, 3), (2, 9)
+
+statement ok
+INSERT INTO slt_transition_dml_target VALUES (1, 10), (2, 20)
+
+statement ok
+UPDATE slt_transition_dml_driver SET delta = delta
+
+query II rowsort
+SELECT id, value FROM slt_transition_dml_target
+----
+1 13
+
+statement ok
+DROP TABLE slt_transition_dml_driver
+
+statement ok
+DROP TABLE slt_transition_dml_target
+
+statement ok
+DROP FUNCTION slt_transition_dml_program()
+
+statement ok
+CREATE TABLE slt_trigger_conflict_driver (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE TABLE slt_trigger_conflict_target (id integer PRIMARY KEY, value integer)
+
+statement ok
+CREATE FUNCTION slt_trigger_conflict_program() RETURNS trigger LANGUAGE plpgsql AS
+'DECLARE step integer := NEW.value - OLD.value; BEGIN INSERT INTO slt_trigger_conflict_target VALUES (NEW.id, NEW.value) ON CONFLICT (id) DO UPDATE SET value = excluded.value + step WHERE step = 2 AND OLD.value = 5 AND NEW.value = 7; RETURN NEW; END'
+
+statement ok
+CREATE TRIGGER slt_trigger_conflict_after AFTER UPDATE ON slt_trigger_conflict_driver
+FOR EACH ROW EXECUTE FUNCTION slt_trigger_conflict_program()
+
+statement ok
+INSERT INTO slt_trigger_conflict_driver VALUES (1, 5)
+
+statement ok
+INSERT INTO slt_trigger_conflict_target VALUES (1, 10)
+
+statement ok
+UPDATE slt_trigger_conflict_driver SET value = 7 WHERE id = 1
+
+query II
+SELECT id, value FROM slt_trigger_conflict_target
+----
+1 9
+
+statement ok
+DROP TABLE slt_trigger_conflict_driver
+
+statement ok
+DROP TABLE slt_trigger_conflict_target
+
+statement ok
+DROP FUNCTION slt_trigger_conflict_program()

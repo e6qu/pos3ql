@@ -8521,6 +8521,148 @@ fn statement_trigger_select_into_reads_typed_transition_relations() {
 }
 
 #[test]
+fn statement_trigger_dml_binds_transition_relations_for_update_and_delete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_transition_dml_driver (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE trigger_transition_dml_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_transition_dml_driver VALUES (1, 3), (2, 9);
+         INSERT INTO trigger_transition_dml_target VALUES (1, 10), (2, 20);
+         CREATE FUNCTION trigger_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE trigger_transition_dml_target
+                 SET value = trigger_transition_dml_target.value + changed_rows.delta
+                FROM changed_rows
+               WHERE trigger_transition_dml_target.id = changed_rows.id;
+              DELETE FROM trigger_transition_dml_target
+                USING changed_rows
+               WHERE trigger_transition_dml_target.id = changed_rows.id
+                 AND changed_rows.delta = 9;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_transition_dml_after AFTER UPDATE ON trigger_transition_dml_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_transition_dml_program();
+         UPDATE trigger_transition_dml_driver SET delta = delta;
+         SELECT id, value FROM trigger_transition_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|13"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_locals_scope_joined_update_and_delete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_local_dml_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_local_dml_source (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE trigger_local_dml_driver (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_local_dml_target VALUES (1, 10), (2, 20);
+         INSERT INTO trigger_local_dml_source VALUES (1, 3), (2, 4);
+         INSERT INTO trigger_local_dml_driver VALUES (1, 5);
+         CREATE FUNCTION trigger_local_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              UPDATE trigger_local_dml_target
+                 SET value = trigger_local_dml_target.value + trigger_local_dml_source.delta + step
+                FROM trigger_local_dml_source
+               WHERE trigger_local_dml_target.id = trigger_local_dml_source.id
+                 AND trigger_local_dml_source.id = NEW.id
+                 AND step = 2;
+              DELETE FROM trigger_local_dml_target
+                    USING trigger_local_dml_source
+               WHERE trigger_local_dml_target.id = trigger_local_dml_source.id
+                 AND trigger_local_dml_source.id = 2
+                 AND step = 2;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_local_dml_after AFTER UPDATE ON trigger_local_dml_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_local_dml_program();
+         UPDATE trigger_local_dml_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_local_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|15"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_locals_scope_insert_select() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_insert_select_driver (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_insert_select_source (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_insert_select_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_insert_select_driver VALUES (1, 5);
+         INSERT INTO trigger_insert_select_source VALUES (1, 10), (2, 20);
+         CREATE FUNCTION trigger_insert_select_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              INSERT INTO trigger_insert_select_target
+                SELECT source.id, source.value + step
+                  FROM trigger_insert_select_source source
+                 WHERE source.id = NEW.id AND step = 2;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_insert_select_before BEFORE UPDATE ON trigger_insert_select_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_insert_select_program();
+         UPDATE trigger_insert_select_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_insert_select_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|12"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_program_locals_scope_conflict_update() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_conflict_driver (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_conflict_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_conflict_driver VALUES (1, 5);
+         INSERT INTO trigger_conflict_target VALUES (1, 10);
+         CREATE FUNCTION trigger_conflict_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              INSERT INTO trigger_conflict_target VALUES (NEW.id, NEW.value)
+                ON CONFLICT (id) DO UPDATE
+                   SET value = excluded.value + step
+                 WHERE step = 2 AND OLD.value = 5 AND NEW.value = 7;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_conflict_after AFTER UPDATE ON trigger_conflict_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_conflict_program();
+         UPDATE trigger_conflict_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_conflict_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|9"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_when_and_update_of_are_typed_and_selective() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -8874,6 +9016,62 @@ fn statement_trigger_catalog_checkpoint_and_recovery_preserve_level() {
     assert_eq!(
         data_rows(&output),
         ["2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn transition_dml_scope_survives_checkpoint_and_recovery() {
+    let mut config = test_config("transition-dml-scope-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("transition-dml-scope-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_transition_dml_driver (id integer PRIMARY KEY, delta integer);
+         CREATE TABLE durable_transition_dml_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION durable_transition_dml_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              UPDATE durable_transition_dml_target
+                 SET value = durable_transition_dml_target.value + changed_rows.delta
+                FROM changed_rows
+               WHERE durable_transition_dml_target.id = changed_rows.id;
+              DELETE FROM durable_transition_dml_target
+                USING changed_rows
+               WHERE durable_transition_dml_target.id = changed_rows.id
+                 AND changed_rows.delta = 9;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER durable_transition_dml_after AFTER UPDATE ON durable_transition_dml_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION durable_transition_dml_program();
+         INSERT INTO durable_transition_dml_driver VALUES (1, 3), (2, 9);
+         INSERT INTO durable_transition_dml_target VALUES (1, 10), (2, 20);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "UPDATE durable_transition_dml_driver SET delta = delta;
+         SELECT id, value FROM durable_transition_dml_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|13"],
         "{}",
         String::from_utf8_lossy(&output)
     );

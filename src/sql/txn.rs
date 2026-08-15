@@ -62,6 +62,7 @@ pub(crate) struct StatementMark {
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
+pub const MAX_TRIGGER_NESTING: u16 = 32;
 pub const MAX_TRUNCATE_TABLES: usize = 16;
 pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
 
@@ -115,6 +116,9 @@ pub struct TxnState {
     /// to the same statement's main query. Starts at 1 so any stored `cid: 0`
     /// (a restored pre-savepoint change) is always visible.
     command_id: u32,
+    /// Nested trigger-side SQL is bounded independently of row and arena
+    /// capacity so a self-referential trigger cannot consume the call stack.
+    trigger_depth: u16,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
@@ -331,6 +335,7 @@ impl TxnState {
             snapshot_lsn: None,
             snapshot_taken: false,
             command_id: 1,
+            trigger_depth: 0,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             truncates: FixedVec::new(budget, "txn_truncates", MAX_TXN_DDL)?,
             truncate_wal_tables: FixedBuf::new(
@@ -384,6 +389,25 @@ impl TxnState {
     /// and its main query) share one command-id and therefore one snapshot.
     pub fn begin_command(&mut self) {
         self.command_id = self.command_id.saturating_add(1);
+    }
+
+    pub fn enter_trigger_sql(&mut self) -> Result<(), SqlError> {
+        if self.trigger_depth == MAX_TRIGGER_NESTING {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "trigger nesting exceeds {} levels",
+                MAX_TRIGGER_NESTING
+            ));
+        }
+        self.trigger_depth += 1;
+        Ok(())
+    }
+
+    pub fn leave_trigger_sql(&mut self) {
+        self.trigger_depth = self
+            .trigger_depth
+            .checked_sub(1)
+            .expect("trigger depth is paired");
     }
 
     pub fn set_characteristics(

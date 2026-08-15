@@ -21,6 +21,12 @@ PG_PORT=${POS3QL_DIFF_PG_PORT:-15498}
 P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
 FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
 FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
+DIFF_OBJECT_PREFIX=${POS3QL_DIFF_OBJECT_STORE_PREFIX:-}
+
+if [[ "${POS3QL_DIFF_OBJECT_STORE:-off}" == "on" && -z "$DIFF_OBJECT_PREFIX" ]]; then
+  print -- "FAIL: durable differential runs require POS3QL_DIFF_OBJECT_STORE_PREFIX"
+  exit 1
+fi
 
 PASS=0
 FAIL=0
@@ -76,6 +82,9 @@ max_value_indexes = 64
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 ${POS3QL_EXTRA_CONF:-}
 EOF
+if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
+  print -- "object_store_prefix = ${DIFF_OBJECT_PREFIX}corpus/" >> "$WORK/p3.conf"
+fi
 # A leftover server on our port would silently answer the readiness probe
 # below and the whole run would test a stale binary. Refuse to start.
 if nc -z 127.0.0.1 $P3_PORT 2>/dev/null; then
@@ -212,6 +221,34 @@ fi
 print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then
+  # The curated corpus deliberately retains trigger targets and audit tables,
+  # while sqllogictest owns a complete 64-table catalog. A durable run needs
+  # a new object prefix as well as a new local cache for independent state.
+  kill "$P3_PID" 2>/dev/null
+  wait "$P3_PID" 2>/dev/null
+  rm -rf "$WORK/p3data"
+  SLT_CONF="$WORK/p3-slt.conf"
+  if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
+    sed '/^object_store_prefix = /d' "$WORK/p3.conf" > "$SLT_CONF"
+    print -- "object_store_prefix = ${DIFF_OBJECT_PREFIX}slt/" >> "$SLT_CONF"
+  else
+    cp "$WORK/p3.conf" "$SLT_CONF"
+  fi
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$SLT_CONF" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  P3_READY=0
+  for i in {1..50}; do
+    if "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
+      P3_READY=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ $P3_READY -ne 1 ]] || ! server_alive "$P3_PID"; then
+    bad "pos3ql did not restart for sqllogictest (see $WORK/p3.log)"
+    tail -20 "$WORK/p3.log"
+    exit 1
+  fi
   SLT_LIMIT=${POS3QL_SLT_LIMIT:-600}
   if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg $PG_PORT --p3 $P3_PORT \
        --limit "$SLT_LIMIT" \

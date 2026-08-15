@@ -748,9 +748,8 @@ step "forced-spill differential: the whole suite with a 256KiB memtable over the
 # through the cache tiers — while the reference PostgreSQL sees plain SQL.
 # Pure-SQL semantics must be indistinguishable from the in-memory run.
 if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
 object_store_namespace = pos3ql-external
-object_store_prefix = spilldiff-$$/
 wal_upload = on
 wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then

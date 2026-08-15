@@ -3998,6 +3998,7 @@ impl Engine {
                     guc.seq_session(),
                     responder,
                     capture,
+                    None,
                 )
             }
             Stmt::Update(update) => {

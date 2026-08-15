@@ -70,6 +70,66 @@ CREATE TRIGGER row_trigger_loop_before BEFORE INSERT ON row_trigger_loop_target
 INSERT INTO row_trigger_loop_target VALUES (1, 10);
 SELECT id, value FROM row_trigger_loop_target;
 
+CREATE TABLE row_trigger_structured_loop_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION row_trigger_structured_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE item integer := 0; total integer := 0; stop integer := 0;
+   BEGIN
+     WHILE item < 5 LOOP
+       item := item + 1;
+       CONTINUE WHEN item = 2;
+       total := total + item;
+     END LOOP;
+     LOOP
+       stop := stop + 1;
+       CONTINUE WHEN stop = 1;
+       total := total + stop;
+       EXIT WHEN stop = 3;
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_structured_loop_before BEFORE INSERT ON row_trigger_structured_loop_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_structured_loop();
+INSERT INTO row_trigger_structured_loop_target VALUES (1, 0);
+SELECT id, value FROM row_trigger_structured_loop_target;
+
+CREATE TABLE row_trigger_labelled_loop_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION row_trigger_labelled_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE round integer := 0; total integer := 0;
+   BEGIN
+     <<outer>> LOOP
+       round := round + 1;
+       EXIT outer WHEN round = 3;
+       <<inner>> LOOP
+         total := total + 1;
+         CONTINUE outer;
+       END LOOP;
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_labelled_loop_before BEFORE INSERT ON row_trigger_labelled_loop_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_labelled_loop();
+INSERT INTO row_trigger_labelled_loop_target VALUES (1, 0);
+SELECT id, value FROM row_trigger_labelled_loop_target;
+
+CREATE TABLE row_trigger_record_loop_target (id integer PRIMARY KEY, value integer);
+CREATE TABLE row_trigger_record_loop_source (id integer PRIMARY KEY, delta integer);
+INSERT INTO row_trigger_record_loop_source VALUES (1, 4), (2, 7);
+CREATE FUNCTION row_trigger_record_loop() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE entry record; total integer := 0;
+   BEGIN
+     FOR entry IN SELECT id, delta FROM row_trigger_record_loop_source ORDER BY id LOOP
+       total := total + entry.id + entry.delta;
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER row_trigger_record_loop_before BEFORE INSERT ON row_trigger_record_loop_target
+  FOR EACH ROW EXECUTE FUNCTION row_trigger_record_loop();
+INSERT INTO row_trigger_record_loop_target VALUES (1, 0);
+SELECT id, value FROM row_trigger_record_loop_target;
+
 CREATE TABLE row_trigger_join_target (id integer PRIMARY KEY, value integer);
 CREATE TABLE row_trigger_join_source (id integer, delta integer, enabled boolean);
 CREATE TABLE row_trigger_join_driver (id integer PRIMARY KEY, value integer);

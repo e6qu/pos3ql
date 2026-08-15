@@ -1535,6 +1535,59 @@ def test_typed_trigger_query_program_over_raw_simple_query():
         "raw wire: numeric trigger loop control flow is visible",
         first_text_row(simple_query(s, "SELECT value FROM wire_loop_target")) == "16",
     )
+    structured = simple_query(
+        s,
+        "CREATE TABLE wire_structured_loop_target (id integer PRIMARY KEY, value integer); "
+        "CREATE FUNCTION wire_structured_loop_program() RETURNS trigger LANGUAGE plpgsql AS "
+        "'DECLARE item integer := 0; total integer := 0; stop integer := 0; BEGIN "
+        "WHILE item < 5 LOOP item := item + 1; CONTINUE WHEN item = 2; "
+        "total := total + item; END LOOP; "
+        "LOOP stop := stop + 1; CONTINUE WHEN stop = 1; total := total + stop; "
+        "EXIT WHEN stop = 3; END LOOP; NEW.value := total; RETURN NEW; END'; "
+        "CREATE TRIGGER wire_structured_loop_before BEFORE INSERT ON wire_structured_loop_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_structured_loop_program(); "
+        "INSERT INTO wire_structured_loop_target VALUES (1, 0)",
+    )
+    check("raw wire: structured trigger loop setup succeeds", not any(kind == b"E" for kind, _ in structured), structured)
+    check(
+        "raw wire: while and unconditional trigger loops are visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_structured_loop_target")) == "18",
+    )
+    labelled = simple_query(
+        s,
+        "CREATE TABLE wire_labelled_loop_target (id integer PRIMARY KEY, value integer); "
+        "CREATE FUNCTION wire_labelled_loop_program() RETURNS trigger LANGUAGE plpgsql AS "
+        "'DECLARE round integer := 0; total integer := 0; BEGIN "
+        "<<outer>> LOOP round := round + 1; EXIT outer WHEN round = 3; "
+        "<<inner>> LOOP total := total + 1; CONTINUE outer; END LOOP; END LOOP; "
+        "NEW.value := total; RETURN NEW; END'; "
+        "CREATE TRIGGER wire_labelled_loop_before BEFORE INSERT ON wire_labelled_loop_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_labelled_loop_program(); "
+        "INSERT INTO wire_labelled_loop_target VALUES (1, 0)",
+    )
+    check("raw wire: labelled trigger loop setup succeeds", not any(kind == b"E" for kind, _ in labelled), labelled)
+    check(
+        "raw wire: parser-resolved labelled loop control is visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_labelled_loop_target")) == "2",
+    )
+    records = simple_query(
+        s,
+        "CREATE TABLE wire_record_loop_target (id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_record_loop_source (id integer PRIMARY KEY, delta integer); "
+        "INSERT INTO wire_record_loop_source VALUES (1, 4), (2, 7); "
+        "CREATE FUNCTION wire_record_loop_program() RETURNS trigger LANGUAGE plpgsql AS "
+        "'DECLARE entry record; total integer := 0; BEGIN "
+        "FOR entry IN SELECT id, delta FROM wire_record_loop_source ORDER BY id LOOP "
+        "total := total + entry.id + entry.delta; END LOOP; NEW.value := total; RETURN NEW; END'; "
+        "CREATE TRIGGER wire_record_loop_before BEFORE INSERT ON wire_record_loop_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_record_loop_program(); "
+        "INSERT INTO wire_record_loop_target VALUES (1, 0)",
+    )
+    check("raw wire: record trigger loop setup succeeds", not any(kind == b"E" for kind, _ in records), records)
+    check(
+        "raw wire: record trigger loop fields are visible",
+        first_text_row(simple_query(s, "SELECT value FROM wire_record_loop_target")) == "14",
+    )
     s.close()
 
 

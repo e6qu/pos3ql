@@ -8547,6 +8547,100 @@ fn trigger_program_numeric_for_loop_propagates_exit_and_continue() {
         "{}",
         String::from_utf8_lossy(&reverse)
     );
+
+    let structured = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_structured_loop_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_structured_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer := 0;
+                    total integer := 0;
+                    stop integer := 0;
+            BEGIN
+              WHILE item < 5 LOOP
+                item := item + 1;
+                CONTINUE WHEN item = 2;
+                total := total + item;
+              END LOOP;
+              LOOP
+                stop := stop + 1;
+                CONTINUE WHEN stop = 1;
+                total := total + stop;
+                EXIT WHEN stop = 3;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_structured_loop_before BEFORE INSERT ON trigger_structured_loop_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_structured_loop_program();
+         INSERT INTO trigger_structured_loop_target VALUES (1, 0);
+         SELECT value FROM trigger_structured_loop_target;",
+    );
+    assert_eq!(
+        data_rows(&structured),
+        ["18"],
+        "{}",
+        String::from_utf8_lossy(&structured)
+    );
+
+    let labelled = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_labelled_loop_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_labelled_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE round integer := 0;
+                    total integer := 0;
+            BEGIN
+              <<outer>> LOOP
+                round := round + 1;
+                EXIT outer WHEN round = 3;
+                <<inner>> LOOP
+                  total := total + 1;
+                  CONTINUE outer;
+                END LOOP;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_labelled_loop_before BEFORE INSERT ON trigger_labelled_loop_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_labelled_loop_program();
+         INSERT INTO trigger_labelled_loop_target VALUES (1, 0);
+         SELECT value FROM trigger_labelled_loop_target;",
+    );
+    assert_eq!(
+        data_rows(&labelled),
+        ["2"],
+        "{}",
+        String::from_utf8_lossy(&labelled)
+    );
+
+    let records = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_record_loop_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_record_loop_source (id integer PRIMARY KEY, delta integer);
+         INSERT INTO trigger_record_loop_source VALUES (1, 4), (2, 7);
+         CREATE FUNCTION trigger_record_loop_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE entry record;
+                    total integer := 0;
+            BEGIN
+              FOR entry IN SELECT id, delta FROM trigger_record_loop_source ORDER BY id LOOP
+                total := total + entry.id + entry.delta;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_record_loop_before BEFORE INSERT ON trigger_record_loop_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_record_loop_program();
+         INSERT INTO trigger_record_loop_target VALUES (1, 0);
+         SELECT value FROM trigger_record_loop_target;",
+    );
+    assert_eq!(
+        data_rows(&records),
+        ["14"],
+        "{}",
+        String::from_utf8_lossy(&records)
+    );
 }
 
 #[test]

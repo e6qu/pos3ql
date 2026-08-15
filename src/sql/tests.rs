@@ -8414,15 +8414,16 @@ fn trigger_program_locals_select_into_and_perform_are_typed() {
          INSERT INTO trigger_query_source VALUES (1, 3);
          CREATE FUNCTION trigger_query_program() RETURNS trigger LANGUAGE plpgsql AS
            'DECLARE change integer := NEW.value - OLD.value;
+                    selected_id integer;
                     selected_delta integer;
             BEGIN
-              SELECT source.delta INTO selected_delta
+              SELECT source.id, source.delta INTO selected_id, selected_delta
                 FROM trigger_query_source source
               WHERE source.id = NEW.id;
-              selected_delta := selected_delta + 1;
+              selected_delta := selected_delta + selected_id + 1;
               INSERT INTO trigger_query_audit VALUES (selected_delta);
               PERFORM 1 FROM trigger_query_source source
-               WHERE source.id = NEW.id AND selected_delta = source.delta + 1;
+               WHERE source.id = NEW.id AND selected_delta = source.delta + selected_id + 1;
               NEW.value := NEW.value + change + selected_delta;
               RETURN NEW;
             END';
@@ -8434,7 +8435,7 @@ fn trigger_program_locals_select_into_and_perform_are_typed() {
     );
     assert_eq!(
         data_rows(&output),
-        ["13", "4"],
+        ["14", "5"],
         "{}",
         String::from_utf8_lossy(&output)
     );

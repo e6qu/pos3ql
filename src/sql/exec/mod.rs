@@ -32,7 +32,7 @@ use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
     eval_full, sqlstate,
 };
-use super::types::{ColDesc, ColType, Datum, TypeMod};
+use super::types::{ColDesc, ColType, Datum, RecordField, TypeMod};
 
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
@@ -6684,8 +6684,14 @@ struct TriggerWhile<'a> {
 
 #[derive(Clone, Copy)]
 enum TriggerLoopControl<'a> {
-    Exit(Option<&'a Expr<'a>>),
-    Continue(Option<&'a Expr<'a>>),
+    Exit {
+        condition: Option<&'a Expr<'a>>,
+        unwind: u8,
+    },
+    Continue {
+        condition: Option<&'a Expr<'a>>,
+        unwind: u8,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -6702,8 +6708,8 @@ struct TriggerProgram<'a> {
 #[derive(Clone, Copy)]
 enum TriggerFlow {
     Return(TriggerReturn),
-    Exit,
-    Continue,
+    Exit(u8),
+    Continue(u8),
 }
 
 /// A trigger has two explicitly named transition images.  Keeping them as a
@@ -6910,31 +6916,43 @@ fn strip_trigger_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
+fn trigger_label_prefix(statement: &str) -> Option<(&str, &str)> {
+    let statement = statement.trim_start();
+    let label = statement.strip_prefix("<<")?;
+    let end = label.find(">>")?;
+    let name = label[..end].trim();
+    (!name.is_empty()).then_some((name, label[end + 2..].trim_start()))
+}
+
 fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
     let statement = statement.trim();
-    let (prefix, terminator) = if strip_trigger_keyword(statement, "if").is_some() {
+    let content = trigger_label_prefix(statement)
+        .map(|(_, content)| content)
+        .unwrap_or(statement);
+    let content_offset = statement.len() - content.len();
+    let (prefix, terminator) = if strip_trigger_keyword(content, "if").is_some() {
         ("if", "then")
-    } else if strip_trigger_keyword(statement, "elsif").is_some() {
+    } else if strip_trigger_keyword(content, "elsif").is_some() {
         ("elsif", "then")
-    } else if strip_trigger_keyword(statement, "for").is_some() {
+    } else if strip_trigger_keyword(content, "for").is_some() {
         ("for", "loop")
-    } else if strip_trigger_keyword(statement, "while").is_some() {
+    } else if strip_trigger_keyword(content, "while").is_some() {
         ("while", "loop")
-    } else if let Some(rest) = strip_trigger_keyword(statement, "loop") {
+    } else if let Some(rest) = strip_trigger_keyword(content, "loop") {
         let rest = rest.trim();
-        return (!rest.is_empty()).then_some(("LOOP", rest));
-    } else if strip_trigger_keyword(statement, "else").is_some() {
-        let rest = strip_trigger_keyword(statement, "else")?.trim();
+        return (!rest.is_empty()).then_some((statement[..content_offset + 4].trim_end(), rest));
+    } else if strip_trigger_keyword(content, "else").is_some() {
+        let rest = strip_trigger_keyword(content, "else")?.trim();
         return (!rest.is_empty()).then_some(("ELSE", rest));
-    } else if strip_trigger_keyword(statement, "begin").is_some() {
-        let rest = strip_trigger_keyword(statement, "begin")?.trim();
+    } else if strip_trigger_keyword(content, "begin").is_some() {
+        let rest = strip_trigger_keyword(content, "begin")?.trim();
         return (!rest.is_empty()).then_some(("BEGIN", rest));
     } else {
         return None;
     };
     let mut quote = None;
     let mut depth = 0usize;
-    for (offset, character) in statement.char_indices() {
+    for (offset, character) in content.char_indices() {
         if let Some(delimiter) = quote {
             if character == delimiter {
                 quote = None;
@@ -6946,18 +6964,18 @@ fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
             '(' => depth += 1,
             ')' if depth > 0 => depth -= 1,
             _ if depth == 0
-                && statement
+                && content
                     .get(offset..offset + terminator.len())
                     .is_some_and(|word| word.eq_ignore_ascii_case(terminator)) =>
             {
-                let before = statement[..offset].chars().next_back();
-                let after = statement[offset + terminator.len()..].chars().next();
+                let before = content[..offset].chars().next_back();
+                let after = content[offset + terminator.len()..].chars().next();
                 if before.is_some_and(|character| character.is_ascii_whitespace())
                     && after.is_some_and(|character| character.is_ascii_whitespace())
-                    && statement[..offset].trim_start().len() > prefix.len()
+                    && content[..offset].trim_start().len() > prefix.len()
                 {
-                    let header = statement[..offset + terminator.len()].trim_end();
-                    let rest = statement[offset + terminator.len()..].trim();
+                    let header = statement[..content_offset + offset + terminator.len()].trim_end();
+                    let rest = content[offset + terminator.len()..].trim();
                     return (!rest.is_empty()).then_some((header, rest));
                 }
             }
@@ -7174,7 +7192,7 @@ fn parse_trigger_local<'a>(
             type_name
         ));
     };
-    if ctype.is_pseudo() {
+    if ctype.is_pseudo() && ctype != ColType::Record {
         return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "trigger local \"{}\" has pseudo-type {}",
@@ -7425,9 +7443,17 @@ fn is_trigger_loop_header(segment: &str) -> bool {
     segment.trim().eq_ignore_ascii_case("loop")
 }
 
+fn trigger_loop_label(segment: &str) -> Result<(Option<SqlName>, &str), SqlError> {
+    match trigger_label_prefix(segment) {
+        Some((label, header)) => Ok((Some(SqlName::parse(label)?), header)),
+        None => Ok((None, segment)),
+    }
+}
+
 fn parse_trigger_loop_control<'a>(
     segment: &'a str,
     arena: &'a Arena,
+    loop_labels: &[Option<SqlName>],
 ) -> Result<Option<TriggerLoopControl<'a>>, SqlError> {
     let (is_exit, tail) = if let Some(tail) = strip_trigger_keyword(segment, "exit") {
         (true, tail.trim())
@@ -7436,22 +7462,85 @@ fn parse_trigger_loop_control<'a>(
     } else {
         return Ok(None);
     };
-    let condition = if tail.is_empty() {
-        None
+    let (label, condition) = if tail.is_empty() {
+        (None, None)
     } else if let Some(condition) = strip_trigger_keyword(tail, "when") {
         let condition = condition.trim();
         if condition.is_empty() {
             return Err(unsupported_trigger_body());
         }
-        Some(super::parser::parse_expr(condition, arena)?)
+        (None, Some(super::parser::parse_expr(condition, arena)?))
     } else {
-        return Err(unsupported_trigger_body());
+        let Some(space) = tail.find(char::is_whitespace) else {
+            return Ok(Some(loop_control_for_label(
+                is_exit,
+                tail,
+                None,
+                loop_labels,
+            )?));
+        };
+        let label = tail[..space].trim();
+        let tail = tail[space..].trim();
+        if label.is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        let condition = if tail.is_empty() {
+            None
+        } else if let Some(condition) = strip_trigger_keyword(tail, "when") {
+            let condition = condition.trim();
+            if condition.is_empty() {
+                return Err(unsupported_trigger_body());
+            }
+            Some(super::parser::parse_expr(condition, arena)?)
+        } else {
+            return Err(unsupported_trigger_body());
+        };
+        (Some(SqlName::parse(label)?), condition)
+    };
+    let unwind = match label {
+        Some(label) => loop_labels
+            .iter()
+            .rev()
+            .position(|candidate| *candidate == Some(label))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "there is no label \"{}\" attached to any enclosing loop",
+                    label.as_str()
+                )
+            })? as u8,
+        None => 0,
     };
     Ok(Some(if is_exit {
-        TriggerLoopControl::Exit(condition)
+        TriggerLoopControl::Exit { condition, unwind }
     } else {
-        TriggerLoopControl::Continue(condition)
+        TriggerLoopControl::Continue { condition, unwind }
     }))
+}
+
+fn loop_control_for_label<'a>(
+    is_exit: bool,
+    label: &str,
+    condition: Option<&'a Expr<'a>>,
+    loop_labels: &[Option<SqlName>],
+) -> Result<TriggerLoopControl<'a>, SqlError> {
+    let label = SqlName::parse(label)?;
+    let unwind = loop_labels
+        .iter()
+        .rev()
+        .position(|candidate| *candidate == Some(label))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "there is no label \"{}\" attached to any enclosing loop",
+                label.as_str()
+            )
+        })? as u8;
+    Ok(if is_exit {
+        TriggerLoopControl::Exit { condition, unwind }
+    } else {
+        TriggerLoopControl::Continue { condition, unwind }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -7474,7 +7563,7 @@ fn trigger_tail<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
 fn parse_trigger_statement<'a>(
     segment: &'a str,
     arena: &'a Arena,
-    loop_depth: usize,
+    loop_labels: &[Option<SqlName>],
 ) -> Result<TriggerStatement<'a>, SqlError> {
     if let Some(result) = parse_trigger_return(segment)? {
         return Ok(TriggerStatement::Return(result));
@@ -7491,12 +7580,12 @@ fn parse_trigger_statement<'a>(
     if let Some(query) = parse_trigger_perform(segment, arena)? {
         return Ok(TriggerStatement::Perform(query));
     }
-    if let Some(control) = parse_trigger_loop_control(segment, arena)? {
-        if loop_depth == 0 {
+    if let Some(control) = parse_trigger_loop_control(segment, arena, loop_labels)? {
+        if loop_labels.is_empty() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "{} cannot be used outside a loop",
-                if matches!(control, TriggerLoopControl::Exit(_)) {
+                if matches!(control, TriggerLoopControl::Exit { .. }) {
                     "EXIT"
                 } else {
                     "CONTINUE"
@@ -7518,6 +7607,7 @@ fn parse_trigger_block<'a>(
     segments: &[Option<&'a str>],
     at: &mut usize,
     arena: &'a Arena,
+    loop_labels: &mut [Option<SqlName>; MAX_COLUMNS],
     loop_depth: usize,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
     let mut statements = [None; MAX_COLUMNS];
@@ -7604,6 +7694,17 @@ fn parse_trigger_block<'a>(
             return Err(unsupported_trigger_body());
         }
         *at += 1;
+        let (loop_label, loop_header) = trigger_loop_label(segment)?;
+        if loop_depth == loop_labels.len()
+            && (strip_trigger_keyword(loop_header, "for").is_some()
+                || strip_trigger_keyword(loop_header, "while").is_some()
+                || is_trigger_loop_header(loop_header))
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "trigger program nesting exceeds the loop limit"
+            ));
+        }
         let statement = if let Some(condition) = strip_trigger_keyword(segment, "if") {
             let Some(condition) = trigger_tail(condition, "then") else {
                 return Err(unsupported_trigger_body());
@@ -7612,7 +7713,8 @@ fn parse_trigger_block<'a>(
             let mut branch_count = 0;
             let mut condition = Some(super::parser::parse_expr(condition, arena)?);
             loop {
-                let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth)?;
+                let (block, ending) =
+                    parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
                 branches[branch_count] = Some(TriggerBranch { condition, block });
                 branch_count += 1;
                 match ending {
@@ -7620,7 +7722,8 @@ fn parse_trigger_block<'a>(
                         condition = Some(super::parser::parse_expr(next, arena)?);
                     }
                     TriggerBlockEnd::Else if branch_count < MAX_COLUMNS => {
-                        let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth)?;
+                        let (block, ending) =
+                            parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
                         if !matches!(ending, TriggerBlockEnd::EndIf) {
                             return Err(unsupported_trigger_body());
                         }
@@ -7647,7 +7750,8 @@ fn parse_trigger_block<'a>(
                 })?;
             TriggerStatement::If(TriggerIf { branches })
         } else if strip_trigger_keyword(segment, "begin").is_some() {
-            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth)?;
+            let (block, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
             if !matches!(ending, TriggerBlockEnd::End) {
                 return Err(unsupported_trigger_body());
             }
@@ -7665,8 +7769,11 @@ fn parse_trigger_block<'a>(
                     )
                 })?;
             TriggerStatement::If(TriggerIf { branches })
-        } else if let Some((target, source)) = parse_trigger_for_header(segment, arena)? {
-            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth + 1)?;
+        } else if let Some((target, source)) = parse_trigger_for_header(loop_header, arena)? {
+            loop_labels[loop_depth] = loop_label;
+            let (block, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
             }
@@ -7675,20 +7782,26 @@ fn parse_trigger_block<'a>(
                 source,
                 block,
             })
-        } else if let Some(condition) = parse_trigger_while_header(segment, arena)? {
-            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth + 1)?;
+        } else if let Some(condition) = parse_trigger_while_header(loop_header, arena)? {
+            loop_labels[loop_depth] = loop_label;
+            let (block, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
             }
             TriggerStatement::While(TriggerWhile { condition, block })
-        } else if is_trigger_loop_header(segment) {
-            let (block, ending) = parse_trigger_block(segments, at, arena, loop_depth + 1)?;
+        } else if is_trigger_loop_header(loop_header) {
+            loop_labels[loop_depth] = loop_label;
+            let (block, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
             }
             TriggerStatement::Loop(block)
         } else {
-            parse_trigger_statement(segment, arena, loop_depth)?
+            parse_trigger_statement(segment, arena, &loop_labels[..loop_depth])?
         };
         saw_return = matches!(statement, TriggerStatement::Return(_));
         statements[statement_count] = Some(statement);
@@ -7751,7 +7864,9 @@ fn parse_trigger_program<'a>(
     };
     let (segments, count) = split_trigger_statements(body)?;
     let mut at = 0;
-    let (body, ending) = parse_trigger_block(&segments[..count], &mut at, arena, 0)?;
+    let mut loop_labels = [None; MAX_COLUMNS];
+    let (body, ending) =
+        parse_trigger_block(&segments[..count], &mut at, arena, &mut loop_labels, 0)?;
     if !matches!(ending, TriggerBlockEnd::End) || at != count {
         return Err(unsupported_trigger_body());
     }
@@ -7803,6 +7918,24 @@ mod trigger_program_tests {
             [
                 Some("FOR item IN REVERSE 1..5 BY 2 LOOP"),
                 Some("INSERT INTO audit VALUES (item)"),
+                Some("END LOOP"),
+                Some("RETURN NEW"),
+                Some("END"),
+            ]
+        );
+    }
+
+    #[test]
+    fn labelled_loop_header_splits_before_its_first_action() {
+        let (segments, count) = split_trigger_statements(
+            "<<outer>> LOOP INSERT INTO audit VALUES (1); END LOOP; RETURN NEW; END",
+        )
+        .unwrap();
+        assert_eq!(
+            segments[..count],
+            [
+                Some("<<outer>> LOOP"),
+                Some("INSERT INTO audit VALUES (1)"),
                 Some("END LOOP"),
                 Some("RETURN NEW"),
                 Some("END"),
@@ -7875,6 +8008,23 @@ where
         {
             return Ok(self.values[index]);
         }
+        if let Some(qualifier) = qualifier
+            && let Some(index) = self.local_index(qualifier)
+            && let Datum::Record(fields) = self.values[index]
+        {
+            return fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(name))
+                .map(|field| field.value)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "record \"{}\" has no field \"{}\"",
+                        qualifier,
+                        name
+                    )
+                });
+        }
         self.transition.lookup(qualifier, name)
     }
 
@@ -7887,6 +8037,17 @@ where
             .then(|| self.local_index(name))
             .flatten()
             .map(|index| self.locals[index].ctype)
+            .or_else(|| {
+                qualifier
+                    .and_then(|qualifier| self.local_index(qualifier))
+                    .and_then(|index| match self.values[index] {
+                        Datum::Record(fields) => fields
+                            .iter()
+                            .find(|field| field.name.eq_ignore_ascii_case(name))
+                            .and_then(|field| ColType::from_oid(field.type_oid)),
+                        _ => None,
+                    })
+            })
             .or_else(|| self.transition.col_type(qualifier, name))
     }
 
@@ -8298,6 +8459,80 @@ where
     Ok(&*rows)
 }
 
+fn materialize_trigger_for_record_query<'result, 'query>(
+    storage: &'query Storage,
+    query: &'query Select<'query>,
+    query_arena: &'query Arena,
+    result_arena: &'result Arena,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    scope: &TriggerLocalScope<'_, 'result>,
+) -> Result<&'result [Datum<'result>], SqlError>
+where
+    'result: 'query,
+{
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
+    let mut count = 0usize;
+    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+    super::query::select_into_rows_recycling(
+        storage,
+        txid,
+        query,
+        query_arena,
+        crate::sql::eval::NO_PARAMS,
+        Some(scope),
+        Some(&dry),
+        &mut |values| {
+            if values.len() != width {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "trigger FOR row shape changed during execution"
+                ));
+            }
+            count += 1;
+            Ok(())
+        },
+    )?;
+    let rows = result_arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let mut at = 0usize;
+    super::query::select_into_rows(
+        storage,
+        txid,
+        query,
+        query_arena,
+        crate::sql::eval::NO_PARAMS,
+        Some(scope),
+        Some(&live),
+        &mut |values| {
+            let mut fields = [RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            }; MAX_PROJ];
+            for index in 0..width {
+                fields[index] = RecordField {
+                    name: result_arena
+                        .alloc_str(columns[index].name)
+                        .map_err(|_| super::query::arena_full_pub())?,
+                    type_oid: columns[index].type_oid,
+                    value: detached_trigger_datum(values[index], result_arena)?,
+                };
+            }
+            let fields = result_arena
+                .alloc_slice_copy(&fields[..width])
+                .map_err(|_| super::query::arena_full_pub())?;
+            rows[at] = Datum::Record(&*fields);
+            at += 1;
+            Ok(())
+        },
+    )?;
+    Ok(&*rows)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger block carries the complete typed firing context"
@@ -8384,9 +8619,9 @@ fn execute_trigger_block<'a>(
                 assign_trigger_local(locals, local_values, assignment.name, value, context.arena)?;
             }
             TriggerStatement::LoopControl(control) => {
-                let condition = match control {
-                    TriggerLoopControl::Exit(condition)
-                    | TriggerLoopControl::Continue(condition) => condition,
+                let (condition, unwind) = match control {
+                    TriggerLoopControl::Exit { condition, unwind }
+                    | TriggerLoopControl::Continue { condition, unwind } => (condition, unwind),
                 };
                 let selected = match condition {
                     Some(condition) => trigger_condition(
@@ -8402,8 +8637,8 @@ fn execute_trigger_block<'a>(
                 };
                 if selected {
                     return Ok(Some(match control {
-                        TriggerLoopControl::Exit(_) => TriggerFlow::Exit,
-                        TriggerLoopControl::Continue(_) => TriggerFlow::Continue,
+                        TriggerLoopControl::Exit { .. } => TriggerFlow::Exit(unwind),
+                        TriggerLoopControl::Continue { .. } => TriggerFlow::Continue(unwind),
                     }));
                 }
             }
@@ -8766,7 +9001,7 @@ fn execute_trigger_block<'a>(
                 }
             }
             TriggerStatement::For(program) => {
-                trigger_local_index(locals, program.target)?;
+                let target = trigger_local_index(locals, program.target)?;
                 match program.source {
                     TriggerForSource::Numeric {
                         lower,
@@ -8847,8 +9082,14 @@ fn execute_trigger_block<'a>(
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
                                 }
-                                Some(TriggerFlow::Exit) => break,
-                                Some(TriggerFlow::Continue) | None => {}
+                                Some(TriggerFlow::Exit(0)) => break,
+                                Some(TriggerFlow::Continue(0)) | None => {}
+                                Some(TriggerFlow::Exit(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                                }
+                                Some(TriggerFlow::Continue(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                                }
                             }
                             let Some(next) = (if reverse {
                                 value.checked_sub(step)
@@ -8882,15 +9123,27 @@ fn execute_trigger_block<'a>(
                                 values: &local_values[..locals.len()],
                                 transition: &transition,
                             };
-                            materialize_trigger_for_query(
-                                context.storage,
-                                query,
-                                context.arena,
-                                context.arena,
-                                context.txn.txid,
-                                context.seq_session,
-                                &scope,
-                            )?
+                            if locals[target].ctype == ColType::Record {
+                                materialize_trigger_for_record_query(
+                                    context.storage,
+                                    query,
+                                    context.arena,
+                                    context.arena,
+                                    context.txn.txid,
+                                    context.seq_session,
+                                    &scope,
+                                )?
+                            } else {
+                                materialize_trigger_for_query(
+                                    context.storage,
+                                    query,
+                                    context.arena,
+                                    context.arena,
+                                    context.txn.txid,
+                                    context.seq_session,
+                                    &scope,
+                                )?
+                            }
                         };
                         for value in values.iter().copied() {
                             assign_trigger_local(
@@ -8914,8 +9167,14 @@ fn execute_trigger_block<'a>(
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
                                 }
-                                Some(TriggerFlow::Exit) => break,
-                                Some(TriggerFlow::Continue) | None => {}
+                                Some(TriggerFlow::Exit(0)) => break,
+                                Some(TriggerFlow::Continue(0)) | None => {}
+                                Some(TriggerFlow::Exit(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                                }
+                                Some(TriggerFlow::Continue(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                                }
                             }
                         }
                     }
@@ -8947,8 +9206,14 @@ fn execute_trigger_block<'a>(
                     Some(TriggerFlow::Return(result)) => {
                         return Ok(Some(TriggerFlow::Return(result)));
                     }
-                    Some(TriggerFlow::Exit) => break,
-                    Some(TriggerFlow::Continue) | None => {}
+                    Some(TriggerFlow::Exit(0)) => break,
+                    Some(TriggerFlow::Continue(0)) | None => {}
+                    Some(TriggerFlow::Exit(unwind)) => {
+                        return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                    }
+                    Some(TriggerFlow::Continue(unwind)) => {
+                        return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                    }
                 }
             },
             TriggerStatement::Loop(block) => loop {
@@ -8966,8 +9231,14 @@ fn execute_trigger_block<'a>(
                     Some(TriggerFlow::Return(result)) => {
                         return Ok(Some(TriggerFlow::Return(result)));
                     }
-                    Some(TriggerFlow::Exit) => break,
-                    Some(TriggerFlow::Continue) | None => {}
+                    Some(TriggerFlow::Exit(0)) => break,
+                    Some(TriggerFlow::Continue(0)) | None => {}
+                    Some(TriggerFlow::Exit(unwind)) => {
+                        return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                    }
+                    Some(TriggerFlow::Continue(unwind)) => {
+                        return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                    }
                 }
             },
             TriggerStatement::If(program) => {
@@ -9133,7 +9404,7 @@ fn fire_row_triggers<'a>(
                 TriggerReturn::New if before && new.is_none() => return Ok(false),
                 _ => {}
             },
-            Some(TriggerFlow::Exit | TriggerFlow::Continue) => {
+            Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
                 return Err(unsupported_trigger_body());
             }
             None => return Err(unsupported_trigger_body()),
@@ -9362,7 +9633,7 @@ fn fire_statement_triggers_with_rows<'a>(
             program.body,
         )? {
             Some(TriggerFlow::Return(_)) => {}
-            Some(TriggerFlow::Exit | TriggerFlow::Continue) | None => {
+            Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) | None => {
                 return Err(unsupported_trigger_body());
             }
         }

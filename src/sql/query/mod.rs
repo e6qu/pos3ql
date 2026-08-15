@@ -2035,7 +2035,7 @@ pub fn describe_stored_query<'a>(
     describe_select(select, storage, txid, arena, out)
 }
 
-fn describe_select<'a>(
+pub(crate) fn describe_select<'a>(
     sel: &'a crate::sql::ast::Select<'a>,
     storage: &'a Storage,
     txid: u32,

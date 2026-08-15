@@ -8598,6 +8598,39 @@ fn trigger_program_locals_scope_joined_update_and_delete() {
 }
 
 #[test]
+fn trigger_program_locals_scope_insert_select() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_insert_select_driver (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_insert_select_source (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_insert_select_target (id integer PRIMARY KEY, value integer);
+         INSERT INTO trigger_insert_select_driver VALUES (1, 5);
+         INSERT INTO trigger_insert_select_source VALUES (1, 10), (2, 20);
+         CREATE FUNCTION trigger_insert_select_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE step integer := NEW.value - OLD.value;
+            BEGIN
+              INSERT INTO trigger_insert_select_target
+                SELECT source.id, source.value + step
+                  FROM trigger_insert_select_source source
+                 WHERE source.id = NEW.id AND step = 2;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_insert_select_before BEFORE UPDATE ON trigger_insert_select_driver
+           FOR EACH ROW EXECUTE FUNCTION trigger_insert_select_program();
+         UPDATE trigger_insert_select_driver SET value = 7 WHERE id = 1;
+         SELECT id, value FROM trigger_insert_select_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|12"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_when_and_update_of_are_typed_and_selective() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

@@ -225,3 +225,22 @@ CREATE TRIGGER trigger_transition_dml_after AFTER UPDATE ON trigger_transition_d
   EXECUTE FUNCTION trigger_transition_dml_program();
 UPDATE trigger_transition_dml_driver SET delta = delta;
 SELECT id, value FROM trigger_transition_dml_target ORDER BY id;
+
+CREATE TABLE trigger_insert_select_driver (id integer PRIMARY KEY, value integer);
+CREATE TABLE trigger_insert_select_source (id integer PRIMARY KEY, value integer);
+CREATE TABLE trigger_insert_select_target (id integer PRIMARY KEY, value integer);
+INSERT INTO trigger_insert_select_driver VALUES (1, 5);
+INSERT INTO trigger_insert_select_source VALUES (1, 10), (2, 20);
+CREATE FUNCTION trigger_insert_select_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE step integer := NEW.value - OLD.value;
+   BEGIN
+     INSERT INTO trigger_insert_select_target
+       SELECT source.id, source.value + step
+         FROM trigger_insert_select_source source
+        WHERE source.id = NEW.id AND step = 2;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_insert_select_before BEFORE UPDATE ON trigger_insert_select_driver
+  FOR EACH ROW EXECUTE FUNCTION trigger_insert_select_program();
+UPDATE trigger_insert_select_driver SET value = 7 WHERE id = 1;
+SELECT id, value FROM trigger_insert_select_target ORDER BY id;

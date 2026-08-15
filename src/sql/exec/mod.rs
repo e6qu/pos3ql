@@ -6553,6 +6553,15 @@ enum TriggerDml<'a> {
 
 static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 
+/// The INSERT source is either evaluated by the ordinary executor or already
+/// encoded by a trigger's short-lived read phase. The latter has no reference
+/// to storage, so the subsequent write phase cannot overlap a source borrow.
+#[derive(Clone, Copy)]
+pub enum InsertSource<'a> {
+    Statement,
+    MaterializedSelect(&'a [&'a [u8]]),
+}
+
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
     Assign(TriggerAssignment<'a>),
@@ -7538,8 +7547,11 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     }
 }
 
-impl<'a> ColumnLookup<'a> for TriggerLocalScope<'_, 'a> {
-    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored>
+where
+    'stored: 'value,
+{
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
             return self.transition.lookup(qualifier, name);
@@ -7587,6 +7599,60 @@ impl<'a> ColumnLookup<'a> for TriggerLocalScope<'_, 'a> {
             self.transition.column_domain(qualifier, name)
         }
     }
+}
+
+fn materialize_trigger_insert_source<'result, 'query>(
+    storage: &'query Storage,
+    select: &'query Select<'query>,
+    query_arena: &'query Arena,
+    result_arena: &'result Arena,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    scope: &TriggerLocalScope<'_, 'result>,
+) -> Result<&'result [&'result [u8]], SqlError>
+where
+    'result: 'query,
+{
+    let mut count = 0usize;
+    {
+        let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+        super::query::select_into_rows_recycling(
+            storage,
+            txid,
+            select,
+            query_arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(&dry),
+            &mut |_| {
+                count += 1;
+                Ok(())
+            },
+        )?;
+    }
+    const EMPTY: &[u8] = &[];
+    let rows = result_arena
+        .alloc_slice_with(count, |_| EMPTY)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut at = 0usize;
+    {
+        let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        super::query::select_into_rows(
+            storage,
+            txid,
+            select,
+            query_arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(&live),
+            &mut |values| {
+                rows[at] = encode_projected_pub(values, result_arena)?;
+                at += 1;
+                Ok(())
+            },
+        )?;
+    }
+    Ok(&*rows)
 }
 
 fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -7873,6 +7939,30 @@ fn execute_trigger_block<'a>(
                     values: &local_values[..locals.len()],
                     transition: &transition,
                 };
+                let prepared_select = match statement.select {
+                    Some(select) => {
+                        let select = match transition_relations {
+                            Some(relations) => super::query::bind_materialized_relations(
+                                select,
+                                relations,
+                                context.storage,
+                                context.txn.txid,
+                                context.arena,
+                            )?,
+                            None => select,
+                        };
+                        Some(materialize_trigger_insert_source(
+                            context.storage,
+                            select,
+                            context.arena,
+                            context.arena,
+                            context.txn.txid,
+                            context.seq_session,
+                            &scope,
+                        )?)
+                    }
+                    None => None,
+                };
                 let scratch = unsafe { &mut *context.scratch };
                 context.txn.enter_trigger_sql()?;
                 let outcome = context.responder.without_command_complete(|responder| {
@@ -7888,6 +7978,8 @@ fn execute_trigger_block<'a>(
                         None,
                         Some(&scope),
                         transition_relations,
+                        prepared_select
+                            .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                     )
                 });
                 context.txn.leave_trigger_sql();
@@ -16883,6 +16975,7 @@ pub fn insert<'a, 'scope>(
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     transition: Option<&'scope dyn ColumnLookup<'a>>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    source: InsertSource<'a>,
 ) -> Outcome {
     let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
     let capturing = capture.is_some();
@@ -17018,69 +17111,71 @@ pub fn insert<'a, 'scope>(
     // (reading storage immutably), then insert them (mutably) — the source may
     // read the very table being written, so the two phases must not overlap.
     if let Some(sel) = statement.select {
-        let sel = match transition_relations {
-            Some(relations) => match super::query::bind_materialized_relations(
-                sel, relations, storage, txn.txid, arena,
-            ) {
-                Ok(select) => select,
-                Err(error) => return sql_fail(error),
-            },
-            None => sel,
-        };
-        // Pass 1: count. A "dry" sequence evaluator resolves names (so errors
-        // still surface) but does not advance any generator — the real advance
-        // happens once, in the encoding pass.
-        let mut count = 0usize;
-        {
-            let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows_recycling(
-                storage,
-                txn.txid,
-                sel,
-                arena,
-                params,
-                None,
-                Some(&dry),
-                &mut |_| {
-                    count += 1;
+        let (rows_bytes, count): (&[&[u8]], usize) =
+            if let InsertSource::MaterializedSelect(rows) = source {
+                (rows, rows.len())
+            } else {
+                let sel = match transition_relations {
+                    Some(relations) => match super::query::bind_materialized_relations(
+                        sel, relations, storage, txn.txid, arena,
+                    ) {
+                        Ok(select) => select,
+                        Err(error) => return sql_fail(error),
+                    },
+                    None => sel,
+                };
+                let mut count = 0usize;
+                {
+                    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
+                    if let Err(e) = super::query::select_into_rows_recycling(
+                        storage,
+                        txn.txid,
+                        sel,
+                        arena,
+                        params,
+                        None,
+                        Some(&dry),
+                        &mut |_| {
+                            count += 1;
+                            Ok(())
+                        },
+                    ) {
+                        return sql_fail(e);
+                    }
+                }
+                let empty: &[u8] = &[];
+                let rows: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "INSERT ... SELECT result exceeds the statement arena"
+                        ));
+                    }
+                };
+                let mut at = 0usize;
+                let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
+                    rows[at] = encode_projected_pub(vals, arena)?;
+                    at += 1;
                     Ok(())
-                },
-            ) {
-                return sql_fail(e);
-            }
-        }
-        // Pass 2: encode each projected row to self-describing arena bytes.
-        let empty: &[u8] = &[];
-        let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
-            Ok(r) => r,
-            Err(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "INSERT ... SELECT result exceeds the statement arena"
-                ));
-            }
-        };
-        let mut at = 0usize;
-        let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
-            rows_bytes[at] = encode_projected_pub(vals, arena)?;
-            at += 1;
-            Ok(())
-        };
-        {
-            let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            if let Err(e) = super::query::select_into_rows(
-                storage,
-                txn.txid,
-                sel,
-                arena,
-                params,
-                None,
-                Some(&live),
-                &mut fill,
-            ) {
-                return sql_fail(e);
-            }
-        }
+                };
+                {
+                    let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    if let Err(e) = super::query::select_into_rows(
+                        storage,
+                        txn.txid,
+                        sel,
+                        arena,
+                        params,
+                        None,
+                        Some(&live),
+                        &mut fill,
+                    ) {
+                        return sql_fail(e);
+                    }
+                }
+                (&*rows, count)
+            };
 
         let default_exprs = match parse_defaults(&def, arena) {
             Ok(d) => d,
@@ -17266,6 +17361,12 @@ pub fn insert<'a, 'scope>(
             responder.command_complete(tag.as_str())?;
         }
         return sql_ok();
+    }
+    if matches!(source, InsertSource::MaterializedSelect(_)) {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "materialized INSERT source requires INSERT ... SELECT"
+        ));
     }
 
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED

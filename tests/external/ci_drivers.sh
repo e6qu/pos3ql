@@ -66,10 +66,20 @@ diff_driver() { # name  build-and-run-fn
 JDBC_VER=42.7.4
 JAR="$WORK/postgresql-$JDBC_VER.jar"
 if command -v javac >/dev/null; then
-  curl -sSL -o "$JAR" "https://repo1.maven.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar"
-  javac -d "$WORK" "$DRV/JdbcTest.java"
-  jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
-  diff_driver jdbc jdbc
+  # A failed Maven response used to be treated as a Java classpath entry,
+  # making two different "No suitable driver" strings look like a protocol
+  # mismatch. Retry the one canonical artifact URL, then verify the archive
+  # before declaring the mandatory driver check runnable.
+  if curl --fail --silent --show-error --location --retry 2 --retry-all-errors \
+      --connect-timeout 10 --max-time 30 -o "$JAR" \
+      "https://repo1.maven.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar" \
+      && jar tf "$JAR" >/dev/null; then
+    javac -d "$WORK" "$DRV/JdbcTest.java"
+    jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
+    diff_driver jdbc jdbc
+  else
+    bad "jdbc (driver artifact unavailable or invalid)"
+  fi
 else
   echo "SKIP: jdbc (no javac)"
 fi

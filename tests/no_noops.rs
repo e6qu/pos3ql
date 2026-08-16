@@ -19,3 +19,21 @@ fn no_untracked_noops() {
         "no-op guard failed — a new untracked no-op was introduced:\n{stdout}\n{stderr}"
     );
 }
+
+#[test]
+fn jdbc_differential_never_compares_missing_driver_failures() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/external/ci_drivers.sh");
+    let source = std::fs::read_to_string(path).expect("readable driver harness");
+    assert!(
+        source.contains("curl --fail --silent --show-error --location --retry 2"),
+        "the mandatory JDBC artifact fetch must fail loudly after bounded retries"
+    );
+    assert!(
+        source.contains("jar tf \"$JAR\" >/dev/null"),
+        "the JDBC artifact must be verified before a transcript is compared"
+    );
+    assert!(
+        source.contains("jdbc (driver artifact unavailable or invalid)"),
+        "an unavailable JDBC artifact must fail the driver job, not emulate a protocol diff"
+    );
+}

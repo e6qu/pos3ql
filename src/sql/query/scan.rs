@@ -82,7 +82,8 @@ mod tests {
         let mut proof = PaxColumnDemand::empty();
         proof.observe(1, 3);
 
-        assert_eq!(PaxReadDemand::full_row().selected_mask(1), None);
+        let full = PaxReadDemand::full_row(super::PaxFullRowReason::WildcardProjection);
+        assert_eq!(full.selected_mask(1), None);
         assert_eq!(PaxReadDemand::selected(proof).selected_mask(0), Some(0));
         assert_eq!(
             PaxReadDemand::selected(proof).selected_mask(1),
@@ -118,35 +119,60 @@ struct PaxColumnDemand {
     masks: [u64; MAX_JOIN_TABLES],
 }
 
+/// Why a source intentionally uses full-row decoding.
+///
+/// A full row is a protocol mode, never an absent or accidental demand proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PaxFullRowReason {
+    IncompleteScope,
+    WildcardProjection,
+    UnprovableExpression,
+}
+
 /// The only two legal physical read modes for a source scan.
 ///
 /// The selected state exists only after the query walker has proved the
 /// complete set of observable base fields. Full-row state is explicit for
 /// whole-row or derived expressions; it is never an absent proof.
 #[derive(Clone, Copy)]
-pub(super) struct PaxReadDemand {
-    selected: bool,
-    columns: PaxColumnDemand,
+pub(super) struct PaxReadDemand(PaxReadMode);
+
+#[derive(Clone, Copy)]
+enum PaxReadMode {
+    FullRow {
+        reason: PaxFullRowReason,
+        columns: PaxColumnDemand,
+    },
+    Selected(PaxColumnDemand),
 }
 
 impl PaxReadDemand {
-    pub(super) const fn full_row() -> Self {
-        Self {
-            selected: false,
+    pub(super) const fn full_row(reason: PaxFullRowReason) -> Self {
+        Self(PaxReadMode::FullRow {
+            reason,
             columns: PaxColumnDemand::empty(),
-        }
+        })
     }
 
     fn selected(columns: PaxColumnDemand) -> Self {
-        Self {
-            selected: true,
-            columns,
-        }
+        Self(PaxReadMode::Selected(columns))
     }
 
     /// The selected PAX fields for `table`, if this scan has a proof.
     fn selected_mask(self, table: usize) -> Option<u64> {
-        self.selected.then(|| self.columns.mask(table))
+        match self.0 {
+            PaxReadMode::FullRow {
+                reason:
+                    PaxFullRowReason::IncompleteScope
+                    | PaxFullRowReason::WildcardProjection
+                    | PaxFullRowReason::UnprovableExpression,
+                columns,
+            } => {
+                debug_assert!(columns.masks.iter().all(|mask| *mask == 0));
+                None
+            }
+            PaxReadMode::Selected(columns) => Some(columns.mask(table)),
+        }
     }
 }
 
@@ -180,11 +206,11 @@ pub(super) fn pax_column_demand(
     expressions: &[&Expr],
 ) -> PaxReadDemand {
     if scope.n == 0 || scope.defs[..scope.n].iter().any(Option::is_none) {
-        return PaxReadDemand::full_row();
+        return PaxReadDemand::full_row(PaxFullRowReason::IncompleteScope);
     }
     pax_column_demand_bounded(scope, from, expressions)
         .map(PaxReadDemand::selected)
-        .unwrap_or_else(PaxReadDemand::full_row)
+        .unwrap_or_else(|| PaxReadDemand::full_row(PaxFullRowReason::UnprovableExpression))
 }
 
 #[inline(never)]

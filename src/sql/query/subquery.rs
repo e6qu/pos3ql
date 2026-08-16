@@ -567,7 +567,7 @@ pub(super) fn correlated_scan_conjuncts<'a>(
     Ok(selected)
 }
 
-pub(super) fn walk_children<'a>(
+pub(crate) fn walk_children<'a>(
     expression: &'a Expr<'a>,
     f: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
@@ -580,9 +580,40 @@ pub(super) fn walk_children<'a>(
             f(left)?;
             f(right)
         }
-        Expr::Call { args, .. } => {
+        Expr::Call {
+            args,
+            order_by,
+            over,
+            filter,
+            ..
+        } => {
             for a in *args {
                 f(a)?;
+            }
+            for order in *order_by {
+                f(order.expression)?;
+            }
+            if let Some(filter) = filter {
+                f(filter)?;
+            }
+            if let Some(window) = over {
+                for expression in window.partition_by {
+                    f(expression)?;
+                }
+                for order in window.order_by {
+                    f(order.expression)?;
+                }
+                if let Some(frame) = window.frame {
+                    for bound in [frame.start, frame.end] {
+                        match bound {
+                            crate::sql::ast::FrameBound::Preceding(expression)
+                            | crate::sql::ast::FrameBound::Following(expression) => f(expression)?,
+                            crate::sql::ast::FrameBound::UnboundedPreceding
+                            | crate::sql::ast::FrameBound::CurrentRow
+                            | crate::sql::ast::FrameBound::UnboundedFollowing => {}
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -601,9 +632,19 @@ pub(super) fn walk_children<'a>(
             f(high)
         }
         Expr::Like {
-            operand, pattern, ..
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            f(operand)?;
+            f(pattern)?;
+            if let Some(escape) = escape {
+                f(escape)?;
+            }
+            Ok(())
         }
-        | Expr::Match {
+        Expr::Match {
             operand, pattern, ..
         } => {
             f(operand)?;
@@ -632,6 +673,26 @@ pub(super) fn walk_children<'a>(
         Expr::AnyAll { operand, array, .. } => {
             f(operand)?;
             f(array)
+        }
+        Expr::Array(elements) => {
+            for element in *elements {
+                f(element)?;
+            }
+            Ok(())
+        }
+        Expr::Subscript { base, index } => {
+            f(base)?;
+            f(index)
+        }
+        Expr::Slice { base, lower, upper } => {
+            f(base)?;
+            if let Some(lower) = lower {
+                f(lower)?;
+            }
+            if let Some(upper) = upper {
+                f(upper)?;
+            }
+            Ok(())
         }
         Expr::Field { base, .. } => f(base),
         _ => Ok(()),

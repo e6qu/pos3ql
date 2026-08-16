@@ -454,3 +454,40 @@ CREATE TRIGGER trigger_stacked_diagnostic_before BEFORE INSERT ON trigger_stacke
   FOR EACH ROW EXECUTE FUNCTION trigger_stacked_diagnostic_program();
 INSERT INTO trigger_stacked_diagnostic_target VALUES (7);
 SELECT code, message, detail, hint FROM trigger_stacked_diagnostic_audit;
+
+CREATE TABLE trigger_diagnostic_surface_target (id integer PRIMARY KEY);
+CREATE TABLE trigger_diagnostic_surface_audit (
+  state text, message text, detail text, hint text,
+  current_context boolean, exception_context boolean,
+  column_name text, constraint_name text, datatype_name text, table_name text, schema_name text
+);
+CREATE FUNCTION trigger_diagnostic_surface_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE state text; message text; detail text; hint text;
+           current_context text; exception_context text;
+           column_name text; constraint_name text; datatype_name text; table_name text; schema_name text;
+   BEGIN
+     BEGIN
+       RAISE EXCEPTION USING ERRCODE = ''ZX123'', MESSAGE = ''typed failure'',
+                             DETAIL = ''typed detail'', HINT = ''typed hint'';
+     EXCEPTION WHEN SQLSTATE ''ZX123'' THEN
+       GET DIAGNOSTICS current_context = PG_CONTEXT;
+       GET STACKED DIAGNOSTICS exception_context = PG_EXCEPTION_CONTEXT,
+                               column_name = COLUMN_NAME,
+                               constraint_name = CONSTRAINT_NAME,
+                               datatype_name = PG_DATATYPE_NAME,
+                               table_name = TABLE_NAME,
+                               schema_name = SCHEMA_NAME,
+                               detail = PG_EXCEPTION_DETAIL,
+                               hint = PG_EXCEPTION_HINT;
+       state := SQLSTATE;
+       message := SQLERRM;
+       INSERT INTO trigger_diagnostic_surface_audit VALUES
+         (state, message, detail, hint, current_context <> '''', exception_context <> '''',
+          column_name, constraint_name, datatype_name, table_name, schema_name);
+     END;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_diagnostic_surface_before BEFORE INSERT ON trigger_diagnostic_surface_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_diagnostic_surface_program();
+INSERT INTO trigger_diagnostic_surface_target VALUES (1);
+SELECT * FROM trigger_diagnostic_surface_audit;

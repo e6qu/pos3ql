@@ -8213,6 +8213,146 @@ fn trigger_context_names_cannot_be_shadowed_by_locals() {
 }
 
 #[test]
+fn trigger_case_and_foreach_array_are_typed_control_primitives() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_control_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_control_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer; total integer := 0;
+            BEGIN
+              CASE NEW.id
+                WHEN 1 THEN total := 10;
+                WHEN 2 THEN total := 20;
+                ELSE total := 30;
+              END CASE;
+              CASE
+                WHEN total = 20 THEN total := total + 5;
+                ELSE total := total + 3;
+              END CASE;
+              FOREACH item IN ARRAY ARRAY[1, 2, 3] LOOP
+                total := total + item;
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_control_before BEFORE INSERT ON trigger_control_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_control_function();
+         INSERT INTO trigger_control_target VALUES (1, 0), (2, 0), (3, 0);
+         SELECT id, value FROM trigger_control_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|19", "2|31", "3|39"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_foreach_slice_preserves_array_rank_and_bounds() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_slice_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_slice_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE piece integer[]; total integer := 0;
+            BEGIN
+              FOREACH piece SLICE 1 IN ARRAY array_fill(1, ARRAY[2, 2], ARRAY[3, 5]) LOOP
+                total := total + piece[5] + piece[6];
+              END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_slice_before BEFORE INSERT ON trigger_slice_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_slice_function();
+         INSERT INTO trigger_slice_target VALUES (1, 0);
+         SELECT id, value FROM trigger_slice_target;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|4"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_foreach_slice_rejects_an_unrepresentable_rank() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_slice_error_target (id integer PRIMARY KEY);
+         CREATE FUNCTION trigger_slice_error_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE piece integer[];
+            BEGIN
+              FOREACH piece SLICE 2 IN ARRAY ARRAY[1, 2] LOOP END LOOP;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_slice_error_before BEFORE INSERT ON trigger_slice_error_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_slice_error_function();
+         INSERT INTO trigger_slice_error_target VALUES (1);",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("2202E"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_case_and_foreach_survive_checkpoint_recovery() {
+    let mut config = test_config("trigger-control-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("trigger-control-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_trigger_control_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION durable_trigger_control_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item integer; total integer := 0;
+            BEGIN
+              CASE WHEN NEW.id = 1 THEN total := 10; ELSE total := 20; END CASE;
+              FOREACH item IN ARRAY ARRAY[2, 3] LOOP total := total + item; END LOOP;
+              NEW.value := total;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_trigger_control_before BEFORE INSERT
+           ON durable_trigger_control_target FOR EACH ROW
+           EXECUTE FUNCTION durable_trigger_control_function();",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO durable_trigger_control_target VALUES (1, 0), (2, 0);
+         SELECT id, value FROM durable_trigger_control_target ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|15", "2|25"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn trigger_arguments_survive_checkpoint_and_recovery() {
     let mut config = test_config("trigger-arguments-recovery");
     config.object_store_on = true;

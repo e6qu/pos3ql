@@ -22,6 +22,7 @@ use crate::storage::{
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
+use core::num::NonZeroU8;
 
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
@@ -6784,6 +6785,7 @@ enum TriggerStatement<'a> {
     Perform(&'a Select<'a>),
     Dml(TriggerDml<'a>),
     If(TriggerIf<'a>),
+    Case(TriggerCase<'a>),
     For(TriggerFor<'a>),
     While(TriggerWhile<'a>),
     Loop(TriggerBlock<'a>),
@@ -6803,6 +6805,19 @@ struct TriggerIf<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct TriggerCaseBranch<'a> {
+    when: &'a Expr<'a>,
+    block: TriggerBlock<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerCase<'a> {
+    operand: Option<&'a Expr<'a>>,
+    branches: &'a [TriggerCaseBranch<'a>],
+    otherwise: Option<TriggerBlock<'a>>,
+}
+
+#[derive(Clone, Copy)]
 enum TriggerForSource<'a> {
     Numeric {
         lower: &'a Expr<'a>,
@@ -6811,6 +6826,10 @@ enum TriggerForSource<'a> {
         reverse: bool,
     },
     Query(&'a Select<'a>),
+    Array {
+        expression: &'a Expr<'a>,
+        slice: Option<NonZeroU8>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -7074,12 +7093,22 @@ fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
         .map(|(_, content)| content)
         .unwrap_or(statement);
     let content_offset = statement.len() - content.len();
+    if strip_trigger_keyword(content, "case").is_some() {
+        let when_at = trigger_top_level_keyword(content, "when")?;
+        let header = statement[..content_offset + when_at].trim_end();
+        let rest = content[when_at..].trim_start();
+        return (!rest.is_empty()).then_some((header, rest));
+    }
     let (prefix, terminator) = if strip_trigger_keyword(content, "if").is_some() {
         ("if", "then")
     } else if strip_trigger_keyword(content, "elsif").is_some() {
         ("elsif", "then")
+    } else if strip_trigger_keyword(content, "when").is_some() {
+        ("when", "then")
     } else if strip_trigger_keyword(content, "for").is_some() {
         ("for", "loop")
+    } else if strip_trigger_keyword(content, "foreach").is_some() {
+        ("foreach", "loop")
     } else if strip_trigger_keyword(content, "while").is_some() {
         ("while", "loop")
     } else if let Some(rest) = strip_trigger_keyword(content, "loop") {
@@ -7573,6 +7602,46 @@ fn parse_trigger_for_header<'a>(
     )))
 }
 
+fn parse_trigger_foreach_header<'a>(
+    segment: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<(SqlName, TriggerForSource<'a>)>, SqlError> {
+    let Some(body) = strip_trigger_keyword(segment, "foreach") else {
+        return Ok(None);
+    };
+    let Some(body) = trigger_tail(body, "loop") else {
+        return Err(unsupported_trigger_body());
+    };
+    let Some(in_at) = trigger_top_level_keyword(body, "in") else {
+        return Err(unsupported_trigger_body());
+    };
+    let target_source = body[..in_at].trim();
+    let (target, slice) = match trigger_top_level_keyword(target_source, "slice") {
+        Some(at) => {
+            let target = SqlName::parse(target_source[..at].trim())?;
+            let slice = target_source[at + 5..].trim();
+            let slice = slice
+                .parse::<u8>()
+                .map_err(|_| unsupported_trigger_body())?;
+            (target, NonZeroU8::new(slice))
+        }
+        None => (SqlName::parse(target_source)?, None),
+    };
+    let array = strip_trigger_keyword(body[in_at + 2..].trim(), "array")
+        .ok_or_else(unsupported_trigger_body)?
+        .trim();
+    if array.is_empty() {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(Some((
+        target,
+        TriggerForSource::Array {
+            expression: super::parser::parse_expr(array, arena)?,
+            slice,
+        },
+    )))
+}
+
 fn parse_trigger_while_header<'a>(
     segment: &'a str,
     arena: &'a Arena,
@@ -7699,7 +7768,9 @@ enum TriggerBlockEnd<'a> {
     End,
     Else,
     Elsif(&'a str),
+    When(&'a str),
     EndIf,
+    EndCase,
     EndLoop,
 }
 
@@ -7793,6 +7864,20 @@ fn parse_trigger_block<'a>(
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndIf));
         }
+        if segment.eq_ignore_ascii_case("end case") {
+            *at += 1;
+            let out = arena
+                .alloc_slice_with(statement_count, |index| {
+                    statements[index].expect("trigger statement initialized")
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "trigger program exceeds the statement arena"
+                    )
+                })?;
+            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndCase));
+        }
         if segment.eq_ignore_ascii_case("end loop") {
             *at += 1;
             let out = arena
@@ -7841,6 +7926,26 @@ fn parse_trigger_block<'a>(
                 TriggerBlockEnd::Elsif(condition),
             ));
         }
+        if let Some(condition) = strip_trigger_keyword(segment, "when") {
+            let Some(condition) = trigger_tail(condition, "then") else {
+                return Err(unsupported_trigger_body());
+            };
+            *at += 1;
+            let out = arena
+                .alloc_slice_with(statement_count, |index| {
+                    statements[index].expect("trigger statement initialized")
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "trigger program exceeds the statement arena"
+                    )
+                })?;
+            return Ok((
+                TriggerBlock { statements: out },
+                TriggerBlockEnd::When(condition),
+            ));
+        }
         if saw_return || statement_count == MAX_COLUMNS {
             return Err(unsupported_trigger_body());
         }
@@ -7849,6 +7954,7 @@ fn parse_trigger_block<'a>(
         if loop_depth == loop_labels.len()
             && (strip_trigger_keyword(loop_header, "for").is_some()
                 || strip_trigger_keyword(loop_header, "while").is_some()
+                || strip_trigger_keyword(loop_header, "foreach").is_some()
                 || is_trigger_loop_header(loop_header))
         {
             return Err(sql_err!(
@@ -7900,6 +8006,67 @@ fn parse_trigger_block<'a>(
                     )
                 })?;
             TriggerStatement::If(TriggerIf { branches })
+        } else if let Some(header) = strip_trigger_keyword(segment, "case") {
+            let operand = (!header.trim().is_empty())
+                .then(|| super::parser::parse_expr(header.trim(), arena))
+                .transpose()?;
+            let mut branches = [None; MAX_COLUMNS];
+            let mut branch_count = 0;
+            let Some(first) = segments.get(*at).and_then(|segment| *segment) else {
+                return Err(unsupported_trigger_body());
+            };
+            let Some(first) = strip_trigger_keyword(first, "when") else {
+                return Err(unsupported_trigger_body());
+            };
+            let Some(first) = trigger_tail(first, "then") else {
+                return Err(unsupported_trigger_body());
+            };
+            let mut when = super::parser::parse_expr(first, arena)?;
+            *at += 1;
+            loop {
+                let (block, ending) =
+                    parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                if branch_count == branches.len() {
+                    return Err(unsupported_trigger_body());
+                }
+                branches[branch_count] = Some(TriggerCaseBranch { when, block });
+                branch_count += 1;
+                match ending {
+                    TriggerBlockEnd::When(next) if branch_count < branches.len() => {
+                        when = super::parser::parse_expr(next, arena)?;
+                    }
+                    TriggerBlockEnd::Else => {
+                        let (otherwise, ending) =
+                            parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                        if !matches!(ending, TriggerBlockEnd::EndCase) {
+                            return Err(unsupported_trigger_body());
+                        }
+                        let branches = arena
+                            .alloc_slice_with(branch_count, |index| {
+                                branches[index].expect("case branch initialized")
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        break TriggerStatement::Case(TriggerCase {
+                            operand,
+                            branches,
+                            otherwise: Some(otherwise),
+                        });
+                    }
+                    TriggerBlockEnd::EndCase => {
+                        let branches = arena
+                            .alloc_slice_with(branch_count, |index| {
+                                branches[index].expect("case branch initialized")
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        break TriggerStatement::Case(TriggerCase {
+                            operand,
+                            branches,
+                            otherwise: None,
+                        });
+                    }
+                    _ => return Err(unsupported_trigger_body()),
+                }
+            }
         } else if strip_trigger_keyword(segment, "begin").is_some() {
             let (block, ending) =
                 parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
@@ -7921,6 +8088,19 @@ fn parse_trigger_block<'a>(
                 })?;
             TriggerStatement::If(TriggerIf { branches })
         } else if let Some((target, source)) = parse_trigger_for_header(loop_header, arena)? {
+            loop_labels[loop_depth] = loop_label;
+            let (block, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            loop_labels[loop_depth] = None;
+            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+                return Err(unsupported_trigger_body());
+            }
+            TriggerStatement::For(TriggerFor {
+                target,
+                source,
+                block,
+            })
+        } else if let Some((target, source)) = parse_trigger_foreach_header(loop_header, arena)? {
             loop_labels[loop_depth] = loop_label;
             let (block, ending) =
                 parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
@@ -9375,6 +9555,133 @@ fn execute_trigger_block<'a>(
                             }
                         }
                     }
+                    TriggerForSource::Array { expression, slice } => {
+                        let values = {
+                            let transition = TriggerTransition {
+                                definition,
+                                old,
+                                new: new.as_deref(),
+                            };
+                            let scope = TriggerLocalScope {
+                                locals,
+                                values: &local_values[..locals.len()],
+                                invocation,
+                                transition: &transition,
+                            };
+                            let array = eval_full(
+                                expression,
+                                context.arena,
+                                crate::sql::eval::NO_PARAMS,
+                                &scope,
+                                &NO_HOOKS,
+                            )?;
+                            let Datum::Array { element, raw } = array else {
+                                if array.is_null() {
+                                    continue;
+                                }
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "FOREACH expression must yield an array"
+                                ));
+                            };
+                            let shape =
+                                crate::sql::array::shape(raw).expect("array datum invariant");
+                            let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
+                            if slice_rank > shape.dimension_count() {
+                                return Err(sql_err!(
+                                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                                    "FOREACH SLICE {} exceeds array dimensions {}",
+                                    slice_rank,
+                                    shape.dimension_count()
+                                ));
+                            }
+                            let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
+                            let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
+                            for index in 0..slice_rank {
+                                let source = shape.dimension_count() - slice_rank + index;
+                                dimensions[index] = shape.dimension(source).unwrap();
+                                lower_bounds[index] = shape.lower_bound(source).unwrap();
+                            }
+                            let slice_shape = crate::sql::array::Shape::new(
+                                &dimensions[..slice_rank],
+                                &lower_bounds[..slice_rank],
+                            )?;
+                            let width = if slice_rank == 0 {
+                                1
+                            } else {
+                                slice_shape.element_count()
+                            };
+                            let values = context
+                                .arena
+                                .alloc_slice_with(crate::sql::array::len(raw) / width, |_| {
+                                    Datum::Null
+                                })
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            for (index, value) in values.iter_mut().enumerate() {
+                                if slice_rank == 0 {
+                                    *value = detached_trigger_datum(
+                                        crate::sql::array::get(raw, element, index)
+                                            .expect("array datum invariant"),
+                                        context.arena,
+                                    )?;
+                                } else {
+                                    let items = context
+                                        .arena
+                                        .alloc_slice_with(width, |offset| {
+                                            crate::sql::array::get(
+                                                raw,
+                                                element,
+                                                index * width + offset,
+                                            )
+                                            .expect("array datum invariant")
+                                        })
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    *value = Datum::Array {
+                                        element,
+                                        raw: crate::sql::array::build_shaped(
+                                            items,
+                                            slice_shape,
+                                            context.arena,
+                                        )?,
+                                    };
+                                }
+                            }
+                            &*values
+                        };
+                        for value in values.iter().copied() {
+                            assign_trigger_local(
+                                locals,
+                                local_values,
+                                program.target,
+                                value,
+                                context.arena,
+                            )?;
+                            match execute_trigger_block(
+                                context,
+                                definition,
+                                invocation,
+                                old,
+                                new,
+                                before,
+                                transition_relations,
+                                locals,
+                                local_values,
+                                program.block,
+                            )? {
+                                Some(TriggerFlow::Return(result)) => {
+                                    return Ok(Some(TriggerFlow::Return(result)));
+                                }
+                                Some(TriggerFlow::Exit(0)) => break,
+                                Some(TriggerFlow::Continue(0)) | None => {}
+                                Some(TriggerFlow::Exit(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                                }
+                                Some(TriggerFlow::Continue(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             TriggerStatement::While(program) => loop {
@@ -9488,6 +9795,78 @@ fn execute_trigger_block<'a>(
                         }
                         break;
                     }
+                }
+            }
+            TriggerStatement::Case(program) => {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    invocation,
+                    transition: &transition,
+                };
+                let operand = program
+                    .operand
+                    .map(|expression| {
+                        eval_full(
+                            expression,
+                            context.arena,
+                            crate::sql::eval::NO_PARAMS,
+                            &scope,
+                            &NO_HOOKS,
+                        )
+                    })
+                    .transpose()?;
+                let mut selected = None;
+                for branch in program.branches {
+                    let value = eval_full(
+                        branch.when,
+                        context.arena,
+                        crate::sql::eval::NO_PARAMS,
+                        &scope,
+                        &NO_HOOKS,
+                    )?;
+                    let matches = match operand {
+                        Some(operand) => {
+                            !operand.is_null()
+                                && !value.is_null()
+                                && compare_datums(&operand, &value)? == core::cmp::Ordering::Equal
+                        }
+                        None => match value {
+                            Datum::Bool(value) => value,
+                            Datum::Null => false,
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "CASE condition must be type boolean"
+                                ));
+                            }
+                        },
+                    };
+                    if matches {
+                        selected = Some(branch.block);
+                        break;
+                    }
+                }
+                if let Some(block) = selected.or(program.otherwise)
+                    && let Some(flow) = execute_trigger_block(
+                        context,
+                        definition,
+                        invocation,
+                        old,
+                        new,
+                        before,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        block,
+                    )?
+                {
+                    return Ok(Some(flow));
                 }
             }
         }

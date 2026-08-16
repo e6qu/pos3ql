@@ -53,6 +53,12 @@ FROM wf ORDER BY grp, val, name;
 SELECT grp, val, sum(val) FILTER (WHERE val > 10) OVER (PARTITION BY grp ORDER BY val)
 FROM wf ORDER BY grp, val, name;
 
+-- The aggregate filter, window keys, and array constructor are independent
+-- expression children and must remain visible to physical-column planning.
+SELECT grp, val, array_length(ARRAY[val], 1),
+  sum(val) FILTER (WHERE length(name) = 1) OVER (PARTITION BY name ORDER BY grp, val)
+FROM wf ORDER BY grp, val, name;
+
 -- lag / lead with offsets and defaults
 SELECT val, lag(val) OVER (ORDER BY val, name), lag(val, 2, -1) OVER (ORDER BY val, name),
   lead(val) OVER (ORDER BY val, name), lead(val, 2, -1) OVER (ORDER BY val, name)

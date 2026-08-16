@@ -84,9 +84,10 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
+pub(crate) use subquery::walk_children;
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
-    prepare_outer_subqueries, subquery_witness, walk_children,
+    prepare_outer_subqueries, subquery_witness,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 
@@ -4421,7 +4422,7 @@ fn streaming_pax_columns<'a>(
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
-                return PaxReadDemand::full_row();
+                return PaxReadDemand::full_row(scan::PaxFullRowReason::WildcardProjection);
             }
         };
         expressions[count] = expression;

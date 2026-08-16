@@ -530,7 +530,9 @@ fn materialization_pax_columns<'a>(
                 count += 1;
             }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
-                return super::scan::PaxReadDemand::full_row();
+                return super::scan::PaxReadDemand::full_row(
+                    super::scan::PaxFullRowReason::WildcardProjection,
+                );
             }
         }
     }

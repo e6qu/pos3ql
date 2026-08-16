@@ -19180,6 +19180,89 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     }
 }
 
+/// Proves the source fields a MERGE can observe without interpreting an
+/// unqualified, derived, or nested reference as a base source field.
+fn merge_source_demand(
+    expression: &Expr,
+    source_alias: &str,
+    source: &crate::storage::TableDef,
+    columns: &mut u64,
+) -> bool {
+    match expression {
+        Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } => {
+            if !qualifier.eq_ignore_ascii_case(source_alias) {
+                return true;
+            }
+            let Some(column) = source.column_index(name) else {
+                return false;
+            };
+            *columns |= 1u64 << column;
+            true
+        }
+        Expr::Column {
+            qualifier: None, ..
+        }
+        | Expr::SchemaColumn { .. }
+        | Expr::WholeRow(_)
+        | Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSubquery { .. } => false,
+        _ => {
+            let mut complete = true;
+            let _ = super::query::walk_children(expression, &mut |child| {
+                if !merge_source_demand(child, source_alias, source, columns) {
+                    complete = false;
+                }
+                Ok(())
+            });
+            complete
+        }
+    }
+}
+
+fn merge_source_columns(
+    statement: &crate::sql::ast::Merge,
+    source_alias: &str,
+    source: &crate::storage::TableDef,
+) -> Option<u64> {
+    if source_alias.is_empty() {
+        return None;
+    }
+    let mut columns = 0u64;
+    if !merge_source_demand(statement.on, source_alias, source, &mut columns) {
+        return None;
+    }
+    for when in statement.whens {
+        if let Some(condition) = when.cond
+            && !merge_source_demand(condition, source_alias, source, &mut columns)
+        {
+            return None;
+        }
+        match when.action {
+            crate::sql::ast::MergeAction::Update(assignments) => {
+                for (_, value) in assignments {
+                    if !merge_source_demand(value, source_alias, source, &mut columns) {
+                        return None;
+                    }
+                }
+            }
+            crate::sql::ast::MergeAction::Insert { values, .. } => {
+                for value in values {
+                    if !merge_source_demand(value, source_alias, source, &mut columns) {
+                        return None;
+                    }
+                }
+            }
+            crate::sql::ast::MergeAction::Delete | crate::sql::ast::MergeAction::DoNothing => {}
+        }
+    }
+    Some(columns)
+}
+
 /// `MERGE INTO target USING source ON cond WHEN ...`. Source-driven: each source
 /// row is matched against the target on `cond`; a match applies the first
 /// satisfied WHEN MATCHED clause, a miss the first WHEN NOT MATCHED clause. A
@@ -19294,7 +19377,7 @@ pub fn merge(
         Ok(s) => &*s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let source_select = crate::sql::ast::Select {
+    let source_all_select = crate::sql::ast::Select {
         items: star,
         distinct: false,
         distinct_on: &[],
@@ -19313,9 +19396,9 @@ pub fn merge(
     };
     // Copy the synthesized def out of the borrow (it is tied to `storage`),
     // so the write path below can borrow storage mutably.
-    let source_def = match super::query::synth_derived_def(
+    let source_all_def = match super::query::synth_derived_def(
         storage,
-        &source_select,
+        &source_all_select,
         source_alias,
         statement.source.col_alias,
         txn.txid,
@@ -19323,6 +19406,60 @@ pub fn merge(
     ) {
         Ok(d) => *d,
         Err(e) => return sql_fail(e),
+    };
+    let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
+        Some(columns) => {
+            let mut items = [SelectItem::Wildcard; MAX_COLUMNS];
+            let mut count = 0usize;
+            for (index, column) in source_all_def.columns().iter().enumerate() {
+                if columns & (1u64 << index) == 0 {
+                    continue;
+                }
+                let expression = match arena.alloc(Expr::Column {
+                    qualifier: Some(source_alias),
+                    name: column.name.as_str(),
+                }) {
+                    Ok(expression) => expression,
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                };
+                items[count] = SelectItem::Expr {
+                    expression,
+                    alias: Some(column.name.as_str()),
+                };
+                count += 1;
+            }
+            if count == 0 {
+                let expression = match arena.alloc(Expr::Int(1)) {
+                    Ok(expression) => expression,
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                };
+                items[0] = SelectItem::Expr {
+                    expression,
+                    alias: Some("__pos3ql_merge_source"),
+                };
+                count = 1;
+            }
+            let items = match arena.alloc_slice_copy(&items[..count]) {
+                Ok(items) => items,
+                Err(_) => return sql_fail(super::query::arena_full_pub()),
+            };
+            crate::sql::ast::Select {
+                items,
+                ..source_all_select
+            }
+        }
+        None => source_all_select,
+    };
+    let source_def = match super::query::synth_derived_def(
+        storage,
+        &source_select,
+        source_alias,
+        None,
+        txn.txid,
+        arena,
+    ) {
+        Ok(definition) => *definition,
+        Err(error) => return sql_fail(error),
     };
     let source_def = &source_def;
     // Pass 1: count source rows. Pass 2: encode each to arena bytes.

@@ -11863,6 +11863,18 @@ fn merge_statement() {
         )),
         ["x|99"]
     );
+
+    let no_action = run_with(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt AS target USING src AS source ON false \
+         WHEN NOT MATCHED THEN DO NOTHING",
+    );
+    assert!(
+        String::from_utf8_lossy(&no_action).contains("MERGE 0"),
+        "{}",
+        String::from_utf8_lossy(&no_action)
+    );
 }
 
 #[test]
@@ -21093,6 +21105,14 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT array_length(ARRAY[id], 1) FROM wide_pax ORDER BY id LIMIT 1",
+        &["1"],
+        Some(1 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT id + id + id + id + id + id + id + id + id + id + id \
          FROM wide_pax ORDER BY id LIMIT 1",
         &["11"],
@@ -21163,6 +21183,23 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     assert_cold_pax_query(
         &config,
+        "SELECT sum(id) FILTER (WHERE length(payload_0) = 2048) FROM wide_pax",
+        &["45150"],
+        Some(3 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT string_agg(id::text, ',' ORDER BY payload_0) \
+         FILTER (WHERE id = 287) FROM wide_pax",
+        &["287"],
+        Some(3 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
         "SELECT o.id, count(*) FROM wide_pax AS o \
          WHERE EXISTS (SELECT 1 FROM wide_pax_right AS i WHERE i.id = o.id) \
          AND o.id = 287 GROUP BY o.id",
@@ -21176,6 +21213,15 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         "SELECT row_number() OVER (ORDER BY id) FROM wide_pax WHERE id = 287",
         &["1"],
         Some(2 << 20),
+    );
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    assert_cold_pax_query(
+        &config,
+        "SELECT row_number() OVER (PARTITION BY payload_0 ORDER BY id) \
+         FROM wide_pax WHERE id = 287",
+        &["1"],
+        Some(3 << 20),
     );
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -21293,6 +21339,31 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         reads.object_read_bytes < 2 << 20,
         "cold UPDATE FROM must decode its predicate and assignment columns only: bytes={}",
         reads.object_read_bytes
+    );
+
+    let before_merge = engine.storage.block_io_stats();
+    let merged = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE wide_pax_merge_target (id int PRIMARY KEY, payload text); \
+         INSERT INTO wide_pax_merge_target VALUES (287, 'before'); \
+         MERGE INTO wide_pax_merge_target AS target USING wide_pax AS source \
+         ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET payload = source.payload_0; \
+         SELECT length(payload) FROM wide_pax_merge_target",
+        4 << 20,
+    );
+    assert_eq!(
+        data_rows(&merged),
+        ["2048"],
+        "{}",
+        String::from_utf8_lossy(&merged)
+    );
+    let merge_reads = engine.storage.block_io_stats().saturating_sub(before_merge);
+    assert!(
+        merge_reads.object_read_bytes < 8 << 20,
+        "cold MERGE must decode only source ON and action columns: bytes={}",
+        merge_reads.object_read_bytes
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

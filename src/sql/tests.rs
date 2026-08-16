@@ -8379,6 +8379,69 @@ fn trigger_select_into_strict_has_postgresql_cardinality_errors() {
 }
 
 #[test]
+fn trigger_exception_blocks_undo_protected_writes_and_match_typed_conditions() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_exception_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_exception_audit (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_exception_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              BEGIN
+                INSERT INTO trigger_exception_audit VALUES (NEW.id + 10, 10);
+                RAISE EXCEPTION ''reject %'', NEW.id;
+              EXCEPTION
+                WHEN unique_violation THEN RAISE EXCEPTION ''wrong handler'';
+                WHEN raise_exception OR SQLSTATE ''P0001'' THEN
+                  INSERT INTO trigger_exception_audit VALUES (NEW.id + 100, 100);
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_exception_before BEFORE INSERT ON trigger_exception_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_exception_function();
+         INSERT INTO trigger_exception_target VALUES (1);
+         SELECT id, value FROM trigger_exception_audit ORDER BY id;
+         SELECT id FROM trigger_exception_target;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["101|100", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_exception_others_handles_unmatched_errors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_exception_others_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_exception_others_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              BEGIN
+                RAISE EXCEPTION ''positive id required'';
+              EXCEPTION
+                WHEN OTHERS THEN NEW.value := 1;
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_exception_others_before BEFORE INSERT ON trigger_exception_others_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_exception_others_function();
+         INSERT INTO trigger_exception_others_target VALUES (-1, 0);
+         SELECT id, value FROM trigger_exception_others_target;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["-1|1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
     let mut config = test_config("trigger-diagnostic-recovery");
     config.object_store_on = true;
@@ -8402,7 +8465,21 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
               RETURN NEW;
             END';
          CREATE TRIGGER durable_trigger_strict_before BEFORE INSERT ON durable_trigger_strict_target
-           FOR EACH ROW EXECUTE FUNCTION durable_trigger_strict_function();",
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_strict_function();
+         CREATE TABLE durable_trigger_exception_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_trigger_exception_audit (id integer PRIMARY KEY);
+         CREATE FUNCTION durable_trigger_exception_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              BEGIN
+                INSERT INTO durable_trigger_exception_audit VALUES (NEW.id + 10);
+                RAISE EXCEPTION ''retry through handler'';
+              EXCEPTION WHEN raise_exception THEN
+                INSERT INTO durable_trigger_exception_audit VALUES (NEW.id + 100);
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_trigger_exception_before BEFORE INSERT ON durable_trigger_exception_target
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_exception_function();",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -8422,6 +8499,15 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
              SELECT id, value FROM durable_trigger_strict_target",
         )),
         ["1|12"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "INSERT INTO durable_trigger_exception_target VALUES (1);
+             SELECT id FROM durable_trigger_exception_audit ORDER BY id",
+        )),
+        ["101"]
     );
 }
 

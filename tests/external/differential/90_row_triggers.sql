@@ -413,3 +413,21 @@ CREATE TRIGGER trigger_strict_before BEFORE INSERT ON trigger_strict_target
   FOR EACH ROW EXECUTE FUNCTION trigger_strict_program();
 INSERT INTO trigger_strict_target VALUES (1, 0);
 SELECT id, value FROM trigger_strict_target;
+
+CREATE TABLE trigger_exception_target (id integer PRIMARY KEY);
+CREATE TABLE trigger_exception_audit (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_exception_program() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN
+     BEGIN
+       INSERT INTO trigger_exception_audit VALUES (NEW.id + 10, 10);
+       RAISE EXCEPTION ''retry through handler'';
+     EXCEPTION WHEN raise_exception OR SQLSTATE ''P0001'' THEN
+       INSERT INTO trigger_exception_audit VALUES (NEW.id + 100, 100);
+     END;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_exception_before BEFORE INSERT ON trigger_exception_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_exception_program();
+INSERT INTO trigger_exception_target VALUES (1);
+SELECT id, value FROM trigger_exception_audit ORDER BY id;
+SELECT id FROM trigger_exception_target;

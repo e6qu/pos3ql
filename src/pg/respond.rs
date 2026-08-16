@@ -1269,6 +1269,26 @@ impl<'b> Responder<'b> {
         )
     }
 
+    /// NoticeResponse at DEBUG severity, subject to `client_min_messages`.
+    pub fn debug(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+        self.diagnostic(
+            crate::sql::guc::MessageLevel::Debug1,
+            "DEBUG",
+            sqlstate,
+            message,
+        )
+    }
+
+    /// NoticeResponse at LOG severity, subject to `client_min_messages`.
+    pub fn log(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+        self.diagnostic(crate::sql::guc::MessageLevel::Log, "LOG", sqlstate, message)
+    }
+
+    /// PostgreSQL sends INFO to the client regardless of `client_min_messages`.
+    pub fn info(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+        self.diagnostic_unfiltered("INFO", sqlstate, message)
+    }
+
     /// Emits a NoticeResponse (NOTICE or WARNING severity) unless the session's
     /// `client_min_messages` threshold filters it out. Same field layout as
     /// errors.
@@ -1285,6 +1305,26 @@ impl<'b> Responder<'b> {
         if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
+        self.write_notice_response(severity, sqlstate, message, diagnostic.as_ref())
+    }
+
+    fn diagnostic_unfiltered(
+        &mut self,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+    ) -> Result<(), WireFull> {
+        let diagnostic = crate::sql::eval::take_diagnostic();
+        self.write_notice_response(severity, sqlstate, message, diagnostic.as_ref())
+    }
+
+    fn write_notice_response(
+        &mut self,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+        diagnostic: Option<&crate::sql::eval::Diagnostic>,
+    ) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_NOTICE_RESPONSE);
         m.u8(b'S');
         m.cstr(severity);
@@ -1294,7 +1334,7 @@ impl<'b> Responder<'b> {
         m.cstr(sqlstate);
         m.u8(b'M');
         m.cstr(message);
-        if let Some(d) = &diagnostic {
+        if let Some(d) = diagnostic {
             m.u8(b'D');
             m.cstr(d.detail.as_str());
             if let Some(h) = &d.hint {

@@ -8259,6 +8259,9 @@ fn trigger_diagnostics_are_typed_and_preserve_postgresql_severity() {
         "CREATE TABLE trigger_diagnostic_target (id integer PRIMARY KEY, value integer);
          CREATE FUNCTION trigger_diagnostic_function() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN
+              RAISE DEBUG ''debug id %'', NEW.id;
+              RAISE LOG ''log id %'', NEW.id;
+              RAISE INFO ''info id %'', NEW.id;
               RAISE NOTICE ''insert id %'', NEW.id;
               RAISE WARNING ''next %% value is %'', NEW.value + 1;
               ASSERT NEW.value > 0, ''value must be positive'';
@@ -8276,16 +8279,44 @@ fn trigger_diagnostics_are_typed_and_preserve_postgresql_severity() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "INSERT INTO trigger_diagnostic_target VALUES (4, 8);",
+        "SET client_min_messages = debug1;
+         INSERT INTO trigger_diagnostic_target VALUES (4, 8);",
     );
     let text = String::from_utf8_lossy(&output);
-    assert_eq!(message_types(&output), [b'N', b'N', b'C'], "{text}");
+    assert_eq!(
+        message_types(&output),
+        [b'C', b'N', b'N', b'N', b'N', b'N', b'C'],
+        "{text}"
+    );
+    assert!(
+        text.contains("DEBUG") && text.contains("debug id 4"),
+        "{text}"
+    );
+    assert!(text.contains("LOG") && text.contains("log id 4"), "{text}");
+    assert!(
+        text.contains("INFO") && text.contains("info id 4"),
+        "{text}"
+    );
     assert!(
         text.contains("NOTICE") && text.contains("insert id 4"),
         "{text}"
     );
     assert!(
         text.contains("WARNING") && text.contains("next % value is 9"),
+        "{text}"
+    );
+
+    let filtered = run_with(
+        &mut engine,
+        &mut budget,
+        "SET client_min_messages = warning;
+         INSERT INTO trigger_diagnostic_target VALUES (45, 2);",
+    );
+    let text = String::from_utf8_lossy(&filtered);
+    assert_eq!(message_types(&filtered), [b'C', b'N', b'N', b'C'], "{text}");
+    assert!(text.contains("INFO") && text.contains("WARNING"), "{text}");
+    assert!(
+        !text.contains("DEBUG") && !text.contains("LOG") && !text.contains("NOTICE"),
         "{text}"
     );
 
@@ -8305,7 +8336,7 @@ fn trigger_diagnostics_are_typed_and_preserve_postgresql_severity() {
             &mut budget,
             "SELECT id, value FROM trigger_diagnostic_target ORDER BY id",
         )),
-        ["4|9"]
+        ["4|9", "45|3"]
     );
 
     let raised = run_with(
@@ -8322,6 +8353,72 @@ fn trigger_diagnostics_are_typed_and_preserve_postgresql_severity() {
         text.contains("P0001") && text.contains("rejected id 6"),
         "{text}"
     );
+}
+
+#[test]
+fn trigger_raise_sqlstates_are_typed_at_the_parse_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_raise_state_target (id integer PRIMARY KEY);
+         CREATE FUNCTION trigger_raise_state_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE caught text;
+            BEGIN
+              RAISE WARNING SQLSTATE ''22012'';
+              RAISE NOTICE unique_violation;
+              RAISE INFO ''typed override'' USING ERRCODE = ''01000'';
+              RAISE NOTICE USING ERRCODE = ''01000'';
+              BEGIN
+                RAISE EXCEPTION SQLSTATE ''P0004'' USING MESSAGE = ''typed exception'';
+              EXCEPTION WHEN assert_failure THEN
+                GET STACKED DIAGNOSTICS caught = RETURNED_SQLSTATE;
+                RAISE NOTICE ''caught %'', caught;
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_raise_state BEFORE INSERT ON trigger_raise_state_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_raise_state_function();",
+    );
+    assert_eq!(
+        message_types(&setup),
+        [b'C', b'C', b'C'],
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_raise_state_target VALUES (1)",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(
+        message_types(&output),
+        [b'N', b'N', b'N', b'N', b'N', b'C'],
+        "{text}"
+    );
+    assert!(text.contains("C22012") && text.contains("M22012"), "{text}");
+    assert!(
+        text.contains("C23505") && text.contains("Munique_violation"),
+        "{text}"
+    );
+    assert!(
+        text.contains("C01000") && text.contains("Mtyped override"),
+        "{text}"
+    );
+    assert!(text.contains("C01000") && text.contains("M01000"), "{text}");
+    assert!(text.contains("Mcaught P0004"), "{text}");
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION invalid_raise_sqlstate() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN RAISE NOTICE SQLSTATE ''00000''; RETURN NEW; END'",
+    );
+    let text = String::from_utf8_lossy(&invalid);
+    assert_eq!(message_types(&invalid), [b'E'], "{text}");
+    assert!(text.contains("0A000"), "{text}");
 }
 
 #[test]

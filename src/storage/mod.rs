@@ -35,6 +35,57 @@ pub(crate) const MAX_PUBLICATION_TABLES: usize = u8::MAX as usize;
 /// state, rather than an unbounded connection-side string.
 pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = 16;
 pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
+pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = 16;
+pub(crate) const TRIGGER_ARGUMENT_BYTES: usize = u8::MAX as usize;
+
+/// A bounded trigger invocation argument vector.  SQL parses the literals once
+/// before catalog mutation; WAL and checkpoints carry the same typed state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriggerArguments {
+    values: [StackStr<TRIGGER_ARGUMENT_BYTES>; MAX_TRIGGER_ARGUMENTS],
+    count: u8,
+}
+
+impl TriggerArguments {
+    pub(crate) const EMPTY: Self = Self {
+        values: [StackStr::new(); MAX_TRIGGER_ARGUMENTS],
+        count: 0,
+    };
+
+    pub(crate) fn parse(values: &[&str]) -> Result<Self, SqlError> {
+        if values.len() > MAX_TRIGGER_ARGUMENTS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many trigger arguments (limit {})",
+                MAX_TRIGGER_ARGUMENTS
+            ));
+        }
+        let mut out = Self::EMPTY;
+        for (index, value) in values.iter().enumerate() {
+            if value.as_bytes().contains(&0) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "trigger argument contains NUL byte"
+                ));
+            }
+            let parsed = StackStr::from_str(value);
+            if parsed.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "trigger argument exceeds {} bytes",
+                    TRIGGER_ARGUMENT_BYTES
+                ));
+            }
+            out.values[index] = parsed;
+        }
+        out.count = values.len() as u8;
+        Ok(out)
+    }
+
+    pub(crate) fn values(&self) -> &[StackStr<TRIGGER_ARGUMENT_BYTES>] {
+        &self.values[..usize::from(self.count)]
+    }
+}
 
 /// A bounded, nonempty connection-info value. SQL and WAL must construct this
 /// before durable catalog state is changed, so truncation and NUL bytes cannot
@@ -2410,6 +2461,7 @@ pub(crate) struct TriggerDef {
     pub(crate) update_columns: u64,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
+    pub(crate) arguments: TriggerArguments,
     pub(crate) enabled: bool,
     pending_definition: Option<PendingTriggerDefinition>,
     pub(crate) ownership: Ownership,
@@ -2445,6 +2497,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) update_columns: u64,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
+    pub(crate) arguments: TriggerArguments,
 }
 
 /// Maximum source length of a durable row-trigger `WHEN` predicate.
@@ -2474,6 +2527,7 @@ impl TriggerDef {
         update_columns: 0,
         transition_tables: TriggerTransitionTables::None,
         when: None,
+        arguments: TriggerArguments::EMPTY,
         enabled: false,
         pending_definition: None,
         ownership: Ownership::BOOTSTRAP,
@@ -13496,6 +13550,7 @@ impl Storage {
             update_columns: spec.update_columns,
             transition_tables: spec.transition_tables,
             when: spec.when,
+            arguments: spec.arguments,
             enabled: true,
             pending_definition: None,
             ownership: self.initial_ownership(txid),
@@ -13622,6 +13677,7 @@ impl Storage {
             update_columns: spec.update_columns,
             transition_tables: spec.transition_tables,
             when: spec.when,
+            arguments: spec.arguments,
             enabled,
             pending_definition: None,
             ownership: Ownership {

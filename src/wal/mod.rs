@@ -434,6 +434,8 @@ pub(crate) enum WalOp<'a> {
         old_table: Option<&'a str>,
         new_table: Option<&'a str>,
         when: Option<&'a str>,
+        arguments: [&'a str; crate::storage::MAX_TRIGGER_ARGUMENTS],
+        argument_count: usize,
     },
     DropTrigger {
         name: &'a str,
@@ -1525,6 +1527,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             old_table,
             new_table,
             when,
+            arguments,
+            argument_count,
             ..
         } => {
             1 + name.len()
@@ -1540,6 +1544,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + old_table.map_or(0, str::len)
                 + new_table.map_or(0, str::len)
                 + when.map_or(0, str::len)
+                + 1
+                + arguments[..*argument_count]
+                    .iter()
+                    .map(|argument| 1 + argument.len())
+                    .sum::<usize>()
         }
         WalOp::DropTrigger {
             name,
@@ -2515,6 +2524,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             old_table,
             new_table,
             when,
+            arguments,
+            argument_count,
         } => {
             let when_len = when.map_or(0usize, |value| value.len() + 1);
             name_bytes(buffer, name)
@@ -2530,6 +2541,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     .ok()
                     .is_some_and(|length| buffer.append(&length.to_le_bytes()))
                 && when.is_none_or(|value| buffer.append(value.as_bytes()))
+                && (*argument_count <= crate::storage::MAX_TRIGGER_ARGUMENTS)
+                && buffer.append(&[*argument_count as u8])
+                && arguments[..*argument_count]
+                    .iter()
+                    .all(|argument| name_bytes(buffer, argument))
         }
         WalOp::DropTrigger {
             name,
@@ -3347,6 +3363,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += length;
                 Some(value)
             };
+            let argument_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if argument_count > crate::storage::MAX_TRIGGER_ARGUMENTS {
+                return None;
+            }
+            let mut arguments = [""; crate::storage::MAX_TRIGGER_ARGUMENTS];
+            for argument in arguments.iter_mut().take(argument_count) {
+                *argument = take_name(&mut at)?;
+            }
             (timing <= 1
                 && (matches!(level, crate::sql::ast::TriggerLevel::Statement)
                     || !events.has_truncate())
@@ -3370,6 +3395,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 old_table,
                 new_table,
                 when,
+                arguments,
+                argument_count,
             })
         }
         KIND_DROP_TRIGGER => {
@@ -5036,6 +5063,8 @@ mod tests {
                 old_table: None,
                 new_table: None,
                 when: None,
+                arguments: [""; crate::storage::MAX_TRIGGER_ARGUMENTS],
+                argument_count: 0,
             },
         ));
         let incomplete_payload = &payload.readable()[..payload.len() - 10];
@@ -5061,6 +5090,8 @@ mod tests {
                 old_table: Some("old_orders"),
                 new_table: Some("new_orders"),
                 when: None,
+                arguments: [""; crate::storage::MAX_TRIGGER_ARGUMENTS],
+                argument_count: 0,
             },
         ));
         let Some(WalOp::CreateTrigger {
@@ -5073,6 +5104,44 @@ mod tests {
         };
         assert_eq!(old_table, Some("old_orders"));
         assert_eq!(new_table, Some("new_orders"));
+    }
+
+    #[test]
+    fn create_trigger_payload_retains_arguments() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "trigger argument payload", 1024).unwrap();
+        let mut arguments = [""; crate::storage::MAX_TRIGGER_ARGUMENTS];
+        arguments[0] = "audit";
+        arguments[1] = "v1";
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTrigger {
+                name: "audit_row",
+                table_schema: "public",
+                table: "orders",
+                function_schema: "public",
+                function: "audit_order",
+                timing: 0,
+                level: crate::sql::ast::TriggerLevel::Row,
+                events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
+                update_columns: 0,
+                old_table: None,
+                new_table: None,
+                when: None,
+                arguments,
+                argument_count: 2,
+            },
+        ));
+        let Some(WalOp::CreateTrigger {
+            arguments,
+            argument_count,
+            ..
+        }) = decode_op(KIND_CREATE_TRIGGER, payload.readable())
+        else {
+            panic!("trigger arguments did not decode");
+        };
+        assert_eq!(argument_count, 2);
+        assert_eq!(&arguments[..argument_count], ["audit", "v1"]);
     }
 
     #[test]
@@ -5293,6 +5362,8 @@ mod tests {
                     old_table: None,
                     new_table: None,
                     when: Some("NEW.total > OLD.total"),
+                    arguments: [""; crate::storage::MAX_TRIGGER_ARGUMENTS],
+                    argument_count: 0,
                 },
             )
             .unwrap();

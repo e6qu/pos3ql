@@ -3779,6 +3779,12 @@ impl Checkpointer {
             let mut hold_table = StackStr::<130>::new();
             let mut hnew_table = StackStr::<130>::new();
             let mut hwhen = StackStr::<{ crate::storage::TRIGGER_WHEN_MAX * 2 }>::new();
+            let mut harguments = StackStr::<
+                {
+                    2 + crate::storage::MAX_TRIGGER_ARGUMENTS
+                        * (2 + crate::storage::TRIGGER_ARGUMENT_BYTES * 2)
+                },
+            >::new();
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(howner, "{byte:02x}");
             }
@@ -3812,10 +3818,17 @@ impl Checkpointer {
                     let _ = write!(hwhen, "{byte:02x}");
                 }
             }
+            let _ = write!(harguments, "{:02x}", trigger.arguments.values().len());
+            for argument in trigger.arguments.values() {
+                let _ = write!(harguments, "{:02x}", argument.as_str().len());
+                for byte in argument.as_str().as_bytes() {
+                    let _ = write!(harguments, "{byte:02x}");
+                }
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
                     howner.as_str(),
                     hname.as_str(),
@@ -3842,6 +3855,7 @@ impl Checkpointer {
                     } else {
                         "-"
                     },
+                    harguments.as_str(),
                     u8::from(trigger.enabled),
                 ),
             )?;
@@ -5176,6 +5190,61 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             })?,
         ),
     };
+    let argument_field = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger arguments"))?;
+    let bytes = argument_field.as_bytes();
+    let hex_byte = |at: &mut usize| -> Result<usize, CheckpointSetupError> {
+        let value = core::str::from_utf8(
+            bytes
+                .get(*at..*at + 2)
+                .ok_or(CheckpointSetupError::Corrupt("trigger argument length"))?,
+        )
+        .ok()
+        .and_then(|value| usize::from_str_radix(value, 16).ok())
+        .ok_or(CheckpointSetupError::Corrupt("trigger argument length"))?;
+        *at += 2;
+        Ok(value)
+    };
+    let mut argument_at = 0usize;
+    let argument_count = hex_byte(&mut argument_at)?;
+    if argument_count > crate::storage::MAX_TRIGGER_ARGUMENTS {
+        return Err(CheckpointSetupError::Corrupt("trigger argument count"));
+    }
+    let mut argument_values =
+        [crate::util::StackStr::<{ crate::storage::TRIGGER_ARGUMENT_BYTES }>::new();
+            crate::storage::MAX_TRIGGER_ARGUMENTS];
+    for value in argument_values.iter_mut().take(argument_count) {
+        let length = hex_byte(&mut argument_at)?;
+        if length > crate::storage::TRIGGER_ARGUMENT_BYTES || argument_at + length * 2 > bytes.len()
+        {
+            return Err(CheckpointSetupError::Corrupt("trigger argument"));
+        }
+        *value = crate::util::StackStr::from_str(&decode_hex_name(
+            core::str::from_utf8(&bytes[argument_at..argument_at + length * 2])
+                .map_err(|_| CheckpointSetupError::Corrupt("trigger argument"))?,
+        )?);
+        argument_at += length * 2;
+        if value.is_truncated() {
+            return Err(CheckpointSetupError::Corrupt("trigger argument"));
+        }
+    }
+    if argument_at != bytes.len() {
+        return Err(CheckpointSetupError::Corrupt(
+            "trigger argument trailing data",
+        ));
+    }
+    let mut argument_refs = [""; crate::storage::MAX_TRIGGER_ARGUMENTS];
+    for (index, value) in argument_values.iter().take(argument_count).enumerate() {
+        argument_refs[index] = value.as_str();
+    }
+    let arguments = crate::storage::TriggerArguments::parse(&argument_refs[..argument_count])
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest trigger rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
     let enabled = match parse_field::<u8>(words.next(), "trigger enabled")? {
         0 => false,
         1 => true,
@@ -5231,6 +5300,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 update_columns,
                 transition_tables,
                 when,
+                arguments,
             },
             enabled,
         )

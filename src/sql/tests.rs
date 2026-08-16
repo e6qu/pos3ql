@@ -8137,6 +8137,127 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
 }
 
 #[test]
+fn trigger_invocation_context_exposes_typed_postgres_variables() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA trigger_context_schema;
+         CREATE TABLE trigger_context_schema.trigger_context_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_context_audit (
+           name text, timing text, level text, operation text, relid integer,
+           table_name text, table_schema text, nargs integer, first_argument text, second_argument text,
+           relation_name text, has_tablespace boolean
+         );
+         CREATE FUNCTION trigger_context_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              INSERT INTO trigger_context_audit VALUES
+                (TG_NAME, TG_WHEN, TG_LEVEL, TG_OP, TG_RELID, TG_TABLE_NAME,
+                 TG_TABLE_SCHEMA, TG_NARGS, TG_ARGV[1], TG_ARGV[2], TG_RELNAME,
+                 TG_TABLESPACE IS NOT NULL);
+              RETURN NEW;
+            END';
+         CREATE TABLE trigger_context_conflict (value text PRIMARY KEY);
+         INSERT INTO trigger_context_conflict VALUES ('first');
+         CREATE FUNCTION trigger_context_nested_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              INSERT INTO trigger_context_conflict VALUES (TG_ARGV[1])
+                ON CONFLICT (value) DO UPDATE SET value = TG_ARGV[2];
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_context_name BEFORE INSERT
+           ON trigger_context_schema.trigger_context_target FOR EACH ROW
+           EXECUTE FUNCTION trigger_context_function('first', 'second');
+         CREATE TRIGGER trigger_context_nested_name AFTER INSERT
+           ON trigger_context_schema.trigger_context_target FOR EACH ROW
+           EXECUTE FUNCTION trigger_context_nested_function('first', 'nested');
+         INSERT INTO trigger_context_schema.trigger_context_target VALUES (1);
+         SELECT name, timing, level, operation, relid = relation.oid,
+                table_name, table_schema, nargs, first_argument, second_argument,
+                relation_name, has_tablespace
+           FROM trigger_context_audit
+           CROSS JOIN pg_class relation
+          WHERE relation.relname = 'trigger_context_target';
+         SELECT value FROM trigger_context_conflict;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "trigger_context_name|BEFORE|ROW|INSERT|t|trigger_context_target|trigger_context_schema|2|first|second|trigger_context_target|f",
+            "nested"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_context_names_cannot_be_shadowed_by_locals() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_context_shadow_target (id integer PRIMARY KEY);
+         CREATE FUNCTION trigger_context_shadow_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE TG_NAME text; BEGIN RETURN NEW; END';
+         CREATE TRIGGER trigger_context_shadow_name BEFORE INSERT
+           ON trigger_context_shadow_target FOR EACH ROW
+           EXECUTE FUNCTION trigger_context_shadow_function();
+         INSERT INTO trigger_context_shadow_target VALUES (1);",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P13"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_arguments_survive_checkpoint_and_recovery() {
+    let mut config = test_config("trigger-arguments-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("trigger-arguments-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_trigger_argument_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_trigger_argument_audit (value text);
+         CREATE FUNCTION durable_trigger_argument_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO durable_trigger_argument_audit VALUES (TG_ARGV[1]); RETURN NEW; END';
+         CREATE TRIGGER durable_trigger_argument_name BEFORE INSERT
+           ON durable_trigger_argument_target FOR EACH ROW
+           EXECUTE FUNCTION durable_trigger_argument_function('recovered');",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO durable_trigger_argument_target VALUES (1);
+         SELECT value FROM durable_trigger_argument_audit;
+         SELECT tgname FROM pg_trigger WHERE tgname = 'durable_trigger_argument_name';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["recovered", "durable_trigger_argument_name"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn row_trigger_new_assignments_are_typed_and_rechecked() {
     let mut config = test_config("row-trigger-body");
     config.max_tables = 16;

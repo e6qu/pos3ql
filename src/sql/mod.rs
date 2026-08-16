@@ -7057,6 +7057,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             old_table,
             new_table,
             when,
+            arguments,
+            argument_count,
         } => {
             let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
                 storage.resolve_relation(Some(table_schema), table, 0)
@@ -7108,6 +7110,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     when: when
                         .map(crate::storage::trigger_when_stackstr)
                         .transpose()?,
+                    arguments: crate::storage::TriggerArguments::parse(
+                        &arguments[..argument_count],
+                    )?,
                 },
                 0,
             )?;

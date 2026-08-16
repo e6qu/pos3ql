@@ -7966,64 +7966,70 @@ fn parse_trigger_exception_condition(text: &str) -> Result<TriggerExceptionCondi
     if text.eq_ignore_ascii_case("others") {
         return Ok(TriggerExceptionCondition::Others);
     }
-    let code = match text.to_ascii_lowercase().as_str() {
-        "unique_violation" => sqlstate::UNIQUE_VIOLATION,
-        "foreign_key_violation" => sqlstate::FOREIGN_KEY_VIOLATION,
-        "not_null_violation" => sqlstate::NOT_NULL_VIOLATION,
-        "check_violation" => sqlstate::CHECK_VIOLATION,
-        "division_by_zero" => sqlstate::DIVISION_BY_ZERO,
-        "cardinality_violation" => sqlstate::CARDINALITY_VIOLATION,
-        "raise_exception" => sqlstate::RAISE_EXCEPTION,
-        "assert_failure" => sqlstate::ASSERT_FAILURE,
-        "data_exception" => return Ok(TriggerExceptionCondition::SqlStateClass("22")),
-        "integrity_constraint_violation" => {
-            return Ok(TriggerExceptionCondition::SqlStateClass("23"));
+    let state = if text.eq_ignore_ascii_case("unique_violation") {
+        sqlstate::UNIQUE_VIOLATION
+    } else if text.eq_ignore_ascii_case("foreign_key_violation") {
+        sqlstate::FOREIGN_KEY_VIOLATION
+    } else if text.eq_ignore_ascii_case("not_null_violation") {
+        sqlstate::NOT_NULL_VIOLATION
+    } else if text.eq_ignore_ascii_case("check_violation") {
+        sqlstate::CHECK_VIOLATION
+    } else if text.eq_ignore_ascii_case("division_by_zero") {
+        sqlstate::DIVISION_BY_ZERO
+    } else if text.eq_ignore_ascii_case("cardinality_violation") {
+        sqlstate::CARDINALITY_VIOLATION
+    } else if text.eq_ignore_ascii_case("raise_exception") {
+        sqlstate::RAISE_EXCEPTION
+    } else if text.eq_ignore_ascii_case("assert_failure") {
+        sqlstate::ASSERT_FAILURE
+    } else if text.eq_ignore_ascii_case("data_exception") {
+        return Ok(TriggerExceptionCondition::SqlStateClass("22"));
+    } else if text.eq_ignore_ascii_case("integrity_constraint_violation") {
+        return Ok(TriggerExceptionCondition::SqlStateClass("23"));
+    } else {
+        let Some(value) = strip_trigger_keyword(text, "sqlstate") else {
+            return Err(unsupported_trigger_body());
+        };
+        let value = value.trim();
+        if value.len() != 7 || !value.starts_with('\'') || !value.ends_with('\'') {
+            return Err(unsupported_trigger_body());
         }
-        _ => {
-            let Some(value) = strip_trigger_keyword(text, "sqlstate") else {
-                return Err(unsupported_trigger_body());
-            };
-            let value = value.trim();
-            if value.len() != 7 || !value.starts_with('\'') || !value.ends_with('\'') {
-                return Err(unsupported_trigger_body());
-            }
-            let code = &value[1..6];
-            if !code
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-            {
-                return Err(unsupported_trigger_body());
-            }
-            return match code {
-                sqlstate::UNIQUE_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::UNIQUE_VIOLATION,
-                )),
-                sqlstate::FOREIGN_KEY_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::FOREIGN_KEY_VIOLATION,
-                )),
-                sqlstate::NOT_NULL_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::NOT_NULL_VIOLATION,
-                )),
-                sqlstate::CHECK_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::CHECK_VIOLATION,
-                )),
-                sqlstate::DIVISION_BY_ZERO => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::DIVISION_BY_ZERO,
-                )),
-                sqlstate::CARDINALITY_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::CARDINALITY_VIOLATION,
-                )),
-                sqlstate::RAISE_EXCEPTION => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::RAISE_EXCEPTION,
-                )),
-                sqlstate::ASSERT_FAILURE => Ok(TriggerExceptionCondition::SqlState(
-                    sqlstate::ASSERT_FAILURE,
-                )),
-                _ => Err(unsupported_trigger_body()),
-            };
+        let code = &value[1..6];
+        if !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Err(unsupported_trigger_body());
         }
+        return match code {
+            sqlstate::UNIQUE_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::UNIQUE_VIOLATION,
+            )),
+            sqlstate::FOREIGN_KEY_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::FOREIGN_KEY_VIOLATION,
+            )),
+            sqlstate::NOT_NULL_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::NOT_NULL_VIOLATION,
+            )),
+            sqlstate::CHECK_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::CHECK_VIOLATION,
+            )),
+            sqlstate::DIVISION_BY_ZERO => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::DIVISION_BY_ZERO,
+            )),
+            sqlstate::CARDINALITY_VIOLATION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::CARDINALITY_VIOLATION,
+            )),
+            sqlstate::RAISE_EXCEPTION => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::RAISE_EXCEPTION,
+            )),
+            sqlstate::ASSERT_FAILURE => Ok(TriggerExceptionCondition::SqlState(
+                sqlstate::ASSERT_FAILURE,
+            )),
+            _ => Err(unsupported_trigger_body()),
+        };
     };
-    Ok(TriggerExceptionCondition::SqlState(code))
+    Ok(TriggerExceptionCondition::SqlState(state))
 }
 
 fn parse_trigger_exception_conditions<'a>(

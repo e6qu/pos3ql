@@ -358,3 +358,42 @@ CREATE TRIGGER trigger_conflict_after AFTER UPDATE ON trigger_conflict_driver
   FOR EACH ROW EXECUTE FUNCTION trigger_conflict_program();
 UPDATE trigger_conflict_driver SET value = 7 WHERE id = 1;
 SELECT id, value FROM trigger_conflict_target ORDER BY id;
+
+CREATE TABLE trigger_case_foreach_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_case_foreach_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE item integer; total integer := 0;
+   BEGIN
+     CASE NEW.id
+       WHEN 1 THEN total := 10;
+       WHEN 2 THEN total := 20;
+       ELSE total := 30;
+     END CASE;
+     CASE
+       WHEN total = 20 THEN total := total + 5;
+       ELSE total := total + 3;
+     END CASE;
+     FOREACH item IN ARRAY ARRAY[1, 2, 3] LOOP
+       total := total + item;
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_case_foreach_before BEFORE INSERT ON trigger_case_foreach_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_case_foreach_program();
+INSERT INTO trigger_case_foreach_target VALUES (1, 0), (2, 0), (3, 0);
+SELECT id, value FROM trigger_case_foreach_target ORDER BY id;
+
+CREATE TABLE trigger_foreach_slice_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_foreach_slice_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE piece integer[]; total integer := 0;
+   BEGIN
+     FOREACH piece SLICE 1 IN ARRAY array_fill(1, ARRAY[2, 2], ARRAY[3, 5]) LOOP
+       total := total + piece[5] + piece[6];
+     END LOOP;
+     NEW.value := total;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_foreach_slice_before BEFORE INSERT ON trigger_foreach_slice_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_foreach_slice_program();
+INSERT INTO trigger_foreach_slice_target VALUES (1, 0);
+SELECT id, value FROM trigger_foreach_slice_target;

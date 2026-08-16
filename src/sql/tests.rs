@@ -8363,15 +8363,17 @@ fn trigger_raise_sqlstates_are_typed_at_the_parse_boundary() {
         &mut budget,
         "CREATE TABLE trigger_raise_state_target (id integer PRIMARY KEY);
          CREATE FUNCTION trigger_raise_state_function() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE caught text;
+           'DECLARE caught text; dynamic_code text := ''ZX123'';
             BEGIN
               RAISE WARNING SQLSTATE ''22012'';
+              RAISE NOTICE SQLSTATE ''00000'';
+              RAISE NOTICE SQLSTATE ''ZZ999'';
               RAISE NOTICE unique_violation;
               RAISE INFO ''typed override'' USING ERRCODE = ''01000'';
               RAISE NOTICE USING ERRCODE = ''01000'';
               BEGIN
-                RAISE EXCEPTION SQLSTATE ''P0004'' USING MESSAGE = ''typed exception'';
-              EXCEPTION WHEN assert_failure THEN
+                RAISE EXCEPTION USING ERRCODE = dynamic_code, MESSAGE = ''typed exception'';
+              EXCEPTION WHEN SQLSTATE ''ZX123'' THEN
                 GET STACKED DIAGNOSTICS caught = RETURNED_SQLSTATE;
                 RAISE NOTICE ''caught %'', caught;
               END;
@@ -8395,10 +8397,12 @@ fn trigger_raise_sqlstates_are_typed_at_the_parse_boundary() {
     let text = String::from_utf8_lossy(&output);
     assert_eq!(
         message_types(&output),
-        [b'N', b'N', b'N', b'N', b'N', b'C'],
+        [b'N', b'N', b'N', b'N', b'N', b'N', b'N', b'C'],
         "{text}"
     );
     assert!(text.contains("C22012") && text.contains("M22012"), "{text}");
+    assert!(text.contains("C00000") && text.contains("M00000"), "{text}");
+    assert!(text.contains("CZZ999") && text.contains("MZZ999"), "{text}");
     assert!(
         text.contains("C23505") && text.contains("Munique_violation"),
         "{text}"
@@ -8408,17 +8412,17 @@ fn trigger_raise_sqlstates_are_typed_at_the_parse_boundary() {
         "{text}"
     );
     assert!(text.contains("C01000") && text.contains("M01000"), "{text}");
-    assert!(text.contains("Mcaught P0004"), "{text}");
+    assert!(text.contains("Mcaught ZX123"), "{text}");
 
     let invalid = run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION invalid_raise_sqlstate() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN RAISE NOTICE SQLSTATE ''00000''; RETURN NEW; END'",
+           'BEGIN RAISE NOTICE SQLSTATE ''2201''; RETURN NEW; END'",
     );
     let text = String::from_utf8_lossy(&invalid);
     assert_eq!(message_types(&invalid), [b'E'], "{text}");
-    assert!(text.contains("0A000"), "{text}");
+    assert!(text.contains("42601"), "{text}");
 }
 
 #[test]

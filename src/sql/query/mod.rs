@@ -5339,7 +5339,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             Ok(entry) => Ok(self.scope.output_type(entry)),
             Err(error)
                 if matches!(
-                    error.sqlstate,
+                    error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
@@ -5386,7 +5386,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             Ok(entry) => (self.scope, entry),
             Err(error)
                 if matches!(
-                    error.sqlstate,
+                    error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
@@ -5417,7 +5417,7 @@ fn scope_column_type_mod<'a>(
         Ok(entry) => Some((scope, entry)),
         Err(error)
             if matches!(
-                error.sqlstate,
+                error.sqlstate.as_str(),
                 sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
             ) =>
         {

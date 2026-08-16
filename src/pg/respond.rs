@@ -1249,7 +1249,7 @@ impl<'b> Responder<'b> {
 
     /// NoticeResponse at NOTICE severity. Dropped when `client_min_messages`
     /// is above NOTICE (e.g. `warning`), matching PostgreSQL.
-    pub fn notice(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn notice<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
             crate::sql::guc::MessageLevel::Notice,
             "NOTICE",
@@ -1260,7 +1260,7 @@ impl<'b> Responder<'b> {
 
     /// NoticeResponse at WARNING severity. Dropped only when
     /// `client_min_messages` is above WARNING (i.e. `error`).
-    pub fn warning(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn warning<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
             crate::sql::guc::MessageLevel::Warning,
             "WARNING",
@@ -1270,7 +1270,7 @@ impl<'b> Responder<'b> {
     }
 
     /// NoticeResponse at DEBUG severity, subject to `client_min_messages`.
-    pub fn debug(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn debug<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
             crate::sql::guc::MessageLevel::Debug1,
             "DEBUG",
@@ -1280,23 +1280,23 @@ impl<'b> Responder<'b> {
     }
 
     /// NoticeResponse at LOG severity, subject to `client_min_messages`.
-    pub fn log(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn log<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(crate::sql::guc::MessageLevel::Log, "LOG", sqlstate, message)
     }
 
     /// PostgreSQL sends INFO to the client regardless of `client_min_messages`.
-    pub fn info(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn info<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic_unfiltered("INFO", sqlstate, message)
     }
 
     /// Emits a NoticeResponse (NOTICE or WARNING severity) unless the session's
     /// `client_min_messages` threshold filters it out. Same field layout as
     /// errors.
-    fn diagnostic(
+    fn diagnostic<S: AsRef<str>>(
         &mut self,
         level: crate::sql::guc::MessageLevel,
         severity: &str,
-        sqlstate: &str,
+        sqlstate: S,
         message: &str,
     ) -> Result<(), WireFull> {
         // The stashed detail belongs to this diagnostic even when the level
@@ -1305,17 +1305,17 @@ impl<'b> Responder<'b> {
         if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
-        self.write_notice_response(severity, sqlstate, message, diagnostic.as_ref())
+        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
     }
 
-    fn diagnostic_unfiltered(
+    fn diagnostic_unfiltered<S: AsRef<str>>(
         &mut self,
         severity: &str,
-        sqlstate: &str,
+        sqlstate: S,
         message: &str,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        self.write_notice_response(severity, sqlstate, message, diagnostic.as_ref())
+        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
     }
 
     fn write_notice_response(
@@ -1348,7 +1348,8 @@ impl<'b> Responder<'b> {
 
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
-    pub fn error(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        let sqlstate = sqlstate.as_ref();
         let diagnostic = crate::sql::eval::take_diagnostic();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
         m.u8(b'S');

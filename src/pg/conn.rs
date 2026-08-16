@@ -3551,7 +3551,8 @@ fn alloc_group_digits(d: i16) -> [u8; 4] {
 /// Writes an error and puts the connection into extended-protocol error
 /// recovery (discard until Sync). Free function so callers can hold
 /// borrows of other connection fields.
-fn ext_err(send: &mut FixedBuf, phase: &mut Phase, code: &str, message: &str) -> Step {
+fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, message: &str) -> Step {
+    let code = code.as_ref();
     let mut responder = Responder::new(send);
     if responder.error(code, message).is_err() {
         return Step::Close;

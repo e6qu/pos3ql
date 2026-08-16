@@ -1586,7 +1586,7 @@ impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
             Ok(ctype) => Ok(ctype),
             Err(error)
                 if matches!(
-                    error.sqlstate,
+                    error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {

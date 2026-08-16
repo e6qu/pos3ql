@@ -251,7 +251,7 @@ pub fn parse_view_select<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, super::eval::SqlError> {
     let to_sql = |m: &str| super::eval::SqlError {
-        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
         message: crate::stack_format!(192, "invalid view definition: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
@@ -264,7 +264,9 @@ pub fn parse_view_select<'a>(
             .alloc(s)
             .map(|r| &*r)
             .map_err(|_| super::eval::SqlError {
-                sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                sqlstate: super::eval::SqlState::known(
+                    super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                ),
                 message: crate::stack_format!(192, "view too large for SQL arena"),
             }),
         _ => Err(to_sql("view body must be a plain SELECT")),
@@ -280,7 +282,7 @@ pub fn parse_query<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, super::eval::SqlError> {
     let to_sql = |m: &str| super::eval::SqlError {
-        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
         message: crate::stack_format!(192, "invalid query: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
@@ -292,7 +294,7 @@ pub fn parse_query<'a>(
         .alloc(sel)
         .map(|r| &*r)
         .map_err(|_| super::eval::SqlError {
-            sqlstate: super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            sqlstate: super::eval::SqlState::known(super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED),
             message: crate::stack_format!(192, "query too large for SQL arena"),
         })
 }
@@ -304,7 +306,7 @@ pub fn parse_expr<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, super::eval::SqlError> {
     let to_sql = |m: &str| super::eval::SqlError {
-        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
         message: crate::stack_format!(192, "invalid expression: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
@@ -325,7 +327,7 @@ pub(crate) fn parse_type_name<'a>(
     arena: &'a Arena,
 ) -> Result<(&'a str, i32), super::eval::SqlError> {
     let to_sql = |m: &str| super::eval::SqlError {
-        sqlstate: super::eval::sqlstate::SYNTAX_ERROR,
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
         message: crate::stack_format!(192, "invalid type name: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;

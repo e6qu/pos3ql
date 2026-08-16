@@ -6779,7 +6779,7 @@ enum TriggerRaiseLevel {
 #[derive(Clone, Copy)]
 struct TriggerRaise<'a> {
     level: TriggerRaiseLevel,
-    sqlstate: &'static str,
+    sqlstate: TriggerRaiseSqlState<'a>,
     format: Option<&'a str>,
     default_message: Option<&'a str>,
     arguments: &'a [&'a Expr<'a>],
@@ -6790,10 +6790,19 @@ struct TriggerRaise<'a> {
 
 #[derive(Clone, Copy)]
 struct TriggerRaiseOptions<'a> {
-    sqlstate: Option<&'static str>,
+    sqlstate: Option<TriggerRaiseSqlState<'a>>,
     message: Option<&'a Expr<'a>>,
     detail: Option<&'a Expr<'a>>,
     hint: Option<&'a Expr<'a>>,
+}
+
+/// A RAISE SQLSTATE becomes a validated value while parsing whenever its
+/// spelling is literal. `ERRCODE = expression` retains the typed expression
+/// and validates its evaluated text once at the execution boundary.
+#[derive(Clone, Copy)]
+enum TriggerRaiseSqlState<'a> {
+    Parsed(crate::sql::eval::SqlState),
+    Expression(&'a Expr<'a>),
 }
 
 /// A diagnostic item has a fixed PostgreSQL spelling and result type. Parsing
@@ -6873,7 +6882,7 @@ struct TriggerExceptionHandler<'a> {
 #[derive(Clone, Copy)]
 enum TriggerExceptionCondition {
     Others,
-    SqlState(&'static str),
+    SqlState(crate::sql::eval::SqlState),
     SqlStateClass(&'static str),
 }
 
@@ -6964,7 +6973,7 @@ enum TriggerFlow {
 /// cannot accidentally inspect a surrounding handler's error.
 #[derive(Clone, Copy)]
 struct TriggerExceptionDiagnostic<'a> {
-    sqlstate: &'static str,
+    sqlstate: crate::sql::eval::SqlState,
     message: &'a StackStr<192>,
     diagnostic: Option<&'a crate::sql::eval::Diagnostic>,
 }
@@ -7659,8 +7668,8 @@ fn parse_trigger_raise<'a>(
     let (sqlstate, format, default_message, arguments) = if format_body.is_empty() {
         let sqlstate = options
             .sqlstate
-            .unwrap_or_else(|| trigger_raise_default_sqlstate(level));
-        (sqlstate, None, options.sqlstate.map(|_| sqlstate), &[][..])
+            .unwrap_or_else(|| TriggerRaiseSqlState::Parsed(trigger_raise_default_sqlstate(level)));
+        (sqlstate, None, None, &[][..])
     } else if let Some(code) = parse_trigger_raise_sqlstate(format_body)? {
         if options.sqlstate.is_some() {
             return Err(sql_err!(
@@ -7668,7 +7677,12 @@ fn parse_trigger_raise<'a>(
                 "RAISE cannot specify both SQLSTATE and ERRCODE"
             ));
         }
-        (code.0, None, Some(code.1), &[][..])
+        (
+            TriggerRaiseSqlState::Parsed(code.0),
+            None,
+            Some(code.1),
+            &[][..],
+        )
     } else if let Some(code) = trigger_condition_sqlstate(format_body) {
         if options.sqlstate.is_some() {
             return Err(sql_err!(
@@ -7676,7 +7690,12 @@ fn parse_trigger_raise<'a>(
                 "RAISE cannot specify both a condition name and ERRCODE"
             ));
         }
-        (code, None, Some(format_body), &[][..])
+        (
+            TriggerRaiseSqlState::Parsed(code),
+            None,
+            Some(format_body),
+            &[][..],
+        )
     } else {
         if options.message.is_some() {
             return Err(sql_err!(
@@ -7711,9 +7730,9 @@ fn parse_trigger_raise<'a>(
             })
             .map_err(|_| super::query::arena_full_pub())?;
         (
-            options
-                .sqlstate
-                .unwrap_or_else(|| trigger_raise_default_sqlstate(level)),
+            options.sqlstate.unwrap_or_else(|| {
+                TriggerRaiseSqlState::Parsed(trigger_raise_default_sqlstate(level))
+            }),
             Some(*format),
             None,
             &*arguments,
@@ -7753,12 +7772,15 @@ fn parse_trigger_raise_options<'a>(
             return Err(unsupported_trigger_body());
         };
         if name.trim().eq_ignore_ascii_case("errcode") {
-            let value = match super::parser::parse_expr(expression.trim(), arena)? {
-                Expr::Str(value) => value,
-                _ => return Err(unsupported_trigger_body()),
+            let expression = super::parser::parse_expr(expression.trim(), arena)?;
+            let state = match expression {
+                Expr::Str(value) => TriggerRaiseSqlState::Parsed(
+                    parse_trigger_raised_sqlstate(value)
+                        .ok_or_else(|| invalid_trigger_sqlstate(value))?,
+                ),
+                _ => TriggerRaiseSqlState::Expression(expression),
             };
-            let code = trigger_sqlstate(value).ok_or_else(unsupported_trigger_body)?;
-            if sqlstate.replace(code).is_some() {
+            if sqlstate.replace(state).is_some() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "RAISE USING option \"ERRCODE\" appears more than once"
@@ -8219,32 +8241,37 @@ fn parse_trigger_exception_condition(text: &str) -> Result<TriggerExceptionCondi
     Ok(TriggerExceptionCondition::SqlState(state))
 }
 
-/// Parses an explicit `SQLSTATE 'code'` into the one known, typed error-code
-/// set used by the bounded trigger language. The string slice is retained only
-/// for PostgreSQL's default message text.
-fn parse_trigger_raise_sqlstate(text: &str) -> Result<Option<(&'static str, &str)>, SqlError> {
+/// Parses an explicit `SQLSTATE 'code'` into the validated value used by the
+/// wire response, error value, handler, and stacked diagnostics. The source
+/// spelling is retained only for PostgreSQL's default message text.
+fn parse_trigger_raise_sqlstate(
+    text: &str,
+) -> Result<Option<(crate::sql::eval::SqlState, &str)>, SqlError> {
     let Some(value) = strip_trigger_keyword(text.trim(), "sqlstate") else {
         return Ok(None);
     };
     let value = value.trim();
-    if value.len() != 7 || !value.starts_with('\'') || !value.ends_with('\'') {
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
         return Err(unsupported_trigger_body());
     }
-    let code = &value[1..6];
-    if !code
-        .bytes()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
-        return Err(unsupported_trigger_body());
-    }
-    let state = trigger_sqlstate(code).ok_or_else(unsupported_trigger_body)?;
+    let code = &value[1..value.len() - 1];
+    let state =
+        parse_trigger_raised_sqlstate(code).ok_or_else(|| invalid_trigger_sqlstate(code))?;
     Ok(Some((state, code)))
+}
+
+fn parse_trigger_raised_sqlstate(code: &str) -> Option<crate::sql::eval::SqlState> {
+    crate::sql::eval::SqlState::parse(code)
+}
+
+fn invalid_trigger_sqlstate(code: &str) -> SqlError {
+    sql_err!(sqlstate::SYNTAX_ERROR, "invalid SQLSTATE code \"{}\"", code)
 }
 
 /// Maps the bounded language's named conditions to canonical PostgreSQL
 /// SQLSTATEs before execution; arbitrary identifier spellings cannot enter a
 /// compiled trigger program.
-fn trigger_condition_sqlstate(text: &str) -> Option<&'static str> {
+fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> {
     let state = if text.eq_ignore_ascii_case("unique_violation") {
         sqlstate::UNIQUE_VIOLATION
     } else if text.eq_ignore_ascii_case("foreign_key_violation") {
@@ -8264,35 +8291,21 @@ fn trigger_condition_sqlstate(text: &str) -> Option<&'static str> {
     } else {
         return None;
     };
-    Some(state)
+    Some(crate::sql::eval::SqlState::known(state))
 }
 
-/// The runtime supports this explicit, statically represented SQLSTATE set.
-/// Unsupported client syntax is rejected at the parse boundary, never stored
-/// as unchecked text for later execution.
-fn trigger_sqlstate(code: &str) -> Option<&'static str> {
-    match code {
-        sqlstate::UNIQUE_VIOLATION => Some(sqlstate::UNIQUE_VIOLATION),
-        sqlstate::FOREIGN_KEY_VIOLATION => Some(sqlstate::FOREIGN_KEY_VIOLATION),
-        sqlstate::NOT_NULL_VIOLATION => Some(sqlstate::NOT_NULL_VIOLATION),
-        sqlstate::CHECK_VIOLATION => Some(sqlstate::CHECK_VIOLATION),
-        sqlstate::DIVISION_BY_ZERO => Some(sqlstate::DIVISION_BY_ZERO),
-        sqlstate::CARDINALITY_VIOLATION => Some(sqlstate::CARDINALITY_VIOLATION),
-        sqlstate::RAISE_EXCEPTION => Some(sqlstate::RAISE_EXCEPTION),
-        sqlstate::ASSERT_FAILURE => Some(sqlstate::ASSERT_FAILURE),
-        sqlstate::WARNING => Some(sqlstate::WARNING),
-        _ => None,
-    }
-}
-
-fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> &'static str {
+fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> crate::sql::eval::SqlState {
     match level {
-        TriggerRaiseLevel::Exception => sqlstate::RAISE_EXCEPTION,
-        TriggerRaiseLevel::Warning => sqlstate::WARNING,
+        TriggerRaiseLevel::Exception => {
+            crate::sql::eval::SqlState::known(sqlstate::RAISE_EXCEPTION)
+        }
+        TriggerRaiseLevel::Warning => crate::sql::eval::SqlState::known(sqlstate::WARNING),
         TriggerRaiseLevel::Debug
         | TriggerRaiseLevel::Log
         | TriggerRaiseLevel::Info
-        | TriggerRaiseLevel::Notice => sqlstate::SUCCESSFUL_COMPLETION,
+        | TriggerRaiseLevel::Notice => {
+            crate::sql::eval::SqlState::known(sqlstate::SUCCESSFUL_COMPLETION)
+        }
     }
 }
 
@@ -8996,18 +9009,14 @@ mod trigger_program_tests {
             panic!("nested block must be an exception node");
         };
         assert_eq!(exception.handlers.len(), 2);
-        assert!(matches!(
-            exception.handlers[0].conditions,
-            [TriggerExceptionCondition::SqlState(
-                sqlstate::UNIQUE_VIOLATION
-            )]
-        ));
-        assert!(matches!(
-            exception.handlers[1].conditions,
-            [TriggerExceptionCondition::SqlState(
-                sqlstate::RAISE_EXCEPTION
-            )]
-        ));
+        let [TriggerExceptionCondition::SqlState(first)] = exception.handlers[0].conditions else {
+            panic!("first handler must retain its typed condition");
+        };
+        assert_eq!(*first, sqlstate::UNIQUE_VIOLATION);
+        let [TriggerExceptionCondition::SqlState(second)] = exception.handlers[1].conditions else {
+            panic!("second handler must retain its typed condition");
+        };
+        assert_eq!(*second, sqlstate::RAISE_EXCEPTION);
     }
 }
 
@@ -9541,6 +9550,21 @@ fn trigger_diagnostic_text<const N: usize>(
     Ok(value)
 }
 
+fn trigger_raise_sqlstate(
+    state: TriggerRaiseSqlState<'_>,
+    arena: &Arena,
+    scope: &TriggerLocalScope<'_, '_>,
+) -> Result<crate::sql::eval::SqlState, SqlError> {
+    match state {
+        TriggerRaiseSqlState::Parsed(state) => Ok(state),
+        TriggerRaiseSqlState::Expression(expression) => {
+            let code = trigger_diagnostic_text::<6>(expression, arena, scope)?;
+            parse_trigger_raised_sqlstate(code.as_str())
+                .ok_or_else(|| invalid_trigger_sqlstate(code.as_str()))
+        }
+    }
+}
+
 fn trigger_notice_to_sql(_: WireFull) -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10035,6 +10059,7 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
+                let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context.arena, &scope)?;
                 let message = match raise.message {
                     Some(message) => {
                         trigger_diagnostic_text::<192>(message, context.arena, &scope)?
@@ -10042,14 +10067,12 @@ fn execute_trigger_block<'a>(
                     None if raise.default_message.is_some() => {
                         stack_format!(192, "{}", raise.default_message.expect("default message"))
                     }
-                    None => trigger_format_message(
-                        raise
-                            .format
-                            .expect("RAISE parser requires a format or MESSAGE"),
-                        raise.arguments,
-                        context.arena,
-                        &scope,
-                    )?,
+                    None => match raise.format {
+                        Some(format) => {
+                            trigger_format_message(format, raise.arguments, context.arena, &scope)?
+                        }
+                        None => stack_format!(192, "{}", sqlstate.as_str()),
+                    },
                 };
                 let detail =
                     raise
@@ -10070,26 +10093,26 @@ fn execute_trigger_block<'a>(
                 match raise.level {
                     TriggerRaiseLevel::Debug => context
                         .responder
-                        .debug(raise.sqlstate, message.as_str())
+                        .debug(sqlstate, message.as_str())
                         .map_err(trigger_notice_to_sql)?,
                     TriggerRaiseLevel::Log => context
                         .responder
-                        .log(raise.sqlstate, message.as_str())
+                        .log(sqlstate, message.as_str())
                         .map_err(trigger_notice_to_sql)?,
                     TriggerRaiseLevel::Info => context
                         .responder
-                        .info(raise.sqlstate, message.as_str())
+                        .info(sqlstate, message.as_str())
                         .map_err(trigger_notice_to_sql)?,
                     TriggerRaiseLevel::Exception => {
-                        return Err(sql_err!(raise.sqlstate, "{}", message.as_str()));
+                        return Err(SqlError { sqlstate, message });
                     }
                     TriggerRaiseLevel::Warning => context
                         .responder
-                        .warning(raise.sqlstate, message.as_str())
+                        .warning(sqlstate, message.as_str())
                         .map_err(trigger_notice_to_sql)?,
                     TriggerRaiseLevel::Notice => context
                         .responder
-                        .notice(raise.sqlstate, message.as_str())
+                        .notice(sqlstate, message.as_str())
                         .map_err(trigger_notice_to_sql)?,
                 }
             }
@@ -10102,7 +10125,9 @@ fn execute_trigger_block<'a>(
                 };
                 for assignment in statement.assignments {
                     let value = match assignment.item {
-                        TriggerStackedDiagnostic::ReturnedSqlstate => Some(exception.sqlstate),
+                        TriggerStackedDiagnostic::ReturnedSqlstate => {
+                            Some(exception.sqlstate.as_str())
+                        }
                         TriggerStackedDiagnostic::MessageText => Some(exception.message.as_str()),
                         TriggerStackedDiagnostic::PgExceptionDetail => exception
                             .diagnostic

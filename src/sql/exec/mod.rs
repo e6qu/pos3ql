@@ -6618,6 +6618,7 @@ struct TriggerInvocation<'a> {
     table_schema: &'a str,
     table_name: &'a str,
     relid: i32,
+    routine_oid: i32,
     nargs: i32,
     when: &'static str,
     level: &'static str,
@@ -6692,6 +6693,7 @@ impl<'a> TriggerInvocation<'a> {
         table: usize,
         event: u8,
         before: bool,
+        routine_oid: i32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut arguments = [Datum::Null; crate::storage::MAX_TRIGGER_ARGUMENTS];
@@ -6724,6 +6726,7 @@ impl<'a> TriggerInvocation<'a> {
                 .alloc_str(definition.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             relid: crate::sql::catalog::user_table_oid(table),
+            routine_oid,
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
             when: if before { "BEFORE" } else { "AFTER" },
@@ -6829,6 +6832,7 @@ enum TriggerStackedDiagnostic {
 #[derive(Clone, Copy)]
 enum TriggerDiagnostic {
     RowCount,
+    PgRoutineOid,
 }
 
 #[derive(Clone, Copy)]
@@ -7920,6 +7924,8 @@ fn parse_trigger_stacked_diagnostic(text: &str) -> Result<TriggerStackedDiagnost
 fn parse_trigger_diagnostic(text: &str) -> Result<TriggerDiagnostic, SqlError> {
     if text.eq_ignore_ascii_case("row_count") {
         Ok(TriggerDiagnostic::RowCount)
+    } else if text.eq_ignore_ascii_case("pg_routine_oid") {
+        Ok(TriggerDiagnostic::PgRoutineOid)
     } else {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -7940,6 +7946,9 @@ fn parse_trigger_get_diagnostics<'a>(
     if strip_trigger_keyword(body, "stacked").is_some() {
         return Ok(None);
     }
+    let body = strip_trigger_keyword(body, "current")
+        .unwrap_or(body)
+        .trim();
     let Some(body) = strip_trigger_keyword(body, "diagnostics") else {
         return Err(unsupported_trigger_body());
     };
@@ -7947,7 +7956,7 @@ fn parse_trigger_get_diagnostics<'a>(
     let mut assignments = [None; MAX_COLUMNS];
     for (index, part) in parts[..count].iter().enumerate() {
         let part = part.expect("diagnostic assignment initialized");
-        let Some((target, item)) = part.split_once('=') else {
+        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
         let target = SqlName::parse(target.trim())?;
@@ -7997,7 +8006,7 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
     let mut assignments = [None; MAX_COLUMNS];
     for (index, part) in parts[..count].iter().enumerate() {
         let part = part.expect("diagnostic assignment initialized");
-        let Some((target, item)) = part.split_once('=') else {
+        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
         let target = SqlName::parse(target.trim())?;
@@ -8492,6 +8501,18 @@ fn parse_trigger_statement<'a>(
     if let Some(result) = parse_trigger_return(segment)? {
         return Ok(TriggerStatement::Return(result));
     }
+    if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
+        return Ok(TriggerStatement::GetDiagnostics(diagnostics));
+    }
+    if let Some(diagnostics) = parse_trigger_get_stacked_diagnostics(segment, arena)? {
+        if !handler_active {
+            return Err(sql_err!(
+                sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+                "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
+            ));
+        }
+        return Ok(TriggerStatement::GetStackedDiagnostics(diagnostics));
+    }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
     }
@@ -8509,18 +8530,6 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(raise) = parse_trigger_raise(segment, arena, handler_active)? {
         return Ok(TriggerStatement::Raise(raise));
-    }
-    if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
-        return Ok(TriggerStatement::GetDiagnostics(diagnostics));
-    }
-    if let Some(diagnostics) = parse_trigger_get_stacked_diagnostics(segment, arena)? {
-        if !handler_active {
-            return Err(sql_err!(
-                sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
-                "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
-            ));
-        }
-        return Ok(TriggerStatement::GetStackedDiagnostics(diagnostics));
     }
     if let Some(control) = parse_trigger_loop_control(segment, arena, loop_labels)? {
         if loop_labels.is_empty() {
@@ -10329,6 +10338,7 @@ fn execute_trigger_block<'a>(
                 for assignment in statement.assignments {
                     let value = match assignment.item {
                         TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
+                        TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
                     };
                     assign_trigger_local(
                         locals,
@@ -11312,8 +11322,17 @@ fn fire_row_triggers<'a>(
                 }
             }
         }
-        let invocation =
-            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
+        let routine_oid =
+            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
+        let invocation = TriggerInvocation::new(
+            &trigger,
+            definition,
+            table,
+            event,
+            before,
+            routine_oid,
+            context.arena,
+        )?;
         let source = {
             let body = context
                 .storage
@@ -11526,8 +11545,17 @@ fn fire_statement_triggers_with_rows<'a>(
             trigger.when.is_none(),
             "statement WHEN was rejected at creation"
         );
-        let invocation =
-            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
+        let routine_oid =
+            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
+        let invocation = TriggerInvocation::new(
+            &trigger,
+            definition,
+            table,
+            event,
+            before,
+            routine_oid,
+            context.arena,
+        )?;
         let source = {
             let body = context
                 .storage

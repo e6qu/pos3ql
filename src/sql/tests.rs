@@ -8707,6 +8707,39 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
 }
 
 #[test]
+fn trigger_current_diagnostics_uses_typed_routine_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_current_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_current_audit (routine_oid oid);
+         CREATE FUNCTION trigger_current_diagnostics() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE current_routine oid;
+            BEGIN
+              GET CURRENT DIAGNOSTICS current_routine := PG_ROUTINE_OID;
+              INSERT INTO trigger_current_audit VALUES (current_routine);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_current_before BEFORE INSERT ON trigger_current_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_current_diagnostics();
+         CREATE TRIGGER trigger_current_after AFTER INSERT ON trigger_current_target
+           FOR EACH STATEMENT EXECUTE FUNCTION trigger_current_diagnostics();
+         INSERT INTO trigger_current_target VALUES (1);
+         SELECT audit.routine_oid = procedure.oid
+           FROM trigger_current_audit audit
+           JOIN pg_proc procedure ON procedure.proname = 'trigger_current_diagnostics'
+          ORDER BY audit.routine_oid;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn trigger_foreach_updates_found_without_changing_row_count() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

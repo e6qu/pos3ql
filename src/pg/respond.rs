@@ -92,6 +92,9 @@ pub struct Responder<'b> {
     /// Composite utility commands execute ordinary DROP helpers but publish
     /// one command tag of their own.
     suppress_command_complete: bool,
+    /// Typed affected-row count for an internally executed DML command. This
+    /// never derives state from a serialized command tag.
+    affected_rows: Option<u64>,
     discarded_rows: u64,
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
@@ -226,6 +229,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -242,6 +246,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -260,6 +265,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -278,6 +284,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -1235,6 +1242,26 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
+    /// Publishes an affected-row count alongside a DML command completion.
+    /// Nested trigger execution consumes the count as typed execution state;
+    /// clients still receive only PostgreSQL's ordinary command tag.
+    pub(crate) fn command_complete_rows(&mut self, tag: &str, rows: u64) -> Result<(), WireFull> {
+        self.set_affected_rows(rows);
+        self.command_complete(tag)
+    }
+
+    pub(crate) fn set_affected_rows(&mut self, rows: u64) {
+        self.affected_rows = Some(rows);
+    }
+
+    pub(crate) fn take_affected_rows(&mut self) -> Option<u64> {
+        self.affected_rows.take()
+    }
+
+    pub(crate) fn clear_affected_rows(&mut self) {
+        self.affected_rows = None;
+    }
+
     pub fn without_command_complete<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
         let prior = self.suppress_command_complete;
         self.suppress_command_complete = true;
@@ -1249,7 +1276,7 @@ impl<'b> Responder<'b> {
 
     /// NoticeResponse at NOTICE severity. Dropped when `client_min_messages`
     /// is above NOTICE (e.g. `warning`), matching PostgreSQL.
-    pub fn notice(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn notice<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
             crate::sql::guc::MessageLevel::Notice,
             "NOTICE",
@@ -1260,7 +1287,7 @@ impl<'b> Responder<'b> {
 
     /// NoticeResponse at WARNING severity. Dropped only when
     /// `client_min_messages` is above WARNING (i.e. `error`).
-    pub fn warning(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn warning<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
         self.diagnostic(
             crate::sql::guc::MessageLevel::Warning,
             "WARNING",
@@ -1269,14 +1296,34 @@ impl<'b> Responder<'b> {
         )
     }
 
+    /// NoticeResponse at DEBUG severity, subject to `client_min_messages`.
+    pub fn debug<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        self.diagnostic(
+            crate::sql::guc::MessageLevel::Debug1,
+            "DEBUG",
+            sqlstate,
+            message,
+        )
+    }
+
+    /// NoticeResponse at LOG severity, subject to `client_min_messages`.
+    pub fn log<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        self.diagnostic(crate::sql::guc::MessageLevel::Log, "LOG", sqlstate, message)
+    }
+
+    /// PostgreSQL sends INFO to the client regardless of `client_min_messages`.
+    pub fn info<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        self.diagnostic_unfiltered("INFO", sqlstate, message)
+    }
+
     /// Emits a NoticeResponse (NOTICE or WARNING severity) unless the session's
     /// `client_min_messages` threshold filters it out. Same field layout as
     /// errors.
-    fn diagnostic(
+    fn diagnostic<S: AsRef<str>>(
         &mut self,
         level: crate::sql::guc::MessageLevel,
         severity: &str,
-        sqlstate: &str,
+        sqlstate: S,
         message: &str,
     ) -> Result<(), WireFull> {
         // The stashed detail belongs to this diagnostic even when the level
@@ -1285,6 +1332,26 @@ impl<'b> Responder<'b> {
         if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
+        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+    }
+
+    fn diagnostic_unfiltered<S: AsRef<str>>(
+        &mut self,
+        severity: &str,
+        sqlstate: S,
+        message: &str,
+    ) -> Result<(), WireFull> {
+        let diagnostic = crate::sql::eval::take_diagnostic();
+        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+    }
+
+    fn write_notice_response(
+        &mut self,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+        diagnostic: Option<&crate::sql::eval::Diagnostic>,
+    ) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_NOTICE_RESPONSE);
         m.u8(b'S');
         m.cstr(severity);
@@ -1294,7 +1361,7 @@ impl<'b> Responder<'b> {
         m.cstr(sqlstate);
         m.u8(b'M');
         m.cstr(message);
-        if let Some(d) = &diagnostic {
+        if let Some(d) = diagnostic {
             m.u8(b'D');
             m.cstr(d.detail.as_str());
             if let Some(h) = &d.hint {
@@ -1308,7 +1375,8 @@ impl<'b> Responder<'b> {
 
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
-    pub fn error(&mut self, sqlstate: &str, message: &str) -> Result<(), WireFull> {
+    pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        let sqlstate = sqlstate.as_ref();
         let diagnostic = crate::sql::eval::take_diagnostic();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
         m.u8(b'S');

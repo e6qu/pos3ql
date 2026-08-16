@@ -66,10 +66,71 @@ pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
 
+/// A PostgreSQL SQLSTATE that has already passed the protocol's five-byte
+/// grammar. Keeping this separate from arbitrary text prevents a dynamic
+/// diagnostic from reaching a wire response or handler unvalidated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlState(StackStr<5>);
+
+impl SqlState {
+    /// Constructs a code used by the engine itself. Constants are audited at
+    /// the call site, while client-provided values must use [`Self::parse`].
+    pub(crate) fn known(code: &'static str) -> Self {
+        assert!(
+            Self::is_valid(code),
+            "engine SQLSTATE constants must be valid"
+        );
+        Self(StackStr::from_str(code))
+    }
+
+    /// Parses the PostgreSQL SQLSTATE grammar: five upper-case ASCII letters
+    /// or digits.
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::is_valid(code).then(|| Self(StackStr::from_str(code)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn starts_with(self, prefix: &str) -> bool {
+        self.0.as_str().starts_with(prefix)
+    }
+
+    pub fn is_successful_completion(self) -> bool {
+        self == sqlstate::SUCCESSFUL_COMPLETION
+    }
+
+    fn is_valid(code: &str) -> bool {
+        code.len() == 5
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }
+}
+
+impl AsRef<str> for SqlState {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl core::fmt::Display for SqlState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+impl PartialEq<&str> for SqlState {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_str() == *other
+    }
+}
+
 #[derive(Debug)]
 pub struct SqlError {
     /// Five-character SQLSTATE per PostgreSQL's errcodes table.
-    pub sqlstate: &'static str,
+    pub sqlstate: SqlState,
     pub message: StackStr<192>,
 }
 
@@ -77,7 +138,7 @@ pub struct SqlError {
 macro_rules! sql_err {
     ($state:expr, $($arg:tt)*) => {
         $crate::sql::eval::SqlError {
-            sqlstate: $state,
+            sqlstate: $crate::sql::eval::SqlState::known($state),
             message: $crate::stack_format!(192, $($arg)*),
         }
     };
@@ -185,7 +246,13 @@ pub mod sqlstate {
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const SUCCESSFUL_COMPLETION: &str = "00000";
+    pub const WARNING: &str = "01000";
     pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const RAISE_EXCEPTION: &str = "P0001";
+    pub const NO_DATA_FOUND: &str = "P0002";
+    pub const TOO_MANY_ROWS: &str = "P0003";
+    pub const ASSERT_FAILURE: &str = "P0004";
+    pub const STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER: &str = "0Z002";
 }
 
 /// Resolves column references during evaluation. Statements without a FROM
@@ -4613,5 +4680,14 @@ mod tests {
             let err = eval_one(a, "SELECT 1::geometry").unwrap_err();
             assert_eq!(err.sqlstate, "42704");
         });
+    }
+
+    #[test]
+    fn sqlstate_is_a_validated_fixed_value() {
+        assert_eq!(SqlState::parse("ZX123").unwrap().as_str(), "ZX123");
+        assert!(SqlState::parse("00000").unwrap().is_successful_completion());
+        for invalid in ["", "2201", "220123", "22p02", "22-02"] {
+            assert!(SqlState::parse(invalid).is_none(), "{invalid}");
+        }
     }
 }

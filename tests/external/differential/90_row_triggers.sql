@@ -397,3 +397,60 @@ CREATE TRIGGER trigger_foreach_slice_before BEFORE INSERT ON trigger_foreach_sli
   FOR EACH ROW EXECUTE FUNCTION trigger_foreach_slice_program();
 INSERT INTO trigger_foreach_slice_target VALUES (1, 0);
 SELECT id, value FROM trigger_foreach_slice_target;
+
+CREATE TABLE trigger_strict_source (id integer, value integer);
+INSERT INTO trigger_strict_source VALUES (1, 11);
+CREATE TABLE trigger_strict_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_strict_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE selected integer;
+   BEGIN
+     ASSERT NEW.id > 0;
+     SELECT value INTO STRICT selected FROM trigger_strict_source WHERE id = NEW.id;
+     NEW.value := selected;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_strict_before BEFORE INSERT ON trigger_strict_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_strict_program();
+INSERT INTO trigger_strict_target VALUES (1, 0);
+SELECT id, value FROM trigger_strict_target;
+
+CREATE TABLE trigger_exception_target (id integer PRIMARY KEY);
+CREATE TABLE trigger_exception_audit (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_exception_program() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN
+     BEGIN
+       INSERT INTO trigger_exception_audit VALUES (NEW.id + 10, 10);
+       RAISE EXCEPTION ''retry through handler'';
+     EXCEPTION WHEN raise_exception OR SQLSTATE ''P0001'' THEN
+       INSERT INTO trigger_exception_audit VALUES (NEW.id + 100, 100);
+     END;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_exception_before BEFORE INSERT ON trigger_exception_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_exception_program();
+INSERT INTO trigger_exception_target VALUES (1);
+SELECT id, value FROM trigger_exception_audit ORDER BY id;
+SELECT id FROM trigger_exception_target;
+
+CREATE TABLE trigger_stacked_diagnostic_target (id integer PRIMARY KEY);
+CREATE TABLE trigger_stacked_diagnostic_audit (code text, message text, detail text, hint text);
+CREATE FUNCTION trigger_stacked_diagnostic_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE caught_code text; caught_message text; caught_detail text; caught_hint text;
+   BEGIN
+     BEGIN
+       RAISE EXCEPTION USING MESSAGE = ''rejected id '' || NEW.id,
+                             DETAIL = ''validation detail'',
+                             HINT = ''supply a different id'';
+     EXCEPTION WHEN raise_exception THEN
+       GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE,
+                               caught_message = MESSAGE_TEXT,
+                               caught_detail = PG_EXCEPTION_DETAIL,
+                               caught_hint = PG_EXCEPTION_HINT;
+       INSERT INTO trigger_stacked_diagnostic_audit VALUES (caught_code, caught_message, caught_detail, caught_hint);
+     END;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_stacked_diagnostic_before BEFORE INSERT ON trigger_stacked_diagnostic_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_stacked_diagnostic_program();
+INSERT INTO trigger_stacked_diagnostic_target VALUES (7);
+SELECT code, message, detail, hint FROM trigger_stacked_diagnostic_audit;

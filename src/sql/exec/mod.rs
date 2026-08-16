@@ -30,8 +30,8 @@ use super::ast::{
     TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
-    eval_full, sqlstate,
+    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, datum_to_text,
+    eval, eval_full, sqlstate,
 };
 use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 
@@ -6618,6 +6618,7 @@ struct TriggerInvocation<'a> {
     table_schema: &'a str,
     table_name: &'a str,
     relid: i32,
+    routine_oid: i32,
     nargs: i32,
     when: &'static str,
     level: &'static str,
@@ -6692,6 +6693,7 @@ impl<'a> TriggerInvocation<'a> {
         table: usize,
         event: u8,
         before: bool,
+        routine_oid: i32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut arguments = [Datum::Null; crate::storage::MAX_TRIGGER_ARGUMENTS];
@@ -6724,6 +6726,7 @@ impl<'a> TriggerInvocation<'a> {
                 .alloc_str(definition.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             relid: crate::sql::catalog::user_table_oid(table),
+            routine_oid,
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
             when: if before { "BEFORE" } else { "AFTER" },
@@ -6757,6 +6760,101 @@ impl<'a> TriggerInvocation<'a> {
 struct TriggerSelectInto<'a> {
     query: &'a Select<'a>,
     targets: &'a [SqlName],
+    strict: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerAssert<'a> {
+    condition: &'a Expr<'a>,
+    message: Option<&'a Expr<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum TriggerRaiseLevel {
+    Debug,
+    Log,
+    Info,
+    Exception,
+    Warning,
+    Notice,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerRaisedMessage<'a> {
+    level: TriggerRaiseLevel,
+    sqlstate: TriggerRaiseSqlState<'a>,
+    format: Option<&'a str>,
+    default_message: Option<&'a str>,
+    arguments: &'a [&'a Expr<'a>],
+    message: Option<&'a Expr<'a>>,
+    detail: Option<&'a Expr<'a>>,
+    hint: Option<&'a Expr<'a>>,
+}
+
+/// `RAISE;` has no independently executable meaning: parsing permits it only
+/// in an exception handler, where it re-emits the handler's caught error.
+#[derive(Clone, Copy)]
+enum TriggerRaise<'a> {
+    Message(TriggerRaisedMessage<'a>),
+    Rethrow,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerRaiseOptions<'a> {
+    sqlstate: Option<TriggerRaiseSqlState<'a>>,
+    message: Option<&'a Expr<'a>>,
+    detail: Option<&'a Expr<'a>>,
+    hint: Option<&'a Expr<'a>>,
+}
+
+/// A RAISE SQLSTATE becomes a validated value while parsing whenever its
+/// spelling is literal. `ERRCODE = expression` retains the typed expression
+/// and validates its evaluated text once at the execution boundary.
+#[derive(Clone, Copy)]
+enum TriggerRaiseSqlState<'a> {
+    Parsed(crate::sql::eval::SqlState),
+    Expression(&'a Expr<'a>),
+}
+
+/// A diagnostic item has a fixed PostgreSQL spelling and result type. Parsing
+/// it here prevents a handler from treating an arbitrary identifier as a
+/// diagnostic field.
+#[derive(Clone, Copy)]
+enum TriggerStackedDiagnostic {
+    ReturnedSqlstate,
+    MessageText,
+    PgExceptionDetail,
+    PgExceptionHint,
+}
+
+/// An ordinary diagnostic item has a fixed PostgreSQL spelling and result
+/// type. Unsupported spellings remain loud parse errors.
+#[derive(Clone, Copy)]
+enum TriggerDiagnostic {
+    RowCount,
+    PgRoutineOid,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerDiagnosticAssignment {
+    target: SqlName,
+    item: TriggerDiagnostic,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerGetDiagnostics<'a> {
+    assignments: &'a [TriggerDiagnosticAssignment],
+}
+
+#[derive(Clone, Copy)]
+struct TriggerStackedDiagnosticAssignment {
+    target: SqlName,
+    item: TriggerStackedDiagnostic,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerGetStackedDiagnostics<'a> {
+    assignments: &'a [TriggerStackedDiagnosticAssignment],
 }
 
 #[derive(Clone, Copy)]
@@ -6783,6 +6881,11 @@ enum TriggerStatement<'a> {
     LocalAssign(TriggerLocalAssignment<'a>),
     SelectInto(TriggerSelectInto<'a>),
     Perform(&'a Select<'a>),
+    Assert(TriggerAssert<'a>),
+    Raise(TriggerRaise<'a>),
+    GetDiagnostics(TriggerGetDiagnostics<'a>),
+    GetStackedDiagnostics(TriggerGetStackedDiagnostics<'a>),
+    Exception(TriggerException<'a>),
     Dml(TriggerDml<'a>),
     If(TriggerIf<'a>),
     Case(TriggerCase<'a>),
@@ -6791,6 +6894,27 @@ enum TriggerStatement<'a> {
     Loop(TriggerBlock<'a>),
     LoopControl(TriggerLoopControl<'a>),
     Return(TriggerReturn),
+}
+
+#[derive(Clone, Copy)]
+struct TriggerException<'a> {
+    protected: TriggerBlock<'a>,
+    handlers: &'a [TriggerExceptionHandler<'a>],
+}
+
+#[derive(Clone, Copy)]
+struct TriggerExceptionHandler<'a> {
+    conditions: &'a [TriggerExceptionCondition],
+    block: TriggerBlock<'a>,
+}
+
+/// Conditions are resolved while parsing: execution compares a SQLSTATE code
+/// or class and cannot accidentally treat an arbitrary identifier as one.
+#[derive(Clone, Copy)]
+enum TriggerExceptionCondition {
+    Others,
+    SqlState(crate::sql::eval::SqlState),
+    SqlStateClass(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -6873,6 +6997,60 @@ enum TriggerFlow {
     Return(TriggerReturn),
     Exit(u8),
     Continue(u8),
+}
+
+/// The caught error is an explicitly scoped execution value. Lexically nested
+/// blocks inherit it; a matching nested exception handler shadows it.
+#[derive(Clone, Copy)]
+struct TriggerExceptionDiagnostic<'a> {
+    sqlstate: crate::sql::eval::SqlState,
+    message: &'a StackStr<192>,
+    diagnostic: Option<&'a crate::sql::eval::Diagnostic>,
+}
+
+/// Per-function execution state, deliberately distinct from local variables
+/// and transaction state. Nested trigger functions receive a fresh value.
+#[derive(Clone, Copy)]
+struct TriggerExecutionStatus {
+    found: Option<bool>,
+    row_count: i64,
+}
+
+impl Default for TriggerExecutionStatus {
+    fn default() -> Self {
+        Self {
+            found: Some(false),
+            row_count: 0,
+        }
+    }
+}
+
+impl TriggerExecutionStatus {
+    fn set_rows(&mut self, rows: u64) -> Result<(), SqlError> {
+        self.row_count = i64::try_from(rows).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "trigger affected-row count exceeds bigint"
+            )
+        })?;
+        self.found = Some(rows != 0);
+        Ok(())
+    }
+
+    fn set_found(&mut self, found: bool) {
+        self.found = Some(found);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TriggerStatusVariable {
+    Found,
+}
+
+impl TriggerStatusVariable {
+    fn parse(name: &str) -> Option<Self> {
+        name.eq_ignore_ascii_case("found").then_some(Self::Found)
+    }
 }
 
 /// A trigger has two explicitly named transition images.  Keeping them as a
@@ -7120,6 +7298,9 @@ fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
     } else if strip_trigger_keyword(content, "begin").is_some() {
         let rest = strip_trigger_keyword(content, "begin")?.trim();
         return (!rest.is_empty()).then_some(("BEGIN", rest));
+    } else if strip_trigger_keyword(content, "exception").is_some() {
+        let rest = strip_trigger_keyword(content, "exception")?.trim();
+        return (!rest.is_empty()).then_some(("EXCEPTION", rest));
     } else {
         return None;
     };
@@ -7408,6 +7589,10 @@ fn parse_trigger_select_into<'a>(
     let (target_source, tail) = clause_at
         .map(|at| (&after_into[..at], &after_into[at..]))
         .unwrap_or((after_into, ""));
+    let (strict, target_source) = match strip_trigger_keyword(target_source.trim(), "strict") {
+        Some(targets) => (true, targets.trim()),
+        None => (false, target_source.trim()),
+    };
     let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
     let mut count = 0usize;
     for target in target_source.split(',') {
@@ -7445,6 +7630,412 @@ fn parse_trigger_select_into<'a>(
     Ok(Some(TriggerSelectInto {
         query,
         targets: &*targets,
+        strict,
+    }))
+}
+
+fn split_trigger_arguments(text: &str) -> Result<([Option<&str>; MAX_COLUMNS], usize), SqlError> {
+    let mut arguments = [None; MAX_COLUMNS];
+    let mut count = 0usize;
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (offset, character) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            ',' if depth == 0 => {
+                let argument = text[start..offset].trim();
+                if argument.is_empty() || count == arguments.len() {
+                    return Err(unsupported_trigger_body());
+                }
+                arguments[count] = Some(argument);
+                count += 1;
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(unsupported_trigger_body());
+    }
+    let argument = text[start..].trim();
+    if argument.is_empty() || count == arguments.len() {
+        return Err(unsupported_trigger_body());
+    }
+    arguments[count] = Some(argument);
+    Ok((arguments, count + 1))
+}
+
+fn parse_trigger_assert<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerAssert<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "assert") else {
+        return Ok(None);
+    };
+    let (parts, count) = split_trigger_arguments(body.trim())?;
+    if count > 2 {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(Some(TriggerAssert {
+        condition: super::parser::parse_expr(parts[0].expect("assert condition"), arena)?,
+        message: parts
+            .get(1)
+            .and_then(|part| *part)
+            .map(|message| super::parser::parse_expr(message, arena))
+            .transpose()?,
+    }))
+}
+
+fn raise_format_arguments(format: &str) -> usize {
+    let mut arguments = 0usize;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        if characters.next() != Some('%') {
+            arguments += 1;
+        }
+    }
+    arguments
+}
+
+fn parse_trigger_raise<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+    handler_active: bool,
+) -> Result<Option<TriggerRaise<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "raise") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    let (level, body) = if let Some(body) = strip_trigger_keyword(body, "debug") {
+        (TriggerRaiseLevel::Debug, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "log") {
+        (TriggerRaiseLevel::Log, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "info") {
+        (TriggerRaiseLevel::Info, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "exception") {
+        (TriggerRaiseLevel::Exception, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "warning") {
+        (TriggerRaiseLevel::Warning, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "notice") {
+        (TriggerRaiseLevel::Notice, body.trim())
+    } else {
+        (TriggerRaiseLevel::Exception, body)
+    };
+    if body.is_empty() {
+        if handler_active {
+            return Ok(Some(TriggerRaise::Rethrow));
+        }
+        return Err(sql_err!(
+            sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+            "RAISE without parameters cannot be used outside an exception handler"
+        ));
+    }
+    let using_at = trigger_top_level_keyword(body, "using");
+    let (format_body, options) = using_at
+        .map(|at| (body[..at].trim(), Some(body[at + 5..].trim())))
+        .unwrap_or((body, None));
+    let options = parse_trigger_raise_options(options, arena)?;
+    if format_body.is_empty() && options.message.is_none() && options.sqlstate.is_none() {
+        return Err(unsupported_trigger_body());
+    }
+    let (sqlstate, format, default_message, arguments) = if format_body.is_empty() {
+        let sqlstate = options
+            .sqlstate
+            .unwrap_or_else(|| TriggerRaiseSqlState::Parsed(trigger_raise_default_sqlstate(level)));
+        (sqlstate, None, None, &[][..])
+    } else if let Some(code) = parse_trigger_raise_sqlstate(format_body)? {
+        if options.sqlstate.is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "RAISE cannot specify both SQLSTATE and ERRCODE"
+            ));
+        }
+        (
+            TriggerRaiseSqlState::Parsed(code.0),
+            None,
+            Some(code.1),
+            &[][..],
+        )
+    } else if let Some(code) = trigger_condition_sqlstate(format_body) {
+        if options.sqlstate.is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "RAISE cannot specify both a condition name and ERRCODE"
+            ));
+        }
+        (
+            TriggerRaiseSqlState::Parsed(code),
+            None,
+            Some(format_body),
+            &[][..],
+        )
+    } else {
+        if options.message.is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "RAISE cannot specify both a format string and MESSAGE"
+            ));
+        }
+        let (parts, count) = split_trigger_arguments(format_body)?;
+        let format = match super::parser::parse_expr(parts[0].expect("RAISE format"), arena)? {
+            Expr::Str(format) => format,
+            _ => return Err(unsupported_trigger_body()),
+        };
+        let argument_count = raise_format_arguments(format);
+        if argument_count != count - 1 {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "RAISE format has {} placeholders but {} arguments",
+                argument_count,
+                count - 1
+            ));
+        }
+        let mut parsed = [None; MAX_COLUMNS];
+        for index in 0..count - 1 {
+            parsed[index] = Some(super::parser::parse_expr(
+                parts[index + 1].expect("RAISE argument"),
+                arena,
+            )?);
+        }
+        let arguments = arena
+            .alloc_slice_with(count - 1, |index| {
+                parsed[index].expect("RAISE argument parsed")
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        (
+            options.sqlstate.unwrap_or_else(|| {
+                TriggerRaiseSqlState::Parsed(trigger_raise_default_sqlstate(level))
+            }),
+            Some(*format),
+            None,
+            &*arguments,
+        )
+    };
+    Ok(Some(TriggerRaise::Message(TriggerRaisedMessage {
+        level,
+        sqlstate,
+        format,
+        default_message,
+        arguments,
+        message: options.message,
+        detail: options.detail,
+        hint: options.hint,
+    })))
+}
+
+fn parse_trigger_raise_options<'a>(
+    options: Option<&'a str>,
+    arena: &'a Arena,
+) -> Result<TriggerRaiseOptions<'a>, SqlError> {
+    let Some(options) = options else {
+        return Ok(TriggerRaiseOptions {
+            sqlstate: None,
+            message: None,
+            detail: None,
+            hint: None,
+        });
+    };
+    let (parts, count) = split_trigger_arguments(options)?;
+    let mut sqlstate = None;
+    let mut message = None;
+    let mut detail = None;
+    let mut hint = None;
+    for part in parts[..count].iter().filter_map(|part| *part) {
+        let Some((name, expression)) = part.split_once('=') else {
+            return Err(unsupported_trigger_body());
+        };
+        if name.trim().eq_ignore_ascii_case("errcode") {
+            let expression = super::parser::parse_expr(expression.trim(), arena)?;
+            let state = match expression {
+                Expr::Str(value) => TriggerRaiseSqlState::Parsed(
+                    parse_trigger_raised_sqlstate(value)
+                        .ok_or_else(|| invalid_trigger_sqlstate(value))?,
+                ),
+                _ => TriggerRaiseSqlState::Expression(expression),
+            };
+            if sqlstate.replace(state).is_some() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "RAISE USING option \"ERRCODE\" appears more than once"
+                ));
+            }
+            continue;
+        }
+        let expression = super::parser::parse_expr(expression.trim(), arena)?;
+        let destination = if name.trim().eq_ignore_ascii_case("message") {
+            &mut message
+        } else if name.trim().eq_ignore_ascii_case("detail") {
+            &mut detail
+        } else if name.trim().eq_ignore_ascii_case("hint") {
+            &mut hint
+        } else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RAISE USING option \"{}\" is not supported",
+                name.trim()
+            ));
+        };
+        if destination.replace(expression).is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "RAISE USING option \"{}\" appears more than once",
+                name.trim()
+            ));
+        }
+    }
+    Ok(TriggerRaiseOptions {
+        sqlstate,
+        message,
+        detail,
+        hint,
+    })
+}
+
+fn parse_trigger_stacked_diagnostic(text: &str) -> Result<TriggerStackedDiagnostic, SqlError> {
+    if text.eq_ignore_ascii_case("returned_sqlstate") {
+        Ok(TriggerStackedDiagnostic::ReturnedSqlstate)
+    } else if text.eq_ignore_ascii_case("message_text") {
+        Ok(TriggerStackedDiagnostic::MessageText)
+    } else if text.eq_ignore_ascii_case("pg_exception_detail") {
+        Ok(TriggerStackedDiagnostic::PgExceptionDetail)
+    } else if text.eq_ignore_ascii_case("pg_exception_hint") {
+        Ok(TriggerStackedDiagnostic::PgExceptionHint)
+    } else {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "GET STACKED DIAGNOSTICS item \"{}\" is not supported",
+            text
+        ))
+    }
+}
+
+fn parse_trigger_diagnostic(text: &str) -> Result<TriggerDiagnostic, SqlError> {
+    if text.eq_ignore_ascii_case("row_count") {
+        Ok(TriggerDiagnostic::RowCount)
+    } else if text.eq_ignore_ascii_case("pg_routine_oid") {
+        Ok(TriggerDiagnostic::PgRoutineOid)
+    } else {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "GET DIAGNOSTICS item \"{}\" is not supported",
+            text
+        ))
+    }
+}
+
+fn parse_trigger_get_diagnostics<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerGetDiagnostics<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "get") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    if strip_trigger_keyword(body, "stacked").is_some() {
+        return Ok(None);
+    }
+    let body = strip_trigger_keyword(body, "current")
+        .unwrap_or(body)
+        .trim();
+    let Some(body) = strip_trigger_keyword(body, "diagnostics") else {
+        return Err(unsupported_trigger_body());
+    };
+    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let mut assignments = [None; MAX_COLUMNS];
+    for (index, part) in parts[..count].iter().enumerate() {
+        let part = part.expect("diagnostic assignment initialized");
+        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
+            return Err(unsupported_trigger_body());
+        };
+        let target = SqlName::parse(target.trim())?;
+        if target.as_str().contains('.') || item.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        if assignments[..index]
+            .iter()
+            .flatten()
+            .any(|prior: &TriggerDiagnosticAssignment| prior.target == target)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "trigger diagnostic target \"{}\" appears more than once",
+                target.as_str()
+            ));
+        }
+        assignments[index] = Some(TriggerDiagnosticAssignment {
+            target,
+            item: parse_trigger_diagnostic(item.trim())?,
+        });
+    }
+    let assignments = arena
+        .alloc_slice_with(count, |index| {
+            assignments[index].expect("diagnostic assignment parsed")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(TriggerGetDiagnostics {
+        assignments: &*assignments,
+    }))
+}
+
+fn parse_trigger_get_stacked_diagnostics<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerGetStackedDiagnostics<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "get") else {
+        return Ok(None);
+    };
+    let Some(body) = strip_trigger_keyword(body.trim(), "stacked") else {
+        return Ok(None);
+    };
+    let Some(body) = strip_trigger_keyword(body.trim(), "diagnostics") else {
+        return Err(unsupported_trigger_body());
+    };
+    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let mut assignments = [None; MAX_COLUMNS];
+    for (index, part) in parts[..count].iter().enumerate() {
+        let part = part.expect("diagnostic assignment initialized");
+        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
+            return Err(unsupported_trigger_body());
+        };
+        let target = SqlName::parse(target.trim())?;
+        if target.as_str().contains('.') || item.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        if assignments[..index]
+            .iter()
+            .flatten()
+            .any(|prior: &TriggerStackedDiagnosticAssignment| prior.target == target)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "trigger diagnostic target \"{}\" appears more than once",
+                target.as_str()
+            ));
+        }
+        assignments[index] = Some(TriggerStackedDiagnosticAssignment {
+            target,
+            item: parse_trigger_stacked_diagnostic(item.trim())?,
+        });
+    }
+    let assignments = arena
+        .alloc_slice_with(count, |index| {
+            assignments[index].expect("diagnostic assignment parsed")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(TriggerGetStackedDiagnostics {
+        assignments: &*assignments,
     }))
 }
 
@@ -7766,6 +8357,7 @@ fn loop_control_for_label<'a>(
 #[derive(Clone, Copy)]
 enum TriggerBlockEnd<'a> {
     End,
+    Exception,
     Else,
     Elsif(&'a str),
     When(&'a str),
@@ -7782,13 +8374,144 @@ fn trigger_tail<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
         .then_some(text[..start].trim_end())
 }
 
+fn parse_trigger_exception_condition(text: &str) -> Result<TriggerExceptionCondition, SqlError> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("others") {
+        return Ok(TriggerExceptionCondition::Others);
+    }
+    let state = if let Some(state) = trigger_condition_sqlstate(text) {
+        state
+    } else if text.eq_ignore_ascii_case("data_exception") {
+        return Ok(TriggerExceptionCondition::SqlStateClass("22"));
+    } else if text.eq_ignore_ascii_case("integrity_constraint_violation") {
+        return Ok(TriggerExceptionCondition::SqlStateClass("23"));
+    } else {
+        let Some((state, _)) = parse_trigger_raise_sqlstate(text)? else {
+            return Err(unsupported_trigger_body());
+        };
+        state
+    };
+    Ok(TriggerExceptionCondition::SqlState(state))
+}
+
+/// Parses an explicit `SQLSTATE 'code'` into the validated value used by the
+/// wire response, error value, handler, and stacked diagnostics. The source
+/// spelling is retained only for PostgreSQL's default message text.
+fn parse_trigger_raise_sqlstate(
+    text: &str,
+) -> Result<Option<(crate::sql::eval::SqlState, &str)>, SqlError> {
+    let Some(value) = strip_trigger_keyword(text.trim(), "sqlstate") else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
+        return Err(unsupported_trigger_body());
+    }
+    let code = &value[1..value.len() - 1];
+    let state =
+        parse_trigger_raised_sqlstate(code).ok_or_else(|| invalid_trigger_sqlstate(code))?;
+    Ok(Some((state, code)))
+}
+
+fn parse_trigger_raised_sqlstate(code: &str) -> Option<crate::sql::eval::SqlState> {
+    crate::sql::eval::SqlState::parse(code)
+}
+
+fn invalid_trigger_sqlstate(code: &str) -> SqlError {
+    sql_err!(sqlstate::SYNTAX_ERROR, "invalid SQLSTATE code \"{}\"", code)
+}
+
+/// Maps the bounded language's named conditions to canonical PostgreSQL
+/// SQLSTATEs before execution; arbitrary identifier spellings cannot enter a
+/// compiled trigger program.
+fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> {
+    let state = if text.eq_ignore_ascii_case("unique_violation") {
+        sqlstate::UNIQUE_VIOLATION
+    } else if text.eq_ignore_ascii_case("foreign_key_violation") {
+        sqlstate::FOREIGN_KEY_VIOLATION
+    } else if text.eq_ignore_ascii_case("not_null_violation") {
+        sqlstate::NOT_NULL_VIOLATION
+    } else if text.eq_ignore_ascii_case("check_violation") {
+        sqlstate::CHECK_VIOLATION
+    } else if text.eq_ignore_ascii_case("division_by_zero") {
+        sqlstate::DIVISION_BY_ZERO
+    } else if text.eq_ignore_ascii_case("cardinality_violation") {
+        sqlstate::CARDINALITY_VIOLATION
+    } else if text.eq_ignore_ascii_case("raise_exception") {
+        sqlstate::RAISE_EXCEPTION
+    } else if text.eq_ignore_ascii_case("assert_failure") {
+        sqlstate::ASSERT_FAILURE
+    } else {
+        return None;
+    };
+    Some(crate::sql::eval::SqlState::known(state))
+}
+
+fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> crate::sql::eval::SqlState {
+    match level {
+        TriggerRaiseLevel::Exception => {
+            crate::sql::eval::SqlState::known(sqlstate::RAISE_EXCEPTION)
+        }
+        TriggerRaiseLevel::Warning => crate::sql::eval::SqlState::known(sqlstate::WARNING),
+        TriggerRaiseLevel::Debug
+        | TriggerRaiseLevel::Log
+        | TriggerRaiseLevel::Info
+        | TriggerRaiseLevel::Notice => {
+            crate::sql::eval::SqlState::known(sqlstate::SUCCESSFUL_COMPLETION)
+        }
+    }
+}
+
+fn parse_trigger_exception_conditions<'a>(
+    text: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [TriggerExceptionCondition], SqlError> {
+    let mut conditions = [None; MAX_COLUMNS];
+    let mut count = 0;
+    let mut remaining = text.trim();
+    // `OR` is a keyword, not a substring: split only on whitespace-delimited
+    // occurrences so a future condition name cannot be split accidentally.
+    while !remaining.is_empty() {
+        let (condition, rest) = if let Some(index) = trigger_top_level_keyword(remaining, "or") {
+            (&remaining[..index], remaining[index + 2..].trim())
+        } else {
+            (remaining, "")
+        };
+        if count == conditions.len() || condition.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        conditions[count] = Some(parse_trigger_exception_condition(condition)?);
+        count += 1;
+        remaining = rest;
+    }
+    arena
+        .alloc_slice_with(count, |index| {
+            conditions[index].expect("exception condition initialized")
+        })
+        .map(|conditions| &*conditions)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
 fn parse_trigger_statement<'a>(
     segment: &'a str,
     arena: &'a Arena,
     loop_labels: &[Option<SqlName>],
+    handler_active: bool,
 ) -> Result<TriggerStatement<'a>, SqlError> {
     if let Some(result) = parse_trigger_return(segment)? {
         return Ok(TriggerStatement::Return(result));
+    }
+    if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
+        return Ok(TriggerStatement::GetDiagnostics(diagnostics));
+    }
+    if let Some(diagnostics) = parse_trigger_get_stacked_diagnostics(segment, arena)? {
+        if !handler_active {
+            return Err(sql_err!(
+                sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+                "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
+            ));
+        }
+        return Ok(TriggerStatement::GetStackedDiagnostics(diagnostics));
     }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
@@ -7801,6 +8524,12 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(query) = parse_trigger_perform(segment, arena)? {
         return Ok(TriggerStatement::Perform(query));
+    }
+    if let Some(assertion) = parse_trigger_assert(segment, arena)? {
+        return Ok(TriggerStatement::Assert(assertion));
+    }
+    if let Some(raise) = parse_trigger_raise(segment, arena, handler_active)? {
+        return Ok(TriggerStatement::Raise(raise));
     }
     if let Some(control) = parse_trigger_loop_control(segment, arena, loop_labels)? {
         if loop_labels.is_empty() {
@@ -7831,11 +8560,21 @@ fn parse_trigger_block<'a>(
     arena: &'a Arena,
     loop_labels: &mut [Option<SqlName>; MAX_COLUMNS],
     loop_depth: usize,
+    handler_active: bool,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
     let mut statements = [None; MAX_COLUMNS];
     let mut statement_count = 0;
     let mut saw_return = false;
     while let Some(segment) = segments.get(*at).and_then(|segment| *segment) {
+        if segment.eq_ignore_ascii_case("exception") {
+            *at += 1;
+            let out = arena
+                .alloc_slice_with(statement_count, |index| {
+                    statements[index].expect("trigger statement initialized")
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::Exception));
+        }
         if segment.eq_ignore_ascii_case("end") {
             *at += 1;
             let out = arena
@@ -7970,8 +8709,14 @@ fn parse_trigger_block<'a>(
             let mut branch_count = 0;
             let mut condition = Some(super::parser::parse_expr(condition, arena)?);
             loop {
-                let (block, ending) =
-                    parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                let (block, ending) = parse_trigger_block(
+                    segments,
+                    at,
+                    arena,
+                    loop_labels,
+                    loop_depth,
+                    handler_active,
+                )?;
                 branches[branch_count] = Some(TriggerBranch { condition, block });
                 branch_count += 1;
                 match ending {
@@ -7979,8 +8724,14 @@ fn parse_trigger_block<'a>(
                         condition = Some(super::parser::parse_expr(next, arena)?);
                     }
                     TriggerBlockEnd::Else if branch_count < MAX_COLUMNS => {
-                        let (block, ending) =
-                            parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                        let (block, ending) = parse_trigger_block(
+                            segments,
+                            at,
+                            arena,
+                            loop_labels,
+                            loop_depth,
+                            handler_active,
+                        )?;
                         if !matches!(ending, TriggerBlockEnd::EndIf) {
                             return Err(unsupported_trigger_body());
                         }
@@ -8024,8 +8775,14 @@ fn parse_trigger_block<'a>(
             let mut when = super::parser::parse_expr(first, arena)?;
             *at += 1;
             loop {
-                let (block, ending) =
-                    parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                let (block, ending) = parse_trigger_block(
+                    segments,
+                    at,
+                    arena,
+                    loop_labels,
+                    loop_depth,
+                    handler_active,
+                )?;
                 if branch_count == branches.len() {
                     return Err(unsupported_trigger_body());
                 }
@@ -8036,8 +8793,14 @@ fn parse_trigger_block<'a>(
                         when = super::parser::parse_expr(next, arena)?;
                     }
                     TriggerBlockEnd::Else => {
-                        let (otherwise, ending) =
-                            parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
+                        let (otherwise, ending) = parse_trigger_block(
+                            segments,
+                            at,
+                            arena,
+                            loop_labels,
+                            loop_depth,
+                            handler_active,
+                        )?;
                         if !matches!(ending, TriggerBlockEnd::EndCase) {
                             return Err(unsupported_trigger_body());
                         }
@@ -8068,29 +8831,73 @@ fn parse_trigger_block<'a>(
                 }
             }
         } else if strip_trigger_keyword(segment, "begin").is_some() {
-            let (block, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth)?;
-            if !matches!(ending, TriggerBlockEnd::End) {
-                return Err(unsupported_trigger_body());
+            let (protected, ending) =
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth, handler_active)?;
+            if matches!(ending, TriggerBlockEnd::Exception) {
+                let mut handlers = [None; MAX_COLUMNS];
+                let mut handler_count = 0;
+                let Some(header) = segments.get(*at).and_then(|segment| *segment) else {
+                    return Err(unsupported_trigger_body());
+                };
+                let Some(conditions) = strip_trigger_keyword(header, "when") else {
+                    return Err(unsupported_trigger_body());
+                };
+                let Some(mut conditions) = trigger_tail(conditions, "then") else {
+                    return Err(unsupported_trigger_body());
+                };
+                *at += 1;
+                loop {
+                    let (block, ending) =
+                        parse_trigger_block(segments, at, arena, loop_labels, loop_depth, true)?;
+                    if handler_count == handlers.len() {
+                        return Err(unsupported_trigger_body());
+                    }
+                    handlers[handler_count] = Some(TriggerExceptionHandler {
+                        conditions: parse_trigger_exception_conditions(conditions, arena)?,
+                        block,
+                    });
+                    handler_count += 1;
+                    match ending {
+                        TriggerBlockEnd::End => break,
+                        TriggerBlockEnd::When(next) => {
+                            conditions = next;
+                        }
+                        _ => return Err(unsupported_trigger_body()),
+                    }
+                }
+                let handlers = arena
+                    .alloc_slice_with(handler_count, |index| {
+                        handlers[index].expect("exception handler initialized")
+                    })
+                    .map_err(|_| super::query::arena_full_pub())?;
+                TriggerStatement::Exception(TriggerException {
+                    protected,
+                    handlers,
+                })
+            } else {
+                if !matches!(ending, TriggerBlockEnd::End) {
+                    return Err(unsupported_trigger_body());
+                }
+                // A nested block is an always-selected branch, which preserves its
+                // lexical scope without introducing an executable no-op node.
+                let branches = arena
+                    .alloc_slice_copy(&[TriggerBranch {
+                        condition: None,
+                        block: protected,
+                    }])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                TriggerStatement::If(TriggerIf { branches })
             }
-            // A nested block is an always-selected branch, which preserves its
-            // lexical scope without introducing an executable no-op node.
-            let branches = arena
-                .alloc_slice_copy(&[TriggerBranch {
-                    condition: None,
-                    block,
-                }])
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
-                    )
-                })?;
-            TriggerStatement::If(TriggerIf { branches })
         } else if let Some((target, source)) = parse_trigger_for_header(loop_header, arena)? {
             loop_labels[loop_depth] = loop_label;
-            let (block, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            let (block, ending) = parse_trigger_block(
+                segments,
+                at,
+                arena,
+                loop_labels,
+                loop_depth + 1,
+                handler_active,
+            )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
@@ -8102,8 +8909,14 @@ fn parse_trigger_block<'a>(
             })
         } else if let Some((target, source)) = parse_trigger_foreach_header(loop_header, arena)? {
             loop_labels[loop_depth] = loop_label;
-            let (block, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            let (block, ending) = parse_trigger_block(
+                segments,
+                at,
+                arena,
+                loop_labels,
+                loop_depth + 1,
+                handler_active,
+            )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
@@ -8115,8 +8928,14 @@ fn parse_trigger_block<'a>(
             })
         } else if let Some(condition) = parse_trigger_while_header(loop_header, arena)? {
             loop_labels[loop_depth] = loop_label;
-            let (block, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            let (block, ending) = parse_trigger_block(
+                segments,
+                at,
+                arena,
+                loop_labels,
+                loop_depth + 1,
+                handler_active,
+            )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
@@ -8124,15 +8943,21 @@ fn parse_trigger_block<'a>(
             TriggerStatement::While(TriggerWhile { condition, block })
         } else if is_trigger_loop_header(loop_header) {
             loop_labels[loop_depth] = loop_label;
-            let (block, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth + 1)?;
+            let (block, ending) = parse_trigger_block(
+                segments,
+                at,
+                arena,
+                loop_labels,
+                loop_depth + 1,
+                handler_active,
+            )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
                 return Err(unsupported_trigger_body());
             }
             TriggerStatement::Loop(block)
         } else {
-            parse_trigger_statement(segment, arena, &loop_labels[..loop_depth])?
+            parse_trigger_statement(segment, arena, &loop_labels[..loop_depth], handler_active)?
         };
         saw_return = matches!(statement, TriggerStatement::Return(_));
         statements[statement_count] = Some(statement);
@@ -8196,8 +9021,14 @@ fn parse_trigger_program<'a>(
     let (segments, count) = split_trigger_statements(body)?;
     let mut at = 0;
     let mut loop_labels = [None; MAX_COLUMNS];
-    let (body, ending) =
-        parse_trigger_block(&segments[..count], &mut at, arena, &mut loop_labels, 0)?;
+    let (body, ending) = parse_trigger_block(
+        &segments[..count],
+        &mut at,
+        arena,
+        &mut loop_labels,
+        0,
+        false,
+    )?;
     if !matches!(ending, TriggerBlockEnd::End) || at != count {
         return Err(unsupported_trigger_body());
     }
@@ -8214,6 +9045,7 @@ fn parse_trigger_program<'a>(
 #[cfg(test)]
 mod trigger_program_tests {
     use super::*;
+    use crate::mem::budget::Budget;
 
     #[test]
     fn control_headers_split_before_their_first_action() {
@@ -8290,6 +9122,58 @@ mod trigger_program_tests {
             ]
         );
     }
+
+    #[test]
+    fn exception_handlers_split_before_each_handler_action() {
+        let (segments, count) = split_trigger_statements(
+            "BEGIN RAISE EXCEPTION 'fail'; EXCEPTION \
+             WHEN unique_violation THEN RAISE EXCEPTION 'first'; \
+             WHEN raise_exception THEN INSERT INTO audit VALUES (1); \
+             END; RETURN NEW; END",
+        )
+        .unwrap();
+        assert_eq!(
+            segments[..count],
+            [
+                Some("BEGIN"),
+                Some("RAISE EXCEPTION 'fail'"),
+                Some("EXCEPTION"),
+                Some("WHEN unique_violation THEN"),
+                Some("RAISE EXCEPTION 'first'"),
+                Some("WHEN raise_exception THEN"),
+                Some("INSERT INTO audit VALUES (1)"),
+                Some("END"),
+                Some("RETURN NEW"),
+                Some("END"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exception_program_retains_each_ordered_handler() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger exception parser", 1 << 12).unwrap();
+        let program = parse_trigger_program(
+            "BEGIN BEGIN RAISE EXCEPTION 'fail'; EXCEPTION \
+             WHEN unique_violation THEN RAISE EXCEPTION 'first'; \
+             WHEN raise_exception THEN INSERT INTO audit VALUES (1); \
+             END; RETURN NEW; END",
+            &arena,
+        )
+        .unwrap();
+        let TriggerStatement::Exception(exception) = program.body.statements[0] else {
+            panic!("nested block must be an exception node");
+        };
+        assert_eq!(exception.handlers.len(), 2);
+        let [TriggerExceptionCondition::SqlState(first)] = exception.handlers[0].conditions else {
+            panic!("first handler must retain its typed condition");
+        };
+        assert_eq!(*first, sqlstate::UNIQUE_VIOLATION);
+        let [TriggerExceptionCondition::SqlState(second)] = exception.handlers[1].conditions else {
+            panic!("second handler must retain its typed condition");
+        };
+        assert_eq!(*second, sqlstate::RAISE_EXCEPTION);
+    }
 }
 
 fn detached_trigger_row<'a>(
@@ -8314,6 +9198,7 @@ fn detached_trigger_row<'a>(
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl<'a>],
     values: &'t [Datum<'a>],
+    found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     transition: &'t TriggerTransition<'t, 't, 'a>,
 }
@@ -8345,6 +9230,9 @@ where
         {
             return Ok(self.values[index]);
         }
+        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
+            return Ok(self.found.map(Datum::Bool).unwrap_or(Datum::Null));
+        }
         if let Some(qualifier) = qualifier
             && let Some(index) = self.local_index(qualifier)
             && let Datum::Record(fields) = self.values[index]
@@ -8375,6 +9263,9 @@ where
         {
             return Some(field.ctype());
         }
+        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
+            return Some(ColType::Bool);
+        }
         (qualifier.is_none())
             .then(|| self.local_index(name))
             .flatten()
@@ -8399,7 +9290,9 @@ where
             return self.transition.collation(qualifier, name);
         }
         if qualifier.is_none()
-            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+            && (self.local_index(name).is_some()
+                || TriggerContextField::parse(name).is_some()
+                || TriggerStatusVariable::parse(name).is_some())
         {
             crate::sql::ast::Collation::None
         } else {
@@ -8413,7 +9306,9 @@ where
             return self.transition.column_domain(qualifier, name);
         }
         if qualifier.is_none()
-            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+            && (self.local_index(name).is_some()
+                || TriggerContextField::parse(name).is_some()
+                || TriggerStatusVariable::parse(name).is_some())
         {
             None
         } else {
@@ -8638,6 +9533,46 @@ struct TriggerExecContext<'s, 'a, 'b> {
     scratch: *mut FixedVec<(u64, RowHome)>,
 }
 
+fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
+    let savepoint = context.txn.savepoint_at(index);
+    for at in (savepoint.touched_mark..context.txn.touched().len()).rev() {
+        let (table, rowid, prior) = context.txn.touched()[at];
+        context
+            .storage
+            .restore_pending(table as usize, rowid, context.txn.txid, prior);
+    }
+    for at in (savepoint.statistics_mark..context.txn.statistics_undo().len()).rev() {
+        let undo = context.txn.statistics_undo()[at];
+        context
+            .storage
+            .rollback_table_statistics(undo.table as usize, context.txn.txid);
+    }
+    context.txn.rewind_touched(savepoint.touched_mark);
+    context.txn.rewind_truncates(savepoint.truncate_mark);
+    context.txn.rewind_statistics(savepoint.statistics_mark);
+    context
+        .txn
+        .rewind_subscription_advances(savepoint.subscription_advance_mark);
+    context.txn.rewind_notifications(
+        savepoint.notify_mark,
+        savepoint.notify_payload_mark,
+        savepoint.listen_mark,
+    );
+    context
+        .storage
+        .rollback_locks_to(context.txn.txid, savepoint.lock_mark);
+    context.txn.release_savepoints_from(index);
+    context.txn.failed = savepoint.failed;
+}
+
+fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlError) -> bool {
+    match condition {
+        TriggerExceptionCondition::Others => !error.sqlstate.starts_with("PZ"),
+        TriggerExceptionCondition::SqlState(state) => error.sqlstate == state,
+        TriggerExceptionCondition::SqlStateClass(class) => error.sqlstate.starts_with(class),
+    }
+}
+
 fn initialize_trigger_locals<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     definition: &TableDef,
@@ -8660,6 +9595,7 @@ fn initialize_trigger_locals<'a>(
         let scope = TriggerLocalScope {
             locals: &locals[..=index],
             values: &values[..=index],
+            found: Some(false),
             invocation,
             transition: &transition,
         };
@@ -8711,6 +9647,99 @@ fn assign_trigger_local<'a>(
     Ok(())
 }
 
+fn trigger_format_message<'a>(
+    format: &str,
+    arguments: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    scope: &TriggerLocalScope<'_, 'a>,
+) -> Result<StackStr<192>, SqlError> {
+    use core::fmt::Write as _;
+
+    let mut message = StackStr::<192>::new();
+    let mut argument = 0usize;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            let _ = message.write_char(character);
+            continue;
+        }
+        if characters.next() == Some('%') {
+            let _ = message.write_char('%');
+            continue;
+        }
+        let value = eval_full(
+            arguments[argument],
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            scope,
+            &NO_HOOKS,
+        )?;
+        argument += 1;
+        if value.is_null() {
+            let _ = message.write_str("<NULL>");
+        } else {
+            let _ = message.write_str(datum_to_text(value, arena)?);
+        }
+    }
+    if message.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger diagnostic message exceeds the maximum length"
+        ));
+    }
+    Ok(message)
+}
+
+fn trigger_diagnostic_text<const N: usize>(
+    expression: &Expr<'_>,
+    arena: &Arena,
+    scope: &TriggerLocalScope<'_, '_>,
+) -> Result<StackStr<N>, SqlError> {
+    let value = eval_full(
+        expression,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        scope,
+        &NO_HOOKS,
+    )?;
+    if value.is_null() {
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "RAISE diagnostic option cannot be null"
+        ));
+    }
+    let value = StackStr::from_str(datum_to_text(value, arena)?);
+    if value.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger diagnostic exceeds the maximum length"
+        ));
+    }
+    Ok(value)
+}
+
+fn trigger_raise_sqlstate(
+    state: TriggerRaiseSqlState<'_>,
+    arena: &Arena,
+    scope: &TriggerLocalScope<'_, '_>,
+) -> Result<crate::sql::eval::SqlState, SqlError> {
+    match state {
+        TriggerRaiseSqlState::Parsed(state) => Ok(state),
+        TriggerRaiseSqlState::Expression(expression) => {
+            let code = trigger_diagnostic_text::<6>(expression, arena, scope)?;
+            parse_trigger_raised_sqlstate(code.as_str())
+                .ok_or_else(|| invalid_trigger_sqlstate(code.as_str()))
+        }
+    }
+}
+
+fn trigger_notice_to_sql(_: WireFull) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "trigger diagnostic exceeds the send buffer"
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger condition evaluates against the complete typed firing context"
@@ -8723,6 +9752,7 @@ fn trigger_condition<'a>(
     new: Option<&[Datum<'a>]>,
     locals: &[TriggerLocalDecl<'a>],
     values: &[Datum<'a>],
+    found: Option<bool>,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     match eval_full(
@@ -8732,6 +9762,7 @@ fn trigger_condition<'a>(
         &TriggerLocalScope {
             locals,
             values,
+            found,
             invocation,
             transition: &TriggerTransition {
                 definition,
@@ -8911,6 +9942,8 @@ fn execute_trigger_block<'a>(
     locals: &[TriggerLocalDecl<'a>],
     local_values: &mut [Datum<'a>; MAX_COLUMNS],
     block: TriggerBlock<'a>,
+    status: &mut TriggerExecutionStatus,
+    exception: Option<&TriggerExceptionDiagnostic<'_>>,
 ) -> Result<Option<TriggerFlow>, SqlError> {
     for statement in block.statements {
         match *statement {
@@ -8944,6 +9977,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -8972,6 +10006,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -8982,7 +10017,29 @@ fn execute_trigger_block<'a>(
                     &scope,
                     &NO_HOOKS,
                 )?;
-                assign_trigger_local(locals, local_values, assignment.name, value, context.arena)?;
+                if locals.iter().any(|local| local.name == assignment.name) {
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.name,
+                        value,
+                        context.arena,
+                    )?;
+                } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
+                    status.found = match cast_to(value, ColType::Bool, context.arena)? {
+                        Datum::Bool(value) => Some(value),
+                        Datum::Null => None,
+                        _ => unreachable!("boolean cast preserves its datum kind"),
+                    };
+                } else {
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.name,
+                        value,
+                        context.arena,
+                    )?;
+                }
             }
             TriggerStatement::LoopControl(control) => {
                 let (condition, unwind) = match control {
@@ -8998,6 +10055,7 @@ fn execute_trigger_block<'a>(
                         new.as_deref(),
                         locals,
                         &local_values[..locals.len()],
+                        status.found,
                         context.arena,
                     )?,
                     None => true,
@@ -9039,6 +10097,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9049,6 +10108,7 @@ fn execute_trigger_block<'a>(
                 );
                 let mut selected = [Datum::Null; MAX_COLUMNS];
                 let mut found = false;
+                let mut row_count = 0usize;
                 super::query::select_into_rows(
                     context.storage,
                     context.txn.txid,
@@ -9072,9 +10132,28 @@ fn execute_trigger_block<'a>(
                             }
                             found = true;
                         }
+                        row_count += 1;
                         Ok(())
                     },
                 )?;
+                status.set_rows(row_count as u64)?;
+                if statement.strict {
+                    match row_count {
+                        0 => {
+                            return Err(sql_err!(
+                                sqlstate::NO_DATA_FOUND,
+                                "query returned no rows"
+                            ));
+                        }
+                        1 => {}
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_ROWS,
+                                "query returned more than one row"
+                            ));
+                        }
+                    }
+                }
                 for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
                     let local = locals[target];
                     local_values[target] = apply_typmod(
@@ -9104,6 +10183,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9112,6 +10192,7 @@ fn execute_trigger_block<'a>(
                     context.seq_session,
                     context.txn.txid,
                 );
+                let mut row_count = 0u64;
                 super::query::select_into_rows(
                     context.storage,
                     context.txn.txid,
@@ -9120,8 +10201,256 @@ fn execute_trigger_block<'a>(
                     crate::sql::eval::NO_PARAMS,
                     Some(&scope),
                     Some(&sequence),
-                    &mut |_| Ok(()),
+                    &mut |_| {
+                        row_count += 1;
+                        Ok(())
+                    },
                 )?;
+                status.set_rows(row_count)?;
+            }
+            TriggerStatement::Assert(assertion) => {
+                if trigger_condition(
+                    assertion.condition,
+                    definition,
+                    invocation,
+                    old,
+                    new.as_deref(),
+                    locals,
+                    &local_values[..locals.len()],
+                    status.found,
+                    context.arena,
+                )? {
+                    continue;
+                }
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let message = match assertion.message {
+                    Some(message) => {
+                        let value = eval_full(
+                            message,
+                            context.arena,
+                            crate::sql::eval::NO_PARAMS,
+                            &scope,
+                            &NO_HOOKS,
+                        )?;
+                        if value.is_null() {
+                            stack_format!(192, "assertion failed")
+                        } else {
+                            stack_format!(192, "{}", datum_to_text(value, context.arena)?)
+                        }
+                    }
+                    None => stack_format!(192, "assertion failed"),
+                };
+                return Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()));
+            }
+            TriggerStatement::Raise(TriggerRaise::Rethrow) => {
+                let exception =
+                    exception.expect("bare RAISE is parsed only in an exception handler");
+                if let Some(diagnostic) = exception.diagnostic {
+                    crate::sql::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+                }
+                return Err(SqlError {
+                    sqlstate: exception.sqlstate,
+                    message: *exception.message,
+                });
+            }
+            TriggerStatement::Raise(TriggerRaise::Message(raise)) => {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context.arena, &scope)?;
+                let message = match raise.message {
+                    Some(message) => {
+                        trigger_diagnostic_text::<192>(message, context.arena, &scope)?
+                    }
+                    None if raise.default_message.is_some() => {
+                        stack_format!(192, "{}", raise.default_message.expect("default message"))
+                    }
+                    None => match raise.format {
+                        Some(format) => {
+                            trigger_format_message(format, raise.arguments, context.arena, &scope)?
+                        }
+                        None => stack_format!(192, "{}", sqlstate.as_str()),
+                    },
+                };
+                let detail =
+                    raise
+                        .detail
+                        .map(|detail| {
+                            trigger_diagnostic_text::<
+                                { crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES },
+                            >(detail, context.arena, &scope)
+                        })
+                        .transpose()?;
+                let hint = raise
+                    .hint
+                    .map(|hint| trigger_diagnostic_text::<128>(hint, context.arena, &scope))
+                    .transpose()?;
+                if detail.is_some() || hint.is_some() {
+                    crate::sql::eval::stash_diagnostic(detail.unwrap_or_default(), hint);
+                }
+                match raise.level {
+                    TriggerRaiseLevel::Debug => context
+                        .responder
+                        .debug(sqlstate, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                    TriggerRaiseLevel::Log => context
+                        .responder
+                        .log(sqlstate, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                    TriggerRaiseLevel::Info => context
+                        .responder
+                        .info(sqlstate, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                    TriggerRaiseLevel::Exception => {
+                        return Err(SqlError { sqlstate, message });
+                    }
+                    TriggerRaiseLevel::Warning => context
+                        .responder
+                        .warning(sqlstate, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                    TriggerRaiseLevel::Notice => context
+                        .responder
+                        .notice(sqlstate, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                }
+            }
+            TriggerStatement::GetDiagnostics(statement) => {
+                for assignment in statement.assignments {
+                    let value = match assignment.item {
+                        TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
+                        TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
+                    };
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.target,
+                        value,
+                        context.arena,
+                    )?;
+                }
+            }
+            TriggerStatement::GetStackedDiagnostics(statement) => {
+                let Some(exception) = exception else {
+                    return Err(sql_err!(
+                        sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+                        "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
+                    ));
+                };
+                for assignment in statement.assignments {
+                    let value = match assignment.item {
+                        TriggerStackedDiagnostic::ReturnedSqlstate => {
+                            Some(exception.sqlstate.as_str())
+                        }
+                        TriggerStackedDiagnostic::MessageText => Some(exception.message.as_str()),
+                        TriggerStackedDiagnostic::PgExceptionDetail => exception
+                            .diagnostic
+                            .map(|diagnostic| diagnostic.detail.as_str()),
+                        TriggerStackedDiagnostic::PgExceptionHint => exception
+                            .diagnostic
+                            .and_then(|diagnostic| diagnostic.hint.as_ref().map(StackStr::as_str)),
+                    };
+                    let value = value
+                        .map(|value| {
+                            context
+                                .arena
+                                .alloc_str(value)
+                                .map(Datum::Text)
+                                .map_err(|_| super::query::arena_full_pub())
+                        })
+                        .transpose()?
+                        .unwrap_or(Datum::Null);
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.target,
+                        value,
+                        context.arena,
+                    )?;
+                }
+            }
+            TriggerStatement::Exception(exception_block) => {
+                context
+                    .txn
+                    .savepoint("__trigger_exception__", 0, context.storage.lock_mark())?;
+                let index = context
+                    .txn
+                    .savepoint_index("__trigger_exception__")
+                    .expect("new trigger savepoint is present");
+                match execute_trigger_block(
+                    context,
+                    definition,
+                    invocation,
+                    old,
+                    new,
+                    before,
+                    transition_relations,
+                    locals,
+                    local_values,
+                    exception_block.protected,
+                    status,
+                    exception,
+                ) {
+                    Ok(flow) => {
+                        context.txn.release_savepoints_from(index);
+                        if flow.is_some() {
+                            return Ok(flow);
+                        }
+                    }
+                    Err(error) => {
+                        rollback_trigger_subtransaction(context, index);
+                        let Some(handler) = exception_block.handlers.iter().find(|handler| {
+                            handler
+                                .conditions
+                                .iter()
+                                .copied()
+                                .any(|condition| trigger_exception_matches(condition, &error))
+                        }) else {
+                            return Err(error);
+                        };
+                        let diagnostic = crate::sql::eval::take_diagnostic();
+                        let caught = TriggerExceptionDiagnostic {
+                            sqlstate: error.sqlstate,
+                            message: &error.message,
+                            diagnostic: diagnostic.as_ref(),
+                        };
+                        if let Some(flow) = execute_trigger_block(
+                            context,
+                            definition,
+                            invocation,
+                            old,
+                            new,
+                            before,
+                            transition_relations,
+                            locals,
+                            local_values,
+                            handler.block,
+                            status,
+                            Some(&caught),
+                        )? {
+                            return Ok(Some(flow));
+                        }
+                    }
+                }
             }
             TriggerStatement::Dml(TriggerDml::Insert(statement)) => {
                 let transition = TriggerTransition {
@@ -9132,6 +10461,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9173,6 +10503,7 @@ fn execute_trigger_block<'a>(
                 };
                 let scratch = unsafe { &mut *context.scratch };
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let outcome = context.responder.without_command_complete(|responder| {
                     insert(
                         context.storage,
@@ -9193,7 +10524,12 @@ fn execute_trigger_block<'a>(
                 });
                 context.txn.leave_trigger_sql();
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger INSERT publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -9242,6 +10578,7 @@ fn execute_trigger_block<'a>(
                         )
                     })?;
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -9250,6 +10587,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9278,7 +10616,12 @@ fn execute_trigger_block<'a>(
                     })?;
                 }
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger UPDATE publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -9327,6 +10670,7 @@ fn execute_trigger_block<'a>(
                         )
                     })?;
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -9335,6 +10679,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9363,7 +10708,12 @@ fn execute_trigger_block<'a>(
                     })?;
                 }
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger DELETE publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -9382,6 +10732,8 @@ fn execute_trigger_block<'a>(
                         step,
                         reverse,
                     } => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let transition = TriggerTransition {
                             definition,
                             old,
@@ -9390,6 +10742,7 @@ fn execute_trigger_block<'a>(
                         let scope = TriggerLocalScope {
                             locals,
                             values: &local_values[..locals.len()],
+                            found: status.found,
                             invocation,
                             transition: &transition,
                         };
@@ -9435,6 +10788,7 @@ fn execute_trigger_block<'a>(
                         } else {
                             value <= upper
                         } {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -9453,6 +10807,8 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
+                                exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
@@ -9475,8 +10831,11 @@ fn execute_trigger_block<'a>(
                             };
                             value = next;
                         }
+                        status.set_found(iterated);
                     }
                     TriggerForSource::Query(query) => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let query = match transition_relations {
                             Some(relations) => super::query::bind_materialized_relations(
                                 query,
@@ -9496,6 +10855,7 @@ fn execute_trigger_block<'a>(
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &transition,
                             };
@@ -9522,6 +10882,7 @@ fn execute_trigger_block<'a>(
                             }
                         };
                         for value in values.iter().copied() {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -9540,6 +10901,8 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
+                                exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
@@ -9554,8 +10917,11 @@ fn execute_trigger_block<'a>(
                                 }
                             }
                         }
+                        status.set_found(iterated);
                     }
                     TriggerForSource::Array { expression, slice } => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let values = {
                             let transition = TriggerTransition {
                                 definition,
@@ -9565,6 +10931,7 @@ fn execute_trigger_block<'a>(
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &transition,
                             };
@@ -9649,6 +11016,7 @@ fn execute_trigger_block<'a>(
                             &*values
                         };
                         for value in values.iter().copied() {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -9667,6 +11035,8 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
+                                exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
@@ -9681,6 +11051,7 @@ fn execute_trigger_block<'a>(
                                 }
                             }
                         }
+                        status.set_found(iterated);
                     }
                 }
             }
@@ -9693,6 +11064,7 @@ fn execute_trigger_block<'a>(
                     new.as_deref(),
                     locals,
                     &local_values[..locals.len()],
+                    status.found,
                     context.arena,
                 )? {
                     break;
@@ -9708,6 +11080,8 @@ fn execute_trigger_block<'a>(
                     locals,
                     local_values,
                     program.block,
+                    status,
+                    exception,
                 )? {
                     Some(TriggerFlow::Return(result)) => {
                         return Ok(Some(TriggerFlow::Return(result)));
@@ -9734,6 +11108,8 @@ fn execute_trigger_block<'a>(
                     locals,
                     local_values,
                     block,
+                    status,
+                    exception,
                 )? {
                     Some(TriggerFlow::Return(result)) => {
                         return Ok(Some(TriggerFlow::Return(result)));
@@ -9759,6 +11135,7 @@ fn execute_trigger_block<'a>(
                             &TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &TriggerTransition {
                                     definition,
@@ -9790,6 +11167,8 @@ fn execute_trigger_block<'a>(
                             locals,
                             local_values,
                             branch.block,
+                            status,
+                            exception,
                         )? {
                             return Ok(Some(flow));
                         }
@@ -9806,6 +11185,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9864,6 +11244,8 @@ fn execute_trigger_block<'a>(
                         locals,
                         local_values,
                         block,
+                        status,
+                        exception,
                     )?
                 {
                     return Ok(Some(flow));
@@ -9940,8 +11322,17 @@ fn fire_row_triggers<'a>(
                 }
             }
         }
-        let invocation =
-            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
+        let routine_oid =
+            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
+        let invocation = TriggerInvocation::new(
+            &trigger,
+            definition,
+            table,
+            event,
+            before,
+            routine_oid,
+            context.arena,
+        )?;
         let source = {
             let body = context
                 .storage
@@ -9957,6 +11348,7 @@ fn fire_row_triggers<'a>(
         };
         let program = parse_trigger_program(source, context.arena)?;
         let mut local_values = [Datum::Null; MAX_COLUMNS];
+        let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
             definition,
@@ -9977,6 +11369,8 @@ fn fire_row_triggers<'a>(
             program.locals,
             &mut local_values,
             program.body,
+            &mut status,
+            None,
         )? {
             Some(TriggerFlow::Return(result)) => match result {
                 TriggerReturn::Null if before => return Ok(false),
@@ -10151,8 +11545,17 @@ fn fire_statement_triggers_with_rows<'a>(
             trigger.when.is_none(),
             "statement WHEN was rejected at creation"
         );
-        let invocation =
-            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
+        let routine_oid =
+            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
+        let invocation = TriggerInvocation::new(
+            &trigger,
+            definition,
+            table,
+            event,
+            before,
+            routine_oid,
+            context.arena,
+        )?;
         let source = {
             let body = context
                 .storage
@@ -10200,6 +11603,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .map_err(|_| super::query::arena_full_pub())?;
         let mut no_new = None;
         let mut local_values = [Datum::Null; MAX_COLUMNS];
+        let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
             definition,
@@ -10220,6 +11624,8 @@ fn fire_statement_triggers_with_rows<'a>(
             program.locals,
             &mut local_values,
             program.body,
+            &mut status,
+            None,
         )? {
             Some(TriggerFlow::Return(_)) => {}
             Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) | None => {
@@ -19044,8 +20450,10 @@ where
             return sql_fail(error);
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        if !capturing {
-            responder.command_complete(tag.as_str())?;
+        if capturing {
+            responder.set_affected_rows(inserted);
+        } else {
+            responder.command_complete_rows(tag.as_str(), inserted)?;
         }
         return sql_ok();
     }
@@ -19267,8 +20675,10 @@ where
         return sql_fail(error);
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(inserted);
+    } else {
+        responder.command_complete_rows(tag.as_str(), inserted)?;
     }
     sql_ok()
 }
@@ -20012,8 +21422,10 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let tag = stack_format!(48, "UPDATE {}", updated);
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(updated);
+    } else {
+        responder.command_complete_rows(tag.as_str(), updated)?;
     }
     sql_ok()
 }
@@ -20352,8 +21764,10 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
     let tag = stack_format!(48, "DELETE {}", scratch.len());
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(scratch.len() as u64);
+    } else {
+        responder.command_complete_rows(tag.as_str(), scratch.len() as u64)?;
     }
     sql_ok()
 }

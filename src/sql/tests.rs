@@ -8251,6 +8251,181 @@ fn trigger_case_and_foreach_array_are_typed_control_primitives() {
 }
 
 #[test]
+fn trigger_diagnostics_are_typed_and_preserve_postgresql_severity() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_diagnostic_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_diagnostic_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              RAISE NOTICE ''insert id %'', NEW.id;
+              RAISE WARNING ''next %% value is %'', NEW.value + 1;
+              ASSERT NEW.value > 0, ''value must be positive'';
+              NEW.value := NEW.value + 1;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_diagnostic_before BEFORE INSERT ON trigger_diagnostic_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_diagnostic_function();",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_diagnostic_target VALUES (4, 8);",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(message_types(&output), [b'N', b'N', b'C'], "{text}");
+    assert!(
+        text.contains("NOTICE") && text.contains("insert id 4"),
+        "{text}"
+    );
+    assert!(
+        text.contains("WARNING") && text.contains("next % value is 9"),
+        "{text}"
+    );
+
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_diagnostic_target VALUES (5, 0);",
+    );
+    let text = String::from_utf8_lossy(&failed);
+    assert!(
+        text.contains("P0004") && text.contains("value must be positive"),
+        "{text}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM trigger_diagnostic_target ORDER BY id",
+        )),
+        ["4|9"]
+    );
+
+    let raised = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_raise_function() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN RAISE EXCEPTION ''rejected id %'', NEW.id; RETURN NEW; END';
+         CREATE TRIGGER trigger_raise_before BEFORE INSERT ON trigger_diagnostic_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_raise_function();
+         INSERT INTO trigger_diagnostic_target VALUES (6, 1);",
+    );
+    let text = String::from_utf8_lossy(&raised);
+    assert!(
+        text.contains("P0001") && text.contains("rejected id 6"),
+        "{text}"
+    );
+}
+
+#[test]
+fn trigger_select_into_strict_has_postgresql_cardinality_errors() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_strict_source (id integer, value integer);
+         INSERT INTO trigger_strict_source VALUES (1, 7), (2, 8), (2, 9);
+         CREATE TABLE trigger_strict_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION trigger_strict_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE selected integer;
+            BEGIN
+              SELECT value INTO STRICT selected FROM trigger_strict_source WHERE id = NEW.id;
+              NEW.value := selected;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_strict_before BEFORE INSERT ON trigger_strict_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_strict_function();",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO trigger_strict_target VALUES (1, 0); SELECT id, value FROM trigger_strict_target",
+        )),
+        ["1|7"]
+    );
+    let no_rows = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_strict_target VALUES (3, 0);",
+    );
+    assert!(String::from_utf8_lossy(&no_rows).contains("P0002"));
+    let many_rows = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO trigger_strict_target VALUES (2, 0);",
+    );
+    assert!(String::from_utf8_lossy(&many_rows).contains("P0003"));
+
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION malformed_trigger_raise() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN RAISE NOTICE ''missing value %''; RETURN NEW; END';",
+    );
+    assert!(String::from_utf8_lossy(&malformed).contains("42601"));
+}
+
+#[test]
+fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
+    let mut config = test_config("trigger-diagnostic-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("trigger-diagnostic-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_trigger_strict_source (id integer, value integer);
+         INSERT INTO durable_trigger_strict_source VALUES (1, 12);
+         CREATE TABLE durable_trigger_strict_target (id integer PRIMARY KEY, value integer);
+         CREATE FUNCTION durable_trigger_strict_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE selected integer;
+            BEGIN
+              ASSERT NEW.id > 0;
+              SELECT value INTO STRICT selected FROM durable_trigger_strict_source WHERE id = NEW.id;
+              NEW.value := selected;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_trigger_strict_before BEFORE INSERT ON durable_trigger_strict_target
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_strict_function();",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "INSERT INTO durable_trigger_strict_target VALUES (1, 0);
+             SELECT id, value FROM durable_trigger_strict_target",
+        )),
+        ["1|12"]
+    );
+}
+
+#[test]
 fn trigger_foreach_slice_preserves_array_rank_and_bounds() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

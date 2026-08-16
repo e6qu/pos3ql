@@ -397,3 +397,19 @@ CREATE TRIGGER trigger_foreach_slice_before BEFORE INSERT ON trigger_foreach_sli
   FOR EACH ROW EXECUTE FUNCTION trigger_foreach_slice_program();
 INSERT INTO trigger_foreach_slice_target VALUES (1, 0);
 SELECT id, value FROM trigger_foreach_slice_target;
+
+CREATE TABLE trigger_strict_source (id integer, value integer);
+INSERT INTO trigger_strict_source VALUES (1, 11);
+CREATE TABLE trigger_strict_target (id integer PRIMARY KEY, value integer);
+CREATE FUNCTION trigger_strict_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE selected integer;
+   BEGIN
+     ASSERT NEW.id > 0;
+     SELECT value INTO STRICT selected FROM trigger_strict_source WHERE id = NEW.id;
+     NEW.value := selected;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_strict_before BEFORE INSERT ON trigger_strict_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_strict_program();
+INSERT INTO trigger_strict_target VALUES (1, 0);
+SELECT id, value FROM trigger_strict_target;

@@ -4,14 +4,11 @@
 # suite all drive the server binary as a subprocess. tools/coverage.sh
 # instruments that binary too, which is what takes the figure to ~80%.
 #
-# The external suite is sharded across parallel jobs so that no job runs past
-# 15 minutes: each coverage shard measures its slice strictly, exports an lcov
-# tracefile, and the merge job unions the tracefiles and holds the floor over
-# the whole. Shard percentages alone are meaningless and never compared. The
-# crash-torture shards are correctness-only (runtest:*): they kill -9 every
-# server, which never flushes a profile, so they contribute no coverage and
-# stay out of the merge — they gate the workflow by running and passing, and
-# build uninstrumented (no profiler tax) so they run several times faster.
+# The external suite uses five workers whose paired workloads fit under five
+# minutes. Coverage-producing runs retain separate lcov files for the merge
+# gate; correctness-only crash workloads run after their paired trace. This
+# preserves every workload while avoiding a long runner queue on the small
+# hosted pool.
 name: coverage
 on:
   push:
@@ -26,37 +23,19 @@ jobs:
   shard:
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # Each differential storage mode has its own shard. This keeps its build,
-    # corpus replay, profile rendering, and artifact upload within the same
-    # hard ceiling as every other PR job.
-    timeout-minutes: 15
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
         include:
-          # The coverage shards (lib / run:* / sql) are the ones whose work
-          # lands on a process that exits gracefully and flushes a profile —
-          # lib measures the in-process tests, sql measures the differential
-          # corpus, and wire-durability runs on the
-          # base-port server run.sh stops at cleanup, and diff/spilldiff on
-          # the differential harness's own server. Everything else runs
-          # uninstrumented for correctness only (runtest:*, several times
-          # faster) and stays out of the merge: the spill group kill -9's a side
-          # server (overlay) or just iterates the same spill/merge/cold-start
-          # code at scale (ingest) that the forced-spill differential already
-          # instruments; tls kill -9's its TLS server; torture kill -9's
-          # everything. Their line coverage is carried by the coverage shards;
-          # what they add here is that they *run and pass*. Torture depth is two
-          # independent seeds rather than one 12-round run.
-          - { name: lib, shard: "lib" }
-          - { name: sql, shard: "sql" }
-          - { name: wire-durability, shard: "run:proto,dur" }
-          - { name: diff, shard: "run:diff" }
-          - { name: spilldiff, shard: "run:spilldiff" }
-          - { name: spill-correctness, shard: "runtest:overlay,ingest,tls" }
-          - { name: subscription-correctness, shard: "runtest:subscription" }
-          - { name: torture-a, shard: "runtest:torture", torture_seed: 20260723 }
-          - { name: torture-b, shard: "runtest:torture", torture_seed: 20260725 }
+          # Coverage traces are generated separately even when they share a
+          # worker. The following correctness-only workloads kill -9 their
+          # servers and intentionally do not produce traces.
+          - { name: lib-subscription, shards: "lib runtest:subscription" }
+          - { name: sql-wire, shards: "sql run:proto,dur" }
+          - { name: diff-torture-a, shards: "run:diff runtest:torture", torture_seed: 20260723 }
+          - { name: spilldiff-torture-b, shards: "run:spilldiff runtest:torture", torture_seed: 20260725 }
+          - { name: spill-correctness, shards: "runtest:overlay,ingest,tls" }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -83,11 +62,16 @@ jobs:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
           POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
-          COVERAGE_SHARD: ${{ matrix.shard }}
-          COVERAGE_LCOV: ${{ github.workspace }}/coverage-${{ matrix.name }}.lcov
+          COVERAGE_SHARDS: ${{ matrix.shards }}
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
-        run: sh tools/coverage.sh
+        run: |
+          for shard in $COVERAGE_SHARDS; do
+            trace_name=$(printf '%s' "$shard" | tr ':,' '--')
+            COVERAGE_SHARD="$shard" \
+            COVERAGE_LCOV="${{ github.workspace }}/coverage-${trace_name}.lcov" \
+            sh tools/coverage.sh
+          done
       - uses: actions/upload-artifact@v6
         with:
           name: lcov-${{ matrix.name }}

@@ -185,7 +185,12 @@ pub mod sqlstate {
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const SUCCESSFUL_COMPLETION: &str = "00000";
+    pub const WARNING: &str = "01000";
     pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const RAISE_EXCEPTION: &str = "P0001";
+    pub const NO_DATA_FOUND: &str = "P0002";
+    pub const TOO_MANY_ROWS: &str = "P0003";
+    pub const ASSERT_FAILURE: &str = "P0004";
 }
 
 /// Resolves column references during evaluation. Statements without a FROM

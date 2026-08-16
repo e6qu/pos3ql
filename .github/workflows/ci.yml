@@ -90,15 +90,19 @@ jobs:
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
 
-  # Split the fixed seed range across runners. The complete 16-seed sweep is
-  # unchanged, but no one runner owns all four batches.
+  # Each worker runs two fixed seed ranges. The complete 16-seed sweep is
+  # unchanged, while four short jobs become two so the limited runner pool
+  # starts the substantive coverage sooner.
   storage-vopr:
+    name: storage-vopr (${{ matrix.first }}-${{ matrix.second }})
     strategy:
       fail-fast: false
       matrix:
-        seed0: [460259, 460263, 460267, 460271]
+        include:
+          - { first: 460259, second: 460263 }
+          - { first: 460267, second: 460271 }
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
@@ -112,31 +116,33 @@ jobs:
           key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-vopr-
 
-      - name: Storage VOPR (seed range ${{ matrix.seed0 }})
-        run: cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
+      - name: Storage VOPR
+        run: |
+          POS3QL_STORAGE_VOPR_SEED0=${{ matrix.first }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
+          POS3QL_STORAGE_VOPR_SEED0=${{ matrix.second }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
         env:
-          POS3QL_STORAGE_VOPR_SEED0: ${{ matrix.seed0 }}
           POS3QL_STORAGE_VOPR_SEEDS: 4
           POS3QL_STORAGE_VOPR_STEPS: 300
 
-  # These cold external-run phases own the fixed object-store workload.
-  # Their independent workers retain every assertion without one serial test
-  # consuming the ordinary suite's runtime budget.
+  # Two cold object-store phases fit comfortably within five minutes. Pairing
+  # them preserves every assertion while halving queue pressure on the small
+  # runner pool.
   external-runs:
+    name: external-runs (${{ matrix.phase }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - phase: cold
-            test: external_cold_order_and_distinct_runs_use_object_storage
-          - phase: recursive
-            test: external_recursive_runs_use_object_storage
-          - phase: lateral
-            test: external_lateral_runs_use_object_storage
-          - phase: set
-            test: external_set_runs_use_object_storage
+          - phase: cold-recursive
+            tests: >-
+              external_cold_order_and_distinct_runs_use_object_storage
+              external_recursive_runs_use_object_storage
+          - phase: lateral-set
+            tests: >-
+              external_lateral_runs_use_object_storage
+              external_set_runs_use_object_storage
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
@@ -151,4 +157,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Cold external-run regression
-        run: cargo test --locked --lib sql::tests::${{ matrix.test }} -- --exact
+        run: |
+          for test in ${{ matrix.tests }}; do
+            cargo test --locked --lib sql::tests::$test -- --exact
+          done

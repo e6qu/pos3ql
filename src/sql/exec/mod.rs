@@ -30,8 +30,8 @@ use super::ast::{
     TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
-    eval_full, sqlstate,
+    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, datum_to_text,
+    eval, eval_full, sqlstate,
 };
 use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 
@@ -6757,6 +6757,27 @@ impl<'a> TriggerInvocation<'a> {
 struct TriggerSelectInto<'a> {
     query: &'a Select<'a>,
     targets: &'a [SqlName],
+    strict: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerAssert<'a> {
+    condition: &'a Expr<'a>,
+    message: Option<&'a Expr<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum TriggerRaiseLevel {
+    Exception,
+    Warning,
+    Notice,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerRaise<'a> {
+    level: TriggerRaiseLevel,
+    format: &'a str,
+    arguments: &'a [&'a Expr<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -6783,6 +6804,8 @@ enum TriggerStatement<'a> {
     LocalAssign(TriggerLocalAssignment<'a>),
     SelectInto(TriggerSelectInto<'a>),
     Perform(&'a Select<'a>),
+    Assert(TriggerAssert<'a>),
+    Raise(TriggerRaise<'a>),
     Dml(TriggerDml<'a>),
     If(TriggerIf<'a>),
     Case(TriggerCase<'a>),
@@ -7408,6 +7431,10 @@ fn parse_trigger_select_into<'a>(
     let (target_source, tail) = clause_at
         .map(|at| (&after_into[..at], &after_into[at..]))
         .unwrap_or((after_into, ""));
+    let (strict, target_source) = match strip_trigger_keyword(target_source.trim(), "strict") {
+        Some(targets) => (true, targets.trim()),
+        None => (false, target_source.trim()),
+    };
     let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
     let mut count = 0usize;
     for target in target_source.split(',') {
@@ -7445,6 +7472,132 @@ fn parse_trigger_select_into<'a>(
     Ok(Some(TriggerSelectInto {
         query,
         targets: &*targets,
+        strict,
+    }))
+}
+
+fn split_trigger_arguments(text: &str) -> Result<([Option<&str>; MAX_COLUMNS], usize), SqlError> {
+    let mut arguments = [None; MAX_COLUMNS];
+    let mut count = 0usize;
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (offset, character) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            ',' if depth == 0 => {
+                let argument = text[start..offset].trim();
+                if argument.is_empty() || count == arguments.len() {
+                    return Err(unsupported_trigger_body());
+                }
+                arguments[count] = Some(argument);
+                count += 1;
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(unsupported_trigger_body());
+    }
+    let argument = text[start..].trim();
+    if argument.is_empty() || count == arguments.len() {
+        return Err(unsupported_trigger_body());
+    }
+    arguments[count] = Some(argument);
+    Ok((arguments, count + 1))
+}
+
+fn parse_trigger_assert<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerAssert<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "assert") else {
+        return Ok(None);
+    };
+    let (parts, count) = split_trigger_arguments(body.trim())?;
+    if count > 2 {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(Some(TriggerAssert {
+        condition: super::parser::parse_expr(parts[0].expect("assert condition"), arena)?,
+        message: parts
+            .get(1)
+            .and_then(|part| *part)
+            .map(|message| super::parser::parse_expr(message, arena))
+            .transpose()?,
+    }))
+}
+
+fn raise_format_arguments(format: &str) -> usize {
+    let mut arguments = 0usize;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        if characters.next() != Some('%') {
+            arguments += 1;
+        }
+    }
+    arguments
+}
+
+fn parse_trigger_raise<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerRaise<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "raise") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    let (level, body) = if let Some(body) = strip_trigger_keyword(body, "exception") {
+        (TriggerRaiseLevel::Exception, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "warning") {
+        (TriggerRaiseLevel::Warning, body.trim())
+    } else if let Some(body) = strip_trigger_keyword(body, "notice") {
+        (TriggerRaiseLevel::Notice, body.trim())
+    } else {
+        (TriggerRaiseLevel::Exception, body)
+    };
+    let (parts, count) = split_trigger_arguments(body)?;
+    let format = match super::parser::parse_expr(parts[0].expect("RAISE format"), arena)? {
+        Expr::Str(format) => format,
+        _ => return Err(unsupported_trigger_body()),
+    };
+    let argument_count = raise_format_arguments(format);
+    if argument_count != count - 1 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "RAISE format has {} placeholders but {} arguments",
+            argument_count,
+            count - 1
+        ));
+    }
+    let mut parsed = [None; MAX_COLUMNS];
+    for index in 0..count - 1 {
+        parsed[index] = Some(super::parser::parse_expr(
+            parts[index + 1].expect("RAISE argument"),
+            arena,
+        )?);
+    }
+    let arguments = arena
+        .alloc_slice_with(count - 1, |index| {
+            parsed[index].expect("RAISE argument parsed")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(TriggerRaise {
+        level,
+        format,
+        arguments: &*arguments,
     }))
 }
 
@@ -7801,6 +7954,12 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(query) = parse_trigger_perform(segment, arena)? {
         return Ok(TriggerStatement::Perform(query));
+    }
+    if let Some(assertion) = parse_trigger_assert(segment, arena)? {
+        return Ok(TriggerStatement::Assert(assertion));
+    }
+    if let Some(raise) = parse_trigger_raise(segment, arena)? {
+        return Ok(TriggerStatement::Raise(raise));
     }
     if let Some(control) = parse_trigger_loop_control(segment, arena, loop_labels)? {
         if loop_labels.is_empty() {
@@ -8711,6 +8870,56 @@ fn assign_trigger_local<'a>(
     Ok(())
 }
 
+fn trigger_format_message<'a>(
+    format: &str,
+    arguments: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    scope: &TriggerLocalScope<'_, 'a>,
+) -> Result<StackStr<192>, SqlError> {
+    use core::fmt::Write as _;
+
+    let mut message = StackStr::<192>::new();
+    let mut argument = 0usize;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            let _ = message.write_char(character);
+            continue;
+        }
+        if characters.next() == Some('%') {
+            let _ = message.write_char('%');
+            continue;
+        }
+        let value = eval_full(
+            arguments[argument],
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            scope,
+            &NO_HOOKS,
+        )?;
+        argument += 1;
+        if value.is_null() {
+            let _ = message.write_str("<NULL>");
+        } else {
+            let _ = message.write_str(datum_to_text(value, arena)?);
+        }
+    }
+    if message.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "trigger diagnostic message exceeds the maximum length"
+        ));
+    }
+    Ok(message)
+}
+
+fn trigger_notice_to_sql(_: WireFull) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "trigger diagnostic exceeds the send buffer"
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger condition evaluates against the complete typed firing context"
@@ -9049,6 +9258,7 @@ fn execute_trigger_block<'a>(
                 );
                 let mut selected = [Datum::Null; MAX_COLUMNS];
                 let mut found = false;
+                let mut row_count = 0usize;
                 super::query::select_into_rows(
                     context.storage,
                     context.txn.txid,
@@ -9072,9 +9282,27 @@ fn execute_trigger_block<'a>(
                             }
                             found = true;
                         }
+                        row_count += 1;
                         Ok(())
                     },
                 )?;
+                if statement.strict {
+                    match row_count {
+                        0 => {
+                            return Err(sql_err!(
+                                sqlstate::NO_DATA_FOUND,
+                                "query returned no rows"
+                            ));
+                        }
+                        1 => {}
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_ROWS,
+                                "query returned more than one row"
+                            ));
+                        }
+                    }
+                }
                 for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
                     let local = locals[target];
                     local_values[target] = apply_typmod(
@@ -9122,6 +9350,77 @@ fn execute_trigger_block<'a>(
                     Some(&sequence),
                     &mut |_| Ok(()),
                 )?;
+            }
+            TriggerStatement::Assert(assertion) => {
+                if trigger_condition(
+                    assertion.condition,
+                    definition,
+                    invocation,
+                    old,
+                    new.as_deref(),
+                    locals,
+                    &local_values[..locals.len()],
+                    context.arena,
+                )? {
+                    continue;
+                }
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    invocation,
+                    transition: &transition,
+                };
+                let message = match assertion.message {
+                    Some(message) => {
+                        let value = eval_full(
+                            message,
+                            context.arena,
+                            crate::sql::eval::NO_PARAMS,
+                            &scope,
+                            &NO_HOOKS,
+                        )?;
+                        if value.is_null() {
+                            stack_format!(192, "assertion failed")
+                        } else {
+                            stack_format!(192, "{}", datum_to_text(value, context.arena)?)
+                        }
+                    }
+                    None => stack_format!(192, "assertion failed"),
+                };
+                return Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()));
+            }
+            TriggerStatement::Raise(raise) => {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    invocation,
+                    transition: &transition,
+                };
+                let message =
+                    trigger_format_message(raise.format, raise.arguments, context.arena, &scope)?;
+                match raise.level {
+                    TriggerRaiseLevel::Exception => {
+                        return Err(sql_err!(sqlstate::RAISE_EXCEPTION, "{}", message.as_str()));
+                    }
+                    TriggerRaiseLevel::Warning => context
+                        .responder
+                        .warning(sqlstate::WARNING, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                    TriggerRaiseLevel::Notice => context
+                        .responder
+                        .notice(sqlstate::SUCCESSFUL_COMPLETION, message.as_str())
+                        .map_err(trigger_notice_to_sql)?,
+                }
             }
             TriggerStatement::Dml(TriggerDml::Insert(statement)) => {
                 let transition = TriggerTransition {

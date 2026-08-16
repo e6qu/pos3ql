@@ -1190,6 +1190,10 @@ pub fn synthesize<'a>(
 /// Deterministic oid for a live table: slot index offset into the user
 /// range (stable for a running process).
 fn table_oid(_storage: &Storage, slot: usize) -> i32 {
+    user_table_oid(slot)
+}
+
+pub(crate) fn user_table_oid(slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
 }
 

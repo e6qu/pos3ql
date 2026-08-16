@@ -32,7 +32,7 @@ use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, eval,
     eval_full, sqlstate,
 };
-use super::types::{ColDesc, ColType, Datum, RecordField, TypeMod};
+use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
@@ -6608,6 +6608,150 @@ struct TriggerLocalDecl<'a> {
     initial: Option<&'a Expr<'a>>,
 }
 
+/// PostgreSQL's immutable per-firing trigger variables.  The parser keeps
+/// these names out of the local namespace, and every execution scope carries
+/// this value explicitly, including nested trigger SQL snapshots.
+#[derive(Clone, Copy)]
+struct TriggerInvocation<'a> {
+    name: &'a str,
+    table_schema: &'a str,
+    table_name: &'a str,
+    relid: i32,
+    nargs: i32,
+    when: &'static str,
+    level: &'static str,
+    operation: &'static str,
+    argv: Datum<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum TriggerContextField {
+    Name,
+    When,
+    Level,
+    Operation,
+    Relid,
+    Relname,
+    TableName,
+    TableSchema,
+    Tablespace,
+    Nargs,
+    Argv,
+}
+
+impl TriggerContextField {
+    fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("tg_name") {
+            Some(Self::Name)
+        } else if name.eq_ignore_ascii_case("tg_when") {
+            Some(Self::When)
+        } else if name.eq_ignore_ascii_case("tg_level") {
+            Some(Self::Level)
+        } else if name.eq_ignore_ascii_case("tg_op") {
+            Some(Self::Operation)
+        } else if name.eq_ignore_ascii_case("tg_relid") {
+            Some(Self::Relid)
+        } else if name.eq_ignore_ascii_case("tg_relname") {
+            Some(Self::Relname)
+        } else if name.eq_ignore_ascii_case("tg_table_name") {
+            Some(Self::TableName)
+        } else if name.eq_ignore_ascii_case("tg_table_schema") {
+            Some(Self::TableSchema)
+        } else if name.eq_ignore_ascii_case("tg_tablespace") {
+            Some(Self::Tablespace)
+        } else if name.eq_ignore_ascii_case("tg_nargs") {
+            Some(Self::Nargs)
+        } else if name.eq_ignore_ascii_case("tg_argv") {
+            Some(Self::Argv)
+        } else {
+            None
+        }
+    }
+
+    const fn ctype(self) -> ColType {
+        match self {
+            Self::Relid | Self::Nargs => ColType::Int4,
+            Self::Argv => ColType::Array(ArrElem::Text),
+            Self::Name
+            | Self::When
+            | Self::Level
+            | Self::Operation
+            | Self::Relname
+            | Self::TableName
+            | Self::TableSchema
+            | Self::Tablespace => ColType::Text,
+        }
+    }
+}
+
+impl<'a> TriggerInvocation<'a> {
+    fn new(
+        trigger: &crate::storage::TriggerDef,
+        definition: &TableDef,
+        table: usize,
+        event: u8,
+        before: bool,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let mut arguments = [Datum::Null; crate::storage::MAX_TRIGGER_ARGUMENTS];
+        for (index, argument) in trigger.arguments.values().iter().enumerate() {
+            arguments[index] = Datum::Text(
+                arena
+                    .alloc_str(argument.as_str())
+                    .map_err(|_| super::query::arena_full_pub())?,
+            );
+        }
+        let argv = Datum::Array {
+            element: ArrElem::Text,
+            raw: crate::sql::array::build(&arguments[..trigger.arguments.values().len()], arena)?,
+        };
+        let operation = match event {
+            TriggerEvents::INSERT => "INSERT",
+            TriggerEvents::UPDATE => "UPDATE",
+            TriggerEvents::DELETE => "DELETE",
+            TriggerEvents::TRUNCATE => "TRUNCATE",
+            _ => unreachable!("trigger event was validated at the parser boundary"),
+        };
+        Ok(Self {
+            name: arena
+                .alloc_str(trigger.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            table_schema: arena
+                .alloc_str(definition.schema.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            table_name: arena
+                .alloc_str(definition.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            relid: crate::sql::catalog::user_table_oid(table),
+            nargs: i32::try_from(trigger.arguments.values().len())
+                .expect("trigger argument capacity fits int4"),
+            when: if before { "BEFORE" } else { "AFTER" },
+            level: match trigger.level {
+                TriggerLevel::Row => "ROW",
+                TriggerLevel::Statement => "STATEMENT",
+            },
+            operation,
+            argv,
+        })
+    }
+
+    fn value(self, field: TriggerContextField) -> Datum<'a> {
+        match field {
+            TriggerContextField::Name => Datum::Text(self.name),
+            TriggerContextField::When => Datum::Text(self.when),
+            TriggerContextField::Level => Datum::Text(self.level),
+            TriggerContextField::Operation => Datum::Text(self.operation),
+            TriggerContextField::Relid => Datum::Int4(self.relid),
+            TriggerContextField::Relname => Datum::Text(self.table_name),
+            TriggerContextField::TableName => Datum::Text(self.table_name),
+            TriggerContextField::TableSchema => Datum::Text(self.table_schema),
+            TriggerContextField::Tablespace => Datum::Null,
+            TriggerContextField::Nargs => Datum::Int4(self.nargs),
+            TriggerContextField::Argv => self.argv,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TriggerSelectInto<'a> {
     query: &'a Select<'a>,
@@ -7180,6 +7324,13 @@ fn parse_trigger_local<'a>(
         return Err(unsupported_trigger_body());
     };
     let name = SqlName::parse(declaration[..split].trim())?;
+    if TriggerContextField::parse(name.as_str()).is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "trigger local \"{}\" conflicts with a trigger context variable",
+            name.as_str()
+        ));
+    }
     let type_source = declaration[split..].trim();
     if type_source.is_empty() {
         return Err(unsupported_trigger_body());
@@ -7983,6 +8134,7 @@ fn detached_trigger_row<'a>(
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl<'a>],
     values: &'t [Datum<'a>],
+    invocation: TriggerInvocation<'a>,
     transition: &'t TriggerTransition<'t, 't, 'a>,
 }
 
@@ -8002,6 +8154,11 @@ where
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
             return self.transition.lookup(qualifier, name);
+        }
+        if qualifier.is_none()
+            && let Some(field) = TriggerContextField::parse(name)
+        {
+            return Ok(self.invocation.value(field));
         }
         if qualifier.is_none()
             && let Some(index) = self.local_index(name)
@@ -8033,6 +8190,11 @@ where
         {
             return self.transition.col_type(qualifier, name);
         }
+        if qualifier.is_none()
+            && let Some(field) = TriggerContextField::parse(name)
+        {
+            return Some(field.ctype());
+        }
         (qualifier.is_none())
             .then(|| self.local_index(name))
             .flatten()
@@ -8056,7 +8218,9 @@ where
         {
             return self.transition.collation(qualifier, name);
         }
-        if qualifier.is_none() && self.local_index(name).is_some() {
+        if qualifier.is_none()
+            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+        {
             crate::sql::ast::Collation::None
         } else {
             self.transition.collation(qualifier, name)
@@ -8068,7 +8232,9 @@ where
         {
             return self.transition.column_domain(qualifier, name);
         }
-        if qualifier.is_none() && self.local_index(name).is_some() {
+        if qualifier.is_none()
+            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+        {
             None
         } else {
             self.transition.column_domain(qualifier, name)
@@ -8144,6 +8310,7 @@ pub(crate) struct TriggerDmlSnapshot<'a> {
     definition: &'a TableDef,
     locals: &'a [TriggerLocalDecl<'a>],
     values: &'a [Datum<'a>],
+    invocation: TriggerInvocation<'a>,
     old: Option<&'a [Datum<'a>]>,
     new: Option<&'a [Datum<'a>]>,
 }
@@ -8192,6 +8359,9 @@ where
         if let Some(index) = self.local_index(name) {
             return Ok(self.values[index]);
         }
+        if let Some(field) = TriggerContextField::parse(name) {
+            return Ok(self.invocation.value(field));
+        }
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column \"{}\" does not exist",
@@ -8201,7 +8371,10 @@ where
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if qualifier.is_none() {
-            return self.local_index(name).map(|index| self.locals[index].ctype);
+            return self
+                .local_index(name)
+                .map(|index| self.locals[index].ctype)
+                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype));
         }
         self.definition
             .column_index(name)
@@ -8229,6 +8402,7 @@ fn snapshot_trigger_dml_scope<'a>(
     definition: &TableDef,
     locals: &[TriggerLocalDecl<'a>],
     local_values: &[Datum<'a>],
+    invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
     arena: &'a Arena,
@@ -8264,6 +8438,7 @@ fn snapshot_trigger_dml_scope<'a>(
             definition: &*definition,
             locals: &*locals,
             values: &*values,
+            invocation,
             old,
             new,
         })
@@ -8286,6 +8461,7 @@ struct TriggerExecContext<'s, 'a, 'b> {
 fn initialize_trigger_locals<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     definition: &TableDef,
+    invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
     locals: &[TriggerLocalDecl<'a>],
@@ -8304,6 +8480,7 @@ fn initialize_trigger_locals<'a>(
         let scope = TriggerLocalScope {
             locals: &locals[..=index],
             values: &values[..=index],
+            invocation,
             transition: &transition,
         };
         let value = eval_full(
@@ -8354,9 +8531,14 @@ fn assign_trigger_local<'a>(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger condition evaluates against the complete typed firing context"
+)]
 fn trigger_condition<'a>(
     expression: &'a Expr<'a>,
     definition: &TableDef,
+    invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
     locals: &[TriggerLocalDecl<'a>],
@@ -8370,6 +8552,7 @@ fn trigger_condition<'a>(
         &TriggerLocalScope {
             locals,
             values,
+            invocation,
             transition: &TriggerTransition {
                 definition,
                 old,
@@ -8540,6 +8723,7 @@ where
 fn execute_trigger_block<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     definition: &TableDef,
+    invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
     before: bool,
@@ -8580,6 +8764,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let value = eval_full(
@@ -8607,6 +8792,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let value = eval_full(
@@ -8627,6 +8813,7 @@ fn execute_trigger_block<'a>(
                     Some(condition) => trigger_condition(
                         condition,
                         definition,
+                        invocation,
                         old,
                         new.as_deref(),
                         locals,
@@ -8672,6 +8859,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
@@ -8736,6 +8924,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
@@ -8763,6 +8952,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let prepared_select = match statement.select {
@@ -8794,6 +8984,7 @@ fn execute_trigger_block<'a>(
                         definition,
                         locals,
                         &local_values[..locals.len()],
+                        invocation,
                         old,
                         new.as_deref(),
                         context.arena,
@@ -8879,6 +9070,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let outcome = context.responder.without_command_complete(|responder| {
@@ -8963,6 +9155,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    invocation,
                     transition: &transition,
                 };
                 let outcome = context.responder.without_command_complete(|responder| {
@@ -9017,6 +9210,7 @@ fn execute_trigger_block<'a>(
                         let scope = TriggerLocalScope {
                             locals,
                             values: &local_values[..locals.len()],
+                            invocation,
                             transition: &transition,
                         };
                         let lower = trigger_loop_integer(
@@ -9071,6 +9265,7 @@ fn execute_trigger_block<'a>(
                             match execute_trigger_block(
                                 context,
                                 definition,
+                                invocation,
                                 old,
                                 new,
                                 before,
@@ -9121,6 +9316,7 @@ fn execute_trigger_block<'a>(
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                invocation,
                                 transition: &transition,
                             };
                             if locals[target].ctype == ColType::Record {
@@ -9156,6 +9352,7 @@ fn execute_trigger_block<'a>(
                             match execute_trigger_block(
                                 context,
                                 definition,
+                                invocation,
                                 old,
                                 new,
                                 before,
@@ -9184,6 +9381,7 @@ fn execute_trigger_block<'a>(
                 if !trigger_condition(
                     program.condition,
                     definition,
+                    invocation,
                     old,
                     new.as_deref(),
                     locals,
@@ -9195,6 +9393,7 @@ fn execute_trigger_block<'a>(
                 match execute_trigger_block(
                     context,
                     definition,
+                    invocation,
                     old,
                     new,
                     before,
@@ -9220,6 +9419,7 @@ fn execute_trigger_block<'a>(
                 match execute_trigger_block(
                     context,
                     definition,
+                    invocation,
                     old,
                     new,
                     before,
@@ -9252,6 +9452,7 @@ fn execute_trigger_block<'a>(
                             &TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                invocation,
                                 transition: &TriggerTransition {
                                     definition,
                                     old,
@@ -9274,6 +9475,7 @@ fn execute_trigger_block<'a>(
                         if let Some(flow) = execute_trigger_block(
                             context,
                             definition,
+                            invocation,
                             old,
                             new,
                             before,
@@ -9359,6 +9561,8 @@ fn fire_row_triggers<'a>(
                 }
             }
         }
+        let invocation =
+            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
         let source = {
             let body = context
                 .storage
@@ -9377,6 +9581,7 @@ fn fire_row_triggers<'a>(
         initialize_trigger_locals(
             &context,
             definition,
+            invocation,
             old,
             new.as_deref(),
             program.locals,
@@ -9385,6 +9590,7 @@ fn fire_row_triggers<'a>(
         match execute_trigger_block(
             &mut context,
             definition,
+            invocation,
             old,
             &mut new,
             before,
@@ -9566,6 +9772,8 @@ fn fire_statement_triggers_with_rows<'a>(
             trigger.when.is_none(),
             "statement WHEN was rejected at creation"
         );
+        let invocation =
+            TriggerInvocation::new(&trigger, definition, table, event, before, context.arena)?;
         let source = {
             let body = context
                 .storage
@@ -9616,6 +9824,7 @@ fn fire_statement_triggers_with_rows<'a>(
         initialize_trigger_locals(
             &context,
             definition,
+            invocation,
             None,
             None,
             program.locals,
@@ -9624,6 +9833,7 @@ fn fire_statement_triggers_with_rows<'a>(
         match execute_trigger_block(
             &mut context,
             definition,
+            invocation,
             None,
             &mut no_new,
             before,
@@ -9696,12 +9906,10 @@ pub fn create_trigger(
     ) {
         return sql_fail(error);
     }
-    if !trigger.arguments.is_empty() {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "trigger arguments are not supported"
-        ));
-    }
+    let arguments = match crate::storage::TriggerArguments::parse(trigger.arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return sql_fail(error),
+    };
     let function = if let Some(schema) = trigger.function.schema {
         storage.routine_slot_by_signature(schema, trigger.function.name, &[], txn.txid)
     } else {
@@ -9790,6 +9998,7 @@ pub fn create_trigger(
             update_columns,
             transition_tables,
             when,
+            arguments,
         },
         txn.txid,
     ) {
@@ -9797,6 +10006,10 @@ pub fn create_trigger(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
+    let mut wal_arguments = [""; crate::storage::MAX_TRIGGER_ARGUMENTS];
+    for (index, argument) in arguments.values().iter().enumerate() {
+        wal_arguments[index] = argument.as_str();
+    }
     let staged = wal.stage(
         txn.txid,
         lsn,
@@ -9813,6 +10026,8 @@ pub fn create_trigger(
             old_table: trigger.transition_tables.old(),
             new_table: trigger.transition_tables.new_table(),
             when: when.as_ref().map(|value| value.as_str()),
+            arguments: wal_arguments,
+            argument_count: arguments.values().len(),
         },
     );
     if let Err(error) = staged {

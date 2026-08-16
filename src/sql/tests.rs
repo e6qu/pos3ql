@@ -8525,10 +8525,18 @@ fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
            'DECLARE caught_code text; caught_message text; caught_detail text; caught_hint text;
             BEGIN
               BEGIN
-                RAISE EXCEPTION USING MESSAGE = ''rejected id '' || NEW.id,
-                                      DETAIL = ''validation detail'',
-                                      HINT = ''supply a different id'';
-              EXCEPTION WHEN raise_exception THEN
+                BEGIN
+                  INSERT INTO trigger_stacked_audit VALUES (''discarded'', ''discarded'', ''discarded'', ''discarded'');
+                  RAISE EXCEPTION USING ERRCODE = ''ZX123'',
+                                        MESSAGE = ''rejected id '' || NEW.id,
+                                        DETAIL = ''validation detail'',
+                                        HINT = ''supply a different id'';
+                EXCEPTION WHEN SQLSTATE ''ZX123'' THEN
+                  BEGIN
+                    RAISE;
+                  END;
+                END;
+              EXCEPTION WHEN SQLSTATE ''ZX123'' THEN
                 GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE,
                                         caught_message = MESSAGE_TEXT,
                                         caught_detail = PG_EXCEPTION_DETAIL,
@@ -8544,7 +8552,7 @@ fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
     );
     assert_eq!(
         data_rows(&output),
-        ["P0001|rejected id 7|validation detail|supply a different id"],
+        ["ZX123|rejected id 7|validation detail|supply a different id"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -8566,6 +8574,26 @@ fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
         String::from_utf8_lossy(&outside_handler).contains("0Z002"),
         "{}",
         String::from_utf8_lossy(&outside_handler)
+    );
+
+    let bare_raise = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_rethrow_invalid() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN
+              RAISE;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_rethrow_invalid_before BEFORE INSERT ON trigger_stacked_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_rethrow_invalid();
+         INSERT INTO trigger_stacked_target VALUES (9);",
+    );
+    assert!(
+        String::from_utf8_lossy(&bare_raise).contains("0Z002")
+            && String::from_utf8_lossy(&bare_raise)
+                .contains("RAISE without parameters cannot be used outside an exception handler"),
+        "{}",
+        String::from_utf8_lossy(&bare_raise)
     );
 }
 

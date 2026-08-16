@@ -6777,7 +6777,7 @@ enum TriggerRaiseLevel {
 }
 
 #[derive(Clone, Copy)]
-struct TriggerRaise<'a> {
+struct TriggerRaisedMessage<'a> {
     level: TriggerRaiseLevel,
     sqlstate: TriggerRaiseSqlState<'a>,
     format: Option<&'a str>,
@@ -6786,6 +6786,14 @@ struct TriggerRaise<'a> {
     message: Option<&'a Expr<'a>>,
     detail: Option<&'a Expr<'a>>,
     hint: Option<&'a Expr<'a>>,
+}
+
+/// `RAISE;` has no independently executable meaning: parsing permits it only
+/// in an exception handler, where it re-emits the handler's caught error.
+#[derive(Clone, Copy)]
+enum TriggerRaise<'a> {
+    Message(TriggerRaisedMessage<'a>),
+    Rethrow,
 }
 
 #[derive(Clone, Copy)]
@@ -6968,9 +6976,8 @@ enum TriggerFlow {
     Continue(u8),
 }
 
-/// The caught error is an explicitly scoped execution value. It is installed
-/// only while the matching exception handler runs, so a protected nested block
-/// cannot accidentally inspect a surrounding handler's error.
+/// The caught error is an explicitly scoped execution value. Lexically nested
+/// blocks inherit it; a matching nested exception handler shadows it.
 #[derive(Clone, Copy)]
 struct TriggerExceptionDiagnostic<'a> {
     sqlstate: crate::sql::eval::SqlState,
@@ -7637,6 +7644,7 @@ fn raise_format_arguments(format: &str) -> usize {
 fn parse_trigger_raise<'a>(
     statement: &'a str,
     arena: &'a Arena,
+    handler_active: bool,
 ) -> Result<Option<TriggerRaise<'a>>, SqlError> {
     let Some(body) = strip_trigger_keyword(statement, "raise") else {
         return Ok(None);
@@ -7657,6 +7665,15 @@ fn parse_trigger_raise<'a>(
     } else {
         (TriggerRaiseLevel::Exception, body)
     };
+    if body.is_empty() {
+        if handler_active {
+            return Ok(Some(TriggerRaise::Rethrow));
+        }
+        return Err(sql_err!(
+            sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+            "RAISE without parameters cannot be used outside an exception handler"
+        ));
+    }
     let using_at = trigger_top_level_keyword(body, "using");
     let (format_body, options) = using_at
         .map(|at| (body[..at].trim(), Some(body[at + 5..].trim())))
@@ -7738,7 +7755,7 @@ fn parse_trigger_raise<'a>(
             &*arguments,
         )
     };
-    Ok(Some(TriggerRaise {
+    Ok(Some(TriggerRaise::Message(TriggerRaisedMessage {
         level,
         sqlstate,
         format,
@@ -7747,7 +7764,7 @@ fn parse_trigger_raise<'a>(
         message: options.message,
         detail: options.detail,
         hint: options.hint,
-    }))
+    })))
 }
 
 fn parse_trigger_raise_options<'a>(
@@ -8363,7 +8380,7 @@ fn parse_trigger_statement<'a>(
     if let Some(assertion) = parse_trigger_assert(segment, arena)? {
         return Ok(TriggerStatement::Assert(assertion));
     }
-    if let Some(raise) = parse_trigger_raise(segment, arena)? {
+    if let Some(raise) = parse_trigger_raise(segment, arena, handler_active)? {
         return Ok(TriggerStatement::Raise(raise));
     }
     if let Some(diagnostics) = parse_trigger_get_stacked_diagnostics(segment, arena)? {
@@ -8676,7 +8693,7 @@ fn parse_trigger_block<'a>(
             }
         } else if strip_trigger_keyword(segment, "begin").is_some() {
             let (protected, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth, false)?;
+                parse_trigger_block(segments, at, arena, loop_labels, loop_depth, handler_active)?;
             if matches!(ending, TriggerBlockEnd::Exception) {
                 let mut handlers = [None; MAX_COLUMNS];
                 let mut handler_count = 0;
@@ -10047,7 +10064,18 @@ fn execute_trigger_block<'a>(
                 };
                 return Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()));
             }
-            TriggerStatement::Raise(raise) => {
+            TriggerStatement::Raise(TriggerRaise::Rethrow) => {
+                let exception =
+                    exception.expect("bare RAISE is parsed only in an exception handler");
+                if let Some(diagnostic) = exception.diagnostic {
+                    crate::sql::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+                }
+                return Err(SqlError {
+                    sqlstate: exception.sqlstate,
+                    message: *exception.message,
+                });
+            }
+            TriggerStatement::Raise(TriggerRaise::Message(raise)) => {
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -10155,7 +10183,7 @@ fn execute_trigger_block<'a>(
                     )?;
                 }
             }
-            TriggerStatement::Exception(exception) => {
+            TriggerStatement::Exception(exception_block) => {
                 context
                     .txn
                     .savepoint("__trigger_exception__", 0, context.storage.lock_mark())?;
@@ -10173,8 +10201,8 @@ fn execute_trigger_block<'a>(
                     transition_relations,
                     locals,
                     local_values,
-                    exception.protected,
-                    None,
+                    exception_block.protected,
+                    exception,
                 ) {
                     Ok(flow) => {
                         context.txn.release_savepoints_from(index);
@@ -10184,7 +10212,7 @@ fn execute_trigger_block<'a>(
                     }
                     Err(error) => {
                         rollback_trigger_subtransaction(context, index);
-                        let Some(handler) = exception.handlers.iter().find(|handler| {
+                        let Some(handler) = exception_block.handlers.iter().find(|handler| {
                             handler
                                 .conditions
                                 .iter()

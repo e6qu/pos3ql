@@ -6615,6 +6615,8 @@ struct TriggerLocalDecl<'a> {
 #[derive(Clone, Copy)]
 struct TriggerInvocation<'a> {
     name: &'a str,
+    routine_schema: &'a str,
+    routine_name: &'a str,
     table_schema: &'a str,
     table_name: &'a str,
     relid: i32,
@@ -6624,6 +6626,7 @@ struct TriggerInvocation<'a> {
     level: &'static str,
     operation: &'static str,
     argv: Datum<'a>,
+    exception: Option<TriggerExceptionDiagnostic<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -6693,7 +6696,7 @@ impl<'a> TriggerInvocation<'a> {
         table: usize,
         event: u8,
         before: bool,
-        routine_oid: i32,
+        routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut arguments = [Datum::Null; crate::storage::MAX_TRIGGER_ARGUMENTS];
@@ -6719,6 +6722,12 @@ impl<'a> TriggerInvocation<'a> {
             name: arena
                 .alloc_str(trigger.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
+            routine_schema: arena
+                .alloc_str(routine.schema.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            routine_name: arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
             table_schema: arena
                 .alloc_str(definition.schema.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
@@ -6726,7 +6735,7 @@ impl<'a> TriggerInvocation<'a> {
                 .alloc_str(definition.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             relid: crate::sql::catalog::user_table_oid(table),
-            routine_oid,
+            routine_oid: crate::storage::routine_oid(routine),
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
             when: if before { "BEFORE" } else { "AFTER" },
@@ -6736,7 +6745,22 @@ impl<'a> TriggerInvocation<'a> {
             },
             operation,
             argv,
+            exception: None,
         })
+    }
+
+    fn with_exception(mut self, exception: TriggerExceptionDiagnostic<'a>) -> Self {
+        self.exception = Some(exception);
+        self
+    }
+
+    fn context(self) -> StackStr<192> {
+        stack_format!(
+            192,
+            "PL/pgSQL function {}.{}()",
+            self.routine_schema,
+            self.routine_name
+        )
     }
 
     fn value(self, field: TriggerContextField) -> Datum<'a> {
@@ -6823,8 +6847,14 @@ enum TriggerRaiseSqlState<'a> {
 enum TriggerStackedDiagnostic {
     ReturnedSqlstate,
     MessageText,
+    ColumnName,
+    ConstraintName,
+    PgDatatypeName,
     PgExceptionDetail,
     PgExceptionHint,
+    PgExceptionContext,
+    TableName,
+    SchemaName,
 }
 
 /// An ordinary diagnostic item has a fixed PostgreSQL spelling and result
@@ -6833,6 +6863,7 @@ enum TriggerStackedDiagnostic {
 enum TriggerDiagnostic {
     RowCount,
     PgRoutineOid,
+    PgContext,
 }
 
 #[derive(Clone, Copy)]
@@ -7004,8 +7035,11 @@ enum TriggerFlow {
 #[derive(Clone, Copy)]
 struct TriggerExceptionDiagnostic<'a> {
     sqlstate: crate::sql::eval::SqlState,
-    message: &'a StackStr<192>,
-    diagnostic: Option<&'a crate::sql::eval::Diagnostic>,
+    sqlstate_text: &'a str,
+    message: &'a str,
+    detail: Option<&'a str>,
+    hint: Option<&'a str>,
+    context: &'a str,
 }
 
 /// Per-function execution state, deliberately distinct from local variables
@@ -7050,6 +7084,24 @@ enum TriggerStatusVariable {
 impl TriggerStatusVariable {
     fn parse(name: &str) -> Option<Self> {
         name.eq_ignore_ascii_case("found").then_some(Self::Found)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TriggerExceptionVariable {
+    Sqlstate,
+    Sqlerrm,
+}
+
+impl TriggerExceptionVariable {
+    fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("sqlstate") {
+            Some(Self::Sqlstate)
+        } else if name.eq_ignore_ascii_case("sqlerrm") {
+            Some(Self::Sqlerrm)
+        } else {
+            None
+        }
     }
 }
 
@@ -7534,10 +7586,12 @@ fn parse_trigger_local<'a>(
         return Err(unsupported_trigger_body());
     };
     let name = SqlName::parse(declaration[..split].trim())?;
-    if TriggerContextField::parse(name.as_str()).is_some() {
+    if TriggerContextField::parse(name.as_str()).is_some()
+        || TriggerExceptionVariable::parse(name.as_str()).is_some()
+    {
         return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
-            "trigger local \"{}\" conflicts with a trigger context variable",
+            "trigger local \"{}\" conflicts with a trigger runtime variable",
             name.as_str()
         ));
     }
@@ -7908,10 +7962,22 @@ fn parse_trigger_stacked_diagnostic(text: &str) -> Result<TriggerStackedDiagnost
         Ok(TriggerStackedDiagnostic::ReturnedSqlstate)
     } else if text.eq_ignore_ascii_case("message_text") {
         Ok(TriggerStackedDiagnostic::MessageText)
+    } else if text.eq_ignore_ascii_case("column_name") {
+        Ok(TriggerStackedDiagnostic::ColumnName)
+    } else if text.eq_ignore_ascii_case("constraint_name") {
+        Ok(TriggerStackedDiagnostic::ConstraintName)
+    } else if text.eq_ignore_ascii_case("pg_datatype_name") {
+        Ok(TriggerStackedDiagnostic::PgDatatypeName)
     } else if text.eq_ignore_ascii_case("pg_exception_detail") {
         Ok(TriggerStackedDiagnostic::PgExceptionDetail)
     } else if text.eq_ignore_ascii_case("pg_exception_hint") {
         Ok(TriggerStackedDiagnostic::PgExceptionHint)
+    } else if text.eq_ignore_ascii_case("pg_exception_context") {
+        Ok(TriggerStackedDiagnostic::PgExceptionContext)
+    } else if text.eq_ignore_ascii_case("table_name") {
+        Ok(TriggerStackedDiagnostic::TableName)
+    } else if text.eq_ignore_ascii_case("schema_name") {
+        Ok(TriggerStackedDiagnostic::SchemaName)
     } else {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -7926,6 +7992,8 @@ fn parse_trigger_diagnostic(text: &str) -> Result<TriggerDiagnostic, SqlError> {
         Ok(TriggerDiagnostic::RowCount)
     } else if text.eq_ignore_ascii_case("pg_routine_oid") {
         Ok(TriggerDiagnostic::PgRoutineOid)
+    } else if text.eq_ignore_ascii_case("pg_context") {
+        Ok(TriggerDiagnostic::PgContext)
     } else {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -9233,6 +9301,15 @@ where
         if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
             return Ok(self.found.map(Datum::Bool).unwrap_or(Datum::Null));
         }
+        if qualifier.is_none()
+            && let Some(variable) = TriggerExceptionVariable::parse(name)
+            && let Some(exception) = self.invocation.exception
+        {
+            return Ok(Datum::Text(match variable {
+                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
+                TriggerExceptionVariable::Sqlerrm => exception.message,
+            }));
+        }
         if let Some(qualifier) = qualifier
             && let Some(index) = self.local_index(qualifier)
             && let Datum::Record(fields) = self.values[index]
@@ -9266,6 +9343,12 @@ where
         if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
             return Some(ColType::Bool);
         }
+        if qualifier.is_none()
+            && TriggerExceptionVariable::parse(name).is_some()
+            && self.invocation.exception.is_some()
+        {
+            return Some(ColType::Text);
+        }
         (qualifier.is_none())
             .then(|| self.local_index(name))
             .flatten()
@@ -9293,6 +9376,8 @@ where
             && (self.local_index(name).is_some()
                 || TriggerContextField::parse(name).is_some()
                 || TriggerStatusVariable::parse(name).is_some())
+            || (TriggerExceptionVariable::parse(name).is_some()
+                && self.invocation.exception.is_some())
         {
             crate::sql::ast::Collation::None
         } else {
@@ -9309,6 +9394,8 @@ where
             && (self.local_index(name).is_some()
                 || TriggerContextField::parse(name).is_some()
                 || TriggerStatusVariable::parse(name).is_some())
+            || (TriggerExceptionVariable::parse(name).is_some()
+                && self.invocation.exception.is_some())
         {
             None
         } else {
@@ -9437,6 +9524,14 @@ where
         if let Some(field) = TriggerContextField::parse(name) {
             return Ok(self.invocation.value(field));
         }
+        if let Some(variable) = TriggerExceptionVariable::parse(name)
+            && let Some(exception) = self.invocation.exception
+        {
+            return Ok(Datum::Text(match variable {
+                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
+                TriggerExceptionVariable::Sqlerrm => exception.message,
+            }));
+        }
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column \"{}\" does not exist",
@@ -9449,7 +9544,12 @@ where
             return self
                 .local_index(name)
                 .map(|index| self.locals[index].ctype)
-                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype));
+                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype))
+                .or_else(|| {
+                    (TriggerExceptionVariable::parse(name).is_some()
+                        && self.invocation.exception.is_some())
+                    .then_some(ColType::Text)
+                });
         }
         self.definition
             .column_index(name)
@@ -10256,12 +10356,15 @@ fn execute_trigger_block<'a>(
             TriggerStatement::Raise(TriggerRaise::Rethrow) => {
                 let exception =
                     exception.expect("bare RAISE is parsed only in an exception handler");
-                if let Some(diagnostic) = exception.diagnostic {
-                    crate::sql::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+                if exception.detail.is_some() || exception.hint.is_some() {
+                    crate::sql::eval::stash_diagnostic(
+                        StackStr::from_str(exception.detail.unwrap_or("")),
+                        exception.hint.map(StackStr::from_str),
+                    );
                 }
                 return Err(SqlError {
                     sqlstate: exception.sqlstate,
-                    message: *exception.message,
+                    message: StackStr::from_str(exception.message),
                 });
             }
             TriggerStatement::Raise(TriggerRaise::Message(raise)) => {
@@ -10339,6 +10442,15 @@ fn execute_trigger_block<'a>(
                     let value = match assignment.item {
                         TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
                         TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
+                        TriggerDiagnostic::PgContext => {
+                            let text = invocation.context();
+                            Datum::Text(
+                                context
+                                    .arena
+                                    .alloc_str(text.as_str())
+                                    .map_err(|_| super::query::arena_full_pub())?,
+                            )
+                        }
                     };
                     assign_trigger_local(
                         locals,
@@ -10361,13 +10473,15 @@ fn execute_trigger_block<'a>(
                         TriggerStackedDiagnostic::ReturnedSqlstate => {
                             Some(exception.sqlstate.as_str())
                         }
-                        TriggerStackedDiagnostic::MessageText => Some(exception.message.as_str()),
-                        TriggerStackedDiagnostic::PgExceptionDetail => exception
-                            .diagnostic
-                            .map(|diagnostic| diagnostic.detail.as_str()),
-                        TriggerStackedDiagnostic::PgExceptionHint => exception
-                            .diagnostic
-                            .and_then(|diagnostic| diagnostic.hint.as_ref().map(StackStr::as_str)),
+                        TriggerStackedDiagnostic::MessageText => Some(exception.message),
+                        TriggerStackedDiagnostic::ColumnName
+                        | TriggerStackedDiagnostic::ConstraintName
+                        | TriggerStackedDiagnostic::PgDatatypeName
+                        | TriggerStackedDiagnostic::TableName
+                        | TriggerStackedDiagnostic::SchemaName => Some(""),
+                        TriggerStackedDiagnostic::PgExceptionDetail => exception.detail,
+                        TriggerStackedDiagnostic::PgExceptionHint => exception.hint,
+                        TriggerStackedDiagnostic::PgExceptionContext => Some(exception.context),
                     };
                     let value = value
                         .map(|value| {
@@ -10428,11 +10542,39 @@ fn execute_trigger_block<'a>(
                             return Err(error);
                         };
                         let diagnostic = crate::sql::eval::take_diagnostic();
+                        let message = context
+                            .arena
+                            .alloc_str(error.message.as_str())
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        let sqlstate_text = context
+                            .arena
+                            .alloc_str(error.sqlstate.as_str())
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        let detail = diagnostic
+                            .as_ref()
+                            .map(|value| context.arena.alloc_str(value.detail.as_str()))
+                            .transpose()
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        let hint = diagnostic
+                            .as_ref()
+                            .and_then(|value| value.hint.as_ref())
+                            .map(|value| context.arena.alloc_str(value.as_str()))
+                            .transpose()
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        let context_text = invocation.context();
+                        let context_text = context
+                            .arena
+                            .alloc_str(context_text.as_str())
+                            .map_err(|_| super::query::arena_full_pub())?;
                         let caught = TriggerExceptionDiagnostic {
                             sqlstate: error.sqlstate,
-                            message: &error.message,
-                            diagnostic: diagnostic.as_ref(),
+                            sqlstate_text,
+                            message,
+                            detail,
+                            hint,
+                            context: context_text,
                         };
+                        let invocation = invocation.with_exception(caught);
                         if let Some(flow) = execute_trigger_block(
                             context,
                             definition,
@@ -11322,15 +11464,13 @@ fn fire_row_triggers<'a>(
                 }
             }
         }
-        let routine_oid =
-            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
             table,
             event,
             before,
-            routine_oid,
+            context.storage.routine(usize::from(trigger.function)),
             context.arena,
         )?;
         let source = {
@@ -11545,15 +11685,13 @@ fn fire_statement_triggers_with_rows<'a>(
             trigger.when.is_none(),
             "statement WHEN was rejected at creation"
         );
-        let routine_oid =
-            crate::storage::routine_oid(context.storage.routine(usize::from(trigger.function)));
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
             table,
             event,
             before,
-            routine_oid,
+            context.storage.routine(usize::from(trigger.function)),
             context.arena,
         )?;
         let source = {

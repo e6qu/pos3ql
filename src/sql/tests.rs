@@ -8598,6 +8598,73 @@ fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
 }
 
 #[test]
+fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_diagnostic_surface_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_diagnostic_surface_audit (
+           state text, message text, detail text, hint text, context text,
+           current_context text, column_name text, constraint_name text,
+           datatype_name text, table_name text, schema_name text
+         );
+         CREATE FUNCTION trigger_diagnostic_surface() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE state text; message text; detail text; hint text; context text;
+                    current_context text; column_name text; constraint_name text;
+                    datatype_name text; table_name text; schema_name text;
+            BEGIN
+              BEGIN
+                RAISE EXCEPTION USING ERRCODE = ''ZX123'', MESSAGE = ''typed failure'',
+                                      DETAIL = ''typed detail'', HINT = ''typed hint'';
+              EXCEPTION WHEN SQLSTATE ''ZX123'' THEN
+                GET DIAGNOSTICS current_context = PG_CONTEXT;
+                GET STACKED DIAGNOSTICS column_name = COLUMN_NAME,
+                                        constraint_name = CONSTRAINT_NAME,
+                                        datatype_name = PG_DATATYPE_NAME,
+                                        table_name = TABLE_NAME,
+                                        schema_name = SCHEMA_NAME,
+                                        detail = PG_EXCEPTION_DETAIL,
+                                        hint = PG_EXCEPTION_HINT,
+                                        context = PG_EXCEPTION_CONTEXT;
+                state := SQLSTATE;
+                message := SQLERRM;
+                INSERT INTO trigger_diagnostic_surface_audit VALUES
+                  (state, message, detail, hint, context, current_context,
+                   column_name, constraint_name, datatype_name, table_name, schema_name);
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_diagnostic_surface_before BEFORE INSERT
+           ON trigger_diagnostic_surface_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_diagnostic_surface();
+         INSERT INTO trigger_diagnostic_surface_target VALUES (1);
+         SELECT * FROM trigger_diagnostic_surface_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function public.trigger_diagnostic_surface()|PL/pgSQL function public.trigger_diagnostic_surface()|||||"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_diagnostic_scope_invalid() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE sqlstate text;
+            BEGIN RETURN NEW; END';",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("conflicts with a trigger runtime variable"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+}
+
+#[test]
 fn trigger_execution_status_is_typed_for_queries_and_dml() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -8664,23 +8731,6 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
         ],
         "{}",
         String::from_utf8_lossy(&output)
-    );
-
-    let invalid = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE FUNCTION trigger_status_invalid() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE value text;
-            BEGIN
-              GET DIAGNOSTICS value = PG_CONTEXT;
-              RETURN NEW;
-            END';",
-    );
-    assert!(
-        String::from_utf8_lossy(&invalid)
-            .contains("GET DIAGNOSTICS item \"PG_CONTEXT\" is not supported"),
-        "{}",
-        String::from_utf8_lossy(&invalid)
     );
 
     let shadowed = run_with(

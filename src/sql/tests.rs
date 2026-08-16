@@ -8413,6 +8413,62 @@ fn trigger_exception_blocks_undo_protected_writes_and_match_typed_conditions() {
 }
 
 #[test]
+fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_stacked_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_stacked_audit (code text, message text, detail text, hint text);
+         CREATE FUNCTION trigger_stacked_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE caught_code text; caught_message text; caught_detail text; caught_hint text;
+            BEGIN
+              BEGIN
+                RAISE EXCEPTION USING MESSAGE = ''rejected id '' || NEW.id,
+                                      DETAIL = ''validation detail'',
+                                      HINT = ''supply a different id'';
+              EXCEPTION WHEN raise_exception THEN
+                GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE,
+                                        caught_message = MESSAGE_TEXT,
+                                        caught_detail = PG_EXCEPTION_DETAIL,
+                                        caught_hint = PG_EXCEPTION_HINT;
+                INSERT INTO trigger_stacked_audit VALUES (caught_code, caught_message, caught_detail, caught_hint);
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_stacked_before BEFORE INSERT ON trigger_stacked_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_stacked_function();
+         INSERT INTO trigger_stacked_target VALUES (7);
+         SELECT code, message, detail, hint FROM trigger_stacked_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["P0001|rejected id 7|validation detail|supply a different id"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let outside_handler = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_stacked_invalid() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE caught_code text;
+            BEGIN
+              GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_stacked_invalid_before BEFORE INSERT ON trigger_stacked_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_stacked_invalid();
+         INSERT INTO trigger_stacked_target VALUES (8);",
+    );
+    assert!(
+        String::from_utf8_lossy(&outside_handler).contains("0Z002"),
+        "{}",
+        String::from_utf8_lossy(&outside_handler)
+    );
+}
+
+#[test]
 fn trigger_exception_others_handles_unmatched_errors() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -8479,7 +8535,22 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
               RETURN NEW;
             END';
          CREATE TRIGGER durable_trigger_exception_before BEFORE INSERT ON durable_trigger_exception_target
-           FOR EACH ROW EXECUTE FUNCTION durable_trigger_exception_function();",
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_exception_function();
+         CREATE TABLE durable_trigger_stacked_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_trigger_stacked_audit (code text, message text);
+         CREATE FUNCTION durable_trigger_stacked_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE caught_code text; caught_message text;
+            BEGIN
+              BEGIN RAISE EXCEPTION ''recovered id %'', NEW.id;
+              EXCEPTION WHEN raise_exception THEN
+                GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE,
+                                        caught_message = MESSAGE_TEXT;
+                INSERT INTO durable_trigger_stacked_audit VALUES (caught_code, caught_message);
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_trigger_stacked_before BEFORE INSERT ON durable_trigger_stacked_target
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_stacked_function();",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -8508,6 +8579,15 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
              SELECT id FROM durable_trigger_exception_audit ORDER BY id",
         )),
         ["101"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "INSERT INTO durable_trigger_stacked_target VALUES (9);
+             SELECT code, message FROM durable_trigger_stacked_audit",
+        )),
+        ["P0001|recovered id 9"]
     );
 }
 

@@ -191,6 +191,7 @@ pub mod sqlstate {
     pub const NO_DATA_FOUND: &str = "P0002";
     pub const TOO_MANY_ROWS: &str = "P0003";
     pub const ASSERT_FAILURE: &str = "P0004";
+    pub const STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER: &str = "0Z002";
 }
 
 /// Resolves column references during evaluation. Statements without a FROM

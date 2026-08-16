@@ -431,3 +431,26 @@ CREATE TRIGGER trigger_exception_before BEFORE INSERT ON trigger_exception_targe
 INSERT INTO trigger_exception_target VALUES (1);
 SELECT id, value FROM trigger_exception_audit ORDER BY id;
 SELECT id FROM trigger_exception_target;
+
+CREATE TABLE trigger_stacked_diagnostic_target (id integer PRIMARY KEY);
+CREATE TABLE trigger_stacked_diagnostic_audit (code text, message text, detail text, hint text);
+CREATE FUNCTION trigger_stacked_diagnostic_program() RETURNS trigger LANGUAGE plpgsql AS
+  'DECLARE caught_code text; caught_message text; caught_detail text; caught_hint text;
+   BEGIN
+     BEGIN
+       RAISE EXCEPTION USING MESSAGE = ''rejected id '' || NEW.id,
+                             DETAIL = ''validation detail'',
+                             HINT = ''supply a different id'';
+     EXCEPTION WHEN raise_exception THEN
+       GET STACKED DIAGNOSTICS caught_code = RETURNED_SQLSTATE,
+                               caught_message = MESSAGE_TEXT,
+                               caught_detail = PG_EXCEPTION_DETAIL,
+                               caught_hint = PG_EXCEPTION_HINT;
+       INSERT INTO trigger_stacked_diagnostic_audit VALUES (caught_code, caught_message, caught_detail, caught_hint);
+     END;
+     RETURN NEW;
+   END';
+CREATE TRIGGER trigger_stacked_diagnostic_before BEFORE INSERT ON trigger_stacked_diagnostic_target
+  FOR EACH ROW EXECUTE FUNCTION trigger_stacked_diagnostic_program();
+INSERT INTO trigger_stacked_diagnostic_target VALUES (7);
+SELECT code, message, detail, hint FROM trigger_stacked_diagnostic_audit;

@@ -92,6 +92,9 @@ pub struct Responder<'b> {
     /// Composite utility commands execute ordinary DROP helpers but publish
     /// one command tag of their own.
     suppress_command_complete: bool,
+    /// Typed affected-row count for an internally executed DML command. This
+    /// never derives state from a serialized command tag.
+    affected_rows: Option<u64>,
     discarded_rows: u64,
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
@@ -226,6 +229,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -242,6 +246,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -260,6 +265,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -278,6 +284,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
@@ -1233,6 +1240,26 @@ impl<'b> Responder<'b> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
         m.finish()
+    }
+
+    /// Publishes an affected-row count alongside a DML command completion.
+    /// Nested trigger execution consumes the count as typed execution state;
+    /// clients still receive only PostgreSQL's ordinary command tag.
+    pub(crate) fn command_complete_rows(&mut self, tag: &str, rows: u64) -> Result<(), WireFull> {
+        self.set_affected_rows(rows);
+        self.command_complete(tag)
+    }
+
+    pub(crate) fn set_affected_rows(&mut self, rows: u64) {
+        self.affected_rows = Some(rows);
+    }
+
+    pub(crate) fn take_affected_rows(&mut self) -> Option<u64> {
+        self.affected_rows.take()
+    }
+
+    pub(crate) fn clear_affected_rows(&mut self) {
+        self.affected_rows = None;
     }
 
     pub fn without_command_complete<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {

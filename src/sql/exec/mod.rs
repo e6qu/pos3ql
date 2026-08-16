@@ -6824,6 +6824,24 @@ enum TriggerStackedDiagnostic {
     PgExceptionHint,
 }
 
+/// An ordinary diagnostic item has a fixed PostgreSQL spelling and result
+/// type. Unsupported spellings remain loud parse errors.
+#[derive(Clone, Copy)]
+enum TriggerDiagnostic {
+    RowCount,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerDiagnosticAssignment {
+    target: SqlName,
+    item: TriggerDiagnostic,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerGetDiagnostics<'a> {
+    assignments: &'a [TriggerDiagnosticAssignment],
+}
+
 #[derive(Clone, Copy)]
 struct TriggerStackedDiagnosticAssignment {
     target: SqlName,
@@ -6861,6 +6879,7 @@ enum TriggerStatement<'a> {
     Perform(&'a Select<'a>),
     Assert(TriggerAssert<'a>),
     Raise(TriggerRaise<'a>),
+    GetDiagnostics(TriggerGetDiagnostics<'a>),
     GetStackedDiagnostics(TriggerGetStackedDiagnostics<'a>),
     Exception(TriggerException<'a>),
     Dml(TriggerDml<'a>),
@@ -6983,6 +7002,51 @@ struct TriggerExceptionDiagnostic<'a> {
     sqlstate: crate::sql::eval::SqlState,
     message: &'a StackStr<192>,
     diagnostic: Option<&'a crate::sql::eval::Diagnostic>,
+}
+
+/// Per-function execution state, deliberately distinct from local variables
+/// and transaction state. Nested trigger functions receive a fresh value.
+#[derive(Clone, Copy)]
+struct TriggerExecutionStatus {
+    found: Option<bool>,
+    row_count: i64,
+}
+
+impl Default for TriggerExecutionStatus {
+    fn default() -> Self {
+        Self {
+            found: Some(false),
+            row_count: 0,
+        }
+    }
+}
+
+impl TriggerExecutionStatus {
+    fn set_rows(&mut self, rows: u64) -> Result<(), SqlError> {
+        self.row_count = i64::try_from(rows).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "trigger affected-row count exceeds bigint"
+            )
+        })?;
+        self.found = Some(rows != 0);
+        Ok(())
+    }
+
+    fn set_found(&mut self, found: bool) {
+        self.found = Some(found);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TriggerStatusVariable {
+    Found,
+}
+
+impl TriggerStatusVariable {
+    fn parse(name: &str) -> Option<Self> {
+        name.eq_ignore_ascii_case("found").then_some(Self::Found)
+    }
 }
 
 /// A trigger has two explicitly named transition images.  Keeping them as a
@@ -7853,6 +7917,69 @@ fn parse_trigger_stacked_diagnostic(text: &str) -> Result<TriggerStackedDiagnost
     }
 }
 
+fn parse_trigger_diagnostic(text: &str) -> Result<TriggerDiagnostic, SqlError> {
+    if text.eq_ignore_ascii_case("row_count") {
+        Ok(TriggerDiagnostic::RowCount)
+    } else {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "GET DIAGNOSTICS item \"{}\" is not supported",
+            text
+        ))
+    }
+}
+
+fn parse_trigger_get_diagnostics<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerGetDiagnostics<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "get") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    if strip_trigger_keyword(body, "stacked").is_some() {
+        return Ok(None);
+    }
+    let Some(body) = strip_trigger_keyword(body, "diagnostics") else {
+        return Err(unsupported_trigger_body());
+    };
+    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let mut assignments = [None; MAX_COLUMNS];
+    for (index, part) in parts[..count].iter().enumerate() {
+        let part = part.expect("diagnostic assignment initialized");
+        let Some((target, item)) = part.split_once('=') else {
+            return Err(unsupported_trigger_body());
+        };
+        let target = SqlName::parse(target.trim())?;
+        if target.as_str().contains('.') || item.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        if assignments[..index]
+            .iter()
+            .flatten()
+            .any(|prior: &TriggerDiagnosticAssignment| prior.target == target)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "trigger diagnostic target \"{}\" appears more than once",
+                target.as_str()
+            ));
+        }
+        assignments[index] = Some(TriggerDiagnosticAssignment {
+            target,
+            item: parse_trigger_diagnostic(item.trim())?,
+        });
+    }
+    let assignments = arena
+        .alloc_slice_with(count, |index| {
+            assignments[index].expect("diagnostic assignment parsed")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(TriggerGetDiagnostics {
+        assignments: &*assignments,
+    }))
+}
+
 fn parse_trigger_get_stacked_diagnostics<'a>(
     statement: &'a str,
     arena: &'a Arena,
@@ -7861,7 +7988,7 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
         return Ok(None);
     };
     let Some(body) = strip_trigger_keyword(body.trim(), "stacked") else {
-        return Err(unsupported_trigger_body());
+        return Ok(None);
     };
     let Some(body) = strip_trigger_keyword(body.trim(), "diagnostics") else {
         return Err(unsupported_trigger_body());
@@ -8382,6 +8509,9 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(raise) = parse_trigger_raise(segment, arena, handler_active)? {
         return Ok(TriggerStatement::Raise(raise));
+    }
+    if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
+        return Ok(TriggerStatement::GetDiagnostics(diagnostics));
     }
     if let Some(diagnostics) = parse_trigger_get_stacked_diagnostics(segment, arena)? {
         if !handler_active {
@@ -9059,6 +9189,7 @@ fn detached_trigger_row<'a>(
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl<'a>],
     values: &'t [Datum<'a>],
+    found: Option<bool>,
     invocation: TriggerInvocation<'a>,
     transition: &'t TriggerTransition<'t, 't, 'a>,
 }
@@ -9090,6 +9221,9 @@ where
         {
             return Ok(self.values[index]);
         }
+        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
+            return Ok(self.found.map(Datum::Bool).unwrap_or(Datum::Null));
+        }
         if let Some(qualifier) = qualifier
             && let Some(index) = self.local_index(qualifier)
             && let Datum::Record(fields) = self.values[index]
@@ -9120,6 +9254,9 @@ where
         {
             return Some(field.ctype());
         }
+        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
+            return Some(ColType::Bool);
+        }
         (qualifier.is_none())
             .then(|| self.local_index(name))
             .flatten()
@@ -9144,7 +9281,9 @@ where
             return self.transition.collation(qualifier, name);
         }
         if qualifier.is_none()
-            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+            && (self.local_index(name).is_some()
+                || TriggerContextField::parse(name).is_some()
+                || TriggerStatusVariable::parse(name).is_some())
         {
             crate::sql::ast::Collation::None
         } else {
@@ -9158,7 +9297,9 @@ where
             return self.transition.column_domain(qualifier, name);
         }
         if qualifier.is_none()
-            && (self.local_index(name).is_some() || TriggerContextField::parse(name).is_some())
+            && (self.local_index(name).is_some()
+                || TriggerContextField::parse(name).is_some()
+                || TriggerStatusVariable::parse(name).is_some())
         {
             None
         } else {
@@ -9445,6 +9586,7 @@ fn initialize_trigger_locals<'a>(
         let scope = TriggerLocalScope {
             locals: &locals[..=index],
             values: &values[..=index],
+            found: Some(false),
             invocation,
             transition: &transition,
         };
@@ -9601,6 +9743,7 @@ fn trigger_condition<'a>(
     new: Option<&[Datum<'a>]>,
     locals: &[TriggerLocalDecl<'a>],
     values: &[Datum<'a>],
+    found: Option<bool>,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     match eval_full(
@@ -9610,6 +9753,7 @@ fn trigger_condition<'a>(
         &TriggerLocalScope {
             locals,
             values,
+            found,
             invocation,
             transition: &TriggerTransition {
                 definition,
@@ -9789,6 +9933,7 @@ fn execute_trigger_block<'a>(
     locals: &[TriggerLocalDecl<'a>],
     local_values: &mut [Datum<'a>; MAX_COLUMNS],
     block: TriggerBlock<'a>,
+    status: &mut TriggerExecutionStatus,
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
 ) -> Result<Option<TriggerFlow>, SqlError> {
     for statement in block.statements {
@@ -9823,6 +9968,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9851,6 +9997,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9861,7 +10008,29 @@ fn execute_trigger_block<'a>(
                     &scope,
                     &NO_HOOKS,
                 )?;
-                assign_trigger_local(locals, local_values, assignment.name, value, context.arena)?;
+                if locals.iter().any(|local| local.name == assignment.name) {
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.name,
+                        value,
+                        context.arena,
+                    )?;
+                } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
+                    status.found = match cast_to(value, ColType::Bool, context.arena)? {
+                        Datum::Bool(value) => Some(value),
+                        Datum::Null => None,
+                        _ => unreachable!("boolean cast preserves its datum kind"),
+                    };
+                } else {
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.name,
+                        value,
+                        context.arena,
+                    )?;
+                }
             }
             TriggerStatement::LoopControl(control) => {
                 let (condition, unwind) = match control {
@@ -9877,6 +10046,7 @@ fn execute_trigger_block<'a>(
                         new.as_deref(),
                         locals,
                         &local_values[..locals.len()],
+                        status.found,
                         context.arena,
                     )?,
                     None => true,
@@ -9918,6 +10088,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -9956,6 +10127,7 @@ fn execute_trigger_block<'a>(
                         Ok(())
                     },
                 )?;
+                status.set_rows(row_count as u64)?;
                 if statement.strict {
                     match row_count {
                         0 => {
@@ -10002,6 +10174,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10010,6 +10183,7 @@ fn execute_trigger_block<'a>(
                     context.seq_session,
                     context.txn.txid,
                 );
+                let mut row_count = 0u64;
                 super::query::select_into_rows(
                     context.storage,
                     context.txn.txid,
@@ -10018,8 +10192,12 @@ fn execute_trigger_block<'a>(
                     crate::sql::eval::NO_PARAMS,
                     Some(&scope),
                     Some(&sequence),
-                    &mut |_| Ok(()),
+                    &mut |_| {
+                        row_count += 1;
+                        Ok(())
+                    },
                 )?;
+                status.set_rows(row_count)?;
             }
             TriggerStatement::Assert(assertion) => {
                 if trigger_condition(
@@ -10030,6 +10208,7 @@ fn execute_trigger_block<'a>(
                     new.as_deref(),
                     locals,
                     &local_values[..locals.len()],
+                    status.found,
                     context.arena,
                 )? {
                     continue;
@@ -10042,6 +10221,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10084,6 +10264,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10144,6 +10325,20 @@ fn execute_trigger_block<'a>(
                         .map_err(trigger_notice_to_sql)?,
                 }
             }
+            TriggerStatement::GetDiagnostics(statement) => {
+                for assignment in statement.assignments {
+                    let value = match assignment.item {
+                        TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
+                    };
+                    assign_trigger_local(
+                        locals,
+                        local_values,
+                        assignment.target,
+                        value,
+                        context.arena,
+                    )?;
+                }
+            }
             TriggerStatement::GetStackedDiagnostics(statement) => {
                 let Some(exception) = exception else {
                     return Err(sql_err!(
@@ -10202,6 +10397,7 @@ fn execute_trigger_block<'a>(
                     locals,
                     local_values,
                     exception_block.protected,
+                    status,
                     exception,
                 ) {
                     Ok(flow) => {
@@ -10238,6 +10434,7 @@ fn execute_trigger_block<'a>(
                             locals,
                             local_values,
                             handler.block,
+                            status,
                             Some(&caught),
                         )? {
                             return Ok(Some(flow));
@@ -10254,6 +10451,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10295,6 +10493,7 @@ fn execute_trigger_block<'a>(
                 };
                 let scratch = unsafe { &mut *context.scratch };
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let outcome = context.responder.without_command_complete(|responder| {
                     insert(
                         context.storage,
@@ -10315,7 +10514,12 @@ fn execute_trigger_block<'a>(
                 });
                 context.txn.leave_trigger_sql();
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger INSERT publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -10364,6 +10568,7 @@ fn execute_trigger_block<'a>(
                         )
                     })?;
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -10372,6 +10577,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10400,7 +10606,12 @@ fn execute_trigger_block<'a>(
                     })?;
                 }
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger UPDATE publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -10449,6 +10660,7 @@ fn execute_trigger_block<'a>(
                         )
                     })?;
                 context.txn.enter_trigger_sql()?;
+                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -10457,6 +10669,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10485,7 +10698,12 @@ fn execute_trigger_block<'a>(
                     })?;
                 }
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger DELETE publishes an affected-row count"),
+                    )?,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         return Err(sql_err!(
@@ -10504,6 +10722,8 @@ fn execute_trigger_block<'a>(
                         step,
                         reverse,
                     } => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let transition = TriggerTransition {
                             definition,
                             old,
@@ -10512,6 +10732,7 @@ fn execute_trigger_block<'a>(
                         let scope = TriggerLocalScope {
                             locals,
                             values: &local_values[..locals.len()],
+                            found: status.found,
                             invocation,
                             transition: &transition,
                         };
@@ -10557,6 +10778,7 @@ fn execute_trigger_block<'a>(
                         } else {
                             value <= upper
                         } {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -10575,6 +10797,7 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
                                 exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
@@ -10598,8 +10821,11 @@ fn execute_trigger_block<'a>(
                             };
                             value = next;
                         }
+                        status.set_found(iterated);
                     }
                     TriggerForSource::Query(query) => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let query = match transition_relations {
                             Some(relations) => super::query::bind_materialized_relations(
                                 query,
@@ -10619,6 +10845,7 @@ fn execute_trigger_block<'a>(
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &transition,
                             };
@@ -10645,6 +10872,7 @@ fn execute_trigger_block<'a>(
                             }
                         };
                         for value in values.iter().copied() {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -10663,6 +10891,7 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
                                 exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
@@ -10678,8 +10907,11 @@ fn execute_trigger_block<'a>(
                                 }
                             }
                         }
+                        status.set_found(iterated);
                     }
                     TriggerForSource::Array { expression, slice } => {
+                        status.set_found(false);
+                        let mut iterated = false;
                         let values = {
                             let transition = TriggerTransition {
                                 definition,
@@ -10689,6 +10921,7 @@ fn execute_trigger_block<'a>(
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &transition,
                             };
@@ -10773,6 +11006,7 @@ fn execute_trigger_block<'a>(
                             &*values
                         };
                         for value in values.iter().copied() {
+                            iterated = true;
                             assign_trigger_local(
                                 locals,
                                 local_values,
@@ -10791,6 +11025,7 @@ fn execute_trigger_block<'a>(
                                 locals,
                                 local_values,
                                 program.block,
+                                status,
                                 exception,
                             )? {
                                 Some(TriggerFlow::Return(result)) => {
@@ -10806,6 +11041,7 @@ fn execute_trigger_block<'a>(
                                 }
                             }
                         }
+                        status.set_found(iterated);
                     }
                 }
             }
@@ -10818,6 +11054,7 @@ fn execute_trigger_block<'a>(
                     new.as_deref(),
                     locals,
                     &local_values[..locals.len()],
+                    status.found,
                     context.arena,
                 )? {
                     break;
@@ -10833,6 +11070,7 @@ fn execute_trigger_block<'a>(
                     locals,
                     local_values,
                     program.block,
+                    status,
                     exception,
                 )? {
                     Some(TriggerFlow::Return(result)) => {
@@ -10860,6 +11098,7 @@ fn execute_trigger_block<'a>(
                     locals,
                     local_values,
                     block,
+                    status,
                     exception,
                 )? {
                     Some(TriggerFlow::Return(result)) => {
@@ -10886,6 +11125,7 @@ fn execute_trigger_block<'a>(
                             &TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
+                                found: status.found,
                                 invocation,
                                 transition: &TriggerTransition {
                                     definition,
@@ -10917,6 +11157,7 @@ fn execute_trigger_block<'a>(
                             locals,
                             local_values,
                             branch.block,
+                            status,
                             exception,
                         )? {
                             return Ok(Some(flow));
@@ -10934,6 +11175,7 @@ fn execute_trigger_block<'a>(
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
+                    found: status.found,
                     invocation,
                     transition: &transition,
                 };
@@ -10992,6 +11234,7 @@ fn execute_trigger_block<'a>(
                         locals,
                         local_values,
                         block,
+                        status,
                         exception,
                     )?
                 {
@@ -11086,6 +11329,7 @@ fn fire_row_triggers<'a>(
         };
         let program = parse_trigger_program(source, context.arena)?;
         let mut local_values = [Datum::Null; MAX_COLUMNS];
+        let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
             definition,
@@ -11106,6 +11350,7 @@ fn fire_row_triggers<'a>(
             program.locals,
             &mut local_values,
             program.body,
+            &mut status,
             None,
         )? {
             Some(TriggerFlow::Return(result)) => match result {
@@ -11330,6 +11575,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .map_err(|_| super::query::arena_full_pub())?;
         let mut no_new = None;
         let mut local_values = [Datum::Null; MAX_COLUMNS];
+        let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
             definition,
@@ -11350,6 +11596,7 @@ fn fire_statement_triggers_with_rows<'a>(
             program.locals,
             &mut local_values,
             program.body,
+            &mut status,
             None,
         )? {
             Some(TriggerFlow::Return(_)) => {}
@@ -20175,8 +20422,10 @@ where
             return sql_fail(error);
         }
         let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        if !capturing {
-            responder.command_complete(tag.as_str())?;
+        if capturing {
+            responder.set_affected_rows(inserted);
+        } else {
+            responder.command_complete_rows(tag.as_str(), inserted)?;
         }
         return sql_ok();
     }
@@ -20398,8 +20647,10 @@ where
         return sql_fail(error);
     }
     let tag = stack_format!(48, "INSERT 0 {}", inserted);
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(inserted);
+    } else {
+        responder.command_complete_rows(tag.as_str(), inserted)?;
     }
     sql_ok()
 }
@@ -21143,8 +21394,10 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let tag = stack_format!(48, "UPDATE {}", updated);
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(updated);
+    } else {
+        responder.command_complete_rows(tag.as_str(), updated)?;
     }
     sql_ok()
 }
@@ -21483,8 +21736,10 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
     let tag = stack_format!(48, "DELETE {}", scratch.len());
-    if !capturing {
-        responder.command_complete(tag.as_str())?;
+    if capturing {
+        responder.set_affected_rows(scratch.len() as u64);
+    } else {
+        responder.command_complete_rows(tag.as_str(), scratch.len() as u64)?;
     }
     sql_ok()
 }

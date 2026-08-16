@@ -8598,6 +8598,187 @@ fn trigger_exception_handlers_expose_typed_stacked_diagnostics() {
 }
 
 #[test]
+fn trigger_execution_status_is_typed_for_queries_and_dml() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_status_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_status_source (id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_status_audit (step text, found boolean, row_count bigint);
+         CREATE FUNCTION trigger_status_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE rows bigint; selected integer; shadowed_found boolean := true;
+            BEGIN
+              PERFORM 1 WHERE false;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''perform-empty'', found, rows);
+              PERFORM 1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''perform-one'', found, rows);
+              SELECT id INTO selected FROM trigger_status_source WHERE id = -1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''select-empty'', found, rows);
+              INSERT INTO trigger_status_source VALUES (1, 10);
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''insert-one'', found, rows);
+              UPDATE trigger_status_source SET value = 11 WHERE id = 1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''update-one'', found, rows);
+              DELETE FROM trigger_status_source WHERE id = -1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_status_audit VALUES (''delete-empty'', found, rows);
+              FOUND := NULL;
+              INSERT INTO trigger_status_audit VALUES (''found-null'', found IS NULL, 0);
+              FOUND := 1;
+              INSERT INTO trigger_status_audit VALUES (''found-manual'', found, 0);
+              INSERT INTO trigger_status_audit VALUES (''found-shadowed'', shadowed_found, 0);
+              FOR selected IN 2..1 LOOP
+                RAISE EXCEPTION ''unreachable'';
+              END LOOP;
+              INSERT INTO trigger_status_audit VALUES (''for-empty'', found, 0);
+              FOR selected IN 1..1 LOOP
+                selected := selected;
+              END LOOP;
+              INSERT INTO trigger_status_audit VALUES (''for-one'', found, 0);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_status_before BEFORE INSERT ON trigger_status_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_status_function();
+         INSERT INTO trigger_status_target VALUES (1);
+         SELECT step, found, row_count FROM trigger_status_audit ORDER BY step;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "delete-empty|f|0",
+            "for-empty|f|0",
+            "for-one|t|0",
+            "found-manual|t|0",
+            "found-null|t|0",
+            "found-shadowed|t|0",
+            "insert-one|t|1",
+            "perform-empty|f|0",
+            "perform-one|t|1",
+            "select-empty|f|0",
+            "update-one|t|1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION trigger_status_invalid() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE value text;
+            BEGIN
+              GET DIAGNOSTICS value = PG_CONTEXT;
+              RETURN NEW;
+            END';",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid)
+            .contains("GET DIAGNOSTICS item \"PG_CONTEXT\" is not supported"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+
+    let shadowed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_status_shadow_target (id integer PRIMARY KEY);
+         CREATE FUNCTION trigger_status_shadow_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE found boolean := true;
+            BEGIN
+              INSERT INTO trigger_status_audit VALUES (''local-shadow'', found, 0);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_status_shadow_before BEFORE INSERT ON trigger_status_shadow_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_status_shadow_function();
+         INSERT INTO trigger_status_shadow_target VALUES (1);
+         SELECT step, found, row_count FROM trigger_status_audit WHERE step = 'local-shadow';",
+    );
+    assert_eq!(
+        data_rows(&shadowed),
+        ["local-shadow|t|0"],
+        "{}",
+        String::from_utf8_lossy(&shadowed)
+    );
+}
+
+#[test]
+fn trigger_foreach_updates_found_without_changing_row_count() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_foreach_status_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_foreach_status_audit (found boolean, row_count bigint);
+         CREATE FUNCTION trigger_foreach_status_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE value integer; rows bigint;
+            BEGIN
+              PERFORM 1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              FOREACH value IN ARRAY ARRAY[1, 2] LOOP
+                value := value;
+              END LOOP;
+              INSERT INTO trigger_foreach_status_audit VALUES (found, rows);
+              FOR value IN SELECT 1 UNION ALL SELECT 2 LOOP
+                value := value;
+              END LOOP;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO trigger_foreach_status_audit VALUES (found, rows);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_foreach_status_before BEFORE INSERT ON trigger_foreach_status_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_foreach_status_function();
+         INSERT INTO trigger_foreach_status_target VALUES (1);
+         SELECT found, row_count FROM trigger_foreach_status_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|1", "t|1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn trigger_execution_status_survives_exception_rollback() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_status_rollback_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_status_rollback_rows (id integer PRIMARY KEY);
+         CREATE TABLE trigger_status_rollback_audit (found boolean, row_count bigint, retained bigint);
+         CREATE FUNCTION trigger_status_rollback_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE rows bigint;
+            BEGIN
+              BEGIN
+                INSERT INTO trigger_status_rollback_rows VALUES (NEW.id);
+                RAISE EXCEPTION ''rollback'';
+              EXCEPTION WHEN raise_exception THEN
+                GET DIAGNOSTICS rows = ROW_COUNT;
+                INSERT INTO trigger_status_rollback_audit VALUES
+                  (found, rows, (SELECT count(*) FROM trigger_status_rollback_rows));
+              END;
+              RETURN NEW;
+            END';
+         CREATE TRIGGER trigger_status_rollback_before BEFORE INSERT ON trigger_status_rollback_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_status_rollback_function();
+         INSERT INTO trigger_status_rollback_target VALUES (1);
+         SELECT found, row_count, retained FROM trigger_status_rollback_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|1|0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn trigger_exception_others_handles_unmatched_errors() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -8679,7 +8860,19 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
               RETURN NEW;
             END';
          CREATE TRIGGER durable_trigger_stacked_before BEFORE INSERT ON durable_trigger_stacked_target
-           FOR EACH ROW EXECUTE FUNCTION durable_trigger_stacked_function();",
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_stacked_function();
+         CREATE TABLE durable_trigger_status_target (id integer PRIMARY KEY);
+         CREATE TABLE durable_trigger_status_audit (found boolean, row_count bigint);
+         CREATE FUNCTION durable_trigger_status_function() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE rows bigint;
+            BEGIN
+              PERFORM 1;
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              INSERT INTO durable_trigger_status_audit VALUES (found, rows);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER durable_trigger_status_before BEFORE INSERT ON durable_trigger_status_target
+           FOR EACH ROW EXECUTE FUNCTION durable_trigger_status_function();",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -8717,6 +8910,15 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
              SELECT code, message FROM durable_trigger_stacked_audit",
         )),
         ["P0001|recovered id 9"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "INSERT INTO durable_trigger_status_target VALUES (1);
+             SELECT found, row_count FROM durable_trigger_status_audit",
+        )),
+        ["t|1"]
     );
 }
 

@@ -926,7 +926,12 @@ impl Engine {
             let operator =
                 crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(SqlError {
                     sqlstate: SqlState::known(sqlstate::INTERNAL_ERROR),
-                    message: stack_format!(192, "corrupt uploaded WAL record"),
+                    message: stack_format!(
+                        192,
+                        "corrupt uploaded WAL record at LSN {} (kind {})",
+                        lsn,
+                        record.first().copied().unwrap_or_default()
+                    ),
                 }))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
         }
@@ -7888,6 +7893,25 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 )
             })?;
             let mut definition = storage.enum_for(slot, 0);
+            definition.name = crate::storage::SqlName::parse(new_name)?;
+            storage.stage_enum_alter(slot, definition, 0)?;
+            storage.commit_enum_alter(slot, 0);
+        }
+        WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            let slot = storage.enum_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::UNDEFINED_OBJECT,
+                    "enum type \"{}\" for WAL identity change does not exist",
+                    name
+                )
+            })?;
+            let mut definition = storage.enum_for(slot, 0);
+            definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
             storage.stage_enum_alter(slot, definition, 0)?;
             storage.commit_enum_alter(slot, 0);

@@ -16870,6 +16870,73 @@ pub fn alter_type(
                 return sql_fail(e);
             }
         }
+        A::SetSchema(new_schema) => {
+            let current = storage.enum_for(slot, txn.txid);
+            if storage.find_schema_visible(new_schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    new_schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(new_schema, txn.txid) {
+                return sql_fail(error);
+            }
+            let schema = match SqlName::parse(new_schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            if current.schema == schema {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    current.name.as_str()
+                ));
+            }
+            if storage
+                .domain_slot(schema.as_str(), current.name.as_str(), txn.txid)
+                .is_some()
+                || storage
+                    .enum_slot(schema.as_str(), current.name.as_str(), txn.txid)
+                    .is_some()
+                || storage
+                    .composite_slot(schema.as_str(), current.name.as_str(), txn.txid)
+                    .is_some()
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    current.name.as_str()
+                ));
+            }
+            let mut altered = current;
+            altered.schema = schema;
+            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::AlterEnumIdentity {
+                    schema: current.schema.as_str(),
+                    name: current.name.as_str(),
+                    new_schema: schema.as_str(),
+                    new_name: current.name.as_str(),
+                },
+            ) {
+                storage.rollback_enum_alter(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_enum_alter(slot, prior);
+                return sql_fail(error);
+            }
+        }
         A::RenameValue { from, to } => {
             let current = storage.enum_for(slot, txn.txid);
             let Some(member_index) = current
@@ -16967,6 +17034,46 @@ fn alter_composite_type(
     };
     match action {
         A::AddValue { .. } | A::RenameValue { .. } => return sql_fail(wrong_type()),
+        A::SetSchema(new_schema) => {
+            if storage.find_schema_visible(new_schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    new_schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(new_schema, txn.txid) {
+                return sql_fail(error);
+            }
+            let schema = match SqlName::parse(new_schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            if altered.schema == schema {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    altered.name.as_str()
+                ));
+            }
+            if storage
+                .domain_slot(schema.as_str(), altered.name.as_str(), txn.txid)
+                .is_some()
+                || storage
+                    .enum_slot(schema.as_str(), altered.name.as_str(), txn.txid)
+                    .is_some()
+                || storage
+                    .composite_slot(schema.as_str(), altered.name.as_str(), txn.txid)
+                    .is_some_and(|other| other != slot)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    altered.name.as_str()
+                ));
+            }
+            altered.schema = schema;
+        }
         A::RenameTo(new_name) => {
             if altered.name.as_str() == *new_name {
                 responder.command_complete("ALTER TYPE")?;

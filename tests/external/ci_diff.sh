@@ -199,6 +199,9 @@ CREATE TABLE outbound_dump.items (
 INSERT INTO outbound_dump.items(mood,location,note) VALUES
   ('ok', ROW(1,2)::outbound_dump.location, 'one'),
   ('great', ROW(3,4)::outbound_dump.location, 'two');
+CREATE SCHEMA outbound_type_target;
+ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
+ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
 CREATE VIEW outbound_dump.item_view AS
   SELECT id,mood,location,note FROM outbound_dump.items;
 CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
@@ -225,11 +228,11 @@ INSERT INTO outbound_dump.view_source VALUES (2, 200), (3, 300);
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  --schema=outbound_dump --no-owner --no-acl \
+  --schema=outbound_dump --schema=outbound_type_target --no-owner --no-acl \
   -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
 outbound_dump_status=$?
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE' \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE' \
   > "$WORK/outbound_drop.out" 2>&1
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -f "$WORK/outbound.sql" \
@@ -245,7 +248,7 @@ else
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
       SELECT id,mood,(location).x,(location).y,note FROM outbound_dump.item_view ORDER BY id;
       INSERT INTO outbound_dump.items(mood,location,note)
-        VALUES ('ok', ROW(5,6)::outbound_dump.location, 'three') RETURNING id;
+        VALUES ('ok', ROW(5,6)::outbound_type_target.location, 'three') RETURNING id;
       SELECT is_identity,identity_generation
         FROM information_schema.columns
        WHERE table_schema='outbound_dump'
@@ -276,7 +279,7 @@ fi
 # name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
 # so pg_type cardinality probes do not inherit this tooling fixture.
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE' \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE' \
   > "$WORK/outbound_cleanup.out" 2>&1 || {
     bad "clean outbound pg_dump fixture from PostgreSQL"
     tail -40 "$WORK/outbound_cleanup.out"

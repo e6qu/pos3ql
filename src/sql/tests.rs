@@ -126,6 +126,8 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     let mut config = test_config("instead-of-view-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
     config.object_store_namespace = format!("instead-of-view-recovery-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
@@ -15895,6 +15897,7 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         for statement in [
+            "CREATE SCHEMA durable_types",
             "CREATE TYPE coordinate AS (x integer, y integer)",
             "CREATE TYPE place AS (name text, point coordinate)",
             "CREATE TABLE durable_places (value place)",
@@ -15902,6 +15905,7 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
             "ALTER TYPE coordinate ADD ATTRIBUTE z integer",
             "ALTER TYPE coordinate RENAME ATTRIBUTE x TO east",
             "ALTER TYPE coordinate RENAME TO coordinate_renamed",
+            "ALTER TYPE coordinate_renamed SET SCHEMA durable_types",
             "CHECKPOINT",
         ] {
             let output = run_with(&mut engine, &mut budget, statement);
@@ -15929,15 +15933,166 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
     let bytes = run_with(
         &mut engine,
         &mut budget,
-        "SELECT typname FROM pg_type WHERE typname IN ('coordinate_renamed', 'place') ORDER BY typname",
+        "SELECT n.nspname, typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE typname IN ('coordinate_renamed', 'place') ORDER BY typname",
     );
-    assert_eq!(data_rows(&bytes), ["coordinate_renamed", "place"]);
-    let bytes = run_with(&mut engine, &mut budget, "DROP TYPE coordinate_renamed");
+    assert_eq!(
+        data_rows(&bytes),
+        ["durable_types|coordinate_renamed", "public|place"]
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE durable_types.coordinate_renamed",
+    );
     assert!(
         String::from_utf8_lossy(&bytes)
             .contains("column point of composite type place depends on type coordinate_renamed"),
         "{}",
         String::from_utf8_lossy(&bytes)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn named_types_move_schema_without_changing_typed_identity() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA moved_types; \
+         CREATE TYPE moved_state AS ENUM ('ready', 'blocked'); \
+         CREATE TYPE moved_point AS (x integer, y integer); \
+         CREATE TYPE moved_container AS (point moved_point, state moved_state); \
+         CREATE TABLE moved_values (state moved_state, point moved_point, points moved_point[], item moved_container); \
+         INSERT INTO moved_values VALUES ( \
+           'ready', ROW(3,4)::moved_point, ARRAY[ROW(5,6)::moved_point], \
+           ROW(ROW(7,8)::moved_point, 'blocked'::moved_state)::moved_container); \
+         ALTER TYPE moved_state SET SCHEMA moved_types; \
+         ALTER TYPE moved_point SET SCHEMA moved_types; \
+         ALTER TYPE moved_container SET SCHEMA moved_types",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT state::text, (point).x, (points[1]).y, ((item).point).x, (item).state::text FROM moved_values",
+        )),
+        ["ready|3|6|7|blocked"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE t.typname IN ('moved_state', 'moved_point', 'moved_container') ORDER BY t.typname",
+        )),
+        [
+            "moved_types|moved_container",
+            "moved_types|moved_point",
+            "moved_types|moved_state"
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TYPE moved_types.moved_point SET SCHEMA public; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((item).point).y FROM moved_values",
+        )),
+        ["8"]
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TYPE moved_types.moved_state SET SCHEMA public; CREATE DOMAIN public.moved_state AS integer; ROLLBACK",
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("42710"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[test]
+fn named_composites_reserve_the_shared_type_namespace() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE shared_composite_name AS (value integer)",
+    );
+    for statement in [
+        "CREATE TYPE shared_composite_name AS ENUM ('ready')",
+        "CREATE DOMAIN shared_composite_name AS integer",
+    ] {
+        let bytes = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("42710"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+}
+
+#[test]
+fn moved_enum_identity_survives_uploaded_wal_and_nested_references() {
+    let mut config = test_config("moved-enum-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("moved-enum-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for statement in [
+            "CREATE SCHEMA moved_enum_schema",
+            "CREATE TYPE moved_enum AS ENUM ('ready', 'blocked')",
+            "CREATE TYPE moved_enum_container AS (state moved_enum)",
+            "CREATE TABLE moved_enum_values (state moved_enum, states moved_enum[], container moved_enum_container)",
+            "INSERT INTO moved_enum_values VALUES ('ready', ARRAY['ready', 'blocked']::moved_enum[], ROW('blocked')::moved_enum_container)",
+            "ALTER TYPE moved_enum SET SCHEMA moved_enum_schema",
+        ] {
+            let created = run_with(&mut engine, &mut budget, statement);
+            assert!(
+                !message_types(&created).contains(&b'E'),
+                "{statement}: {}",
+                String::from_utf8_lossy(&created)
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT count(*) FROM moved_enum_values",
+            )),
+            ["1"]
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT state::text, states::text, (container).state::text FROM moved_enum_values",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["ready|{ready,blocked}|blocked"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE typname='moved_enum'",
+        )),
+        ["moved_enum_schema"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

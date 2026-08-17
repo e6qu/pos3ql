@@ -926,7 +926,12 @@ impl Engine {
             let operator =
                 crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(SqlError {
                     sqlstate: SqlState::known(sqlstate::INTERNAL_ERROR),
-                    message: stack_format!(192, "corrupt uploaded WAL record"),
+                    message: stack_format!(
+                        192,
+                        "corrupt uploaded WAL record at LSN {} (kind {})",
+                        lsn,
+                        record.first().copied().unwrap_or_default()
+                    ),
                 }))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
         }

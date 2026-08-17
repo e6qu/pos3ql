@@ -126,6 +126,8 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     let mut config = test_config("instead-of-view-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
     config.object_store_namespace = format!("instead-of-view-recovery-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
@@ -16037,7 +16039,7 @@ fn named_composites_reserve_the_shared_type_namespace() {
 }
 
 #[test]
-fn moved_enum_identity_survives_wal_checkpoint_and_nested_references() {
+fn moved_enum_identity_survives_uploaded_wal_and_nested_references() {
     let mut config = test_config("moved-enum-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -16053,7 +16055,6 @@ fn moved_enum_identity_survives_wal_checkpoint_and_nested_references() {
             "CREATE TABLE moved_enum_values (state moved_enum, states moved_enum[], container moved_enum_container)",
             "INSERT INTO moved_enum_values VALUES ('ready', ARRAY['ready', 'blocked']::moved_enum[], ROW('blocked')::moved_enum_container)",
             "ALTER TYPE moved_enum SET SCHEMA moved_enum_schema",
-            "CHECKPOINT",
         ] {
             let created = run_with(&mut engine, &mut budget, statement);
             assert!(

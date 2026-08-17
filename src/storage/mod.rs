@@ -3421,6 +3421,7 @@ impl AccessClass {
             6 => Self::Enum,
             7 => Self::Index,
             8 => Self::Routine,
+            9 => Self::Composite,
             _ => return None,
         })
     }
@@ -15562,6 +15563,25 @@ mod tests {
         }
         assert_eq!(CommentClass::from_u8(3), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
+    }
+
+    #[test]
+    fn access_class_codec_covers_every_durable_catalog_class() {
+        for class in [
+            AccessClass::Table,
+            AccessClass::View,
+            AccessClass::MaterializedView,
+            AccessClass::Sequence,
+            AccessClass::Schema,
+            AccessClass::Domain,
+            AccessClass::Enum,
+            AccessClass::Index,
+            AccessClass::Routine,
+            AccessClass::Composite,
+        ] {
+            assert_eq!(AccessClass::from_u8(class as u8), Some(class));
+        }
+        assert_eq!(AccessClass::from_u8(u8::MAX), None);
     }
 
     fn test_config() -> Config {

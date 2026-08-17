@@ -28,17 +28,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Coverage traces are generated separately even when they share a
-          # worker. The following correctness-only workloads kill -9 their
-          # servers and intentionally do not produce traces.
-          # The coverage-producing lib pass and cold subscription regression
-          # have independent outputs. Keeping them separate prevents setup
-          # plus both workloads from consuming the five-minute job ceiling.
+          # Coverage and crash-torture builds use incompatible instrumentation.
+          # Keep them in distinct jobs: serializing either pair can exceed the
+          # hard five-minute bound even though each workload fits on its own.
           - { name: lib, shards: "lib" }
           - { name: subscription, shards: "runtest:subscription" }
           - { name: sql-wire, shards: "sql run:proto,dur" }
-          - { name: diff-torture-a, shards: "run:diff runtest:torture", torture_seed: 20260723 }
-          - { name: spilldiff-torture-b, shards: "run:spilldiff runtest:torture", torture_seed: 20260725 }
+          - { name: diff, shards: "run:diff" }
+          - { name: spilldiff, shards: "run:spilldiff" }
+          - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723 }
+          - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725 }
           - { name: spill-overlay-ingest, shards: "runtest:overlay,ingest" }
           - { name: tls-correctness, shards: "runtest:tls" }
     steps:

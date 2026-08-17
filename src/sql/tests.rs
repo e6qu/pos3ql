@@ -97,6 +97,31 @@ fn postgres_oracle_regressions_reject_unsupported_forms_with_correct_sqlstates()
         "{}",
         String::from_utf8_lossy(&whole_row)
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE oracle_null_fold (id integer NOT NULL, value integer, stamp timestamptz);
+         INSERT INTO oracle_null_fold VALUES (1, 1, '2020-01-01'), (2, 0, NULL)",
+    );
+    for query in [
+        "SELECT count(*) FROM oracle_null_fold WHERE value / 0 = 1 OR id IS NOT NULL",
+        "SELECT count(*) FROM oracle_null_fold WHERE stamp IS NULL OR (value / 0 = 1 OR id IS NOT NULL)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&output).contains("22012"),
+            "{query}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM oracle_null_fold WHERE id IS NOT NULL OR value / 0 = 1",
+        )),
+        ["2"]
+    );
 }
 
 fn test_engine() -> (Engine, Budget) {

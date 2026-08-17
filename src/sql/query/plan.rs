@@ -363,16 +363,10 @@ pub(super) fn where_passes<'e, 'a>(
 }
 
 /// Reduces NullTests on NOT NULL columns exactly as far as PostgreSQL's
-/// planner does (verified against 18 with `EXPLAIN (VERBOSE)`): a top-level
-/// conjunct that *is* the bare test folds (`IS NULL` → FALSE, `IS NOT NULL`
-/// → TRUE), and a top-level conjunct that is an OR folds to TRUE when any
-/// arm of its (recursively flattened) OR spine is an `IS NOT NULL` on such
-/// a column — a constant-true arm makes the whole disjunction true. Nothing
-/// deeper is rewritten: a test inside a nested AND, or under NOT, stays for
-/// execution's left-to-right short circuit, because folding it changes
-/// which side effects fire — PostgreSQL keeps `ts IS NULL OR (x/0 = 1 AND
-/// id IS NULL)` erroring on the division, and so must we (a fuzzer caught
-/// the over-eager rewrite as a missing 22012).
+/// planner does: only a top-level conjunct that *is* the bare test folds
+/// (`IS NULL` → FALSE, `IS NOT NULL` → TRUE). Rewriting an OR changes its
+/// left-to-right error timing, so it remains for ordinary short-circuit
+/// evaluation.
 pub(super) fn fold_null<'a>(
     e: &'a Expr<'a>,
     scope: &QueryScope<'a>,
@@ -402,30 +396,9 @@ pub(super) fn fold_null<'a>(
         None
     }
 
-    fn or_spine_has_true<'a>(e: &Expr<'a>, scope: &QueryScope<'a>) -> bool {
-        match e {
-            Expr::Binary {
-                operator: BinaryOp::Or,
-                left,
-                right,
-            } => or_spine_has_true(left, scope) || or_spine_has_true(right, scope),
-            other => not_null_test(other, scope) == Some(true),
-        }
-    }
-
     fn fold_conjunct<'a>(e: &'a Expr<'a>, scope: &QueryScope<'a>) -> Option<bool> {
         if let Some(negated) = not_null_test(e, scope) {
             return Some(negated); // IS NOT NULL → TRUE, IS NULL → FALSE
-        }
-        if matches!(
-            e,
-            Expr::Binary {
-                operator: BinaryOp::Or,
-                ..
-            }
-        ) && or_spine_has_true(e, scope)
-        {
-            return Some(true);
         }
         None
     }

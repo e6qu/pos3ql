@@ -8,7 +8,6 @@
 
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
-use crate::pg::wire::WireFull;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
 use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
@@ -178,8 +177,10 @@ pub fn set_query<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        if responder.data_row(&out[..n_cols]).is_err() {
-            return Err(WireFull);
+        match super::emit_data_row(storage, txid, arena, responder, &out[..n_cols]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(wire) => return Err(wire),
         }
         emitted += 1;
     }
@@ -849,7 +850,17 @@ fn external_set_query<'a>(
                             Err(error) => return sql_fail(error),
                         };
                     }
-                    responder.data_row(&values[..target.len()])?;
+                    match super::emit_data_row(
+                        storage,
+                        txid,
+                        arena,
+                        responder,
+                        &values[..target.len()],
+                    ) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
                     emitted += 1;
                 }
                 if query.with_ties && limit > 0 && logical + 1 == window {

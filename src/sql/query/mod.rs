@@ -1393,6 +1393,43 @@ fn sql_fail(e: SqlError) -> Outcome {
     Ok(Err(e))
 }
 
+/// The sole query-result wire boundary. Composite values are stored in rows as
+/// canonical text, so binary output materializes them before the retryable
+/// responder writes the PostgreSQL send representation.
+pub(crate) fn emit_data_row(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    responder: &mut Responder,
+    values: &[Datum],
+) -> Outcome {
+    let formats = responder.result_formats();
+    if !(0..values.len()).any(|index| formats.is_binary(index)) {
+        return responder.data_row(values).map(|()| Ok(()));
+    }
+    let mut plans = [super::exec::BinaryFieldPlan::Direct; MAX_PROJ];
+    for (index, plan) in plans.iter_mut().enumerate().take(values.len()) {
+        if formats.is_binary(index) {
+            *plan = match super::exec::binary_field_plan(&values[index], storage, txid, arena) {
+                Ok(plan) => plan,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
+    let render = responder.render_context();
+    responder
+        .data_row_prepared(values, &|m| {
+            for (index, value) in values.iter().enumerate() {
+                if formats.is_binary(index) {
+                    super::exec::encode_binary_field_plan(m, value, plans[index]);
+                } else {
+                    Responder::encode_value_text(m, value, render);
+                }
+            }
+        })
+        .map(|()| Ok(()))
+}
+
 /// The aggregate hook data for a select's items: the aggregate-call node
 /// addresses and their folded values.
 type AggregateHookData<'a> = (&'a [*const Expr<'a>], &'a [Datum<'a>]);
@@ -3160,10 +3197,14 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
                         &mut projected,
                         None,
                     )?;
-                    if let Err(w) = responder.data_row(&projected[..n]) {
-                        wire_full = true;
-                        wire_result = Err(w);
-                        return Ok(false);
+                    match emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(wire) => {
+                            wire_full = true;
+                            wire_result = Err(wire);
+                            return Ok(false);
+                        }
                     }
                     emitted += 1;
                 }
@@ -3458,7 +3499,17 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     Err(e) => return sql_fail(e),
                 }
             }
-            responder.data_row(&vals[..statement.items.len()])?;
+            match emit_data_row(
+                storage,
+                txid,
+                arena,
+                responder,
+                &vals[..statement.items.len()],
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return sql_fail(error),
+                Err(wire) => return Err(wire),
+            }
             rows = 1;
         }
         let tag = stack_format!(48, "SELECT {}", rows);
@@ -3717,7 +3768,11 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                 Err(error) => return sql_fail(error),
             };
         }
-        responder.data_row(&values[..width])?;
+        match emit_data_row(storage, txid, arena, responder, &values[..width]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(wire) => return Err(wire),
+        }
         rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);

@@ -48,7 +48,7 @@ impl ResultFmt {
     }
 
     /// Whether column `col` is requested in binary.
-    fn is_binary(&self, col: usize) -> bool {
+    pub(crate) fn is_binary(&self, col: usize) -> bool {
         match self.n {
             0 => false,
             1 => self.codes[0],
@@ -631,6 +631,39 @@ impl<'b> Responder<'b> {
         let formats = self.formats;
         let render = self.render_context();
         self.with_retry(|buffer| Self::build_data_row(buffer, values, formats, render))
+    }
+
+    /// Emits a row whose fields were prepared by the executor. The writer must
+    /// emit each field's length prefix and bytes, and remain deterministic when
+    /// the transport drains and retries the message.
+    pub(crate) fn data_row_prepared(
+        &mut self,
+        values: &[Datum],
+        write: &dyn Fn(&mut MsgOut),
+    ) -> Result<(), WireFull> {
+        if self.discard_query_output {
+            self.discarded_rows = self.discarded_rows.saturating_add(1);
+            if self.discard_serialize != ExplainSerialize::None {
+                let started = std::time::Instant::now();
+                let binary = self.discard_serialize == ExplainSerialize::Binary;
+                let bytes = serialized_row_len(values, binary, self.render_context());
+                self.serialized_bytes = self.serialized_bytes.saturating_add(bytes as u64);
+                self.serialization_micros = self
+                    .serialization_micros
+                    .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+            }
+            return Ok(());
+        }
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
+            m.i16(values.len() as i16);
+            write(&mut m);
+            m.finish()
+        })
+    }
+
+    pub(crate) fn result_formats(&self) -> ResultFmt {
+        self.formats
     }
 
     /// Emits one row, each column in its Bind-requested text or binary format.

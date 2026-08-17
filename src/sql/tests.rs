@@ -15071,34 +15071,82 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
     let mut pool = test_pool(&mut b);
     let mut cursors = test_cursors(&mut b);
     let mut guc = GucState::new();
-    let mut responder =
-        Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
-    assert!(matches!(
-        e.execute_extended(
-            "SELECT value FROM addresses",
-            &arena,
-            &[],
-            &mut transaction,
-            &mut pool,
-            &mut cursors,
-            &mut guc,
-            &mut responder,
-            1,
-            false,
-        )
-        .unwrap(),
-        ExtendedExecutionStatus::Complete(true)
-    ));
-    let binary = buffer.readable();
-    let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
-    let payload = &binary[row_at + 5..];
-    assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
-    assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 28);
-    assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 2);
-    assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 25);
-    assert_eq!(&payload[18..22], b"Road");
-    assert_eq!(i32::from_be_bytes(payload[22..26].try_into().unwrap()), 23);
-    assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 7);
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "SELECT value FROM addresses",
+                &arena,
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    {
+        let binary = buffer.readable();
+        let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+        let payload = &binary[row_at + 5..];
+        assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 28);
+        assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 2);
+        assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 25);
+        assert_eq!(&payload[18..22], b"Road");
+        assert_eq!(i32::from_be_bytes(payload[22..26].try_into().unwrap()), 23);
+        assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 7);
+    }
+    buffer.clear();
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "SELECT values FROM address_arrays",
+                &arena,
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    {
+        let binary = buffer.readable();
+        let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+        let payload = &binary[row_at + 5..];
+        assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
+        assert_eq!(
+            i32::from_be_bytes(payload[2..6].try_into().unwrap()),
+            52,
+            "{binary:?}"
+        );
+        assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_be_bytes(payload[14..18].try_into().unwrap()),
+            address_oid
+        );
+        assert_eq!(i32::from_be_bytes(payload[26..30].try_into().unwrap()), 28);
+        assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 2);
+        assert_eq!(i32::from_be_bytes(payload[34..38].try_into().unwrap()), 25);
+        assert_eq!(&payload[42..46], b"Park");
+        assert_eq!(i32::from_be_bytes(payload[46..50].try_into().unwrap()), 23);
+        assert_eq!(i32::from_be_bytes(payload[54..58].try_into().unwrap()), 3);
+    }
     let copy_binary = run_with(&mut e, &mut b, "COPY addresses TO STDOUT (FORMAT binary)");
     let expected_copy_record = [
         0, 1, // COPY field count

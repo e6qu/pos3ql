@@ -2186,12 +2186,12 @@ pub(crate) fn window_select<'a>(
             None,
             limit,
             offset,
-            &mut |values| {
-                if responder.data_row(values).is_err() {
+            &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
                     wire_full = true;
                     Ok(false)
-                } else {
-                    Ok(true)
                 }
             },
         ) {
@@ -2260,7 +2260,11 @@ pub(crate) fn window_select<'a>(
         if emitted >= limit {
             break;
         }
-        responder.data_row(proj_rows[i])?;
+        match super::emit_data_row(storage, txid, arena, responder, proj_rows[i]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(wire) => return Err(wire),
+        }
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);

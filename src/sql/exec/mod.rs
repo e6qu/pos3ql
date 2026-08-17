@@ -18865,36 +18865,7 @@ pub fn copy_out(
                 responder
                     .copy_binary_row(setup.n_targets, &|m| {
                         for i in 0..setup.n_targets {
-                            match plans[i] {
-                                BinaryFieldPlan::Direct => {
-                                    Responder::encode_value_binary(m, &values[setup.targets[i]]);
-                                }
-                                BinaryFieldPlan::Range(f, l, u) => {
-                                    m.field(|m| encode_range_binary(m, f, l, u));
-                                }
-                                BinaryFieldPlan::Multirange(ranges) => {
-                                    m.field(|m| {
-                                        m.i32(ranges.len() as i32);
-                                        for &(f, l, u) in ranges {
-                                            m.field(|m| encode_range_binary(m, f, l, u));
-                                        }
-                                    });
-                                }
-                                BinaryFieldPlan::CompositeArray(element, shape, elements) => {
-                                    m.field(|m| {
-                                        m.i32(shape.dimension_count() as i32);
-                                        m.i32(i32::from(elements.iter().any(Datum::is_null)));
-                                        m.i32(element.element_oid());
-                                        for index in 0..shape.dimension_count() {
-                                            m.i32(shape.dimension(index).unwrap() as i32);
-                                            m.i32(shape.lower_bound(index).unwrap());
-                                        }
-                                        for element in elements {
-                                            Responder::encode_value_binary(m, element);
-                                        }
-                                    });
-                                }
-                            }
+                            encode_binary_field_plan(m, &values[setup.targets[i]], plans[i]);
                         }
                     })
                     .map_err(wire_to_sql)?;
@@ -19090,36 +19061,7 @@ pub fn copy_out_query(
             responder
                 .copy_binary_row(n, &|m| {
                     for (i, plan) in plans.iter().enumerate().take(n) {
-                        match *plan {
-                            BinaryFieldPlan::Direct => {
-                                Responder::encode_value_binary(m, &vals[i]);
-                            }
-                            BinaryFieldPlan::Range(f, l, u) => {
-                                m.field(|m| encode_range_binary(m, f, l, u));
-                            }
-                            BinaryFieldPlan::Multirange(ranges) => {
-                                m.field(|m| {
-                                    m.i32(ranges.len() as i32);
-                                    for &(f, l, u) in ranges {
-                                        m.field(|m| encode_range_binary(m, f, l, u));
-                                    }
-                                });
-                            }
-                            BinaryFieldPlan::CompositeArray(element, shape, elements) => {
-                                m.field(|m| {
-                                    m.i32(shape.dimension_count() as i32);
-                                    m.i32(i32::from(elements.iter().any(Datum::is_null)));
-                                    m.i32(element.element_oid());
-                                    for index in 0..shape.dimension_count() {
-                                        m.i32(shape.dimension(index).unwrap() as i32);
-                                        m.i32(shape.lower_bound(index).unwrap());
-                                    }
-                                    for element in elements {
-                                        Responder::encode_value_binary(m, element);
-                                    }
-                                });
-                            }
-                        }
+                        encode_binary_field_plan(m, &vals[i], *plan);
                     }
                 })
                 .map_err(wire_to_sql)?;
@@ -19174,8 +19116,9 @@ type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
 /// arena datums up front so the retry-safe emission closure never allocates
 /// or fails.
 #[derive(Clone, Copy)]
-enum BinaryFieldPlan<'a> {
+pub(crate) enum BinaryFieldPlan<'a> {
     Direct,
+    Composite(Datum<'a>),
     Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
     Multirange(&'a [RangeBinaryParts<'a>]),
     CompositeArray(
@@ -19185,13 +19128,54 @@ enum BinaryFieldPlan<'a> {
     ),
 }
 
-fn binary_field_plan<'a>(
+/// Writes one already-planned binary field. Planning performs every fallible
+/// parse and composite materialization before the retryable wire emitter runs.
+pub(crate) fn encode_binary_field_plan(
+    m: &mut crate::pg::wire::MsgOut,
+    value: &Datum,
+    plan: BinaryFieldPlan,
+) {
+    match plan {
+        BinaryFieldPlan::Direct => Responder::encode_value_binary(m, value),
+        BinaryFieldPlan::Composite(value) => Responder::encode_value_binary(m, &value),
+        BinaryFieldPlan::Range(flags, lower, upper) => {
+            m.field(|m| encode_range_binary(m, flags, lower, upper));
+        }
+        BinaryFieldPlan::Multirange(ranges) => {
+            m.field(|m| {
+                m.i32(ranges.len() as i32);
+                for &(flags, lower, upper) in ranges {
+                    m.field(|m| encode_range_binary(m, flags, lower, upper));
+                }
+            });
+        }
+        BinaryFieldPlan::CompositeArray(element, shape, elements) => {
+            m.field(|m| {
+                m.i32(shape.dimension_count() as i32);
+                m.i32(i32::from(elements.iter().any(Datum::is_null)));
+                m.i32(element.element_oid());
+                for index in 0..shape.dimension_count() {
+                    m.i32(shape.dimension(index).unwrap() as i32);
+                    m.i32(shape.lower_bound(index).unwrap());
+                }
+                for element in elements {
+                    Responder::encode_value_binary(m, element);
+                }
+            });
+        }
+    }
+}
+
+pub(crate) fn binary_field_plan<'a>(
     v: &Datum<'a>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<BinaryFieldPlan<'a>, SqlError> {
     match v {
+        Datum::CompositeText { slot, text } => Ok(BinaryFieldPlan::Composite(
+            decode_composite_text(text, *slot, storage, txid, arena)?,
+        )),
         Datum::Range { text, kind } => {
             let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
             Ok(BinaryFieldPlan::Range(flags, lower, upper))
@@ -21407,7 +21391,11 @@ fn emit_projected(
             return Ok(Err(e));
         }
     } else {
-        responder.data_row(&projected[..n])?;
+        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Ok(Err(error)),
+            Err(wire) => return Err(wire),
+        }
     }
     Ok(Ok(()))
 }

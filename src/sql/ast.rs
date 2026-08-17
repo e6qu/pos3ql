@@ -104,6 +104,10 @@ pub enum CreateSchemaElement<'a> {
         name: QualName<'a>,
         labels: &'a [&'a str],
     },
+    Composite {
+        name: QualName<'a>,
+        fields: &'a [CompositeField<'a>],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +378,11 @@ pub enum Stmt<'a> {
         name: QualName<'a>,
         labels: &'a [&'a str],
     },
+    /// CREATE TYPE name AS (field type [, ...]).
+    CreateComposite {
+        name: QualName<'a>,
+        fields: &'a [CompositeField<'a>],
+    },
     /// ALTER TYPE name <action> (enum ADD VALUE / RENAME).
     AlterType {
         name: QualName<'a>,
@@ -597,6 +606,15 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+/// A parsed named-composite attribute. Keeping the field name and type spelling
+/// together prevents the executor from accepting a name-only half-definition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompositeField<'a> {
+    pub name: &'a str,
+    pub type_name: &'a str,
+    pub type_mod: i32,
 }
 
 /// A parsed ALTER INDEX operation. Keeping the supported operation typed

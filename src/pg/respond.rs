@@ -48,7 +48,7 @@ impl ResultFmt {
     }
 
     /// Whether column `col` is requested in binary.
-    fn is_binary(&self, col: usize) -> bool {
+    pub(crate) fn is_binary(&self, col: usize) -> bool {
         match self.n {
             0 => false,
             1 => self.codes[0],
@@ -183,7 +183,9 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Inet(network) | Datum::Cidr(network) => 4usize.saturating_add(network.addr_len()),
         Datum::Enum { label, .. } => label.len(),
         Datum::Numeric(number) => 8usize.saturating_add(number.ndigits().saturating_mul(2)),
-        Datum::Record(_) => display_len(value),
+        Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
+            display_len(value)
+        }
         Datum::Int2Vector(raw) => {
             let count = raw.len() / 2;
             12usize
@@ -631,6 +633,39 @@ impl<'b> Responder<'b> {
         self.with_retry(|buffer| Self::build_data_row(buffer, values, formats, render))
     }
 
+    /// Emits a row whose fields were prepared by the executor. The writer must
+    /// emit each field's length prefix and bytes, and remain deterministic when
+    /// the transport drains and retries the message.
+    pub(crate) fn data_row_prepared(
+        &mut self,
+        values: &[Datum],
+        write: &dyn Fn(&mut MsgOut),
+    ) -> Result<(), WireFull> {
+        if self.discard_query_output {
+            self.discarded_rows = self.discarded_rows.saturating_add(1);
+            if self.discard_serialize != ExplainSerialize::None {
+                let started = std::time::Instant::now();
+                let binary = self.discard_serialize == ExplainSerialize::Binary;
+                let bytes = serialized_row_len(values, binary, self.render_context());
+                self.serialized_bytes = self.serialized_bytes.saturating_add(bytes as u64);
+                self.serialization_micros = self
+                    .serialization_micros
+                    .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+            }
+            return Ok(());
+        }
+        self.with_retry(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
+            m.i16(values.len() as i16);
+            write(&mut m);
+            m.finish()
+        })
+    }
+
+    pub(crate) fn result_formats(&self) -> ResultFmt {
+        self.formats
+    }
+
     /// Emits one row, each column in its Bind-requested text or binary format.
     fn build_data_row(
         buffer: &mut FixedBuf,
@@ -1010,7 +1045,7 @@ impl<'b> Responder<'b> {
                         }
                     });
                 }
-                Datum::Record(fields) => {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => {
                     // PostgreSQL's anonymous-record send format is a field
                     // count followed by each field's type OID and its ordinary
                     // binary field representation. Records are transient, but
@@ -1023,6 +1058,10 @@ impl<'b> Responder<'b> {
                             Self::encode_value_binary(m, &field.value);
                         }
                     });
+                }
+                Datum::CompositeText { text, .. } => {
+                    m.i32(text.len() as i32);
+                    m.bytes(text.as_bytes());
                 }
                 Datum::Numeric(nm) => {
                     // PostgreSQL numeric binary: i16 ndigits, weight, sign,

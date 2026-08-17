@@ -154,8 +154,9 @@ pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
     infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_type,
-    record_shape, register_shape_for, reset_record_shapes, typeof_static, typeof_static_coltype,
-    typeof_static_oid, visit_record_shape as visit_record_shape_pub,
+    record_shape, register_named_composite_shape, register_shape_for, reset_record_shapes,
+    typeof_static, typeof_static_coltype, typeof_static_oid,
+    visit_record_shape as visit_record_shape_pub,
 };
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
 
@@ -3195,6 +3196,7 @@ fn privilege_mask(
         AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::Composite => PrivilegeSet::TYPE_ALL,
     };
     let mut result = PrivilegeSet::NONE;
     for privilege in privileges {
@@ -3455,6 +3457,7 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Domain | AccessClass::Enum => DefaultPrivilegeClass::Type,
         AccessClass::Index => return Ok(()),
         AccessClass::Routine => DefaultPrivilegeClass::Function,
+        AccessClass::Composite => DefaultPrivilegeClass::Type,
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -13440,6 +13443,33 @@ pub(crate) fn catalog_column_type(
             }),
         ));
     }
+    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&type_oid)
+    {
+        let slot = (type_oid - oid::FIRST_COMPOSITE) as usize;
+        let definition = storage.composite(slot);
+        return definition.visible_to(txid).then_some((
+            ColType::Composite(slot as u16),
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
+    if (oid::FIRST_COMPOSITE_ARRAY
+        ..oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&type_oid)
+    {
+        let slot = (type_oid - oid::FIRST_COMPOSITE_ARRAY) as usize;
+        let definition = storage.composite(slot);
+        return definition.visible_to(txid).then_some((
+            ColType::Array(ArrElem::Composite(slot as u16)),
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            }),
+        ));
+    }
     let ctype = coltype_of_oid(type_oid)?;
     let user_type = match ctype {
         ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot)) => {
@@ -13450,6 +13480,16 @@ pub(crate) fn catalog_column_type(
             Some(crate::storage::UserTypeName {
                 schema: enumeration.schema,
                 name: enumeration.name,
+            })
+        }
+        ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot)) => {
+            let definition = storage.composite(slot as usize);
+            if !definition.visible_to(txid) {
+                return None;
+            }
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
             })
         }
         _ => None,
@@ -14442,6 +14482,9 @@ pub fn create_domain(
         || storage
             .enum_slot(schema.as_str(), d.name.name, txn.txid)
             .is_some()
+        || storage
+            .composite_slot(schema.as_str(), d.name.name, txn.txid)
+            .is_some()
     {
         return sql_fail(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
@@ -15159,6 +15202,9 @@ pub fn create_enum(
         || storage
             .domain_slot(schema.as_str(), name.name, txn.txid)
             .is_some()
+        || storage
+            .composite_slot(schema.as_str(), name.name, txn.txid)
+            .is_some()
     {
         return sql_fail(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
@@ -15195,6 +15241,170 @@ pub fn create_enum(
         txn,
         crate::storage::AccessObject {
             class: crate::storage::AccessClass::Enum,
+            slot: slot as u16,
+        },
+    ) {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TYPE")?;
+    sql_ok()
+}
+
+fn build_composite_spec(
+    storage: &Storage,
+    txid: u32,
+    fields: &[crate::sql::ast::CompositeField<'_>],
+) -> Result<crate::storage::CompositeSpec, SqlError> {
+    if fields.len() > crate::storage::MAX_COMPOSITE_FIELDS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "a composite type may have at most {} fields",
+            crate::storage::MAX_COMPOSITE_FIELDS
+        ));
+    }
+    let mut out = [crate::storage::CompositeFieldDef::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS];
+    for (index, field) in fields.iter().enumerate() {
+        if fields[..index]
+            .iter()
+            .any(|prior| prior.name.eq_ignore_ascii_case(field.name))
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column \"{}\" specified more than once",
+                field.name
+            ));
+        }
+        let (base_name, array) = field
+            .type_name
+            .strip_suffix("[]")
+            .map_or((field.type_name, false), |base| (base, true));
+        let (ctype, user_type) = if let Some(ctype) = ColType::from_sql_name(field.type_name) {
+            (ctype, None)
+        } else if let Some(domain) = storage.find_domain(base_name, txid) {
+            let ctype = if array {
+                ColType::Array(
+                    ArrElem::domain(
+                        storage
+                            .domain_identity_slot(
+                                domain.schema.as_str(),
+                                domain.name.as_str(),
+                                txid,
+                            )
+                            .expect("visible domain has slot") as u16,
+                        domain.base,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "arrays of record-valued domains are not supported"
+                        )
+                    })?,
+                )
+            } else {
+                domain.base
+            };
+            (
+                ctype,
+                Some(crate::storage::UserTypeName {
+                    schema: domain.schema,
+                    name: domain.name,
+                }),
+            )
+        } else if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
+            let definition = storage.enum_for(slot, txid);
+            (
+                if array {
+                    ColType::Array(ArrElem::Enum(slot as u16))
+                } else {
+                    ColType::Enum(slot as u16)
+                },
+                Some(crate::storage::UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                }),
+            )
+        } else if let Some(slot) = storage.resolve_composite_slot(base_name, txid) {
+            let definition = storage.composite(slot);
+            (
+                if array {
+                    ColType::Array(ArrElem::Composite(slot as u16))
+                } else {
+                    ColType::Composite(slot as u16)
+                },
+                Some(crate::storage::UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                }),
+            )
+        } else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                field.type_name
+            ));
+        };
+        if matches!(ctype, ColType::Record | ColType::Void | ColType::Int2Vector) {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "type \"{}\" cannot be a composite field",
+                field.type_name
+            ));
+        }
+        out[index] = crate::storage::CompositeFieldDef {
+            name: SqlName::parse(field.name)?,
+            ctype,
+            type_mod: field.type_mod,
+            user_type,
+        };
+    }
+    Ok(crate::storage::CompositeSpec {
+        fields: out,
+        n_fields: fields.len(),
+    })
+}
+
+pub fn create_composite(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName,
+    fields: &[crate::sql::ast::CompositeField<'_>],
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let spec = match build_composite_spec(storage, txn.txid, fields) {
+        Ok(spec) => spec,
+        Err(error) => return sql_fail(error),
+    };
+    let name = match SqlName::parse(name.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_composite(schema, name, spec, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateComposite(*storage.composite(slot)),
+    ) {
+        storage.rollback_composite_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeCreated(slot as u32)) {
+        storage.rollback_composite_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = apply_default_privileges_to_new_object(
+        storage,
+        txn,
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Composite,
             slot: slot as u16,
         },
     ) {
@@ -17930,6 +18140,12 @@ pub(crate) fn resolve_parameter_input_type(
         {
             Err(unknown_type())
         }
+        ColType::Composite(slot) | ColType::Array(crate::sql::types::ArrElem::Composite(slot))
+            if slot as usize >= crate::storage::MAX_COMPOSITES
+                || !storage.composite(slot as usize).visible_to(txid) =>
+        {
+            Err(unknown_type())
+        }
         _ => Ok(ParameterInputType::Builtin(ctype)),
     }
 }
@@ -18021,8 +18237,10 @@ pub(crate) fn decode_text_input<'a>(
             crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
         }
         ColType::Enum(slot) => coerce_enum_value(Datum::Text(text), slot, storage, txid, arena),
+        ColType::Composite(slot) => decode_composite_text(text, slot, storage, txid, arena),
         ColType::Array(
             element @ (crate::sql::types::ArrElem::Enum(_)
+            | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
         ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena),
         _ => crate::sql::eval::cast_to(Datum::Text(text), ctype, arena),
@@ -18178,6 +18396,16 @@ fn decode_binary_field_with_context<'a>(
                 ));
             };
             coerce_enum_value(Datum::Text(label), slot, storage, txid, arena)
+        }
+        ColType::Composite(slot) => {
+            let BinaryDecodeContext::Catalog { storage, txid } = context else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "binary input of a named composite requires catalog context"
+                ));
+            };
+            let record = decode_binary_record(bytes, arena, context)?;
+            coerce_composite_value(record, slot, storage, txid, arena)
         }
     }
 }
@@ -18371,6 +18599,20 @@ fn decode_binary_array<'a>(
                     arena,
                     crate::sql::eval::NO_PARAMS,
                 )?
+            }
+            crate::sql::types::ArrElem::Composite(slot) => {
+                let Datum::Composite { .. } = value else {
+                    return Err(bad());
+                };
+                Datum::CompositeText {
+                    slot,
+                    text: arena.alloc_str_display(value).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "composite array element exceeds statement arena"
+                        )
+                    })?,
+                }
             }
             _ => value,
         };
@@ -18614,27 +18856,16 @@ pub fn copy_out(
                 // (it may run twice on the flush-and-retry path).
                 let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
                 for (i, plan) in plans.iter_mut().enumerate().take(setup.n_targets) {
-                    *plan = binary_field_plan(&values[setup.targets[i]], arena)?;
+                    let target = setup.targets[i];
+                    if let Datum::CompositeText { slot, text } = values[target] {
+                        values[target] = decode_composite_text(text, slot, storage, txid, arena)?;
+                    }
+                    *plan = binary_field_plan(&values[target], storage, txid, arena)?;
                 }
                 responder
                     .copy_binary_row(setup.n_targets, &|m| {
                         for i in 0..setup.n_targets {
-                            match plans[i] {
-                                BinaryFieldPlan::Direct => {
-                                    Responder::encode_value_binary(m, &values[setup.targets[i]]);
-                                }
-                                BinaryFieldPlan::Range(f, l, u) => {
-                                    m.field(|m| encode_range_binary(m, f, l, u));
-                                }
-                                BinaryFieldPlan::Multirange(ranges) => {
-                                    m.field(|m| {
-                                        m.i32(ranges.len() as i32);
-                                        for &(f, l, u) in ranges {
-                                            m.field(|m| encode_range_binary(m, f, l, u));
-                                        }
-                                    });
-                                }
-                            }
+                            encode_binary_field_plan(m, &values[setup.targets[i]], plans[i]);
                         }
                     })
                     .map_err(wire_to_sql)?;
@@ -18825,27 +19056,12 @@ pub fn copy_out_query(
         if fmt.binary {
             let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
             for (i, plan) in plans.iter_mut().enumerate().take(n) {
-                *plan = binary_field_plan(&vals[i], arena)?;
+                *plan = binary_field_plan(&vals[i], storage, txid, arena)?;
             }
             responder
                 .copy_binary_row(n, &|m| {
                     for (i, plan) in plans.iter().enumerate().take(n) {
-                        match *plan {
-                            BinaryFieldPlan::Direct => {
-                                Responder::encode_value_binary(m, &vals[i]);
-                            }
-                            BinaryFieldPlan::Range(f, l, u) => {
-                                m.field(|m| encode_range_binary(m, f, l, u));
-                            }
-                            BinaryFieldPlan::Multirange(ranges) => {
-                                m.field(|m| {
-                                    m.i32(ranges.len() as i32);
-                                    for &(f, l, u) in ranges {
-                                        m.field(|m| encode_range_binary(m, f, l, u));
-                                    }
-                                });
-                            }
-                        }
+                        encode_binary_field_plan(m, &vals[i], *plan);
                     }
                 })
                 .map_err(wire_to_sql)?;
@@ -18900,14 +19116,66 @@ type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
 /// arena datums up front so the retry-safe emission closure never allocates
 /// or fails.
 #[derive(Clone, Copy)]
-enum BinaryFieldPlan<'a> {
+pub(crate) enum BinaryFieldPlan<'a> {
     Direct,
+    Composite(Datum<'a>),
     Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
     Multirange(&'a [RangeBinaryParts<'a>]),
+    CompositeArray(
+        crate::sql::types::ArrElem,
+        crate::sql::array::Shape,
+        &'a [Datum<'a>],
+    ),
 }
 
-fn binary_field_plan<'a>(v: &Datum<'a>, arena: &'a Arena) -> Result<BinaryFieldPlan<'a>, SqlError> {
+/// Writes one already-planned binary field. Planning performs every fallible
+/// parse and composite materialization before the retryable wire emitter runs.
+pub(crate) fn encode_binary_field_plan(
+    m: &mut crate::pg::wire::MsgOut,
+    value: &Datum,
+    plan: BinaryFieldPlan,
+) {
+    match plan {
+        BinaryFieldPlan::Direct => Responder::encode_value_binary(m, value),
+        BinaryFieldPlan::Composite(value) => Responder::encode_value_binary(m, &value),
+        BinaryFieldPlan::Range(flags, lower, upper) => {
+            m.field(|m| encode_range_binary(m, flags, lower, upper));
+        }
+        BinaryFieldPlan::Multirange(ranges) => {
+            m.field(|m| {
+                m.i32(ranges.len() as i32);
+                for &(flags, lower, upper) in ranges {
+                    m.field(|m| encode_range_binary(m, flags, lower, upper));
+                }
+            });
+        }
+        BinaryFieldPlan::CompositeArray(element, shape, elements) => {
+            m.field(|m| {
+                m.i32(shape.dimension_count() as i32);
+                m.i32(i32::from(elements.iter().any(Datum::is_null)));
+                m.i32(element.element_oid());
+                for index in 0..shape.dimension_count() {
+                    m.i32(shape.dimension(index).unwrap() as i32);
+                    m.i32(shape.lower_bound(index).unwrap());
+                }
+                for element in elements {
+                    Responder::encode_value_binary(m, element);
+                }
+            });
+        }
+    }
+}
+
+pub(crate) fn binary_field_plan<'a>(
+    v: &Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<BinaryFieldPlan<'a>, SqlError> {
     match v {
+        Datum::CompositeText { slot, text } => Ok(BinaryFieldPlan::Composite(
+            decode_composite_text(text, *slot, storage, txid, arena)?,
+        )),
         Datum::Range { text, kind } => {
             let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
             Ok(BinaryFieldPlan::Range(flags, lower, upper))
@@ -18927,6 +19195,31 @@ fn binary_field_plan<'a>(v: &Datum<'a>, arena: &'a Arena) -> Result<BinaryFieldP
                 )
             })?;
             Ok(BinaryFieldPlan::Multirange(stored))
+        }
+        Datum::Array {
+            element: element @ crate::sql::types::ArrElem::Composite(_),
+            raw,
+        } => {
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+            for (index, value) in values.iter_mut().take(shape.element_count()).enumerate() {
+                *value = match crate::sql::array::get(raw, *element, index) {
+                    Some(Datum::CompositeText { slot, text }) => {
+                        decode_composite_text(text, slot, storage, txid, arena)?
+                    }
+                    Some(value) => value,
+                    None => Datum::Null,
+                };
+            }
+            let stored = arena
+                .alloc_slice_copy(&values[..shape.element_count()])
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "COPY BINARY composite array exceeds the statement arena"
+                    )
+                })?;
+            Ok(BinaryFieldPlan::CompositeArray(*element, shape, stored))
         }
         _ => Ok(BinaryFieldPlan::Direct),
     }
@@ -21032,8 +21325,10 @@ fn emit_projected(
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         subs: Some(&subqueries),
+        catalog: Some(&catalog),
         ..NO_HOOKS
     };
     let mut projected = [Datum::Null; MAX_PROJ];
@@ -21081,6 +21376,14 @@ fn emit_projected(
             }
         }
     }
+    for value in projected.iter_mut().take(n) {
+        if let Datum::CompositeText { slot, text } = *value {
+            *value = match decode_composite_text(text, slot, storage, txid, arena) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+    }
     // A data-modifying CTE captures its RETURNING rows in memory instead of
     // streaming them to the client.
     if let Some(sink) = capture.as_deref_mut() {
@@ -21088,7 +21391,11 @@ fn emit_projected(
             return Ok(Err(e));
         }
     } else {
-        responder.data_row(&projected[..n])?;
+        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Ok(Err(error)),
+            Err(wire) => return Err(wire),
+        }
     }
     Ok(Ok(()))
 }
@@ -24090,13 +24397,39 @@ fn coerce<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if let ColType::Composite(slot) = col.ctype {
+        let typed = match v {
+            value @ Datum::Composite { slot: actual, .. } if actual == slot => value,
+            value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
+                return Ok(value);
+            }
+            Datum::Record(_) => coerce_composite_value(v, slot, storage, txid, arena)?,
+            Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" is of type composite but expression is of incompatible type",
+                    col.name.as_str()
+                ));
+            }
+        };
+        let text = arena.alloc_str_display(typed).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite exceeds statement arena"
+            )
+        })?;
+        return Ok(Datum::CompositeText { slot, text });
+    }
     // An enum column resolves a text (or already-typed enum) value to a member
     // of its type, validating the label against the catalog (22P02 otherwise).
     if let ColType::Enum(slot) = col.ctype {
         return coerce_enum_value(v, slot, storage, txid, arena);
     }
     if let ColType::Array(
-        element @ (crate::sql::types::ArrElem::Enum(_) | crate::sql::types::ArrElem::Domain { .. }),
+        element @ (crate::sql::types::ArrElem::Enum(_)
+        | crate::sql::types::ArrElem::Composite(_)
+        | crate::sql::types::ArrElem::Domain { .. }),
     ) = col.ctype
     {
         return coerce_user_type_array(v, element, storage, txid, arena);
@@ -24122,6 +24455,210 @@ fn coerce<'a>(
         }
     })?;
     apply_typmod(v, col.ctype, col.type_mod, arena)
+}
+
+/// Converts an anonymous row constructor into one catalog-defined composite.
+/// The catalog field list is the parse boundary: arity, order and each field's
+/// concrete type are established once, before a `Datum::Composite` exists.
+pub(crate) fn coerce_composite_value<'a>(
+    value: Datum<'a>,
+    slot: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if let Datum::Composite { slot: actual, .. } = value {
+        return if actual == slot {
+            Ok(value)
+        } else {
+            Err(sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "cannot cast one named composite type to another"
+            ))
+        };
+    }
+    let Datum::Record(input) = value else {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast non-record value to named composite"
+        ));
+    };
+    let definition = storage.composite(slot as usize);
+    if !definition.visible_to(txid) {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "composite type does not exist"
+        ));
+    }
+    if input.len() != definition.n_fields {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot cast record with {} fields to composite with {} fields",
+            input.len(),
+            definition.n_fields
+        ));
+    }
+    let fields = arena
+        .alloc_slice_with(input.len(), |_| RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite exceeds statement arena"
+            )
+        })?;
+    for (index, (out, field)) in fields.iter_mut().zip(definition.fields()).enumerate() {
+        let column = ColumnMeta {
+            name: field.name,
+            ctype: field.ctype,
+            type_mod: field.type_mod,
+            collation: crate::sql::ast::Collation::None,
+            not_null: false,
+            unique: false,
+            primary: false,
+            auto_increment: false,
+            default: crate::storage::ColumnDefault::NONE,
+            is_identity: false,
+            identity_always: false,
+            auto_increment_step: 1,
+            user_type: field.user_type,
+        };
+        out.name = arena.alloc_str(field.name.as_str()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite field name exceeds statement arena"
+            )
+        })?;
+        out.type_oid = match storage.declared_column_type(&column, txid)? {
+            crate::storage::DeclaredColumnType::Builtin { oid }
+            | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
+        };
+        out.value = coerce(input[index].value, &column, storage, txid, arena)?;
+    }
+    Ok(Datum::Composite { slot, fields })
+}
+
+/// Parses PostgreSQL's composite text form stored in a row. This parser keeps
+/// quoting at the boundary: commas and parentheses inside quoted fields never
+/// leak into type coercion as separate attributes.
+pub(crate) fn decode_composite_text<'a>(
+    text: &'a str,
+    slot: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let body = text
+        .strip_prefix('(')
+        .and_then(|body| body.strip_suffix(')'))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "malformed composite literal"
+            )
+        })?;
+    let definition = storage.composite(slot as usize);
+    let values = arena
+        .alloc_slice_with(definition.n_fields, |_| RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite exceeds statement arena"
+            )
+        })?;
+    let mut at = 0usize;
+    for (index, out) in values.iter_mut().enumerate() {
+        let rest = &body[at..];
+        let (raw, used, quoted) = if let Some(source) = rest.strip_prefix('"') {
+            let mut read = 0;
+            let mut written = 0;
+            let decoded = arena.alloc_slice_with(source.len(), |_| 0u8).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "composite literal exceeds statement arena"
+                )
+            })?;
+            let mut closed = false;
+            while read < source.len() {
+                match source.as_bytes()[read] {
+                    b'\\' => {
+                        read += 1;
+                        let Some(&byte) = source.as_bytes().get(read) else {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_TEXT_REPRESENTATION,
+                                "unterminated composite field escape"
+                            ));
+                        };
+                        decoded[written] = byte;
+                        written += 1;
+                        read += 1;
+                    }
+                    b'"' if source.as_bytes().get(read + 1) == Some(&b'"') => {
+                        decoded[written] = b'"';
+                        written += 1;
+                        read += 2;
+                    }
+                    b'"' => {
+                        read += 1;
+                        closed = true;
+                        break;
+                    }
+                    byte => {
+                        decoded[written] = byte;
+                        written += 1;
+                        read += 1;
+                    }
+                }
+            }
+            if !closed {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "unterminated composite field"
+                ));
+            }
+            let raw = core::str::from_utf8(&decoded[..written]).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "composite field is not valid UTF-8"
+                )
+            })?;
+            (raw, read + 1, true)
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            (&rest[..end], end, false)
+        };
+        at += used;
+        if index + 1 < definition.n_fields {
+            if body.as_bytes().get(at) != Some(&b',') {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "malformed composite literal"
+                ));
+            }
+            at += 1;
+        }
+        out.name = "";
+        out.type_oid = 0;
+        out.value = if raw.is_empty() && !quoted {
+            Datum::Null
+        } else {
+            Datum::Text(raw)
+        };
+    }
+    if at != body.len() {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "wrong number of composite fields"
+        ));
+    }
+    coerce_composite_value(Datum::Record(values), slot, storage, txid, arena)
 }
 
 /// Coerces an array to a user-defined element type. Its raw element payloads
@@ -24170,6 +24707,26 @@ pub(crate) fn coerce_user_type_array<'a>(
                 arena,
                 crate::sql::eval::NO_PARAMS,
             )?,
+            crate::sql::types::ArrElem::Composite(slot) => {
+                let composite = match value {
+                    Datum::CompositeText { slot: actual, .. } if actual == slot => value,
+                    Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
+                    value => coerce_composite_value(value, slot, storage, txid, arena)?,
+                };
+                match composite {
+                    value @ Datum::CompositeText { .. } => value,
+                    value @ Datum::Composite { .. } => Datum::CompositeText {
+                        slot,
+                        text: arena.alloc_str_display(value).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "composite array element exceeds statement arena"
+                            )
+                        })?,
+                    },
+                    _ => unreachable!("composite coercion returns a composite datum"),
+                }
+            }
             _ => unreachable!("caller restricts user-defined array elements"),
         };
     }

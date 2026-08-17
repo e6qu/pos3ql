@@ -399,7 +399,7 @@ impl OwnedDatum {
     pub fn from_datum(d: &crate::sql::types::Datum) -> Result<Self, SqlError> {
         use crate::sql::types::Datum;
         Ok(match d {
-            Datum::Record(_) => {
+            Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store a composite (record) value in a column"
@@ -2663,6 +2663,10 @@ pub struct DomainSpec {
 /// the catalog's static footprint is `MAX_ENUMS * MAX_ENUM_LABELS * size_of::<EnumMember>()`.
 pub(crate) const MAX_ENUMS: usize = 32;
 pub(crate) const MAX_ENUM_LABELS: usize = 64;
+/// Named composite types and their attributes are fixed at startup along with
+/// every other catalog registry. A composite cannot be partially defined.
+pub(crate) const MAX_COMPOSITES: usize = 32;
+pub(crate) const MAX_COMPOSITE_FIELDS: usize = 16;
 
 /// One member of an enum type: a label plus its sort key. Ordering among enum
 /// values is by `sort` (PostgreSQL's `pg_enum.enumsortorder`), *not* by label
@@ -2752,6 +2756,64 @@ impl EnumDef {
 pub struct EnumSpec {
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
+}
+
+/// One validated attribute of a named composite. `user_type` preserves the
+/// stable name used to rebind catalog slots after recovery.
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeFieldDef {
+    pub name: SqlName,
+    pub ctype: ColType,
+    pub type_mod: i32,
+    pub user_type: Option<UserTypeName>,
+}
+
+impl CompositeFieldDef {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        ctype: ColType::Bool,
+        type_mod: -1,
+        user_type: None,
+    };
+}
+
+/// A durable, named record layout. The type and field list are one catalog
+/// object, so field access never needs to reparse a declaration string.
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeDef {
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub ownership: Ownership,
+    pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
+    pub n_fields: usize,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl CompositeDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
+        fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS],
+        n_fields: 0,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub fn fields(&self) -> &[CompositeFieldDef] {
+        &self.fields[..self.n_fields]
+    }
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CompositeSpec {
+    pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
+    pub n_fields: usize,
 }
 
 /// A sequence's declared integer type: it sets the default MIN/MAXVALUE and the
@@ -3216,6 +3278,7 @@ pub(crate) enum AccessClass {
     Enum = 6,
     Index = 7,
     Routine = 8,
+    Composite = 9,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -3773,6 +3836,7 @@ pub struct Storage {
     sequences: FixedVec<SequenceDef>,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
+    composites: FixedVec<CompositeDef>,
     indexes: FixedVec<IndexDef>,
     schemas: FixedVec<SchemaDef>,
     roles: FixedVec<RoleDef>,
@@ -4365,6 +4429,7 @@ impl Storage {
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
+            + MAX_COMPOSITES * size_of::<CompositeDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
             + config.max_connections as usize * config.max_tables * size_of::<TableLock>()
@@ -4582,6 +4647,12 @@ impl Storage {
         for _ in 0..MAX_ENUMS {
             enums.push(EnumDef::EMPTY).expect("sized to MAX_ENUMS");
         }
+        let mut composites = FixedVec::new(budget, "composites", MAX_COMPOSITES)?;
+        for _ in 0..MAX_COMPOSITES {
+            composites
+                .push(CompositeDef::EMPTY)
+                .expect("sized to MAX_COMPOSITES");
+        }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
             schemas
@@ -4714,6 +4785,7 @@ impl Storage {
             sequences,
             domains,
             enums,
+            composites,
             indexes,
             schemas,
             roles,
@@ -4875,6 +4947,7 @@ impl Storage {
             AccessClass::Enum => &self.enums[slot].ownership,
             AccessClass::Index => &self.indexes[slot].ownership,
             AccessClass::Routine => &self.routines[slot].ownership,
+            AccessClass::Composite => &self.composites[slot].ownership,
         }
     }
 
@@ -4890,6 +4963,7 @@ impl Storage {
             AccessClass::Enum => &mut self.enums[slot].ownership,
             AccessClass::Index => &mut self.indexes[slot].ownership,
             AccessClass::Routine => &mut self.routines[slot].ownership,
+            AccessClass::Composite => &mut self.composites[slot].ownership,
         }
     }
 
@@ -4960,6 +5034,7 @@ impl Storage {
                     && routine.schema_for(txid).as_str() == schema
                     && routine.name_for(txid).as_str() == name
             }),
+            AccessClass::Composite => self.composite_slot(schema, name, txid),
         }?;
         u16::try_from(slot)
             .ok()
@@ -5010,6 +5085,10 @@ impl Storage {
                 let definition = &self.routines[slot];
                 (definition.schema_for(txid), definition.name_for(txid))
             }
+            AccessClass::Composite => {
+                let definition = self.composite(slot);
+                (definition.schema, definition.name)
+            }
         }
     }
 
@@ -5027,6 +5106,7 @@ impl Storage {
             AccessClass::Enum => self.enums[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Composite => self.composites[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -5042,6 +5122,7 @@ impl Storage {
             AccessClass::Enum => self.enums[slot].visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
             AccessClass::Routine => self.routines[slot].visible_to(txid),
+            AccessClass::Composite => self.composites[slot].visible_to(txid),
         }
     }
 
@@ -5056,6 +5137,7 @@ impl Storage {
             AccessClass::Enum => self.enums.len(),
             AccessClass::Index => self.indexes.len(),
             AccessClass::Routine => self.routines.len(),
+            AccessClass::Composite => self.composites.len(),
         }
     }
 
@@ -5086,6 +5168,7 @@ impl Storage {
             (AccessClass::Enum, self.enums.len()),
             (AccessClass::Index, self.indexes.len()),
             (AccessClass::Routine, self.routines.len()),
+            (AccessClass::Composite, self.composites.len()),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -5601,7 +5684,10 @@ impl Storage {
                     && entry.grantor == 0)
                 || (matches!(
                     entry.object.class,
-                    AccessClass::Domain | AccessClass::Enum | AccessClass::Routine
+                    AccessClass::Domain
+                        | AccessClass::Enum
+                        | AccessClass::Composite
+                        | AccessClass::Routine
                 ) && entry.object.slot != u16::MAX
                     && entry.grantee == PUBLIC_ROLE)
         })
@@ -5814,6 +5900,13 @@ impl Storage {
                     class: AccessClass::Enum,
                     slot: slot as u16,
                 })
+            })
+            .or_else(|| {
+                self.composite_slot(schema, name, txid)
+                    .map(|slot| AccessObject {
+                        class: AccessClass::Composite,
+                        slot: slot as u16,
+                    })
             })
             .ok_or_else(|| {
                 sql_err!(
@@ -10284,6 +10377,29 @@ impl Storage {
                     })?;
                     def.columns[i].ctype = ColType::Array(element);
                 }
+                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => {
+                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "reloaded composite column has no type identity"
+                        )
+                    })?;
+                    let slot = self
+                        .composite_slot(schema.as_str(), name.as_str(), 0)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "composite type \"{}.{}\" for a reloaded column does not exist",
+                                schema.as_str(),
+                                name.as_str()
+                            )
+                        })?;
+                    def.columns[i].ctype = if matches!(col.ctype, ColType::Array(_)) {
+                        ColType::Array(ArrElem::Composite(slot as u16))
+                    } else {
+                        ColType::Composite(slot as u16)
+                    };
+                }
                 _ => {}
             }
         }
@@ -12174,6 +12290,44 @@ impl Storage {
                     oid: oid::enum_array_oid(slot),
                 });
             }
+            ColType::Composite(slot) => {
+                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "composite column type lacks its durable identity"
+                    )
+                })?;
+                if self.composite_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize)
+                {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "composite column type does not match its durable identity"
+                    ));
+                }
+                return Ok(DeclaredColumnType::UserDefined {
+                    oid: oid::composite_oid(slot),
+                    schema,
+                    name,
+                });
+            }
+            ColType::Array(ArrElem::Composite(slot)) => {
+                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "composite-array column type lacks its durable identity"
+                    )
+                })?;
+                if self.composite_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize)
+                {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "composite-array column type does not match its durable identity"
+                    ));
+                }
+                return Ok(DeclaredColumnType::Builtin {
+                    oid: oid::composite_array_oid(slot),
+                });
+            }
             _ => {}
         }
 
@@ -12192,6 +12346,13 @@ impl Storage {
         if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), txid) {
             return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::enum_oid(slot as u16),
+                schema,
+                name,
+            });
+        }
+        if let Some(slot) = self.composite_slot(schema.as_str(), name.as_str(), txid) {
+            return Ok(DeclaredColumnType::UserDefined {
+                oid: oid::composite_oid(slot as u16),
                 schema,
                 name,
             });
@@ -12917,6 +13078,132 @@ impl Storage {
     pub fn rollback_enum_drop(&mut self, slot: usize, txid: u32) {
         let e = &mut self.enums[slot];
         e.ddl_state = e.ddl_state.rollback_drop(txid);
+    }
+
+    // --- Named composite types (CREATE TYPE ... AS (...)) ---
+
+    pub fn resolve_composite_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
+        let (qualifier, name) = type_name
+            .split_once('.')
+            .map_or((None, type_name), |(s, n)| (Some(s), n));
+        self.composites.iter().enumerate().find_map(|(slot, definition)| {
+            (definition.visible_to(txid)
+                && definition.name.as_str() == name
+                && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.schema)), |schema| definition.schema.as_str() == schema))
+                .then_some(slot)
+        })
+    }
+
+    pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.composites.iter().position(|definition| {
+            definition.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        })
+    }
+
+    pub fn composite(&self, slot: usize) -> &CompositeDef {
+        &self.composites[slot]
+    }
+
+    pub fn live_composites(&self) -> impl Iterator<Item = (usize, &CompositeDef)> {
+        self.composites
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub fn create_composite(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        mut spec: CompositeSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(schema.as_str(), txid)?;
+        for field in spec.fields.iter_mut().take(spec.n_fields) {
+            let Some(identity) = field.user_type else {
+                continue;
+            };
+            let rebound = match field.ctype {
+                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => self
+                    .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .map(|slot| {
+                        if matches!(field.ctype, ColType::Array(_)) {
+                            ColType::Array(ArrElem::Enum(slot as u16))
+                        } else {
+                            ColType::Enum(slot as u16)
+                        }
+                    }),
+                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => self
+                    .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .map(|slot| {
+                        if matches!(field.ctype, ColType::Array(_)) {
+                            ColType::Array(ArrElem::Composite(slot as u16))
+                        } else {
+                            ColType::Composite(slot as u16)
+                        }
+                    }),
+                _ => None,
+            };
+            if let Some(ctype) = rebound {
+                field.ctype = ctype;
+            }
+        }
+        let exists = self
+            .domain_slot(schema.as_str(), name.as_str(), txid)
+            .is_some()
+            || self
+                .enum_slot(schema.as_str(), name.as_str(), txid)
+                .is_some()
+            || self
+                .composite_slot(schema.as_str(), name.as_str(), txid)
+                .is_some();
+        if exists {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .composites
+            .iter()
+            .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many composite types (limit {})",
+                self.composites.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Composite,
+            slot: slot as u16,
+        });
+        self.composites[slot] = CompositeDef {
+            created_at: self.catalog_seq,
+            schema,
+            name,
+            ownership: self.initial_ownership(txid),
+            fields: spec.fields,
+            n_fields: spec.n_fields,
+            ddl_state: if txid == 0 {
+                CatalogDdlState::Present
+            } else {
+                CatalogDdlState::PendingCreate { txid }
+            },
+        };
+        Ok(slot)
+    }
+
+    pub fn commit_composite_create(&mut self, slot: usize) {
+        self.composites[slot].ddl_state = self.composites[slot].ddl_state.commit_create();
+    }
+
+    pub fn rollback_composite_create(&mut self, slot: usize) {
+        self.composites[slot].ddl_state = self.composites[slot].ddl_state.rollback_create();
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other

@@ -2271,6 +2271,64 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("cmp") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let hexstr = |w: Option<&str>,
+                                  what: &'static str|
+                     -> Result<String, CheckpointSetupError> {
+                        match w.ok_or(CheckpointSetupError::Corrupt(what))? {
+                            "0" => Ok(String::new()),
+                            h => decode_hex_name(h),
+                        }
+                    };
+                    let schema = hexstr(words.next(), "cmp schema missing")?;
+                    let name = hexstr(words.next(), "cmp name missing")?;
+                    let n_fields: usize = parse_field(words.next(), "cmp nfields")?;
+                    if n_fields > crate::storage::MAX_COMPOSITE_FIELDS {
+                        return Err(CheckpointSetupError::Corrupt("too many composite fields"));
+                    }
+                    let mut fields = [crate::storage::CompositeFieldDef::EMPTY;
+                        crate::storage::MAX_COMPOSITE_FIELDS];
+                    for field in fields.iter_mut().take(n_fields) {
+                        let field_name = hexstr(words.next(), "cmp field name missing")?;
+                        let code: u8 = parse_field(words.next(), "cmp field type missing")?;
+                        let type_mod: i32 = parse_field(words.next(), "cmp field typmod missing")?;
+                        let user_schema = hexstr(words.next(), "cmp field user schema missing")?;
+                        let user_name = hexstr(words.next(), "cmp field user name missing")?;
+                        let user_type = match (user_schema.is_empty(), user_name.is_empty()) {
+                            (true, true) => None,
+                            (false, false) => Some(crate::storage::UserTypeName {
+                                schema: sql_name(&user_schema)?,
+                                name: sql_name(&user_name)?,
+                            }),
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "composite field user type identity is incomplete",
+                                ));
+                            }
+                        };
+                        *field = crate::storage::CompositeFieldDef {
+                            name: sql_name(&field_name)?,
+                            ctype: crate::sql::types::ColType::from_code(code)
+                                .ok_or(CheckpointSetupError::Corrupt("bad composite field type"))?,
+                            type_mod,
+                            user_type,
+                        };
+                    }
+                    storage
+                        .create_composite(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            crate::storage::CompositeSpec { fields, n_fields },
+                            0,
+                        )
+                        .map_err(|e| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest composite rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("cmt") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let class: u8 = parse_field(words.next(), "cmt class")?;
@@ -3092,6 +3150,49 @@ impl Checkpointer {
                 let _ = write!(line, " ");
                 hex(&mut line, m.label.as_str());
                 let _ = write!(line, " {}", m.sort.to_bits());
+            }
+            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+        }
+        // Named composites precede tables because composite columns rebind by
+        // catalog identity while the table definitions are restored.
+        for (_, definition) in storage.live_composites() {
+            use core::fmt::Write;
+            let mut line = StackStr::<10_240>::new();
+            let hex = |line: &mut StackStr<10_240>, value: &str| {
+                if value.is_empty() {
+                    let _ = write!(line, "0");
+                } else {
+                    for byte in value.as_bytes() {
+                        let _ = write!(line, "{byte:02x}");
+                    }
+                }
+            };
+            let _ = write!(line, "cmp ");
+            hex(&mut line, definition.schema.as_str());
+            let _ = write!(line, " ");
+            hex(&mut line, definition.name.as_str());
+            let _ = write!(line, " {}", definition.n_fields);
+            for field in definition.fields() {
+                let _ = write!(line, " ");
+                hex(&mut line, field.name.as_str());
+                let _ = write!(line, " {} {} ", field.ctype.code(), field.type_mod);
+                hex(
+                    &mut line,
+                    field
+                        .user_type
+                        .as_ref()
+                        .map(|identity| identity.schema.as_str())
+                        .unwrap_or(""),
+                );
+                let _ = write!(line, " ");
+                hex(
+                    &mut line,
+                    field
+                        .user_type
+                        .as_ref()
+                        .map(|identity| identity.name.as_str())
+                        .unwrap_or(""),
+                );
             }
             write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }

@@ -484,6 +484,20 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Materializes a durable named-composite row value into its catalog field
+    /// layout. The default is a loud capability error: raw composite text is
+    /// never treated as an anonymous record.
+    fn materialize_composite<'a>(
+        &self,
+        _slot: u16,
+        _text: &'a str,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
     /// cannot silently substitute a process-global locale.
@@ -1085,7 +1099,7 @@ pub fn eval_full<'a>(
             varying: false,
         }),
         Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
-            Ok(v) => Ok(v),
+            Ok(v) => materialize_named_composite(v, hooks, arena),
             // A bare name that is not a column but names a FROM item is a
             // whole-row reference (`SELECT t FROM t`, `row_to_json(r)`).
             Err(e) if qualifier.is_none() && e.sqlstate == sqlstate::UNDEFINED_COLUMN => {
@@ -1113,7 +1127,7 @@ pub fn eval_full<'a>(
             let composed = arena
                 .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
                 .map_err(|_| arena_full())?;
-            row.lookup(Some(composed), name)
+            materialize_named_composite(row.lookup(Some(composed), name)?, hooks, arena)
         }
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
@@ -1741,6 +1755,15 @@ pub fn eval_full<'a>(
                         // A bpchar element keeps its padding in the array
                         // value, as PostgreSQL's array_out shows it.
                         Datum::Bpchar(s) => Datum::Text(s),
+                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                            Datum::CompositeText {
+                                slot,
+                                text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
+                            }
+                        }
+                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                            value
+                        }
                         other => cast_to(other, ct, arena)?,
                     };
                 }
@@ -1939,7 +1962,7 @@ pub fn eval_full<'a>(
                 Datum::Null => Ok(Datum::Null),
                 // A record: select the field by name (records carry lowercase
                 // field names — `f1,f2,…` for ROW(), column names for a row).
-                Datum::Record(fields) => {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => {
                     match fields.iter().find(|f| f.name.eq_ignore_ascii_case(field)) {
                         Some(f) => Ok(f.value),
                         None => Err(match base {
@@ -1956,6 +1979,24 @@ pub fn eval_full<'a>(
                             _ => crate::sql::exec::could_not_identify(field),
                         }),
                     }
+                }
+                Datum::CompositeText { slot, text } => {
+                    let catalog = hooks.catalog.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named composite catalog access is unavailable"
+                        )
+                    })?;
+                    let Datum::Composite { fields, .. } =
+                        catalog.materialize_composite(slot, text, arena)?
+                    else {
+                        unreachable!("catalog materializes named composites")
+                    };
+                    fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(field))
+                        .map(|f| f.value)
+                        .ok_or_else(|| crate::sql::exec::could_not_identify(field))
                 }
                 // The `_pg_expandarray` result is encoded as the 2-element array
                 // `[x, n]`; `.x`/`.f1` is the element and `.n`/`.f2` the ordinal.
@@ -3276,12 +3317,47 @@ pub fn record_star_expand<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
     match eval_full(base, arena, params, row, hooks)? {
-        Datum::Record(fields) => Ok(fields),
+        Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields),
+        Datum::CompositeText { slot, text } => {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?;
+            let Datum::Composite { fields, .. } =
+                catalog.materialize_composite(slot, text, arena)?
+            else {
+                unreachable!("catalog materializes named composites")
+            };
+            Ok(fields)
+        }
         other => Err(type_mismatch(
             "record expansion of a non-composite value",
             &other,
         )),
     }
+}
+
+/// Storage rows carry named composites as canonical text. Evaluation exposes
+/// the catalog-defined structural value before operators, grouping, joins, or
+/// set operations can observe it, so a text representation never becomes a
+/// second comparison semantics.
+fn materialize_named_composite<'a>(
+    value: Datum<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Datum::CompositeText { slot, text } = value else {
+        return Ok(value);
+    };
+    let catalog = hooks.catalog.ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        )
+    })?;
+    catalog.materialize_composite(slot, text, arena)
 }
 
 /// The `(key, value)` members a `json_each` / `jsonb_each` family call yields
@@ -4459,6 +4535,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         // The real enum type name is dynamic; this fallback is used only in
         // error messages where the catalog is not in scope.
         Datum::Enum { .. } => "enum",
+        Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
     }
 }
 

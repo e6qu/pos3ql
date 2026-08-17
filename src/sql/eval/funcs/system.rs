@@ -958,6 +958,25 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(regtype(referenced_oid, name));
                 }
+                // A named composite is represented structurally at execution
+                // time, while its PostgreSQL identity belongs to the catalog.
+                // Resolve that identity before the generic static-type path,
+                // whose structural representation is `record`.
+                if matches!(v, Datum::Composite { .. } | Datum::CompositeText { .. })
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.type_name(v.type_oid(), arena)?
+                {
+                    return Ok(regtype(v.type_oid(), name));
+                }
+                // Array subscripting yields a structural record value, but
+                // inference still retains the declared named-composite OID.
+                // Prefer that catalog identity to the structural runtime tag.
+                if let Some(referenced_oid) = exec::typeof_static_oid(args[0], row)
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.type_name(referenced_oid, arena)?
+                {
+                    return Ok(regtype(referenced_oid, name));
+                }
                 // PostgreSQL's pg_typeof reports the argument's *static* type —
                 // `current_user` is `name` though the value is plain text. The
                 // static answer is used whenever it is consistent with the
@@ -1037,6 +1056,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Macaddr8(_) => "macaddr8",
                     Datum::Record(_) => "record",
                     Datum::Enum { .. } => "enum",
+                    Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
                 };
                 Ok(regtype(referenced_oid, name))
             }

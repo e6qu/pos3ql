@@ -99,6 +99,12 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Enum { .. } => v,
             _ => return Err(cast_unsupported(&v, "enum")),
         },
+        ColType::Composite(_) => {
+            return Err(sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "cannot cast to a named composite without its catalog definition"
+            ));
+        }
         ColType::Bool => match v {
             Datum::Bool(_) => v,
             Datum::Int4(x) => Datum::Bool(x != 0),
@@ -732,14 +738,12 @@ fn classify_int_literal(s: &str) -> IntLiteral {
     for &c in db {
         if c == b'_' {
             if prev_underscore {
-                return Malformed; // `__` is not allowed
+                return Malformed;
             }
             prev_underscore = true;
             continue;
         }
         prev_underscore = false;
-        // A character that is not a digit for this radix is malformed input,
-        // not an overflow — the distinction the two error kinds rest on.
         if !(c as char).is_digit(radix) {
             return Malformed;
         }

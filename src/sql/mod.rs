@@ -350,6 +350,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterDomain { .. }
         | Stmt::DropDomain { .. }
         | Stmt::CreateEnum { .. }
+        | Stmt::CreateComposite { .. }
         | Stmt::AlterType { .. }
         | Stmt::DropType { .. }
         | Stmt::CreateIndex { .. }
@@ -1851,6 +1852,10 @@ impl Engine {
                     class: crate::storage::AccessClass::Enum,
                     slot: slot as u16,
                 }),
+                DdlUndo::CompositeCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Composite,
+                    slot: slot as u16,
+                }),
                 DdlUndo::IndexCreated(slot) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Index,
                     slot: slot as u16,
@@ -2235,6 +2240,16 @@ impl Engine {
                     );
                 }
                 DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
+                DdlUndo::CompositeCreated(slot) => {
+                    self.storage.commit_composite_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Composite,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::EnumAltered { slot, .. } => {
                     self.storage.commit_enum_alter(*slot as usize, txn.txid)
                 }
@@ -2439,6 +2454,9 @@ impl Engine {
                 self.storage.rollback_domain_alter(slot as usize, prior)
             }
             DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
+            DdlUndo::CompositeCreated(slot) => {
+                self.storage.rollback_composite_create(slot as usize)
+            }
             DdlUndo::EnumDropped(slot) => {
                 self.storage.rollback_enum_drop(slot as usize, txid);
             }
@@ -5185,6 +5203,13 @@ impl Engine {
         // every name resolution below reads it from storage.
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
+        for (slot, composite) in self.storage.live_composites() {
+            exec::register_named_composite_shape(
+                slot as u16,
+                composite.name.as_str(),
+                composite.fields(),
+            );
+        }
         let session_user = guc.session_user();
         eval::funcs::system::set_session_user(session_user.as_str());
         let current_role = guc.current_role();
@@ -5770,6 +5795,14 @@ impl Engine {
                 txn,
                 name,
                 labels,
+                responder,
+            ),
+            Stmt::CreateComposite { name, fields } => exec::create_composite(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                fields,
                 responder,
             ),
             Stmt::AlterType { name, action } => exec::alter_type(
@@ -7023,6 +7056,10 @@ fn requalify_schema_element<'a>(
             name: requalify(*name)?,
             labels,
         },
+        ast::CreateSchemaElement::Composite { name, fields } => Stmt::CreateComposite {
+            name: requalify(*name)?,
+            fields,
+        },
     };
     arena
         .alloc(rewritten)
@@ -7695,6 +7732,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             } else {
                 storage.create_enum(def.schema, def.name, spec, 0)?;
             }
+        }
+        WalOp::CreateComposite(def) => {
+            let spec = crate::storage::CompositeSpec {
+                fields: def.fields,
+                n_fields: def.n_fields,
+            };
+            storage.create_composite(def.schema, def.name, spec, 0)?;
         }
         WalOp::DropEnum { schema, name } => {
             if let Some(slot) = storage.drop_enum(schema, name, 0)? {

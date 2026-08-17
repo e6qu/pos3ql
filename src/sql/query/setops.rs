@@ -8,7 +8,6 @@
 
 use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
-use crate::pg::wire::WireFull;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
 use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
@@ -178,8 +177,10 @@ pub fn set_query<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        if responder.data_row(&out[..n_cols]).is_err() {
-            return Err(WireFull);
+        match super::emit_data_row(storage, txid, arena, responder, &out[..n_cols]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(wire) => return Err(wire),
         }
         emitted += 1;
     }
@@ -418,8 +419,7 @@ fn external_set_leaf<'a>(
             }
             let mut coerced = [Datum::Null; MAX_PROJ];
             for column in 0..target.len() {
-                coerced[column] =
-                    crate::sql::eval::cast_to(values[column], target[column], context.arena)?;
+                coerced[column] = coerce_set_value(values[column], target[column], context.arena)?;
             }
             context
                 .storage
@@ -850,7 +850,17 @@ fn external_set_query<'a>(
                             Err(error) => return sql_fail(error),
                         };
                     }
-                    responder.data_row(&values[..target.len()])?;
+                    match super::emit_data_row(
+                        storage,
+                        txid,
+                        arena,
+                        responder,
+                        &values[..target.len()],
+                    ) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
                     emitted += 1;
                 }
                 if query.with_ties && limit > 0 && logical + 1 == window {
@@ -1011,6 +1021,26 @@ fn register_first_leaf_record_shapes(
 
 /// The common type of two set-operation columns: equal types, the numeric
 /// tower, or (else) an error signalled by None.
+fn coerce_set_value<'a>(
+    value: Datum<'a>,
+    target: ColType,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match (value, target) {
+        (value @ Datum::Composite { slot, .. }, ColType::Composite(expected))
+            if slot == expected =>
+        {
+            Ok(value)
+        }
+        (value @ Datum::CompositeText { slot, .. }, ColType::Composite(expected))
+            if slot == expected =>
+        {
+            Ok(value)
+        }
+        (value, target) => crate::sql::eval::cast_to(value, target, arena),
+    }
+}
+
 fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if a == b {
         return Some(a);
@@ -1282,7 +1312,7 @@ fn eval_set_leaf<'a>(
             }
             let mut coerced = [Datum::Null; MAX_PROJ];
             for c in 0..n {
-                coerced[c] = crate::sql::eval::cast_to(vals[c], target[c], arena)?;
+                coerced[c] = coerce_set_value(vals[c], target[c], arena)?;
             }
             rows[at] = exec::encode_projected_pub(&coerced[..n], arena)?;
             at += 1;

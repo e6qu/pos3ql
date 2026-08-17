@@ -1413,12 +1413,12 @@ fn external_materialized_select<'a>(
         None,
         limit,
         offset,
-        &mut |values, _rowids| {
-            if responder.data_row(values).is_err() {
+        &mut |values, _rowids| match super::emit_data_row(storage, txid, arena, responder, values) {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
                 wire_full = true;
                 Ok(false)
-            } else {
-                Ok(true)
             }
         },
     ) {
@@ -1628,7 +1628,11 @@ pub(crate) fn materialized_select<'a>(
                 accepted += 1;
                 continue;
             }
-            responder.data_row(&out[..width])?;
+            match super::emit_data_row(storage, txid, arena, responder, &out[..width]) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return sql_fail(error),
+                Err(wire) => return Err(wire),
+            }
             accepted += 1;
             emitted += 1;
             if emitted == limit {
@@ -1675,7 +1679,11 @@ pub(crate) fn materialized_select<'a>(
             return sql_fail(e);
         }
         if (index as u64) >= offset {
-            responder.data_row(&out[..width])?;
+            match super::emit_data_row(storage, txid, arena, responder, &out[..width]) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return sql_fail(error),
+                Err(wire) => return Err(wire),
+            }
             emitted += 1;
         }
     }

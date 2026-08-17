@@ -2098,7 +2098,8 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         &mut budget,
         "CREATE TYPE binary_state AS ENUM ('ready', 'blocked'); \
          CREATE DOMAIN binary_positive AS integer CHECK (VALUE > 0); \
-         CREATE DOMAIN binary_required AS integer NOT NULL",
+         CREATE DOMAIN binary_required AS integer NOT NULL; \
+         CREATE TYPE binary_coordinate AS (x integer, y integer)",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
@@ -2110,6 +2111,12 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         engine
             .storage
             .domain_slot("public", "binary_positive", 0)
+            .unwrap() as u16,
+    );
+    let composite_oid = crate::sql::types::oid::composite_oid(
+        engine
+            .storage
+            .composite_slot("public", "binary_coordinate", 0)
             .unwrap() as u16,
     );
     let transaction = TxnState::new(&mut budget, 64).unwrap();
@@ -2136,6 +2143,39 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .unwrap()
             .to_string(),
         "7"
+    );
+    let composite_binary = [
+        0, 0, 0, 2, // field count
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 4, // x int4
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 8, // y int4
+    ];
+    assert_eq!(
+        engine
+            .decode_binary_parameter(composite_oid, &composite_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "(4,8)"
+    );
+    let composite_array_oid = crate::sql::types::oid::composite_array_oid(
+        engine
+            .storage
+            .composite_slot("public", "binary_coordinate", 0)
+            .unwrap() as u16,
+    );
+    let mut composite_array_binary = Vec::new();
+    composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
+    composite_array_binary.extend_from_slice(&0_i32.to_be_bytes());
+    composite_array_binary.extend_from_slice(&composite_oid.to_be_bytes());
+    composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
+    composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
+    composite_array_binary.extend_from_slice(&(composite_binary.len() as i32).to_be_bytes());
+    composite_array_binary.extend_from_slice(&composite_binary);
+    assert_eq!(
+        engine
+            .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{\"(4,8)\"}"
     );
     assert_eq!(
         engine
@@ -12904,7 +12944,7 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
 fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body() {
     let config = test_config("analyze-wal-recovery");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -12943,7 +12983,7 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body()
         );
     }
 
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -14919,6 +14959,405 @@ fn fetch_first_and_with_ties() {
         "SELECT v FROM ft UNION ALL SELECT v FROM ft ORDER BY v FETCH FIRST 1 ROWS WITH TIES",
     );
     assert_eq!(data_rows(&bytes), ["10", "10", "10", "10"]);
+}
+
+#[test]
+fn named_composite_type_is_transactional_and_catalog_visible() {
+    let (mut e, mut b) = test_engine();
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TYPE address AS (street text, zip integer)",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT typname, typtype, typcategory, typelem <> 0 FROM pg_type WHERE typname IN ('address', '_address') ORDER BY typname",
+    );
+    assert_eq!(data_rows(&bytes), ["_address|b|A|t", "address|c|C|f"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT c.relkind, t.typrelid = c.oid, c.reltype = t.oid
+           FROM pg_type t
+           JOIN pg_class c ON c.oid = t.typrelid
+          WHERE t.typname = 'address'",
+    );
+    assert_eq!(data_rows(&bytes), ["c|t|t"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT attname, atttypid FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'address') ORDER BY attnum",
+    );
+    assert_eq!(data_rows(&bytes), ["street|25", "zip|23"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT (ROW('Road', 7)::address).street, (ROW('Road', 7)::address).zip",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["Road|7"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE address_arrays (values address[])",
+    );
+    let inserted = run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO address_arrays VALUES (ARRAY[ROW('Park', 3)::address])",
+    );
+    assert!(
+        !String::from_utf8_lossy(&inserted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    let bytes = run_with(&mut e, &mut b, "SELECT values FROM address_arrays");
+    assert_eq!(
+        data_rows(&bytes),
+        ["{\"(Park,3)\"}"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT pg_typeof(values), pg_typeof(values[1]) FROM address_arrays",
+    );
+    assert_eq!(data_rows(&bytes), ["address[]|address"]);
+    let address_oid = crate::sql::types::oid::composite_oid(
+        e.storage.composite_slot("public", "address", 0).unwrap() as u16,
+    );
+    let copy_array_binary = run_with(
+        &mut e,
+        &mut b,
+        "COPY address_arrays TO STDOUT (FORMAT binary)",
+    );
+    let expected_array_prefix = [
+        0, 1, // COPY field count
+        0, 0, 0, 52, // array field length
+        0, 0, 0, 1, // ndim
+        0, 0, 0, 0, // has-null
+    ];
+    assert!(
+        copy_array_binary
+            .windows(expected_array_prefix.len())
+            .any(|window| window == expected_array_prefix)
+    );
+    assert!(
+        copy_array_binary
+            .windows(4)
+            .any(|window| window == address_oid.to_be_bytes())
+    );
+    run_with(&mut e, &mut b, "CREATE TABLE addresses (value address)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO addresses VALUES (ROW('Road', 7)::address)",
+    );
+    let bytes = run_with(&mut e, &mut b, "SELECT value FROM addresses");
+    assert_eq!(
+        data_rows(&bytes),
+        ["(Road,7)"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT pg_typeof(value) FROM addresses"
+        )),
+        ["address"]
+    );
+    let arena = Arena::new(&mut b, "composite binary result", 1 << 18).unwrap();
+    let mut buffer = crate::mem::FixedBuf::new(&mut b, "composite binary send", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut b, 128).unwrap();
+    let mut pool = test_pool(&mut b);
+    let mut cursors = test_cursors(&mut b);
+    let mut guc = GucState::new();
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "SELECT value FROM addresses",
+                &arena,
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    {
+        let binary = buffer.readable();
+        let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+        let payload = &binary[row_at + 5..];
+        assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 28);
+        assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 2);
+        assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 25);
+        assert_eq!(&payload[18..22], b"Road");
+        assert_eq!(i32::from_be_bytes(payload[22..26].try_into().unwrap()), 23);
+        assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 7);
+    }
+    buffer.clear();
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "SELECT values FROM address_arrays",
+                &arena,
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    {
+        let binary = buffer.readable();
+        let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+        let payload = &binary[row_at + 5..];
+        assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
+        assert_eq!(
+            i32::from_be_bytes(payload[2..6].try_into().unwrap()),
+            52,
+            "{binary:?}"
+        );
+        assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_be_bytes(payload[14..18].try_into().unwrap()),
+            address_oid
+        );
+        assert_eq!(i32::from_be_bytes(payload[26..30].try_into().unwrap()), 28);
+        assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 2);
+        assert_eq!(i32::from_be_bytes(payload[34..38].try_into().unwrap()), 25);
+        assert_eq!(&payload[42..46], b"Park");
+        assert_eq!(i32::from_be_bytes(payload[46..50].try_into().unwrap()), 23);
+        assert_eq!(i32::from_be_bytes(payload[54..58].try_into().unwrap()), 3);
+    }
+    let copy_binary = run_with(&mut e, &mut b, "COPY addresses TO STDOUT (FORMAT binary)");
+    let expected_copy_record = [
+        0, 1, // COPY field count
+        0, 0, 0, 28, // record length
+        0, 0, 0, 2, // record field count
+        0, 0, 0, 25, 0, 0, 0, 4, b'R', b'o', b'a', b'd', 0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 7,
+    ];
+    assert!(
+        copy_binary
+            .windows(expected_copy_record.len())
+            .any(|window| window == expected_copy_record),
+        "{:?}",
+        copy_binary
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT (value).street, (value).zip FROM addresses",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["Road|7"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(&mut e, &mut b, "SELECT (value).* FROM addresses");
+    assert_eq!(
+        data_rows(&bytes),
+        ["Road|7"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "UPDATE addresses SET value = ROW('Square', 11)::address RETURNING (value).*",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["Square|11"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO addresses VALUES (ROW('Square', 11)::address), (ROW('Hill', 2)::address)",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT value, count(*) FROM addresses GROUP BY value ORDER BY value",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["(Hill,2)|1", "(Square,11)|2"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "WITH copied AS (SELECT value FROM addresses) SELECT (value).street FROM copied ORDER BY 1",
+    );
+    assert_eq!(data_rows(&bytes), ["Hill", "Square", "Square"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT value FROM addresses WHERE value = ROW('Square', 11)::address ORDER BY value",
+    );
+    assert_eq!(data_rows(&bytes), ["(Square,11)", "(Square,11)"]);
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT value FROM addresses UNION SELECT value FROM addresses ORDER BY value",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["(Hill,2)", "(Square,11)"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT count(*) FROM addresses a JOIN addresses b ON a.value = b.value",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["5"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT (value).street, count(*) OVER (PARTITION BY value) FROM addresses ORDER BY 1",
+    );
+    assert_eq!(data_rows(&bytes), ["Hill|1", "Square|2", "Square|2"]);
+    let bytes = run_with(&mut e, &mut b, "SELECT ('(Lane,9)'::address).zip");
+    assert_eq!(
+        data_rows(&bytes),
+        ["9"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let mut transaction = TxnState::new(&mut b, 128).unwrap();
+    let mut guc = GucState::new();
+    run_session_transaction(&mut e, &mut b, &mut transaction, &mut guc, "BEGIN");
+    run_session_transaction(
+        &mut e,
+        &mut b,
+        &mut transaction,
+        &mut guc,
+        "CREATE TYPE discarded AS (v integer)",
+    );
+    run_session_transaction(&mut e, &mut b, &mut transaction, &mut guc, "ROLLBACK");
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT count(*) FROM pg_type WHERE typname = 'discarded'",
+    );
+    assert_eq!(data_rows(&bytes), ["0"]);
+    let duplicate = run_with(&mut e, &mut b, "CREATE TYPE address AS (other text)");
+    assert!(String::from_utf8_lossy(&duplicate).contains("42710"));
+}
+
+#[test]
+fn named_composites_survive_wal_and_checkpoint_recovery() {
+    let mut config = test_config("composite-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("composite-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for statement in [
+            "CREATE TYPE coordinate AS (x integer, y integer)",
+            "CREATE TYPE place AS (name text, point coordinate)",
+            "CREATE TABLE durable_places (value place)",
+            "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
+            "CHECKPOINT",
+        ] {
+            let output = run_with(&mut engine, &mut budget, statement);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).name, ((value).point).x, ((value).point).y FROM durable_places",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["Station|4|8"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT typname FROM pg_type WHERE typname IN ('coordinate', 'place') ORDER BY typname",
+    );
+    assert_eq!(data_rows(&bytes), ["coordinate", "place"]);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn composite_text_uses_postgresql_quoting_and_null_rules() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        r##"CREATE TYPE quoted_pair AS (first text, second text);
+           CREATE TABLE quoted_pairs (value quoted_pair);
+           INSERT INTO quoted_pairs VALUES ('("","comma, \"quote\"")'::quoted_pair)"##,
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).first, (value).second FROM quoted_pairs",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["|comma, \"quote\""],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ('(,present)'::quoted_pair).first IS NULL, ('(,present)'::quoted_pair).second",
+    );
+    assert_eq!(data_rows(&bytes), ["t|present"]);
 }
 
 #[test]

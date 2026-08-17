@@ -909,7 +909,11 @@ pub(super) fn grouped_select<'a>(
                 Err(error) => return sql_fail(error),
             };
         }
-        responder.data_row(&out[..width])?;
+        match super::emit_data_row(storage, txid, arena, responder, &out[..width]) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(wire) => return Err(wire),
+        }
         emitted += 1;
     }
     let tag = stack_format!(48, "SELECT {}", emitted);

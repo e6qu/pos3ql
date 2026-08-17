@@ -190,20 +190,25 @@ psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
 CREATE SCHEMA outbound_dump;
 CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
 CREATE TYPE outbound_dump.location AS (x integer, y integer);
+CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location;
 CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   mood outbound_dump.mood NOT NULL,
   location outbound_dump.location NOT NULL,
+  marked_location outbound_dump.location_domain NOT NULL,
+  marked_locations outbound_dump.location_domain[] NOT NULL,
   note text DEFAULT 'hello'
 );
-INSERT INTO outbound_dump.items(mood,location,note) VALUES
-  ('ok', ROW(1,2)::outbound_dump.location, 'one'),
-  ('great', ROW(3,4)::outbound_dump.location, 'two');
+INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,note) VALUES
+  ('ok', ROW(1,2)::outbound_dump.location, ROW(10,20)::outbound_dump.location_domain,
+   ARRAY[ROW(100,200)::outbound_dump.location_domain], 'one'),
+  ('great', ROW(3,4)::outbound_dump.location, ROW(30,40)::outbound_dump.location_domain,
+   ARRAY[ROW(300,400)::outbound_dump.location_domain], 'two');
 CREATE SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
 CREATE VIEW outbound_dump.item_view AS
-  SELECT id,mood,location,note FROM outbound_dump.items;
+  SELECT id,mood,location,marked_location,marked_locations,note FROM outbound_dump.items;
 CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
 INSERT INTO outbound_dump.view_base VALUES (1, 10), (2, 20);
 CREATE VIEW outbound_dump.writable_view AS
@@ -246,9 +251,12 @@ if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_r
 else
   outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
-      SELECT id,mood,(location).x,(location).y,note FROM outbound_dump.item_view ORDER BY id;
-      INSERT INTO outbound_dump.items(mood,location,note)
-        VALUES ('ok', ROW(5,6)::outbound_type_target.location, 'three') RETURNING id;
+      SELECT id,mood,(location).x,(location).y,(marked_location).x,
+             (marked_locations[1]).y,note FROM outbound_dump.item_view ORDER BY id;
+      INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,note)
+        VALUES ('ok', ROW(5,6)::outbound_type_target.location,
+                ROW(50,60)::outbound_dump.location_domain,
+                ARRAY[ROW(500,600)::outbound_dump.location_domain], 'three') RETURNING id;
       SELECT is_identity,identity_generation
         FROM information_schema.columns
        WHERE table_schema='outbound_dump'
@@ -266,7 +274,7 @@ else
         WHERE target.id = source.id AND source.id = 2 RETURNING target.id,target.value;
       SELECT id,value FROM outbound_dump.view_base ORDER BY id;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|one\n2|great|3|4|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300'
+  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

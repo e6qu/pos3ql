@@ -5174,7 +5174,7 @@ impl Storage {
                 (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::Composite => {
-                let definition = self.composite(slot);
+                let definition = self.composite_for(slot, txid);
                 (definition.schema, definition.name)
             }
         }

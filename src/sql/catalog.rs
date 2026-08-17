@@ -4467,6 +4467,52 @@ fn pg_depend<'a>(
         )?;
     }
 
+    // A domain is ordered after its parent domain or direct user-defined base
+    // type. pg_dump reads this graph to emit a restorable type definition.
+    for domain_slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(domain_slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let typed_base = || match domain.base {
+            ColType::Enum(slot) => Some(crate::sql::types::oid::enum_oid(slot)),
+            ColType::Composite(slot) => Some(crate::sql::types::oid::composite_oid(slot)),
+            _ => None,
+        };
+        let referenced_type = if let Some(parent) = domain.base_domain {
+            storage
+                .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
+                .map(domain_oid)
+        } else {
+            domain
+                .base_user_type
+                .and_then(|base| {
+                    storage
+                        .enum_slot(base.schema.as_str(), base.name.as_str(), txid)
+                        .map(|slot| crate::sql::types::oid::enum_oid(slot as u16))
+                        .or_else(|| {
+                            composite_type_oid(
+                                storage,
+                                base.schema.as_str(),
+                                base.name.as_str(),
+                                txid,
+                            )
+                        })
+                })
+                .or_else(typed_base)
+        };
+        if let Some(referenced_type) = referenced_type {
+            push(
+                PG_TYPE_OID,
+                domain_oid(domain_slot),
+                PG_TYPE_OID,
+                referenced_type,
+                0,
+                "n",
+            )?;
+        }
+    }
+
     let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| match dependency.class
     {
         crate::storage::DependencyClass::Table => {

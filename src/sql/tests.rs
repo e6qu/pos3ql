@@ -3387,6 +3387,16 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
             "composite_values|5|YES|ARRAY",
         ]
     );
+    let domain_dependencies = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT objid, refobjid FROM pg_depend WHERE refobjid = 230000",
+    ));
+    assert_eq!(
+        domain_dependencies,
+        ["110001|230000"],
+        "domain type dependencies: {domain_dependencies:?}"
+    );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
     let mut observer = TxnState::new(&mut budget, 256).unwrap();
     run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");

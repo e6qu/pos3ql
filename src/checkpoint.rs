@@ -3169,6 +3169,14 @@ impl Checkpointer {
             let _ = write!(line, " ");
             hex(
                 &mut line,
+                d.base_domain
+                    .as_ref()
+                    .map(|identity| identity.schema.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
                 d.base_user_type
                     .as_ref()
                     .map(|identity| identity.name.as_str())
@@ -3178,14 +3186,6 @@ impl Checkpointer {
             hex(
                 &mut line,
                 d.base_user_type
-                    .as_ref()
-                    .map(|identity| identity.schema.as_str())
-                    .unwrap_or(""),
-            );
-            let _ = write!(line, " ");
-            hex(
-                &mut line,
-                d.base_domain
                     .as_ref()
                     .map(|identity| identity.schema.as_str())
                     .unwrap_or(""),

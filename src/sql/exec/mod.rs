@@ -24588,8 +24588,7 @@ pub(crate) fn decode_composite_text<'a>(
     let mut at = 0usize;
     for (index, out) in values.iter_mut().enumerate() {
         let rest = &body[at..];
-        let (raw, used, quoted) = if rest.starts_with('"') {
-            let source = &rest[1..];
+        let (raw, used, quoted) = if let Some(source) = rest.strip_prefix('"') {
             let mut read = 0;
             let mut written = 0;
             let decoded = arena.alloc_slice_with(source.len(), |_| 0u8).map_err(|_| {

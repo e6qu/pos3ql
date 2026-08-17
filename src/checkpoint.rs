@@ -2289,7 +2289,7 @@ impl Checkpointer {
                     }
                     let mut fields = [crate::storage::CompositeFieldDef::EMPTY;
                         crate::storage::MAX_COMPOSITE_FIELDS];
-                    for index in 0..n_fields {
+                    for field in fields.iter_mut().take(n_fields) {
                         let field_name = hexstr(words.next(), "cmp field name missing")?;
                         let code: u8 = parse_field(words.next(), "cmp field type missing")?;
                         let type_mod: i32 = parse_field(words.next(), "cmp field typmod missing")?;
@@ -2307,7 +2307,7 @@ impl Checkpointer {
                                 ));
                             }
                         };
-                        fields[index] = crate::storage::CompositeFieldDef {
+                        *field = crate::storage::CompositeFieldDef {
                             name: sql_name(&field_name)?,
                             ctype: crate::sql::types::ColType::from_code(code)
                                 .ok_or(CheckpointSetupError::Corrupt("bad composite field type"))?,

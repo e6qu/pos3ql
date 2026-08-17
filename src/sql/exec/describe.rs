@@ -245,7 +245,7 @@ fn describe_record_star<'q>(
                     }
                 }
             });
-            return push_err.map_or(Ok(()), Err);
+            push_err.map_or(Ok(()), Err)
         }
         // A record-typed column (or nested record field) with a registered
         // shape expands to its fields. Names come from static leases (fN,

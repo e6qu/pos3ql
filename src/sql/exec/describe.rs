@@ -207,7 +207,11 @@ fn describe_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                for field in storage.expect("checked").composite(slot as usize).fields() {
+                for field in storage
+                    .expect("checked")
+                    .composite(slot as usize)
+                    .active_fields_for(txid)
+                {
                     push(
                         ColDesc::of_type(field.name.as_str(), field.ctype)
                             .with_type_mod(field.type_mod),
@@ -1039,6 +1043,16 @@ pub fn record_shape(
             ) =>
         {
             let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
+                unreachable!()
+            };
+            visit_composite_slot_shape(slot, visit)
+        }
+        Expr::Subscript { .. } if matches!(infer_type_res(base, columns), Ok((oid, _)) if matches!(coltype_of_oid(oid), Some(ColType::Composite(_)))) =>
+        {
+            let Ok((type_oid, _)) = infer_type_res(base, columns) else {
+                unreachable!()
+            };
+            let Some(ColType::Composite(slot)) = coltype_of_oid(type_oid) else {
                 unreachable!()
             };
             visit_composite_slot_shape(slot, visit)

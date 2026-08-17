@@ -233,6 +233,13 @@ pub(crate) enum DdlUndo {
     EnumCreated(u32),
     /// CREATE TYPE (...): named composites are distinct from anonymous records.
     CompositeCreated(u32),
+    /// ALTER TYPE on a named composite staged a private physical layout.
+    CompositeAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingCompositeDefinition>,
+    },
+    /// DROP TYPE (...): revive the physical type slot on rollback.
+    CompositeDropped(u32),
     /// DROP TYPE (enum) at this slot — undo by reviving it.
     EnumDropped(u32),
     /// ALTER TYPE staged a definition visible only to its transaction.

@@ -23,7 +23,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Record(_) | Datum::Composite { .. } => {
                 unreachable!("record cannot be a stored column value")
             }
-            Datum::CompositeText { text, .. } => 4 + text.len(),
+            Datum::CompositeText { text, .. } => 5 + text.len(),
             Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
@@ -81,10 +81,15 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             Datum::Record(_) | Datum::Composite { .. } => {
                 unreachable!("record cannot be a stored column value")
             }
-            Datum::CompositeText { text, .. } => {
-                rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
-                rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
-                take = 4 + text.len();
+            Datum::CompositeText {
+                physical_fields,
+                text,
+                ..
+            } => {
+                rest[0] = *physical_fields;
+                rest[1..5].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                rest[5..5 + text.len()].copy_from_slice(text.as_bytes());
+                take = 5 + text.len();
             }
             Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
             Datum::Regtype {
@@ -332,8 +337,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             return Err(corrupt());
         }
         ColType::Composite(_) => {
-            let length = bytes.get(..4).ok_or_else(corrupt)?;
-            Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let length = bytes.get(1..5).ok_or_else(corrupt)?;
+            Some(5 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
     };
     let length = fixed.expect("all stored types have a length");
@@ -664,13 +669,19 @@ pub(crate) fn decode<'a>(
                 out[i] = Datum::Enum { slot, sort, label };
             }
             ColType::Composite(slot) => {
+                let physical_fields = *bytes.get(at).ok_or_else(corrupt)?;
+                at += 1;
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
                 at += 4;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
-                out[i] = Datum::CompositeText { slot, text };
+                out[i] = Datum::CompositeText {
+                    slot,
+                    physical_fields,
+                    text,
+                };
             }
         }
     }

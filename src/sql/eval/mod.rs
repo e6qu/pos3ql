@@ -490,6 +490,7 @@ pub trait CatalogAccess {
     fn materialize_composite<'a>(
         &self,
         _slot: u16,
+        _physical_fields: u8,
         _text: &'a str,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -1186,8 +1187,21 @@ pub fn eval_full<'a>(
             } else {
                 None
             };
-            let l = eval_full(left, arena, params, row, hooks)?;
-            let r = eval_full(right, arena, params, row, hooks)?;
+            // A column reference materializes its stored composite layout, but
+            // a cast or binary Bind parameter can still carry the same value
+            // as `CompositeText`. Normalize both operands at this comparison
+            // choke point so historical physical layouts never acquire a
+            // second equality or index-key semantics.
+            let l = materialize_named_composite(
+                eval_full(left, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
+            let r = materialize_named_composite(
+                eval_full(right, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
             // `array || NULL` resolution depends on the NULL operand's static
             // type, which the datum has lost — resolve it here where the
             // expression is still available.
@@ -1758,6 +1772,7 @@ pub fn eval_full<'a>(
                         Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
                             Datum::CompositeText {
                                 slot,
+                                physical_fields: 0,
                                 text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
                             }
                         }
@@ -1980,7 +1995,11 @@ pub fn eval_full<'a>(
                         }),
                     }
                 }
-                Datum::CompositeText { slot, text } => {
+                Datum::CompositeText {
+                    slot,
+                    physical_fields,
+                    text,
+                } => {
                     let catalog = hooks.catalog.ok_or_else(|| {
                         sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1988,7 +2007,7 @@ pub fn eval_full<'a>(
                         )
                     })?;
                     let Datum::Composite { fields, .. } =
-                        catalog.materialize_composite(slot, text, arena)?
+                        catalog.materialize_composite(slot, physical_fields, text, arena)?
                     else {
                         unreachable!("catalog materializes named composites")
                     };
@@ -3318,7 +3337,11 @@ pub fn record_star_expand<'a>(
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
     match eval_full(base, arena, params, row, hooks)? {
         Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields),
-        Datum::CompositeText { slot, text } => {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
             let catalog = hooks.catalog.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3326,7 +3349,7 @@ pub fn record_star_expand<'a>(
                 )
             })?;
             let Datum::Composite { fields, .. } =
-                catalog.materialize_composite(slot, text, arena)?
+                catalog.materialize_composite(slot, physical_fields, text, arena)?
             else {
                 unreachable!("catalog materializes named composites")
             };
@@ -3348,7 +3371,12 @@ fn materialize_named_composite<'a>(
     hooks: &EvalHooks<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let Datum::CompositeText { slot, text } = value else {
+    let Datum::CompositeText {
+        slot,
+        physical_fields,
+        text,
+    } = value
+    else {
         return Ok(value);
     };
     let catalog = hooks.catalog.ok_or_else(|| {
@@ -3357,7 +3385,7 @@ fn materialize_named_composite<'a>(
             "named composite catalog access is unavailable"
         )
     })?;
-    catalog.materialize_composite(slot, text, arena)
+    catalog.materialize_composite(slot, physical_fields, text, arena)
 }
 
 /// The `(key, value)` members a `json_each` / `jsonb_each` family call yields

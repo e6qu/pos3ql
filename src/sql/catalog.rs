@@ -2768,7 +2768,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_COMPOSITE) as usize;
-        let definition = storage.composite(slot);
+        let definition = storage.composite_for(slot, txid);
         (
             definition.schema,
             definition.name,
@@ -2781,7 +2781,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_COMPOSITE_ARRAY) as usize;
-        let definition = storage.composite(slot);
+        let definition = storage.composite_for(slot, txid);
         (
             definition.schema,
             definition.name,
@@ -3768,7 +3768,7 @@ fn pg_class<'a>(
     // A named composite owns a backing catalog relation. It is not a
     // user-addressable table, but `pg_type.typrelid` and `pg_attribute` must
     // resolve through this `relkind = 'c'` row exactly as they do in PostgreSQL.
-    for (slot, composite) in storage.live_composites() {
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
@@ -3782,7 +3782,7 @@ fn pg_class<'a>(
                 text(composite.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
                 text("c", arena)?,
-                Datum::Int4(composite.n_fields as i32),
+                Datum::Int4(composite.active_field_count() as i32),
                 Datum::Float8(-1.0),
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -4441,6 +4441,10 @@ fn pg_depend<'a>(
             PG_TYPE_OID,
             crate::sql::types::oid::enum_oid(dependency.slot),
         )),
+        crate::storage::DependencyClass::Composite => Some((
+            PG_TYPE_OID,
+            crate::sql::types::oid::composite_oid(dependency.slot),
+        )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
         push(
@@ -4800,8 +4804,8 @@ fn pg_attribute<'a>(
     }
     // Standalone composite fields belong to the generated `pg_class` relation
     // named by their `pg_type.typrelid`, just as PostgreSQL does.
-    for (slot, composite) in storage.live_composites() {
-        for (index, field) in composite.fields().iter().enumerate() {
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
+        for field in composite.fields() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
@@ -4824,20 +4828,39 @@ fn pg_attribute<'a>(
                 &[
                     Datum::Int4(named_composite_relation_oid(slot)),
                     text(field.name.as_str(), arena)?,
-                    Datum::Int4(catalog_column_type_oid(storage, &column, txid)?),
-                    Datum::Int4(index as i32 + 1),
-                    Datum::Bool(false),
-                    Datum::Int4(i32::from(field.ctype.typlen())),
-                    Datum::Int4(field.type_mod),
+                    if field.dropped {
+                        Datum::Int4(0)
+                    } else {
+                        Datum::Int4(catalog_column_type_oid(storage, &column, txid)?)
+                    },
+                    Datum::Int4(i32::from(field.attribute_number)),
+                    Datum::Bool(field.not_null),
+                    if field.dropped {
+                        Datum::Int4(0)
+                    } else {
+                        Datum::Int4(i32::from(field.ctype.typlen()))
+                    },
+                    if field.dropped {
+                        Datum::Int4(-1)
+                    } else {
+                        Datum::Int4(field.type_mod)
+                    },
                     Datum::Bool(false),
                     Datum::Int4(0),
                     text("", arena)?,
                     text("", arena)?,
-                    text(if field.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text(
+                        if !field.dropped && field.ctype.typlen() < 0 {
+                            "x"
+                        } else {
+                            "p"
+                        },
+                        arena,
+                    )?,
                     text("", arena)?,
                     Datum::Int4(-1),
-                    Datum::Bool(false),
-                    Datum::Int4(index as i32 + 1),
+                    Datum::Bool(field.dropped),
+                    Datum::Int4(i32::from(field.attribute_number)),
                     text("i", arena)?,
                     Datum::Bool(true),
                     Datum::Null,
@@ -5590,7 +5613,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     // Named composite types have their own `pg_type` identity (typtype 'c')
     // and automatically-created array type. Attribute rows are synthesized
     // separately from the same bounded `CompositeDef` field list.
-    for (slot, composite) in storage.live_composites() {
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         let composite_oid = crate::sql::types::oid::composite_oid(slot as u16);
         let array_oid = crate::sql::types::oid::composite_array_oid(slot as u16);
         out[n] = row(
@@ -7504,8 +7527,8 @@ fn info_column_row<'a>(
 }
 
 /// The SQL-standard `data_type` spelling is intentionally less specific than
-/// PostgreSQL's OID. Domains report their base type, enums report
-/// `USER-DEFINED`, and arrays report `ARRAY`.
+/// PostgreSQL's OID. Domains report their base type, named enums and
+/// composites report `USER-DEFINED`, and arrays report `ARRAY`.
 fn information_schema_data_type(
     storage: &Storage,
     txid: u32,
@@ -7528,11 +7551,17 @@ fn information_schema_data_type(
         || (type_oid::FIRST_ENUM_ARRAY
             ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
             .contains(&oid)
+        || (type_oid::FIRST_COMPOSITE_ARRAY
+            ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+            .contains(&oid)
     {
         return Ok(StackStr::from_str("ARRAY"));
     }
     if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
         .contains(&oid)
+        || (type_oid::FIRST_COMPOSITE
+            ..type_oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+            .contains(&oid)
     {
         return Ok(StackStr::from_str("USER-DEFINED"));
     }

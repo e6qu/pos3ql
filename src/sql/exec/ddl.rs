@@ -155,7 +155,7 @@ pub(super) fn build_column(
                         None,
                     )
                 } else if let Some(slot) = storage.resolve_composite_slot(element_name, txid) {
-                    let definition = storage.composite(slot);
+                    let definition = storage.composite_for(slot, txid);
                     (
                         ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16)),
                         -1,
@@ -198,7 +198,7 @@ pub(super) fn build_column(
                         }
                         None => match storage.resolve_composite_slot(c.type_name, txid) {
                             Some(slot) => {
-                                let definition = storage.composite(slot);
+                                let definition = storage.composite_for(slot, txid);
                                 (
                                     ColType::Composite(slot as u16),
                                     -1,

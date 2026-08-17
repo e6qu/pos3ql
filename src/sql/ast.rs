@@ -1566,7 +1566,8 @@ pub enum AlterDomainAction<'a> {
     SetSchema(&'a str),
 }
 
-/// One `ALTER TYPE` action on an enum type.
+/// One `ALTER TYPE` action. Enum and named-composite actions are distinct
+/// variants, so execution cannot apply an enum mutation to an attribute layout.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterTypeAction<'a> {
     /// ADD VALUE [IF NOT EXISTS] 'label' [ {BEFORE|AFTER} 'existing' ].
@@ -1580,6 +1581,22 @@ pub enum AlterTypeAction<'a> {
     RenameTo(&'a str),
     /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
     RenameValue { from: &'a str, to: &'a str },
+    /// ADD ATTRIBUTE name type.
+    AddAttribute(CompositeField<'a>),
+    /// DROP ATTRIBUTE [IF EXISTS] name.
+    DropAttribute { name: &'a str, if_exists: bool },
+    /// RENAME ATTRIBUTE old TO new.
+    RenameAttribute { from: &'a str, to: &'a str },
+    /// ALTER ATTRIBUTE name [SET DATA] TYPE type.
+    AlterAttributeType {
+        name: &'a str,
+        type_name: &'a str,
+        type_mod: i32,
+    },
+    /// ALTER ATTRIBUTE name SET NOT NULL.
+    SetAttributeNotNull(&'a str),
+    /// ALTER ATTRIBUTE name DROP NOT NULL.
+    DropAttributeNotNull(&'a str),
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.

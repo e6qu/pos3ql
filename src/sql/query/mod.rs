@@ -580,10 +580,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn materialize_composite<'a>(
         &self,
         slot: u16,
+        physical_fields: u8,
         text: &'a str,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        super::exec::decode_composite_text(text, slot, self.storage, self.txid, arena)
+        super::exec::decode_stored_composite_text(
+            text,
+            slot,
+            physical_fields,
+            self.storage,
+            self.txid,
+            arena,
+        )
     }
 
     fn compare_text(
@@ -1238,7 +1246,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 def.visible_to(self.txid).then_some(def.name)
             }
             super::types::ArrElem::Composite(slot) => {
-                let def = self.storage.composite(slot as usize);
+                let def = self.storage.composite_for(slot as usize, self.txid);
                 def.visible_to(self.txid).then_some(def.name)
             }
             _ => None,
@@ -4685,9 +4693,11 @@ fn materialize_composite_outputs<'a>(
     };
     for value in values {
         *value = match *value {
-            Datum::CompositeText { slot, text } => {
-                catalog.materialize_composite(slot, text, arena)?
-            }
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => catalog.materialize_composite(slot, physical_fields, text, arena)?,
             other => other,
         };
     }
@@ -5417,7 +5427,7 @@ fn describe_scope_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                for field in storage.composite(slot as usize).fields() {
+                for field in storage.composite_for(slot as usize, txid).active_fields() {
                     let name = arena
                         .alloc_str(field.name.as_str())
                         .map_err(|_| arena_full())?;
@@ -5529,7 +5539,8 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, ColType)> {
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
-        let field = self.storage.composite(slot).fields().get(index)?;
+        let definition = self.storage.composite_for(slot, self.txid);
+        let field = definition.active_field(index)?;
         Some((
             crate::util::StackStr::from_str(field.name.as_str()),
             field.ctype,

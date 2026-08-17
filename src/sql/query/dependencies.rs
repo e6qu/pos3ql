@@ -688,6 +688,16 @@ fn collect_type(
                 dependencies,
             );
         }
+        if let Some(slot) = storage.composite_slot(schema, name, txid) {
+            let definition = storage.composite_for(slot, txid);
+            return record(
+                DependencyClass::Composite,
+                slot,
+                definition.schema,
+                definition.name,
+                dependencies,
+            );
+        }
         return Ok(());
     }
     for entry in path.entries() {
@@ -710,6 +720,16 @@ fn collect_type(
                     let definition = storage.enum_for(slot, txid);
                     return record(
                         DependencyClass::Enum,
+                        slot,
+                        definition.schema,
+                        definition.name,
+                        dependencies,
+                    );
+                }
+                if let Some(slot) = storage.composite_slot(schema.as_str(), bare, txid) {
+                    let definition = storage.composite_for(slot, txid);
+                    return record(
+                        DependencyClass::Composite,
                         slot,
                         definition.schema,
                         definition.name,

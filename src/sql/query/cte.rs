@@ -1942,7 +1942,9 @@ fn rewrite_stored_type_name<'a>(
     let Some(dependency) = dependencies.entries().iter().find(|dependency| {
         matches!(
             dependency.class,
-            crate::storage::DependencyClass::Domain | crate::storage::DependencyClass::Enum
+            crate::storage::DependencyClass::Domain
+                | crate::storage::DependencyClass::Enum
+                | crate::storage::DependencyClass::Composite
         ) && dependency.referenced_schema.as_str() == referenced_schema
             && dependency.referenced_name.as_str() == referenced_name
     }) else {
@@ -1959,6 +1961,12 @@ fn rewrite_stored_type_name<'a>(
             let definition = context
                 .storage
                 .enum_for(dependency.slot as usize, context.txid);
+            (definition.schema, definition.name)
+        }
+        crate::storage::DependencyClass::Composite => {
+            let definition = context
+                .storage
+                .composite_for(dependency.slot as usize, context.txid);
             (definition.schema, definition.name)
         }
         _ => unreachable!("stored type-name rewriting records only type dependencies"),

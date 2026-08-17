@@ -2250,6 +2250,12 @@ impl Engine {
                         txn.txid,
                     );
                 }
+                DdlUndo::CompositeAltered { slot, .. } => self
+                    .storage
+                    .commit_composite_alter(*slot as usize, txn.txid),
+                DdlUndo::CompositeDropped(slot) => {
+                    self.storage.commit_composite_drop(*slot as usize)
+                }
                 DdlUndo::EnumAltered { slot, .. } => {
                     self.storage.commit_enum_alter(*slot as usize, txn.txid)
                 }
@@ -2456,6 +2462,12 @@ impl Engine {
             DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
             DdlUndo::CompositeCreated(slot) => {
                 self.storage.rollback_composite_create(slot as usize)
+            }
+            DdlUndo::CompositeAltered { slot, prior } => {
+                self.storage.rollback_composite_alter(slot as usize, prior)
+            }
+            DdlUndo::CompositeDropped(slot) => {
+                self.storage.rollback_composite_drop(slot as usize, txid)
             }
             DdlUndo::EnumDropped(slot) => {
                 self.storage.rollback_enum_drop(slot as usize, txid);
@@ -5818,7 +5830,7 @@ impl Engine {
                 names,
                 if_exists,
                 cascade,
-            } => exec::drop_enum(
+            } => exec::drop_type(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
@@ -7733,12 +7745,31 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.create_enum(def.schema, def.name, spec, 0)?;
             }
         }
-        WalOp::CreateComposite(def) => {
+        WalOp::CreateComposite {
+            slot,
+            definition: def,
+        } => {
             let spec = crate::storage::CompositeSpec {
                 fields: def.fields,
                 n_fields: def.n_fields,
             };
-            storage.create_composite(def.schema, def.name, spec, 0)?;
+            let slot = slot as usize;
+            if storage.composite(slot).visible_to(0) {
+                let mut definition = storage.composite_for(slot, 0);
+                definition.schema = def.schema;
+                definition.name = def.name;
+                definition.fields = spec.fields;
+                definition.n_fields = spec.n_fields;
+                storage.stage_composite_alter(slot, definition, 0)?;
+                storage.commit_composite_alter(slot, 0);
+            } else {
+                storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
+            }
+        }
+        WalOp::DropComposite { schema, name } => {
+            if let Some(slot) = storage.drop_composite(schema, name, 0)? {
+                storage.commit_composite_drop(slot);
+            }
         }
         WalOp::DropEnum { schema, name } => {
             if let Some(slot) = storage.drop_enum(schema, name, 0)? {

@@ -304,6 +304,10 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
             | "pg_get_functiondef"
+            | "pg_get_function_arguments"
+            | "pg_get_function_identity_arguments"
+            | "pg_get_function_result"
+            | "pg_get_function_sqlbody"
             | "pg_get_expr"
             | "pg_get_viewdef"
             | "pg_table_size"
@@ -705,6 +709,39 @@ pub(crate) fn dispatch<'a>(
                         "function pg_get_functiondef(integer) does not exist"
                     )),
                 }
+            }
+            "pg_get_function_arguments"
+            | "pg_get_function_identity_arguments"
+            | "pg_get_function_result" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
+                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => return Ok(Datum::Null),
+                };
+                let value = if name == "pg_get_function_result" {
+                    cat.function_result(oid, arena)?
+                } else {
+                    cat.function_arguments(
+                        oid,
+                        name == "pg_get_function_identity_arguments",
+                        arena,
+                    )?
+                };
+                Ok(value.map(Datum::Text).unwrap_or(Datum::Null))
+            }
+            "pg_get_function_sqlbody" => {
+                arity(1)?;
+                // Supported bodies are stored as prosrc; pg_dump selects it
+                // whenever this SQL-standard parse-tree representation is NULL.
+                Ok(Datum::Null)
             }
             "obj_description" => {
                 // obj_description(objoid [, catalog]): the object's comment.

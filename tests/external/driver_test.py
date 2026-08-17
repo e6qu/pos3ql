@@ -83,12 +83,33 @@ cur.execute(
 )
 cur.execute("INSERT INTO drv_view VALUES (%s, %s) RETURNING id, value", (3, 30))
 assert cur.fetchone() == (3, 30)
+cur.execute(
+    "INSERT INTO drv_view (value, id) "
+    "SELECT value, id FROM (VALUES (%s, %s)) supplied(value, id) "
+    "RETURNING id, value",
+    (40, 4),
+)
+assert cur.fetchone() == (4, 40)
 cur.execute("UPDATE drv_view SET value = %s WHERE id = %s RETURNING id, value", (21, 2))
 assert cur.fetchone() == (2, 21)
 cur.execute("DELETE FROM drv_view WHERE id = %s RETURNING id", (1,))
 assert cur.fetchone() == (1,)
+cur.execute("CREATE TABLE drv_view_source (id int PRIMARY KEY, value int)")
+cur.execute("INSERT INTO drv_view_source VALUES (%s, %s), (%s, %s)", (2, 200, 4, 400))
+cur.execute(
+    "UPDATE drv_view AS target SET value = source.value FROM drv_view_source AS source "
+    "WHERE target.id = source.id RETURNING target.id, target.value"
+)
+joined_rows = cur.fetchall()
+assert sorted(joined_rows) == [(2, 200), (4, 400)], joined_rows
+cur.execute(
+    "DELETE FROM drv_view AS target USING drv_view_source AS source "
+    "WHERE target.id = source.id AND source.id = %s RETURNING id",
+    (2,),
+)
+assert cur.fetchone() == (2,)
 cur.execute("SELECT id, value FROM drv_view_base ORDER BY id")
-assert cur.fetchall() == [(2, 21), (3, 30)]
+assert cur.fetchall() == [(3, 30), (4, 400)]
 print("instead-of view DML extended protocol ok")
 
 # WITH before a data-modifying main statement travels through Parse/Bind/

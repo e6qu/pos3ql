@@ -22003,10 +22003,26 @@ pub(crate) fn instead_of_view_dml<'a>(
                 ));
             }
             if let Some(select) = insert.select {
-                if !insert.columns.is_empty() {
+                let target_count = if insert.columns.is_empty() {
+                    def.n_columns
+                } else {
+                    insert.columns.len()
+                };
+                let mut source_columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
+                let source_count = match super::query::describe_select(
+                    select,
+                    storage,
+                    txn.txid,
+                    arena,
+                    &mut source_columns,
+                ) {
+                    Ok(count) => count,
+                    Err(error) => return sql_fail(error),
+                };
+                if source_count != target_count {
                     return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "INSERT ... SELECT with a view column list is not supported for INSTEAD OF triggers"
+                        sqlstate::SYNTAX_ERROR,
+                        "INSERT has wrong number of expressions"
                     ));
                 }
                 let rows = match arena.alloc_slice_with(scratch.capacity(), |_| &[][..]) {
@@ -22030,11 +22046,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 rows.len()
                             ));
                         }
-                        let encoded = arena
-                            .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        rowenc::encode(values, encoded);
-                        rows[count] = encoded;
+                        rows[count] = encode_projected_pub(values, arena)?;
                         count += 1;
                         Ok(())
                     },
@@ -22042,15 +22054,25 @@ pub(crate) fn instead_of_view_dml<'a>(
                     return sql_fail(error);
                 }
                 for bytes in &rows[..count] {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    if let Err(error) = rowenc::decode(bytes, schema, &mut values) {
-                        return sql_fail(error);
+                    let mut selected = [Datum::Null; MAX_COLUMNS];
+                    for (index, value) in selected[..source_count].iter_mut().enumerate() {
+                        *value = decode_projected_pub(bytes, index);
                     }
-                    if values[..def.n_columns].len() != def.n_columns {
-                        return sql_fail(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "INSERT has wrong number of expressions"
-                        ));
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    for (source, value) in selected[..target_count].iter().enumerate() {
+                        let column = if insert.columns.is_empty() {
+                            source
+                        } else {
+                            match def.column_index(insert.columns[source]) {
+                                Some(column) => column,
+                                None => return sql_fail(undefined_column(insert.columns[source])),
+                            }
+                        };
+                        values[column] =
+                            match coerce(*value, &def.columns[column], storage, txn.txid, arena) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -22134,12 +22156,6 @@ pub(crate) fn instead_of_view_dml<'a>(
             }
         }
         Stmt::Update(update) => {
-            if update.from.is_some() {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "UPDATE ... FROM is not supported for INSTEAD OF triggers"
-                ));
-            }
             let rows = match materialize_view_rows(
                 storage,
                 txn.txid,
@@ -22163,37 +22179,87 @@ pub(crate) fn instead_of_view_dml<'a>(
                     values: &old[..def.n_columns],
                     alias: update.alias,
                 };
-                if let Some(predicate) = update.where_clause {
-                    match row_matches_values(
-                        &def,
-                        update.alias,
-                        &old[..def.n_columns],
-                        predicate,
+                let mut new = old;
+                if let Some(from) = update.from {
+                    let mut expressions = [&Expr::Null; MAX_COLUMNS];
+                    for (index, (_, expression)) in update.assignments.iter().enumerate() {
+                        expressions[index] = expression;
+                    }
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = super::eval::EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..super::eval::NO_HOOKS
+                    };
+                    let matched = match super::query::first_from_match(
+                        storage,
+                        from,
+                        txn.txid,
+                        update.where_clause,
+                        &expressions[..update.assignments.len()],
                         arena,
                         params,
-                        &NO_HOOKS,
-                        None,
+                        &context,
+                        &mut |combined| {
+                            for (name, expression) in update.assignments {
+                                let Some(column) = def.column_index(name) else {
+                                    return Err(undefined_column(name));
+                                };
+                                let value =
+                                    eval_full(expression, arena, params, &combined, &hooks)?;
+                                new[column] =
+                                    coerce(value, &def.columns[column], storage, txn.txid, arena)?;
+                            }
+                            Ok(())
+                        },
                     ) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
+                        Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
+                    };
+                    if !matched {
+                        continue;
                     }
-                }
-                let mut new = old;
-                for (name, expression) in update.assignments {
-                    let Some(column) = def.column_index(name) else {
-                        return sql_fail(undefined_column(name));
-                    };
-                    let value = match eval_full(expression, arena, params, &context, &NO_HOOKS) {
-                        Ok(value) => value,
-                        Err(error) => return sql_fail(error),
-                    };
-                    new[column] =
-                        match coerce(value, &def.columns[column], storage, txn.txid, arena) {
+                } else {
+                    if let Some(predicate) = update.where_clause {
+                        match row_matches_values(
+                            &def,
+                            update.alias,
+                            &old[..def.n_columns],
+                            predicate,
+                            arena,
+                            params,
+                            &NO_HOOKS,
+                            None,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    for (name, expression) in update.assignments {
+                        let Some(column) = def.column_index(name) else {
+                            return sql_fail(undefined_column(name));
+                        };
+                        let value = match eval_full(expression, arena, params, &context, &NO_HOOKS)
+                        {
                             Ok(value) => value,
                             Err(error) => return sql_fail(error),
                         };
+                        new[column] =
+                            match coerce(value, &def.columns[column], storage, txn.txid, arena) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                    }
                 }
+                // A joined source can expose storage-backed datums. Detach the
+                // completed NEW image before the trigger body mutates storage.
+                let new = match detached_trigger_row(&new[..def.n_columns], arena) {
+                    Ok(values) => values,
+                    Err(error) => return sql_fail(error),
+                };
                 match fire_view_row_trigger(
                     storage,
                     txn,
@@ -22205,7 +22271,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                     &def,
                     event,
                     Some(&old[..def.n_columns]),
-                    Some(&mut new[..def.n_columns]),
+                    Some(new),
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -22217,7 +22283,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         txn.txid,
                         &def,
                         update.alias,
-                        &new[..def.n_columns],
+                        new,
                         returning,
                         arena,
                         params,
@@ -22233,12 +22299,6 @@ pub(crate) fn instead_of_view_dml<'a>(
             }
         }
         Stmt::Delete(delete) => {
-            if delete.using.is_some() {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "DELETE ... USING is not supported for INSTEAD OF triggers"
-                ));
-            }
             let rows = match materialize_view_rows(
                 storage,
                 txn.txid,
@@ -22257,7 +22317,27 @@ pub(crate) fn instead_of_view_dml<'a>(
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
                 }
-                if let Some(predicate) = delete.where_clause {
+                let context = RowCtx {
+                    def: &def,
+                    values: &old[..def.n_columns],
+                    alias: delete.alias,
+                };
+                let matched = if let Some(using) = delete.using {
+                    match super::query::first_from_match(
+                        storage,
+                        using,
+                        txn.txid,
+                        delete.where_clause,
+                        &[],
+                        arena,
+                        params,
+                        &context,
+                        &mut |_| Ok(()),
+                    ) {
+                        Ok(matched) => matched,
+                        Err(error) => return sql_fail(error),
+                    }
+                } else if let Some(predicate) = delete.where_clause {
                     match row_matches_values(
                         &def,
                         delete.alias,
@@ -22268,10 +22348,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                         &NO_HOOKS,
                         None,
                     ) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
+                        Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
                     }
+                } else {
+                    true
+                };
+                if !matched {
+                    continue;
                 }
                 match fire_view_row_trigger(
                     storage,

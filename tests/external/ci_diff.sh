@@ -201,6 +201,27 @@ INSERT INTO outbound_dump.items(mood,location,note) VALUES
   ('great', ROW(3,4)::outbound_dump.location, 'two');
 CREATE VIEW outbound_dump.item_view AS
   SELECT id,mood,location,note FROM outbound_dump.items;
+CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
+INSERT INTO outbound_dump.view_base VALUES (1, 10), (2, 20);
+CREATE VIEW outbound_dump.writable_view AS
+  SELECT id,value FROM outbound_dump.view_base;
+CREATE FUNCTION outbound_dump.write_writable_view() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN
+     IF TG_OP = ''INSERT'' THEN
+       INSERT INTO outbound_dump.view_base VALUES (NEW.id, NEW.value);
+       RETURN NEW;
+     ELSIF TG_OP = ''UPDATE'' THEN
+       UPDATE outbound_dump.view_base SET value = NEW.value WHERE id = OLD.id;
+       RETURN NEW;
+     END IF;
+     DELETE FROM outbound_dump.view_base WHERE id = OLD.id;
+     RETURN OLD;
+   END';
+CREATE TRIGGER writable_view_write INSTEAD OF INSERT OR UPDATE OR DELETE
+  ON outbound_dump.writable_view FOR EACH ROW
+  EXECUTE FUNCTION outbound_dump.write_writable_view();
+CREATE TABLE outbound_dump.view_source (id integer PRIMARY KEY, value integer NOT NULL);
+INSERT INTO outbound_dump.view_source VALUES (2, 200), (3, 300);
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
@@ -230,10 +251,21 @@ else
        WHERE table_schema='outbound_dump'
          AND table_name='items'
          AND column_name='id';
+      INSERT INTO outbound_dump.writable_view(value,id)
+        SELECT value,id FROM (VALUES (30,3)) AS supplied(value,id)
+        RETURNING id,value;
+      UPDATE outbound_dump.writable_view SET value = 21 WHERE id = 2 RETURNING id,value;
+      DELETE FROM outbound_dump.writable_view WHERE id = 1 RETURNING id,value;
+      UPDATE outbound_dump.writable_view AS target SET value = source.value
+        FROM outbound_dump.view_source AS source WHERE target.id = source.id;
+      SELECT id,value FROM outbound_dump.view_base ORDER BY id;
+      DELETE FROM outbound_dump.writable_view AS target USING outbound_dump.view_source AS source
+        WHERE target.id = source.id AND source.id = 2 RETURNING target.id,target.value;
+      SELECT id,value FROM outbound_dump.view_base ORDER BY id;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|one\n2|great|3|4|two\n3\nINSERT 0 1\nYES|ALWAYS'
+  expected_outbound_observed=$'1|ok|1|2|one\n2|great|3|4|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
-    ok "pos3ql pg_dump restores into PostgreSQL 18 with data, view and identity"
+    ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else
     bad "pos3ql pg_dump round-trip result"
     printf 'expected:\n%s\nobserved:\n%s\n' \

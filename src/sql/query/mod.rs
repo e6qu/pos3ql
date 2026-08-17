@@ -759,6 +759,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }
 
+    fn function_arguments<'a>(
+        &self,
+        oid: i32,
+        identity: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::function_arguments_text(self.storage, self.txid, oid, identity, arena)
+    }
+
+    fn function_result<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::function_result_text(self.storage, self.txid, oid, arena)
+    }
+
     fn collation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::collation_oid_is_visible(oid).then_some(true)
     }

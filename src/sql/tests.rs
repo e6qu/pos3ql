@@ -2282,7 +2282,8 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         "CREATE TYPE binary_state AS ENUM ('ready', 'blocked'); \
          CREATE DOMAIN binary_positive AS integer CHECK (VALUE > 0); \
          CREATE DOMAIN binary_required AS integer NOT NULL; \
-         CREATE TYPE binary_coordinate AS (x integer, y integer)",
+         CREATE TYPE binary_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN binary_coordinate_domain AS binary_coordinate",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
@@ -2300,6 +2301,12 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         engine
             .storage
             .composite_slot("public", "binary_coordinate", 0)
+            .unwrap() as u16,
+    );
+    let composite_domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_coordinate_domain", 0)
             .unwrap() as u16,
     );
     let transaction = TxnState::new(&mut budget, 64).unwrap();
@@ -2339,6 +2346,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "(4,8)"
     );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "(4,8)"
+    );
     let composite_array_oid = crate::sql::types::oid::composite_array_oid(
         engine
             .storage
@@ -2356,6 +2370,26 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{\"(4,8)\"}"
+    );
+    let mut composite_domain_array_binary = composite_array_binary.clone();
+    composite_domain_array_binary[8..12].copy_from_slice(&composite_domain_oid.to_be_bytes());
+    let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_coordinate_domain", 0)
+            .unwrap() as u16,
+    );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                composite_domain_array_oid,
+                &composite_domain_array_binary,
+                &arena,
+                0,
+            )
             .unwrap()
             .to_string(),
         "{\"(4,8)\"}"
@@ -16503,6 +16537,115 @@ fn domains_enforce_and_report() {
          SELECT 0::posint",
     );
     assert!(String::from_utf8_lossy(&bytes).contains("23514"));
+}
+
+#[test]
+fn domains_over_named_composites_preserve_identity_and_array_elements() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE domain_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN coordinate_value AS domain_coordinate; \
+         CREATE TABLE domain_coordinates (value coordinate_value, values coordinate_value[])",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO domain_coordinates VALUES \
+         ('(3,4)', ARRAY[ROW(5,6)::domain_coordinate]::coordinate_value[])",
+    );
+    assert!(
+        !String::from_utf8_lossy(&inserted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text, values::text, pg_typeof(values) FROM domain_coordinates",
+        )),
+        ["(3,4)|{\"(5,6)\"}|coordinate_value[]"]
+    );
+}
+
+#[test]
+fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
+    let mut config = test_config("composite-domain-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("composite-domain-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA durable_domain; \
+             CREATE TYPE domain_point AS (x integer, y integer); \
+             CREATE DOMAIN point_value AS domain_point; \
+             CREATE TABLE domain_point_values (values point_value[]); \
+             INSERT INTO domain_point_values VALUES (ARRAY[ROW(7,8)::domain_point]::point_value[]); \
+             ALTER TYPE domain_point SET SCHEMA durable_domain; \
+             ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
+             CHECKPOINT",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values::text FROM domain_point_values",
+        )),
+        ["{\"(7,8)\"}"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn composite_domain_is_a_drop_dependency() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE drop_domain_point AS (x integer); \
+         CREATE DOMAIN drop_domain_point_value AS drop_domain_point; \
+         CREATE TABLE drop_domain_points (value drop_domain_point_value)",
+    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE drop_domain_point");
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE drop_domain_point CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_type WHERE typname IN ('drop_domain_point', 'drop_domain_point_value')",
+        )),
+        ["0"]
+    );
 }
 
 #[test]

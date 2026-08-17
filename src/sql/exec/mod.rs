@@ -14484,20 +14484,41 @@ fn build_domain_spec(
             base_type
         ));
     }
-    let (base_domain, base, inherited_default) =
+    let (base_domain, base_user_type, base, inherited_default) =
         if let Some(base) = ColType::from_sql_name(base_type) {
-            (None, base, None)
+            (None, None, base, None)
         } else if let Some(parent) = storage.find_domain(base_type, txid) {
             (
                 Some(crate::storage::UserTypeName {
                     schema: parent.schema,
                     name: parent.name,
                 }),
+                None,
                 parent.base,
                 parent.default_expr,
             )
         } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            (None, ColType::Enum(enum_slot as u16), None)
+            let enumeration = storage.enum_for(enum_slot, txid);
+            (
+                None,
+                Some(crate::storage::UserTypeName {
+                    schema: enumeration.schema,
+                    name: enumeration.name,
+                }),
+                ColType::Enum(enum_slot as u16),
+                None,
+            )
+        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
+            let composite = storage.composite_for(composite_slot, txid);
+            (
+                None,
+                Some(crate::storage::UserTypeName {
+                    schema: composite.schema,
+                    name: composite.name,
+                }),
+                ColType::Composite(composite_slot as u16),
+                None,
+            )
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -14515,6 +14536,9 @@ fn build_domain_spec(
                 enumeration.name.as_str(),
                 txid,
             )?;
+        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
+            let composite = storage.composite_for(composite_slot, txid);
+            storage.require_type_usage(composite.schema.as_str(), composite.name.as_str(), txid)?;
         }
     }
     let default_expr = match default_text {
@@ -14549,6 +14573,7 @@ fn build_domain_spec(
     }
     Ok(crate::storage::DomainSpec {
         base_domain,
+        base_user_type,
         base,
         base_type_mod,
         not_null,
@@ -15065,6 +15090,7 @@ pub fn alter_domain(
     let current = storage.domain_for(slot, txn.txid);
     let mut spec = crate::storage::DomainSpec {
         base_domain: current.base_domain,
+        base_user_type: current.base_user_type,
         base: current.base,
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
@@ -15842,6 +15868,29 @@ fn drop_composite_type(
         ));
     }
 
+    let mut dependent_domains = [false; crate::storage::MAX_DOMAINS];
+    for (domain_slot, selected) in dependent_domains
+        .iter_mut()
+        .enumerate()
+        .take(storage.domain_count())
+    {
+        let domain = storage.domain(domain_slot);
+        *selected = domain.visible_to(txn.txid)
+            && matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
+            && domain.base_user_type
+                == Some(crate::storage::UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                });
+    }
+    if dependent_domains.iter().any(|&selected| selected) && !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type {} because other objects depend on it",
+            definition.name.as_str()
+        ));
+    }
+
     while let Some((dependent, attribute_number)) = composite_field_uses_composite(
         storage,
         CompositeTypeDependencyRoot {
@@ -15904,6 +15953,19 @@ fn drop_composite_type(
 
     if cascade {
         drop_selected_stored_queries(storage, wal, txn, &dependent_views, &dependent_matviews)?;
+        drop_domain_selection(
+            storage,
+            wal,
+            txn,
+            scratch,
+            &dependent_domains,
+            None,
+            true,
+            1,
+            arena,
+            seq_session,
+            responder,
+        )?;
     }
 
     let lsn = storage.bump_lsn();
@@ -19893,14 +19955,27 @@ fn decode_binary_array<'a>(
                         "binary input of a domain array requires catalog context"
                     ));
                 };
-                coerce_domain_value(
+                let value = coerce_domain_value(
                     storage,
                     slot as usize,
                     value,
                     txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
-                )?
+                )?;
+                match value {
+                    Datum::Composite {
+                        slot: composite_slot,
+                        ..
+                    } => Datum::CompositeText {
+                        slot: composite_slot,
+                        physical_fields: storage
+                            .composite_for(composite_slot as usize, txid)
+                            .n_fields as u8,
+                        text: composite_storage_text(value, composite_slot, storage, txid, arena)?,
+                    },
+                    value => value,
+                }
             }
             crate::sql::types::ArrElem::Composite(slot) => {
                 let Datum::Composite { .. } = value else {

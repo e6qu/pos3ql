@@ -2160,8 +2160,9 @@ impl Checkpointer {
                     seq.is_called.set(is_called != 0);
                     seq.dirty.set(false);
                 }
-                tag @ (Some("dom") | Some("dom2")) => {
-                    let has_parent = tag == Some("dom2");
+                tag @ (Some("dom") | Some("dom2") | Some("dom3")) => {
+                    let has_parent = matches!(tag, Some("dom2") | Some("dom3"));
+                    let has_base_identity = tag == Some("dom3");
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -2186,6 +2187,14 @@ impl Checkpointer {
                         (
                             hexstr(words.next(), "dom base domain missing")?,
                             hexstr(words.next(), "dom base domain schema missing")?,
+                        )
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    let (base_user_type, base_user_type_schema) = if has_base_identity {
+                        (
+                            hexstr(words.next(), "dom base type missing")?,
+                            hexstr(words.next(), "dom base type schema missing")?,
                         )
                     } else {
                         (String::new(), String::new())
@@ -2216,8 +2225,22 @@ impl Checkpointer {
                             ));
                         }
                     };
+                    let base_user_type =
+                        match (base_user_type.is_empty(), base_user_type_schema.is_empty()) {
+                            (true, true) => None,
+                            (false, false) => Some(crate::storage::UserTypeName {
+                                schema: sql_name(&base_user_type_schema)?,
+                                name: sql_name(&base_user_type)?,
+                            }),
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "domain base type identity is incomplete",
+                                ));
+                            }
+                        };
                     let spec = crate::storage::DomainSpec {
                         base_domain,
+                        base_user_type,
                         base,
                         base_type_mod,
                         not_null: not_null != 0,
@@ -2227,7 +2250,7 @@ impl Checkpointer {
                         n_checks,
                     };
                     storage
-                        .create_domain(sql_name(&schema)?, sql_name(&name)?, spec, 0)
+                        .create_domain_from_manifest(sql_name(&schema)?, sql_name(&name)?, spec)
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest domain rejected: {}",
@@ -2667,6 +2690,12 @@ impl Checkpointer {
             storage.install_table_statistics(slot, statistics);
         }
 
+        storage.rebind_domain_base_types().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest domain base type rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
         storage
             .rebind_all_stored_query_dependencies()
             .map_err(|error| {
@@ -3100,8 +3129,9 @@ impl Checkpointer {
             }
             write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
         }
-        // Domains: `dom2 <base-code> <base-typmod> <not-null> <n-checks>
-        // <hex-schema> <hex-name> <hex-base-domain> <hex-base-domain-schema> <hex-default>
+        // Domains: `dom3 <base-code> <base-typmod> <not-null> <n-checks>
+        // <hex-schema> <hex-name> <hex-base-domain> <hex-base-domain-schema>
+        // <hex-base-type> <hex-base-type-schema> <hex-default>
         // [<hex-cname> <hex-cexpr>]...`. Like enums, domains precede tables
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
@@ -3119,7 +3149,7 @@ impl Checkpointer {
             };
             let _ = write!(
                 line,
-                "dom2 {} {} {} {} ",
+                "dom3 {} {} {} {} ",
                 d.base.code(),
                 d.base_type_mod,
                 u8::from(d.not_null),
@@ -3134,6 +3164,22 @@ impl Checkpointer {
                 d.base_domain
                     .as_ref()
                     .map(|identity| identity.name.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
+                d.base_user_type
+                    .as_ref()
+                    .map(|identity| identity.name.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
+                d.base_user_type
+                    .as_ref()
+                    .map(|identity| identity.schema.as_str())
                     .unwrap_or(""),
             );
             let _ = write!(line, " ");

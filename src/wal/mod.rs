@@ -114,6 +114,7 @@ const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
 const LAST_KIND: u8 = KIND_ALTER_ENUM_IDENTITY;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
+const DOMAIN_PAYLOAD_WITH_BASE_IDENTITY: u8 = u8::MAX - 1;
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -1735,6 +1736,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 .base_domain
                 .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
+            let base_name = def
+                .base_user_type
+                .map(|d| d.name.as_str().len())
+                .unwrap_or(0);
+            let base_schema = def
+                .base_user_type
+                .map(|d| d.schema.as_str().len())
+                .unwrap_or(0);
             let mut n = 1
                 + def.name.as_str().len()
                 + 1
@@ -1744,6 +1753,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + parent
                 + 1
                 + parent_schema
+                + 1
+                + base_name
+                + 1
+                + base_schema
                 + 1
                 + 4
                 + 1
@@ -2349,7 +2362,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
             let mut ok = name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[DOMAIN_PAYLOAD_WITH_PARENT])
+                && buffer.append(&[DOMAIN_PAYLOAD_WITH_BASE_IDENTITY])
                 && name_bytes(
                     buffer,
                     def.base_domain
@@ -2360,6 +2373,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(
                     buffer,
                     def.base_domain
+                        .as_ref()
+                        .map(|identity| identity.schema.as_str())
+                        .unwrap_or(""),
+                )
+                && name_bytes(
+                    buffer,
+                    def.base_user_type
+                        .as_ref()
+                        .map(|identity| identity.name.as_str())
+                        .unwrap_or(""),
+                )
+                && name_bytes(
+                    buffer,
+                    def.base_user_type
                         .as_ref()
                         .map(|identity| identity.schema.as_str())
                         .unwrap_or(""),
@@ -3906,7 +3933,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let base_domain = if *payload.get(at)? == DOMAIN_PAYLOAD_WITH_PARENT {
+            let version = *payload.get(at)?;
+            let has_base_identity = version == DOMAIN_PAYLOAD_WITH_BASE_IDENTITY;
+            let base_domain = if matches!(
+                version,
+                DOMAIN_PAYLOAD_WITH_PARENT | DOMAIN_PAYLOAD_WITH_BASE_IDENTITY
+            ) {
                 at += 1;
                 let base_domain_name = take_name(&mut at)?;
                 let base_domain = if base_domain_name.is_empty() {
@@ -3925,6 +3957,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     (Some(name), Some(schema)) => {
                         Some(crate::storage::UserTypeName { schema, name })
                     }
+                    _ => return None,
+                }
+            } else {
+                None
+            };
+            let base_user_type = if has_base_identity {
+                let name = take_name(&mut at)?;
+                let schema = take_name(&mut at)?;
+                match (name.is_empty(), schema.is_empty()) {
+                    (true, true) => None,
+                    (false, false) => Some(crate::storage::UserTypeName {
+                        schema: SqlName::parse(schema).ok()?,
+                        name: SqlName::parse(name).ok()?,
+                    }),
                     _ => return None,
                 }
             } else {
@@ -3966,6 +4012,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name: SqlName::parse(name).ok()?,
                 ownership: crate::storage::Ownership::BOOTSTRAP,
                 base_domain,
+                base_user_type,
                 base,
                 base_type_mod,
                 not_null,
@@ -4636,16 +4683,16 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }) => {
             out[0] = 21;
             out[1] = element.code();
-            let (base_code, enum_slot) = match element {
+            let (base_code, base_user_slot) = match element {
                 crate::sql::types::ArrElem::Domain {
                     base_code,
-                    enum_slot,
+                    base_user_slot,
                     ..
-                } => (*base_code, *enum_slot),
+                } => (*base_code, *base_user_slot),
                 _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
             };
             out[2] = base_code;
-            out[3..5].copy_from_slice(&enum_slot.to_le_bytes());
+            out[3..5].copy_from_slice(&base_user_slot.to_le_bytes());
             out[5] = *len;
             out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             6 + *len as usize
@@ -4850,7 +4897,8 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         21 => {
             let code = *payload.get(*at)?;
             let base_code = *payload.get(*at + 1)?;
-            let enum_slot = u16::from_le_bytes(payload.get(*at + 2..*at + 4)?.try_into().unwrap());
+            let base_user_slot =
+                u16::from_le_bytes(payload.get(*at + 2..*at + 4)?.try_into().unwrap());
             let len = *payload.get(*at + 4)? as usize;
             *at += 5;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
@@ -4860,7 +4908,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                 element = crate::sql::types::ArrElem::Domain {
                     slot,
                     base_code,
-                    enum_slot,
+                    base_user_slot,
                 };
             }
             Some(OwnedDatum::Array {

@@ -803,13 +803,14 @@ pub enum ArrElem {
     /// An array of one named composite type.
     Composite(u16),
     /// An array whose elements are values of a domain. Domain values use their
-    /// ultimate base representation; `base_code` identifies that scalar
-    /// representation and `enum_slot` completes it when the base is an enum.
-    /// Keeping both facts inline preserves allocation-free array decoding.
+    /// ultimate base representation; `base_code` identifies that runtime
+    /// representation and `base_user_slot` completes it for an enum or named
+    /// composite base. Keeping both facts inline preserves allocation-free
+    /// array decoding without reducing a user-defined base to an untyped tag.
     Domain {
         slot: u16,
         base_code: u8,
-        enum_slot: u16,
+        base_user_slot: u16,
     },
 }
 
@@ -1002,13 +1003,14 @@ impl ArrElem {
             ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
                 base_code,
-                enum_slot,
+                base_user_slot,
                 ..
             } => {
                 match ColType::from_code(base_code)
                     .expect("domain array carries a valid scalar base code")
                 {
-                    ColType::Enum(_) => ColType::Enum(enum_slot),
+                    ColType::Enum(_) => ColType::Enum(base_user_slot),
+                    ColType::Composite(_) => ColType::Composite(base_user_slot),
                     base => base,
                 }
             }
@@ -1131,7 +1133,7 @@ impl ArrElem {
                 ArrElem::Domain {
                     slot: (c - Self::DOMAIN_CODE_BASE) as u16,
                     base_code: ColType::Text.code(),
-                    enum_slot: ColType::ENUM_SLOT_UNRESOLVED,
+                    base_user_slot: ColType::ENUM_SLOT_UNRESOLVED,
                 }
             }
             c if (Self::COMPOSITE_CODE_BASE
@@ -1149,14 +1151,14 @@ impl ArrElem {
         if matches!(base, ColType::Record) {
             return None;
         }
-        let enum_slot = match base {
-            ColType::Enum(slot) => slot,
+        let base_user_slot = match base {
+            ColType::Enum(slot) | ColType::Composite(slot) => slot,
             _ => ColType::ENUM_SLOT_UNRESOLVED,
         };
         Some(Self::Domain {
             slot,
             base_code: base.code(),
-            enum_slot,
+            base_user_slot,
         })
     }
 

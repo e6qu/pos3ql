@@ -1264,6 +1264,8 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_positive AS integer CHECK (VALUE > 0); "
         "CREATE DOMAIN wire_binary_vector AS integer[]; "
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
+        "CREATE TYPE wire_binary_coordinate AS (x integer, y integer); "
+        "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
         "CREATE TABLE wire_binary_regclass (id integer); "
         "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
         "AS 'SELECT value'",
@@ -1278,6 +1280,13 @@ def test_catalog_aware_binary_bind_parameters():
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
+    coordinate_domain_oid = int(
+        first_text_row(
+            simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate_domain'")
+        )
+    )
+    coordinate_domain_array_oid = 150000 + coordinate_domain_oid - 110000
+    coordinate = binary_record([(23, struct.pack("!i", 4)), (23, struct.pack("!i", 8))])
     regclass_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
     )
@@ -1318,6 +1327,14 @@ def test_catalog_aware_binary_bind_parameters():
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
         (
+            "composite domain",
+            "SELECT $1::wire_binary_coordinate_domain",
+            coordinate_domain_oid,
+            coordinate,
+            "(4,8)",
+            None,
+        ),
+        (
             "enum array",
             "SELECT $1::wire_binary_state[]",
             enum_array_oid,
@@ -1339,6 +1356,14 @@ def test_catalog_aware_binary_bind_parameters():
             vector_array_oid,
             binary_array(vector_oid, [binary_array(23, [struct.pack("!i", 3), struct.pack("!i", 4)])]),
             '{"{3,4}"}',
+            None,
+        ),
+        (
+            "composite domain array",
+            "SELECT $1::wire_binary_coordinate_domain[]",
+            coordinate_domain_array_oid,
+            binary_array(coordinate_domain_oid, [coordinate]),
+            '{"(4,8)"}',
             None,
         ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),

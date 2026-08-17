@@ -5446,6 +5446,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("typowner", ColType::Int4),
             ("typisdefined", ColType::Bool),
             ("typstorage", ColType::Bpchar),
+            ("typdefaultbin", ColType::Text),
         ],
     );
     let types = [
@@ -5548,6 +5549,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(10),
                 Datum::Bool(true),
                 text(if t.typlen() < 0 { "x" } else { "p" }, arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5612,6 +5614,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text(if d.base.typlen() < 0 { "x" } else { "p" }, arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5650,6 +5653,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5702,6 +5706,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("p", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5740,6 +5745,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5792,6 +5798,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5830,6 +5837,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5881,6 +5889,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 ),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5918,6 +5927,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;

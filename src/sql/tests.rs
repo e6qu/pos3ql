@@ -21852,6 +21852,19 @@ fn pg_dump_bootstrap_surface() {
         )),
         ["0"]
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN pg_dump_domain AS integer",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typdefaultbin IS NULL FROM pg_type WHERE typname = 'pg_dump_domain'",
+        )),
+        ["t"]
+    );
     assert!(
         String::from_utf8_lossy(&run_with(
             &mut engine,

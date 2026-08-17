@@ -5324,10 +5324,14 @@ mod tests {
         assert_eq!(slot, 7);
         assert_eq!(definition.fields()[0].attribute_number, 1);
         assert!(definition.fields()[0].not_null);
-        assert!(matches!(
-            definition.fields()[0].ctype,
-            ColType::Composite(3)
-        ));
+        assert_eq!(
+            definition.fields()[0]
+                .user_type
+                .expect("composite field identity")
+                .name
+                .as_str(),
+            "root"
+        );
         assert_eq!(definition.fields()[1].attribute_number, 2);
         assert!(definition.fields()[1].dropped);
 

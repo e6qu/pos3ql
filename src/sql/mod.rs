@@ -3983,6 +3983,27 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Insert(insert) => {
+                if let Some(crate::storage::ResolvedRelation::View(view)) =
+                    storage.resolve_relation(insert.table.schema, insert.table.name, txn.txid)
+                    && storage
+                        .triggers_for_view(view, txn.txid)
+                        .any(|(_, trigger)| {
+                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                        })
+                {
+                    return exec::instead_of_view_dml(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        view,
+                        arena,
+                        params,
+                        guc.seq_session(),
+                        responder,
+                        capture,
+                    );
+                }
                 let insert =
                     match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
                         Ok(Some(view)) => {
@@ -4038,6 +4059,27 @@ impl Engine {
                 )
             }
             Stmt::Update(update) => {
+                if let Some(crate::storage::ResolvedRelation::View(view)) =
+                    storage.resolve_relation(update.table.schema, update.table.name, txn.txid)
+                    && storage
+                        .triggers_for_view(view, txn.txid)
+                        .any(|(_, trigger)| {
+                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                        })
+                {
+                    return exec::instead_of_view_dml(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        view,
+                        arena,
+                        params,
+                        guc.seq_session(),
+                        responder,
+                        capture,
+                    );
+                }
                 let update =
                     match query::resolve_view_for_dml(storage, update.table, txn.txid, arena) {
                         Ok(Some(view)) => {
@@ -4092,6 +4134,27 @@ impl Engine {
                 )
             }
             Stmt::Delete(delete) => {
+                if let Some(crate::storage::ResolvedRelation::View(view)) =
+                    storage.resolve_relation(delete.table.schema, delete.table.name, txn.txid)
+                    && storage
+                        .triggers_for_view(view, txn.txid)
+                        .any(|(_, trigger)| {
+                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                        })
+                {
+                    return exec::instead_of_view_dml(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        view,
+                        arena,
+                        params,
+                        guc.seq_session(),
+                        responder,
+                        capture,
+                    );
+                }
                 let delete =
                     match query::resolve_view_for_dml(storage, delete.table, txn.txid, arena) {
                         Ok(Some(view)) => {
@@ -7097,6 +7160,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::CreateTrigger {
             name,
+            target,
             table_schema,
             table,
             function_schema,
@@ -7111,15 +7175,26 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             arguments,
             argument_count,
         } => {
-            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
-                storage.resolve_relation(Some(table_schema), table, 0)
-            else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "journal trigger targets unknown relation \"{}.{}\"",
-                    table_schema,
-                    table
-                ));
+            let target = match (
+                target,
+                storage.resolve_relation(Some(table_schema), table, 0),
+            ) {
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    Some(crate::storage::ResolvedRelation::Table(slot)),
+                ) => crate::storage::TriggerTarget::Table(slot as u16),
+                (
+                    crate::wal::TriggerTargetKind::View,
+                    Some(crate::storage::ResolvedRelation::View(slot)),
+                ) => crate::storage::TriggerTarget::View(slot as u16),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal trigger targets unknown relation \"{}.{}\"",
+                        table_schema,
+                        table
+                    ));
+                }
             };
             let Some(function_slot) =
                 storage.routine_slot_by_signature(function_schema, function, &[], 0)
@@ -7143,7 +7218,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let slot = storage.create_trigger(
                 crate::storage::TriggerSpec {
                     name: crate::storage::SqlName::parse(name)?,
-                    table: table_slot,
+                    target,
                     function: function_slot,
                     timing,
                     level,
@@ -7171,38 +7246,62 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::DropTrigger {
             name,
+            target,
             table_schema,
             table,
         } => {
-            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
-                storage.resolve_relation(Some(table_schema), table, 0)
-            else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "journal trigger targets unknown relation"
-                ));
+            let target = match (
+                target,
+                storage.resolve_relation(Some(table_schema), table, 0),
+            ) {
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    Some(crate::storage::ResolvedRelation::Table(slot)),
+                ) => crate::storage::TriggerTarget::Table(slot as u16),
+                (
+                    crate::wal::TriggerTargetKind::View,
+                    Some(crate::storage::ResolvedRelation::View(slot)),
+                ) => crate::storage::TriggerTarget::View(slot as u16),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal trigger targets unknown relation"
+                    ));
+                }
             };
-            if let Some(slot) = storage.trigger_slot(table_slot, name, 0) {
+            if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
                 storage.drop_trigger(slot, 0);
                 storage.commit_trigger_drop(slot);
             }
         }
         WalOp::AlterTrigger {
             name,
+            target,
             table_schema,
             table,
             new_name,
             enabled,
         } => {
-            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
-                storage.resolve_relation(Some(table_schema), table, 0)
-            else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "journal trigger targets unknown relation"
-                ));
+            let target = match (
+                target,
+                storage.resolve_relation(Some(table_schema), table, 0),
+            ) {
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    Some(crate::storage::ResolvedRelation::Table(slot)),
+                ) => crate::storage::TriggerTarget::Table(slot as u16),
+                (
+                    crate::wal::TriggerTargetKind::View,
+                    Some(crate::storage::ResolvedRelation::View(slot)),
+                ) => crate::storage::TriggerTarget::View(slot as u16),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal trigger targets unknown relation"
+                    ));
+                }
             };
-            let slot = storage.trigger_slot(table_slot, name, 0).ok_or_else(|| {
+            let slot = storage.trigger_slot_on(target, name, 0).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "journal alters unknown trigger \"{}\"",

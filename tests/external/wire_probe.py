@@ -1151,6 +1151,34 @@ def test_row_trigger_body_over_raw_wire():
     s.close()
 
 
+def test_instead_of_view_trigger_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_view_base (id integer PRIMARY KEY, value integer); "
+        "INSERT INTO wire_view_base VALUES (1, 10), (2, 20); "
+        "CREATE VIEW wire_view AS SELECT id, value FROM wire_view_base; "
+        "CREATE FUNCTION wire_view_write() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN IF TG_OP = ''INSERT'' THEN INSERT INTO wire_view_base VALUES (NEW.id, NEW.value); RETURN NEW; "
+        "ELSIF TG_OP = ''UPDATE'' THEN UPDATE wire_view_base SET value = NEW.value WHERE id = OLD.id; RETURN NEW; "
+        "END IF; DELETE FROM wire_view_base WHERE id = OLD.id; RETURN OLD; END'; "
+        "CREATE TRIGGER wire_view_write INSTEAD OF INSERT OR UPDATE OR DELETE ON wire_view "
+        "FOR EACH ROW EXECUTE FUNCTION wire_view_write(); "
+        "INSERT INTO wire_view VALUES (3, 30); "
+        "UPDATE wire_view SET value = 21 WHERE id = 2; "
+        "DELETE FROM wire_view WHERE id = 1",
+    )
+    check("raw wire: INSTEAD OF view setup and DML complete", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: INSTEAD OF view trigger changes only its base-table actions",
+        first_text_row(simple_query(s, "SELECT string_agg(id::text || ':' || value::text, ',' ORDER BY id) FROM wire_view_base"))
+        == "2:21,3:30",
+    )
+    s.close()
+
+
 def test_statement_and_conflict_triggers_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

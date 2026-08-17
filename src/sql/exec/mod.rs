@@ -6703,9 +6703,9 @@ impl<'a> TriggerInvocation<'a> {
     fn new(
         trigger: &crate::storage::TriggerDef,
         definition: &TableDef,
-        table: usize,
+        target: crate::storage::TriggerTarget,
         event: u8,
-        before: bool,
+        _before: bool,
         routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
@@ -6744,11 +6744,23 @@ impl<'a> TriggerInvocation<'a> {
             table_name: arena
                 .alloc_str(definition.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
-            relid: crate::sql::catalog::user_table_oid(table),
+            relid: match target {
+                crate::storage::TriggerTarget::Table(slot) => {
+                    crate::sql::catalog::user_table_oid(usize::from(slot))
+                }
+                crate::storage::TriggerTarget::View(slot) => {
+                    crate::sql::catalog::view_oid(usize::from(slot))
+                }
+            },
             routine_oid: crate::storage::routine_oid(routine),
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
-            when: if before { "BEFORE" } else { "AFTER" },
+            when: match trigger.timing {
+                0 => "BEFORE",
+                1 => "AFTER",
+                2 => "INSTEAD OF",
+                _ => unreachable!("trigger timing was validated at the storage boundary"),
+            },
             level: match trigger.level {
                 TriggerLevel::Row => "ROW",
                 TriggerLevel::Statement => "STATEMENT",
@@ -11412,9 +11424,9 @@ fn execute_trigger_block<'a>(
     clippy::too_many_arguments,
     reason = "row-transition dispatch carries the complete typed firing context"
 )]
-fn fire_row_triggers<'a>(
+fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     mut context: TriggerExecContext<'_, 'a, '_>,
-    table: usize,
+    target: T,
     definition: &TableDef,
     event: u8,
     before: bool,
@@ -11422,13 +11434,14 @@ fn fire_row_triggers<'a>(
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
 ) -> Result<bool, SqlError> {
+    let target = target.into();
     let mut new = new;
     let mut trigger_at = 0usize;
     loop {
         let Some(trigger) = ({
             context
                 .storage
-                .triggers_for_table(table, context.txn.txid)
+                .triggers_for_target(target, context.txn.txid)
                 .nth(trigger_at)
                 .map(|(_, trigger)| *trigger)
         }) else {
@@ -11437,7 +11450,12 @@ fn fire_row_triggers<'a>(
         trigger_at += 1;
         if !trigger.enabled_to(context.txn.txid)
             || !matches!(trigger.level, TriggerLevel::Row)
-            || trigger.timing != u8::from(!before)
+            || trigger.timing
+                != if matches!(target, crate::storage::TriggerTarget::View(_)) {
+                    2
+                } else {
+                    u8::from(!before)
+                }
             || !trigger.events.contains(event)
             || (event == 2
                 && trigger.update_columns != 0
@@ -11477,7 +11495,7 @@ fn fire_row_triggers<'a>(
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
-            table,
+            target,
             event,
             before,
             context.storage.routine(usize::from(trigger.function)),
@@ -11698,7 +11716,7 @@ fn fire_statement_triggers_with_rows<'a>(
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
-            table,
+            table.into(),
             event,
             before,
             context.storage.routine(usize::from(trigger.function)),
@@ -11828,17 +11846,55 @@ pub fn create_trigger(
     trigger: &CreateTrigger<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    let table = match resolve_dml_table(storage, &trigger.table, txn.txid) {
-        Ok(table) => table,
-        Err(error) => return sql_fail(error),
-    };
-    if let Err(error) = storage.require_owner(
-        storage.table_access_object(table, txn.txid),
-        txn.txid,
-        "table",
-    ) {
-        return sql_fail(error);
-    }
+    let (target, target_schema, target_name) =
+        match storage.resolve_relation(trigger.table.schema, trigger.table.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(table)) => {
+                if matches!(trigger.timing, TriggerTiming::InsteadOf) {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "INSTEAD OF trigger's WHEN condition cannot be a table"
+                    ));
+                }
+                if let Err(error) = storage.require_owner(
+                    storage.table_access_object(table, txn.txid),
+                    txn.txid,
+                    "table",
+                ) {
+                    return sql_fail(error);
+                }
+                let definition = storage.table_def(table, txn.txid);
+                (
+                    crate::storage::TriggerTarget::Table(table as u16),
+                    definition.schema,
+                    definition.name,
+                )
+            }
+            Some(crate::storage::ResolvedRelation::View(view)) => {
+                if !matches!(trigger.timing, TriggerTiming::InsteadOf) {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot create a BEFORE or AFTER trigger on a view"
+                    ));
+                }
+                if let Err(error) = storage.require_owner(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: view as u16,
+                    },
+                    txn.txid,
+                    "view",
+                ) {
+                    return sql_fail(error);
+                }
+                let definition = storage.view(view);
+                (
+                    crate::storage::TriggerTarget::View(view as u16),
+                    definition.schema,
+                    definition.name,
+                )
+            }
+            _ => return sql_fail(undefined_qual(&trigger.table)),
+        };
     let arguments = match crate::storage::TriggerArguments::parse(trigger.arguments) {
         Ok(arguments) => arguments,
         Err(error) => return sql_fail(error),
@@ -11878,11 +11934,18 @@ pub fn create_trigger(
     let timing = match trigger.timing {
         TriggerTiming::Before => 0,
         TriggerTiming::After => 1,
+        TriggerTiming::InsteadOf => 2,
     };
     let level = trigger.level;
-    let definition = storage.table_def(table, txn.txid);
     let mut update_columns = 0u64;
     for name in trigger.update_columns {
+        let crate::storage::TriggerTarget::Table(table) = target else {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "INSTEAD OF triggers cannot have column lists"
+            ));
+        };
+        let definition = storage.table_def(usize::from(table), txn.txid);
         let Some(column) = definition.column_index(name) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
@@ -11916,14 +11979,12 @@ pub fn create_trigger(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let table_schema = storage.table_def(table, txn.txid).schema;
-    let table_name = storage.table_def(table, txn.txid).name;
     let function_schema = storage.routine(function).schema_for(txn.txid);
     let function_name = storage.routine(function).name_for(txn.txid);
     let slot = match storage.create_trigger(
         crate::storage::TriggerSpec {
             name,
-            table,
+            target,
             function,
             timing,
             level,
@@ -11948,8 +12009,12 @@ pub fn create_trigger(
         lsn,
         &WalOp::CreateTrigger {
             name: trigger.name,
-            table_schema: table_schema.as_str(),
-            table: table_name.as_str(),
+            target: match target {
+                crate::storage::TriggerTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+                crate::storage::TriggerTarget::View(_) => crate::wal::TriggerTargetKind::View,
+            },
+            table_schema: target_schema.as_str(),
+            table: target_name.as_str(),
             function_schema: function_schema.as_str(),
             function: function_name.as_str(),
             timing,
@@ -11984,18 +12049,12 @@ pub fn drop_trigger(
     responder: &mut Responder,
 ) -> Outcome {
     for trigger in triggers {
-        let table = match resolve_dml_table(storage, &trigger.table, txn.txid) {
-            Ok(table) => table,
-            Err(error) => return sql_fail(error),
-        };
-        if let Err(error) = storage.require_owner(
-            storage.table_access_object(table, txn.txid),
-            txn.txid,
-            "table",
-        ) {
-            return sql_fail(error);
-        }
-        let Some(slot) = storage.trigger_slot(table, trigger.name, txn.txid) else {
+        let (target, target_kind, schema, relation) =
+            match trigger_target_for_ddl(storage, &trigger.table, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+        let Some(slot) = storage.trigger_slot_on(target, trigger.name, txn.txid) else {
             if if_exists {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -12016,8 +12075,6 @@ pub fn drop_trigger(
                 trigger.table.name
             ));
         };
-        let schema = storage.table_def(table, txn.txid).schema;
-        let name = storage.table_def(table, txn.txid).name;
         storage.drop_trigger(slot, txn.txid);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
@@ -12025,8 +12082,9 @@ pub fn drop_trigger(
             lsn,
             &WalOp::DropTrigger {
                 name: trigger.name,
+                target: target_kind,
                 table_schema: schema.as_str(),
-                table: name.as_str(),
+                table: relation.as_str(),
             },
         ) {
             storage.rollback_trigger_drop(slot, txn.txid);
@@ -12041,6 +12099,56 @@ pub fn drop_trigger(
     sql_ok()
 }
 
+fn trigger_target_for_ddl(
+    storage: &Storage,
+    relation: &QualName<'_>,
+    txid: u32,
+) -> Result<
+    (
+        crate::storage::TriggerTarget,
+        crate::wal::TriggerTargetKind,
+        SqlName,
+        SqlName,
+    ),
+    SqlError,
+> {
+    match storage.resolve_relation(relation.schema, relation.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            storage.require_owner(storage.table_access_object(slot, txid), txid, "table")?;
+            let definition = storage.table_def(slot, txid);
+            Ok((
+                crate::storage::TriggerTarget::Table(slot as u16),
+                crate::wal::TriggerTargetKind::Table,
+                definition.schema,
+                definition.name,
+            ))
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: slot as u16,
+                },
+                txid,
+                "view",
+            )?;
+            let definition = storage.view(slot);
+            Ok((
+                crate::storage::TriggerTarget::View(slot as u16),
+                crate::wal::TriggerTargetKind::View,
+                definition.schema,
+                definition.name,
+            ))
+        }
+        Some(crate::storage::ResolvedRelation::Catalog) => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a table or view",
+            relation.name
+        )),
+        None => Err(undefined_qual(relation)),
+    }
+}
+
 pub fn alter_trigger(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -12049,18 +12157,12 @@ pub fn alter_trigger(
     action: super::ast::AlterTriggerAction<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    let table = match resolve_dml_table(storage, &identity.table, txn.txid) {
-        Ok(table) => table,
-        Err(error) => return sql_fail(error),
-    };
-    if let Err(error) = storage.require_owner(
-        storage.table_access_object(table, txn.txid),
-        txn.txid,
-        "table",
-    ) {
-        return sql_fail(error);
-    }
-    let Some(slot) = storage.trigger_slot(table, identity.name, txn.txid) else {
+    let (target, target_kind, schema, relation) =
+        match trigger_target_for_ddl(storage, &identity.table, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+    let Some(slot) = storage.trigger_slot_on(target, identity.name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "trigger \"{}\" for relation \"{}\" does not exist",
@@ -12069,7 +12171,7 @@ pub fn alter_trigger(
         ));
     };
     let trigger = storage
-        .triggers_for_table(table, txn.txid)
+        .triggers_for_target(target, txn.txid)
         .find_map(|(index, trigger)| (index == slot).then_some(*trigger))
         .expect("resolved trigger remains visible");
     let (new_name, enabled) = match action {
@@ -12079,7 +12181,7 @@ pub fn alter_trigger(
                 Err(error) => return sql_fail(error),
             };
             if storage
-                .trigger_slot(table, name.as_str(), txn.txid)
+                .trigger_slot_on(target, name.as_str(), txn.txid)
                 .is_some_and(|other| other != slot)
             {
                 return sql_fail(sql_err!(
@@ -12101,16 +12203,15 @@ pub fn alter_trigger(
         }
         Err(error) => return sql_fail(error),
     };
-    let schema = storage.table_def(table, txn.txid).schema;
-    let table_name = storage.table_def(table, txn.txid).name;
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,
         lsn,
         &WalOp::AlterTrigger {
             name: identity.name,
+            target: target_kind,
             table_schema: schema.as_str(),
-            table: table_name.as_str(),
+            table: relation.as_str(),
             new_name: new_name.as_str(),
             enabled,
         },
@@ -12696,9 +12797,19 @@ pub fn drop_routine(
             let Some((trigger_slot, trigger)) = dependency else {
                 break;
             };
-            let (table_schema, table_name) = {
-                let table = storage.table_def(usize::from(trigger.table), txn.txid);
-                (table.schema, table.name)
+            let (target, relation_schema, relation_name) = match trigger.target {
+                crate::storage::TriggerTarget::Table(slot) => {
+                    let table = storage.table_def(usize::from(slot), txn.txid);
+                    (
+                        crate::wal::TriggerTargetKind::Table,
+                        table.schema,
+                        table.name,
+                    )
+                }
+                crate::storage::TriggerTarget::View(slot) => {
+                    let view = storage.view(usize::from(slot));
+                    (crate::wal::TriggerTargetKind::View, view.schema, view.name)
+                }
             };
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage(
@@ -12706,8 +12817,9 @@ pub fn drop_routine(
                 lsn,
                 &WalOp::DropTrigger {
                     name: trigger.name_to(txn.txid).as_str(),
-                    table_schema: table_schema.as_str(),
-                    table: table_name.as_str(),
+                    target,
+                    table_schema: relation_schema.as_str(),
+                    table: relation_name.as_str(),
                 },
             ) {
                 return sql_fail(error);
@@ -16486,6 +16598,7 @@ fn drop_view_slot(
         let view = storage.view(slot);
         (view.schema, view.name)
     };
+    drop_view_trigger_dependencies(storage, wal, txn, slot)?;
     let lsn = storage.bump_lsn();
     wal.stage(
         txn.txid,
@@ -16499,6 +16612,42 @@ fn drop_view_slot(
         txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))?;
     }
     Ok(())
+}
+
+fn drop_view_trigger_dependencies(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    view_slot: usize,
+) -> Result<(), SqlError> {
+    loop {
+        let dependency = {
+            storage
+                .triggers_for_view(view_slot, txn.txid)
+                .next()
+                .map(|(slot, trigger)| (slot, *trigger))
+        };
+        let Some((slot, trigger)) = dependency else {
+            return Ok(());
+        };
+        let (schema, name) = {
+            let view = storage.view(view_slot);
+            (view.schema, view.name)
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropTrigger {
+                name: trigger.name_to(txn.txid).as_str(),
+                target: crate::wal::TriggerTargetKind::View,
+                table_schema: schema.as_str(),
+                table: name.as_str(),
+            },
+        )?;
+        storage.drop_trigger(slot, txn.txid);
+        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+    }
 }
 
 fn drop_matview_slot(
@@ -17572,10 +17721,11 @@ pub fn drop_view(
             };
             let has_dependents = dependent_views.iter().any(|selected| *selected)
                 || dependent_matviews.iter().any(|selected| *selected);
-            if has_dependents && !cascade {
+            let has_triggers = storage.triggers_for_view(slot, txn.txid).next().is_some();
+            if (has_dependents || has_triggers) && !cascade {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop view {} because other objects depend on it",
+                    "cannot drop view {} because dependent objects exist",
                     view_name.as_str()
                 ));
             }
@@ -17588,6 +17738,9 @@ pub fn drop_view(
                     &dependent_matviews,
                 )
             {
+                return sql_fail(error);
+            }
+            if cascade && let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
@@ -21687,6 +21840,639 @@ where
         )?
     {
         return Ok(Err(error));
+    }
+    Ok(Ok(true))
+}
+
+/// Executes DML whose target is a view with a matching row-level INSTEAD OF
+/// trigger.  A view has no heap rows: its query supplies OLD images and the
+/// trigger body performs the durable work.  Keeping that distinction here
+/// prevents the ordinary table path from accidentally treating a view slot as
+/// writable storage.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn instead_of_view_dml<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    statement: &'a Stmt<'a>,
+    view_slot: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Outcome {
+    let view = storage.view(view_slot);
+    let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
+    let user = crate::sql::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txn.txid);
+    let n_columns = match super::query::describe_stored_query(
+        view.sql.as_str(),
+        storage,
+        txn.txid,
+        path,
+        storage.view_dependencies(view_slot),
+        arena,
+        &mut columns,
+    ) {
+        Ok(n) => n,
+        Err(error) => return sql_fail(error),
+    };
+    if n_columns > MAX_COLUMNS {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view has too many columns"
+        ));
+    }
+    let mut def = TableDef::empty();
+    def.schema = view.schema;
+    def.name = view.name;
+    def.n_columns = n_columns;
+    for (index, column) in columns[..n_columns].iter().enumerate() {
+        let Some((ctype, user_type)) = catalog_column_type(storage, txn.txid, column.type_oid)
+        else {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column {} has unsupported type oid {}",
+                index + 1,
+                column.type_oid
+            ));
+        };
+        let name = match SqlName::parse(column.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        def.columns[index] = ColumnMeta {
+            name,
+            ctype,
+            type_mod: column.type_mod,
+            collation: column.collation,
+            not_null: false,
+            unique: false,
+            primary: false,
+            auto_increment: false,
+            default: crate::storage::ColumnDefault::NONE,
+            is_identity: false,
+            identity_always: false,
+            auto_increment_step: 1,
+            user_type,
+        };
+    }
+    let target = crate::storage::TriggerTarget::View(view_slot as u16);
+    let event = match statement {
+        Stmt::Insert(_) => TriggerEvents::INSERT,
+        Stmt::Update(_) => TriggerEvents::UPDATE,
+        Stmt::Delete(_) => TriggerEvents::DELETE,
+        _ => unreachable!(),
+    };
+    let privilege = match event {
+        TriggerEvents::INSERT => crate::storage::PrivilegeSet::INSERT,
+        TriggerEvents::UPDATE => crate::storage::PrivilegeSet::UPDATE,
+        TriggerEvents::DELETE => crate::storage::PrivilegeSet::DELETE,
+        _ => unreachable!(),
+    };
+    if let Err(error) = require_view_privilege(storage, view_slot, privilege, txn.txid) {
+        return sql_fail(error);
+    }
+    if !storage
+        .triggers_for_target(target, txn.txid)
+        .any(|(_, trigger)| {
+            trigger.enabled_to(txn.txid)
+                && matches!(trigger.level, TriggerLevel::Row)
+                && trigger.timing == 2
+                && trigger.events.contains(event)
+        })
+    {
+        return sql_fail(sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "cannot {} view \"{}\": no INSTEAD OF {} trigger",
+            if event == TriggerEvents::INSERT {
+                "insert into"
+            } else if event == TriggerEvents::UPDATE {
+                "update"
+            } else {
+                "delete from"
+            },
+            view.name.as_str(),
+            if event == TriggerEvents::INSERT {
+                "INSERT"
+            } else if event == TriggerEvents::UPDATE {
+                "UPDATE"
+            } else {
+                "DELETE"
+            }
+        ));
+    }
+    let capturing = capture.is_some();
+    let returning = match statement {
+        Stmt::Insert(s) => s.returning,
+        Stmt::Update(s) => s.returning,
+        Stmt::Delete(s) => s.returning,
+        _ => unreachable!(),
+    };
+    let alias = match statement {
+        Stmt::Update(s) => s.alias,
+        Stmt::Delete(s) => s.alias,
+        _ => None,
+    };
+    if !returning.is_empty() && !capturing {
+        let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let count = match super::query::describe_catalog_items_as(
+            returning,
+            Some(&def),
+            alias,
+            storage,
+            txn.txid,
+            &mut description,
+        ) {
+            Ok(count) => count,
+            Err(error) => return sql_fail(error),
+        };
+        responder.row_description(&description[..count])?;
+    }
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    let schema = &schema[..def.n_columns];
+    let mut affected = 0u64;
+    match statement {
+        Stmt::Insert(insert) => {
+            if insert.on_conflict.is_some() || !matches!(insert.overriding, Overriding::None) {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "INSERT options ON CONFLICT and OVERRIDING are not supported for INSTEAD OF triggers"
+                ));
+            }
+            if let Some(select) = insert.select {
+                if !insert.columns.is_empty() {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "INSERT ... SELECT with a view column list is not supported for INSTEAD OF triggers"
+                    ));
+                }
+                let rows = match arena.alloc_slice_with(scratch.capacity(), |_| &[][..]) {
+                    Ok(rows) => rows,
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                };
+                let mut count = 0usize;
+                if let Err(error) = super::query::select_into_rows(
+                    storage,
+                    txn.txid,
+                    select,
+                    arena,
+                    params,
+                    None,
+                    None,
+                    &mut |values| {
+                        if count == rows.len() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement touches more than {} rows",
+                                rows.len()
+                            ));
+                        }
+                        let encoded = arena
+                            .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        rowenc::encode(values, encoded);
+                        rows[count] = encoded;
+                        count += 1;
+                        Ok(())
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                for bytes in &rows[..count] {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    if let Err(error) = rowenc::decode(bytes, schema, &mut values) {
+                        return sql_fail(error);
+                    }
+                    if values[..def.n_columns].len() != def.n_columns {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "INSERT has wrong number of expressions"
+                        ));
+                    }
+                    match finish_instead_of_view_new_row(
+                        storage,
+                        txn,
+                        scratch,
+                        arena,
+                        seq_session,
+                        responder,
+                        target,
+                        &def,
+                        event,
+                        &mut values[..def.n_columns],
+                        returning,
+                        params,
+                        &mut capture,
+                    ) {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => continue,
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
+                    affected += 1;
+                }
+            } else {
+                for row in insert.rows {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    if row.len()
+                        != if insert.columns.is_empty() {
+                            def.n_columns
+                        } else {
+                            insert.columns.len()
+                        }
+                    {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "INSERT has more expressions than target columns"
+                        ));
+                    }
+                    for (index, expression) in row.iter().enumerate() {
+                        let column = if insert.columns.is_empty() {
+                            index
+                        } else {
+                            match def.column_index(insert.columns[index]) {
+                                Some(column) => column,
+                                None => return sql_fail(undefined_column(insert.columns[index])),
+                            }
+                        };
+                        let value =
+                            match eval_full(expression, arena, params, &NoColumns, &NO_HOOKS) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                        values[column] =
+                            match coerce(value, &def.columns[column], storage, txn.txid, arena) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                    }
+                    match finish_instead_of_view_new_row(
+                        storage,
+                        txn,
+                        scratch,
+                        arena,
+                        seq_session,
+                        responder,
+                        target,
+                        &def,
+                        event,
+                        &mut values[..def.n_columns],
+                        returning,
+                        params,
+                        &mut capture,
+                    ) {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => continue,
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
+                    affected += 1;
+                }
+            }
+        }
+        Stmt::Update(update) => {
+            if update.from.is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "UPDATE ... FROM is not supported for INSTEAD OF triggers"
+                ));
+            }
+            let rows = match materialize_view_rows(
+                storage,
+                txn.txid,
+                view_slot,
+                &def,
+                schema,
+                arena,
+                params,
+                scratch.capacity(),
+            ) {
+                Ok(rows) => rows,
+                Err(error) => return sql_fail(error),
+            };
+            for bytes in rows {
+                let mut old = [Datum::Null; MAX_COLUMNS];
+                if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
+                    return sql_fail(error);
+                }
+                let context = RowCtx {
+                    def: &def,
+                    values: &old[..def.n_columns],
+                    alias: update.alias,
+                };
+                if let Some(predicate) = update.where_clause {
+                    match row_matches_values(
+                        &def,
+                        update.alias,
+                        &old[..def.n_columns],
+                        predicate,
+                        arena,
+                        params,
+                        &NO_HOOKS,
+                        None,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+                let mut new = old;
+                for (name, expression) in update.assignments {
+                    let Some(column) = def.column_index(name) else {
+                        return sql_fail(undefined_column(name));
+                    };
+                    let value = match eval_full(expression, arena, params, &context, &NO_HOOKS) {
+                        Ok(value) => value,
+                        Err(error) => return sql_fail(error),
+                    };
+                    new[column] =
+                        match coerce(value, &def.columns[column], storage, txn.txid, arena) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
+                }
+                match fire_view_row_trigger(
+                    storage,
+                    txn,
+                    scratch,
+                    arena,
+                    seq_session,
+                    responder,
+                    target,
+                    &def,
+                    event,
+                    Some(&old[..def.n_columns]),
+                    Some(&mut new[..def.n_columns]),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => return sql_fail(error),
+                }
+                if !returning.is_empty() {
+                    match emit_projected(
+                        storage,
+                        txn.txid,
+                        &def,
+                        update.alias,
+                        &new[..def.n_columns],
+                        returning,
+                        arena,
+                        params,
+                        responder,
+                        &mut capture,
+                    ) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
+                }
+                affected += 1;
+            }
+        }
+        Stmt::Delete(delete) => {
+            if delete.using.is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "DELETE ... USING is not supported for INSTEAD OF triggers"
+                ));
+            }
+            let rows = match materialize_view_rows(
+                storage,
+                txn.txid,
+                view_slot,
+                &def,
+                schema,
+                arena,
+                params,
+                scratch.capacity(),
+            ) {
+                Ok(rows) => rows,
+                Err(error) => return sql_fail(error),
+            };
+            for bytes in rows {
+                let mut old = [Datum::Null; MAX_COLUMNS];
+                if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
+                    return sql_fail(error);
+                }
+                if let Some(predicate) = delete.where_clause {
+                    match row_matches_values(
+                        &def,
+                        delete.alias,
+                        &old[..def.n_columns],
+                        predicate,
+                        arena,
+                        params,
+                        &NO_HOOKS,
+                        None,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+                match fire_view_row_trigger(
+                    storage,
+                    txn,
+                    scratch,
+                    arena,
+                    seq_session,
+                    responder,
+                    target,
+                    &def,
+                    event,
+                    Some(&old[..def.n_columns]),
+                    None,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => return sql_fail(error),
+                }
+                if !returning.is_empty() {
+                    match emit_projected(
+                        storage,
+                        txn.txid,
+                        &def,
+                        delete.alias,
+                        &old[..def.n_columns],
+                        returning,
+                        arena,
+                        params,
+                        responder,
+                        &mut capture,
+                    ) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(wire) => return Err(wire),
+                    }
+                }
+                affected += 1;
+            }
+        }
+        _ => unreachable!(),
+    }
+    let tag = if event == TriggerEvents::INSERT {
+        stack_format!(48, "INSERT 0 {}", affected)
+    } else if event == TriggerEvents::UPDATE {
+        stack_format!(48, "UPDATE {}", affected)
+    } else {
+        stack_format!(48, "DELETE {}", affected)
+    };
+    if capturing {
+        responder.set_affected_rows(affected);
+    } else {
+        responder.command_complete_rows(tag.as_str(), affected)?;
+    }
+    sql_ok()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "view-row materialization needs the bounded query execution context"
+)]
+fn materialize_view_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    view_slot: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    capacity: usize,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let view = storage.view(view_slot);
+    let user = crate::sql::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let source = arena
+        .alloc_str(view.sql.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let select = super::parser::parse_query(source, arena)?;
+    let select = super::query::expand_stored_query(
+        select,
+        storage,
+        txid,
+        path,
+        storage.view_dependencies(view_slot),
+        arena,
+    )?;
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[][..])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut count = 0usize;
+    super::query::select_into_rows(
+        storage,
+        txid,
+        select,
+        arena,
+        params,
+        None,
+        None,
+        &mut |values| {
+            if values.len() != def.n_columns {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view row shape does not match its catalog description"
+                ));
+            }
+            if count == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement touches more than {} rows",
+                    rows.len()
+                ));
+            }
+            let encoded = arena
+                .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
+                .map_err(|_| super::query::arena_full_pub())?;
+            rowenc::encode(values, encoded);
+            rows[count] = encoded;
+            count += 1;
+            Ok(())
+        },
+    )?;
+    let _ = schema;
+    Ok(&rows[..count])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fire_view_row_trigger<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    arena: &'a Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    target: crate::storage::TriggerTarget,
+    definition: &TableDef,
+    event: u8,
+    old: Option<&[Datum<'a>]>,
+    new: Option<&mut [Datum<'a>]>,
+) -> Result<bool, SqlError> {
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch: scratch as *mut _,
+        },
+        target,
+        definition,
+        event,
+        true,
+        0,
+        old,
+        new,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn finish_instead_of_view_new_row<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    scratch: &mut FixedVec<(u64, RowHome)>,
+    arena: &'a Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    target: crate::storage::TriggerTarget,
+    definition: &TableDef,
+    event: u8,
+    values: &mut [Datum<'a>],
+    returning: &[SelectItem<'a>],
+    params: &[Datum<'a>],
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<Result<bool, SqlError>, WireFull> {
+    let fired = match fire_view_row_trigger(
+        storage,
+        txn,
+        scratch,
+        arena,
+        seq_session,
+        responder,
+        target,
+        definition,
+        event,
+        None,
+        Some(values),
+    ) {
+        Ok(fired) => fired,
+        Err(error) => return Ok(Err(error)),
+    };
+    if !fired {
+        return Ok(Ok(false));
+    }
+    if !returning.is_empty() {
+        match emit_projected(
+            storage, txn.txid, definition, None, values, returning, arena, params, responder,
+            capture,
+        ) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Ok(Err(error)),
+            Err(wire) => return Err(wire),
+        }
     }
     Ok(Ok(true))
 }
@@ -26425,6 +27211,34 @@ fn require_table_privilege(
         sqlstate::INSUFFICIENT_PRIVILEGE,
         "permission denied for table {}",
         storage.table_def(table, txid).name.as_str()
+    ))
+}
+
+fn require_view_privilege(
+    storage: &Storage,
+    view: usize,
+    privilege: crate::storage::PrivilegeSet,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage(definition.schema.as_str(), txid)?;
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::View,
+        slot: view as u16,
+    };
+    if storage.has_object_privilege(object, role, privilege, txid) {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "permission denied for view {}",
+        definition.name.as_str()
     ))
 }
 

@@ -672,6 +672,7 @@ pub enum AlterSubscriptionAction<'a> {
 pub enum TriggerTiming {
     Before,
     After,
+    InsteadOf,
 }
 
 /// PostgreSQL's trigger granularity. The parser records the SQL default

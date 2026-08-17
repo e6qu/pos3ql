@@ -4773,6 +4773,35 @@ mod tests {
     }
 
     #[test]
+    fn instead_of_view_trigger_is_typed_and_illegal_forms_fail_at_parse_boundary() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "instead of trigger parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER write_view INSTEAD OF INSERT OR UPDATE OR DELETE ON public.orders_view \
+             FOR EACH ROW EXECUTE FUNCTION write_orders()",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreateTrigger(trigger)) = parser.next_stmt().unwrap() else {
+                panic!("INSTEAD OF trigger did not parse")
+            };
+            assert_eq!(trigger.timing, crate::sql::ast::TriggerTiming::InsteadOf);
+            assert_eq!(trigger.level, crate::sql::ast::TriggerLevel::Row);
+        });
+        for source in [
+            "CREATE TRIGGER bad INSTEAD OF INSERT ON orders_view FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad INSTEAD OF TRUNCATE ON orders_view FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TRIGGER bad INSTEAD OF UPDATE OF id ON orders_view FOR EACH ROW EXECUTE FUNCTION f()",
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena = Arena::new(&mut budget, "invalid instead of trigger", 1 << 18).unwrap();
+            let mut parser = Parser::new(source, &arena).unwrap();
+            assert!(parser.next_stmt().is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn transition_table_trigger_is_typed_and_illegal_forms_fail_at_parse_boundary() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "transition trigger parser", 1 << 18).unwrap();

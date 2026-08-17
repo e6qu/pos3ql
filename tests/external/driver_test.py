@@ -58,6 +58,39 @@ cur.execute("SELECT count(*) FROM drv")
 assert cur.fetchone()[0] == 3
 print("update/delete ok")
 
+# PostgreSQL views become writable through row-level INSTEAD OF triggers. This
+# uses Parse/Bind/Describe/Execute for each parameterized DML statement.
+cur.execute("DROP TABLE IF EXISTS drv_view_base")
+cur.execute("CREATE TABLE drv_view_base (id int PRIMARY KEY, value int)")
+cur.execute("INSERT INTO drv_view_base VALUES (1, 10), (2, 20)")
+cur.execute("CREATE VIEW drv_view AS SELECT id, value FROM drv_view_base")
+cur.execute(
+    """
+    CREATE FUNCTION drv_view_write() RETURNS trigger LANGUAGE plpgsql AS
+    'BEGIN
+       IF TG_OP = ''INSERT'' THEN
+         INSERT INTO drv_view_base VALUES (NEW.id, NEW.value); RETURN NEW;
+       ELSIF TG_OP = ''UPDATE'' THEN
+         UPDATE drv_view_base SET value = NEW.value WHERE id = OLD.id; RETURN NEW;
+       END IF;
+       DELETE FROM drv_view_base WHERE id = OLD.id; RETURN OLD;
+     END'
+    """
+)
+cur.execute(
+    "CREATE TRIGGER drv_view_write INSTEAD OF INSERT OR UPDATE OR DELETE ON drv_view "
+    "FOR EACH ROW EXECUTE FUNCTION drv_view_write()"
+)
+cur.execute("INSERT INTO drv_view VALUES (%s, %s) RETURNING id, value", (3, 30))
+assert cur.fetchone() == (3, 30)
+cur.execute("UPDATE drv_view SET value = %s WHERE id = %s RETURNING id, value", (21, 2))
+assert cur.fetchone() == (2, 21)
+cur.execute("DELETE FROM drv_view WHERE id = %s RETURNING id", (1,))
+assert cur.fetchone() == (1,)
+cur.execute("SELECT id, value FROM drv_view_base ORDER BY id")
+assert cur.fetchall() == [(2, 21), (3, 30)]
+print("instead-of view DML extended protocol ok")
+
 # WITH before a data-modifying main statement travels through Parse/Bind/
 # Describe/Execute with typed parameters and RETURNING metadata intact.
 cur.execute(

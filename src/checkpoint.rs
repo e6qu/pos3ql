@@ -3908,7 +3908,16 @@ impl Checkpointer {
         }
         for (_, trigger) in storage.triggers_with_slots_visible_to(0) {
             use core::fmt::Write;
-            let table = storage.table_def(usize::from(trigger.table), 0);
+            let (target_kind, relation_schema, relation_name) = match trigger.target {
+                crate::storage::TriggerTarget::Table(slot) => {
+                    let table = storage.table_def(usize::from(slot), 0);
+                    (0u8, table.schema, table.name)
+                }
+                crate::storage::TriggerTarget::View(slot) => {
+                    let view = storage.view(usize::from(slot));
+                    (1u8, view.schema, view.name)
+                }
+            };
             let function = storage.routine(usize::from(trigger.function));
             let owner = storage.role(trigger.ownership.owner_to(0) as usize).name;
             let mut howner = StackStr::<130>::new();
@@ -3932,10 +3941,10 @@ impl Checkpointer {
             for byte in trigger.name.as_str().as_bytes() {
                 let _ = write!(hname, "{byte:02x}");
             }
-            for byte in table.schema.as_str().as_bytes() {
+            for byte in relation_schema.as_str().as_bytes() {
                 let _ = write!(hschema, "{byte:02x}");
             }
-            for byte in table.name.as_str().as_bytes() {
+            for byte in relation_name.as_str().as_bytes() {
                 let _ = write!(htable, "{byte:02x}");
             }
             for byte in function.schema.as_str().as_bytes() {
@@ -3969,8 +3978,9 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
+                    target_kind,
                     howner.as_str(),
                     hname.as_str(),
                     hschema.as_str(),
@@ -5258,6 +5268,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         return Err(CheckpointSetupError::Corrupt("trigger record"));
     }
     let created_at = parse_field(words.next(), "trigger created_at")?;
+    let target_kind: u8 = parse_field(words.next(), "trigger target")?;
     let owner = decode_hex_name(
         words
             .next()
@@ -5391,7 +5402,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         1 => true,
         _ => return Err(CheckpointSetupError::Corrupt("trigger enabled")),
     };
-    if timing > 1
+    if timing > 2
         || (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
         || !transition_tables.is_valid_for(timing, level, events)
         || (!matches!(
@@ -5407,13 +5418,37 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         .ok_or(CheckpointSetupError::Corrupt(
             "trigger owner does not exist",
         ))?;
-    let Some(crate::storage::ResolvedRelation::Table(table)) =
-        storage.resolve_relation(Some(&schema), &table_name, 0)
-    else {
-        return Err(CheckpointSetupError::Corrupt(
-            "trigger table does not exist",
-        ));
+    let target = match (
+        target_kind,
+        storage.resolve_relation(Some(&schema), &table_name, 0),
+    ) {
+        (0, Some(crate::storage::ResolvedRelation::Table(slot))) => {
+            crate::storage::TriggerTarget::Table(slot as u16)
+        }
+        (1, Some(crate::storage::ResolvedRelation::View(slot))) => {
+            crate::storage::TriggerTarget::View(slot as u16)
+        }
+        _ => {
+            return Err(CheckpointSetupError::Corrupt(
+                "trigger relation does not exist",
+            ));
+        }
     };
+    if (matches!(target, crate::storage::TriggerTarget::Table(_)) && timing == 2)
+        || (matches!(target, crate::storage::TriggerTarget::View(_))
+            && (timing != 2
+                || !matches!(level, crate::sql::ast::TriggerLevel::Row)
+                || events.has_truncate()
+                || update_columns != 0
+                || !matches!(
+                    transition_tables,
+                    crate::storage::TriggerTransitionTables::None
+                )))
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "invalid trigger relation or timing",
+        ));
+    }
     let function = storage
         .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
         .ok_or(CheckpointSetupError::Corrupt(
@@ -5433,7 +5468,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             owner as u16,
             crate::storage::TriggerSpec {
                 name,
-                table,
+                target,
                 function,
                 timing,
                 level,

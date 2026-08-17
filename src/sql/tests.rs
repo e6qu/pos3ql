@@ -25,6 +25,124 @@ fn test_config(name: &str) -> Config {
     config
 }
 
+#[test]
+fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_trigger_base (id integer PRIMARY KEY, value integer); \
+         INSERT INTO view_trigger_base VALUES (1, 10), (2, 20); \
+         CREATE VIEW view_trigger_target AS SELECT id, value FROM view_trigger_base; \
+         CREATE FUNCTION view_trigger_write() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN \
+              IF TG_OP = ''INSERT'' THEN INSERT INTO view_trigger_base VALUES (NEW.id, NEW.value); RETURN NEW; END IF; \
+              IF TG_OP = ''UPDATE'' THEN UPDATE view_trigger_base SET value = NEW.value WHERE id = OLD.id; RETURN NEW; END IF; \
+              DELETE FROM view_trigger_base WHERE id = OLD.id; RETURN OLD; \
+            END'; \
+         CREATE TRIGGER view_trigger_write INSTEAD OF INSERT OR UPDATE OR DELETE ON view_trigger_target \
+           FOR EACH ROW EXECUTE FUNCTION view_trigger_write(); \
+         INSERT INTO view_trigger_target VALUES (3, 30) RETURNING id, value; \
+         UPDATE view_trigger_target SET value = value + 1 WHERE id = 2 RETURNING id, value; \
+         DELETE FROM view_trigger_target WHERE id = 1 RETURNING id;",
+    );
+    assert_eq!(data_rows(&output), ["3|30", "2|21", "1"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM view_trigger_base ORDER BY id"
+        )),
+        ["2|21", "3|30"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO view_trigger_target VALUES (4, 40); ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM view_trigger_base WHERE id = 4"
+        )),
+        ["0"]
+    );
+}
+
+#[test]
+fn instead_of_view_trigger_survives_checkpoint_recovery() {
+    let mut config = test_config("instead-of-view-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("instead-of-view-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovered_view_base (id integer PRIMARY KEY); \
+         CREATE VIEW recovered_view AS SELECT id FROM recovered_view_base; \
+         CREATE FUNCTION recovered_view_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO recovered_view_base VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TRIGGER recovered_view_trigger INSTEAD OF INSERT ON recovered_view \
+           FOR EACH ROW EXECUTE FUNCTION recovered_view_trigger(); \
+         ALTER TRIGGER recovered_view_trigger ON recovered_view DISABLE;",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let disabled = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO recovered_view VALUES (7)",
+    );
+    assert!(String::from_utf8_lossy(&disabled).contains("55000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "ALTER TRIGGER recovered_view_trigger ON recovered_view ENABLE; \
+             INSERT INTO recovered_view VALUES (7); SELECT id FROM recovered_view_base"
+        )),
+        ["7"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE drop_view_trigger_base (id integer); \
+         CREATE VIEW drop_view_trigger_target AS SELECT id FROM drop_view_trigger_base; \
+         CREATE FUNCTION drop_view_trigger_function() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN RETURN NEW; END'; \
+         CREATE TRIGGER drop_view_trigger INSTEAD OF INSERT ON drop_view_trigger_target \
+           FOR EACH ROW EXECUTE FUNCTION drop_view_trigger_function();",
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP VIEW drop_view_trigger_target",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP VIEW drop_view_trigger_target CASCADE; \
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'drop_view_trigger'",
+    );
+    assert_eq!(data_rows(&dropped), ["0"]);
+}
+
 fn test_engine() -> (Engine, Budget) {
     // Each test gets its own journal; the caller's function name is not
     // available, so a counter differentiates them.

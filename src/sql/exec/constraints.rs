@@ -65,7 +65,19 @@ pub(crate) fn coerce_domain_value<'a>(
             })?;
         coerce_domain_value(storage, parent, value, txid, arena, params)?
     } else {
-        crate::sql::eval::cast_to(value, domain.base, arena)?
+        match domain.base {
+            crate::sql::types::ColType::Enum(slot) => {
+                super::coerce_enum_value(value, slot, storage, txid, arena)?
+            }
+            crate::sql::types::ColType::Composite(slot) => match value {
+                value @ Datum::CompositeText { slot: actual, .. } if actual == slot => value,
+                Datum::Text(text) | Datum::Bpchar(text) => {
+                    super::decode_composite_text(text, slot, storage, txid, arena)?
+                }
+                value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
+            },
+            base => crate::sql::eval::cast_to(value, base, arena)?,
+        }
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
     validate_domain_value(&domain, value, arena, params)?;

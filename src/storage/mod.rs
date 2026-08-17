@@ -2588,6 +2588,10 @@ pub struct DomainDef {
     /// The value representation is flattened to `base`, but the parent chain
     /// remains explicit so every inherited NOT NULL/CHECK is enforced.
     pub base_domain: Option<UserTypeName>,
+    /// Stable identity of a directly-declared enum or composite base.  The
+    /// execution type carries a runtime slot, but a slot cannot survive a
+    /// cold rebuild or a schema/name move.
+    pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
     /// before the domain's own constraints.
@@ -2620,6 +2624,7 @@ impl DomainDef {
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
         base_domain: None,
+        base_user_type: None,
         base: ColType::Bool,
         base_type_mod: -1,
         not_null: false,
@@ -2647,6 +2652,7 @@ impl DomainDef {
                     .map_or(self.schema, |identity| identity.schema),
                 name: pending.identity.map_or(self.name, |identity| identity.name),
                 base_domain: pending.spec.base_domain,
+                base_user_type: pending.spec.base_user_type,
                 base: pending.spec.base,
                 base_type_mod: pending.spec.base_type_mod,
                 not_null: pending.spec.not_null,
@@ -2664,6 +2670,7 @@ impl DomainDef {
 #[derive(Debug, Clone, Copy)]
 pub struct DomainSpec {
     pub base_domain: Option<UserTypeName>,
+    pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
     pub base_type_mod: i32,
     pub not_null: bool,
@@ -12495,6 +12502,72 @@ impl Storage {
         spec: DomainSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.create_domain_with_binding(schema, name, spec, txid, false)
+    }
+
+    /// Manifest loading is the sole phase allowed to defer a named base-type
+    /// slot until every catalog record has been parsed.
+    pub(crate) fn create_domain_from_manifest(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: DomainSpec,
+    ) -> Result<usize, SqlError> {
+        self.create_domain_with_binding(schema, name, spec, 0, true)
+    }
+
+    fn create_domain_with_binding(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        mut spec: DomainSpec,
+        txid: u32,
+        defer_manifest_binding: bool,
+    ) -> Result<usize, SqlError> {
+        if let Some(identity) = spec.base_user_type {
+            spec.base = match spec.base {
+                ColType::Enum(_) => {
+                    match self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+                        Some(slot) => ColType::Enum(slot as u16),
+                        None if defer_manifest_binding => {
+                            ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED)
+                        }
+                        None => {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base enum \"{}.{}\" does not exist",
+                                identity.schema.as_str(),
+                                identity.name.as_str()
+                            ));
+                        }
+                    }
+                }
+                ColType::Composite(_) => match self.composite_slot(
+                    identity.schema.as_str(),
+                    identity.name.as_str(),
+                    txid,
+                ) {
+                    Some(slot) => ColType::Composite(slot as u16),
+                    None if defer_manifest_binding => {
+                        ColType::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED)
+                    }
+                    None => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "domain base composite \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "domain base identity names a non-user-defined type"
+                    ));
+                }
+            };
+        }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
             (d.schema == schema && d.name == name
@@ -12597,6 +12670,7 @@ impl Storage {
             name,
             ownership,
             base_domain: spec.base_domain,
+            base_user_type: spec.base_user_type,
             base: spec.base,
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
@@ -12615,6 +12689,52 @@ impl Storage {
 
     pub(crate) fn domain_for(&self, slot: usize, txid: u32) -> DomainDef {
         self.domains[slot].definition_for(txid)
+    }
+
+    /// Finishes manifest-time user-type binding once every catalog definition
+    /// has been installed. Startup never exposes the interim unresolved slot.
+    pub(crate) fn rebind_domain_base_types(&mut self) -> Result<(), SqlError> {
+        for slot in 0..self.domains.len() {
+            let domain = self.domains[slot];
+            if domain.ddl_state != CatalogDdlState::Present {
+                continue;
+            }
+            let Some(identity) = domain.base_user_type else {
+                continue;
+            };
+            let base = match domain.base {
+                ColType::Enum(_) => ColType::Enum(
+                    self.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base enum \"{}.{}\" does not exist",
+                                identity.schema.as_str(),
+                                identity.name.as_str()
+                            )
+                        })? as u16,
+                ),
+                ColType::Composite(_) => ColType::Composite(
+                    self.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base composite \"{}.{}\" does not exist",
+                                identity.schema.as_str(),
+                                identity.name.as_str()
+                            )
+                        })? as u16,
+                ),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "domain base identity names a non-user-defined type"
+                    ));
+                }
+            };
+            self.domains[slot].base = base;
+        }
+        Ok(())
     }
 
     pub(crate) fn stage_domain_alter(
@@ -12702,6 +12822,7 @@ impl Storage {
         let spec = prior.map_or(
             DomainSpec {
                 base_domain: domain.base_domain,
+                base_user_type: domain.base_user_type,
                 base: domain.base,
                 base_type_mod: domain.base_type_mod,
                 not_null: domain.not_null,
@@ -13212,6 +13333,24 @@ impl Storage {
                 }
             }
         }
+        for domain in self
+            .domains
+            .iter_mut()
+            .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
+        {
+            if matches!(domain.base, ColType::Enum(candidate) if candidate as usize == slot)
+                && domain.base_user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+            {
+                domain.base_user_type = Some(UserTypeName {
+                    schema: new_schema,
+                    name: new_name,
+                });
+            }
+        }
         for comment in self.comments.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
@@ -13519,6 +13658,24 @@ impl Storage {
                         identity.name = new_name;
                     }
                 }
+            }
+        }
+        for domain in self
+            .domains
+            .iter_mut()
+            .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
+        {
+            if matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
+                && domain.base_user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+            {
+                domain.base_user_type = Some(UserTypeName {
+                    schema: new_schema,
+                    name: new_name,
+                });
             }
         }
         for comment in self.comments.iter_mut() {

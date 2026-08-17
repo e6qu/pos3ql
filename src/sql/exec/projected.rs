@@ -333,16 +333,16 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         Datum::Array { element, raw } => {
             out[0] = 15;
             out[1] = element.code();
-            let (base_code, enum_slot) = match element {
+            let (base_code, base_user_slot) = match element {
                 crate::sql::types::ArrElem::Domain {
                     base_code,
-                    enum_slot,
+                    base_user_slot,
                     ..
-                } => (*base_code, *enum_slot),
+                } => (*base_code, *base_user_slot),
                 _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
             };
             out[2] = base_code;
-            out[3..5].copy_from_slice(&enum_slot.to_le_bytes());
+            out[3..5].copy_from_slice(&base_user_slot.to_le_bytes());
             out[5..9].copy_from_slice(&(raw.len() as u32).to_le_bytes());
             out[9..9 + raw.len()].copy_from_slice(raw);
             9 + raw.len()
@@ -609,7 +609,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 element = crate::sql::types::ArrElem::Domain {
                     slot,
                     base_code: bytes[at + 1],
-                    enum_slot: u16::from_le_bytes(bytes[at + 2..at + 4].try_into().unwrap()),
+                    base_user_slot: u16::from_le_bytes(bytes[at + 2..at + 4].try_into().unwrap()),
                 };
             }
             let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;

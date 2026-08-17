@@ -2282,7 +2282,8 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         "CREATE TYPE binary_state AS ENUM ('ready', 'blocked'); \
          CREATE DOMAIN binary_positive AS integer CHECK (VALUE > 0); \
          CREATE DOMAIN binary_required AS integer NOT NULL; \
-         CREATE TYPE binary_coordinate AS (x integer, y integer)",
+         CREATE TYPE binary_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN binary_coordinate_domain AS binary_coordinate",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
@@ -2300,6 +2301,12 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         engine
             .storage
             .composite_slot("public", "binary_coordinate", 0)
+            .unwrap() as u16,
+    );
+    let composite_domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_coordinate_domain", 0)
             .unwrap() as u16,
     );
     let transaction = TxnState::new(&mut budget, 64).unwrap();
@@ -2339,6 +2346,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "(4,8)"
     );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "(4,8)"
+    );
     let composite_array_oid = crate::sql::types::oid::composite_array_oid(
         engine
             .storage
@@ -2356,6 +2370,26 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{\"(4,8)\"}"
+    );
+    let mut composite_domain_array_binary = composite_array_binary.clone();
+    composite_domain_array_binary[8..12].copy_from_slice(&composite_domain_oid.to_be_bytes());
+    let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_coordinate_domain", 0)
+            .unwrap() as u16,
+    );
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                composite_domain_array_oid,
+                &composite_domain_array_binary,
+                &arena,
+                0,
+            )
             .unwrap()
             .to_string(),
         "{\"(4,8)\"}"
@@ -2564,6 +2598,35 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         invalid_text_domain_array.sqlstate,
         sqlstate::CHECK_VIOLATION
+    );
+    let mut bit_array = Vec::new();
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    bit_array.extend_from_slice(&crate::sql::types::oid::BIT.to_be_bytes());
+    bit_array.extend_from_slice(&3_i32.to_be_bytes());
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    for value in [
+        &[0, 0, 0, 5, 0b1011_0000][..],
+        &[0, 0, 0, 5, 0b0011_1000][..],
+    ] {
+        bit_array.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bit_array.extend_from_slice(value);
+    }
+    bit_array.extend_from_slice(&(-1_i32).to_be_bytes());
+    assert_eq!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::BIT_ARRAY, &bit_array, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{10110,00111,NULL}"
+    );
+    bit_array[8..12].copy_from_slice(&crate::sql::types::oid::VARBIT.to_be_bytes());
+    assert_eq!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::VARBIT_ARRAY, &bit_array, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{10110,00111,NULL}"
     );
     domain_array[8..12].copy_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
     let wrong_element_oid = engine
@@ -3327,10 +3390,14 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
         &mut budget,
         "CREATE DOMAIN view_column_domain AS integer CHECK (VALUE > 0); \
          CREATE TYPE view_column_enum AS ENUM ('ready'); \
+         CREATE TYPE view_column_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN view_column_coordinate_domain AS view_column_coordinate; \
          CREATE VIEW view_column_catalog AS \
            SELECT 1::view_column_domain AS domain_value, \
                   'ready'::view_column_enum AS enum_value, \
-                  ARRAY[1] AS array_value",
+                  ARRAY[1] AS array_value, \
+                  ROW(1, 2)::view_column_coordinate_domain AS composite_value, \
+                  ARRAY[ROW(3, 4)::view_column_coordinate_domain] AS composite_values",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -3345,7 +3412,19 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
             "domain_value|1|YES|integer",
             "enum_value|2|YES|USER-DEFINED",
             "array_value|3|YES|ARRAY",
+            "composite_value|4|YES|USER-DEFINED",
+            "composite_values|5|YES|ARRAY",
         ]
+    );
+    let domain_dependencies = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT objid, refobjid FROM pg_depend WHERE refobjid = 230000",
+    ));
+    assert_eq!(
+        domain_dependencies,
+        ["110001|230000"],
+        "domain type dependencies: {domain_dependencies:?}"
     );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
     let mut observer = TxnState::new(&mut budget, 256).unwrap();
@@ -12364,6 +12443,8 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
                  numbers integer[] DEFAULT ARRAY[4,5],
                  bounds int4range DEFAULT '[2,7]'::int4range,
                  bitset bit(3) DEFAULT B'101',
+                 bitset_array bit(3)[] DEFAULT ARRAY[B'101', B'011']::bit(3)[],
+                 varbit_array varbit[] DEFAULT ARRAY[B'1', B'00111']::varbit[],
                  payload bytea DEFAULT '\\x00ff'::bytea,
                  token uuid DEFAULT '00000000-0000-0000-0000-000000000099'::uuid
                      REFERENCES default_parent(id) ON DELETE SET DEFAULT
@@ -12417,7 +12498,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
         "INSERT INTO default_values (id) VALUES (3);
          DELETE FROM default_parent WHERE id = '00000000-0000-0000-0000-000000000001';
          SELECT day, stamp, zoned, clock, zoned_clock, span, document, numbers,
-                bounds, bitset, encode(payload, 'hex'), token
+                bounds, bitset, bitset_array, varbit_array, encode(payload, 'hex'), token
            FROM default_values ORDER BY id;",
     );
     assert!(
@@ -12428,9 +12509,9 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     assert_eq!(
         data_rows(&rows),
         [
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"a\": [1, 2]}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"a\": [1, 2]}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
         ]
     );
     assert_eq!(
@@ -16503,6 +16584,115 @@ fn domains_enforce_and_report() {
          SELECT 0::posint",
     );
     assert!(String::from_utf8_lossy(&bytes).contains("23514"));
+}
+
+#[test]
+fn domains_over_named_composites_preserve_identity_and_array_elements() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE domain_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN coordinate_value AS domain_coordinate; \
+         CREATE TABLE domain_coordinates (value coordinate_value, values coordinate_value[])",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO domain_coordinates VALUES \
+         ('(3,4)', ARRAY[ROW(5,6)::domain_coordinate]::coordinate_value[])",
+    );
+    assert!(
+        !String::from_utf8_lossy(&inserted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text, values::text, pg_typeof(values) FROM domain_coordinates",
+        )),
+        ["(3,4)|{\"(5,6)\"}|coordinate_value[]"]
+    );
+}
+
+#[test]
+fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
+    let mut config = test_config("composite-domain-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("composite-domain-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA durable_domain; \
+             CREATE TYPE domain_point AS (x integer, y integer); \
+             CREATE DOMAIN point_value AS domain_point; \
+             CREATE TABLE domain_point_values (values point_value[]); \
+             INSERT INTO domain_point_values VALUES (ARRAY[ROW(7,8)::domain_point]::point_value[]); \
+             ALTER TYPE domain_point SET SCHEMA durable_domain; \
+             ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
+             CHECKPOINT",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values::text FROM domain_point_values",
+        )),
+        ["{\"(7,8)\"}"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn composite_domain_is_a_drop_dependency() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE drop_domain_point AS (x integer); \
+         CREATE DOMAIN drop_domain_point_value AS drop_domain_point; \
+         CREATE TABLE drop_domain_points (value drop_domain_point_value)",
+    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE drop_domain_point");
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE drop_domain_point CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_type WHERE typname IN ('drop_domain_point', 'drop_domain_point_value')",
+        )),
+        ["0"]
+    );
 }
 
 #[test]
@@ -21702,6 +21892,33 @@ fn pg_dump_bootstrap_surface() {
              JOIN pg_namespace n ON n.oid=x.extnamespace"
         )),
         ["0"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN pg_dump_domain AS integer",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typdefaultbin IS NULL FROM pg_type WHERE typname = 'pg_dump_domain'",
+        )),
+        ["t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname, typelem, typarray FROM pg_type \
+             WHERE typname IN ('bit', 'varbit', '_bit', '_varbit') ORDER BY typname",
+        )),
+        [
+            "_bit|1560|0",
+            "_varbit|1562|0",
+            "bit|0|1561",
+            "varbit|0|1563"
+        ]
     );
     assert!(
         String::from_utf8_lossy(&run_with(

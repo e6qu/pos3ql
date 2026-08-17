@@ -2684,34 +2684,7 @@ pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'stati
     ) {
         return None;
     }
-    let array_elements = [
-        ArrElem::Bool,
-        ArrElem::Int2,
-        ArrElem::Int4,
-        ArrElem::Int8,
-        ArrElem::Float4,
-        ArrElem::Float8,
-        ArrElem::Text,
-        ArrElem::Name,
-        ArrElem::Varchar,
-        ArrElem::Bpchar,
-        ArrElem::Date,
-        ArrElem::Timestamp,
-        ArrElem::Timestamptz,
-        ArrElem::Time,
-        ArrElem::Timetz,
-        ArrElem::Interval,
-        ArrElem::Json,
-        ArrElem::Jsonb,
-        ArrElem::Uuid,
-        ArrElem::Bytea,
-        ArrElem::Numeric,
-        ArrElem::Inet,
-        ArrElem::Cidr,
-        ArrElem::Macaddr,
-        ArrElem::Macaddr8,
-    ];
-    if let Some(element) = array_elements
+    if let Some(element) = ArrElem::BUILTIN
         .iter()
         .find(|element| element.catalog_name() == name)
     {
@@ -4467,6 +4440,52 @@ fn pg_depend<'a>(
         )?;
     }
 
+    // A domain is ordered after its parent domain or direct user-defined base
+    // type. pg_dump reads this graph to emit a restorable type definition.
+    for domain_slot in 0..storage.domain_count() {
+        let domain = storage.domain_for(domain_slot, txid);
+        if !domain.visible_to(txid) {
+            continue;
+        }
+        let typed_base = || match domain.base {
+            ColType::Enum(slot) => Some(crate::sql::types::oid::enum_oid(slot)),
+            ColType::Composite(slot) => Some(crate::sql::types::oid::composite_oid(slot)),
+            _ => None,
+        };
+        let referenced_type = if let Some(parent) = domain.base_domain {
+            storage
+                .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
+                .map(domain_oid)
+        } else {
+            domain
+                .base_user_type
+                .and_then(|base| {
+                    storage
+                        .enum_slot(base.schema.as_str(), base.name.as_str(), txid)
+                        .map(|slot| crate::sql::types::oid::enum_oid(slot as u16))
+                        .or_else(|| {
+                            composite_type_oid(
+                                storage,
+                                base.schema.as_str(),
+                                base.name.as_str(),
+                                txid,
+                            )
+                        })
+                })
+                .or_else(typed_base)
+        };
+        if let Some(referenced_type) = referenced_type {
+            push(
+                PG_TYPE_OID,
+                domain_oid(domain_slot),
+                PG_TYPE_OID,
+                referenced_type,
+                0,
+                "n",
+            )?;
+        }
+    }
+
     let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| match dependency.class
     {
         crate::storage::DependencyClass::Table => {
@@ -5446,6 +5465,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("typowner", ColType::Int4),
             ("typisdefined", ColType::Bool),
             ("typstorage", ColType::Bpchar),
+            ("typdefaultbin", ColType::Text),
         ],
     );
     let types = [
@@ -5534,10 +5554,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_CATALOG_NS_OID),
                 text("b", arena)?,
                 text(category(t), arena)?,
-                Datum::Int4(0),  // typbasetype
-                Datum::Int4(0),  // typelem
-                Datum::Int4(0),  // typarray
-                Datum::Int4(0),  // typrelid
+                Datum::Int4(0), // typbasetype
+                Datum::Int4(0), // typelem
+                Datum::Int4(
+                    super::types::ArrElem::from_coltype(*t)
+                        .map_or(0, super::types::ArrElem::array_oid),
+                ), // typarray
+                Datum::Int4(0), // typrelid
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
@@ -5548,11 +5571,46 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(10),
                 Datum::Bool(true),
                 text(if t.typlen() < 0 { "x" } else { "p" }, arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
     }
     let mut n = types.len();
+    // Arrays are catalog types in their own right. Keeping this inventory on
+    // `ArrElem` means an accepted array OID is simultaneously visible to
+    // `pg_type`, has a matching `typelem`, and is discoverable by catalog
+    // clients such as pg_dump.
+    for element in super::types::ArrElem::BUILTIN {
+        out[n] = row(
+            &[
+                Datum::Int4(element.array_oid()),
+                text(element.catalog_name(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(element.element_oid()),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     // User-defined domains: typtype 'd', with their base type and constraints.
     for slot in 0..storage.domain_count() {
         let d = storage.domain_for(slot, txid);
@@ -5612,6 +5670,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text(if d.base.typlen() < 0 { "x" } else { "p" }, arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5650,6 +5709,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5702,6 +5762,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("p", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5740,6 +5801,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5792,6 +5854,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5830,6 +5893,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5881,6 +5945,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 ),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -5918,6 +5983,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text("x", arena)?,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -7385,40 +7451,13 @@ fn view_column_catalog_type(
     txid: u32,
     oid: i32,
 ) -> Result<(ColType, Option<crate::storage::UserTypeName>), SqlError> {
-    use crate::sql::types::oid as type_oid;
-    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
-        .contains(&oid)
-    {
-        let definition = storage.domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid);
-        return Ok((
-            definition.base,
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
-        .contains(&oid)
-    {
-        let definition = storage.enum_for((oid - type_oid::FIRST_ENUM) as usize, txid);
-        return Ok((
-            ColType::Enum((oid - type_oid::FIRST_ENUM) as u16),
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    super::exec::coltype_of_oid(oid)
-        .map(|ctype| (ctype, None))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column has unsupported type oid {}",
-                oid
-            )
-        })
+    super::exec::catalog_column_type(storage, txid, oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "view column has unsupported type oid {}",
+            oid
+        )
+    })
 }
 
 /// The type-dependent portion of `information_schema.columns`.  `TypeMod`

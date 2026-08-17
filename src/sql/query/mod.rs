@@ -577,6 +577,15 @@ pub(super) fn storage_catalog<'a>(
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn materialize_composite<'a>(
+        &self,
+        slot: u16,
+        text: &'a str,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::exec::decode_composite_text(text, slot, self.storage, self.txid, arena)
+    }
+
     fn compare_text(
         &self,
         collation: super::ast::Collation,
@@ -1182,6 +1191,25 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             )
             .map(Some);
         }
+        if let Some(slot) = self.storage.resolve_composite_slot(type_name, self.txid) {
+            return match value {
+                Datum::Text(text) => super::exec::decode_composite_text(
+                    text,
+                    slot as u16,
+                    self.storage,
+                    self.txid,
+                    arena,
+                ),
+                value => super::exec::coerce_composite_value(
+                    value,
+                    slot as u16,
+                    self.storage,
+                    self.txid,
+                    arena,
+                ),
+            }
+            .map(Some);
+        }
         let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
             return Ok(None);
         };
@@ -1209,6 +1237,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let def = self.storage.domain(slot as usize);
                 def.visible_to(self.txid).then_some(def.name)
             }
+            super::types::ArrElem::Composite(slot) => {
+                let def = self.storage.composite(slot as usize);
+                def.visible_to(self.txid).then_some(def.name)
+            }
             _ => None,
         };
         let Some(name) = name else { return Ok(None) };
@@ -1230,7 +1262,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => (type_name, false),
         };
         let visible = self.storage.resolve_domain_slot(base, self.txid).is_some()
-            || self.storage.resolve_enum_slot(base, self.txid).is_some();
+            || self.storage.resolve_enum_slot(base, self.txid).is_some()
+            || self
+                .storage
+                .resolve_composite_slot(base, self.txid)
+                .is_some();
         if !visible {
             return Ok(None);
         }
@@ -1258,13 +1294,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 super::types::oid::domain_oid(slot as u16)
             });
         }
-        self.storage.resolve_enum_slot(base, self.txid).map(|slot| {
-            if array {
+        if let Some(slot) = self.storage.resolve_enum_slot(base, self.txid) {
+            return Some(if array {
                 super::types::oid::enum_array_oid(slot as u16)
             } else {
                 super::types::oid::enum_oid(slot as u16)
-            }
-        })
+            });
+        }
+        self.storage
+            .resolve_composite_slot(base, self.txid)
+            .map(|slot| {
+                if array {
+                    super::types::oid::composite_array_oid(slot as u16)
+                } else {
+                    super::types::oid::composite_oid(slot as u16)
+                }
+            })
     }
 }
 
@@ -1777,6 +1822,11 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
     use ColType::*;
     if a == b {
         return Some(a);
+    }
+    if let (ColType::Composite(slot), ColType::Record)
+    | (ColType::Record, ColType::Composite(slot)) = (a, b)
+    {
+        return Some(ColType::Composite(slot));
     }
     let numeric_rank = |t: ColType| match t {
         Int2 => Some(0),
@@ -4562,7 +4612,31 @@ fn project_row_skipping<'a>(
             }
         }
     }
+    materialize_composite_outputs(&mut out[..n], arena, hooks)?;
     Ok(n)
+}
+
+/// Result rows must retain the structural composite value through the final
+/// protocol encoder. Storage keeps a canonical text representation, but
+/// turning that text into an anonymous record here would lose the declared
+/// field OIDs required by PostgreSQL binary Result and COPY.
+fn materialize_composite_outputs<'a>(
+    values: &mut [Datum<'a>],
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    for value in values {
+        *value = match *value {
+            Datum::CompositeText { slot, text } => {
+                catalog.materialize_composite(slot, text, arena)?
+            }
+            other => other,
+        };
+    }
+    Ok(())
 }
 
 /// Column descriptions across the whole scope (wildcards expand every
@@ -4614,7 +4688,7 @@ pub fn describe_scope_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                n = describe_scope_record_star(base, scope, arena, out, n)?;
+                n = describe_scope_record_star(base, scope, storage, txid, arena, out, n)?;
             }
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
@@ -4674,7 +4748,7 @@ pub fn describe_scope_items<'q>(
 pub fn describe_catalog_items<'q>(
     items: &[SelectItem<'q>],
     definition: Option<&'q TableDef>,
-    storage: &Storage,
+    storage: &'q Storage,
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
@@ -4685,11 +4759,11 @@ pub fn describe_catalog_items_as<'q>(
     items: &[SelectItem<'q>],
     definition: Option<&'q TableDef>,
     alias: Option<&str>,
-    storage: &Storage,
+    storage: &'q Storage,
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    let count = describe_items(items, definition, alias, out)?;
+    let count = describe_items(items, definition, alias, Some(storage), txid, out)?;
     let mut column = 0;
     for item in items {
         match item {
@@ -5212,6 +5286,8 @@ fn matching_user_type_description<'q>(
 fn describe_scope_record_star<'q>(
     base: &Expr<'q>,
     scope: &QueryScope<'q>,
+    storage: &Storage,
+    txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
     mut n: usize,
@@ -5260,11 +5336,49 @@ fn describe_scope_record_star<'q>(
             let value_type = super::exec::json_each_value_type_pub(name).expect("checked");
             push(ColDesc::of_type("value", value_type), &mut n)?;
         }
-        // A record-typed column (or nested record field) with a registered
-        // shape expands to its fields.
-        _ if super::exec::expr_record_handle_pub(base, &ScopeCols(scope)).is_some() => {
-            let handle =
-                super::exec::expr_record_handle_pub(base, &ScopeCols(scope)).expect("checked");
+        _ => {
+            let resolver = CatalogScopeCols {
+                scope,
+                outer_scope: None,
+                storage,
+                txid,
+            };
+            let slot = match base {
+                Expr::Column { qualifier, name } => {
+                    match super::exec::ColTypeResolver::resolve(&resolver, *qualifier, name)? {
+                        ColType::Composite(slot) => Some(slot),
+                        _ => None,
+                    }
+                }
+                Expr::Field { base, field } => {
+                    match super::exec::record_field_type(base, field, &resolver)? {
+                        ColType::Composite(slot) => Some(slot),
+                        _ => None,
+                    }
+                }
+                Expr::Cast { type_name, .. } => storage
+                    .resolve_composite_slot(type_name, txid)
+                    .map(|slot| slot as u16),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                for field in storage.composite(slot as usize).fields() {
+                    let name = arena
+                        .alloc_str(field.name.as_str())
+                        .map_err(|_| arena_full())?;
+                    push(
+                        ColDesc::of_type(name, field.ctype).with_type_mod(field.type_mod),
+                        &mut n,
+                    )?;
+                }
+                return Ok(n);
+            }
+            let Some(handle) = super::exec::expr_record_handle_pub(base, &ScopeCols(scope)) else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            };
             let mut push_err = None;
             super::exec::visit_record_shape_pub(handle, |field_name, ctype| {
                 if push_err.is_some() {
@@ -5272,22 +5386,17 @@ fn describe_scope_record_star<'q>(
                 }
                 match arena.alloc_str(field_name) {
                     Ok(name) => {
-                        if let Err(e) = push(ColDesc::of_type(name, ctype), &mut n) {
-                            push_err = Some(e);
+                        if let Err(error) = push(ColDesc::of_type(name, ctype), &mut n) {
+                            push_err = Some(error);
                         }
                     }
                     Err(_) => push_err = Some(arena_full()),
                 }
             });
-            if let Some(e) = push_err {
-                return Err(e);
+            if let Some(error) = push_err {
+                return Err(error);
             }
-        }
-        _ => {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "row expansion is not supported on this expression"
-            ));
+            return Ok(n);
         }
     }
     Ok(n)
@@ -5357,6 +5466,19 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             .routine_for_call_types(name, arguments, self.txid)?
             .kind
             .function_result()
+    }
+
+    fn named_composite_field(
+        &self,
+        type_name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
+        let field = self.storage.composite(slot).fields().get(index)?;
+        Some((
+            crate::util::StackStr::from_str(field.name.as_str()),
+            field.ctype,
+        ))
     }
 
     fn is_whole_row(&self, name: &str) -> bool {

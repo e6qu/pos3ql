@@ -231,6 +231,8 @@ pub(crate) enum DdlUndo {
     },
     /// CREATE TYPE (enum) at this slot — undo by dropping it.
     EnumCreated(u32),
+    /// CREATE TYPE (...): named composites are distinct from anonymous records.
+    CompositeCreated(u32),
     /// DROP TYPE (enum) at this slot — undo by reviving it.
     EnumDropped(u32),
     /// ALTER TYPE staged a definition visible only to its transaction.

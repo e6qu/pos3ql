@@ -191,6 +191,14 @@ pub fn projected_value_len(v: &Datum) -> usize {
             }
             n
         }
+        Datum::Composite { fields, .. } => {
+            let mut n = 2 + 4 + record_text_len(v) + 1;
+            for f in *fields {
+                n += 1 + f.name.len() + 4 + projected_value_len(&f.value);
+            }
+            n
+        }
+        Datum::CompositeText { text, .. } => 2 + 4 + text.len(),
     }
 }
 
@@ -451,6 +459,46 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             }
             at
         }
+        Datum::Composite { slot, fields } => {
+            use core::fmt::Write as _;
+            struct SliceWriter<'b> {
+                buf: &'b mut [u8],
+                at: usize,
+            }
+            impl core::fmt::Write for SliceWriter<'_> {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    self.buf[self.at..self.at + s.len()].copy_from_slice(s.as_bytes());
+                    self.at += s.len();
+                    Ok(())
+                }
+            }
+            out[0] = 32;
+            out[1..3].copy_from_slice(&slot.to_le_bytes());
+            let mut w = SliceWriter { buf: out, at: 7 };
+            let _ = write!(w, "{v}");
+            let text_len = w.at - 7;
+            out[3..7].copy_from_slice(&(text_len as u32).to_le_bytes());
+            let mut at = 7 + text_len;
+            out[at] = fields.len() as u8;
+            at += 1;
+            for f in *fields {
+                out[at] = f.name.len() as u8;
+                at += 1;
+                out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
+                at += f.name.len();
+                out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
+                at += 4;
+                at += write_projected_value(&f.value, &mut out[at..]);
+            }
+            at
+        }
+        Datum::CompositeText { slot, text } => {
+            out[0] = 33;
+            out[1..3].copy_from_slice(&slot.to_le_bytes());
+            out[3..7].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[7..7 + text.len()].copy_from_slice(text.as_bytes());
+            7 + text.len()
+        }
     }
 }
 
@@ -690,6 +738,22 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (Datum::Int2Vector(&bytes[at + 4..at + 4 + len]), 4 + len)
         }
+        32 => {
+            let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 6..at + 6 + len])
+                .expect("projected composite text was encoded from valid UTF-8");
+            (
+                Datum::Text(s),
+                6 + len + record_tail_len(bytes, at + 6 + len),
+            )
+        }
+        33 => {
+            let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
+            let text = core::str::from_utf8(&bytes[at + 6..at + 6 + len])
+                .expect("projected composite text was encoded from valid UTF-8");
+            (Datum::CompositeText { slot, text }, 6 + len)
+        }
         _ => unreachable!("tags are exhaustive"),
     }
 }
@@ -782,6 +846,16 @@ pub fn decode_projected_col_record<'a>(
                 let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
                 return decode_record_tail(bytes, at + 4 + text_len, arena);
             }
+            if tag == 32 {
+                let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+                let text_len =
+                    u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
+                let Datum::Record(fields) = decode_record_tail(bytes, at + 6 + text_len, arena)?
+                else {
+                    unreachable!()
+                };
+                return Ok(Datum::Composite { slot, fields });
+            }
             return Ok(value);
         }
         at += size;
@@ -825,6 +899,16 @@ fn decode_record_tail<'a>(
             let text_len =
                 u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
             f.value = decode_record_tail(bytes, cursor + 4 + text_len, arena)?;
+            cursor += decode_projected_value(bytes, tag, cursor).1;
+        } else if tag == 32 {
+            let slot = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
+            let text_len =
+                u32::from_le_bytes(bytes[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
+            let Datum::Record(fields) = decode_record_tail(bytes, cursor + 6 + text_len, arena)?
+            else {
+                unreachable!()
+            };
+            f.value = Datum::Composite { slot, fields };
             cursor += decode_projected_value(bytes, tag, cursor).1;
         } else {
             let (value, size) = decode_projected_value(bytes, tag, cursor);

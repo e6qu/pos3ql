@@ -743,27 +743,51 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `CREATE TYPE name AS ENUM ('label', ...)` ("create type" consumed). Only
-    /// the ENUM kind is supported; composite/range/base types are a loud gap.
+    /// `CREATE TYPE name AS ENUM (...)` or `CREATE TYPE name AS (field type, ...)`.
     pub(super) fn create_type(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("type name")?;
         self.expect_ident("as")?;
-        if !self.eat_ident("enum")? {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "only CREATE TYPE ... AS ENUM is supported"),
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        if self.eat_ident("enum")? {
+            self.expect_op("(")?;
+            let mut labels = [""; MAX_LIST];
+            let mut n = 0;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    if n == MAX_LIST {
+                        return Err(self.limit("enum labels", MAX_LIST));
+                    }
+                    labels[n] = self.str_literal("enum label")?;
+                    n += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+            }
+            self.expect_op(")")?;
+            return Ok(Stmt::CreateEnum {
+                name,
+                labels: self.arena_slice(&labels[..n])?,
             });
         }
         self.expect_op("(")?;
-        let mut labels = [""; MAX_LIST];
+        let mut fields = [crate::sql::ast::CompositeField {
+            name: "",
+            type_name: "",
+            type_mod: -1,
+        }; MAX_LIST];
         let mut n = 0;
         if self.peeked != Tok::Op(")") {
             loop {
                 if n == MAX_LIST {
-                    return Err(self.limit("enum labels", MAX_LIST));
+                    return Err(self.limit("composite fields", MAX_LIST));
                 }
-                labels[n] = self.str_literal("enum label")?;
+                let field_name = self.any_ident("composite field name")?;
+                let (type_name, type_mod) = self.type_name_mod()?;
+                fields[n] = crate::sql::ast::CompositeField {
+                    name: field_name,
+                    type_name,
+                    type_mod,
+                };
                 n += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -771,9 +795,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        Ok(Stmt::CreateEnum {
+        Ok(Stmt::CreateComposite {
             name,
-            labels: self.arena_slice(&labels[..n])?,
+            fields: self.arena_slice(&fields[..n])?,
         })
     }
 
@@ -1146,6 +1170,9 @@ impl<'a> Parser<'a> {
                 },
                 Stmt::CreateDomain(domain) => CreateSchemaElement::Domain(domain),
                 Stmt::CreateEnum { name, labels } => CreateSchemaElement::Enum { name, labels },
+                Stmt::CreateComposite { name, fields } => {
+                    CreateSchemaElement::Composite { name, fields }
+                }
                 _ => {
                     return Err(self.err_here(
                         "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, DOMAIN, or TYPE",

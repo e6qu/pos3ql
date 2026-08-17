@@ -183,7 +183,9 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Inet(network) | Datum::Cidr(network) => 4usize.saturating_add(network.addr_len()),
         Datum::Enum { label, .. } => label.len(),
         Datum::Numeric(number) => 8usize.saturating_add(number.ndigits().saturating_mul(2)),
-        Datum::Record(_) => display_len(value),
+        Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
+            display_len(value)
+        }
         Datum::Int2Vector(raw) => {
             let count = raw.len() / 2;
             12usize
@@ -1010,7 +1012,7 @@ impl<'b> Responder<'b> {
                         }
                     });
                 }
-                Datum::Record(fields) => {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => {
                     // PostgreSQL's anonymous-record send format is a field
                     // count followed by each field's type OID and its ordinary
                     // binary field representation. Records are transient, but
@@ -1023,6 +1025,10 @@ impl<'b> Responder<'b> {
                             Self::encode_value_binary(m, &field.value);
                         }
                     });
+                }
+                Datum::CompositeText { text, .. } => {
+                    m.i32(text.len() as i32);
+                    m.bytes(text.as_bytes());
                 }
                 Datum::Numeric(nm) => {
                     // PostgreSQL numeric binary: i16 ndigits, weight, sign,

@@ -68,13 +68,15 @@ pub mod oid {
     pub const REGTYPE: i32 = 2206;
     pub const REGNAMESPACE: i32 = 4089;
     pub const REGROLE: i32 = 4096;
-    /// Base OIDs for user-defined domains, enums, and the array types PostgreSQL
+    /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Slots are catalog-local identities; the
     /// bands are deliberately disjoint from relation/composite OIDs.
     pub const FIRST_DOMAIN: i32 = 110_000;
     pub const FIRST_ENUM: i32 = 120_000;
+    pub const FIRST_COMPOSITE: i32 = 130_000;
     pub const FIRST_DOMAIN_ARRAY: i32 = 150_000;
     pub const FIRST_ENUM_ARRAY: i32 = 160_000;
+    pub const FIRST_COMPOSITE_ARRAY: i32 = 170_000;
     pub fn domain_oid(slot: u16) -> i32 {
         FIRST_DOMAIN + slot as i32
     }
@@ -87,6 +89,12 @@ pub mod oid {
     }
     pub fn enum_array_oid(slot: u16) -> i32 {
         FIRST_ENUM_ARRAY + slot as i32
+    }
+    pub fn composite_oid(slot: u16) -> i32 {
+        FIRST_COMPOSITE + slot as i32
+    }
+    pub fn composite_array_oid(slot: u16) -> i32 {
+        FIRST_COMPOSITE_ARRAY + slot as i32
     }
 }
 
@@ -188,6 +196,9 @@ pub enum ColType {
     /// carries its own label and sort key inline, so [`from_code`](Self::from_code)
     /// need not recover the slot to decode a row.
     Enum(u16),
+    /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
+    /// this is durable and carries a catalog identity.
+    Composite(u16),
 }
 
 /// Base storage codes for the parameterized type families. They must stay far
@@ -333,6 +344,7 @@ impl ColType {
             Self::Macaddr8 => oid::MACADDR8,
             Self::Record => oid::RECORD,
             Self::Enum(slot) => oid::enum_oid(slot),
+            Self::Composite(slot) => oid::composite_oid(slot),
         }
     }
 
@@ -447,6 +459,18 @@ impl ColType {
                 (type_oid - oid::FIRST_ENUM_ARRAY) as u16,
             )));
         }
+        if type_oid >= oid::FIRST_COMPOSITE
+            && type_oid < oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32
+        {
+            return Some(Self::Composite((type_oid - oid::FIRST_COMPOSITE) as u16));
+        }
+        if type_oid >= oid::FIRST_COMPOSITE_ARRAY
+            && type_oid < oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32
+        {
+            return Some(Self::Array(ArrElem::Composite(
+                (type_oid - oid::FIRST_COMPOSITE_ARRAY) as u16,
+            )));
+        }
         // Bit-string arrays have no array-element type here, so they (and any
         // other unmodeled OID) fall through unsupported.
         None
@@ -489,6 +513,7 @@ impl ColType {
             Self::Record => -1,
             // PostgreSQL enums are a fixed 4-byte OID on the wire.
             Self::Enum(_) => 4,
+            Self::Composite(_) => -1,
         }
     }
 
@@ -559,6 +584,7 @@ impl ColType {
             // The real enum name is dynamic (per catalog slot); callers that
             // must title a column after the enum resolve it via the catalog.
             Self::Enum(_) => "enum",
+            Self::Composite(_) => "record",
         }
     }
 
@@ -616,6 +642,7 @@ impl ColType {
             Self::Macaddr8 => "macaddr8",
             Self::Record => "record",
             Self::Enum(_) => "enum",
+            Self::Composite(_) => "record",
         }
     }
 
@@ -675,12 +702,14 @@ impl ColType {
             // alongside as the type name (slots are not stable across restart),
             // and a stored enum value carries its own label + sort inline.
             Self::Enum(_) => 54,
+            Self::Composite(_) => 66,
         }
     }
 
     /// The catalog slot placed in [`ColType::Enum`] by [`from_code`](Self::from_code)
     /// before the real slot is resolved from the persisted type name.
     pub const ENUM_SLOT_UNRESOLVED: u16 = u16::MAX;
+    pub const COMPOSITE_SLOT_UNRESOLVED: u16 = u16::MAX;
 
     /// Inverse of [`ColType::code`]; `None` for an unknown or corrupt code.
     pub fn from_code(code: u8) -> Option<Self> {
@@ -726,6 +755,7 @@ impl ColType {
             // An enum column: the concrete slot is resolved from the persisted
             // type name after decode (see the column codec's name handling).
             54 => Self::Enum(Self::ENUM_SLOT_UNRESOLVED),
+            66 => Self::Composite(Self::COMPOSITE_SLOT_UNRESOLVED),
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE)?)
             }
@@ -770,6 +800,8 @@ pub enum ArrElem {
     /// An enum array keeps the catalog slot as its runtime identity. Table
     /// metadata also persists the type name and rebinds the slot on startup.
     Enum(u16),
+    /// An array of one named composite type.
+    Composite(u16),
     /// An array whose elements are values of a domain. Domain values use their
     /// ultimate base representation; `base_code` identifies that scalar
     /// representation and `enum_slot` completes it when the base is an enum.
@@ -784,6 +816,7 @@ pub enum ArrElem {
 impl ArrElem {
     const ENUM_CODE_BASE: u8 = 32;
     const DOMAIN_CODE_BASE: u8 = 64;
+    const COMPOSITE_CODE_BASE: u8 = 96;
 
     /// The array type's internal `pg_type.typname`.
     pub fn catalog_name(self) -> &'static str {
@@ -814,6 +847,7 @@ impl ArrElem {
             ArrElem::Macaddr => "_macaddr",
             ArrElem::Macaddr8 => "_macaddr8",
             ArrElem::Enum(_) => "_enum",
+            ArrElem::Composite(_) => "_record",
             ArrElem::Domain { .. } => "_domain",
         }
     }
@@ -849,6 +883,7 @@ impl ArrElem {
             ArrElem::Macaddr => "macaddr[]",
             ArrElem::Macaddr8 => "macaddr8[]",
             ArrElem::Enum(_) => "enum[]",
+            ArrElem::Composite(_) => "record[]",
             ArrElem::Domain { .. } => "domain[]",
         }
     }
@@ -889,6 +924,9 @@ impl ArrElem {
             Datum::Macaddr(_) => ArrElem::Macaddr,
             Datum::Macaddr8(_) => ArrElem::Macaddr8,
             Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
+            Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
+                ArrElem::Composite(*slot)
+            }
             _ => return None,
         })
     }
@@ -904,6 +942,7 @@ impl ArrElem {
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
             ColType::Enum(slot) => return Some(ArrElem::Enum(slot)),
+            ColType::Composite(slot) => return Some(ArrElem::Composite(slot)),
             _ => {}
         }
         Some(match c.storage() {
@@ -960,6 +999,7 @@ impl ArrElem {
             ArrElem::Macaddr => ColType::Macaddr,
             ArrElem::Macaddr8 => ColType::Macaddr8,
             ArrElem::Enum(slot) => ColType::Enum(slot),
+            ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
                 base_code,
                 enum_slot,
@@ -1004,6 +1044,7 @@ impl ArrElem {
             ArrElem::Macaddr => oid::MACADDR_ARRAY,
             ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
             ArrElem::Enum(slot) => oid::enum_array_oid(slot),
+            ArrElem::Composite(slot) => oid::composite_array_oid(slot),
             ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
         }
     }
@@ -1047,6 +1088,7 @@ impl ArrElem {
             ArrElem::Macaddr8 => 24,
             ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
             ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
+            ArrElem::Composite(slot) => Self::COMPOSITE_CODE_BASE + slot as u8,
         }
     }
 
@@ -1092,6 +1134,12 @@ impl ArrElem {
                     enum_slot: ColType::ENUM_SLOT_UNRESOLVED,
                 }
             }
+            c if (Self::COMPOSITE_CODE_BASE
+                ..Self::COMPOSITE_CODE_BASE + crate::storage::MAX_COMPOSITES as u8)
+                .contains(&c) =>
+            {
+                ArrElem::Composite((c - Self::COMPOSITE_CODE_BASE) as u16)
+            }
             _ => return None,
         })
     }
@@ -1114,7 +1162,7 @@ impl ArrElem {
 
     pub fn user_type_slot(self) -> Option<u16> {
         match self {
-            Self::Enum(slot) | Self::Domain { slot, .. } => Some(slot),
+            Self::Enum(slot) | Self::Composite(slot) | Self::Domain { slot, .. } => Some(slot),
             _ => None,
         }
     }
@@ -1454,6 +1502,20 @@ pub enum Datum<'a> {
     /// transient — produced by `t.*`, a bare table reference, or `ROW(...)` —
     /// never stored in a column.
     Record(&'a [RecordField<'a>]),
+    /// A value of one named composite catalog type. Keeping this distinct from
+    /// `Record` preserves the PostgreSQL type OID across expressions, Bind,
+    /// Result and persistence; an anonymous row can never masquerade as it.
+    Composite {
+        slot: u16,
+        fields: &'a [RecordField<'a>],
+    },
+    /// The durable row form of a named composite. It carries its immutable
+    /// catalog slot and PostgreSQL text input spelling; only catalog-aware
+    /// evaluation may materialize fields from it.
+    CompositeText {
+        slot: u16,
+        text: &'a str,
+    },
     /// A user-defined enum value. `slot` identifies the enum type (for OID /
     /// `pg_typeof`); `sort` is the member's sort key, by which enum values
     /// order (PostgreSQL orders by `enumsortorder`, not label text); `label`
@@ -1483,6 +1545,8 @@ impl<'a> Datum<'a> {
     pub fn type_oid(&self) -> i32 {
         match self {
             Datum::Record(_) => oid::RECORD,
+            Datum::Composite { slot, .. } => oid::composite_oid(*slot),
+            Datum::CompositeText { slot, .. } => oid::composite_oid(*slot),
             Datum::Null => oid::TEXT,
             Datum::Bool(_) => oid::BOOL,
             Datum::Int2(_) => oid::INT2,
@@ -1712,6 +1776,17 @@ impl fmt::Display for Datum<'_> {
                 }
                 f.write_char(')')
             }
+            Datum::Composite { fields, .. } => {
+                f.write_char('(')?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_char(',')?;
+                    }
+                    write_record_field(f, &field.value)?;
+                }
+                f.write_char(')')
+            }
+            Datum::CompositeText { text, .. } => f.write_str(text),
         }
     }
 }

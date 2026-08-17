@@ -154,6 +154,17 @@ pub(super) fn build_column(
                         }),
                         None,
                     )
+                } else if let Some(slot) = storage.resolve_composite_slot(element_name, txid) {
+                    let definition = storage.composite(slot);
+                    (
+                        ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16)),
+                        -1,
+                        Some(crate::storage::UserTypeName {
+                            schema: definition.schema,
+                            name: definition.name,
+                        }),
+                        None,
+                    )
                 } else {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -185,13 +196,27 @@ pub(super) fn build_column(
                                 None,
                             )
                         }
-                        None => {
-                            return Err(sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "type \"{}\" does not exist",
-                                c.type_name
-                            ));
-                        }
+                        None => match storage.resolve_composite_slot(c.type_name, txid) {
+                            Some(slot) => {
+                                let definition = storage.composite(slot);
+                                (
+                                    ColType::Composite(slot as u16),
+                                    -1,
+                                    Some(crate::storage::UserTypeName {
+                                        schema: definition.schema,
+                                        name: definition.name,
+                                    }),
+                                    None,
+                                )
+                            }
+                            None => {
+                                return Err(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "type \"{}\" does not exist",
+                                    c.type_name
+                                ));
+                            }
+                        },
                     },
                 }
             }

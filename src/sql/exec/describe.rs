@@ -35,6 +35,8 @@ pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<&'q TableDef>,
     table_alias: Option<&str>,
+    storage: Option<&'q crate::storage::Storage>,
+    txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let mut n = 0;
@@ -86,7 +88,7 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                describe_record_star(base, def, table_alias, &mut push)?;
+                describe_record_star(base, def, table_alias, storage, txid, &mut push)?;
             }
             SelectItem::Expr { expression, alias } => {
                 let resolver: &dyn ColTypeResolver = match def {
@@ -141,6 +143,8 @@ fn describe_record_star<'q>(
     base: &Expr<'q>,
     def: Option<&'q TableDef>,
     table_alias: Option<&str>,
+    storage: Option<&'q crate::storage::Storage>,
+    txid: u32,
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match base {
@@ -178,6 +182,70 @@ fn describe_record_star<'q>(
                 push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
             }
             Ok(())
+        }
+        _ if storage.is_some() => {
+            let resolver: &dyn ColTypeResolver = match def {
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
+                None => &NoCols,
+            };
+            let slot = match base {
+                Expr::Column { qualifier, name } => match resolver.resolve(*qualifier, name)? {
+                    ColType::Composite(slot) => Some(slot),
+                    _ => None,
+                },
+                Expr::Field { base, field } => match record_field_type(base, field, resolver)? {
+                    ColType::Composite(slot) => Some(slot),
+                    _ => None,
+                },
+                Expr::Cast { type_name, .. } => storage
+                    .expect("checked")
+                    .resolve_composite_slot(type_name, txid)
+                    .map(|slot| slot as u16),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                for field in storage.expect("checked").composite(slot as usize).fields() {
+                    push(
+                        ColDesc::of_type(field.name.as_str(), field.ctype)
+                            .with_type_mod(field.type_mod),
+                    )?;
+                }
+                return Ok(());
+            }
+            let Some(handle) = expr_record_handle(base, resolver) else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            };
+            let mut push_err = None;
+            visit_record_shape(handle, |field_name, ctype| {
+                if push_err.is_some() {
+                    return;
+                }
+                let leased = RECORD_FIELD_NAMES
+                    .iter()
+                    .chain(["key", "value"].iter())
+                    .find(|n| n.eq_ignore_ascii_case(field_name))
+                    .copied();
+                match leased {
+                    Some(name) => {
+                        if let Err(error) = push(ColDesc::of_type(name, ctype)) {
+                            push_err = Some(error);
+                        }
+                    }
+                    None => {
+                        push_err = Some(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "row expansion is not supported on this expression"
+                        ))
+                    }
+                }
+            });
+            return push_err.map_or(Ok(()), Err);
         }
         // A record-typed column (or nested record field) with a registered
         // shape expands to its fields. Names come from static leases (fN,
@@ -498,6 +566,15 @@ pub trait ColTypeResolver {
     fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
         None
     }
+
+    /// One durable named-composite field, copied out of the bounded catalog.
+    fn named_composite_field(
+        &self,
+        _type_name: &str,
+        _index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        None
+    }
 }
 
 /// Declared formal-parameter types for the SQL routine currently undergoing
@@ -565,6 +642,11 @@ struct ShapePool {
     fields: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_SHAPES],
     lens: [u8; MAX_SHAPES],
     n: usize,
+    named: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_SHAPES],
+    named_names: [crate::util::StackStr<64>; MAX_SHAPES],
+    named_lens: [u8; MAX_SHAPES],
+    named_slots: [u16; MAX_SHAPES],
+    named_n: usize,
 }
 
 std::thread_local! {
@@ -589,6 +671,15 @@ fn empty_shape_pool() -> Box<ShapePool> {
         }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
         lens: [0; MAX_SHAPES],
         n: 0,
+        named: [[RecordShapeField {
+            name: crate::util::StackStr::new(),
+            ctype: ColType::Record,
+            nested: -1,
+        }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
+        named_names: [crate::util::StackStr::new(); MAX_SHAPES],
+        named_lens: [0; MAX_SHAPES],
+        named_slots: [u16::MAX; MAX_SHAPES],
+        named_n: 0,
     })
 }
 
@@ -609,8 +700,66 @@ pub fn reset_record_shapes() {
     RECORD_SHAPES.with(|p| {
         if let Some(pool) = p.borrow_mut().as_mut() {
             pool.n = 0;
+            pool.named_n = 0;
         }
     });
+}
+
+/// Publishes the durable fields of one named composite for this statement.
+/// Both the name and fields are copied into fixed storage, making planner
+/// access independent of runtime values and without post-startup allocation.
+pub fn register_named_composite_shape(
+    slot: u16,
+    name: &str,
+    fields: &[crate::storage::CompositeFieldDef],
+) {
+    RECORD_SHAPES.with(|p| {
+        let mut p = p.borrow_mut();
+        let pool = p.get_or_insert_with(empty_shape_pool);
+        if pool.named_n == MAX_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
+            return;
+        }
+        let at = pool.named_n;
+        pool.named_names[at] = crate::util::StackStr::from_str(name);
+        pool.named_slots[at] = slot;
+        pool.named_lens[at] = fields.len() as u8;
+        for (out, field) in pool.named[at].iter_mut().zip(fields) {
+            out.name = crate::util::StackStr::from_str(field.name.as_str());
+            out.ctype = field.ctype;
+            out.nested = -1;
+        }
+        pool.named_n += 1;
+    });
+}
+
+fn visit_named_composite_shape(name: &str, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+    RECORD_SHAPES.with(|p| {
+        let p = p.borrow();
+        let pool = p.as_ref()?;
+        let at = pool.named_names[..pool.named_n]
+            .iter()
+            .position(|candidate| candidate.as_str().eq_ignore_ascii_case(name))?;
+        let len = pool.named_lens[at] as usize;
+        for field in &pool.named[at][..len] {
+            visit(field.name.as_str(), field.ctype);
+        }
+        Some(len)
+    })
+}
+
+fn visit_composite_slot_shape(slot: u16, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+    RECORD_SHAPES.with(|p| {
+        let p = p.borrow();
+        let pool = p.as_ref()?;
+        let at = pool.named_slots[..pool.named_n]
+            .iter()
+            .position(|candidate| *candidate == slot)?;
+        let len = pool.named_lens[at] as usize;
+        for field in &pool.named[at][..len] {
+            visit(field.name.as_str(), field.ctype);
+        }
+        Some(len)
+    })
 }
 
 /// Registers a record shape, returning its handle, or None when the
@@ -864,6 +1013,36 @@ pub fn record_shape(
             Some(2)
         }
         Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
+        Expr::Cast { type_name, .. } => {
+            if let Some(count) = visit_named_composite_shape(type_name, &mut visit) {
+                return Some(count);
+            }
+            let mut n = 0;
+            while let Some((name, ctype)) = columns.named_composite_field(type_name, n) {
+                visit(name.as_str(), ctype);
+                n += 1;
+            }
+            (n != 0).then_some(n)
+        }
+        Expr::Column { qualifier, name }
+            if matches!(columns.resolve(*qualifier, name), Ok(ColType::Composite(_))) =>
+        {
+            let ColType::Composite(slot) = columns.resolve(*qualifier, name).ok()? else {
+                unreachable!()
+            };
+            visit_composite_slot_shape(slot, visit)
+        }
+        Expr::Field { base, field }
+            if matches!(
+                record_field_type(base, field, columns),
+                Ok(ColType::Composite(_))
+            ) =>
+        {
+            let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
+                unreachable!()
+            };
+            visit_composite_slot_shape(slot, visit)
+        }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
         Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
@@ -1217,6 +1396,11 @@ fn comparable(a: ColType, b: ColType) -> bool {
         return false;
     }
     if a == b {
+        return true;
+    }
+    if matches!(a, ColType::Record | ColType::Composite(_))
+        && matches!(b, ColType::Record | ColType::Composite(_))
+    {
         return true;
     }
     let numeric = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8 | Numeric | Float8 | Float4);

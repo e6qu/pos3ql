@@ -1325,6 +1325,7 @@ fn acl<'a>(
         }
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
+        crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -2755,6 +2756,32 @@ pub fn user_type_name_text<'a>(
             true,
             true,
         )
+    } else if (type_oid::FIRST_COMPOSITE
+        ..type_oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_COMPOSITE) as usize;
+        let definition = storage.composite(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            false,
+            false,
+        )
+    } else if (type_oid::FIRST_COMPOSITE_ARRAY
+        ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&oid)
+    {
+        let slot = (oid - type_oid::FIRST_COMPOSITE_ARRAY) as usize;
+        let definition = storage.composite(slot);
+        (
+            definition.schema,
+            definition.name,
+            definition.visible_to(txid),
+            true,
+            false,
+        )
     } else {
         return Ok(None);
     };
@@ -2767,6 +2794,16 @@ pub fn user_type_name_text<'a>(
                 (oid - type_oid::FIRST_ENUM_ARRAY) as usize
             } else {
                 (oid - type_oid::FIRST_ENUM) as usize
+            })
+    } else if (type_oid::FIRST_COMPOSITE
+        ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&oid)
+    {
+        storage.resolve_composite_slot(name.as_str(), txid)
+            == Some(if array {
+                (oid - type_oid::FIRST_COMPOSITE_ARRAY) as usize
+            } else {
+                (oid - type_oid::FIRST_COMPOSITE) as usize
             })
     } else {
         storage.resolve_domain_slot(name.as_str(), txid)
@@ -4706,6 +4743,59 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
+    // Standalone composite fields share the pg_attribute contract with table
+    // columns, keyed by their durable type OID.
+    for (slot, composite) in storage.live_composites() {
+        for (index, field) in composite.fields().iter().enumerate() {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
+            }
+            let column = crate::storage::ColumnMeta {
+                name: field.name,
+                ctype: field.ctype,
+                type_mod: field.type_mod,
+                collation: crate::sql::ast::Collation::None,
+                not_null: false,
+                unique: false,
+                primary: false,
+                auto_increment: false,
+                default: crate::storage::ColumnDefault::NONE,
+                is_identity: false,
+                identity_always: false,
+                auto_increment_step: 1,
+                user_type: field.user_type,
+            };
+            out[n] = row(
+                &[
+                    Datum::Int4(crate::sql::types::oid::composite_oid(slot as u16)),
+                    text(field.name.as_str(), arena)?,
+                    Datum::Int4(catalog_column_type_oid(storage, &column, txid)?),
+                    Datum::Int4(index as i32 + 1),
+                    Datum::Bool(false),
+                    Datum::Int4(i32::from(field.ctype.typlen())),
+                    Datum::Int4(field.type_mod),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text(if field.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text("", arena)?,
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(index as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
         let table = storage.table_def(info.table_slot, txid);
@@ -5214,8 +5304,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
     };
-    let mut out: [&[Datum]; 512 + crate::storage::MAX_DOMAINS * 2 + crate::storage::MAX_ENUMS * 2] =
-        [&[]; 512 + crate::storage::MAX_DOMAINS * 2 + crate::storage::MAX_ENUMS * 2];
+    let mut out: [&[Datum];
+        512 + crate::storage::MAX_DOMAINS * 2
+            + crate::storage::MAX_ENUMS * 2
+            + crate::storage::MAX_COMPOSITES * 2] = [&[]; 512
+        + crate::storage::MAX_DOMAINS * 2
+        + crate::storage::MAX_ENUMS * 2
+        + crate::storage::MAX_COMPOSITES * 2];
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -5427,6 +5522,96 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Enum,
+                    slot,
+                    txid,
+                )),
+                Datum::Bool(true),
+                text("x", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    // Named composite types have their own `pg_type` identity (typtype 'c')
+    // and automatically-created array type. Attribute rows are synthesized
+    // separately from the same bounded `CompositeDef` field list.
+    for (slot, composite) in storage.live_composites() {
+        let composite_oid = crate::sql::types::oid::composite_oid(slot as u16);
+        let array_oid = crate::sql::types::oid::composite_array_oid(slot as u16);
+        out[n] = row(
+            &[
+                Datum::Int4(composite_oid),
+                text(
+                    arena
+                        .alloc_str(composite.name.as_str())
+                        .map_err(|_| arena_full())?,
+                    arena,
+                )?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                text("c", arena)?,
+                text("C", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(array_oid),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Composite,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Composite,
+                    slot,
+                    txid,
+                )),
+                Datum::Bool(true),
+                text("x", arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+        let array_name = crate::stack_format!(128, "_{}", composite.name.as_str());
+        out[n] = row(
+            &[
+                Datum::Int4(array_oid),
+                text(
+                    arena
+                        .alloc_str(array_name.as_str())
+                        .map_err(|_| arena_full())?,
+                    arena,
+                )?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(composite_oid),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Composite,
                     slot,
                     txid,
                 )),

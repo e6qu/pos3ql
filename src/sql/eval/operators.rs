@@ -668,7 +668,9 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[32]);
             hasher.write(raw);
         }
-        Datum::Record(_) => hasher.write(&[26]),
+        Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
+            hasher.write(&[26])
+        }
         Datum::Json { jsonb: false, .. } => hasher.write(&[27]),
         // Network addresses hash by their comparison key (family, address,
         // mask), so equal values hash equal and distinct ones rarely collide.
@@ -778,7 +780,10 @@ pub(crate) fn compare_datums_as(
                 "operator does not exist: json = json"
             ));
         }
-        (Datum::Record(a), Datum::Record(b)) => {
+        (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) => {
             // Field-wise, with a NULL field comparing greater (PostgreSQL
             // record ordering); shorter record sorts first on a common prefix.
             for i in 0..a.len().min(b.len()) {
@@ -795,6 +800,16 @@ pub(crate) fn compare_datums_as(
             }
             a.len().cmp(&b.len())
         }
+        (
+            Datum::CompositeText {
+                slot: left_slot,
+                text: left,
+            },
+            Datum::CompositeText {
+                slot: right_slot,
+                text: right,
+            },
+        ) => left_slot.cmp(right_slot).then_with(|| left.cmp(right)),
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
@@ -1618,7 +1633,11 @@ pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<b
     if l.is_null() || r.is_null() {
         return Ok(None);
     }
-    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
+    if let (
+        Datum::Record(a) | Datum::Composite { fields: a, .. },
+        Datum::Record(b) | Datum::Composite { fields: b, .. },
+    ) = (l, r)
+    {
         return Ok(match row_compare(BinaryOp::Eq, a, b)? {
             Datum::Bool(equal) => Some(equal),
             _ => None,
@@ -1856,7 +1875,10 @@ pub(crate) fn binary<'a>(
             // Row comparison uses PostgreSQL's three-valued, short-circuiting
             // semantics (NULL-propagating), distinct from the total order that
             // `compare_datums` gives ORDER BY / DISTINCT.
-            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
+            (
+                Datum::Record(a) | Datum::Composite { fields: a, .. },
+                Datum::Record(b) | Datum::Composite { fields: b, .. },
+            ) => row_compare(operator, a, b),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         // `jsonb - text`/`text[]`/`integer` deletes a key, keys, or an element.

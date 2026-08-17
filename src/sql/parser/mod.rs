@@ -87,18 +87,12 @@ pub const MAX_ROWS: usize = 256;
 
 /// Words that cannot appear as a bare column reference; mirrors the
 /// reserved entries of PostgreSQL's keyword table that this grammar uses.
-/// Whether a numeric token carries a `0x`/`0o`/`0b` base prefix.
 /// Whether `text` mentions the word `window` in any case — the cheap pre-filter
 /// that keeps the WINDOW-clause lookahead off the path of ordinary queries.
 fn mentions_window(text: &str) -> bool {
     text.as_bytes()
         .windows(6)
         .any(|w| w.eq_ignore_ascii_case(b"window"))
-}
-
-fn is_base_prefixed(text: &str) -> bool {
-    let b = text.as_bytes();
-    b.len() > 2 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
 }
 
 /// The PostgreSQL keyword categories that constrain where a word may be used

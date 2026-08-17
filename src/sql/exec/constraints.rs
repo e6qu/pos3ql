@@ -1278,15 +1278,8 @@ pub(crate) fn apply_fk_parent_actions(
                 action,
                 StorageFkAction::NoAction | StorageFkAction::Restrict
             ) {
-                // NO ACTION raises 23503; RESTRICT the distinct 23001, as
-                // PostgreSQL (same message, different SQLSTATE).
-                let code = if action == StorageFkAction::Restrict {
-                    "23001"
-                } else {
-                    "23503"
-                };
                 return Err(sql_err!(
-                    code,
+                    sqlstate::FOREIGN_KEY_VIOLATION,
                     "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
                     parent_name,
                     fk.name.as_str(),

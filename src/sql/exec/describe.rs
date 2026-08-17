@@ -2050,10 +2050,14 @@ pub fn infer_type_res(
                 // uuid, json or jsonb, bit strings, ranges or multiranges —
                 // this engine can order most of those internally, but ordering
                 // them is not the same as PostgreSQL offering the aggregate.
-                let t = args
-                    .first()
-                    .map(|a| infer_type_res(a, columns))
-                    .transpose()?;
+                let t = match args.first() {
+                    // In an expression `t.*` denotes the whole-row record.
+                    // It is rejected by ordinary evaluation, but overload
+                    // resolution must first reject min/max(record) as 42883.
+                    Some(Expr::Field { field, .. }) if *field == "*" => Some(of(ColType::Record)),
+                    Some(argument) => Some(infer_type_res(argument, columns)?),
+                    None => None,
+                };
                 if let Some((o, _)) = t {
                     let unordered = o == oid::BOOL
                         || o == oid::UUID
@@ -2065,6 +2069,8 @@ pub fn infer_type_res(
                                     | ColType::Bit { .. }
                                     | ColType::Range(_)
                                     | ColType::Multirange(_)
+                                    | ColType::Record
+                                    | ColType::Composite(_)
                             )
                         );
                     if unordered {

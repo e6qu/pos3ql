@@ -73,10 +73,10 @@ pub mod oid {
     /// bands are deliberately disjoint from relation/composite OIDs.
     pub const FIRST_DOMAIN: i32 = 110_000;
     pub const FIRST_ENUM: i32 = 120_000;
-    pub const FIRST_COMPOSITE: i32 = 130_000;
+    pub const FIRST_COMPOSITE: i32 = 230_000;
     pub const FIRST_DOMAIN_ARRAY: i32 = 150_000;
     pub const FIRST_ENUM_ARRAY: i32 = 160_000;
-    pub const FIRST_COMPOSITE_ARRAY: i32 = 170_000;
+    pub const FIRST_COMPOSITE_ARRAY: i32 = 240_000;
     pub fn domain_oid(slot: u16) -> i32 {
         FIRST_DOMAIN + slot as i32
     }

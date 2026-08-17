@@ -404,6 +404,14 @@ fn render_roman<'a>(
     fm: bool,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
+    // Numeric NaN has no Roman-numeral representation, while float8's
+    // non-finite path uses PostgreSQL's ordinary overflow fill.
+    if value.is_nan() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "Roman numeral format is not supported for NaN"
+        ));
+    }
     let text = match float_source {
         Some(x) if x.is_finite() => stack_format!(512, "{:.0}", x),
         _ => {

@@ -1650,6 +1650,13 @@ fn domain_oid(slot: usize) -> i32 {
 /// bands. PostgreSQL gives every row-bearing relation a separate pg_type row.
 const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
 const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
+/// PostgreSQL gives every named composite a backing `pg_class` relation whose
+/// OID links `pg_type.typrelid` and its `pg_attribute` rows.
+const FIRST_NAMED_COMPOSITE_RELATION_OID: i32 = 180_000;
+
+fn named_composite_relation_oid(slot: usize) -> i32 {
+    FIRST_NAMED_COMPOSITE_RELATION_OID + slot as i32
+}
 
 fn composite_type_oid(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
     match storage.resolve_relation(Some(schema), name, txid)? {
@@ -3758,6 +3765,54 @@ fn pg_class<'a>(
         )?;
         n += 1;
     }
+    // A named composite owns a backing catalog relation. It is not a
+    // user-addressable table, but `pg_type.typrelid` and `pg_attribute` must
+    // resolve through this `relkind = 'c'` row exactly as they do in PostgreSQL.
+    for (slot, composite) in storage.live_composites() {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Composite,
+            slot: slot as u16,
+        };
+        out[n] = row(
+            &[
+                Datum::Int4(named_composite_relation_oid(slot)),
+                text(composite.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                text("c", arena)?,
+                Datum::Int4(composite.n_fields as i32),
+                Datum::Float8(-1.0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(crate::sql::types::oid::composite_oid(slot as u16)),
+                acl(storage, object, txid, arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     // Each index is itself a relation (relkind 'i'), so psql's `\d` join
     // (pg_index i JOIN pg_class c2 ON i.indexrelid = c2.oid) finds its name.
     for info in indexes {
@@ -4743,8 +4798,8 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    // Standalone composite fields share the pg_attribute contract with table
-    // columns, keyed by their durable type OID.
+    // Standalone composite fields belong to the generated `pg_class` relation
+    // named by their `pg_type.typrelid`, just as PostgreSQL does.
     for (slot, composite) in storage.live_composites() {
         for (index, field) in composite.fields().iter().enumerate() {
             if n == out.len() {
@@ -4767,7 +4822,7 @@ fn pg_attribute<'a>(
             };
             out[n] = row(
                 &[
-                    Datum::Int4(crate::sql::types::oid::composite_oid(slot as u16)),
+                    Datum::Int4(named_composite_relation_oid(slot)),
                     text(field.name.as_str(), arena)?,
                     Datum::Int4(catalog_column_type_oid(storage, &column, txid)?),
                     Datum::Int4(index as i32 + 1),
@@ -5555,7 +5610,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(array_oid),
-                Datum::Int4(0),
+                Datum::Int4(named_composite_relation_oid(slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
@@ -8733,23 +8788,6 @@ fn info_domain_constraints<'a>(
             )?;
             count += 1;
         }
-        if domain.not_null {
-            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
-            output[count] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(domain.name.as_str(), arena)?,
-                    text("NO", arena)?,
-                    text("NO", arena)?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
     }
     finish(definition, &output[..count], arena)
 }
@@ -8816,10 +8854,6 @@ fn info_check_constraints<'a>(
         for check in domain.checks() {
             let clause = stack_format!(1024, "({})", check.expression.as_str());
             append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
-        }
-        if domain.not_null {
-            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
-            append(domain.schema.as_str(), name.as_str(), "VALUE IS NOT NULL")?;
         }
     }
     finish(definition, &output[..count], arena)

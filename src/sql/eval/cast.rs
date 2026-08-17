@@ -674,9 +674,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
     }
 }
 
-/// Parses an integer the way PostgreSQL's integer input does: optional sign, an
-/// optional `0x`/`0o`/`0b` base prefix, and `_` digit separators (only between
-/// digits). Returns None for anything malformed or out of `i64` range.
+/// Parses PostgreSQL integer input: optional sign followed by decimal digits.
 /// How an integer literal parsed: a value, a well-formed literal that exceeds
 /// `i64`, or something not shaped like an integer at all. The last two are the
 /// same `None` to [`parse_int_literal`] but different errors to a cast —
@@ -718,35 +716,14 @@ fn classify_int_literal(s: &str) -> IntLiteral {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     use IntLiteral::{Malformed, Overflow, Value};
-    let (radix, digits) =
-        if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-            (16, r)
-        } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
-            (8, r)
-        } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
-            (2, r)
-        } else {
-            (10, rest)
-        };
-    let db = digits.as_bytes();
-    if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
+    let db = rest.as_bytes();
+    if db.is_empty() {
         return Malformed;
     }
     let mut buffer = [0u8; 80];
     let mut n = 0;
-    let mut prev_underscore = false;
     for &c in db {
-        if c == b'_' {
-            if prev_underscore {
-                return Malformed; // `__` is not allowed
-            }
-            prev_underscore = true;
-            continue;
-        }
-        prev_underscore = false;
-        // A character that is not a digit for this radix is malformed input,
-        // not an overflow — the distinction the two error kinds rest on.
-        if !(c as char).is_digit(radix) {
+        if !c.is_ascii_digit() {
             return Malformed;
         }
         if n >= buffer.len() {
@@ -769,9 +746,9 @@ fn classify_int_literal(s: &str) -> IntLiteral {
     let Ok(cleaned) = core::str::from_utf8(&signed[..text_len]) else {
         return Malformed;
     };
-    // The digits are already validated for the radix, so a parse failure here is
+    // The digits are already validated, so a parse failure here is
     // an overflow, not a malformation.
-    match i64::from_str_radix(cleaned, radix) {
+    match cleaned.parse::<i64>() {
         Ok(v) => Value(v),
         Err(_) => Overflow,
     }
@@ -808,7 +785,7 @@ mod tests {
         // Text not shaped like an integer is a syntax error naming the type —
         // distinct from an overflow, and the reason a bad char must not be
         // mistaken for too many digits.
-        for bad in ["abc", "12abc", "", "  ", "0xGG", "1__0", "_5", "5_"] {
+        for bad in ["abc", "12abc", "", "  ", "0x1F", "1_000", "_5", "5_"] {
             let (state, msg) = err(bad, i32::MIN as i64, i32::MAX as i64, "integer");
             assert_eq!(state, "22P02", "{bad:?} should be a syntax error");
             assert_eq!(
@@ -825,8 +802,6 @@ mod tests {
         assert_eq!(ok("42"), 42);
         assert_eq!(ok("-2147483648"), -2147483648);
         assert_eq!(ok("2147483647"), 2147483647);
-        assert_eq!(ok("0x1F"), 31);
-        assert_eq!(ok("1_000"), 1000);
         assert_eq!(ok("+7"), 7);
     }
 }

@@ -53,8 +53,7 @@ impl Collation {
         match self {
             Self::None => "",
             Self::Default => "d",
-            Self::C | Self::Posix => "c",
-            Self::UcsBasic => "b",
+            Self::C | Self::Posix | Self::UcsBasic => "c",
         }
     }
 

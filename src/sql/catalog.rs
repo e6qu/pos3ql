@@ -947,25 +947,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_language") => finish(
-            def_of(
-                "pg_language",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("lanname", ColType::Name),
-                    ("lanowner", ColType::Int4),
-                    ("lanpltrusted", ColType::Bool),
-                    ("lanispl", ColType::Bool),
-                    ("lanplcallfoid", ColType::Int4),
-                    ("lanvalidator", ColType::Int4),
-                    ("laninline", ColType::Int4),
-                    ("lanacl", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_language") => pg_language(arena),
         (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => finish(
             def_of(
@@ -2419,6 +2401,68 @@ pub fn function_def_text<'a>(
             .alloc_str(definition.as_str())
             .map_err(|_| super::eval::arena_full())?,
     ))
+}
+
+pub fn function_arguments_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    identity: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine(slot);
+    let mut output = StackStr::<256>::new();
+    use core::fmt::Write;
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        if index != 0 {
+            write!(output, ", ").map_err(|_| super::eval::arena_full())?;
+        }
+        if !identity && !argument.name.as_str().is_empty() {
+            write!(output, "{} ", argument.name.as_str()).map_err(|_| super::eval::arena_full())?;
+        }
+        write!(output, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
+    }
+    if output.is_truncated() {
+        return Err(super::eval::arena_full());
+    }
+    arena
+        .alloc_str(output.as_str())
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
+}
+
+pub fn function_result_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine(slot);
+    let result = match routine.kind {
+        crate::storage::RoutineKind::Function { result } => result.name(),
+        crate::storage::RoutineKind::SetFunction { result } => {
+            let mut output = StackStr::<64>::new();
+            use core::fmt::Write;
+            write!(output, "SETOF {}", result.name()).map_err(|_| super::eval::arena_full())?;
+            return arena
+                .alloc_str(output.as_str())
+                .map(Some)
+                .map_err(|_| super::eval::arena_full());
+        }
+        crate::storage::RoutineKind::TableFunction => "record",
+        crate::storage::RoutineKind::Trigger => "trigger",
+        crate::storage::RoutineKind::Procedure => "void",
+    };
+    arena
+        .alloc_str(result)
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
 }
 
 pub fn collation_oid_is_visible(oid: i32) -> bool {
@@ -5113,6 +5157,55 @@ fn pg_trigger<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_language",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("lanname", ColType::Name),
+            ("lanowner", ColType::Int4),
+            ("lanpltrusted", ColType::Bool),
+            ("lanispl", ColType::Bool),
+            ("lanplcallfoid", ColType::Int4),
+            ("lanvalidator", ColType::Int4),
+            ("laninline", ColType::Int4),
+            ("lanacl", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let sql = row(
+        &[
+            Datum::Int4(2612),
+            Datum::Int4(14),
+            text("sql", arena)?,
+            Datum::Int4(10),
+            Datum::Bool(true),
+            Datum::Bool(true),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    let plpgsql = row(
+        &[
+            Datum::Int4(2612),
+            Datum::Int4(13563),
+            text("plpgsql", arena)?,
+            Datum::Int4(10),
+            Datum::Bool(true),
+            Datum::Bool(true),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    finish(definition, &[sql, plpgsql], arena)
+}
+
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_proc",
@@ -5133,6 +5226,14 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("proacl", ColType::Array(super::types::ArrElem::Text)),
             ("prolang", ColType::Oid),
             ("prosrc", ColType::Text),
+            ("probin", ColType::Text),
+            ("proisstrict", ColType::Bool),
+            ("proleakproof", ColType::Bool),
+            ("proconfig", ColType::Array(super::types::ArrElem::Text)),
+            ("procost", ColType::Float8),
+            ("prorows", ColType::Float8),
+            ("protrftypes", ColType::Array(super::types::ArrElem::Int4)),
+            ("prosupport", ColType::Text),
         ],
     );
     const MAX_ROWS: usize = 512;
@@ -5163,6 +5264,14 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     arena,
                 )?,
+                text("", arena)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Float8(1.0),
+                Datum::Float8(0.0),
+                Datum::Null,
+                text("-", arena)?,
             ],
             arena,
         )?;
@@ -5208,8 +5317,22 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(false),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
-                Datum::Int4(14),
+                Datum::Int4(
+                    if matches!(routine.kind, crate::storage::RoutineKind::Trigger) {
+                        13563
+                    } else {
+                        14
+                    },
+                ),
                 text(routine.body.as_str(), arena)?,
+                text("", arena)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Float8(100.0),
+                Datum::Float8(0.0),
+                Datum::Null,
+                text("-", arena)?,
             ],
             arena,
         )?;

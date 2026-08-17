@@ -535,6 +535,21 @@ pub trait CatalogAccess {
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    fn function_arguments<'a>(
+        &self,
+        _oid: i32,
+        _identity: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn function_result<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// Whether this OID names a collation visible to the current query.
     fn collation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a relation eligible for a publication.

@@ -140,6 +140,7 @@ sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
 table_rows = 8192
+max_value_indexes = 64
 max_subscriptions = 2
 subscription_relation_capacity = 16
 subscription_arena_bytes = 256KiB

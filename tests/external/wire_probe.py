@@ -1166,15 +1166,21 @@ def test_instead_of_view_trigger_over_raw_wire():
         "END IF; DELETE FROM wire_view_base WHERE id = OLD.id; RETURN OLD; END'; "
         "CREATE TRIGGER wire_view_write INSTEAD OF INSERT OR UPDATE OR DELETE ON wire_view "
         "FOR EACH ROW EXECUTE FUNCTION wire_view_write(); "
-        "INSERT INTO wire_view VALUES (3, 30); "
+        "INSERT INTO wire_view (value, id) SELECT value, id FROM (VALUES (30, 3)) supplied(value, id); "
         "UPDATE wire_view SET value = 21 WHERE id = 2; "
-        "DELETE FROM wire_view WHERE id = 1",
+        "DELETE FROM wire_view WHERE id = 1; "
+        "CREATE TABLE wire_view_source (id integer PRIMARY KEY, value integer); "
+        "INSERT INTO wire_view_source VALUES (2, 200), (3, 300); "
+        "UPDATE wire_view AS target SET value = source.value FROM wire_view_source AS source "
+        "WHERE target.id = source.id; "
+        "DELETE FROM wire_view AS target USING wire_view_source AS source "
+        "WHERE target.id = source.id AND source.id = 2",
     )
     check("raw wire: INSTEAD OF view setup and DML complete", not any(kind == b"E" for kind, _ in setup), setup)
     check(
         "raw wire: INSTEAD OF view trigger changes only its base-table actions",
         first_text_row(simple_query(s, "SELECT string_agg(id::text || ':' || value::text, ',' ORDER BY id) FROM wire_view_base"))
-        == "2:21,3:30",
+        == "3:300",
     )
     s.close()
 

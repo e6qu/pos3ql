@@ -51,20 +51,71 @@ fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT id, value FROM view_trigger_base ORDER BY id"
+            "SELECT pg_get_function_arguments(p.oid), pg_get_function_identity_arguments(p.oid), \
+                    pg_get_function_result(p.oid), p.probin, language.lanname \
+               FROM pg_proc p JOIN pg_language language ON language.oid = p.prolang \
+              WHERE p.proname = 'view_trigger_write'"
         )),
-        ["2|21", "3|30"]
+        ["||trigger||plpgsql"]
     );
-    run_with(
+    let insert_select = run_with(
         &mut engine,
         &mut budget,
-        "BEGIN; INSERT INTO view_trigger_target VALUES (4, 40); ROLLBACK",
+        "INSERT INTO view_trigger_target (value, id) SELECT value, id FROM (VALUES (40, 4)) source(value, id) RETURNING id, value",
+    );
+    assert_eq!(
+        data_rows(&insert_select),
+        ["4|40"],
+        "{}",
+        String::from_utf8_lossy(&insert_select)
     );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM view_trigger_base WHERE id = 4"
+            "SELECT id, value FROM view_trigger_base ORDER BY id"
+        )),
+        ["2|21", "3|30", "4|40"]
+    );
+    let joined_dml = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_trigger_source (id integer PRIMARY KEY, value integer); \
+         INSERT INTO view_trigger_source VALUES (2, 200), (4, 400); \
+         UPDATE view_trigger_target AS target SET value = source.value \
+           FROM view_trigger_source AS source WHERE target.id = source.id \
+           RETURNING target.id, target.value; \
+         DELETE FROM view_trigger_target AS target USING view_trigger_source AS source \
+           WHERE target.id = source.id AND source.id = 2 RETURNING target.id",
+    );
+    assert_eq!(data_rows(&joined_dml), ["2|200", "4|400", "2"]);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         UPDATE view_trigger_source SET value = 444 WHERE id = 4; \
+         UPDATE view_trigger_target AS target SET value = source.value \
+           FROM view_trigger_source AS source WHERE target.id = source.id; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM view_trigger_base ORDER BY id"
+        )),
+        ["3|30", "4|400"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO view_trigger_target VALUES (5, 50); ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM view_trigger_base WHERE id = 5"
         )),
         ["0"]
     );
@@ -82,11 +133,17 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE recovered_view_base (id integer PRIMARY KEY); \
-         CREATE VIEW recovered_view AS SELECT id FROM recovered_view_base; \
+        "CREATE TABLE recovered_view_base (id integer PRIMARY KEY, value integer); \
+         CREATE TABLE recovered_view_source (id integer PRIMARY KEY, value integer); \
+         INSERT INTO recovered_view_source VALUES (7, 77); \
+         CREATE VIEW recovered_view AS SELECT id, value FROM recovered_view_base; \
          CREATE FUNCTION recovered_view_trigger() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN INSERT INTO recovered_view_base VALUES (NEW.id); RETURN NEW; END'; \
-         CREATE TRIGGER recovered_view_trigger INSTEAD OF INSERT ON recovered_view \
+           'BEGIN \
+              IF TG_OP = ''INSERT'' THEN INSERT INTO recovered_view_base VALUES (NEW.id, NEW.value); RETURN NEW; END IF; \
+              IF TG_OP = ''UPDATE'' THEN UPDATE recovered_view_base SET value = NEW.value WHERE id = OLD.id; RETURN NEW; END IF; \
+              DELETE FROM recovered_view_base WHERE id = OLD.id; RETURN OLD; \
+            END'; \
+         CREATE TRIGGER recovered_view_trigger INSTEAD OF INSERT OR UPDATE OR DELETE ON recovered_view \
            FOR EACH ROW EXECUTE FUNCTION recovered_view_trigger(); \
          ALTER TRIGGER recovered_view_trigger ON recovered_view DISABLE;",
     );
@@ -99,7 +156,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     let disabled = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "INSERT INTO recovered_view VALUES (7)",
+        "INSERT INTO recovered_view VALUES (7, 70)",
     );
     assert!(String::from_utf8_lossy(&disabled).contains("55000"));
     assert_eq!(
@@ -107,9 +164,15 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
             &mut restarted,
             &mut restarted_budget,
             "ALTER TRIGGER recovered_view_trigger ON recovered_view ENABLE; \
-             INSERT INTO recovered_view VALUES (7); SELECT id FROM recovered_view_base"
+             INSERT INTO recovered_view VALUES (7, 70); \
+             UPDATE recovered_view AS target SET value = source.value \
+               FROM recovered_view_source AS source WHERE target.id = source.id \
+               RETURNING target.id, target.value; \
+             DELETE FROM recovered_view AS target USING recovered_view_source AS source \
+               WHERE target.id = source.id RETURNING target.id; \
+             SELECT count(*) FROM recovered_view_base"
         )),
-        ["7"]
+        ["7|77", "7", "0"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

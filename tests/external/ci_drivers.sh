@@ -37,6 +37,7 @@ data_dir = ${WORK}/p3data
 object_store = off
 max_tables = 64
 table_rows = 65536
+max_value_indexes = 64
 memtable_bytes = 256MiB
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &

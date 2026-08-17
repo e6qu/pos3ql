@@ -3361,10 +3361,14 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
         &mut budget,
         "CREATE DOMAIN view_column_domain AS integer CHECK (VALUE > 0); \
          CREATE TYPE view_column_enum AS ENUM ('ready'); \
+         CREATE TYPE view_column_coordinate AS (x integer, y integer); \
+         CREATE DOMAIN view_column_coordinate_domain AS view_column_coordinate; \
          CREATE VIEW view_column_catalog AS \
            SELECT 1::view_column_domain AS domain_value, \
                   'ready'::view_column_enum AS enum_value, \
-                  ARRAY[1] AS array_value",
+                  ARRAY[1] AS array_value, \
+                  ROW(1, 2)::view_column_coordinate_domain AS composite_value, \
+                  ARRAY[ROW(3, 4)::view_column_coordinate_domain] AS composite_values",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -3379,6 +3383,8 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
             "domain_value|1|YES|integer",
             "enum_value|2|YES|USER-DEFINED",
             "array_value|3|YES|ARRAY",
+            "composite_value|4|YES|USER-DEFINED",
+            "composite_values|5|YES|ARRAY",
         ]
     );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();

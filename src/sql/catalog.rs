@@ -7385,40 +7385,13 @@ fn view_column_catalog_type(
     txid: u32,
     oid: i32,
 ) -> Result<(ColType, Option<crate::storage::UserTypeName>), SqlError> {
-    use crate::sql::types::oid as type_oid;
-    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
-        .contains(&oid)
-    {
-        let definition = storage.domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid);
-        return Ok((
-            definition.base,
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
-        .contains(&oid)
-    {
-        let definition = storage.enum_for((oid - type_oid::FIRST_ENUM) as usize, txid);
-        return Ok((
-            ColType::Enum((oid - type_oid::FIRST_ENUM) as u16),
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    super::exec::coltype_of_oid(oid)
-        .map(|ctype| (ctype, None))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column has unsupported type oid {}",
-                oid
-            )
-        })
+    super::exec::catalog_column_type(storage, txid, oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "view column has unsupported type oid {}",
+            oid
+        )
+    })
 }
 
 /// The type-dependent portion of `information_schema.columns`.  `TypeMod`

@@ -14433,6 +14433,146 @@ fn drop_composite_type_reports_all_direct_dependents() {
 }
 
 #[test]
+fn drop_composite_type_reports_dependencies_created_in_separate_transactions() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TYPE composite_committed_root AS (value integer)",
+        "CREATE TYPE composite_committed_leaf AS (root composite_committed_root)",
+        "CREATE TABLE composite_committed_values (root composite_committed_root)",
+        "CREATE VIEW composite_committed_view AS SELECT ROW(1)::composite_committed_root AS root",
+    ] {
+        let result = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !message_types(&result).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&result)
+        );
+    }
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE composite_committed_root",
+    );
+    let text = String::from_utf8_lossy(&restricted);
+    assert!(
+        text.contains(
+            "column root of composite type composite_committed_leaf depends on type composite_committed_root"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "column root of table composite_committed_values depends on type composite_committed_root"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("view composite_committed_view depends on type composite_committed_root"),
+        "{text}"
+    );
+}
+
+#[test]
+fn drop_composite_type_reports_dependencies_across_one_connection_lifetime() {
+    let (mut engine, mut budget) = test_engine();
+    let mut buffer = crate::mem::FixedBuf::new(&mut budget, "send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    let mut execute = |engine: &mut Engine,
+                       buffer: &mut crate::mem::FixedBuf,
+                       txn: &mut TxnState,
+                       pool: &mut SqlPreparedPool,
+                       cursors: &mut crate::sql::cursor::CursorPool,
+                       guc: &mut GucState,
+                       text: &str| {
+        buffer.clear();
+        let mut responder = Responder::new(buffer);
+        engine
+            .execute_simple_from(
+                text,
+                0,
+                &arena,
+                txn,
+                pool,
+                cursors,
+                guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap();
+        engine.commit_wal().unwrap();
+        let output = buffer.readable().to_vec();
+        arena.reset();
+        output
+    };
+    for statement in [
+        "CREATE TYPE composite_connection_coordinate AS (x integer, y integer)",
+        "CREATE TYPE composite_connection_place AS (name text, coordinate composite_connection_coordinate)",
+        "CREATE TABLE composite_connection_places (id integer, place composite_connection_place, places composite_connection_place[])",
+        "INSERT INTO composite_connection_places VALUES (1, ROW('park', ROW(3, 4)::composite_connection_coordinate)::composite_connection_place, ARRAY[ROW('park', ROW(3, 4)::composite_connection_coordinate)::composite_connection_place])",
+        "SELECT typname FROM pg_type WHERE typname IN ('composite_connection_coordinate', 'composite_connection_place') ORDER BY typname",
+        "SELECT (place).name, ((place).coordinate).x FROM composite_connection_places",
+        "BEGIN",
+        "CREATE TYPE composite_connection_rollback AS (value integer)",
+        "ROLLBACK",
+        "CREATE TYPE composite_connection_evolving AS (left_value integer, removed_value text)",
+        "CREATE TABLE composite_connection_evolving_values (value composite_connection_evolving, values composite_connection_evolving[])",
+        "INSERT INTO composite_connection_evolving_values VALUES (ROW(7, 'old')::composite_connection_evolving, ARRAY[ROW(8, 'array-old')::composite_connection_evolving])",
+        "ALTER TYPE composite_connection_evolving ADD ATTRIBUTE right_value integer",
+        "ALTER TYPE composite_connection_evolving RENAME ATTRIBUTE left_value TO retained_value",
+        "ALTER TYPE composite_connection_evolving DROP ATTRIBUTE removed_value",
+        "SELECT (value).retained_value FROM composite_connection_evolving_values",
+        "CREATE TYPE composite_connection_root AS (value integer)",
+        "CREATE TYPE composite_connection_leaf AS (root composite_connection_root)",
+        "SELECT attname FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_connection_leaf')",
+        "CREATE TABLE composite_connection_values (root composite_connection_root)",
+        "CREATE VIEW composite_connection_view AS SELECT ROW(1)::composite_connection_root AS root",
+    ] {
+        let result = execute(
+            &mut engine,
+            &mut buffer,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            statement,
+        );
+        assert!(!message_types(&result).contains(&b'E'));
+    }
+    let root = engine
+        .storage
+        .resolve_composite_slot("composite_connection_root", txn.txid)
+        .unwrap();
+    let leaf = engine
+        .storage
+        .resolve_composite_slot("composite_connection_leaf", txn.txid)
+        .unwrap();
+    let leaf_definition = engine.storage.composite_for(leaf, txn.txid);
+    assert!(matches!(
+        leaf_definition.fields()[0].ctype,
+        ColType::Composite(candidate) if candidate as usize == root
+    ));
+    let result = execute(
+        &mut engine,
+        &mut buffer,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+        &mut guc,
+        "DROP TYPE composite_connection_root",
+    );
+    assert!(
+        String::from_utf8_lossy(&result).contains(
+            "column root of composite type composite_connection_leaf depends on type composite_connection_root"
+        )
+    );
+}
+
+#[test]
 fn drop_composite_type_reports_nested_dependency_in_one_query_batch() {
     let (mut engine, mut budget) = test_engine();
     let mut buffer = crate::mem::FixedBuf::new(&mut budget, "send", 1 << 18).unwrap();
@@ -15611,6 +15751,13 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "SELECT typname FROM pg_type WHERE typname IN ('coordinate_renamed', 'place') ORDER BY typname",
     );
     assert_eq!(data_rows(&bytes), ["coordinate_renamed", "place"]);
+    let bytes = run_with(&mut engine, &mut budget, "DROP TYPE coordinate_renamed");
+    assert!(
+        String::from_utf8_lossy(&bytes)
+            .contains("column point of composite type place depends on type coordinate_renamed"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 

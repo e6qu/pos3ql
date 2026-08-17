@@ -33,8 +33,8 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 ## Current invariants
 
 - Catalog identity, DDL visibility, domain, enum, named-composite, and sequence definitions, and retained TZif cache entries are atomic typed states.
-- A composite attribute has one stable physical number for its lifetime. A dropped attribute remains a typed physical hole; stored values are decoded by physical number and new client values by active logical position, so neither a rename nor add/drop evolution can create a stale field mapping.
-- Composite WAL records carry their durable catalog slot. Recovery alters that exact identity rather than allocating a coincidentally free slot; stored-query type dependencies likewise carry an explicit composite class.
+- A composite attribute has one stable physical number; its `Composite(slot)` type tag is the referenced-composite identity. A dropped attribute remains a typed physical hole; stored values are decoded by physical number and new client values by active logical position, so neither a rename nor add/drop evolution can create a stale field mapping or dependency lookup by name.
+- Composite WAL records carry durable catalog slots for definitions and their typed fields. Recovery alters exact identities rather than allocating coincidentally free slots; stored-query type dependencies likewise carry an explicit composite class.
 - A collation is either absent or a resolved identity; it cannot be accepted and discarded. Columns, derived relations, CTEs, set operations, indexes, WAL, checkpoints, catalogs, and comparison compatibility retain that identity.
 - Persisted default tags and bounded payloads are parsed as typed states; malformed lengths and type codes are rejected rather than reinterpreted.
 - A sequence's staged parameters and value state are visible only to the owning transaction; rollback restores the exact savepoint image and WAL publishes only the final committed image.

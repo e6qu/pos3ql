@@ -63,8 +63,17 @@ SELECT (value).retained_value FROM composite_evolving_values
 
 CREATE TYPE composite_drop_root AS (value integer);
 CREATE TYPE composite_drop_leaf AS (root composite_drop_root);
+SELECT pg_typeof((ROW(ROW(1)::composite_drop_root)::composite_drop_leaf).root);
+SELECT attname, atttypid = (SELECT oid FROM pg_type WHERE typname = 'composite_drop_root'), attisdropped
+  FROM pg_attribute
+ WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_drop_leaf')
+ ORDER BY attnum;
 CREATE TABLE composite_drop_values (id integer, root composite_drop_root, roots composite_drop_root[]);
 CREATE VIEW composite_drop_view AS SELECT ROW(1)::composite_drop_root AS root;
+SELECT attname, atttypid = (SELECT oid FROM pg_type WHERE typname = 'composite_drop_root'), attisdropped
+  FROM pg_attribute
+ WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_drop_leaf')
+ ORDER BY attnum;
 DROP TYPE composite_drop_root;
 DROP TYPE composite_drop_root CASCADE;
 SELECT typname FROM pg_type

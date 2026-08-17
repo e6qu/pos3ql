@@ -5282,9 +5282,12 @@ mod tests {
         fields[0] = crate::storage::CompositeFieldDef {
             attribute_number: 1,
             name: crate::storage::SqlName::parse("retained").unwrap(),
-            ctype: ColType::Int4,
+            ctype: ColType::Composite(3),
             type_mod: -1,
-            user_type: None,
+            user_type: Some(crate::storage::UserTypeName {
+                schema: crate::storage::SqlName::parse("public").unwrap(),
+                name: crate::storage::SqlName::parse("root").unwrap(),
+            }),
             dropped: false,
             not_null: true,
         };
@@ -5321,6 +5324,10 @@ mod tests {
         assert_eq!(slot, 7);
         assert_eq!(definition.fields()[0].attribute_number, 1);
         assert!(definition.fields()[0].not_null);
+        assert!(matches!(
+            definition.fields()[0].ctype,
+            ColType::Composite(3)
+        ));
         assert_eq!(definition.fields()[1].attribute_number, 2);
         assert!(definition.fields()[1].dropped);
 

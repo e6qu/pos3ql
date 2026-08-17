@@ -15713,7 +15713,6 @@ fn drop_composite_type(
         txn.txid,
         CompositeTypeDependencyRoot {
             slot,
-            schema: definition.schema,
             name: definition.name,
         },
         CompositeTypeDependencySelection {
@@ -15731,11 +15730,14 @@ fn drop_composite_type(
         ));
     }
 
-    let identity = crate::storage::UserTypeName {
-        schema: definition.schema,
-        name: definition.name,
-    };
-    while let Some(dependent) = composite_field_uses_composite(storage, slot, identity, txn.txid) {
+    while let Some((dependent, attribute_number)) = composite_field_uses_composite(
+        storage,
+        CompositeTypeDependencyRoot {
+            slot,
+            name: definition.name,
+        },
+        txn.txid,
+    )? {
         if !cascade {
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -15744,7 +15746,7 @@ fn drop_composite_type(
             ));
         }
         cascade_drop_composite_fields(storage, wal, txn, dependent, |field| {
-            field.user_type == Some(identity)
+            field.attribute_number == attribute_number
         })?;
     }
 
@@ -15820,7 +15822,6 @@ fn drop_composite_type(
 #[derive(Clone, Copy)]
 struct CompositeTypeDependencyRoot {
     slot: usize,
-    schema: SqlName,
     name: SqlName,
 }
 
@@ -15841,7 +15842,6 @@ fn report_composite_type_dependents(
     use core::fmt::Write as _;
     let CompositeTypeDependencyRoot {
         slot,
-        schema,
         name: type_name,
     } = root;
     let CompositeTypeDependencySelection { views, matviews } = selection;
@@ -15850,9 +15850,7 @@ fn report_composite_type_dependents(
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut count = 0usize;
     let mut push = |line: &str| {
-        if count != 0 {
-            let _ = detail.write_char('\n');
-        }
+        let _ = detail.write_char('\n');
         let _ = detail.write_str(line);
         count += 1;
     };
@@ -15860,27 +15858,29 @@ fn report_composite_type_dependents(
         if candidate == slot {
             continue;
         }
-        for field in composite.active_fields() {
-            if field.user_type
-                == Some(crate::storage::UserTypeName {
-                    schema,
-                    name: type_name,
-                })
+        for field in composite.fields() {
+            if field.dropped
+                || !matches!(
+                    field.ctype,
+                    ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate))
+                        if candidate as usize == slot
+                )
             {
-                let line = stack_format!(
-                    192,
-                    "column {} of composite type {}{}",
-                    field.name.as_str(),
-                    composite.name.as_str(),
-                    if cascade { "" } else { " depends on type" }
-                );
-                if cascade {
-                    let cascade_line = stack_format!(192, "drop cascades to {}", line.as_str());
-                    push(cascade_line.as_str());
-                } else {
-                    let line = stack_format!(192, "{} {}", line.as_str(), type_name.as_str());
-                    push(line.as_str());
-                }
+                continue;
+            }
+            let line = stack_format!(
+                192,
+                "column {} of composite type {}{}",
+                field.name.as_str(),
+                composite.name.as_str(),
+                if cascade { "" } else { " depends on type" }
+            );
+            if cascade {
+                let cascade_line = stack_format!(192, "drop cascades to {}", line.as_str());
+                push(cascade_line.as_str());
+            } else {
+                let line = stack_format!(192, "{} {}", line.as_str(), type_name.as_str());
+                push(line.as_str());
             }
         }
     }
@@ -15977,19 +15977,26 @@ fn report_composite_type_dependents(
 
 fn composite_field_uses_composite(
     storage: &Storage,
-    composite_slot: usize,
-    identity: crate::storage::UserTypeName,
+    root: CompositeTypeDependencyRoot,
     txid: u32,
-) -> Option<usize> {
-    storage
-        .composites_with_slots_visible_to(txid)
-        .find(|(candidate, definition)| {
-            *candidate != composite_slot
-                && definition
-                    .active_fields()
-                    .any(|field| field.user_type == Some(identity))
-        })
-        .map(|(candidate, _)| candidate)
+) -> Result<Option<(usize, u16)>, SqlError> {
+    for (candidate, definition) in storage.composites_with_slots_visible_to(txid) {
+        if candidate == root.slot {
+            continue;
+        }
+        for field in definition.fields() {
+            if !field.dropped
+                && matches!(
+                    field.ctype,
+                    ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate))
+                        if candidate as usize == root.slot
+                )
+            {
+                return Ok(Some((candidate, field.attribute_number)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// PostgreSQL CASCADE removes a dependent composite attribute, leaving the

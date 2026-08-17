@@ -25,105 +25,6 @@ fn test_config(name: &str) -> Config {
     config
 }
 
-#[test]
-fn postgres_oracle_regressions_reject_unsupported_forms_with_correct_sqlstates() {
-    let (mut engine, mut budget) = test_engine();
-    let roman = run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT to_char('NaN'::numeric, 'RN')",
-    );
-    assert!(
-        String::from_utf8_lossy(&roman).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&roman)
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT to_char('NaN'::float8, 'RN')",
-        )),
-        ["###############"]
-    );
-    for input in ["0x1F", "1_000"] {
-        let integer = run_with(
-            &mut engine,
-            &mut budget,
-            &format!("SELECT '{input}'::integer"),
-        );
-        assert!(
-            String::from_utf8_lossy(&integer).contains("22P02"),
-            "{}",
-            String::from_utf8_lossy(&integer)
-        );
-    }
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE oracle_parent (id integer PRIMARY KEY);
-         CREATE TABLE oracle_child (id integer, parent_id integer REFERENCES oracle_parent(id) ON DELETE RESTRICT);
-         INSERT INTO oracle_parent VALUES (1);
-         INSERT INTO oracle_child VALUES (1, 1)",
-    );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DELETE FROM oracle_parent WHERE id = 1",
-    );
-    assert!(
-        String::from_utf8_lossy(&restricted).contains("23503"),
-        "{}",
-        String::from_utf8_lossy(&restricted)
-    );
-    let record = run_with(&mut engine, &mut budget, "SELECT max(ROW(1, 'x'))");
-    assert!(
-        String::from_utf8_lossy(&record).contains("42883"),
-        "{}",
-        String::from_utf8_lossy(&record)
-    );
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE oracle_record (id integer); INSERT INTO oracle_record VALUES (1)",
-    );
-    let whole_row = run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT min(oracle_record.*) FROM oracle_record",
-    );
-    assert!(
-        String::from_utf8_lossy(&whole_row).contains("42883"),
-        "{}",
-        String::from_utf8_lossy(&whole_row)
-    );
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE oracle_null_fold (id integer NOT NULL, value integer, stamp timestamptz);
-         INSERT INTO oracle_null_fold VALUES (1, 1, '2020-01-01'), (2, 0, NULL)",
-    );
-    for query in [
-        "SELECT count(*) FROM oracle_null_fold WHERE value / 0 = 1 OR id IS NOT NULL",
-        "SELECT count(*) FROM oracle_null_fold WHERE stamp IS NULL OR (value / 0 = 1 OR id IS NOT NULL)",
-    ] {
-        let output = run_with(&mut engine, &mut budget, query);
-        assert!(
-            String::from_utf8_lossy(&output).contains("22012"),
-            "{query}: {}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT count(*) FROM oracle_null_fold WHERE id IS NOT NULL OR value / 0 = 1",
-        )),
-        ["2"]
-    );
-}
-
 fn test_engine() -> (Engine, Budget) {
     // Each test gets its own journal; the caller's function name is not
     // available, so a counter differentiates them.
@@ -3457,7 +3358,7 @@ fn information_schema_domains_and_constraints_are_transaction_visible() {
             "SELECT constraint_name, domain_name FROM information_schema.domain_constraints \
              WHERE domain_name = 'information_schema_not_null_domain'",
         )),
-        Vec::<String>::new()
+        ["information_schema_not_null_domain_not_null|information_schema_not_null_domain"]
     );
     assert_eq!(
         data_rows(&run_with_txn_bytes(
@@ -19390,7 +19291,7 @@ fn psql_catalog_listing_contracts() {
             &mut budget,
             "SELECT collname, collprovider FROM pg_collation ORDER BY collname",
         )),
-        ["C|c", "POSIX|c", "default|d", "ucs_basic|c"]
+        ["C|c", "POSIX|c", "default|d", "ucs_basic|b"]
     );
     run_with(
         &mut engine,

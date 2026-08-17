@@ -8788,6 +8788,23 @@ fn info_domain_constraints<'a>(
             )?;
             count += 1;
         }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            output[count] = row(
+                &[
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(name.as_str(), arena)?,
+                    text("postgres", arena)?,
+                    text(domain.schema.as_str(), arena)?,
+                    text(domain.name.as_str(), arena)?,
+                    text("NO", arena)?,
+                    text("NO", arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
     }
     finish(definition, &output[..count], arena)
 }
@@ -8854,6 +8871,10 @@ fn info_check_constraints<'a>(
         for check in domain.checks() {
             let clause = stack_format!(1024, "({})", check.expression.as_str());
             append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
+        }
+        if domain.not_null {
+            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
+            append(domain.schema.as_str(), name.as_str(), "VALUE IS NOT NULL")?;
         }
     }
     finish(definition, &output[..count], arena)

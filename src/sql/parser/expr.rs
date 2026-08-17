@@ -10,7 +10,7 @@
 use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
-use super::{MAX_LIST, ParseError, Parser, is_reserved_keyword};
+use super::{MAX_LIST, ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
 impl<'a> Parser<'a> {
@@ -457,7 +457,10 @@ impl<'a> Parser<'a> {
         match tok {
             Tok::Num(text) => {
                 self.advance()?;
-                let looks_integral = !text.contains(['.', 'e', 'E']);
+                // Base-prefixed literals (0x/0o/0b) are always integers; a plain
+                // token is integral unless it has a decimal point or exponent.
+                let prefixed = is_base_prefixed(text);
+                let looks_integral = prefixed || !text.contains(['.', 'e', 'E']);
                 if looks_integral && let Some(v) = crate::sql::eval::parse_int_literal(text) {
                     return self.arena_expr(Expr::Int(v));
                 }
@@ -581,7 +584,7 @@ impl<'a> Parser<'a> {
                 // `-2147483648` is int4 (INT4_MIN fits), not int8. Decimal
                 // literals negate through the normal Neg path (numeric).
                 if let Tok::Num(text) = self.peeked {
-                    let integral = !text.contains(['.', 'e', 'E']);
+                    let integral = is_base_prefixed(text) || !text.contains(['.', 'e', 'E']);
                     // A following `::` binds tighter than the minus, so
                     // `-32768::int2` is `-(32768::int2)` — PostgreSQL raises
                     // "smallint out of range" there, and folding would hide it.

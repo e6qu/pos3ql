@@ -8428,9 +8428,11 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
     let replace = run_with(
         &mut engine,
         &mut budget,
-        "CREATE OR REPLACE FUNCTION keep_row() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'",
+        "CREATE OR REPLACE FUNCTION keep_row() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+         INSERT INTO trigger_target VALUES (3);
+         SELECT count(*) FROM trigger_target;",
     );
-    assert!(String::from_utf8_lossy(&replace).contains("0A000"));
+    assert_eq!(data_rows(&replace), ["2"]);
     let create_delete_trigger = run_with(
         &mut engine,
         &mut budget,
@@ -8454,6 +8456,79 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
          SELECT count(*) FROM pg_trigger",
     );
     assert_eq!(data_rows(&cascaded), ["0"]);
+}
+
+#[test]
+fn replacing_trigger_function_preserves_identity_rollback_and_recovery() {
+    let config = test_config("replace-trigger-function");
+    let function_oid: String;
+    {
+        let mut budget = Budget::new(1 << 27);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE replacement_target (id integer PRIMARY KEY);
+             CREATE FUNCTION replacement_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+             CREATE TRIGGER replacement_gate BEFORE INSERT ON replacement_target
+               FOR EACH ROW EXECUTE FUNCTION replacement_gate();",
+        );
+        assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+        function_oid = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid FROM pg_proc WHERE proname = 'replacement_gate'",
+        ))[0]
+            .to_owned();
+
+        let rolled_back = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN;
+             SAVEPOINT before_replacement;
+             CREATE OR REPLACE FUNCTION replacement_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+             INSERT INTO replacement_target VALUES (1);
+             ROLLBACK TO SAVEPOINT before_replacement;
+             INSERT INTO replacement_target VALUES (1);
+             COMMIT;
+             SELECT count(*) FROM replacement_target;",
+        );
+        assert_eq!(data_rows(&rolled_back), ["1"]);
+        let committed = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE OR REPLACE FUNCTION replacement_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+             INSERT INTO replacement_target VALUES (2);
+             SELECT oid, (SELECT count(*) FROM replacement_target) FROM pg_proc WHERE proname = 'replacement_gate';",
+        );
+        assert_eq!(data_rows(&committed), [format!("{function_oid}|1")]);
+        let procedure = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE replacement_log (value integer);
+             CREATE PROCEDURE replacement_append() LANGUAGE SQL AS 'INSERT INTO replacement_log VALUES (1)';
+             CREATE OR REPLACE PROCEDURE replacement_append() LANGUAGE SQL AS 'INSERT INTO replacement_log VALUES (2)';
+             CALL replacement_append();
+             SELECT value FROM replacement_log;",
+        );
+        assert_eq!(data_rows(&procedure), ["2"]);
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO replacement_target VALUES (3);
+         CALL replacement_append();
+         SELECT oid, (SELECT count(*) FROM replacement_target), (SELECT count(*) FROM replacement_log), (SELECT max(value) FROM replacement_log) FROM pg_proc WHERE proname = 'replacement_gate';",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [format!("{function_oid}|1|2|2")],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
 }
 
 #[test]
@@ -12530,7 +12605,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
 #[test]
 fn alter_column_default_and_not_null() {
     let config = test_config("alter-column");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
@@ -12735,7 +12810,7 @@ fn alter_rename_constraint() {
 #[test]
 fn check_constraint_auto_naming() {
     let config = test_config("check-naming");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // Four unnamed CHECKs: a>0 and a<100 and a<>50 each reference only `a`, so
     // they collide on cn_a_check and disambiguate to cn_a_check / cn_a_check1 /

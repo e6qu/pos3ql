@@ -2158,6 +2158,9 @@ impl Engine {
                     self.storage.commit_routine_create(*slot as usize, txn.txid)
                 }
                 DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
+                DdlUndo::RoutineReplaced { slot, .. } => self
+                    .storage
+                    .commit_routine_replace(*slot as usize, txn.txid),
                 DdlUndo::TriggerCreated(slot) => self.storage.commit_trigger_create(*slot as usize),
                 DdlUndo::TriggerDropped(slot) => self.storage.commit_trigger_drop(*slot as usize),
                 DdlUndo::TriggerAltered { slot, .. } => {
@@ -2403,6 +2406,9 @@ impl Engine {
             DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
             DdlUndo::RoutineDropped(slot) => {
                 self.storage.rollback_routine_drop(slot as usize, txid)
+            }
+            DdlUndo::RoutineReplaced { slot, prior } => {
+                self.storage.rollback_routine_replace(slot as usize, prior)
             }
             DdlUndo::TriggerCreated(slot) => self.storage.rollback_trigger_create(slot as usize),
             DdlUndo::TriggerDropped(slot) => {
@@ -4292,7 +4298,12 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if self.storage.routine(pending.slot).kind.is_set_returning() {
+        if self
+            .storage
+            .routine_for(pending.slot, txn.txid)
+            .kind
+            .is_set_returning()
+        {
             let rows = match self.execute_pending_table_routine(
                 pending, arena, txn, sqlprep, cursors, guc, responder,
             )? {
@@ -4590,7 +4601,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
-        let routine = *self.storage.routine(pending.slot);
+        let routine = self.storage.routine_for(pending.slot, txn.txid);
         let Some(result_type) = routine.kind.function_result() else {
             return Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -4660,7 +4671,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<&'a [&'a [u8]], SqlError>, WireFull> {
-        let routine = *self.storage.routine(pending.slot);
+        let routine = self.storage.routine_for(pending.slot, txn.txid);
         if !routine.kind.is_set_returning() {
             return Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -5154,7 +5165,7 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
-        let routine = self.storage.routine(slot);
+        let routine = self.storage.routine_for(slot, txn.txid);
         let body = routine.body;
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let mut parser = match Parser::new(body.as_str(), arena) {

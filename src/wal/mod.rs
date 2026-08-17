@@ -4215,6 +4215,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 pending_identity: None,
+                pending_definition: None,
                 arguments,
                 argument_count,
                 kind,

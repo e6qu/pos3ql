@@ -1660,6 +1660,7 @@ pub enum DependencyClass {
     Domain = 3,
     Enum = 4,
     Sequence = 5,
+    Composite = 6,
 }
 
 impl DependencyClass {
@@ -1670,6 +1671,7 @@ impl DependencyClass {
             3 => Some(Self::Domain),
             4 => Some(Self::Enum),
             5 => Some(Self::Sequence),
+            6 => Some(Self::Composite),
             _ => None,
         }
     }
@@ -2762,18 +2764,26 @@ pub struct EnumSpec {
 /// stable name used to rebind catalog slots after recovery.
 #[derive(Debug, Clone, Copy)]
 pub struct CompositeFieldDef {
+    /// Stable physical attribute number. Dropping an attribute never changes
+    /// another attribute's number, which keeps old row values decodable.
+    pub attribute_number: u16,
     pub name: SqlName,
     pub ctype: ColType,
     pub type_mod: i32,
     pub user_type: Option<UserTypeName>,
+    pub dropped: bool,
+    pub not_null: bool,
 }
 
 impl CompositeFieldDef {
     pub(crate) const EMPTY: Self = Self {
+        attribute_number: 0,
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         type_mod: -1,
         user_type: None,
+        dropped: true,
+        not_null: false,
     };
 }
 
@@ -2787,7 +2797,18 @@ pub struct CompositeDef {
     pub ownership: Ownership,
     pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
     pub n_fields: usize,
+    pub(crate) pending_definition: Option<PendingCompositeDefinition>,
     pub ddl_state: CatalogDdlState,
+}
+
+/// A transaction-private composite layout. Attribute numbers are physical and
+/// therefore remain stable across add/drop/rename operations.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingCompositeDefinition {
+    pub txid: u32,
+    pub name: SqlName,
+    pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
+    pub n_fields: usize,
 }
 
 impl CompositeDef {
@@ -2798,6 +2819,7 @@ impl CompositeDef {
         ownership: Ownership::BOOTSTRAP,
         fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS],
         n_fields: 0,
+        pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
 
@@ -2805,8 +2827,56 @@ impl CompositeDef {
         &self.fields[..self.n_fields]
     }
 
+    pub fn active_fields(&self) -> impl Iterator<Item = &CompositeFieldDef> {
+        self.fields().iter().filter(|field| !field.dropped)
+    }
+
+    /// The field layout visible to one transaction. Returning a borrow into
+    /// the catalog, rather than a copied definition, preserves the identity of
+    /// transaction-private attribute names through Describe/RowDescription.
+    pub fn fields_for(&self, txid: u32) -> &[CompositeFieldDef] {
+        match self
+            .pending_definition
+            .as_ref()
+            .filter(|pending| pending.txid == txid)
+        {
+            Some(pending) => &pending.fields[..pending.n_fields],
+            None => self.fields(),
+        }
+    }
+
+    pub fn active_fields_for(&self, txid: u32) -> impl Iterator<Item = &CompositeFieldDef> {
+        self.fields_for(txid).iter().filter(|field| !field.dropped)
+    }
+
+    pub fn active_field_count(&self) -> usize {
+        self.active_fields().count()
+    }
+
+    pub fn active_field(&self, index: usize) -> Option<&CompositeFieldDef> {
+        self.active_fields().nth(index)
+    }
+
+    pub fn active_field_index(&self, name: &str) -> Option<usize> {
+        self.fields()
+            .iter()
+            .position(|field| !field.dropped && field.name.as_str() == name)
+    }
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> Self {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(*self, |pending| Self {
+                name: pending.name,
+                fields: pending.fields,
+                n_fields: pending.n_fields,
+                pending_definition: None,
+                ..*self
+            })
     }
 }
 
@@ -4323,6 +4393,7 @@ impl Storage {
                 DependencyClass::Domain => self.domain_slot(schema, name, txid),
                 DependencyClass::Enum => self.enum_slot(schema, name, txid),
                 DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
+                DependencyClass::Composite => self.composite_slot(schema, name, txid),
             }
             .ok_or_else(|| {
                 sql_err!(
@@ -13088,7 +13159,7 @@ impl Storage {
             .map_or((None, type_name), |(s, n)| (Some(s), n));
         self.composites.iter().enumerate().find_map(|(slot, definition)| {
             (definition.visible_to(txid)
-                && definition.name.as_str() == name
+                && definition.definition_for(txid).name.as_str() == name
                 && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.schema)), |schema| definition.schema.as_str() == schema))
                 .then_some(slot)
         })
@@ -13098,7 +13169,7 @@ impl Storage {
         self.composites.iter().position(|definition| {
             definition.visible_to(txid)
                 && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
+                && definition.definition_for(txid).name.as_str() == name
         })
     }
 
@@ -13106,11 +13177,148 @@ impl Storage {
         &self.composites[slot]
     }
 
+    pub(crate) fn composite_for(&self, slot: usize, txid: u32) -> CompositeDef {
+        self.composites[slot].definition_for(txid)
+    }
+
     pub fn live_composites(&self) -> impl Iterator<Item = (usize, &CompositeDef)> {
         self.composites
             .iter()
             .enumerate()
             .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn composites_with_slots_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
+        self.composites
+            .iter()
+            .enumerate()
+            .filter(move |(_, definition)| definition.visible_to(txid))
+            .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
+    }
+
+    pub(crate) fn stage_composite_alter(
+        &mut self,
+        slot: usize,
+        definition: CompositeDef,
+        txid: u32,
+    ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
+        let name = self.composites[slot].name;
+        let composite = &mut self.composites[slot];
+        if let Some(pending) = composite.pending_definition
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
+        }
+        let prior = composite.pending_definition;
+        composite.pending_definition = Some(PendingCompositeDefinition {
+            txid,
+            name: definition.name,
+            fields: definition.fields,
+            n_fields: definition.n_fields,
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_composite_alter(&mut self, slot: usize, txid: u32) {
+        let renamed = {
+            let composite = &mut self.composites[slot];
+            if let Some(pending) = composite.pending_definition
+                && pending.txid == txid
+            {
+                let prior_name = composite.name;
+                composite.name = pending.name;
+                composite.fields = pending.fields;
+                composite.n_fields = pending.n_fields;
+                composite.pending_definition = None;
+                (prior_name != composite.name).then_some((prior_name, composite.name))
+            } else {
+                None
+            }
+        };
+        if let Some((prior_name, new_name)) = renamed {
+            self.rename_composite_references(slot, prior_name, new_name);
+        }
+    }
+
+    /// A composite slot is durable identity, while persisted definitions retain
+    /// the SQL name needed to rebind that slot after recovery. Rename every
+    /// such identity in the same catalog commit that changes the type name.
+    fn rename_composite_references(&mut self, slot: usize, old_name: SqlName, new_name: SqlName) {
+        let schema = self.composites[slot].schema;
+        for table in self
+            .tables
+            .iter_mut()
+            .filter(|table| table.live || table.pending_ddl.is_some())
+        {
+            let mut changed = false;
+            for column in table.def.columns[..table.def.n_columns].iter_mut() {
+                if matches!(
+                    column.ctype,
+                    ColType::Composite(candidate)
+                        | ColType::Array(ArrElem::Composite(candidate))
+                        if candidate as usize == slot
+                ) {
+                    if let Some(identity) = &mut column.user_type {
+                        identity.name = new_name;
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                table.mark_dirty();
+            }
+        }
+        for composite in self
+            .composites
+            .iter_mut()
+            .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
+        {
+            for field in composite.fields.iter_mut().take(composite.n_fields) {
+                if matches!(
+                    field.ctype,
+                    ColType::Composite(candidate)
+                        | ColType::Array(ArrElem::Composite(candidate))
+                        if candidate as usize == slot
+                ) && let Some(identity) = &mut field.user_type
+                {
+                    identity.name = new_name;
+                }
+            }
+            if let Some(pending) = &mut composite.pending_definition {
+                for field in pending.fields.iter_mut().take(pending.n_fields) {
+                    if matches!(
+                        field.ctype,
+                        ColType::Composite(candidate)
+                            | ColType::Array(ArrElem::Composite(candidate))
+                            if candidate as usize == slot
+                    ) && let Some(identity) = &mut field.user_type
+                    {
+                        identity.name = new_name;
+                    }
+                }
+            }
+        }
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && comment.class == CommentClass::Type
+                && comment.schema == schema
+                && comment.name == old_name
+            {
+                comment.name = new_name;
+            }
+        }
+        self.rename_stored_query_dependency(DependencyClass::Composite, slot, schema, new_name);
+    }
+
+    pub(crate) fn rollback_composite_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingCompositeDefinition>,
+    ) {
+        self.composites[slot].pending_definition = prior;
     }
 
     pub fn create_composite(
@@ -13177,6 +13385,56 @@ impl Storage {
                 self.composites.len()
             ));
         };
+        self.create_composite_at(slot, schema, name, spec, txid)
+    }
+
+    /// Replays a durable composite catalog identity. A WAL record names the
+    /// slot explicitly, so restart cannot rebind existing rows to whichever
+    /// free slot happens to be allocated first.
+    pub(crate) fn create_composite_at(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+        mut spec: CompositeSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if slot >= self.composites.len()
+            || self.composites[slot].ddl_state != CatalogDdlState::Absent
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal composite catalog identity is unavailable"
+            ));
+        }
+        for field in spec.fields.iter_mut().take(spec.n_fields) {
+            let Some(identity) = field.user_type else {
+                continue;
+            };
+            if let Some(ctype) = match field.ctype {
+                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => self
+                    .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .map(|type_slot| {
+                        if matches!(field.ctype, ColType::Array(_)) {
+                            ColType::Array(ArrElem::Enum(type_slot as u16))
+                        } else {
+                            ColType::Enum(type_slot as u16)
+                        }
+                    }),
+                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => self
+                    .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .map(|type_slot| {
+                        if matches!(field.ctype, ColType::Array(_)) {
+                            ColType::Array(ArrElem::Composite(type_slot as u16))
+                        } else {
+                            ColType::Composite(type_slot as u16)
+                        }
+                    }),
+                _ => None,
+            } {
+                field.ctype = ctype;
+            }
+        }
         self.catalog_seq += 1;
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Composite,
@@ -13189,6 +13447,7 @@ impl Storage {
             ownership: self.initial_ownership(txid),
             fields: spec.fields,
             n_fields: spec.n_fields,
+            pending_definition: None,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
             } else {
@@ -13202,8 +13461,56 @@ impl Storage {
         self.composites[slot].ddl_state = self.composites[slot].ddl_state.commit_create();
     }
 
+    pub fn drop_composite(
+        &mut self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        if let Some(blocker) = self.composites.iter().find_map(|definition| {
+            (definition.schema.as_str() == schema
+                && (definition.name.as_str() == name
+                    || definition
+                        .pending_definition
+                        .is_some_and(|pending| pending.name.as_str() == name)))
+            .then(|| {
+                definition
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| definition.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
+        }
+        let Some(slot) = self.composites.iter().position(|definition| {
+            definition.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.definition_for(txid).name.as_str() == name
+        }) else {
+            return Ok(None);
+        };
+        self.composites[slot].ddl_state = self.composites[slot].ddl_state.drop_by(txid);
+        Ok(Some(slot))
+    }
+
+    pub fn commit_composite_drop(&mut self, slot: usize) {
+        let definition = self.composites[slot];
+        self.drop_object_comments(
+            CommentClass::Type,
+            definition.schema.as_str(),
+            definition.name.as_str(),
+        );
+        self.composites[slot].ddl_state = self.composites[slot].ddl_state.commit_drop();
+    }
+
     pub fn rollback_composite_create(&mut self, slot: usize) {
         self.composites[slot].ddl_state = self.composites[slot].ddl_state.rollback_create();
+    }
+
+    pub fn rollback_composite_drop(&mut self, slot: usize, txid: u32) {
+        self.composites[slot].ddl_state = self.composites[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other

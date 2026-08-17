@@ -34,6 +34,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # `target` is cached by dependency lockfile, not source revision. Keep
+      # dependencies warm but rebuild this checkout's crate every time.
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
       # Fail fast on any new silent accept-and-ignore of SQL/protocol
       # semantics. See tools/check-noops.sh.
       - name: No-op guard
@@ -116,6 +121,10 @@ jobs:
           key: ${{ runner.os }}-cargo-vopr-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-vopr-
 
+      # The cache may contain another commit's application artifacts.
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
       - name: Storage VOPR
         run: |
           POS3QL_STORAGE_VOPR_SEED0=${{ matrix.first }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
@@ -155,6 +164,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      # The cache may contain another commit's application artifacts.
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
 
       - name: Cold external-run regression
         run: |

@@ -54,6 +54,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # `target` is cached by dependency lockfile, not source revision. Keep
+      # dependencies warm but rebuild this checkout's crate every time.
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

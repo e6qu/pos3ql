@@ -804,10 +804,12 @@ pub(crate) fn compare_datums_as(
             Datum::CompositeText {
                 slot: left_slot,
                 text: left,
+                ..
             },
             Datum::CompositeText {
                 slot: right_slot,
                 text: right,
+                ..
             },
         ) => left_slot.cmp(right_slot).then_with(|| left.cmp(right)),
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {

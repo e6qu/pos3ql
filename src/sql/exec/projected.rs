@@ -198,7 +198,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
             }
             n
         }
-        Datum::CompositeText { text, .. } => 2 + 4 + text.len(),
+        Datum::CompositeText { text, .. } => 2 + 1 + 4 + text.len(),
     }
 }
 
@@ -492,12 +492,17 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             }
             at
         }
-        Datum::CompositeText { slot, text } => {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
             out[0] = 33;
             out[1..3].copy_from_slice(&slot.to_le_bytes());
-            out[3..7].copy_from_slice(&(text.len() as u32).to_le_bytes());
-            out[7..7 + text.len()].copy_from_slice(text.as_bytes());
-            7 + text.len()
+            out[3] = *physical_fields;
+            out[4..8].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[8..8 + text.len()].copy_from_slice(text.as_bytes());
+            8 + text.len()
         }
     }
 }
@@ -749,10 +754,18 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         33 => {
             let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
-            let text = core::str::from_utf8(&bytes[at + 6..at + 6 + len])
+            let physical_fields = bytes[at + 2];
+            let len = u32::from_le_bytes(bytes[at + 3..at + 7].try_into().unwrap()) as usize;
+            let text = core::str::from_utf8(&bytes[at + 7..at + 7 + len])
                 .expect("projected composite text was encoded from valid UTF-8");
-            (Datum::CompositeText { slot, text }, 6 + len)
+            (
+                Datum::CompositeText {
+                    slot,
+                    physical_fields,
+                    text,
+                },
+                7 + len,
+            )
         }
         _ => unreachable!("tags are exhaustive"),
     }

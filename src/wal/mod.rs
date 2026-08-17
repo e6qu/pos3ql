@@ -103,6 +103,7 @@ const KIND_CREATE_TRIGGER: u8 = 55;
 const KIND_DROP_TRIGGER: u8 = 56;
 const KIND_ALTER_TRIGGER: u8 = 57;
 const KIND_CREATE_COMPOSITE: u8 = 58;
+const KIND_DROP_COMPOSITE: u8 = 59;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -110,7 +111,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_CREATE_COMPOSITE;
+const LAST_KIND: u8 = KIND_DROP_COMPOSITE;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -585,7 +586,16 @@ pub(crate) enum WalOp<'a> {
     /// CREATE TYPE ... AS (...). Each field carries its durable user-type
     /// identity beside the representation code, so recovery never trusts a
     /// catalog slot from a prior process.
-    CreateComposite(crate::storage::CompositeDef),
+    /// A composite definition at its durable catalog identity. The slot is
+    /// part of the record: fields and rows refer to it directly.
+    CreateComposite {
+        slot: u16,
+        definition: crate::storage::CompositeDef,
+    },
+    DropComposite {
+        schema: &'a str,
+        name: &'a str,
+    },
     CreateRoutine(crate::storage::RoutineDef),
     DropRoutine {
         schema: &'a str,
@@ -1351,7 +1361,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
-        WalOp::CreateComposite(_) => KIND_CREATE_COMPOSITE,
+        WalOp::CreateComposite { .. } => KIND_CREATE_COMPOSITE,
+        WalOp::DropComposite { .. } => KIND_DROP_COMPOSITE,
         WalOp::CreateRoutine(_) => KIND_CREATE_ROUTINE,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
@@ -1718,16 +1729,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             old_name,
             new_name,
         } => 1 + old_name.len() + 1 + schema.len() + 1 + new_name.len(),
-        WalOp::CreateComposite(def) => {
-            let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
+        WalOp::CreateComposite {
+            definition: def, ..
+        } => {
+            let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
             for field in def.fields() {
-                n += 1 + field.name.as_str().len() + 1 + 4 + 1;
+                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1;
                 if let Some(identity) = field.user_type {
                     n += 1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len();
                 }
             }
             n
         }
+        WalOp::DropComposite { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateRoutine(def) => {
             8 + 2
                 + 1
@@ -2339,12 +2353,19 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, new_name)
         }
-        WalOp::CreateComposite(def) => {
-            let mut ok = name_bytes(buffer, def.name.as_str())
+        WalOp::CreateComposite {
+            slot,
+            definition: def,
+        } => {
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
                 && buffer.append(&[def.n_fields as u8]);
             for field in def.fields() {
                 ok &= name_bytes(buffer, field.name.as_str())
+                    && buffer.append(&field.attribute_number.to_le_bytes())
+                    && buffer.append(&[u8::from(field.dropped)])
+                    && buffer.append(&[u8::from(field.not_null)])
                     && buffer.append(&[field.ctype.code()])
                     && buffer.append(&field.type_mod.to_le_bytes());
                 match field.user_type {
@@ -2357,6 +2378,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
             }
             ok
+        }
+        WalOp::DropComposite { schema, name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
         WalOp::CreateRoutine(def) => {
             let mut ok = buffer.append(&def.created_at.to_le_bytes())
@@ -3930,6 +3954,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             })
         }
         KIND_CREATE_COMPOSITE => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let n_fields = *payload.get(at)? as usize;
@@ -3941,6 +3967,21 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 [crate::storage::CompositeFieldDef::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS];
             for field in fields.iter_mut().take(n_fields) {
                 let field_name = take_name(&mut at)?;
+                let attribute_number =
+                    u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                let dropped = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
+                let not_null = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
                 let code = *payload.get(at)?;
                 at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -3956,21 +3997,33 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     _ => return None,
                 };
                 *field = crate::storage::CompositeFieldDef {
+                    attribute_number,
                     name: SqlName::parse(field_name).ok()?,
                     ctype: crate::sql::types::ColType::from_code(code)?,
                     type_mod,
                     user_type,
+                    dropped,
+                    not_null,
                 };
             }
-            (at == payload.len()).then_some(WalOp::CreateComposite(crate::storage::CompositeDef {
-                created_at: 0,
-                schema: SqlName::parse(schema).ok()?,
-                name: SqlName::parse(name).ok()?,
-                ownership: crate::storage::Ownership::BOOTSTRAP,
-                fields,
-                n_fields,
-                ddl_state: crate::storage::CatalogDdlState::Absent,
-            }))
+            (at == payload.len()).then_some(WalOp::CreateComposite {
+                slot,
+                definition: crate::storage::CompositeDef {
+                    created_at: 0,
+                    schema: SqlName::parse(schema).ok()?,
+                    name: SqlName::parse(name).ok()?,
+                    ownership: crate::storage::Ownership::BOOTSTRAP,
+                    fields,
+                    n_fields,
+                    pending_definition: None,
+                    ddl_state: crate::storage::CatalogDdlState::Absent,
+                },
+            })
+        }
+        KIND_DROP_COMPOSITE => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropComposite { schema, name })
         }
         KIND_CREATE_ROUTINE => {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -5220,6 +5273,70 @@ mod tests {
         };
         assert_eq!(argument_count, 2);
         assert_eq!(&arguments[..argument_count], ["audit", "v1"]);
+    }
+
+    #[test]
+    fn composite_lifecycle_payload_keeps_slot_and_physical_attributes() {
+        let mut fields =
+            [crate::storage::CompositeFieldDef::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS];
+        fields[0] = crate::storage::CompositeFieldDef {
+            attribute_number: 1,
+            name: crate::storage::SqlName::parse("retained").unwrap(),
+            ctype: ColType::Int4,
+            type_mod: -1,
+            user_type: None,
+            dropped: false,
+            not_null: true,
+        };
+        fields[1] = crate::storage::CompositeFieldDef {
+            attribute_number: 2,
+            name: crate::storage::SqlName::parse("........pg.dropped.2........").unwrap(),
+            ctype: ColType::Text,
+            type_mod: -1,
+            user_type: None,
+            dropped: true,
+            not_null: false,
+        };
+        let op = WalOp::CreateComposite {
+            slot: 7,
+            definition: crate::storage::CompositeDef {
+                created_at: 0,
+                schema: crate::storage::SqlName::parse("public").unwrap(),
+                name: crate::storage::SqlName::parse("evolving").unwrap(),
+                ownership: crate::storage::Ownership::BOOTSTRAP,
+                fields,
+                n_fields: 2,
+                pending_definition: None,
+                ddl_state: crate::storage::CatalogDdlState::Absent,
+            },
+        };
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "composite WAL", 2048).unwrap();
+        assert!(append_payload(&mut payload, &op));
+        let Some(WalOp::CreateComposite { slot, definition }) =
+            decode_op(KIND_CREATE_COMPOSITE, payload.readable())
+        else {
+            panic!("composite WAL did not decode");
+        };
+        assert_eq!(slot, 7);
+        assert_eq!(definition.fields()[0].attribute_number, 1);
+        assert!(definition.fields()[0].not_null);
+        assert_eq!(definition.fields()[1].attribute_number, 2);
+        assert!(definition.fields()[1].dropped);
+
+        payload.clear();
+        let drop = WalOp::DropComposite {
+            schema: "public",
+            name: "evolving",
+        };
+        assert!(append_payload(&mut payload, &drop));
+        assert!(matches!(
+            decode_op(KIND_DROP_COMPOSITE, payload.readable()),
+            Some(WalOp::DropComposite {
+                schema: "public",
+                name: "evolving"
+            })
+        ));
     }
 
     #[test]

@@ -189,14 +189,18 @@ psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/outbound_setup.out" 2>&1 <<'SQL'
 CREATE SCHEMA outbound_dump;
 CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
+CREATE TYPE outbound_dump.location AS (x integer, y integer);
 CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   mood outbound_dump.mood NOT NULL,
+  location outbound_dump.location NOT NULL,
   note text DEFAULT 'hello'
 );
-INSERT INTO outbound_dump.items(mood,note) VALUES ('ok','one'),('great','two');
+INSERT INTO outbound_dump.items(mood,location,note) VALUES
+  ('ok', ROW(1,2)::outbound_dump.location, 'one'),
+  ('great', ROW(3,4)::outbound_dump.location, 'two');
 CREATE VIEW outbound_dump.item_view AS
-  SELECT id,mood,note FROM outbound_dump.items;
+  SELECT id,mood,location,note FROM outbound_dump.items;
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
@@ -218,15 +222,16 @@ if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_r
 else
   outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
-      SELECT id,mood,note FROM outbound_dump.item_view ORDER BY id;
-      INSERT INTO outbound_dump.items(mood,note) VALUES ('ok','three') RETURNING id;
+      SELECT id,mood,(location).x,(location).y,note FROM outbound_dump.item_view ORDER BY id;
+      INSERT INTO outbound_dump.items(mood,location,note)
+        VALUES ('ok', ROW(5,6)::outbound_dump.location, 'three') RETURNING id;
       SELECT is_identity,identity_generation
         FROM information_schema.columns
        WHERE table_schema='outbound_dump'
          AND table_name='items'
          AND column_name='id';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|one\n2|great|two\n3\nINSERT 0 1\nYES|ALWAYS'
+  expected_outbound_observed=$'1|ok|1|2|one\n2|great|3|4|two\n3\nINSERT 0 1\nYES|ALWAYS'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, view and identity"
   else

@@ -2177,6 +2177,24 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "{\"(4,8)\"}"
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE binary_coordinate ADD ATTRIBUTE z integer",
+    );
+    let evolved_composite_binary = [
+        0, 0, 0, 3, // field count
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 4, // x int4
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 8, // y int4
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 12, // z int4
+    ];
+    assert_eq!(
+        engine
+            .decode_binary_parameter(composite_oid, &evolved_composite_binary, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "(4,8,12)"
+    );
     assert_eq!(
         engine
             .decode_binary_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
@@ -14293,6 +14311,258 @@ fn drop_enum_cascade_removes_dependent_domains() {
 }
 
 #[test]
+fn drop_composite_type_tracks_table_composite_and_view_dependencies() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE address AS (street text);
+         CREATE TYPE shipment AS (destination address);
+         CREATE TABLE deliveries (id integer, value shipment, addresses address[]);
+         CREATE VIEW address_view AS SELECT ROW('Main')::address AS value;",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let address_slot = engine
+        .storage
+        .composite_slot("public", "address", 0)
+        .unwrap();
+    let shipment_slot = engine
+        .storage
+        .composite_slot("public", "shipment", 0)
+        .unwrap();
+    assert!(matches!(
+        engine.storage.composite_for(shipment_slot, 0).fields()[0].ctype,
+        ColType::Composite(slot) if slot as usize == address_slot
+    ));
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE address");
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted)
+            .contains("column destination of composite type shipment depends on type address"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP TYPE address CASCADE; ROLLBACK",
+    );
+    assert!(
+        !message_types(&rolled_back).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('address', 'shipment') ORDER BY typname",
+        )),
+        ["address", "shipment"]
+    );
+    let dropped = run_with(&mut engine, &mut budget, "DROP TYPE address CASCADE");
+    assert!(
+        !message_types(&dropped).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('address', 'shipment')",
+        )),
+        ["shipment"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname FROM pg_class WHERE relname IN ('deliveries', 'address_view') ORDER BY relname",
+        )),
+        ["deliveries"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname FROM pg_attribute WHERE attrelid = 'deliveries'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+        )),
+        ["id", "value"]
+    );
+}
+
+#[test]
+fn drop_composite_type_reports_all_direct_dependents() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE composite_drop_root AS (value integer);
+         CREATE TYPE composite_drop_leaf AS (root composite_drop_root);
+         CREATE TABLE composite_drop_values (id integer, root composite_drop_root, roots composite_drop_root[]);
+         CREATE VIEW composite_drop_view AS SELECT ROW(1)::composite_drop_root AS root;",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE composite_drop_root");
+    let text = String::from_utf8_lossy(&restricted);
+    assert!(
+        text.contains(
+            "column root of composite type composite_drop_leaf depends on type composite_drop_root"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "column root of table composite_drop_values depends on type composite_drop_root"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("view composite_drop_view depends on type composite_drop_root"),
+        "{text}"
+    );
+}
+
+#[test]
+fn drop_composite_type_reports_nested_dependency_in_one_query_batch() {
+    let (mut engine, mut budget) = test_engine();
+    let mut buffer = crate::mem::FixedBuf::new(&mut budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple_from(
+            "CREATE TYPE composite_batch_coordinate AS (x integer, y integer);
+         CREATE TYPE composite_batch_place AS (name text, coordinate composite_batch_coordinate);
+         CREATE TABLE composite_batch_places (id integer, place composite_batch_place);
+         CREATE TYPE composite_batch_evolving AS (left_value integer, removed_value text);
+         ALTER TYPE composite_batch_evolving ADD ATTRIBUTE right_value integer;
+         ALTER TYPE composite_batch_evolving RENAME ATTRIBUTE left_value TO retained_value;
+         ALTER TYPE composite_batch_evolving DROP ATTRIBUTE removed_value;
+         CREATE TYPE composite_batch_root AS (value integer);
+         CREATE TYPE composite_batch_leaf AS (root composite_batch_root);
+         CREATE TABLE composite_batch_values (root composite_batch_root);
+         CREATE VIEW composite_batch_view AS SELECT ROW(1)::composite_batch_root AS root;
+         DROP TYPE composite_batch_root;",
+            0,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut responder,
+            1,
+            false,
+        )
+        .unwrap();
+    let result = buffer.readable().to_vec();
+    let text = String::from_utf8_lossy(&result);
+    assert!(
+        text.contains(
+            "column root of composite type composite_batch_leaf depends on type composite_batch_root"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn drop_enum_tracks_composite_field_dependencies() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE composite_enum_root AS ENUM ('one');
+         CREATE TYPE composite_enum_leaf AS (value composite_enum_root);",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE composite_enum_root");
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE composite_enum_root CASCADE",
+    );
+    assert!(
+        !message_types(&dropped).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('composite_enum_root', 'composite_enum_leaf')",
+        )),
+        ["composite_enum_leaf"]
+    );
+}
+
+#[test]
+fn drop_domain_tracks_composite_field_dependencies() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN composite_domain_root AS integer CHECK (VALUE > 0);
+         CREATE TYPE composite_domain_leaf AS (value composite_domain_root);",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DOMAIN composite_domain_root",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DOMAIN composite_domain_root CASCADE",
+    );
+    assert!(
+        !message_types(&dropped).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type
+             WHERE typname IN ('composite_domain_root', 'composite_domain_leaf')",
+        )),
+        ["composite_domain_leaf"]
+    );
+}
+
+#[test]
 fn drop_schema_cascade_handles_cross_schema_type_dependents_without_corruption() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
@@ -15074,6 +15344,16 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
         )),
         ["address"]
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT data_type, udt_schema, udt_name
+             FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'addresses' AND column_name = 'value'",
+        )),
+        ["USER-DEFINED|public|address"]
+    );
     let arena = Arena::new(&mut b, "composite binary result", 1 << 18).unwrap();
     let mut buffer = crate::mem::FixedBuf::new(&mut b, "composite binary send", 1 << 18).unwrap();
     let mut transaction = TxnState::new(&mut b, 128).unwrap();
@@ -15298,6 +15578,9 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
             "CREATE TYPE place AS (name text, point coordinate)",
             "CREATE TABLE durable_places (value place)",
             "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
+            "ALTER TYPE coordinate ADD ATTRIBUTE z integer",
+            "ALTER TYPE coordinate RENAME ATTRIBUTE x TO east",
+            "ALTER TYPE coordinate RENAME TO coordinate_renamed",
             "CHECKPOINT",
         ] {
             let output = run_with(&mut engine, &mut budget, statement);
@@ -15314,20 +15597,20 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
     let bytes = run_with(
         &mut engine,
         &mut budget,
-        "SELECT (value).name, ((value).point).x, ((value).point).y FROM durable_places",
+        "SELECT (value).name, ((value).point).east, ((value).point).y, ((value).point).z IS NULL FROM durable_places",
     );
     assert_eq!(
         data_rows(&bytes),
-        ["Station|4|8"],
+        ["Station|4|8|t"],
         "{}",
         String::from_utf8_lossy(&bytes)
     );
     let bytes = run_with(
         &mut engine,
         &mut budget,
-        "SELECT typname FROM pg_type WHERE typname IN ('coordinate', 'place') ORDER BY typname",
+        "SELECT typname FROM pg_type WHERE typname IN ('coordinate_renamed', 'place') ORDER BY typname",
     );
-    assert_eq!(data_rows(&bytes), ["coordinate", "place"]);
+    assert_eq!(data_rows(&bytes), ["coordinate_renamed", "place"]);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
@@ -15358,6 +15641,180 @@ fn composite_text_uses_postgresql_quoting_and_null_rules() {
         "SELECT ('(,present)'::quoted_pair).first IS NULL, ('(,present)'::quoted_pair).second",
     );
     assert_eq!(data_rows(&bytes), ["t|present"]);
+}
+
+#[test]
+fn named_composite_attributes_keep_physical_positions_across_evolution() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE evolving_pair AS (left_value integer, middle_value text); \
+         CREATE TABLE evolving_pairs (value evolving_pair); \
+         INSERT INTO evolving_pairs VALUES (ROW(7, 'obsolete')::evolving_pair); \
+         CREATE INDEX evolving_pair_value_idx ON evolving_pairs (value); \
+         ALTER TYPE evolving_pair ADD ATTRIBUTE right_value integer; \
+         ALTER TYPE evolving_pair RENAME ATTRIBUTE middle_value TO renamed_value; \
+         ALTER TYPE evolving_pair DROP ATTRIBUTE renamed_value",
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).left_value, (value).right_value IS NULL FROM evolving_pairs",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["7|t"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT attnum, attisdropped FROM pg_attribute WHERE attrelid = \
+           (SELECT typrelid FROM pg_type WHERE typname = 'evolving_pair') ORDER BY attnum",
+    );
+    assert_eq!(data_rows(&bytes), ["1|f", "2|t", "3|f"]);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO evolving_pairs VALUES (ROW(8, 9)::evolving_pair)",
+    );
+    let indexed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).left_value FROM evolving_pairs \
+         WHERE value = ROW(8, 9)::evolving_pair",
+    );
+    assert_eq!(data_rows(&indexed), ["8"]);
+}
+
+#[test]
+fn nested_composite_attribute_evolution_preserves_old_values() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE nested_inner AS (first_value integer, removed_value text); \
+         CREATE TYPE nested_outer AS (payload nested_inner); \
+         CREATE TABLE nested_values (value nested_outer); \
+         INSERT INTO nested_values VALUES \
+           (ROW(ROW(9, 'obsolete')::nested_inner)::nested_outer); \
+         ALTER TYPE nested_inner ADD ATTRIBUTE later_value integer; \
+         ALTER TYPE nested_inner DROP ATTRIBUTE removed_value",
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((value).payload).first_value, ((value).payload).later_value IS NULL FROM nested_values",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["9|t"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[test]
+fn composite_array_attribute_evolution_preserves_old_values() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE array_inner AS (first_value integer, removed_value text); \
+         CREATE TABLE array_values (values array_inner[]); \
+         INSERT INTO array_values VALUES \
+           (ARRAY[ROW(4, 'obsolete')::array_inner]); \
+         ALTER TYPE array_inner ADD ATTRIBUTE later_value integer; \
+         ALTER TYPE array_inner DROP ATTRIBUTE removed_value",
+    );
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((values[1]).first_value), ((values[1]).later_value) IS NULL FROM array_values",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["4|t"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[test]
+fn composite_attribute_not_null_is_enforced_on_alter_and_new_values() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE required_part AS (value integer); \
+         CREATE TABLE required_parts (part required_part); \
+         INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
+    );
+    let existing = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
+    );
+    assert!(
+        String::from_utf8_lossy(&existing).contains("23502"),
+        "{}",
+        String::from_utf8_lossy(&existing)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM required_parts; ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
+    );
+    assert!(
+        String::from_utf8_lossy(&inserted).contains("23502"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+}
+
+#[test]
+fn composite_attribute_type_changes_validate_old_values_before_publication() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE converted_part AS (value integer); \
+         CREATE TABLE converted_parts (part converted_part); \
+         INSERT INTO converted_parts VALUES (ROW(42)::converted_part); \
+         ALTER TYPE converted_part ALTER ATTRIBUTE value TYPE text",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (part).value, pg_typeof((part).value) FROM converted_parts",
+        )),
+        ["42|text"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE invalid_conversion AS (value text); \
+         CREATE TABLE invalid_conversions (part invalid_conversion); \
+         INSERT INTO invalid_conversions VALUES (ROW('not-a-number')::invalid_conversion)",
+    );
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE invalid_conversion ALTER ATTRIBUTE value TYPE integer",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("22P02"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
 }
 
 #[test]

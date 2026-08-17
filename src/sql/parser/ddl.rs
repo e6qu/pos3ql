@@ -808,30 +808,47 @@ impl<'a> Parser<'a> {
             return self.alter_owner(crate::sql::ast::AlterOwnerKind::Type, name, false);
         }
         let action = if self.eat_ident("add")? {
-            self.expect_ident("value")?;
-            let if_not_exists = if self.eat_ident("if")? {
-                self.expect_ident("not")?;
-                self.expect_ident("exists")?;
-                true
+            if self.eat_ident("attribute")? {
+                let field_name = self.any_ident("composite field name")?;
+                let (type_name, type_mod) = self.type_name_mod()?;
+                AlterTypeAction::AddAttribute(crate::sql::ast::CompositeField {
+                    name: field_name,
+                    type_name,
+                    type_mod,
+                })
             } else {
-                false
-            };
-            let label = self.str_literal("enum label")?;
-            let (before, after) = if self.eat_ident("before")? {
-                (Some(self.str_literal("enum label")?), None)
-            } else if self.eat_ident("after")? {
-                (None, Some(self.str_literal("enum label")?))
-            } else {
-                (None, None)
-            };
-            AlterTypeAction::AddValue {
-                label,
-                if_not_exists,
-                before,
-                after,
+                self.expect_ident("value")?;
+                let if_not_exists = if self.eat_ident("if")? {
+                    self.expect_ident("not")?;
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let label = self.str_literal("enum label")?;
+                let (before, after) = if self.eat_ident("before")? {
+                    (Some(self.str_literal("enum label")?), None)
+                } else if self.eat_ident("after")? {
+                    (None, Some(self.str_literal("enum label")?))
+                } else {
+                    (None, None)
+                };
+                AlterTypeAction::AddValue {
+                    label,
+                    if_not_exists,
+                    before,
+                    after,
+                }
             }
         } else if self.eat_ident("rename")? {
-            if self.eat_ident("value")? {
+            if self.eat_ident("attribute")? {
+                let from = self.any_ident("composite field name")?;
+                self.expect_ident("to")?;
+                AlterTypeAction::RenameAttribute {
+                    from,
+                    to: self.any_ident("new composite field name")?,
+                }
+            } else if self.eat_ident("value")? {
                 let from = self.str_literal("enum label")?;
                 self.expect_ident("to")?;
                 let to = self.str_literal("enum label")?;
@@ -840,8 +857,55 @@ impl<'a> Parser<'a> {
                 self.expect_ident("to")?;
                 AlterTypeAction::RenameTo(self.col_ident("new type name")?)
             }
+        } else if self.eat_ident("drop")? {
+            self.expect_ident("attribute")?;
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            AlterTypeAction::DropAttribute {
+                name: self.any_ident("composite field name")?,
+                if_exists,
+            }
+        } else if self.eat_ident("alter")? {
+            self.expect_ident("attribute")?;
+            let field = self.any_ident("composite field name")?;
+            if self.eat_ident("set")? {
+                if self.eat_ident("data")? {
+                    self.expect_ident("type")?;
+                    let (type_name, type_mod) = self.type_name_mod()?;
+                    AlterTypeAction::AlterAttributeType {
+                        name: field,
+                        type_name,
+                        type_mod,
+                    }
+                } else {
+                    self.expect_ident("not")?;
+                    self.expect_ident("null")?;
+                    AlterTypeAction::SetAttributeNotNull(field)
+                }
+            } else if self.eat_ident("type")? {
+                let (type_name, type_mod) = self.type_name_mod()?;
+                AlterTypeAction::AlterAttributeType {
+                    name: field,
+                    type_name,
+                    type_mod,
+                }
+            } else if self.eat_ident("drop")? {
+                self.expect_ident("not")?;
+                self.expect_ident("null")?;
+                AlterTypeAction::DropAttributeNotNull(field)
+            } else {
+                return Err(self.err_here(
+                    "expected SET DATA TYPE, SET NOT NULL, or DROP NOT NULL after ALTER ATTRIBUTE",
+                ));
+            }
         } else {
-            return Err(self.err_here("expected ADD VALUE or RENAME after ALTER TYPE"));
+            return Err(
+                self.err_here("expected composite attribute or enum action after ALTER TYPE")
+            );
         };
         Ok(Stmt::AlterType { name, action })
     }

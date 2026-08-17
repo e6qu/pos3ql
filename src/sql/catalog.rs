@@ -2684,34 +2684,7 @@ pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'stati
     ) {
         return None;
     }
-    let array_elements = [
-        ArrElem::Bool,
-        ArrElem::Int2,
-        ArrElem::Int4,
-        ArrElem::Int8,
-        ArrElem::Float4,
-        ArrElem::Float8,
-        ArrElem::Text,
-        ArrElem::Name,
-        ArrElem::Varchar,
-        ArrElem::Bpchar,
-        ArrElem::Date,
-        ArrElem::Timestamp,
-        ArrElem::Timestamptz,
-        ArrElem::Time,
-        ArrElem::Timetz,
-        ArrElem::Interval,
-        ArrElem::Json,
-        ArrElem::Jsonb,
-        ArrElem::Uuid,
-        ArrElem::Bytea,
-        ArrElem::Numeric,
-        ArrElem::Inet,
-        ArrElem::Cidr,
-        ArrElem::Macaddr,
-        ArrElem::Macaddr8,
-    ];
-    if let Some(element) = array_elements
+    if let Some(element) = ArrElem::BUILTIN
         .iter()
         .find(|element| element.catalog_name() == name)
     {
@@ -5581,10 +5554,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_CATALOG_NS_OID),
                 text("b", arena)?,
                 text(category(t), arena)?,
-                Datum::Int4(0),  // typbasetype
-                Datum::Int4(0),  // typelem
-                Datum::Int4(0),  // typarray
-                Datum::Int4(0),  // typrelid
+                Datum::Int4(0), // typbasetype
+                Datum::Int4(0), // typelem
+                Datum::Int4(
+                    super::types::ArrElem::from_coltype(*t)
+                        .map_or(0, super::types::ArrElem::array_oid),
+                ), // typarray
+                Datum::Int4(0), // typrelid
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
@@ -5601,6 +5577,40 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
     }
     let mut n = types.len();
+    // Arrays are catalog types in their own right. Keeping this inventory on
+    // `ArrElem` means an accepted array OID is simultaneously visible to
+    // `pg_type`, has a matching `typelem`, and is discoverable by catalog
+    // clients such as pg_dump.
+    for element in super::types::ArrElem::BUILTIN {
+        out[n] = row(
+            &[
+                Datum::Int4(element.array_oid()),
+                text(element.catalog_name(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(element.element_oid()),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text("x", arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     // User-defined domains: typtype 'd', with their base type and constraints.
     for slot in 0..storage.domain_count() {
         let d = storage.domain_for(slot, txid);

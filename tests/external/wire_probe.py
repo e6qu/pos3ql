@@ -1007,6 +1007,14 @@ def binary_array(element_oid, values):
     return body
 
 
+def binary_bit(bits):
+    packed = bytearray((len(bits) + 7) // 8)
+    for index, bit in enumerate(bits):
+        if bit == "1":
+            packed[index // 8] |= 0x80 >> (index % 8)
+    return struct.pack("!i", len(bits)) + bytes(packed)
+
+
 def binary_record(fields):
     body = struct.pack("!i", len(fields))
     for field_oid, value in fields:
@@ -1364,6 +1372,22 @@ def test_catalog_aware_binary_bind_parameters():
             coordinate_domain_array_oid,
             binary_array(coordinate_domain_oid, [coordinate]),
             '{"(4,8)"}',
+            None,
+        ),
+        (
+            "bit array",
+            "SELECT $1::bit(5)[]",
+            1561,
+            binary_array(1560, [binary_bit("10110"), None, binary_bit("00111")]),
+            "{10110,NULL,00111}",
+            None,
+        ),
+        (
+            "varbit array",
+            "SELECT $1::varbit[]",
+            1563,
+            binary_array(1562, [binary_bit("1"), None, binary_bit("00111")]),
+            "{1,NULL,00111}",
             None,
         ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),

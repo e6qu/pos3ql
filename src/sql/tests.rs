@@ -2599,6 +2599,35 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         invalid_text_domain_array.sqlstate,
         sqlstate::CHECK_VIOLATION
     );
+    let mut bit_array = Vec::new();
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    bit_array.extend_from_slice(&crate::sql::types::oid::BIT.to_be_bytes());
+    bit_array.extend_from_slice(&3_i32.to_be_bytes());
+    bit_array.extend_from_slice(&1_i32.to_be_bytes());
+    for value in [
+        &[0, 0, 0, 5, 0b1011_0000][..],
+        &[0, 0, 0, 5, 0b0011_1000][..],
+    ] {
+        bit_array.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bit_array.extend_from_slice(value);
+    }
+    bit_array.extend_from_slice(&(-1_i32).to_be_bytes());
+    assert_eq!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::BIT_ARRAY, &bit_array, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{10110,00111,NULL}"
+    );
+    bit_array[8..12].copy_from_slice(&crate::sql::types::oid::VARBIT.to_be_bytes());
+    assert_eq!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::VARBIT_ARRAY, &bit_array, &arena, 0)
+            .unwrap()
+            .to_string(),
+        "{10110,00111,NULL}"
+    );
     domain_array[8..12].copy_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
     let wrong_element_oid = engine
         .decode_binary_parameter(
@@ -12414,6 +12443,8 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
                  numbers integer[] DEFAULT ARRAY[4,5],
                  bounds int4range DEFAULT '[2,7]'::int4range,
                  bitset bit(3) DEFAULT B'101',
+                 bitset_array bit(3)[] DEFAULT ARRAY[B'101', B'011']::bit(3)[],
+                 varbit_array varbit[] DEFAULT ARRAY[B'1', B'00111']::varbit[],
                  payload bytea DEFAULT '\\x00ff'::bytea,
                  token uuid DEFAULT '00000000-0000-0000-0000-000000000099'::uuid
                      REFERENCES default_parent(id) ON DELETE SET DEFAULT
@@ -12467,7 +12498,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
         "INSERT INTO default_values (id) VALUES (3);
          DELETE FROM default_parent WHERE id = '00000000-0000-0000-0000-000000000001';
          SELECT day, stamp, zoned, clock, zoned_clock, span, document, numbers,
-                bounds, bitset, encode(payload, 'hex'), token
+                bounds, bitset, bitset_array, varbit_array, encode(payload, 'hex'), token
            FROM default_values ORDER BY id;",
     );
     assert!(
@@ -12478,9 +12509,9 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     assert_eq!(
         data_rows(&rows),
         [
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"a\": [1, 2]}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
-            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"a\": [1, 2]}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
+            "2024-01-02|2024-01-02 03:04:05|2024-01-02 03:04:05+00|03:04:05|03:04:05+02|2 days 03:04:05|{\"b\": 3}|{4,5}|[2,8)|101|{101,011}|{1,00111}|00ff|00000000-0000-0000-0000-000000000099",
         ]
     );
     assert_eq!(
@@ -21874,6 +21905,20 @@ fn pg_dump_bootstrap_surface() {
             "SELECT typdefaultbin IS NULL FROM pg_type WHERE typname = 'pg_dump_domain'",
         )),
         ["t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname, typelem, typarray FROM pg_type \
+             WHERE typname IN ('bit', 'varbit', '_bit', '_varbit') ORDER BY typname",
+        )),
+        [
+            "_bit|1560|0",
+            "_varbit|1562|0",
+            "bit|0|1561",
+            "varbit|0|1563"
+        ]
     );
     assert!(
         String::from_utf8_lossy(&run_with(

@@ -441,6 +441,8 @@ impl ColType {
             ArrElem::Cidr,
             ArrElem::Macaddr,
             ArrElem::Macaddr8,
+            ArrElem::Bit,
+            ArrElem::Varbit,
         ] {
             if type_oid == element.array_oid() {
                 return Some(Self::Array(element));
@@ -797,6 +799,11 @@ pub enum ArrElem {
     Cidr,
     Macaddr,
     Macaddr8,
+    /// A fixed-length `bit` array element. The element typmod supplies the
+    /// declared width; this tag preserves the `_bit` catalog identity.
+    Bit,
+    /// A `bit varying` / `varbit` array element, with `_varbit` identity.
+    Varbit,
     /// An enum array keeps the catalog slot as its runtime identity. Table
     /// metadata also persists the type name and rebinds the slot on startup.
     Enum(u16),
@@ -818,6 +825,40 @@ impl ArrElem {
     const ENUM_CODE_BASE: u8 = 32;
     const DOMAIN_CODE_BASE: u8 = 64;
     const COMPOSITE_CODE_BASE: u8 = 96;
+
+    /// Every catalog-defined built-in element type that pos3ql stores and
+    /// transmits as an array. This is the single inventory for OID decoding
+    /// and catalog synthesis, so adding an accepted array cannot leave its
+    /// `pg_type` identity behind.
+    pub const BUILTIN: [Self; 27] = [
+        Self::Bool,
+        Self::Int2,
+        Self::Int4,
+        Self::Int8,
+        Self::Float4,
+        Self::Float8,
+        Self::Text,
+        Self::Name,
+        Self::Varchar,
+        Self::Bpchar,
+        Self::Date,
+        Self::Timestamp,
+        Self::Timestamptz,
+        Self::Time,
+        Self::Timetz,
+        Self::Interval,
+        Self::Json,
+        Self::Jsonb,
+        Self::Uuid,
+        Self::Bytea,
+        Self::Numeric,
+        Self::Inet,
+        Self::Cidr,
+        Self::Macaddr,
+        Self::Macaddr8,
+        Self::Bit,
+        Self::Varbit,
+    ];
 
     /// The array type's internal `pg_type.typname`.
     pub fn catalog_name(self) -> &'static str {
@@ -847,6 +888,8 @@ impl ArrElem {
             ArrElem::Cidr => "_cidr",
             ArrElem::Macaddr => "_macaddr",
             ArrElem::Macaddr8 => "_macaddr8",
+            ArrElem::Bit => "_bit",
+            ArrElem::Varbit => "_varbit",
             ArrElem::Enum(_) => "_enum",
             ArrElem::Composite(_) => "_record",
             ArrElem::Domain { .. } => "_domain",
@@ -883,6 +926,8 @@ impl ArrElem {
             ArrElem::Cidr => "cidr[]",
             ArrElem::Macaddr => "macaddr[]",
             ArrElem::Macaddr8 => "macaddr8[]",
+            ArrElem::Bit => "bit[]",
+            ArrElem::Varbit => "bit varying[]",
             ArrElem::Enum(_) => "enum[]",
             ArrElem::Composite(_) => "record[]",
             ArrElem::Domain { .. } => "domain[]",
@@ -924,6 +969,8 @@ impl ArrElem {
             Datum::Cidr(_) => ArrElem::Cidr,
             Datum::Macaddr(_) => ArrElem::Macaddr,
             Datum::Macaddr8(_) => ArrElem::Macaddr8,
+            Datum::Bit { varying: false, .. } => ArrElem::Bit,
+            Datum::Bit { varying: true, .. } => ArrElem::Varbit,
             Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
             Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
                 ArrElem::Composite(*slot)
@@ -942,6 +989,8 @@ impl ArrElem {
             ColType::Name => return Some(ArrElem::Name),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
+            ColType::Bit { varying: false } => return Some(ArrElem::Bit),
+            ColType::Bit { varying: true } => return Some(ArrElem::Varbit),
             ColType::Enum(slot) => return Some(ArrElem::Enum(slot)),
             ColType::Composite(slot) => return Some(ArrElem::Composite(slot)),
             _ => {}
@@ -999,6 +1048,8 @@ impl ArrElem {
             ArrElem::Cidr => ColType::Cidr,
             ArrElem::Macaddr => ColType::Macaddr,
             ArrElem::Macaddr8 => ColType::Macaddr8,
+            ArrElem::Bit => ColType::Bit { varying: false },
+            ArrElem::Varbit => ColType::Bit { varying: true },
             ArrElem::Enum(slot) => ColType::Enum(slot),
             ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
@@ -1045,6 +1096,8 @@ impl ArrElem {
             ArrElem::Cidr => oid::CIDR_ARRAY,
             ArrElem::Macaddr => oid::MACADDR_ARRAY,
             ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
+            ArrElem::Bit => oid::BIT_ARRAY,
+            ArrElem::Varbit => oid::VARBIT_ARRAY,
             ArrElem::Enum(slot) => oid::enum_array_oid(slot),
             ArrElem::Composite(slot) => oid::composite_array_oid(slot),
             ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
@@ -1088,6 +1141,8 @@ impl ArrElem {
             ArrElem::Cidr => 22,
             ArrElem::Macaddr => 23,
             ArrElem::Macaddr8 => 24,
+            ArrElem::Bit => 25,
+            ArrElem::Varbit => 26,
             ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
             ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
             ArrElem::Composite(slot) => Self::COMPOSITE_CODE_BASE + slot as u8,
@@ -1121,6 +1176,8 @@ impl ArrElem {
             22 => ArrElem::Cidr,
             23 => ArrElem::Macaddr,
             24 => ArrElem::Macaddr8,
+            25 => ArrElem::Bit,
+            26 => ArrElem::Varbit,
             c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
                 .contains(&c) =>
             {
@@ -2186,6 +2243,8 @@ mod tests {
             ArrElem::Cidr,
             ArrElem::Macaddr,
             ArrElem::Macaddr8,
+            ArrElem::Bit,
+            ArrElem::Varbit,
         ] {
             types.push(ColType::Array(e));
         }
@@ -2288,6 +2347,8 @@ mod code_roundtrip_tests {
             ArrElem::Cidr,
             ArrElem::Macaddr,
             ArrElem::Macaddr8,
+            ArrElem::Bit,
+            ArrElem::Varbit,
         ] {
             types.push(ColType::Array(e));
         }

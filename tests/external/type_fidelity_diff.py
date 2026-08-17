@@ -47,6 +47,8 @@ STATIC_COLUMNS = [
     ("bytea_value", "bytea", "'\\xcafe'"),
     ("bit_value", "bit(5)", "B'10110'"),
     ("varbit_value", "varbit", "B'101'"),
+    ("bit_array", "bit(5)[]", "ARRAY[B'10110', NULL, B'00111']::bit(5)[]"),
+    ("varbit_array", "varbit[]", "ARRAY[B'1', NULL, B'00111']::varbit[]"),
     ("inet_value", "inet", "'192.0.2.1/24'"),
     ("cidr_value", "cidr", "'192.0.2.0/24'"),
     ("macaddr_value", "macaddr", "'08:00:2b:01:02:03'"),

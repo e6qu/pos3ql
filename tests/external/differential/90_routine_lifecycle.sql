@@ -25,3 +25,25 @@ SELECT proname, nspname, prokind
 DROP ROUTINE routine_lifecycle_target.routine_lifecycle(text), routine_renamed(integer);
 SELECT count(*) FROM pg_proc WHERE proname IN ('routine_lifecycle', 'routine_renamed');
 DROP SCHEMA routine_lifecycle_target;
+
+CREATE TABLE routine_replace_target (id integer PRIMARY KEY);
+CREATE FUNCTION routine_replace_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TRIGGER routine_replace_gate BEFORE INSERT ON routine_replace_target
+  FOR EACH ROW EXECUTE FUNCTION routine_replace_gate();
+CREATE TABLE routine_replace_reference (fn regprocedure);
+INSERT INTO routine_replace_reference VALUES ('routine_replace_gate()'::regprocedure);
+BEGIN;
+SAVEPOINT before_replacement;
+CREATE OR REPLACE FUNCTION routine_replace_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+INSERT INTO routine_replace_target VALUES (1);
+ROLLBACK TO SAVEPOINT before_replacement;
+INSERT INTO routine_replace_target VALUES (1);
+COMMIT;
+CREATE OR REPLACE FUNCTION routine_replace_gate() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+INSERT INTO routine_replace_target VALUES (2);
+SELECT p.oid = (SELECT fn::oid FROM routine_replace_reference),
+       (SELECT count(*) FROM routine_replace_target)
+  FROM pg_proc p
+ WHERE p.proname = 'routine_replace_gate';
+DROP TABLE routine_replace_target, routine_replace_reference;
+DROP FUNCTION routine_replace_gate();

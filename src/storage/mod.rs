@@ -2332,6 +2332,7 @@ pub(crate) struct RoutineDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub(crate) pending_identity: Option<PendingRoutineIdentity>,
+    pub(crate) pending_definition: Option<PendingRoutineDefinition>,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
     pub kind: RoutineKind,
@@ -2342,12 +2343,27 @@ pub(crate) struct RoutineDef {
     pub ddl_state: CatalogDdlState,
 }
 
+/// The mutable portion of a routine definition, staged for one transaction.
+/// Keeping it as one value prevents a caller from observing a new body with
+/// an old result contract (or vice versa).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingRoutineDefinition {
+    pub(crate) txid: u32,
+    pub(crate) arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) argument_count: usize,
+    pub(crate) kind: RoutineKind,
+    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) result_column_count: usize,
+    pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
+}
+
 impl RoutineDef {
     pub(crate) const EMPTY: Self = Self {
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         pending_identity: None,
+        pending_definition: None,
         arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         argument_count: 0,
         kind: RoutineKind::Function {
@@ -2366,6 +2382,21 @@ impl RoutineDef {
 
     pub(crate) fn arguments(&self) -> &[RoutineArgumentDef] {
         &self.arguments[..self.argument_count]
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> Self {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(*self, |pending| Self {
+                arguments: pending.arguments,
+                argument_count: pending.argument_count,
+                kind: pending.kind,
+                result_columns: pending.result_columns,
+                result_column_count: pending.result_column_count,
+                body: pending.body,
+                pending_definition: None,
+                ..*self
+            })
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
@@ -14108,6 +14139,13 @@ impl Storage {
         &self.routines[slot]
     }
 
+    /// Returns the routine definition visible to `txid`.  Replacement keeps
+    /// the catalog slot and object identifier stable while its new definition
+    /// is private until commit.
+    pub(crate) fn routine_for(&self, slot: usize, txid: u32) -> RoutineDef {
+        self.routines[slot].definition_for(txid)
+    }
+
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
         self.routines
             .iter()
@@ -14135,9 +14173,9 @@ impl Storage {
         name: &str,
         argument_types: &[ColType],
         txid: u32,
-    ) -> Option<&RoutineDef> {
+    ) -> Option<RoutineDef> {
         self.routine_slot_for_call_types(name, argument_types, txid)
-            .map(|slot| &self.routines[slot])
+            .map(|slot| self.routine_for(slot, txid))
     }
 
     pub(crate) fn routine_slot_for_call_types(
@@ -14204,12 +14242,13 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
+            let definition = routine.definition_for(txid);
             routine.visible_to(txid)
-                && kind.accepts(routine.kind)
-                && routine.schema_for(txid).as_str() == schema
-                && routine.name_for(txid).as_str() == name
-                && routine.argument_count == argument_types.len()
-                && routine
+                && kind.accepts(definition.kind)
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.argument_count == argument_types.len()
+                && definition
                     .arguments()
                     .iter()
                     .zip(argument_types)
@@ -14225,11 +14264,12 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
+            let definition = routine.definition_for(txid);
             routine.visible_to(txid)
-                && routine.schema_for(txid).as_str() == schema
-                && routine.name_for(txid).as_str() == name
-                && routine.argument_count == argument_types.len()
-                && routine
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.argument_count == argument_types.len()
+                && definition
                     .arguments()
                     .iter()
                     .zip(argument_types)
@@ -14439,6 +14479,7 @@ impl Storage {
             schema,
             name,
             pending_identity: None,
+            pending_definition: None,
             arguments,
             argument_count,
             kind,
@@ -14464,6 +14505,46 @@ impl Storage {
 
     pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn replace_routine(
+        &mut self,
+        slot: usize,
+        definition: PendingRoutineDefinition,
+    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
+        let name = self.routines[slot].name;
+        if let Some(pending) = self.routines[slot].pending_definition
+            && pending.txid != definition.txid
+        {
+            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
+        }
+        let routine = &mut self.routines[slot];
+        let prior = routine.pending_definition;
+        routine.pending_definition = Some(definition);
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_routine_replace(&mut self, slot: usize, txid: u32) {
+        let routine = &mut self.routines[slot];
+        if let Some(pending) = routine.pending_definition
+            && pending.txid == txid
+        {
+            routine.arguments = pending.arguments;
+            routine.argument_count = pending.argument_count;
+            routine.kind = pending.kind;
+            routine.result_columns = pending.result_columns;
+            routine.result_column_count = pending.result_column_count;
+            routine.body = pending.body;
+            routine.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn rollback_routine_replace(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingRoutineDefinition>,
+    ) {
+        self.routines[slot].pending_definition = prior;
     }
 
     pub(crate) fn drop_routine(&mut self, slot: usize, txid: u32) {
@@ -14786,6 +14867,21 @@ impl Storage {
             &argument_types[..definition.argument_count],
             0,
         ) {
+            // CREATE OR REPLACE keeps its routine object identifier.  WAL uses
+            // the complete post-change definition for both creates and
+            // replacements, so the matching durable identity selects an
+            // in-place replay rather than a drop/reallocate cycle.
+            if self.routines[slot].created_at == definition.created_at {
+                self.routines[slot].arguments = definition.arguments;
+                self.routines[slot].argument_count = definition.argument_count;
+                self.routines[slot].kind = definition.kind;
+                self.routines[slot].result_columns = definition.result_columns;
+                self.routines[slot].result_column_count = definition.result_column_count;
+                self.routines[slot].body = definition.body;
+                self.routines[slot].ownership = definition.ownership;
+                self.routines[slot].pending_definition = None;
+                return Ok(());
+            }
             self.drop_routine(slot, 0);
             self.commit_routine_drop(slot);
         }

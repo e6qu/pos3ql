@@ -35,7 +35,11 @@ jobs:
           - { name: subscription, shards: "runtest:subscription" }
           - { name: sql-wire, shards: "sql run:proto,dur" }
           - { name: diff, shards: "run:diff" }
-          - { name: spilldiff, shards: "run:spilldiff" }
+          # Forced-spill differential is a complete correctness workload, but
+          # its PostgreSQL setup plus an instrumented server build cannot fit
+          # in the fixed five-minute cap. Run the same workload uninstrumented;
+          # the other external shards retain the coverage trace.
+          - { name: spilldiff, shards: "runtest:spilldiff" }
           - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723 }
           - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725 }
           - { name: spill-overlay-ingest, shards: "runtest:overlay,ingest" }

@@ -860,7 +860,11 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
         return Ok(None);
     };
     storage.require_routine_execute(slot, txid)?;
-    Ok(Some((slot, storage.routine(slot))))
+    let routine = storage.routine_for(slot, txid);
+    Ok(Some((
+        slot,
+        arena.alloc(routine).map_err(|_| arena_full())?,
+    )))
 }
 
 /// Evaluates a table function's arguments against `columns` — an

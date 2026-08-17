@@ -616,7 +616,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return Ok(None);
         };
         self.storage.require_routine_execute(slot, self.txid)?;
-        let routine = self.storage.routine(slot);
+        let routine = self.storage.routine_for(slot, self.txid);
         let result_type = routine
             .kind
             .function_result()

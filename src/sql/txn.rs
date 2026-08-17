@@ -171,6 +171,10 @@ pub(crate) enum DdlUndo {
     /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
     RoutineCreated(u32),
     RoutineDropped(u32),
+    RoutineReplaced {
+        slot: u32,
+        prior: Option<crate::storage::PendingRoutineDefinition>,
+    },
     TriggerCreated(u32),
     TriggerDropped(u32),
     TriggerAltered {

@@ -2156,7 +2156,7 @@ pub(crate) fn routine_oid_by_name(
         consider(routine.oid)?;
     }
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine(slot);
+        let routine = storage.routine_for(slot, txid);
         if !routine.visible_to(txid)
             || !routine_name_matches(
                 name,
@@ -2173,7 +2173,7 @@ pub(crate) fn routine_oid_by_name(
         {
             continue;
         }
-        consider(crate::storage::routine_oid(routine))?;
+        consider(crate::storage::routine_oid(&routine))?;
     }
     Ok(found)
 }
@@ -2202,7 +2202,7 @@ pub(crate) fn routine_name_by_oid<'a>(
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
-    let routine = storage.routine(slot);
+    let routine = storage.routine_for(slot, txid);
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
@@ -2320,7 +2320,7 @@ pub fn function_def_text<'a>(
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
-    let routine = storage.routine(slot);
+    let routine = storage.routine_for(slot, txid);
     use core::fmt::Write;
     let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
     write!(
@@ -2413,7 +2413,7 @@ pub fn function_arguments_text<'a>(
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
-    let routine = storage.routine(slot);
+    let routine = storage.routine_for(slot, txid);
     let mut output = StackStr::<256>::new();
     use core::fmt::Write;
     for (index, argument) in routine.arguments().iter().enumerate() {
@@ -2443,7 +2443,7 @@ pub fn function_result_text<'a>(
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
-    let routine = storage.routine(slot);
+    let routine = storage.routine_for(slot, txid);
     let result = match routine.kind {
         crate::storage::RoutineKind::Function { result } => result.name(),
         crate::storage::RoutineKind::SetFunction { result } => {
@@ -5297,7 +5297,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     }
     let mut count = INTRINSIC_ROUTINES.len();
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine(slot);
+        let routine = storage.routine_for(slot, txid);
         if !routine.visible_to(txid) {
             continue;
         }
@@ -5317,7 +5317,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         rows[count] = row(
             &[
                 Datum::Int4(1255),
-                Datum::Int4(crate::storage::routine_oid(routine)),
+                Datum::Int4(crate::storage::routine_oid(&routine)),
                 text(routine.name_for(txid).as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
                 Datum::Int4(routine.argument_count as i32),
@@ -6835,11 +6835,11 @@ fn info_routines<'a>(
         .map_err(|_| arena_full())?;
     let mut row_index = 0;
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine(slot);
+        let routine = storage.routine_for(slot, txid);
         if !routine.visible_to(txid) {
             continue;
         }
-        let specific_name = routine_specific_name(routine, txid);
+        let specific_name = routine_specific_name(&routine, txid);
         output[row_index] = row(
             &[
                 text("postgres", arena)?,
@@ -6913,8 +6913,8 @@ fn info_routine_privileges<'a>(
                     "information_schema.routine_privileges",
                 ));
             }
-            let routine = storage.routine(slot);
-            let specific_name = routine_specific_name(routine, txid);
+            let routine = storage.routine_for(slot, txid);
+            let specific_name = routine_specific_name(&routine, txid);
             let grantor_name = storage.role_name(grantor as usize, txid);
             let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
                 SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
@@ -6940,7 +6940,7 @@ fn info_routine_privileges<'a>(
             Ok(())
         };
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine(slot);
+        let routine = storage.routine_for(slot, txid);
         if !routine.visible_to(txid) {
             continue;
         }
@@ -7006,11 +7006,11 @@ fn info_parameters<'a>(
         .map_err(|_| arena_full())?;
     let mut row_index = 0;
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine(slot);
+        let routine = storage.routine_for(slot, txid);
         if !routine.visible_to(txid) {
             continue;
         }
-        let specific_name = routine_specific_name(routine, txid);
+        let specific_name = routine_specific_name(&routine, txid);
         for (argument_index, argument) in routine.arguments().iter().enumerate() {
             output[row_index] = row(
                 &[

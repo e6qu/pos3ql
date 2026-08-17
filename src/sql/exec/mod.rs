@@ -11492,21 +11492,20 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
                 }
             }
         }
+        let routine = context
+            .storage
+            .routine_for(usize::from(trigger.function), context.txn.txid);
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
             target,
             event,
             before,
-            context.storage.routine(usize::from(trigger.function)),
+            &routine,
             context.arena,
         )?;
         let source = {
-            let body = context
-                .storage
-                .routine(usize::from(trigger.function))
-                .body
-                .as_str();
+            let body = routine.body.as_str();
             context.arena.alloc_str(body).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -11713,21 +11712,20 @@ fn fire_statement_triggers_with_rows<'a>(
             trigger.when.is_none(),
             "statement WHEN was rejected at creation"
         );
+        let routine = context
+            .storage
+            .routine_for(usize::from(trigger.function), context.txn.txid);
         let invocation = TriggerInvocation::new(
             &trigger,
             definition,
             table.into(),
             event,
             before,
-            context.storage.routine(usize::from(trigger.function)),
+            &routine,
             context.arena,
         )?;
         let source = {
-            let body = context
-                .storage
-                .routine(usize::from(trigger.function))
-                .body
-                .as_str();
+            let body = routine.body.as_str();
             context.arena.alloc_str(body).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -12365,16 +12363,6 @@ pub fn create_routine(
         }
         let prior = storage.routine(replaced_slot);
         let prior_kind = prior.kind;
-        if matches!(prior_kind, crate::storage::RoutineKind::Trigger)
-            && storage
-                .triggers_with_slots_visible_to(txn.txid)
-                .any(|(_, trigger)| usize::from(trigger.function) == replaced_slot)
-        {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "replacing a trigger function with dependent triggers is not supported"
-            ));
-        }
         let same_result_contract = prior_kind == kind
             && (!matches!(kind, crate::storage::RoutineKind::TableFunction)
                 || (prior.result_column_count == result_column_count
@@ -12393,7 +12381,6 @@ pub fn create_routine(
                 message
             ));
         }
-        storage.drop_routine(replaced_slot, txn.txid);
     }
     match kind {
         crate::storage::RoutineKind::Function { .. } => {
@@ -12454,58 +12441,70 @@ pub fn create_routine(
             ROUTINE_SQL_MAX
         ));
     }
-    let slot = match storage.create_routine(
-        RoutineSpec {
-            identity: replaced
-                .map(|slot| RoutineIdentity::Preserve {
-                    created_at: storage.routine(slot).created_at,
-                    ownership: storage.routine(slot).ownership,
-                })
-                .unwrap_or(RoutineIdentity::Allocate),
-            schema,
-            name,
-            arguments,
-            argument_count: routine.arguments.len(),
-            kind,
-            result_columns,
-            result_column_count,
-            body,
+    let slot = match replaced {
+        Some(slot) => {
+            let pending = crate::storage::PendingRoutineDefinition {
+                txid: txn.txid,
+                arguments,
+                argument_count: routine.arguments.len(),
+                kind,
+                result_columns,
+                result_column_count,
+                body,
+            };
+            let prior = match storage.replace_routine(slot, pending) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let definition = storage.routine_for(slot, txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(definition)) {
+                storage.rollback_routine_replace(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_routine_replace(slot, prior);
+                return sql_fail(error);
+            }
+            slot
+        }
+        None => match storage.create_routine(
+            RoutineSpec {
+                identity: RoutineIdentity::Allocate,
+                schema,
+                name,
+                arguments,
+                argument_count: routine.arguments.len(),
+                kind,
+                result_columns,
+                result_column_count,
+                body,
+            },
+            txn.txid,
+        ) {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
         },
-        txn.txid,
-    ) {
-        Ok(slot) => slot,
-        Err(error) => return sql_fail(error),
     };
-    let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot))) {
-        storage.rollback_routine_create(slot);
-        if let Some(replaced_slot) = replaced {
-            storage.rollback_routine_drop(replaced_slot, txn.txid);
-        }
-        return sql_fail(error);
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
-        storage.rollback_routine_create(slot);
-        if let Some(replaced_slot) = replaced {
-            storage.rollback_routine_drop(replaced_slot, txn.txid);
-        }
-        return sql_fail(error);
-    }
-    if let Some(replaced_slot) = replaced
-        && let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::RoutineDropped(replaced_slot as u32))
-    {
-        storage.rollback_routine_create(slot);
-        storage.rollback_routine_drop(replaced_slot, txn.txid);
-        return sql_fail(error);
-    }
-    let new_object = Storage::routine_access_object(slot);
-    if let Some(replaced_slot) = replaced {
-        let old_object = Storage::routine_access_object(replaced_slot);
-        if let Err(error) = preserve_object_acl(storage, txn, old_object, new_object) {
+    if replaced.is_none() {
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot)))
+        {
+            storage.rollback_routine_create(slot);
             return sql_fail(error);
         }
-    } else if let Err(error) = apply_default_privileges_to_new_object(storage, txn, new_object) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
+            storage.rollback_routine_create(slot);
+            return sql_fail(error);
+        }
+    }
+    let new_object = Storage::routine_access_object(slot);
+    if replaced.is_none()
+        && let Err(error) = apply_default_privileges_to_new_object(storage, txn, new_object)
+    {
         return sql_fail(error);
     }
     responder.command_complete(match kind {

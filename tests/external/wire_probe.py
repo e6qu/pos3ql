@@ -1159,6 +1159,38 @@ def test_row_trigger_body_over_raw_wire():
     s.close()
 
 
+def test_trigger_function_replacement_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_replacement_target (id integer PRIMARY KEY); "
+        "CREATE FUNCTION wire_replacement_gate() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN RETURN NEW; END'; "
+        "CREATE TRIGGER wire_replacement_gate BEFORE INSERT ON wire_replacement_target "
+        "FOR EACH ROW EXECUTE FUNCTION wire_replacement_gate()",
+    )
+    check("raw wire: replacement trigger setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    before = first_text_row(simple_query(s, "SELECT oid FROM pg_proc WHERE proname = 'wire_replacement_gate'"))
+    after = first_text_row(
+        simple_query(
+            s,
+            "CREATE OR REPLACE FUNCTION wire_replacement_gate() RETURNS trigger LANGUAGE plpgsql AS "
+            "'BEGIN RETURN NULL; END'; "
+            "INSERT INTO wire_replacement_target VALUES (1); "
+            "SELECT oid || ':' || (SELECT count(*) FROM wire_replacement_target) "
+            "FROM pg_proc WHERE proname = 'wire_replacement_gate'",
+        )
+    )
+    check(
+        "raw wire: replacing a trigger function preserves OID and dependency",
+        before is not None and after == f"{before}:0",
+        (before, after),
+    )
+    s.close()
+
+
 def test_instead_of_view_trigger_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

@@ -104,6 +104,7 @@ const KIND_DROP_TRIGGER: u8 = 56;
 const KIND_ALTER_TRIGGER: u8 = 57;
 const KIND_CREATE_COMPOSITE: u8 = 58;
 const KIND_DROP_COMPOSITE: u8 = 59;
+const KIND_ALTER_ENUM_IDENTITY: u8 = 60;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -111,7 +112,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_COMPOSITE;
+const LAST_KIND: u8 = KIND_ALTER_ENUM_IDENTITY;
 const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
 
 /// SQLSTATE 53100 disk_full.
@@ -609,6 +610,12 @@ pub(crate) enum WalOp<'a> {
     RenameEnum {
         schema: &'a str,
         old_name: &'a str,
+        new_name: &'a str,
+    },
+    AlterEnumIdentity {
+        schema: &'a str,
+        name: &'a str,
+        new_schema: &'a str,
         new_name: &'a str,
     },
     /// CREATE TYPE ... AS (...). Each field carries its durable user-type
@@ -1389,6 +1396,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
+        WalOp::AlterEnumIdentity { .. } => KIND_ALTER_ENUM_IDENTITY,
         WalOp::CreateComposite { .. } => KIND_CREATE_COMPOSITE,
         WalOp::DropComposite { .. } => KIND_DROP_COMPOSITE,
         WalOp::CreateRoutine(_) => KIND_CREATE_ROUTINE,
@@ -1761,6 +1769,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             old_name,
             new_name,
         } => 1 + old_name.len() + 1 + schema.len() + 1 + new_name.len(),
+        WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_schema.len() + 1 + new_name.len(),
         WalOp::CreateComposite {
             definition: def, ..
         } => {
@@ -2383,6 +2397,17 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             name_bytes(buffer, old_name)
                 && name_bytes(buffer, schema)
+                && name_bytes(buffer, new_name)
+        }
+        WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, new_schema)
                 && name_bytes(buffer, new_name)
         }
         WalOp::CreateComposite {
@@ -4201,6 +4226,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_name,
             })
         }
+        KIND_ALTER_ENUM_IDENTITY => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::AlterEnumIdentity {
+                schema,
+                name,
+                new_schema,
+                new_name,
+            })
+        }
         KIND_CREATE_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -5693,12 +5730,22 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                24,
+                &WalOp::AlterEnumIdentity {
+                    schema: "public",
+                    name: "mood",
+                    new_schema: "types",
+                    new_name: "state",
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 23);
+        assert_eq!(seen.len(), 24);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
         assert!(seen[0].contains("t_id_v_key"), "unique key: {}", seen[0]);
@@ -5780,10 +5827,17 @@ mod tests {
         assert!(seen[20].contains("AlterTrigger"), "{}", seen[20]);
         assert!(seen[21].contains("DropTrigger"), "{}", seen[21]);
         assert!(seen[22].contains("AlterSubscription"), "{}", seen[22]);
-        assert_eq!(wal.last_lsn(), 23);
+        assert!(
+            seen[23].contains("AlterEnumIdentity")
+                && seen[23].contains("new_schema: \"types\"")
+                && seen[23].contains("new_name: \"state\""),
+            "enum identity: {}",
+            seen[23]
+        );
+        assert_eq!(wal.last_lsn(), 24);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            24,
+            25,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",

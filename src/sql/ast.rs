@@ -1580,6 +1580,8 @@ pub enum AlterTypeAction<'a> {
     },
     /// RENAME TO new_name (renames the type itself, not a value).
     RenameTo(&'a str),
+    /// SET SCHEMA new_schema. The durable type identity remains its catalog slot.
+    SetSchema(&'a str),
     /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
     RenameValue { from: &'a str, to: &'a str },
     /// ADD ATTRIBUTE name type.

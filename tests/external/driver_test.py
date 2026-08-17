@@ -58,6 +58,21 @@ cur.execute("SELECT count(*) FROM drv")
 assert cur.fetchone()[0] == 3
 print("update/delete ok")
 
+# Type schema moves retain the type OID and every existing column reference.
+cur.execute("CREATE SCHEMA drv_moved_types")
+cur.execute("CREATE TYPE drv_state AS ENUM ('ready', 'blocked')")
+cur.execute("CREATE TYPE drv_point AS (x int, y int)")
+cur.execute("CREATE TABLE drv_moved_values (state drv_state, point drv_point)")
+cur.execute(
+    "INSERT INTO drv_moved_values VALUES (%s::drv_state, ROW(%s, %s)::drv_point)",
+    ("ready", 3, 4),
+)
+cur.execute("ALTER TYPE drv_state SET SCHEMA drv_moved_types")
+cur.execute("ALTER TYPE drv_point SET SCHEMA drv_moved_types")
+cur.execute("SELECT state::text, (point).x, (point).y FROM drv_moved_values")
+assert cur.fetchone() == ("ready", 3, 4)
+print("type schema moves extended protocol ok")
+
 # PostgreSQL views become writable through row-level INSTEAD OF triggers. This
 # uses Parse/Bind/Describe/Execute for each parameterized DML statement.
 cur.execute("DROP TABLE IF EXISTS drv_view_base")

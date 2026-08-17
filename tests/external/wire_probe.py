@@ -1625,6 +1625,29 @@ def test_typed_trigger_query_program_over_raw_simple_query():
     s.close()
 
 
+def test_type_schema_moves_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE SCHEMA wire_moved_types; "
+        "CREATE TYPE wire_moved_state AS ENUM ('ready', 'blocked'); "
+        "CREATE TYPE wire_moved_point AS (x integer, y integer); "
+        "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point); "
+        "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point); "
+        "ALTER TYPE wire_moved_state SET SCHEMA wire_moved_types; "
+        "ALTER TYPE wire_moved_point SET SCHEMA wire_moved_types",
+    )
+    check("raw wire: type schema moves succeed", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: moved types retain existing values",
+        first_text_row(simple_query(s, "SELECT state::text || ':' || (point).x || ':' || (point).y FROM wire_moved_values"))
+        == "ready:3:4",
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

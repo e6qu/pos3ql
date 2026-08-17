@@ -7892,6 +7892,25 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.stage_enum_alter(slot, definition, 0)?;
             storage.commit_enum_alter(slot, 0);
         }
+        WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            let slot = storage.enum_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::UNDEFINED_OBJECT,
+                    "enum type \"{}\" for WAL identity change does not exist",
+                    name
+                )
+            })?;
+            let mut definition = storage.enum_for(slot, 0);
+            definition.schema = crate::storage::SqlName::parse(new_schema)?;
+            definition.name = crate::storage::SqlName::parse(new_name)?;
+            storage.stage_enum_alter(slot, definition, 0)?;
+            storage.commit_enum_alter(slot, 0);
+        }
         WalOp::AlterDomainIdentity {
             schema,
             name,

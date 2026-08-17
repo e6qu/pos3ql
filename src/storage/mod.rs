@@ -2718,6 +2718,7 @@ pub struct EnumDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingEnumDefinition {
     pub txid: u32,
+    pub schema: SqlName,
     pub name: SqlName,
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
@@ -2755,6 +2756,7 @@ impl EnumDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
+                schema: pending.schema,
                 name: pending.name,
                 members: pending.members,
                 n_members: pending.n_members,
@@ -2818,6 +2820,7 @@ pub struct CompositeDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingCompositeDefinition {
     pub txid: u32,
+    pub schema: SqlName,
     pub name: SqlName,
     pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
     pub n_fields: usize,
@@ -2883,6 +2886,7 @@ impl CompositeDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
+                schema: pending.schema,
                 name: pending.name,
                 fields: pending.fields,
                 n_fields: pending.n_fields,
@@ -12492,17 +12496,24 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.schema.as_str() == schema.as_str() && d.name.as_str() == name.as_str())
-                .then_some(d.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (d.schema == schema && d.name == name
+                || d.pending_definition
+                    .and_then(|pending| pending.identity)
+                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            .then(|| {
+                d.pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| d.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            (e.schema == schema
-                && (e.name == name
-                    || e.pending_definition
-                        .is_some_and(|pending| pending.name == name)))
+            (e.schema == schema && e.name == name
+                || e.pending_definition
+                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
             .then(|| {
                 e.pending_definition
                     .map(|pending| pending.txid)
@@ -12513,8 +12524,48 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
+        if let Some(blocker) = self.composites.iter().find_map(|composite| {
+            (composite.schema == schema && composite.name == name
+                || composite
+                    .pending_definition
+                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            .then(|| {
+                composite
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| composite.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if self.domains.iter().any(|domain| {
+            domain.visible_to(txid)
+                && domain.definition_for(txid).schema == schema
+                && domain.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
         if self.enums.iter().any(|e| {
-            e.visible_to(txid) && e.schema == schema && e.definition_for(txid).name == name
+            e.visible_to(txid)
+                && e.definition_for(txid).schema == schema
+                && e.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self.composites.iter().any(|composite| {
+            composite.visible_to(txid)
+                && composite.definition_for(txid).schema == schema
+                && composite.definition_for(txid).name == name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -12799,7 +12850,7 @@ impl Storage {
         if let Some(schema) = qualifier {
             return self.enums.iter().position(|e| {
                 e.visible_to(txid)
-                    && e.schema.as_str() == schema
+                    && e.definition_for(txid).schema.as_str() == schema
                     && e.definition_for(txid).name.as_str() == name
             });
         }
@@ -12808,7 +12859,7 @@ impl Storage {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.enums.iter().position(|e| {
                     e.visible_to(txid)
-                        && e.schema.as_str() == schema.as_str()
+                        && e.definition_for(txid).schema.as_str() == schema.as_str()
                         && e.definition_for(txid).name.as_str() == name
                 }) {
                     return Some(i);
@@ -12847,7 +12898,7 @@ impl Storage {
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
             e.visible_to(txid)
-                && e.schema.as_str() == schema
+                && e.definition_for(txid).schema.as_str() == schema
                 && e.definition_for(txid).name.as_str() == name
         })
     }
@@ -12899,10 +12950,9 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            let same_name = e.schema == schema
-                && (e.name == name
-                    || e.pending_definition
-                        .is_some_and(|pending| pending.name == name));
+            let same_name = e.schema == schema && e.name == name
+                || e.pending_definition
+                    .is_some_and(|pending| pending.schema == schema && pending.name == name);
             same_name
                 .then(|| {
                     e.pending_definition
@@ -12915,7 +12965,9 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.enums.iter().any(|e| {
-            e.visible_to(txid) && e.schema == schema && e.definition_for(txid).name == name
+            e.visible_to(txid)
+                && e.definition_for(txid).schema == schema
+                && e.definition_for(txid).name == name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -12924,17 +12976,31 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.schema == schema && d.name == name)
-                .then_some(d.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (d.schema == schema && d.name == name
+                || d.pending_definition
+                    .and_then(|pending| pending.identity)
+                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            .then_some(d.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self
-            .domains
-            .iter()
-            .any(|d| d.visible_to(txid) && d.schema == schema && d.name == name)
-        {
+        if self.domains.iter().any(|d| {
+            d.visible_to(txid)
+                && d.definition_for(txid).schema == schema
+                && d.definition_for(txid).name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self.composites.iter().any(|composite| {
+            composite.visible_to(txid)
+                && composite.definition_for(txid).schema == schema
+                && composite.definition_for(txid).name == name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "type \"{}\" already exists",
@@ -12981,18 +13047,16 @@ impl Storage {
         definition: EnumDef,
         txid: u32,
     ) -> Result<Option<PendingEnumDefinition>, SqlError> {
-        let schema = self.enums[slot].schema;
         if let Some(blocker) = self
             .enums
             .iter()
             .enumerate()
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
-                    && other.schema == schema
-                    && (other.name == definition.name
-                        || other
-                            .pending_definition
-                            .is_some_and(|pending| pending.name == definition.name)))
+                    && (other.schema == definition.schema && other.name == definition.name
+                        || other.pending_definition.is_some_and(|pending| {
+                            pending.schema == definition.schema && pending.name == definition.name
+                        })))
                 .then(|| {
                     other
                         .pending_definition
@@ -13006,19 +13070,31 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.schema == schema && domain.name == definition.name)
-                .then_some(domain.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (domain.schema == definition.schema && domain.name == definition.name
+                || domain
+                    .pending_definition
+                    .and_then(|pending| pending.identity)
+                    .is_some_and(|identity| {
+                        identity.schema == definition.schema && identity.name == definition.name
+                    }))
+            .then_some(domain.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if self.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
                 && other.visible_to(txid)
-                && other.schema == schema
+                && other.definition_for(txid).schema == definition.schema
                 && other.definition_for(txid).name == definition.name
         }) || self.domains.iter().any(|domain| {
-            domain.visible_to(txid) && domain.schema == schema && domain.name == definition.name
+            domain.visible_to(txid)
+                && domain.definition_for(txid).schema == definition.schema
+                && domain.definition_for(txid).name == definition.name
+        }) || self.composites.iter().any(|composite| {
+            composite.visible_to(txid)
+                && composite.definition_for(txid).schema == definition.schema
+                && composite.definition_for(txid).name == definition.name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -13039,6 +13115,7 @@ impl Storage {
         let prior = enumeration.pending_definition;
         enumeration.pending_definition = Some(PendingEnumDefinition {
             txid,
+            schema: definition.schema,
             name: definition.name,
             members: definition.members,
             n_members: definition.n_members,
@@ -13053,8 +13130,15 @@ impl Storage {
             .is_some()
         {
             let definition = self.enums[slot].definition_for(txid);
-            if definition.name != self.enums[slot].name {
-                self.rename_enum_references(slot, definition.name);
+            let previous = self.enums[slot];
+            if definition.schema != previous.schema || definition.name != previous.name {
+                self.move_enum_references(
+                    slot,
+                    previous.schema,
+                    previous.name,
+                    definition.schema,
+                    definition.name,
+                );
             }
             self.enums[slot] = definition;
         }
@@ -13068,13 +13152,17 @@ impl Storage {
         self.enums[slot].pending_definition = prior;
     }
 
-    /// Renames an enum and every persisted reference to its type name. Runtime
+    /// Moves an enum and every persisted reference to its type identity. Runtime
     /// slots and value sort keys stay stable; comments are name-keyed and move
     /// with the type just as PostgreSQL keeps the same `pg_type` OID.
-    fn rename_enum_references(&mut self, slot: usize, new_name: SqlName) {
-        let old_name = self.enums[slot].name;
-        let schema = self.enums[slot].schema;
-        self.enums[slot].name = new_name;
+    fn move_enum_references(
+        &mut self,
+        slot: usize,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+    ) {
         for table in self
             .tables
             .iter_mut()
@@ -13089,6 +13177,7 @@ impl Storage {
                     );
                 if uses_enum {
                     if let Some(identity) = &mut column.user_type {
+                        identity.schema = new_schema;
                         identity.name = new_name;
                     }
                     changed = true;
@@ -13098,16 +13187,41 @@ impl Storage {
                 table.mark_dirty();
             }
         }
+        for composite in self
+            .composites
+            .iter_mut()
+            .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
+        {
+            for field in composite.fields.iter_mut().take(composite.n_fields) {
+                if matches!(field.ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
+                    && let Some(identity) = &mut field.user_type
+                {
+                    identity.schema = new_schema;
+                    identity.name = new_name;
+                }
+            }
+            if let Some(pending) = &mut composite.pending_definition {
+                for field in pending.fields.iter_mut().take(pending.n_fields) {
+                    if matches!(field.ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
+                        && let Some(identity) = &mut field.user_type
+                    {
+                        identity.schema = new_schema;
+                        identity.name = new_name;
+                    }
+                }
+            }
+        }
         for comment in self.comments.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
-                && comment.schema == schema
+                && comment.schema == old_schema
                 && comment.name == old_name
             {
+                comment.schema = new_schema;
                 comment.name = new_name;
             }
         }
-        self.rename_stored_query_dependency(DependencyClass::Enum, slot, schema, new_name);
+        self.rename_stored_query_dependency(DependencyClass::Enum, slot, new_schema, new_name);
     }
 
     pub fn drop_enum(
@@ -13172,7 +13286,7 @@ impl Storage {
         self.composites.iter().enumerate().find_map(|(slot, definition)| {
             (definition.visible_to(txid)
                 && definition.definition_for(txid).name.as_str() == name
-                && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.schema)), |schema| definition.schema.as_str() == schema))
+                && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.definition_for(txid).schema)), |schema| definition.definition_for(txid).schema.as_str() == schema))
                 .then_some(slot)
         })
     }
@@ -13180,7 +13294,7 @@ impl Storage {
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.composites.iter().position(|definition| {
             definition.visible_to(txid)
-                && definition.schema.as_str() == schema
+                && definition.definition_for(txid).schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
         })
     }
@@ -13217,6 +13331,82 @@ impl Storage {
         definition: CompositeDef,
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
+        if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
+            (enumeration.schema == definition.schema && enumeration.name == definition.name
+                || enumeration.pending_definition.is_some_and(|pending| {
+                    pending.schema == definition.schema && pending.name == definition.name
+                }))
+            .then(|| {
+                enumeration
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| enumeration.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if let Some(blocker) = self.domains.iter().find_map(|domain| {
+            (domain.schema == definition.schema && domain.name == definition.name
+                || domain
+                    .pending_definition
+                    .and_then(|pending| pending.identity)
+                    .is_some_and(|identity| {
+                        identity.schema == definition.schema && identity.name == definition.name
+                    }))
+            .then_some(domain.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if let Some(blocker) = self
+            .composites
+            .iter()
+            .enumerate()
+            .find_map(|(other_slot, other)| {
+                (other_slot != slot
+                    && (other.schema == definition.schema && other.name == definition.name
+                        || other.pending_definition.is_some_and(|pending| {
+                            pending.schema == definition.schema && pending.name == definition.name
+                        })))
+                .then(|| {
+                    other
+                        .pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| other.ddl_state.pending_txid())
+                })
+                .flatten()
+                .filter(|&owner| owner != txid)
+            })
+        {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if self.enums.iter().any(|enumeration| {
+            enumeration.visible_to(txid)
+                && enumeration.definition_for(txid).schema == definition.schema
+                && enumeration.definition_for(txid).name == definition.name
+        }) || self.domains.iter().any(|domain| {
+            domain.visible_to(txid)
+                && domain.definition_for(txid).schema == definition.schema
+                && domain.definition_for(txid).name == definition.name
+        }) || self
+            .composites
+            .iter()
+            .enumerate()
+            .any(|(other_slot, other)| {
+                other_slot != slot
+                    && other.visible_to(txid)
+                    && other.definition_for(txid).schema == definition.schema
+                    && other.definition_for(txid).name == definition.name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
         let name = self.composites[slot].name;
         let composite = &mut self.composites[slot];
         if let Some(pending) = composite.pending_definition
@@ -13227,6 +13417,7 @@ impl Storage {
         let prior = composite.pending_definition;
         composite.pending_definition = Some(PendingCompositeDefinition {
             txid,
+            schema: definition.schema,
             name: definition.name,
             fields: definition.fields,
             n_fields: definition.n_fields,
@@ -13240,26 +13431,39 @@ impl Storage {
             if let Some(pending) = composite.pending_definition
                 && pending.txid == txid
             {
+                let prior_schema = composite.schema;
                 let prior_name = composite.name;
+                composite.schema = pending.schema;
                 composite.name = pending.name;
                 composite.fields = pending.fields;
                 composite.n_fields = pending.n_fields;
                 composite.pending_definition = None;
-                (prior_name != composite.name).then_some((prior_name, composite.name))
+                (prior_schema != composite.schema || prior_name != composite.name).then_some((
+                    prior_schema,
+                    prior_name,
+                    composite.schema,
+                    composite.name,
+                ))
             } else {
                 None
             }
         };
-        if let Some((prior_name, new_name)) = renamed {
-            self.rename_composite_references(slot, prior_name, new_name);
+        if let Some((prior_schema, prior_name, new_schema, new_name)) = renamed {
+            self.move_composite_references(slot, prior_schema, prior_name, new_schema, new_name);
         }
     }
 
     /// A composite slot is durable identity, while persisted definitions retain
-    /// the SQL name needed to rebind that slot after recovery. Rename every
-    /// such identity in the same catalog commit that changes the type name.
-    fn rename_composite_references(&mut self, slot: usize, old_name: SqlName, new_name: SqlName) {
-        let schema = self.composites[slot].schema;
+    /// the SQL identity needed to rebind that slot after recovery. Move every
+    /// such identity in the same catalog commit that changes its schema or name.
+    fn move_composite_references(
+        &mut self,
+        slot: usize,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+    ) {
         for table in self
             .tables
             .iter_mut()
@@ -13274,6 +13478,7 @@ impl Storage {
                         if candidate as usize == slot
                 ) {
                     if let Some(identity) = &mut column.user_type {
+                        identity.schema = new_schema;
                         identity.name = new_name;
                     }
                     changed = true;
@@ -13296,6 +13501,7 @@ impl Storage {
                         if candidate as usize == slot
                 ) && let Some(identity) = &mut field.user_type
                 {
+                    identity.schema = new_schema;
                     identity.name = new_name;
                 }
             }
@@ -13308,6 +13514,7 @@ impl Storage {
                             if candidate as usize == slot
                     ) && let Some(identity) = &mut field.user_type
                     {
+                        identity.schema = new_schema;
                         identity.name = new_name;
                     }
                 }
@@ -13316,13 +13523,14 @@ impl Storage {
         for comment in self.comments.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
-                && comment.schema == schema
+                && comment.schema == old_schema
                 && comment.name == old_name
             {
+                comment.schema = new_schema;
                 comment.name = new_name;
             }
         }
-        self.rename_stored_query_dependency(DependencyClass::Composite, slot, schema, new_name);
+        self.rename_stored_query_dependency(DependencyClass::Composite, slot, new_schema, new_name);
     }
 
     pub(crate) fn rollback_composite_alter(
@@ -13341,6 +13549,55 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        if let Some(blocker) = self.domains.iter().find_map(|domain| {
+            (domain.schema == schema && domain.name == name
+                || domain
+                    .pending_definition
+                    .and_then(|pending| pending.identity)
+                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            .then(|| {
+                domain
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| domain.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
+            (enumeration.schema == schema && enumeration.name == name
+                || enumeration
+                    .pending_definition
+                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            .then(|| {
+                enumeration
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| enumeration.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if let Some(blocker) = self.composites.iter().find_map(|composite| {
+            (composite.schema == schema && composite.name == name
+                || composite
+                    .pending_definition
+                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            .then(|| {
+                composite
+                    .pending_definition
+                    .map(|pending| pending.txid)
+                    .or_else(|| composite.ddl_state.pending_txid())
+            })
+            .flatten()
+            .filter(|&owner| owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
         for field in spec.fields.iter_mut().take(spec.n_fields) {
             let Some(identity) = field.user_type else {
                 continue;

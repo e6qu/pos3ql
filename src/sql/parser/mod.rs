@@ -4712,6 +4712,29 @@ mod tests {
     }
 
     #[test]
+    fn alter_type_set_schema_is_a_typed_operation_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "alter type parser", 1 << 18).unwrap();
+        let mut parser = Parser::new("ALTER TYPE public.state SET SCHEMA archive", &arena).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::AlterType { name, action }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER TYPE did not parse")
+            };
+            assert_eq!(
+                name,
+                QualName {
+                    schema: Some("public"),
+                    name: "state"
+                }
+            );
+            assert_eq!(
+                action,
+                crate::sql::ast::AlterTypeAction::SetSchema("archive")
+            );
+        });
+    }
+
+    #[test]
     fn row_trigger_lifecycle_is_typed_without_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "trigger parser", 1 << 18).unwrap();

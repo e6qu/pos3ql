@@ -851,6 +851,9 @@ impl<'a> Parser<'a> {
                     after,
                 }
             }
+        } else if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterTypeAction::SetSchema(self.col_ident("schema name")?)
         } else if self.eat_ident("rename")? {
             if self.eat_ident("attribute")? {
                 let from = self.any_ident("composite field name")?;

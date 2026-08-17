@@ -2451,11 +2451,23 @@ impl TriggerTransitionTables {
 /// A durable trigger definition. The bit set is valid only when nonzero;
 /// construction remains inside the storage choke point so an empty trigger
 /// event set cannot enter the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerTarget {
+    Table(u16),
+    View(u16),
+}
+
+impl From<usize> for TriggerTarget {
+    fn from(slot: usize) -> Self {
+        Self::Table(u16::try_from(slot).expect("table slots fit the trigger target representation"))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerDef {
     pub(crate) created_at: u64,
     pub(crate) name: SqlName,
-    pub(crate) table: u16,
+    pub(crate) target: TriggerTarget,
     pub(crate) function: u16,
     pub(crate) timing: u8,
     pub(crate) level: crate::sql::ast::TriggerLevel,
@@ -2491,7 +2503,7 @@ pub(crate) enum TriggerAlter {
 #[derive(Clone, Copy)]
 pub(crate) struct TriggerSpec {
     pub(crate) name: SqlName,
-    pub(crate) table: usize,
+    pub(crate) target: TriggerTarget,
     pub(crate) function: usize,
     pub(crate) timing: u8,
     pub(crate) level: crate::sql::ast::TriggerLevel,
@@ -2521,7 +2533,7 @@ impl TriggerDef {
     pub(crate) const EMPTY: Self = Self {
         created_at: 0,
         name: SqlName::EMPTY,
-        table: u16::MAX,
+        target: TriggerTarget::Table(u16::MAX),
         function: u16::MAX,
         timing: 0,
         level: crate::sql::ast::TriggerLevel::Row,
@@ -14061,8 +14073,30 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.visible_to(txid) && usize::from(trigger.table) == table
+                trigger.visible_to(txid) && trigger.target == TriggerTarget::Table(table as u16)
             })
+    }
+
+    pub(crate) fn triggers_for_view(
+        &self,
+        view: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| {
+                trigger.visible_to(txid) && trigger.target == TriggerTarget::View(view as u16)
+            })
+    }
+
+    pub(crate) fn triggers_for_target(
+        &self,
+        target: TriggerTarget,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+        self.triggers_with_slots_visible_to(txid)
+            .filter(move |(_, trigger)| trigger.target == target)
     }
 
     pub(crate) fn triggers_with_slots_visible_to(
@@ -14075,8 +14109,13 @@ impl Storage {
             .filter(move |(_, trigger)| trigger.visible_to(txid))
     }
 
-    pub(crate) fn trigger_slot(&self, table: usize, name: &str, txid: u32) -> Option<usize> {
-        self.triggers_for_table(table, txid)
+    pub(crate) fn trigger_slot_on(
+        &self,
+        target: TriggerTarget,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.triggers_for_target(target, txid)
             .find_map(|(slot, trigger)| (trigger.name_to(txid).as_str() == name).then_some(slot))
     }
 
@@ -14085,13 +14124,19 @@ impl Storage {
         spec: TriggerSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if spec.timing > 1
+        if spec.timing > 2
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
                 && spec.events.has_truncate())
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
                 && spec.when.is_some())
             || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
                 && spec.update_columns != 0)
+            || (spec.timing == 2
+                && (!matches!(spec.target, TriggerTarget::View(_))
+                    || !matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
+                    || spec.events.has_truncate()
+                    || spec.update_columns != 0
+                    || !matches!(spec.transition_tables, TriggerTransitionTables::None)))
             || !spec
                 .transition_tables
                 .is_valid_for(spec.timing, spec.level, spec.events)
@@ -14102,7 +14147,11 @@ impl Storage {
             ));
         }
         if self
-            .trigger_slot(spec.table, spec.name.as_str(), txid)
+            .triggers_with_slots_visible_to(txid)
+            .find_map(|(slot, trigger)| {
+                (trigger.target == spec.target && trigger.name_to(txid) == spec.name)
+                    .then_some(slot)
+            })
             .is_some()
         {
             return Err(sql_err!(
@@ -14126,12 +14175,7 @@ impl Storage {
         self.triggers[slot] = TriggerDef {
             created_at: self.catalog_seq,
             name: spec.name,
-            table: u16::try_from(spec.table).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table slot exceeds trigger capacity"
-                )
-            })?,
+            target: spec.target,
             function: u16::try_from(spec.function).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -14214,13 +14258,19 @@ impl Storage {
         spec: TriggerSpec,
         enabled: bool,
     ) -> Result<usize, SqlError> {
-        if spec.timing > 1
+        if spec.timing > 2
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
                 && spec.events.has_truncate())
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
                 && spec.when.is_some())
             || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
                 && spec.update_columns != 0)
+            || (spec.timing == 2
+                && (!matches!(spec.target, TriggerTarget::View(_))
+                    || !matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
+                    || spec.events.has_truncate()
+                    || spec.update_columns != 0
+                    || !matches!(spec.transition_tables, TriggerTransitionTables::None)))
             || !spec
                 .transition_tables
                 .is_valid_for(spec.timing, spec.level, spec.events)
@@ -14231,7 +14281,10 @@ impl Storage {
             ));
         }
         if self
-            .trigger_slot(spec.table, spec.name.as_str(), 0)
+            .triggers_with_slots_visible_to(0)
+            .find_map(|(slot, trigger)| {
+                (trigger.target == spec.target && trigger.name_to(0) == spec.name).then_some(slot)
+            })
             .is_some()
         {
             return Err(sql_err!(
@@ -14253,12 +14306,7 @@ impl Storage {
         self.triggers[slot] = TriggerDef {
             created_at,
             name: spec.name,
-            table: u16::try_from(spec.table).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table slot exceeds trigger capacity"
-                )
-            })?,
+            target: spec.target,
             function: u16::try_from(spec.function).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -14295,7 +14343,9 @@ impl Storage {
     /// retires them in the same catalog transition.
     pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
         for trigger in self.triggers.iter_mut() {
-            if trigger.ddl_state != CatalogDdlState::Absent && usize::from(trigger.table) == table {
+            if trigger.ddl_state != CatalogDdlState::Absent
+                && trigger.target == TriggerTarget::Table(table as u16)
+            {
                 trigger.ddl_state = CatalogDdlState::Absent;
                 trigger.pending_definition = None;
             }

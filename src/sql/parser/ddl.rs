@@ -163,7 +163,7 @@ impl<'a> Parser<'a> {
             TriggerTiming::After
         } else if self.eat_ident("instead")? {
             self.expect_ident("of")?;
-            return Err(self.err_here("INSTEAD OF triggers are not supported"));
+            TriggerTiming::InsteadOf
         } else {
             return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF for CREATE TRIGGER"));
         };
@@ -254,6 +254,17 @@ impl<'a> Parser<'a> {
             && events[..event_count].contains(&TriggerEvent::Truncate)
         {
             return Err(self.err_here("TRUNCATE triggers must be FOR EACH STATEMENT"));
+        }
+        if matches!(timing, TriggerTiming::InsteadOf) {
+            if !matches!(level, crate::sql::ast::TriggerLevel::Row) {
+                return Err(self.err_here("INSTEAD OF triggers must be FOR EACH ROW"));
+            }
+            if events[..event_count].contains(&TriggerEvent::Truncate) {
+                return Err(self.err_here("INSTEAD OF triggers cannot have TRUNCATE events"));
+            }
+            if update_column_count != 0 {
+                return Err(self.err_here("INSTEAD OF triggers cannot have column lists"));
+            }
         }
         if !matches!(transition_tables, TriggerTransitionTables::None) {
             if !matches!(timing, TriggerTiming::After)

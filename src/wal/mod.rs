@@ -292,6 +292,31 @@ impl WalTableStatistics<'_> {
     }
 }
 
+/// A trigger's durable relation class. Recovery must not reinterpret a view
+/// trigger as a table trigger based only on a matching schema/name pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerTargetKind {
+    Table,
+    View,
+}
+
+impl TriggerTargetKind {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Table => 0,
+            Self::View => 1,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Table),
+            1 => Some(Self::View),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -425,6 +450,7 @@ pub(crate) enum WalOp<'a> {
     },
     CreateTrigger {
         name: &'a str,
+        target: TriggerTargetKind,
         table_schema: &'a str,
         table: &'a str,
         function_schema: &'a str,
@@ -441,11 +467,13 @@ pub(crate) enum WalOp<'a> {
     },
     DropTrigger {
         name: &'a str,
+        target: TriggerTargetKind,
         table_schema: &'a str,
         table: &'a str,
     },
     AlterTrigger {
         name: &'a str,
+        target: TriggerTargetKind,
         table_schema: &'a str,
         table: &'a str,
         new_name: &'a str,
@@ -1537,6 +1565,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::CreateTrigger {
             name,
+            target: _,
             table_schema,
             table,
             function_schema,
@@ -1549,6 +1578,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => {
             1 + name.len()
+                + 1
                 + 1
                 + table_schema.len()
                 + 1
@@ -1569,16 +1599,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropTrigger {
             name,
+            target: _,
             table_schema,
             table,
-        } => 1 + name.len() + 1 + table_schema.len() + 1 + table.len(),
+        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len(),
         WalOp::AlterTrigger {
             name,
+            target: _,
             table_schema,
             table,
             new_name,
             ..
-        } => 1 + name.len() + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
+        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -2572,6 +2604,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => name_bytes(buffer, table) && name_bytes(buffer, schema) && statistics.append(buffer),
         WalOp::CreateTrigger {
             name,
+            target,
             table_schema,
             table,
             function_schema,
@@ -2588,6 +2621,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             let when_len = when.map_or(0usize, |value| value.len() + 1);
             name_bytes(buffer, name)
+                && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, function_schema)
@@ -2608,21 +2642,25 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::DropTrigger {
             name,
+            target,
             table_schema,
             table,
         } => {
             name_bytes(buffer, name)
+                && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
         }
         WalOp::AlterTrigger {
             name,
+            target,
             table_schema,
             table,
             new_name,
             enabled,
         } => {
             name_bytes(buffer, name)
+                && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, new_name)
@@ -3398,6 +3436,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_CREATE_TRIGGER => {
             let name = take_name(&mut at)?;
+            let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
+            at += 1;
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let function_schema = take_name(&mut at)?;
@@ -3431,7 +3471,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             for argument in arguments.iter_mut().take(argument_count) {
                 *argument = take_name(&mut at)?;
             }
-            (timing <= 1
+            (timing <= 2
                 && (matches!(level, crate::sql::ast::TriggerLevel::Statement)
                     || !events.has_truncate())
                 && crate::storage::TriggerTransitionTables::from_names(old_table, new_table)
@@ -3443,6 +3483,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 && at == payload.len())
             .then_some(WalOp::CreateTrigger {
                 name,
+                target,
                 table_schema,
                 table,
                 function_schema,
@@ -3460,16 +3501,21 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP_TRIGGER => {
             let name = take_name(&mut at)?;
+            let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
+            at += 1;
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTrigger {
                 name,
+                target,
                 table_schema,
                 table,
             })
         }
         KIND_ALTER_TRIGGER => {
             let name = take_name(&mut at)?;
+            let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
+            at += 1;
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
@@ -3481,6 +3527,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             (at == payload.len()).then_some(WalOp::AlterTrigger {
                 name,
+                target,
                 table_schema,
                 table,
                 new_name,
@@ -5183,6 +5230,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTrigger {
                 name: "audit_row",
+                target: TriggerTargetKind::Table,
                 table_schema: "public",
                 table: "orders",
                 function_schema: "public",
@@ -5210,6 +5258,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTrigger {
                 name: "audit_statement",
+                target: TriggerTargetKind::Table,
                 table_schema: "public",
                 table: "orders",
                 function_schema: "public",
@@ -5238,6 +5287,39 @@ mod tests {
     }
 
     #[test]
+    fn create_view_trigger_payload_retains_its_relation_kind() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "view trigger payload", 1024).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTrigger {
+                name: "write_view",
+                target: TriggerTargetKind::View,
+                table_schema: "public",
+                table: "orders_view",
+                function_schema: "public",
+                function: "write_orders",
+                timing: 2,
+                level: crate::sql::ast::TriggerLevel::Row,
+                events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
+                update_columns: 0,
+                old_table: None,
+                new_table: None,
+                when: None,
+                arguments: [""; crate::storage::MAX_TRIGGER_ARGUMENTS],
+                argument_count: 0,
+            },
+        ));
+        let Some(WalOp::CreateTrigger { target, timing, .. }) =
+            decode_op(KIND_CREATE_TRIGGER, payload.readable())
+        else {
+            panic!("view trigger did not decode");
+        };
+        assert_eq!(target, TriggerTargetKind::View);
+        assert_eq!(timing, 2);
+    }
+
+    #[test]
     fn create_trigger_payload_retains_arguments() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "trigger argument payload", 1024).unwrap();
@@ -5248,6 +5330,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTrigger {
                 name: "audit_row",
+                target: TriggerTargetKind::Table,
                 table_schema: "public",
                 table: "orders",
                 function_schema: "public",
@@ -5557,6 +5640,7 @@ mod tests {
                 20,
                 &WalOp::CreateTrigger {
                     name: "audit_row",
+                    target: TriggerTargetKind::Table,
                     table_schema: "public",
                     table: "orders",
                     function_schema: "public",
@@ -5577,6 +5661,7 @@ mod tests {
                 21,
                 &WalOp::AlterTrigger {
                     name: "audit_row",
+                    target: TriggerTargetKind::Table,
                     table_schema: "public",
                     table: "orders",
                     new_name: "audit_row_disabled",
@@ -5588,6 +5673,7 @@ mod tests {
                 22,
                 &WalOp::DropTrigger {
                     name: "audit_row_disabled",
+                    target: TriggerTargetKind::Table,
                     table_schema: "public",
                     table: "orders",
                 },

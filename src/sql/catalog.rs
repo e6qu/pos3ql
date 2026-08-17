@@ -1630,7 +1630,7 @@ pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32) -> Option<(i64,
 /// Plain views get OIDs from their own range so `'view'::regclass` resolves and
 /// their comments surface, even though a view is not yet a full `pg_class` row.
 const FIRST_VIEW_OID: i32 = 100_000;
-fn view_oid(slot: usize) -> i32 {
+pub(crate) fn view_oid(slot: usize) -> i32 {
     FIRST_VIEW_OID + slot as i32
 }
 
@@ -5067,10 +5067,22 @@ fn pg_trigger<'a>(
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_trigger"));
         }
-        let table = usize::from(trigger.table);
-        if !storage.table(table).visible_to(txid) {
-            continue;
-        }
+        let relation_oid = match trigger.target {
+            crate::storage::TriggerTarget::Table(slot) => {
+                let slot = usize::from(slot);
+                if !storage.table(slot).visible_to(txid) {
+                    continue;
+                }
+                table_oid(storage, slot)
+            }
+            crate::storage::TriggerTarget::View(slot) => {
+                let slot = usize::from(slot);
+                if !storage.view(slot).visible_to(txid) {
+                    continue;
+                }
+                view_oid(slot)
+            }
+        };
         let function = storage.routine(usize::from(trigger.function));
         let (old_table, new_table) = match &trigger.transition_tables {
             crate::storage::TriggerTransitionTables::None => ("", ""),
@@ -5085,7 +5097,7 @@ fn pg_trigger<'a>(
                 Datum::Int4(2620),
                 Datum::Int4(crate::storage::trigger_oid(trigger)),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(table_oid(storage, table)),
+                Datum::Int4(relation_oid),
                 Datum::Bpchar(if trigger.enabled_to(txid) { "O" } else { "D" }),
                 Datum::Bool(false),
                 Datum::Int4(0),

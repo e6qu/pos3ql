@@ -1350,6 +1350,7 @@ def test_catalog_aware_binary_bind_parameters():
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
+    required_domain_array_oid = 150000 + required_domain_oid - 110000
     coordinate_domain_oid = int(
         first_text_row(
             simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate_domain'")
@@ -1363,6 +1364,13 @@ def test_catalog_aware_binary_bind_parameters():
     routine_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_proc WHERE proname = 'wire_binary_routine'"))
     )
+    namespace_oid = int(
+        first_text_row(
+            simple_query(s, "SELECT oid FROM pg_namespace WHERE nspname = 'public'")
+        )
+    )
+    role_name = first_text_row(simple_query(s, "SELECT current_user"))
+    role_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_roles WHERE rolname = current_user")))
     cases = [
         ("unknown", "SELECT $1::text", 705, b"wire text", "wire text", None),
         ("regtype", "SELECT $1::regtype", 2206, struct.pack("!i", 23), "integer", None),
@@ -1389,6 +1397,70 @@ def test_catalog_aware_binary_bind_parameters():
             2204,
             struct.pack("!i", 551),
             "+(integer,integer)",
+            None,
+        ),
+        (
+            "regtype array",
+            "SELECT $1::regtype[]",
+            2211,
+            binary_array(2206, [struct.pack("!i", 23)]),
+            "{integer}",
+            None,
+        ),
+        (
+            "regproc array",
+            "SELECT $1::regproc[]",
+            1008,
+            binary_array(24, [struct.pack("!i", routine_oid)]),
+            "{wire_binary_routine}",
+            None,
+        ),
+        (
+            "regprocedure array",
+            "SELECT $1::regprocedure[]",
+            2207,
+            binary_array(2202, [struct.pack("!i", routine_oid)]),
+            "{wire_binary_routine(integer)}",
+            None,
+        ),
+        (
+            "regoper array",
+            "SELECT $1::regoper[]",
+            2208,
+            binary_array(2203, [struct.pack("!i", 551)]),
+            "{pg_catalog.+}",
+            None,
+        ),
+        (
+            "regoperator array",
+            "SELECT $1::regoperator[]",
+            2209,
+            binary_array(2204, [struct.pack("!i", 551)]),
+            '{"+(integer,integer)"}',
+            None,
+        ),
+        (
+            "regclass array",
+            "SELECT $1::regclass[]",
+            2210,
+            binary_array(2205, [struct.pack("!i", regclass_oid)]),
+            "{wire_binary_regclass}",
+            None,
+        ),
+        (
+            "regnamespace array",
+            "SELECT $1::regnamespace[]",
+            4090,
+            binary_array(4089, [struct.pack("!i", namespace_oid)]),
+            "{public}",
+            None,
+        ),
+        (
+            "regrole array",
+            "SELECT $1::regrole[]",
+            4097,
+            binary_array(4096, [struct.pack("!i", role_oid)]),
+            "{" + role_name + "}",
             None,
         ),
         ("invalid regtype", "SELECT $1::regtype", 2206, b"\x00", None, "22P03"),
@@ -1503,6 +1575,14 @@ def test_catalog_aware_binary_bind_parameters():
             "23514",
         ),
         ("null required domain", "SELECT $1::wire_binary_required", required_domain_oid, None, None, "23502"),
+        (
+            "null required domain-array element",
+            "SELECT $1::wire_binary_required[]",
+            required_domain_array_oid,
+            binary_array(required_domain_oid, [None]),
+            None,
+            "23502",
+        ),
     ]
     for name, text, oid, value, expected, state in cases:
         messages = extended_binary_parameter(s, text, oid, value)
@@ -1551,6 +1631,13 @@ def test_catalog_aware_binary_bind_parameters():
     check(
         "binary Bind record enforces nested domain constraints",
         has_sqlstate(messages, "23514"),
+        messages,
+    )
+    null_domain_record = binary_record([(required_domain_oid, None)])
+    messages = extended_binary_parameter(s, "SELECT $1::record", 2249, null_domain_record)
+    check(
+        "binary Bind record enforces nested domain not-null",
+        has_sqlstate(messages, "23502"),
         messages,
     )
     # A domain over a composite remains a domain at the array wire boundary:
@@ -1603,6 +1690,47 @@ def test_catalog_aware_binary_bind_parameters():
             f"binary Result preserves {name}",
             description is not None
             and row_description_type_oids(description) == [oid]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+            messages,
+        )
+    catalog_reference_results = [
+        ("regtype", "SELECT ARRAY['integer'::regtype]", 2211, 2206, 23),
+        ("regproc", "SELECT ARRAY['wire_binary_routine'::regproc]", 1008, 24, routine_oid),
+        (
+            "regprocedure",
+            "SELECT ARRAY['wire_binary_routine(integer)'::regprocedure]",
+            2207,
+            2202,
+            routine_oid,
+        ),
+        ("regoper", "SELECT ARRAY[551::regoper]", 2208, 2203, 551),
+        (
+            "regoperator",
+            "SELECT ARRAY['+(integer,integer)'::regoperator]",
+            2209,
+            2204,
+            551,
+        ),
+        (
+            "regclass",
+            "SELECT ARRAY['wire_binary_regclass'::regclass]",
+            2210,
+            2205,
+            regclass_oid,
+        ),
+        ("regnamespace", "SELECT ARRAY['public'::regnamespace]", 4090, 4089, namespace_oid),
+        ("regrole", "SELECT ARRAY[current_user::regrole]", 4097, 4096, role_oid),
+    ]
+    for name, query, array_oid, element_oid, value_oid in catalog_reference_results:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        expected = binary_array(element_oid, [struct.pack("!i", value_oid)])
+        check(
+            f"binary Result preserves {name} array identity and element OID",
+            description is not None
+            and row_description_type_oids(description) == [array_oid]
             and row_description_formats(description) == [1]
             and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
             messages,

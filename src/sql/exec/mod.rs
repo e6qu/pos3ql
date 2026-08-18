@@ -19802,6 +19802,10 @@ pub(crate) fn decode_text_input<'a>(
             | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
         ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena),
+        ColType::Array(element) if element.is_catalog_reference() => {
+            let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+            crate::sql::eval::reg_array_cast(Datum::Text(text), element, Some(&catalog), arena)
+        }
         _ => crate::sql::eval::cast_to(Datum::Text(text), ctype, arena),
     };
     match resolve_parameter_input_type(storage, oid, txid)? {
@@ -20001,7 +20005,12 @@ fn decode_binary_record<'a>(
         field.name = RECORD_FIELD_NAMES[index];
         field.type_oid = type_oid;
         field.value = if length == -1 {
-            Datum::Null
+            match context {
+                BinaryDecodeContext::Plain => Datum::Null,
+                BinaryDecodeContext::Catalog { storage, txid } => {
+                    coerce_binary_input_null(storage, type_oid, arena, txid)?
+                }
+            }
         } else {
             let bytes = reader.take(length as usize).map_err(|_| bad())?;
             decode_binary_field_by_oid(type_oid, bytes, arena, context)?
@@ -20132,16 +20141,15 @@ fn decode_binary_array<'a>(
     let mut saw_null = false;
     for slot in items.iter_mut().take(count) {
         let len = reader.i32().map_err(|_| bad())?;
-        if len == -1 {
-            *slot = Datum::Null;
+        let value = if len == -1 {
             saw_null = true;
-            continue;
-        }
-        if len < -1 {
+            Datum::Null
+        } else if len < -1 {
             return Err(bad());
-        }
-        let field = reader.take(len as usize).map_err(|_| bad())?;
-        let value = decode_binary_field_with_context(element_type, field, arena, context)?;
+        } else {
+            let field = reader.take(len as usize).map_err(|_| bad())?;
+            decode_binary_field_with_context(element_type, field, arena, context)?
+        };
         *slot = match element {
             crate::sql::types::ArrElem::Domain { slot, .. } => {
                 let BinaryDecodeContext::Catalog { storage, txid } = context else {
@@ -26766,6 +26774,12 @@ fn coerce<'a>(
     ) = col.ctype
     {
         return coerce_user_type_array(v, element, storage, txid, arena);
+    }
+    if let ColType::Array(element) = col.ctype
+        && element.is_catalog_reference()
+    {
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+        return crate::sql::eval::reg_array_cast(v, element, Some(&catalog), arena);
     }
     if col.ctype.is_reg_object() {
         let catalog = crate::sql::query::storage_catalog(storage, arena, txid);

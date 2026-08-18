@@ -1040,6 +1040,22 @@ def binary_record(fields):
     return body
 
 
+def binary_int4_range(lower, upper):
+    return (
+        b"\x02"
+        + struct.pack("!i", 4)
+        + struct.pack("!i", lower)
+        + struct.pack("!i", 4)
+        + struct.pack("!i", upper)
+    )
+
+
+def binary_multirange(ranges):
+    return struct.pack("!i", len(ranges)) + b"".join(
+        struct.pack("!i", len(item)) + item for item in ranges
+    )
+
+
 def extended_binary_parameter(s, text, oid, value):
     parse = frontend_message(
         b"P", b"\x00" + text.encode() + b"\x00" + struct.pack("!hi", 1, oid)
@@ -1555,6 +1571,22 @@ def test_catalog_aware_binary_bind_parameters():
             "{1,NULL,00111}",
             None,
         ),
+        (
+            "range array",
+            "SELECT $1::int4range[]",
+            3905,
+            binary_array(3904, [binary_int4_range(1, 3), None, binary_int4_range(5, 7)]),
+            '{"[1,3)",NULL,"[5,7)"}',
+            None,
+        ),
+        (
+            "multirange array",
+            "SELECT $1::int4multirange[]",
+            6150,
+            binary_array(4451, [binary_multirange([binary_int4_range(1, 3)])]),
+            '{"{[1,3)}"}',
+            None,
+        ),
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),
         ("invalid json", "SELECT $1::json", 114, b"{not json}", None, "22P02"),
         ("invalid jsonb", "SELECT $1::jsonb", 3802, b"\x01{not json}", None, "22P02"),
@@ -1729,6 +1761,29 @@ def test_catalog_aware_binary_bind_parameters():
         expected = binary_array(element_oid, [struct.pack("!i", value_oid)])
         check(
             f"binary Result preserves {name} array identity and element OID",
+            description is not None
+            and row_description_type_oids(description) == [array_oid]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+            messages,
+        )
+    range_array_results = [
+        ("range", "SELECT ARRAY['[1,3)'::int4range]", 3905, 3904, binary_int4_range(1, 3)),
+        (
+            "multirange",
+            "SELECT ARRAY['{[1,3)}'::int4multirange]",
+            6150,
+            4451,
+            binary_multirange([binary_int4_range(1, 3)]),
+        ),
+    ]
+    for name, query, array_oid, element_oid, value in range_array_results:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        expected = binary_array(element_oid, [value])
+        check(
+            f"binary Result preserves {name} array identity and nested send form",
             description is not None
             and row_description_type_oids(description) == [array_oid]
             and row_description_formats(description) == [1]

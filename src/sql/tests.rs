@@ -2299,6 +2299,104 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
 }
 
 #[test]
+fn range_and_multirange_arrays_keep_catalog_and_durable_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE range_array_values (\
+           int4_ranges int4range[], int8_ranges int8range[], numeric_ranges numrange[],\
+           date_ranges daterange[], timestamp_ranges tsrange[], timestamptz_ranges tstzrange[],\
+           int4_multiranges int4multirange[], int8_multiranges int8multirange[],\
+           numeric_multiranges nummultirange[], date_multiranges datemultirange[],\
+           timestamp_multiranges tsmultirange[], timestamptz_multiranges tstzmultirange[]\
+         ); \
+         INSERT INTO range_array_values VALUES (\
+           ARRAY['[1,3)'::int4range], ARRAY['[1,3)'::int8range], ARRAY['[1.5,3.5)'::numrange],\
+           ARRAY['[2020-01-01,2020-01-03)'::daterange],\
+           ARRAY['[2020-01-01 00:00:00,2020-01-02 00:00:00)'::tsrange],\
+           ARRAY['[2020-01-01 00:00:00+00,2020-01-02 00:00:00+00)'::tstzrange],\
+           ARRAY['{[1,3)}'::int4multirange], ARRAY['{[1,3)}'::int8multirange],\
+           ARRAY['{[1.5,3.5)}'::nummultirange], ARRAY['{[2020-01-01,2020-01-03)}'::datemultirange],\
+           ARRAY['{[2020-01-01 00:00:00,2020-01-02 00:00:00)}'::tsmultirange],\
+           ARRAY['{[2020-01-01 00:00:00+00,2020-01-02 00:00:00+00)}'::tstzmultirange]\
+         ); \
+         SELECT pg_typeof(int4_ranges), pg_typeof(int8_ranges), pg_typeof(numeric_ranges),\
+                pg_typeof(date_ranges), pg_typeof(timestamp_ranges), pg_typeof(timestamptz_ranges),\
+                pg_typeof(int4_multiranges), pg_typeof(int8_multiranges), pg_typeof(numeric_multiranges),\
+                pg_typeof(date_multiranges), pg_typeof(timestamp_multiranges), pg_typeof(timestamptz_multiranges)\
+           FROM range_array_values",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "int4range[]|int8range[]|numrange[]|daterange[]|tsrange[]|tstzrange[]|int4multirange[]|int8multirange[]|nummultirange[]|datemultirange[]|tsmultirange[]|tstzmultirange[]"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let oids = row_description_type_oids(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT int4_ranges, int8_ranges, numeric_ranges, date_ranges, timestamp_ranges, timestamptz_ranges, \
+                int4_multiranges, int8_multiranges, numeric_multiranges, date_multiranges, timestamp_multiranges, timestamptz_multiranges \
+           FROM range_array_values",
+    ));
+    assert_eq!(
+        oids,
+        [
+            3905, 3927, 3907, 3913, 3909, 3911, 6150, 6157, 6151, 6155, 6152, 6153
+        ]
+    );
+}
+
+#[test]
+fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("range-array-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_range_arrays (\
+               int4_values int4range[], int8_values int8range[], numeric_values numrange[],\
+               date_values daterange[], timestamp_values tsrange[], timestamptz_values tstzrange[],\
+               int4_multi int4multirange[], int8_multi int8multirange[], numeric_multi nummultirange[],\
+               date_multi datemultirange[], timestamp_multi tsmultirange[], timestamptz_multi tstzmultirange[]\
+             ); \
+             INSERT INTO durable_range_arrays VALUES (\
+               ARRAY['[1,3)'::int4range], ARRAY['[1,3)'::int8range], ARRAY['[1.5,3.5)'::numrange],\
+               ARRAY['[2020-01-01,2020-01-03)'::daterange],\
+               ARRAY['[2020-01-01 00:00:00,2020-01-02 00:00:00)'::tsrange],\
+               ARRAY['[2020-01-01 00:00:00+00,2020-01-02 00:00:00+00)'::tstzrange],\
+               ARRAY['{[1,3)}'::int4multirange], ARRAY['{[1,3)}'::int8multirange],\
+               ARRAY['{[1.5,3.5)}'::nummultirange], ARRAY['{[2020-01-01,2020-01-03)}'::datemultirange],\
+               ARRAY['{[2020-01-01 00:00:00,2020-01-02 00:00:00)}'::tsmultirange],\
+               ARRAY['{[2020-01-01 00:00:00+00,2020-01-02 00:00:00+00)}'::tstzmultirange]\
+             )",
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_range_arrays",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{\"[1,3)\"}|{\"[1,3)\"}|{\"[1.5,3.5)\"}|{\"[2020-01-01,2020-01-03)\"}|{\"[\\\"2020-01-01 00:00:00\\\",\\\"2020-01-02 00:00:00\\\")\"}|{\"[\\\"2020-01-01 00:00:00+00\\\",\\\"2020-01-02 00:00:00+00\\\")\"}|{\"{[1,3)}\"}|{\"{[1,3)}\"}|{\"{[1.5,3.5)}\"}|{\"{[2020-01-01,2020-01-03)}\"}|{\"{[\\\"2020-01-01 00:00:00\\\",\\\"2020-01-02 00:00:00\\\")}\"}|{\"{[\\\"2020-01-01 00:00:00+00\\\",\\\"2020-01-02 00:00:00+00\\\")}\"}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn binary_parameters_resolve_catalog_types_before_decoding() {
     let (mut engine, mut budget) = test_engine();
     run_with(

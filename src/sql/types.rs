@@ -355,7 +355,6 @@ impl ColType {
             Self::Composite(slot) => oid::composite_oid(slot),
         }
     }
-
     /// Inverse of [`ColType::oid`]: the column type a PostgreSQL type OID names,
     /// or `None` for an OID this engine does not model. Used to decode a
     /// binary-format parameter whose type the client declared by OID.
@@ -793,6 +792,12 @@ pub enum ArrElem {
     Regclass,
     Regnamespace,
     Regrole,
+    /// One of PostgreSQL's six built-in range types. Keeping the subtype in
+    /// the element identity makes `int4range[]` and `numrange[]` distinct
+    /// durable and wire types rather than text arrays.
+    Range(RangeKind),
+    /// One of PostgreSQL's six built-in multirange types.
+    Multirange(RangeKind),
     /// An enum array keeps the catalog slot as its runtime identity. Table
     /// metadata also persists the type name and rebinds the slot on startup.
     Enum(u16),
@@ -819,7 +824,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 35] = [
+    pub const BUILTIN: [Self; 47] = [
         Self::Bool,
         Self::Int2,
         Self::Int4,
@@ -855,6 +860,18 @@ impl ArrElem {
         Self::Regclass,
         Self::Regnamespace,
         Self::Regrole,
+        Self::Range(RangeKind::Int4),
+        Self::Range(RangeKind::Int8),
+        Self::Range(RangeKind::Num),
+        Self::Range(RangeKind::Date),
+        Self::Range(RangeKind::Ts),
+        Self::Range(RangeKind::Tstz),
+        Self::Multirange(RangeKind::Int4),
+        Self::Multirange(RangeKind::Int8),
+        Self::Multirange(RangeKind::Num),
+        Self::Multirange(RangeKind::Date),
+        Self::Multirange(RangeKind::Ts),
+        Self::Multirange(RangeKind::Tstz),
     ];
 
     /// Whether text input for this element needs catalog identity resolution.
@@ -910,6 +927,22 @@ impl ArrElem {
             ArrElem::Regclass => "_regclass",
             ArrElem::Regnamespace => "_regnamespace",
             ArrElem::Regrole => "_regrole",
+            ArrElem::Range(kind) => match kind {
+                RangeKind::Int4 => "_int4range",
+                RangeKind::Int8 => "_int8range",
+                RangeKind::Num => "_numrange",
+                RangeKind::Date => "_daterange",
+                RangeKind::Ts => "_tsrange",
+                RangeKind::Tstz => "_tstzrange",
+            },
+            ArrElem::Multirange(kind) => match kind {
+                RangeKind::Int4 => "_int4multirange",
+                RangeKind::Int8 => "_int8multirange",
+                RangeKind::Num => "_nummultirange",
+                RangeKind::Date => "_datemultirange",
+                RangeKind::Ts => "_tsmultirange",
+                RangeKind::Tstz => "_tstzmultirange",
+            },
             ArrElem::Enum(_) => "_enum",
             ArrElem::Composite(_) => "_record",
             ArrElem::Domain { .. } => "_domain",
@@ -956,6 +989,22 @@ impl ArrElem {
             ArrElem::Regclass => "regclass[]",
             ArrElem::Regnamespace => "regnamespace[]",
             ArrElem::Regrole => "regrole[]",
+            ArrElem::Range(kind) => match kind {
+                RangeKind::Int4 => "int4range[]",
+                RangeKind::Int8 => "int8range[]",
+                RangeKind::Num => "numrange[]",
+                RangeKind::Date => "daterange[]",
+                RangeKind::Ts => "tsrange[]",
+                RangeKind::Tstz => "tstzrange[]",
+            },
+            ArrElem::Multirange(kind) => match kind {
+                RangeKind::Int4 => "int4multirange[]",
+                RangeKind::Int8 => "int8multirange[]",
+                RangeKind::Num => "nummultirange[]",
+                RangeKind::Date => "datemultirange[]",
+                RangeKind::Ts => "tsmultirange[]",
+                RangeKind::Tstz => "tstzmultirange[]",
+            },
             ArrElem::Enum(_) => "enum[]",
             ArrElem::Composite(_) => "record[]",
             ArrElem::Domain { .. } => "domain[]",
@@ -1010,6 +1059,8 @@ impl ArrElem {
                 oid::REGROLE => ArrElem::Regrole,
                 _ => return None,
             },
+            Datum::Range { kind, .. } => ArrElem::Range(*kind),
+            Datum::Multirange { kind, .. } => ArrElem::Multirange(*kind),
             Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
             Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
                 ArrElem::Composite(*slot)
@@ -1040,6 +1091,8 @@ impl ArrElem {
             ColType::Regclass => return Some(ArrElem::Regclass),
             ColType::Regnamespace => return Some(ArrElem::Regnamespace),
             ColType::Regrole => return Some(ArrElem::Regrole),
+            ColType::Range(kind) => return Some(ArrElem::Range(kind)),
+            ColType::Multirange(kind) => return Some(ArrElem::Multirange(kind)),
             _ => {}
         }
         Some(match c.storage() {
@@ -1105,6 +1158,8 @@ impl ArrElem {
             ArrElem::Regclass => ColType::Regclass,
             ArrElem::Regnamespace => ColType::Regnamespace,
             ArrElem::Regrole => ColType::Regrole,
+            ArrElem::Range(kind) => ColType::Range(kind),
+            ArrElem::Multirange(kind) => ColType::Multirange(kind),
             ArrElem::Enum(slot) => ColType::Enum(slot),
             ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
@@ -1161,6 +1216,8 @@ impl ArrElem {
             ArrElem::Regclass => oid::REGCLASS_ARRAY,
             ArrElem::Regnamespace => oid::REGNAMESPACE_ARRAY,
             ArrElem::Regrole => oid::REGROLE_ARRAY,
+            ArrElem::Range(kind) => kind.array_oid(),
+            ArrElem::Multirange(kind) => kind.multirange_array_oid(),
             ArrElem::Enum(slot) => oid::enum_array_oid(slot),
             ArrElem::Composite(slot) => oid::composite_array_oid(slot),
             ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
@@ -1214,6 +1271,8 @@ impl ArrElem {
             ArrElem::Regclass => 48,
             ArrElem::Regnamespace => 49,
             ArrElem::Regrole => 50,
+            ArrElem::Range(kind) => 51 + kind.code(),
+            ArrElem::Multirange(kind) => 57 + kind.code(),
             ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
             ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
             ArrElem::Composite(slot) => Self::COMPOSITE_CODE_BASE + slot as u8,
@@ -1257,6 +1316,8 @@ impl ArrElem {
             48 => ArrElem::Regclass,
             49 => ArrElem::Regnamespace,
             50 => ArrElem::Regrole,
+            51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
+            57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
             c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
                 .contains(&c) =>
             {
@@ -1467,6 +1528,17 @@ impl RangeKind {
             Self::Int8 => 3926,
         }
     }
+    /// PostgreSQL's array type OID for this range type.
+    pub fn array_oid(self) -> i32 {
+        match self {
+            Self::Int4 => 3905,
+            Self::Num => 3907,
+            Self::Ts => 3909,
+            Self::Tstz => 3911,
+            Self::Date => 3913,
+            Self::Int8 => 3927,
+        }
+    }
     /// The element (subtype) column type.
     pub fn elem_type(self) -> ColType {
         match self {
@@ -1525,6 +1597,17 @@ impl RangeKind {
             Self::Date => oid::DATEMULTIRANGE,
             Self::Ts => oid::TSMULTIRANGE,
             Self::Tstz => oid::TSTZMULTIRANGE,
+        }
+    }
+    /// PostgreSQL's array type OID for this multirange type.
+    pub fn multirange_array_oid(self) -> i32 {
+        match self {
+            Self::Int4 => 6150,
+            Self::Num => 6151,
+            Self::Ts => 6152,
+            Self::Tstz => 6153,
+            Self::Date => 6155,
+            Self::Int8 => 6157,
         }
     }
     /// Resolves a multirange type name to its range subtype.

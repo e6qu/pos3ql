@@ -19,6 +19,7 @@ use crate::storage::{
     OwnedDatum, RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics,
     UniqueKey,
 };
+use crate::util::StackStr;
 
 use crc32c::crc32c;
 
@@ -389,6 +390,8 @@ pub(crate) enum WalOp<'a> {
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
+            crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
         schemas: [u8; crate::storage::MAX_SCHEMAS],
         schema_count: usize,
@@ -407,6 +410,8 @@ pub(crate) enum WalOp<'a> {
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
+            crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
         schemas: [u8; crate::storage::MAX_SCHEMAS],
         schema_count: usize,
@@ -1524,15 +1529,40 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             table_count,
             schema_count,
+            table_filter_sql,
             ..
-        } => 1 + name.len() + 2 + 1 + 1 + 1 + table_count * 10 + schema_count,
+        } => {
+            1 + name.len()
+                + 2
+                + 1
+                + 1
+                + 1
+                + table_count * 10
+                + schema_count
+                + table_filter_sql[..*table_count]
+                    .iter()
+                    .map(|filter| 2 + filter.as_str().len())
+                    .sum::<usize>()
+        }
         WalOp::DropPublication { name } => 1 + name.len(),
         WalOp::AlterPublication {
             name,
             table_count,
             schema_count,
+            table_filter_sql,
             ..
-        } => 1 + name.len() + 1 + 1 + 1 + table_count * 10 + schema_count,
+        } => {
+            1 + name.len()
+                + 1
+                + 1
+                + 1
+                + table_count * 10
+                + schema_count
+                + table_filter_sql[..*table_count]
+                    .iter()
+                    .map(|filter| 2 + filter.as_str().len())
+                    .sum::<usize>()
+        }
         WalOp::SetPublicationOwner { name, .. } => 1 + name.len() + 2,
         WalOp::RenamePublication { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::CreateSubscription {
@@ -2098,6 +2128,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             all_tables,
             tables,
             table_column_masks,
+            table_filter_sql,
             table_count,
             publish_insert,
             publish_update,
@@ -2120,6 +2151,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for mask in &table_column_masks[..*table_count] {
                 ok = ok && buffer.append(&mask.to_le_bytes());
             }
+            for filter in &table_filter_sql[..*table_count] {
+                ok = ok
+                    && buffer.append(&(filter.as_str().len() as u16).to_le_bytes())
+                    && buffer.append(filter.as_str().as_bytes());
+            }
             ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
         }
@@ -2129,6 +2165,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             all_tables,
             tables,
             table_column_masks,
+            table_filter_sql,
             table_count,
             schemas,
             schema_count,
@@ -2149,6 +2186,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             for mask in &table_column_masks[..*table_count] {
                 ok = ok && buffer.append(&mask.to_le_bytes());
+            }
+            for filter in &table_filter_sql[..*table_count] {
+                ok = ok
+                    && buffer.append(&(filter.as_str().len() as u16).to_le_bytes())
+                    && buffer.append(filter.as_str().as_bytes());
             }
             ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
@@ -3351,6 +3393,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
             }
+            let mut table_filter_sql = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
+            for filter in &mut table_filter_sql[..count] {
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                core::fmt::Write::write_str(
+                    filter,
+                    core::str::from_utf8(payload.get(at..at + len)?).ok()?,
+                )
+                .ok()?;
+                if filter.is_truncated() {
+                    return None;
+                }
+                at += len;
+            }
             let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
@@ -3360,6 +3416,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 all_tables: flags & 1 != 0,
                 tables,
                 table_column_masks,
+                table_filter_sql,
                 table_count: count,
                 schemas,
                 schema_count,
@@ -3397,6 +3454,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
             }
+            let mut table_filter_sql = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
+            for filter in &mut table_filter_sql[..count] {
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                core::fmt::Write::write_str(
+                    filter,
+                    core::str::from_utf8(payload.get(at..at + len)?).ok()?,
+                )
+                .ok()?;
+                if filter.is_truncated() {
+                    return None;
+                }
+                at += len;
+            }
             let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
@@ -3405,6 +3476,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 all_tables: flags & 1 != 0,
                 tables,
                 table_column_masks,
+                table_filter_sql,
                 table_count: count,
                 schemas,
                 schema_count,
@@ -5673,6 +5745,7 @@ mod tests {
                     all_tables: false,
                     tables: publication_tables,
                     table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
                     schema_count: 0,
@@ -5690,6 +5763,7 @@ mod tests {
                     all_tables: false,
                     tables: publication_tables,
                     table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
                     schema_count: 0,

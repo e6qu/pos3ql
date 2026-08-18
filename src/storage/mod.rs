@@ -30,6 +30,68 @@ pub(crate) use rowenc::MAX_COLUMNS;
 /// encodes this count in one byte, so the capacity derives from that boundary
 /// instead of permitting an unencodable 256th member.
 pub(crate) const MAX_PUBLICATION_TABLES: usize = u8::MAX as usize;
+/// One publication's filters live inline in its fixed catalog record.  The
+/// bound keeps catalog and WAL decode frames comfortably below the server's
+/// bounded-stack contract while still accepting the simple predicates that
+/// PostgreSQL permits here.
+pub(crate) const PUBLICATION_FILTER_SQL_MAX: usize = 64;
+/// Total filter-source storage for one publication. Individual filters retain
+/// their own SQL boundary above; this shared storage avoids reserving that
+/// boundary for every unused relation member.
+pub(crate) const PUBLICATION_FILTER_STORAGE_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PublicationFilters {
+    sql: StackStr<PUBLICATION_FILTER_STORAGE_BYTES>,
+    ends: [u16; MAX_PUBLICATION_TABLES],
+}
+
+impl PublicationFilters {
+    pub(crate) const EMPTY: Self = Self {
+        sql: StackStr::new(),
+        ends: [0; MAX_PUBLICATION_TABLES],
+    };
+
+    pub(crate) fn from_sql(
+        filters: &[StackStr<PUBLICATION_FILTER_SQL_MAX>],
+    ) -> Result<Self, SqlError> {
+        let mut out = Self::EMPTY;
+        for (index, filter) in filters.iter().enumerate() {
+            let before = out.sql.as_str().len();
+            use core::fmt::Write;
+            let _ = out.sql.write_str(filter.as_str());
+            if out.sql.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "publication row filters exceed {} bytes",
+                    PUBLICATION_FILTER_STORAGE_BYTES
+                ));
+            }
+            out.ends[index] = (before + filter.as_str().len()) as u16;
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn get(&self, index: usize) -> &str {
+        let start = if index == 0 {
+            0
+        } else {
+            self.ends[index - 1] as usize
+        };
+        &self.sql.as_str()[start..self.ends[index] as usize]
+    }
+
+    pub(crate) fn materialize_sql(
+        &self,
+        count: usize,
+    ) -> [StackStr<PUBLICATION_FILTER_SQL_MAX>; MAX_PUBLICATION_TABLES] {
+        let mut filters = [StackStr::new(); MAX_PUBLICATION_TABLES];
+        for (index, filter) in filters[..count].iter_mut().enumerate() {
+            *filter = StackStr::from_str(self.get(index));
+        }
+        filters
+    }
+}
 
 /// A subscription's publication list is part of its startup-bounded durable
 /// state, rather than an unbounded connection-side string.
@@ -1889,6 +1951,7 @@ pub struct PublicationDef {
     /// A zero mask means the member publishes all columns; otherwise bit n
     /// selects PostgreSQL attribute n + 1.
     pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    pub table_filters: PublicationFilters,
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
     pub schema_count: usize,
@@ -1909,6 +1972,7 @@ pub(crate) struct PublicationDefinition {
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
     pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    pub table_filters: PublicationFilters,
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
     pub schema_count: usize,
@@ -1947,6 +2011,7 @@ pub struct PublicationSpec<'a> {
     pub all_tables: bool,
     pub tables: &'a [u16],
     pub table_column_masks: &'a [u64],
+    pub table_filter_sql: &'a [StackStr<PUBLICATION_FILTER_SQL_MAX>],
     pub schemas: &'a [u8],
     pub publish_insert: bool,
     pub publish_update: bool,
@@ -2126,6 +2191,7 @@ impl PublicationDef {
             all_tables: self.all_tables,
             tables: self.tables,
             table_column_masks: self.table_column_masks,
+            table_filters: self.table_filters,
             table_count: self.table_count,
             schemas: self.schemas,
             schema_count: self.schema_count,
@@ -2146,6 +2212,7 @@ impl PublicationDef {
         self.all_tables = definition.all_tables;
         self.tables = definition.tables;
         self.table_column_masks = definition.table_column_masks;
+        self.table_filters = definition.table_filters;
         self.table_count = definition.table_count;
         self.schemas = definition.schemas;
         self.schema_count = definition.schema_count;
@@ -4546,6 +4613,7 @@ impl Storage {
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
                     + size_of::<TriggerDef>()
+                    + size_of::<PublicationDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<MatviewDef>()
                     + size_of::<StoredQueryDependencies>()
@@ -4678,6 +4746,7 @@ impl Storage {
                     all_tables: false,
                     tables: [u16::MAX; MAX_PUBLICATION_TABLES],
                     table_column_masks: [0; MAX_PUBLICATION_TABLES],
+                    table_filters: PublicationFilters::EMPTY,
                     table_count: 0,
                     schemas: [u8::MAX; MAX_SCHEMAS],
                     schema_count: 0,
@@ -11490,6 +11559,12 @@ impl Storage {
                 "publication table projections do not match publication members"
             ));
         }
+        if spec.table_filter_sql.len() != spec.tables.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "publication row filters do not match publication members"
+            ));
+        }
         if spec.schemas.len() > MAX_SCHEMAS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -11537,6 +11612,7 @@ impl Storage {
         let mut table_column_masks = [0u64; MAX_PUBLICATION_TABLES];
         table_column_masks[..spec.table_column_masks.len()]
             .copy_from_slice(spec.table_column_masks);
+        let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
@@ -11547,6 +11623,7 @@ impl Storage {
             all_tables: spec.all_tables,
             tables: members,
             table_column_masks,
+            table_filters,
             table_count: spec.tables.len(),
             schemas,
             schema_count: spec.schemas.len(),
@@ -16193,6 +16270,24 @@ mod tests {
         assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, true).is_none());
         assert!(
             ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), true).is_none()
+        );
+    }
+
+    #[test]
+    fn publication_filters_share_one_bounded_catalog_payload() {
+        let source = [StackStr::from_str("id > 0"), StackStr::from_str("id < 10")];
+        let filters = PublicationFilters::from_sql(&source).unwrap();
+        assert_eq!(filters.get(0), "id > 0");
+        assert_eq!(filters.get(1), "id < 10");
+
+        let member =
+            StackStr::from_str("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        let too_large = [member; PUBLICATION_FILTER_STORAGE_BYTES / PUBLICATION_FILTER_SQL_MAX + 1];
+        assert_eq!(
+            PublicationFilters::from_sql(&too_large)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
     }
 }

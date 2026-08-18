@@ -661,6 +661,79 @@ fn publication_column_mask(
     Ok((selected != 0).then_some(selected))
 }
 
+/// True when the subscribed publication union selects this row.  A missing
+/// filter admits every row; otherwise PostgreSQL combines the filters with OR
+/// and treats NULL like false.
+#[inline(never)]
+fn publication_row_matches(
+    storage: &Storage,
+    publication_names: &[SqlName],
+    table_slot: usize,
+    operation: PublicationOperation,
+    values: &[Datum],
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    let definition = storage.table_def(table_slot, 0);
+    let schema_member = |publication: &crate::storage::PublicationDef| {
+        storage
+            .find_schema(definition.schema.as_str())
+            .is_some_and(|slot| {
+                publication.schemas[..publication.schema_count].contains(&(slot as u8))
+            })
+    };
+    for name in publication_names {
+        let publication = storage.publication(name.as_str()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                name.as_str()
+            )
+        })?;
+        let publishes = match operation {
+            PublicationOperation::Insert => publication.publish_insert,
+            PublicationOperation::Update => publication.publish_update,
+            PublicationOperation::Delete => publication.publish_delete,
+            PublicationOperation::Truncate => publication.publish_truncate,
+        };
+        if !publishes {
+            continue;
+        }
+        if publication.all_tables || schema_member(publication) {
+            return Ok(true);
+        }
+        let Some(index) = publication.tables[..publication.table_count]
+            .iter()
+            .position(|member| *member == table_slot as u16)
+        else {
+            continue;
+        };
+        let filter = publication.table_filters.get(index);
+        if filter.is_empty() {
+            return Ok(true);
+        }
+        let mark = arena.mark();
+        let result = (|| {
+            let expression = parser::parse_expr(filter, arena)?;
+            let row = exec::RowCtx {
+                def: definition,
+                values,
+                alias: None,
+            };
+            Ok(matches!(
+                eval(expression, arena, NO_PARAMS, &row)?,
+                Datum::Bool(true)
+            ))
+        })();
+        // The parsed AST and every scalar temporary are consumed above.  A
+        // filter never retains execution memory across rows or transactions.
+        unsafe { arena.rewind_to(mark) };
+        if result? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn project_replication_values<'a>(
     values: &[Datum<'a>],
     column_mask: u64,
@@ -1222,7 +1295,9 @@ impl Engine {
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<(u64, bool)>, SqlError> {
+        self.work.reset();
         let storage = &self.storage;
+        let filter_arena = &self.work;
         for name in publication_names {
             if storage.publication(name.as_str()).is_none() {
                 return Err(sql_err!(
@@ -1368,7 +1443,9 @@ impl Engine {
                     WalOp::Upsert {
                         schema,
                         table,
+                        row,
                         is_update,
+                        old_row,
                         ..
                     } => {
                         let table_slot = storage.find_table(schema, table).ok_or_else(|| {
@@ -1378,20 +1455,50 @@ impl Engine {
                                 table
                             )
                         })?;
-                        publication_selects(
-                            storage,
-                            publication_names,
-                            table_slot,
-                            if is_update {
-                                PublicationOperation::Update
-                            } else {
-                                PublicationOperation::Insert
-                            },
-                        )?
+                        let definition = storage.table_def(table_slot, 0);
+                        let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                        let count = definition.schema(&mut types);
+                        let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                        crate::storage::rowenc::decode(row, &types[..count], &mut values)?;
+                        if is_update {
+                            let old = old_row.ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROTOCOL_VIOLATION,
+                                    "update WAL record lacks replica identity"
+                                )
+                            })?;
+                            let mut old_values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                            crate::storage::rowenc::decode(old, &types[..count], &mut old_values)?;
+                            publication_row_matches(
+                                storage,
+                                publication_names,
+                                table_slot,
+                                PublicationOperation::Update,
+                                &values[..count],
+                                filter_arena,
+                            )? || publication_row_matches(
+                                storage,
+                                publication_names,
+                                table_slot,
+                                PublicationOperation::Update,
+                                &old_values[..count],
+                                filter_arena,
+                            )?
+                        } else {
+                            publication_row_matches(
+                                storage,
+                                publication_names,
+                                table_slot,
+                                PublicationOperation::Insert,
+                                &values[..count],
+                                filter_arena,
+                            )?
+                        }
                     }
                     WalOp::Delete {
                         schema,
                         table,
+                        old_row,
                         command_id,
                         ..
                     } => {
@@ -1408,13 +1515,29 @@ impl Engine {
                                     && truncate.table_slots[..truncate.table_count]
                                         .contains(&(table_slot as u16))
                             });
-                        !suppressed_by_truncate
-                            && publication_selects(
+                        if suppressed_by_truncate {
+                            false
+                        } else {
+                            let old = old_row.ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROTOCOL_VIOLATION,
+                                    "delete WAL record lacks replica identity"
+                                )
+                            })?;
+                            let definition = storage.table_def(table_slot, 0);
+                            let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                            let count = definition.schema(&mut types);
+                            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                            crate::storage::rowenc::decode(old, &types[..count], &mut values)?;
+                            publication_row_matches(
                                 storage,
                                 publication_names,
                                 table_slot,
                                 PublicationOperation::Delete,
+                                &values[..count],
+                                filter_arena,
                             )?
+                        }
                     }
                     _ => false,
                 };
@@ -1492,15 +1615,6 @@ impl Engine {
                                 &schema_types[..column_count],
                                 &mut values,
                             )?;
-                            let relation_id = table_slot as u32 + 1;
-                            emit_replication_relation(
-                                storage,
-                                definition,
-                                relation_id,
-                                column_mask,
-                                responder,
-                                end_lsn,
-                            )?;
                             if is_update {
                                 let old = old_row.ok_or_else(|| {
                                     sql_err!(
@@ -1514,46 +1628,107 @@ impl Engine {
                                     &schema_types[..column_count],
                                     &mut old_values,
                                 )?;
-                                responder
-                                    .copy_data(&|message| {
-                                        let (old_projected, old_count) = project_replication_values(
-                                            &old_values[..column_count],
-                                            column_mask,
-                                        );
-                                        let (projected, projected_count) =
-                                            project_replication_values(
-                                                &values[..column_count],
-                                                column_mask,
-                                            );
-                                        pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
-                                            pgoutput::update(
-                                                plugin,
-                                                relation_id,
-                                                &old_projected[..old_count],
-                                                &projected[..projected_count],
-                                                binary,
-                                            )
+                                let old_matches = publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Update,
+                                    &old_values[..column_count],
+                                    filter_arena,
+                                )?;
+                                let new_matches = publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Update,
+                                    &values[..column_count],
+                                    filter_arena,
+                                )?;
+                                if old_matches || new_matches {
+                                    let relation_id = table_slot as u32 + 1;
+                                    emit_replication_relation(
+                                        storage,
+                                        definition,
+                                        relation_id,
+                                        column_mask,
+                                        responder,
+                                        end_lsn,
+                                    )?;
+                                    responder
+                                        .copy_data(&|message| {
+                                            let (old_projected, old_count) =
+                                                project_replication_values(
+                                                    &old_values[..column_count],
+                                                    column_mask,
+                                                );
+                                            let (projected, projected_count) =
+                                                project_replication_values(
+                                                    &values[..column_count],
+                                                    column_mask,
+                                                );
+                                            pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                                match (old_matches, new_matches) {
+                                                    (true, true) => pgoutput::update(
+                                                        plugin,
+                                                        relation_id,
+                                                        &old_projected[..old_count],
+                                                        &projected[..projected_count],
+                                                        binary,
+                                                    ),
+                                                    (true, false) => pgoutput::delete(
+                                                        plugin,
+                                                        relation_id,
+                                                        &old_projected[..old_count],
+                                                        binary,
+                                                    ),
+                                                    (false, true) => pgoutput::insert(
+                                                        plugin,
+                                                        relation_id,
+                                                        &projected[..projected_count],
+                                                        binary,
+                                                    ),
+                                                    (false, false) => unreachable!(),
+                                                }
+                                            })
                                         })
-                                    })
-                                    .map_err(|_| overflow())?;
+                                        .map_err(|_| overflow())?;
+                                }
                             } else {
-                                responder
-                                    .copy_data(&|message| {
-                                        let (projected, projected_count) =
-                                            project_replication_values(
-                                                &values[..column_count],
-                                                column_mask,
-                                            );
-                                        pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
-                                            pgoutput::insert(
-                                                plugin,
-                                                relation_id,
-                                                &projected[..projected_count],
-                                                binary,
-                                            )
+                                if publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Insert,
+                                    &values[..column_count],
+                                    filter_arena,
+                                )? {
+                                    let relation_id = table_slot as u32 + 1;
+                                    emit_replication_relation(
+                                        storage,
+                                        definition,
+                                        relation_id,
+                                        column_mask,
+                                        responder,
+                                        end_lsn,
+                                    )?;
+                                    responder
+                                        .copy_data(&|message| {
+                                            let (projected, projected_count) =
+                                                project_replication_values(
+                                                    &values[..column_count],
+                                                    column_mask,
+                                                );
+                                            pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                                pgoutput::insert(
+                                                    plugin,
+                                                    relation_id,
+                                                    &projected[..projected_count],
+                                                    binary,
+                                                )
+                                            })
                                         })
-                                    })
-                                    .map_err(|_| overflow())?;
+                                        .map_err(|_| overflow())?;
+                                }
                             }
                         }
                     }
@@ -1608,31 +1783,41 @@ impl Engine {
                                 &schema_types[..column_count],
                                 &mut values,
                             )?;
-                            let relation_id = table_slot as u32 + 1;
-                            emit_replication_relation(
+                            if publication_row_matches(
                                 storage,
-                                definition,
-                                relation_id,
-                                column_mask,
-                                responder,
-                                end_lsn,
-                            )?;
-                            responder
-                                .copy_data(&|message| {
-                                    let (projected, projected_count) = project_replication_values(
-                                        &values[..column_count],
-                                        column_mask,
-                                    );
-                                    pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
-                                        pgoutput::delete(
-                                            plugin,
-                                            relation_id,
-                                            &projected[..projected_count],
-                                            binary,
-                                        )
+                                publication_names,
+                                table_slot,
+                                PublicationOperation::Delete,
+                                &values[..column_count],
+                                filter_arena,
+                            )? {
+                                let relation_id = table_slot as u32 + 1;
+                                emit_replication_relation(
+                                    storage,
+                                    definition,
+                                    relation_id,
+                                    column_mask,
+                                    responder,
+                                    end_lsn,
+                                )?;
+                                responder
+                                    .copy_data(&|message| {
+                                        let (projected, projected_count) =
+                                            project_replication_values(
+                                                &values[..column_count],
+                                                column_mask,
+                                            );
+                                        pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
+                                            pgoutput::delete(
+                                                plugin,
+                                                relation_id,
+                                                &projected[..projected_count],
+                                                binary,
+                                            )
+                                        })
                                     })
-                                })
-                                .map_err(|_| overflow())?;
+                                    .map_err(|_| overflow())?;
+                            }
                         }
                     }
                     WalOp::Truncate { .. } => {}
@@ -7552,6 +7737,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_filter_sql,
             table_count,
             schemas,
             schema_count,
@@ -7566,6 +7752,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     all_tables,
                     tables: &tables[..table_count],
                     table_column_masks: &table_column_masks[..table_count],
+                    table_filter_sql: &table_filter_sql[..table_count],
                     schemas: &schemas[..schema_count],
                     publish_insert,
                     publish_update,
@@ -7587,6 +7774,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_filter_sql,
             table_count,
             schemas,
             schema_count,
@@ -7599,6 +7787,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 all_tables,
                 tables,
                 table_column_masks,
+                table_filters: crate::storage::PublicationFilters::from_sql(
+                    &table_filter_sql[..table_count],
+                )?,
                 table_count,
                 schemas,
                 schema_count,

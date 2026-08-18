@@ -729,7 +729,8 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         "CREATE TYPE wire_replication_state AS ENUM ('ready'); "
         "CREATE TABLE wire_replication (id integer); "
         "CREATE TABLE wire_replication_two (id integer, state wire_replication_state); "
-        "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication; "
+        "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication WHERE (id > 0) "
+        "WITH (publish = 'insert'); "
         "CREATE PUBLICATION \"wire, replication\" FOR TABLE wire_replication_two",
     )
 
@@ -773,7 +774,7 @@ def test_pgoutput_startup_options_and_default_text_tuples():
 
     simple_query(
         setup,
-        "BEGIN; INSERT INTO wire_replication VALUES (42); "
+        "BEGIN; INSERT INTO wire_replication VALUES (-42); INSERT INTO wire_replication VALUES (42); "
         "INSERT INTO wire_replication_two VALUES (7, 'ready'); COMMIT",
     )
     inserts = []
@@ -793,6 +794,7 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         "pgoutput publication union emits both text tuples exactly once",
         len(inserts) == 2
         and any(payload.endswith(b"42") for payload in inserts)
+        and not any(payload.endswith(b"-42") for payload in inserts)
         and any(payload.endswith(b"ready") and b"\x00\x00\x00\x01" in payload for payload in inserts),
         inserts,
     )

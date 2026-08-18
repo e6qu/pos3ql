@@ -1611,6 +1611,8 @@ impl<'a> Parser<'a> {
                 name: "",
             },
             columns: &[],
+            filter: None,
+            filter_text: None,
         }; MAX_LIST];
         let mut schemas = [""; MAX_LIST];
         let mut table_count = 0;
@@ -1637,9 +1639,21 @@ impl<'a> Parser<'a> {
                         }
                         self.expect_op(")")?;
                     }
+                    let (filter, filter_text) = if self.eat_ident("where")? {
+                        self.expect_op("(")?;
+                        let start = self.peek_at;
+                        let filter = self.expression(0)?;
+                        let filter_text = self.text[start..self.peek_at].trim_end();
+                        self.expect_op(")")?;
+                        (Some(filter), Some(filter_text))
+                    } else {
+                        (None, None)
+                    };
                     tables[table_count] = PublicationTarget {
                         relation,
                         columns: self.arena_slice(&columns[..column_count])?,
+                        filter,
+                        filter_text,
                     };
                     table_count += 1;
                     if !self.eat_op(",")? {

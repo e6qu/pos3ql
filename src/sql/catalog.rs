@@ -3476,10 +3476,12 @@ fn pg_publication_rel<'a>(
         if definition.all_tables {
             continue;
         }
-        for (member, column_mask) in definition.tables[..definition.table_count]
+        for (index, (member, column_mask)) in definition.tables[..definition.table_count]
             .iter()
             .zip(&definition.table_column_masks[..definition.table_count])
+            .enumerate()
         {
+            let filter = definition.table_filters.get(index);
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -3506,7 +3508,11 @@ fn pg_publication_rel<'a>(
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
                     Datum::Int4(table_oid(storage, *member as usize)),
-                    Datum::Null,
+                    if filter.is_empty() {
+                        Datum::Null
+                    } else {
+                        text(filter, arena)?
+                    },
                     prattrs,
                 ],
                 arena,

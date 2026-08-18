@@ -5666,6 +5666,9 @@ fn remove_schema_from_publications(
                 all_tables: definition.all_tables,
                 tables: definition.tables,
                 table_column_masks: definition.table_column_masks,
+                table_filter_sql: definition
+                    .table_filters
+                    .materialize_sql(definition.table_count),
                 table_count: definition.table_count,
                 schemas: definition.schemas,
                 schema_count: definition.schema_count,
@@ -5709,7 +5712,7 @@ pub fn create_publication(
             "FOR ALL TABLES cannot name tables"
         ));
     }
-    let (members, table_column_masks, table_count) =
+    let (members, table_column_masks, table_filter_sql, table_count) =
         match publication_members(storage, txn.txid, tables, publish.update || publish.delete) {
             Ok(members) => members,
             Err(error) => return sql_fail(error),
@@ -5728,6 +5731,7 @@ pub fn create_publication(
             all_tables,
             tables: &members[..table_count],
             table_column_masks: &table_column_masks[..table_count],
+            table_filter_sql: &table_filter_sql[..table_count],
             schemas: &schema_members[..schemas.len()],
             publish_insert: publish.insert,
             publish_update: publish.update,
@@ -5748,6 +5752,7 @@ pub fn create_publication(
                     all_tables,
                     tables: members,
                     table_column_masks,
+                    table_filter_sql,
                     table_count,
                     schemas: schema_members,
                     schema_count: schemas.len(),
@@ -6279,6 +6284,9 @@ pub fn alter_publication(
         return sql_fail(error);
     }
     let mut definition = current;
+    let mut definition_filter_sql = definition
+        .table_filters
+        .materialize_sql(definition.table_count);
     match action {
         crate::sql::ast::AlterPublicationAction::Rename(new_name) => {
             let new_name = match SqlName::parse(new_name) {
@@ -6384,7 +6392,7 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, masks, count) = match publication_members(
+            let (members, masks, filters, count) = match publication_members(
                 storage,
                 txn.txid,
                 tables,
@@ -6395,6 +6403,7 @@ pub fn alter_publication(
             };
             definition.tables = members;
             definition.table_column_masks = masks;
+            definition_filter_sql = filters;
             definition.table_count = count;
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
                 Ok(schemas) => schemas,
@@ -6411,7 +6420,7 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, masks, count) = match publication_members(
+            let (members, masks, filters, count) = match publication_members(
                 storage,
                 txn.txid,
                 tables,
@@ -6437,6 +6446,7 @@ pub fn alter_publication(
                 }
                 definition.tables[definition.table_count] = *table;
                 definition.table_column_masks[definition.table_count] = masks[index];
+                definition_filter_sql[definition.table_count] = filters[index];
                 definition.table_count += 1;
             }
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
@@ -6475,7 +6485,8 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, _, count) = match publication_members(storage, txn.txid, tables, false) {
+            let (members, _, _, count) = match publication_members(storage, txn.txid, tables, false)
+            {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -6499,6 +6510,7 @@ pub fn alter_publication(
                 definition.table_count -= 1;
                 definition.tables[definition.table_count] = u16::MAX;
                 definition.table_column_masks[definition.table_count] = 0;
+                definition_filter_sql[definition.table_count] = StackStr::new();
             }
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
                 Ok(schemas) => schemas,
@@ -6523,6 +6535,12 @@ pub fn alter_publication(
             }
         }
     }
+    definition.table_filters = match crate::storage::PublicationFilters::from_sql(
+        &definition_filter_sql[..definition.table_count],
+    ) {
+        Ok(filters) => filters,
+        Err(error) => return sql_fail(error),
+    };
     if let Err(error) = validate_publication_replica_identity(storage, &definition) {
         return sql_fail(error);
     }
@@ -6539,6 +6557,7 @@ pub fn alter_publication(
             all_tables: definition.all_tables,
             tables: definition.tables,
             table_column_masks: definition.table_column_masks,
+            table_filter_sql: definition_filter_sql,
             table_count: definition.table_count,
             schemas: definition.schemas,
             schema_count: definition.schema_count,
@@ -6561,21 +6580,23 @@ pub fn alter_publication(
     Ok(Ok(responder.command_complete("ALTER PUBLICATION")?))
 }
 
+type PublicationMembers = (
+    [u16; crate::storage::MAX_PUBLICATION_TABLES],
+    [u64; crate::storage::MAX_PUBLICATION_TABLES],
+    [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
+        crate::storage::MAX_PUBLICATION_TABLES],
+    usize,
+);
+
 fn publication_members(
     storage: &Storage,
     txid: u32,
     tables: &[PublicationTarget],
     require_replica_identity: bool,
-) -> Result<
-    (
-        [u16; crate::storage::MAX_PUBLICATION_TABLES],
-        [u64; crate::storage::MAX_PUBLICATION_TABLES],
-        usize,
-    ),
-    SqlError,
-> {
+) -> Result<PublicationMembers, SqlError> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     let mut masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut filters = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
     for (index, table) in tables.iter().enumerate() {
         let Some(crate::storage::ResolvedRelation::Table(slot)) =
             storage.resolve_relation(table.relation.schema, table.relation.name, txid)
@@ -6619,10 +6640,55 @@ fn publication_members(
         if require_replica_identity {
             validate_publication_column_mask(definition, mask)?;
         }
+        if let Some(filter) = table.filter {
+            if let Some(function) = filter.contains_nonimmutable_function() {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "publication row filter cannot use non-immutable function \"{}\"",
+                    function
+                ));
+            }
+            let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, definition)?;
+            let (type_oid, _) = describe::infer_type_pub(filter, Some(definition))?;
+            if type_oid != ColType::Bool.oid() {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "argument of WHERE must be type boolean, not {}",
+                    ColType::from_oid(type_oid).map_or("unknown", |ty| ty.name())
+                ));
+            }
+            if require_replica_identity && referenced & !replica_identity_columns(definition) != 0 {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "publication row filter must use only replica identity columns"
+                ));
+            }
+            let Some(filter_text) = table.filter_text else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "publication filter lost its source"
+                ));
+            };
+            use core::fmt::Write as _;
+            write!(filters[index], "{filter_text}").map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "publication row filter exceeds {} bytes",
+                    crate::storage::PUBLICATION_FILTER_SQL_MAX
+                )
+            })?;
+            if filters[index].is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "publication row filter exceeds {} bytes",
+                    crate::storage::PUBLICATION_FILTER_SQL_MAX
+                ));
+            }
+        }
         members[index] = slot as u16;
         masks[index] = mask;
     }
-    Ok((members, masks, tables.len()))
+    Ok((members, masks, filters, tables.len()))
 }
 
 fn validate_publication_replica_identity(
@@ -6650,13 +6716,7 @@ fn validate_publication_column_mask(definition: &TableDef, mask: u64) -> Result<
     } else {
         (1u64 << definition.n_columns) - 1
     };
-    let identity = definition
-        .columns()
-        .iter()
-        .enumerate()
-        .fold(0u64, |mask, (index, column)| {
-            mask | (u64::from(column.primary) << index)
-        });
+    let identity = replica_identity_columns(definition);
     if identity != 0 && mask & identity == identity {
         return Ok(());
     }
@@ -6667,6 +6727,25 @@ fn validate_publication_column_mask(definition: &TableDef, mask: u64) -> Result<
         sqlstate::INVALID_PARAMETER_VALUE,
         "publication column list must include the replica identity"
     ))
+}
+
+fn replica_identity_columns(definition: &TableDef) -> u64 {
+    let identity = definition
+        .columns()
+        .iter()
+        .enumerate()
+        .fold(0u64, |mask, (index, column)| {
+            mask | (u64::from(column.primary) << index)
+        });
+    if identity == 0 {
+        if definition.n_columns == MAX_COLUMNS {
+            u64::MAX
+        } else {
+            (1u64 << definition.n_columns) - 1
+        }
+    } else {
+        identity
+    }
 }
 
 /// The user-supplied portion of CREATE VIEW, grouped to keep execution's

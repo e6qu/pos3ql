@@ -2904,6 +2904,153 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
     assert!(send.is_empty());
 }
 
+#[test]
+fn logical_replication_row_filter_suppresses_unmatched_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE filtered_rows (id int PRIMARY KEY); \
+         CREATE PUBLICATION filtered_changes FOR TABLE filtered_rows WHERE (id > 0)",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO filtered_rows VALUES (-1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("filtered_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("filtered transaction is retained for the stream cursor");
+    assert!(!emitted);
+    assert!(send.is_empty());
+}
+
+#[test]
+fn logical_replication_row_filter_transforms_updates_at_the_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE filtered_updates (id int PRIMARY KEY, payload text); \
+         CREATE PUBLICATION filtered_updates_changes FOR TABLE filtered_updates WHERE (id > 0)",
+    );
+    let publication = crate::storage::SqlName::parse("filtered_updates_changes").unwrap();
+    let emit = |floor: u64, engine: &mut Engine, budget: &mut Budget| {
+        let mut scratch =
+            crate::mem::FixedBuf::new(budget, "replication scratch", 1 << 16).unwrap();
+        let mut send = crate::mem::FixedBuf::new(budget, "replication send", 1 << 16).unwrap();
+        let (lsn, emitted) = engine
+            .emit_replication_transaction(
+                floor,
+                &[publication],
+                false,
+                crate::pg::pgoutput::ProtocolVersion::V2,
+                &mut scratch,
+                &mut Responder::new(&mut send),
+            )
+            .unwrap()
+            .expect("committed row-filter transaction is retained");
+        (lsn, emitted, send.readable().to_vec())
+    };
+
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO filtered_updates VALUES (-1, 'before')",
+    );
+    let (floor, emitted, bytes) = emit(floor, &mut engine, &mut budget);
+    assert!(!emitted);
+    assert!(bytes.is_empty());
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "UPDATE filtered_updates SET id = 1 WHERE id = -1",
+    );
+    let (floor, emitted, bytes) = emit(floor, &mut engine, &mut budget);
+    assert!(emitted);
+    assert!(bytes.windows(1).any(|byte| byte == b"I"));
+    assert!(!bytes.windows(1).any(|byte| byte == b"U"));
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "UPDATE filtered_updates SET id = -1 WHERE id = 1",
+    );
+    let (_, emitted, bytes) = emit(floor, &mut engine, &mut budget);
+    assert!(emitted);
+    assert!(bytes.windows(1).any(|byte| byte == b"D"));
+    assert!(!bytes.windows(1).any(|byte| byte == b"U"));
+}
+
+#[test]
+fn logical_replication_ors_row_filters_across_publications() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE filtered_union (id int PRIMARY KEY); \
+         CREATE PUBLICATION positive_rows FOR TABLE filtered_union WHERE (id > 0) WITH (publish = 'insert'); \
+         CREATE PUBLICATION negative_rows FOR TABLE filtered_union WHERE (id < 0) WITH (publish = 'insert')",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO filtered_union VALUES (-1), (1), (0)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[
+                crate::storage::SqlName::parse("positive_rows").unwrap(),
+                crate::storage::SqlName::parse("negative_rows").unwrap(),
+            ],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("publication-union transaction is retained");
+    assert!(emitted);
+    assert_eq!(
+        send.readable()
+            .windows(1)
+            .filter(|byte| *byte == b"I")
+            .count(),
+        2,
+        "the publication union admits rows matching either filter"
+    );
+}
+
 fn logical_replication_unions_multiple_publications_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -12745,7 +12892,7 @@ fn alter_column_default_and_not_null() {
 fn alter_column_type_rewrites_and_persists() {
     let config = test_config("alter-column-type");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a int, b text)");
         run_with(
@@ -12775,7 +12922,7 @@ fn alter_column_type_rewrites_and_persists() {
         assert_eq!(data_rows(&bytes), ["42|text|5", "100|text|2"]);
     }
     // The rewritten shape and values survive a restart.
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(
         &mut e,
@@ -12789,7 +12936,7 @@ fn alter_column_type_rewrites_and_persists() {
 fn alter_add_drop_constraint() {
     let config = test_config("alter-constraint");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ch (id int, a int, b int)");
         run_with(
@@ -12835,7 +12982,7 @@ fn alter_add_drop_constraint() {
         );
     }
     // The CHECK constraint survives a restart and stays enforced.
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "INSERT INTO ch VALUES (6, -5, 60)");
     assert!(
@@ -12849,7 +12996,7 @@ fn alter_add_drop_constraint() {
 #[test]
 fn alter_rename_constraint() {
     let config = test_config("rename-constraint");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE rc (id int, a int, b int)");
     run_with(
@@ -13105,7 +13252,7 @@ fn named_single_column_key_retains_name() {
 #[test]
 fn alter_table_multi_action() {
     let config = test_config("alter-multi");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
     run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
@@ -21067,6 +21214,59 @@ fn publications_are_transactional_and_catalog_visible() {
 }
 
 #[test]
+fn publication_row_filters_require_replica_identity_columns_for_updates() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_filter_source (id int PRIMARY KEY, private_value int)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION filtered_changes FOR TABLE publication_filter_source WHERE (private_value > 0)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("replica identity columns"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn publication_row_filters_are_boolean_at_ddl_time() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_filter_boolean (id int PRIMARY KEY)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION filtered_boolean FOR TABLE publication_filter_boolean WHERE (id)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("argument of WHERE must be type boolean"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn publication_row_filters_reject_nonimmutable_functions_at_ddl_time() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_filter_volatile (id int PRIMARY KEY); \
+         CREATE PUBLICATION publication_filter_volatile_pub \
+           FOR TABLE publication_filter_volatile WHERE (random() > 0)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("42P17"));
+}
+
+#[test]
 fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
     let mut config = test_config("publication-column-lists-replay");
     config.object_store_on = true;
@@ -21079,7 +21279,7 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         &mut engine,
         &mut budget,
         "CREATE TABLE publication_projected (id int PRIMARY KEY, visible text, hidden text); \
-         CREATE PUBLICATION projected_changes FOR TABLE publication_projected (id, visible) \
+         CREATE PUBLICATION projected_changes FOR TABLE publication_projected (id, visible) WHERE (id > 0) \
          WITH (publish = 'insert, update, delete')",
     );
     assert_eq!(
@@ -21089,6 +21289,14 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
             "SELECT prattrs::text FROM pg_publication_rel"
         )),
         ["1 2"],
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
+        )),
+        ["id > 0"],
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -21102,6 +21310,15 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         )),
         ["1 2"],
         "publication projections are WAL-replayable catalog state"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
+        )),
+        ["id > 0"],
+        "publication filters survive checkpoint recovery"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

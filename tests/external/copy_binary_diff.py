@@ -42,22 +42,44 @@ CREATE TABLE cb (
   t text, vc varchar(10), bp char(5), d date, ts timestamp, tz timestamptz,
   tm time, tt timetz, iv interval, j json, jb jsonb, u uuid, by bytea,
   ia int[], ta text[], r4 int4range, nr numrange, mr int4multirange,
-  b5 bit(5), vb varbit, em cb_mood, dp cb_positive, ro regoperator)"""
+  b5 bit(5), vb varbit, em cb_mood, dp cb_positive, ro regoperator,
+  ba bool[], i2a smallint[], i8a bigint[], f4a real[], f8a float8[],
+  na numeric[], namea name[], vca varchar[], bpa char[], da date[],
+  tsa timestamp[], tza timestamptz[], tma time[], tta timetz[], iva interval[],
+  ja json[], jba jsonb[], ua uuid[], bya bytea[], ineta inet[], cidra cidr[],
+  maca macaddr[], mac8a macaddr8[], bita bit[], vbita varbit[])"""
 
 INSERT = """INSERT INTO cb VALUES
   (32000, 123456, 9000000000, 1.5, 2.25, 123.456, true, 'héllo', 'abc', 'xy',
    '2021-03-04', '2021-03-04 05:06:07.89', '2021-03-04 05:06:07+02', '01:02:03.5',
    '08:09:10-05', '1 year 2 mons 3 days 04:05:06', '{"a":1}', '{"b": 2}',
    '00112233-4455-6677-8899-aabbccddeeff', '\\xcafe',
-   '{1,2,3}', '{a,bb}', '[1,5)', '[1.5,3.5]', '{[1,3),[5,7)}', B'10110', B'101',
-   'happy', 5, '+(integer,integer)'::regoperator),
+   '[2:4]={1,2,3}', '[3:4][5:6]={{a,bb},{c,d}}', '[1,5)', '[1.5,3.5]', '{[1,3),[5,7)}', B'10110', B'101',
+   'happy', 5, '+(integer,integer)'::regoperator,
+   ARRAY[true,false], ARRAY[1::smallint,-2::smallint], ARRAY[9000000000::bigint,-3::bigint],
+   ARRAY[1.5::real,-2.25::real], ARRAY[2.25::float8,-3.5::float8], ARRAY[123.456::numeric,-0.001::numeric],
+   ARRAY['named'::name], ARRAY['abc'::varchar], ARRAY['x'::char],
+   ARRAY['2021-03-04'::date], ARRAY['2021-03-04 05:06:07.89'::timestamp],
+   ARRAY['2021-03-04 05:06:07+02'::timestamptz], ARRAY['01:02:03.5'::time],
+   ARRAY['08:09:10-05'::timetz], ARRAY['1 year 2 mons 3 days 04:05:06'::interval],
+   ARRAY['{"a":1}'::json], ARRAY['{"b": 2}'::jsonb],
+   ARRAY['00112233-4455-6677-8899-aabbccddeeff'::uuid], ARRAY['\\xcafe'::bytea],
+   ARRAY['192.168.1.2/24'::inet], ARRAY['192.168.1.0/24'::cidr],
+   ARRAY['08:00:2b:01:02:03'::macaddr], ARRAY['08:00:2b:01:02:03:04:05'::macaddr8],
+   ARRAY[B'1'::bit], ARRAY[B'101'::varbit]),
   (-1, -123, -9000000000, -0.5, -1.25, -0.001, false, '', 'z', '', '2000-01-01',
    '1999-12-31 23:59:59', '2000-06-01 12:00:00+00', '00:00:00', '23:59:59+14',
    '-5 days', 'null', '[1,2,3]', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '\\x',
    '{1,NULL,3}', '{}', 'empty', '(1.5,)', '{}', B'00000', B'', 'sad', 1,
-   '+(integer,integer)'::regoperator),
+   '+(integer,integer)'::regoperator,
+   ARRAY[]::bool[], ARRAY[]::smallint[], ARRAY[]::bigint[], ARRAY[]::real[], ARRAY[]::float8[],
+   ARRAY[]::numeric[], ARRAY[]::name[], ARRAY[]::varchar[], ARRAY[]::char[], ARRAY[]::date[],
+   ARRAY[]::timestamp[], ARRAY[]::timestamptz[], ARRAY[]::time[], ARRAY[]::timetz[], ARRAY[]::interval[],
+   ARRAY[]::json[], ARRAY[]::jsonb[], ARRAY[]::uuid[], ARRAY[]::bytea[], ARRAY[]::inet[], ARRAY[]::cidr[],
+   ARRAY[]::macaddr[], ARRAY[]::macaddr8[], ARRAY[]::bit[], ARRAY[]::varbit[]),
   (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
+   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
 COMPOSITE_DDL = """DROP TABLE IF EXISTS cb_composite;
 CREATE TABLE cb_composite (points cb_point_value[])"""
@@ -75,6 +97,14 @@ def connect(host, port):
 def dump(conn, table="cb"):
     out = b""
     with conn.cursor().copy("COPY %s TO STDOUT (FORMAT binary)" % table) as cp:
+        for chunk in cp:
+            out += bytes(chunk)
+    return out
+
+
+def dump_query(conn, query):
+    out = b""
+    with conn.cursor().copy("COPY (%s) TO STDOUT (FORMAT binary)" % query) as cp:
         for chunk in cp:
             out += bytes(chunk)
     return out
@@ -150,6 +180,21 @@ def main():
         fails += 1
         print("DIVERGENCE: COPY TO binary differs (pg=%d p3=%d)" % (len(pg_dump), len(p3_dump)))
         for i, (a, b) in enumerate(zip(pg_dump, p3_dump)):
+            if a != b:
+                print("  first byte diff at %d: pg=%02x p3=%02x" % (i, a, b))
+                break
+
+    pg_query_dump = dump_query(pg, "SELECT * FROM cb ORDER BY i4 NULLS LAST")
+    p3_query_dump = dump_query(p3, "SELECT * FROM cb ORDER BY i4 NULLS LAST")
+    if pg_query_dump == p3_query_dump:
+        print("ok: COPY query binary byte-identical (%d bytes)" % len(pg_query_dump))
+    else:
+        fails += 1
+        print(
+            "DIVERGENCE: COPY query binary differs (pg=%d p3=%d)"
+            % (len(pg_query_dump), len(p3_query_dump))
+        )
+        for i, (a, b) in enumerate(zip(pg_query_dump, p3_query_dump)):
             if a != b:
                 print("  first byte diff at %d: pg=%02x p3=%02x" % (i, a, b))
                 break

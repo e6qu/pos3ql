@@ -3688,30 +3688,65 @@ impl Checkpointer {
                 | (u8::from(publication.publish_update) << 2)
                 | (u8::from(publication.publish_delete) << 3)
                 | (u8::from(publication.publish_truncate) << 4);
-            let mut members = StackStr::<1024>::new();
-            for (table, mask) in publication.tables[..publication.table_count]
+            write!(
+                &mut self.manifest_buf,
+                "pub {} {} {} {} {}",
+                name.as_str(),
+                publication.ownership.owner,
+                flags,
+                publication.table_count,
+                publication.schema_count
+            )
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "manifest exceeds its fixed buffer"
+                )
+            })?;
+            for (index, (table, mask)) in publication.tables[..publication.table_count]
                 .iter()
                 .zip(&publication.table_column_masks[..publication.table_count])
+                .enumerate()
             {
-                let _ = write!(members, " {table} {mask}");
+                let filter = publication.table_filters.get(index);
+                write!(&mut self.manifest_buf, " {table} {mask} ").map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "manifest exceeds its fixed buffer"
+                    )
+                })?;
+                if filter.is_empty() {
+                    write!(&mut self.manifest_buf, "-").map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "manifest exceeds its fixed buffer"
+                        )
+                    })?;
+                } else {
+                    for byte in filter.as_bytes() {
+                        write!(&mut self.manifest_buf, "{byte:02x}").map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "manifest exceeds its fixed buffer"
+                            )
+                        })?;
+                    }
+                }
             }
-            let mut schemas = StackStr::<128>::new();
             for schema in &publication.schemas[..publication.schema_count] {
-                let _ = write!(schemas, " {schema}");
+                write!(&mut self.manifest_buf, " {schema}").map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "manifest exceeds its fixed buffer"
+                    )
+                })?;
             }
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "pub {} {} {} {} {}{}{}",
-                    name.as_str(),
-                    publication.ownership.owner,
-                    flags,
-                    publication.table_count,
-                    publication.schema_count,
-                    members.as_str(),
-                    schemas.as_str()
-                ),
-            )?;
+            writeln!(&mut self.manifest_buf).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "manifest exceeds its fixed buffer"
+                )
+            })?;
         }
         // A replication slot's active flag is process-local; only its resume
         // positions survive a checkpoint and restart.
@@ -5252,12 +5287,25 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         ));
     }
     let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
-    for table in &mut tables[..count] {
-        *table = parse_field(words.next(), "pub table")?;
-    }
     let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
-    for mask in &mut table_column_masks[..count] {
-        *mask = parse_field(words.next(), "pub table column mask")?;
+    let mut table_filter_sql =
+        [crate::util::StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
+    for index in 0..count {
+        tables[index] = parse_field(words.next(), "pub table")?;
+        table_column_masks[index] = parse_field(words.next(), "pub table column mask")?;
+        let filter = words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("pub row filter"))?;
+        if filter != "-" {
+            let decoded = decode_hex_name(filter)?;
+            core::fmt::Write::write_str(&mut table_filter_sql[index], decoded.as_str())
+                .map_err(|_| CheckpointSetupError::Corrupt("pub row filter exceeds limit"))?;
+            if table_filter_sql[index].is_truncated() {
+                return Err(CheckpointSetupError::Corrupt(
+                    "pub row filter exceeds limit",
+                ));
+            }
+        }
     }
     let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
     for schema in &mut schemas[..schema_count] {
@@ -5273,6 +5321,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],
                 table_column_masks: &table_column_masks[..count],
+                table_filter_sql: &table_filter_sql[..count],
                 schemas: &schemas[..schema_count],
                 publish_insert: flags & 2 != 0,
                 publish_update: flags & 4 != 0,

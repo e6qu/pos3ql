@@ -16,10 +16,12 @@ pub struct QualName<'a> {
 /// means the PostgreSQL default: publish every column.  Keeping the selected
 /// names beside their relation prevents later execution from losing a column
 /// list while resolving a batch of targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PublicationTarget<'a> {
     pub relation: QualName<'a>,
     pub columns: &'a [&'a str],
+    pub filter: Option<&'a Expr<'a>>,
+    pub filter_text: Option<&'a str>,
 }
 
 /// A resolved built-in collation identity.  The parser resolves the spelling

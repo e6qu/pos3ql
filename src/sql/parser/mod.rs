@@ -4663,7 +4663,7 @@ mod tests {
     #[test]
     fn publication_column_lists_remain_attached_to_their_relation_without_allocation() {
         with_parser(
-            "CREATE PUBLICATION changes FOR TABLE public.orders (id, total), archive.orders",
+            "CREATE PUBLICATION changes FOR TABLE public.orders (id, total) WHERE (id > 0), archive.orders",
             |parser| {
                 let Some(Stmt::CreatePublication { tables, .. }) = parser.next_stmt().unwrap()
                 else {
@@ -4673,7 +4673,10 @@ mod tests {
                 assert_eq!(tables[0].relation.schema, Some("public"));
                 assert_eq!(tables[0].relation.name, "orders");
                 assert_eq!(tables[0].columns, ["id", "total"]);
+                assert_eq!(tables[0].filter_text, Some("id > 0"));
+                assert!(matches!(tables[0].filter, Some(Expr::Binary { .. })));
                 assert!(tables[1].columns.is_empty());
+                assert!(tables[1].filter.is_none());
             },
         );
     }

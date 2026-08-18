@@ -81,3 +81,36 @@ SELECT typname FROM pg_type
 SELECT attname FROM pg_attribute
  WHERE attrelid = 'composite_drop_values'::regclass
    AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+
+-- A domain over a named composite keeps that identity at the array boundary:
+-- SQL values, catalog metadata, constraints, evolution, and type moves must
+-- all select the same composite definition.
+CREATE TYPE composite_domain_coordinate AS (x integer, y integer);
+CREATE DOMAIN composite_domain_coordinate_value AS composite_domain_coordinate
+  CHECK ((VALUE).x > 0);
+CREATE TABLE composite_domain_coordinates (
+  value composite_domain_coordinate_value,
+  values composite_domain_coordinate_value[]
+);
+INSERT INTO composite_domain_coordinates VALUES
+  (ROW(3, 4)::composite_domain_coordinate,
+   ARRAY[ROW(5, 6)::composite_domain_coordinate]::composite_domain_coordinate_value[]);
+SELECT (value).x, (values[1]).y, pg_typeof(value), pg_typeof(values), pg_typeof(values[1])
+  FROM composite_domain_coordinates;
+SELECT t.typtype, t.typbasetype = b.oid, a.typelem = t.oid
+  FROM pg_type t
+  JOIN pg_type b ON b.typname = 'composite_domain_coordinate'
+  JOIN pg_type a ON a.oid = t.typarray
+ WHERE t.typname = 'composite_domain_coordinate_value';
+INSERT INTO composite_domain_coordinates VALUES
+  (ROW(-1, 4)::composite_domain_coordinate, NULL);
+ALTER TYPE composite_domain_coordinate ADD ATTRIBUTE z integer;
+SELECT (value).z IS NULL, (values[1]).z IS NULL FROM composite_domain_coordinates;
+CREATE SCHEMA composite_domain_schema;
+ALTER TYPE composite_domain_coordinate SET SCHEMA composite_domain_schema;
+ALTER TYPE composite_domain_schema.composite_domain_coordinate RENAME TO composite_domain_point;
+SELECT (value).x, (values[1]).y FROM composite_domain_coordinates;
+DROP TABLE composite_domain_coordinates;
+DROP DOMAIN composite_domain_coordinate_value;
+DROP TYPE composite_domain_schema.composite_domain_point;
+DROP SCHEMA composite_domain_schema;

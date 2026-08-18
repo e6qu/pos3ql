@@ -987,6 +987,14 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 }
+                if let crate::sql::ast::Expr::Subscript { base, .. } = args[0]
+                    && let crate::sql::ast::Expr::Column { qualifier, name } = &**base
+                    && let Some(ColType::Array(element)) = row.col_type(*qualifier, name)
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.type_name(element.element_oid(), arena)?
+                {
+                    return Ok(regtype(element.element_oid(), name));
+                }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
                 if let crate::sql::ast::Expr::Cast { type_name, .. } = args[0]
                     && let Some(cat) = hooks.catalog

@@ -1204,6 +1204,9 @@ const DAY_FULL: [&str; 7] = [
     "Saturday",
 ];
 const DAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_ROMAN: [&str; 12] = [
+    "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+];
 
 /// The output casing a name-producing code selects: `MONTH`→upper, `month`→
 /// lower, `Month`→title (matching the code's own casing).
@@ -1231,6 +1234,28 @@ fn name_case(code: &[u8]) -> Case {
     }
 }
 
+/// ISO week-year fields share one calculation so `IYYY`, `IW`, and `ID`
+/// cannot disagree at a calendar-year boundary.
+fn iso_week_date(days: i64) -> (i64, i64, i64) {
+    use crate::sql::datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
+
+    let iso_day = ((day_of_week(days) + 6) % 7 + 1) as i64;
+    // Thursday always belongs to the ISO year of its week.
+    let (iso_year, _, _) = civil_from_days(days + (4 - iso_day) + PG_EPOCH_DAYS);
+    let jan4 = days_from_civil(iso_year, 1, 4) - PG_EPOCH_DAYS;
+    let jan4_iso_day = ((day_of_week(jan4) + 6) % 7 + 1) as i64;
+    let first_monday = jan4 - (jan4_iso_day - 1);
+    (iso_year, (days - first_monday) / 7 + 1, iso_day)
+}
+
+fn era_year(year: i64) -> (i64, bool) {
+    if year <= 0 {
+        (1 - year, true)
+    } else {
+        (year, false)
+    }
+}
+
 /// `to_char(timestamp/date, text)` — formats the temporal value `micros`
 /// (microseconds since 2000-01-01) per the format string. Supports the common
 /// field codes; unrecognized letter codes are rejected loudly.
@@ -1251,6 +1276,9 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
     } else {
         hh24 % 12
     };
+    let (display_year, bc) = era_year(y);
+    let (iso_year, iso_week, iso_day) = iso_week_date(days);
+    let (display_iso_year, _) = era_year(iso_year);
 
     let mut out = StackStr::<512>::new();
     let name = |out: &mut StackStr<512>, s: &str, case: Case, pad: usize, fm: bool| {
@@ -1293,14 +1321,20 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
         }
         let rest = &fb[i..];
         let m = |w: &[u8]| rest.len() >= w.len() && rest[..w.len()].eq_ignore_ascii_case(w);
-        if m(b"HH24") {
+        if m(b"IYYY") {
+            num(&mut out, display_iso_year, 4, fm);
+            i += 4;
+        } else if m(b"YYYY") {
+            num(&mut out, display_year, 4, fm);
+            i += 4;
+        } else if m(b"HH24") {
             num(&mut out, hh24 as i64, 2, fm);
             i += 4;
         } else if m(b"HH12") {
             num(&mut out, hh12 as i64, 2, fm);
             i += 4;
-        } else if m(b"YYYY") {
-            num(&mut out, y, 4, fm);
+        } else if m(b"SSSS") {
+            num(&mut out, time_of_day / 1_000_000, 1, fm);
             i += 4;
         } else if m(b"MONTH") {
             name(
@@ -1326,17 +1360,26 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
         } else if m(b"DDD") {
             num(&mut out, doy as i64, 3, fm);
             i += 3;
+        } else if m(b"IYY") {
+            num(&mut out, display_iso_year % 1000, 3, fm);
+            i += 3;
         } else if m(b"DY") {
             name(&mut out, DAY_ABBR[dow], name_case(&rest[..2]), 3, fm);
             i += 2;
         } else if m(b"YYY") {
-            num(&mut out, y % 1000, 3, fm);
+            num(&mut out, display_year % 1000, 3, fm);
             i += 3;
+        } else if m(b"IY") {
+            num(&mut out, display_iso_year % 100, 2, fm);
+            i += 2;
+        } else if m(b"IW") {
+            num(&mut out, iso_week, 2, fm);
+            i += 2;
         } else if m(b"HH") {
             num(&mut out, hh12 as i64, 2, fm);
             i += 2;
         } else if m(b"YY") {
-            num(&mut out, y % 100, 2, fm);
+            num(&mut out, display_year % 100, 2, fm);
             i += 2;
         } else if m(b"MI") {
             num(&mut out, minute as i64, 2, fm);
@@ -1359,18 +1402,55 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
         } else if m(b"WW") {
             num(&mut out, ((doy - 1) / 7 + 1) as i64, 2, fm);
             i += 2;
+        } else if m(b"RM") {
+            name(
+                &mut out,
+                MONTH_ROMAN[(month - 1) as usize],
+                name_case(&rest[..2]),
+                4,
+                fm,
+            );
+            i += 2;
+        } else if m(b"A.M.") || m(b"P.M.") {
+            let mer = if hh24 < 12 { "A.M." } else { "P.M." };
+            name(&mut out, mer, name_case(&rest[..4]), 0, true);
+            i += 4;
         } else if m(b"AM") || m(b"PM") {
             let mer = if hh24 < 12 { "AM" } else { "PM" };
             name(&mut out, mer, name_case(&rest[..2]), 0, true);
             i += 2;
+        } else if m(b"A.D.") || m(b"B.C.") {
+            let era = if bc { "B.C." } else { "A.D." };
+            name(&mut out, era, name_case(&rest[..4]), 0, true);
+            i += 4;
+        } else if m(b"AD") || m(b"BC") {
+            let era = if bc { "BC" } else { "AD" };
+            name(&mut out, era, name_case(&rest[..2]), 0, true);
+            i += 2;
+        } else if m(b"CC") {
+            let century = (display_year - 1) / 100 + 1;
+            if bc {
+                let _ = out.write_char('-');
+            }
+            num(&mut out, century, 2, fm);
+            i += 2;
         } else if m(b"Q") {
             num(&mut out, ((month - 1) / 3 + 1) as i64, 1, fm);
             i += 1;
+        } else if m(b"ID") {
+            num(&mut out, iso_day, 1, fm);
+            i += 2;
         } else if m(b"D") {
             num(&mut out, (dow + 1) as i64, 1, fm);
             i += 1;
+        } else if m(b"W") {
+            num(&mut out, ((d - 1) / 7 + 1) as i64, 1, fm);
+            i += 1;
+        } else if m(b"I") {
+            num(&mut out, display_iso_year % 10, 1, fm);
+            i += 1;
         } else if m(b"Y") {
-            num(&mut out, y % 10, 1, fm);
+            num(&mut out, display_year % 10, 1, fm);
             i += 1;
         } else if rest[0].is_ascii_alphabetic() {
             return Err(sql_err!(
@@ -1457,6 +1537,31 @@ mod tests {
         assert_eq!(tc("Q WW DDD"), "2 24 167");
         assert_eq!(tc("US"), "123456");
         assert!(timestamp(micros, "ZZZ", &a).is_err());
+    }
+
+    #[test]
+    fn timestamp_calendar_models_match_postgres() {
+        let a = arena();
+        let boundary =
+            crate::sql::datetime::parse_timestamp("2021-01-01 13:02:03.456789", false).unwrap();
+        let tc = |micros, f: &str| timestamp(micros, f, &a).unwrap().to_string();
+        assert_eq!(
+            tc(boundary, "IYYY-IW-ID|YYYY-CC-W-WW-D-DDD|RM|A.M.|AD|SSSS"),
+            "2020-53-5|2021-21-1-01-6-001|I   |P.M.|AD|46923"
+        );
+        let december = crate::sql::datetime::parse_timestamp("2020-12-31 00:00:00", false).unwrap();
+        assert_eq!(
+            tc(
+                december,
+                "IYYY-IW-ID|YYYY-MM-DD|RM|Month|FMMonth|A.M.|AM|A.D.|AD|CC|SSSS"
+            ),
+            "2020-53-4|2020-12-31|XII |December |December|A.M.|AM|A.D.|AD|21|0"
+        );
+        let bc = crate::sql::datetime::make_timestamp(0, 1, 1, 0, 0, 0.0).unwrap();
+        assert_eq!(
+            tc(bc, "YYYY|YY|Y|CC|AD|A.D.|IYYY-IW-ID"),
+            "0001|01|1|-01|BC|B.C.|0002-52-6"
+        );
     }
 
     #[test]

@@ -20594,10 +20594,12 @@ pub(crate) fn binary_field_plan<'a>(
             })?;
             Ok(BinaryFieldPlan::Multirange(stored))
         }
-        Datum::Array {
-            element: element @ crate::sql::types::ArrElem::Composite(_),
-            raw,
-        } => {
+        Datum::Array { element, raw }
+            if matches!(
+                element.to_coltype(),
+                crate::sql::types::ColType::Composite(_)
+            ) =>
+        {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
             let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
             for (index, value) in values.iter_mut().take(shape.element_count()).enumerate() {

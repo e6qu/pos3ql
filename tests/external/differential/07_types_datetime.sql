@@ -26,6 +26,11 @@ SELECT age(timestamp '2024-01-01 10:00', timestamp '2023-12-15 14:30');
 SELECT age(date '2000-01-01', date '1999-02-05');
 -- to_timestamp(epoch): Unix seconds -> timestamptz
 SELECT to_timestamp(0), to_timestamp(1700000000), to_timestamp(1700000000.5), to_timestamp(-100000);
+-- calendar format models, including ISO-week boundaries and BCE era forms
+SELECT to_char(timestamp '2021-01-01 13:02:03.456789', 'IYYY-IW-ID|YYYY-CC-W-WW-D-DDD|RM|A.M.|AD|SSSS');
+SELECT to_char(timestamp '0001-01-01 BC', 'YYYY|YY|Y|CC|AD|A.D.|IYYY-IW-ID');
+SELECT to_date('2024-060', 'YYYY-DDD'), to_date('2020-53-5', 'IYYY-IW-ID'), to_date('XII-31-2024', 'RM-DD-YYYY');
+SELECT to_timestamp('2021-01-01 01:02:03.456789 PM', 'YYYY-MM-DD HH12:MI:SS.US AM') AT TIME ZONE 'UTC';
 -- AT TIME ZONE (timestamp <-> timestamptz), with DST and offset zones
 SELECT timestamp '2024-01-01 12:00' AT TIME ZONE 'UTC';
 SELECT timestamptz '2024-01-01 12:00+00' AT TIME ZONE 'America/New_York';

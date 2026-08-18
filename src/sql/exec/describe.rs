@@ -1047,13 +1047,31 @@ pub fn record_shape(
             };
             visit_composite_slot_shape(slot, visit)
         }
-        Expr::Subscript { .. } if matches!(infer_type_res(base, columns), Ok((oid, _)) if matches!(coltype_of_oid(oid), Some(ColType::Composite(_)))) =>
-        {
-            let Ok((type_oid, _)) = infer_type_res(base, columns) else {
-                unreachable!()
+        Expr::Subscript { base: array, .. } => {
+            let element = match &**array {
+                Expr::Column { qualifier, name } => columns
+                    .resolve(*qualifier, name)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
+                Expr::Field { base, field } => record_field_type(base, field, columns)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
+                _ => infer_type_res(array, columns)
+                    .ok()
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
             };
-            let Some(ColType::Composite(slot)) = coltype_of_oid(type_oid) else {
-                unreachable!()
+            let Some(ColType::Composite(slot)) = element else {
+                return None;
             };
             visit_composite_slot_shape(slot, visit)
         }
@@ -1878,12 +1896,38 @@ pub fn infer_type_res(
                 .unwrap_or(crate::sql::types::ArrElem::Text);
             of(ColType::Array(element))
         }
-        Expr::Subscript { base, .. } => match coltype_of_oid(infer_type_res(base, columns)?.0) {
-            Some(ColType::Array(e)) => of(e.to_coltype()),
-            Some(ColType::Name) => of(ColType::Bpchar),
-            Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
-            _ => (oid::UNKNOWN, -2),
-        },
+        Expr::Subscript { base, .. } => {
+            // A catalog-backed column retains its array element identity here:
+            // a domain element has a structural base `ColType`, but its Result
+            // OID and `pg_typeof` identity are the domain itself.
+            let direct_element = match &**base {
+                Expr::Column { qualifier, name } => columns
+                    .resolve(*qualifier, name)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element),
+                        _ => None,
+                    }),
+                Expr::Field { base, field } => record_field_type(base, field, columns)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            if let Some(element) = direct_element {
+                let ctype = element.to_coltype();
+                (element.element_oid(), ctype.typlen())
+            } else {
+                match coltype_of_oid(infer_type_res(base, columns)?.0) {
+                    Some(ColType::Array(e)) => of(e.to_coltype()),
+                    Some(ColType::Name) => of(ColType::Bpchar),
+                    Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
+                    _ => (oid::UNKNOWN, -2),
+                }
+            }
+        }
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
         Expr::Slice { base, .. } => infer_type_res(base, columns)?,

@@ -26,6 +26,27 @@ fn test_config(name: &str) -> Config {
 }
 
 #[test]
+fn sql_calendar_format_models_match_postgres() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT to_char(timestamp '2021-01-01 13:02:03.456789',
+                            'IYYY-IW-ID|YYYY-CC-W-WW-D-DDD|RM|A.M.|AD|SSSS'),
+                    to_date('2024-060', 'YYYY-DDD')::text,
+                    to_date('2020-53-5', 'IYYY-IW-ID')::text,
+                    to_char(to_timestamp('2021-01-01 01:02:03.456789 PM',
+                                          'YYYY-MM-DD HH12:MI:SS.US AM'),
+                            'YYYY-MM-DD HH24:MI:SS.US')"
+        )),
+        [
+            "2020-53-5|2021-21-1-01-6-001|I   |P.M.|AD|46923|2024-02-29|2021-01-01|2021-01-01 13:02:03.456789"
+        ]
+    );
+}
+
+#[test]
 fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -16668,7 +16689,7 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         &mut engine,
         &mut budget,
         "CREATE TYPE domain_coordinate AS (x integer, y integer); \
-         CREATE DOMAIN coordinate_value AS domain_coordinate; \
+         CREATE DOMAIN coordinate_value AS domain_coordinate CHECK ((VALUE).x > 0); \
          CREATE TABLE domain_coordinates (value coordinate_value, values coordinate_value[])",
     );
     assert!(
@@ -16691,10 +16712,173 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT value::text, values::text, pg_typeof(values) FROM domain_coordinates",
+            "SELECT value::text, values::text, pg_typeof(values), pg_typeof(values[1]) \
+             FROM domain_coordinates",
         )),
-        ["(3,4)|{\"(5,6)\"}|coordinate_value[]"]
+        ["(3,4)|{\"(5,6)\"}|coordinate_value[]|coordinate_value"]
     );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO domain_coordinates VALUES (ROW(-1, 0)::domain_coordinate, NULL)",
+        ))
+        .contains("23514")
+    );
+}
+
+#[test]
+fn composite_domain_arrays_keep_the_domain_binary_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE binary_domain_point AS (x integer, label text); \
+         CREATE DOMAIN binary_domain_point_value AS binary_domain_point; \
+         CREATE TABLE binary_domain_points (values binary_domain_point_value[]); \
+         INSERT INTO binary_domain_points VALUES \
+           (ARRAY[ROW(7, 'seven')::binary_domain_point]::binary_domain_point_value[])",
+    );
+    let domain_slot = engine
+        .storage
+        .domain_slot("public", "binary_domain_point_value", 0)
+        .unwrap() as u16;
+    let domain_oid = crate::sql::types::oid::domain_oid(domain_slot);
+    let copy = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY binary_domain_points TO STDOUT (FORMAT binary)",
+    );
+    let row = [
+        0, 1, // field count
+        0, 0, 0, 53, // array length
+        0, 0, 0, 1, // dimensions
+        0, 0, 0, 0, // no null elements
+    ];
+    assert!(
+        copy.windows(row.len()).any(|window| window == row),
+        "{copy:?}"
+    );
+    assert!(
+        copy.windows(4)
+            .any(|window| window == domain_oid.to_be_bytes()),
+        "{copy:?}"
+    );
+    let record = [
+        0, 0, 0, 29, // record length
+        0, 0, 0, 2, // field count
+        0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 7, // x int4
+        0, 0, 0, 25, 0, 0, 0, 5, b's', b'e', b'v', b'e', b'n', // label text
+    ];
+    assert!(
+        copy.windows(record.len()).any(|window| window == record),
+        "{copy:?}"
+    );
+
+    let mut arena = Arena::new(&mut budget, "domain binary result", 1 << 18).unwrap();
+    let mut buffer = crate::mem::FixedBuf::new(&mut budget, "domain binary send", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 128).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    let mut copy_send =
+        crate::mem::FixedBuf::new(&mut budget, "domain binary copy send", 1 << 18).unwrap();
+    {
+        let mut responder = Responder::new(&mut copy_send);
+        engine
+            .execute_simple(
+                "COPY binary_domain_points FROM STDIN (FORMAT binary)",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters binary streaming mode");
+    arena.reset();
+    let mut input_record = Vec::new();
+    input_record.extend_from_slice(&2_i32.to_be_bytes());
+    input_record.extend_from_slice(&23_i32.to_be_bytes());
+    input_record.extend_from_slice(&4_i32.to_be_bytes());
+    input_record.extend_from_slice(&9_i32.to_be_bytes());
+    input_record.extend_from_slice(&25_i32.to_be_bytes());
+    input_record.extend_from_slice(&4_i32.to_be_bytes());
+    input_record.extend_from_slice(b"nine");
+    let mut input_array = Vec::new();
+    input_array.extend_from_slice(&1_i32.to_be_bytes());
+    input_array.extend_from_slice(&0_i32.to_be_bytes());
+    input_array.extend_from_slice(&domain_oid.to_be_bytes());
+    input_array.extend_from_slice(&1_i32.to_be_bytes());
+    input_array.extend_from_slice(&1_i32.to_be_bytes());
+    input_array.extend_from_slice(&(input_record.len() as i32).to_be_bytes());
+    input_array.extend_from_slice(&input_record);
+    let mut input_row = Vec::new();
+    input_row.extend_from_slice(&1_i16.to_be_bytes());
+    input_row.extend_from_slice(&(input_array.len() as i32).to_be_bytes());
+    input_row.extend_from_slice(&input_array);
+    engine
+        .copy_row_binary(
+            &setup,
+            &mut transaction,
+            guc.seq_session(),
+            &arena,
+            &input_row,
+        )
+        .unwrap();
+    engine.copy_finish(&mut transaction, &guc).unwrap();
+    engine.commit_txn(&mut transaction, &guc).unwrap();
+    let selected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT values::text FROM binary_domain_points ORDER BY (values[1]).x",
+    );
+    assert_eq!(
+        data_rows(&selected),
+        ["{\"(7,seven)\"}", "{\"(9,nine)\"}"],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            engine
+                .execute_extended(
+                    "SELECT values FROM binary_domain_points",
+                    &arena,
+                    &[],
+                    &mut transaction,
+                    &mut pool,
+                    &mut cursors,
+                    &mut guc,
+                    &mut responder,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    let binary = buffer.readable();
+    let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+    let payload = &binary[row_at + 5..];
+    assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 1);
+    assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 53);
+    assert_eq!(
+        i32::from_be_bytes(payload[14..18].try_into().unwrap()),
+        domain_oid
+    );
+    assert_eq!(i32::from_be_bytes(payload[26..30].try_into().unwrap()), 29);
+    assert_eq!(i32::from_be_bytes(payload[30..34].try_into().unwrap()), 2);
+    assert_eq!(i32::from_be_bytes(payload[34..38].try_into().unwrap()), 23);
+    assert_eq!(&payload[54..59], b"seven");
 }
 
 #[test]

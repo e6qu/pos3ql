@@ -27005,7 +27005,8 @@ pub(crate) fn coerce_user_type_array<'a>(
             ));
         }
     };
-    let count = crate::sql::array::len(raw);
+    let shape = crate::sql::array::shape(raw).expect("array datum carries a valid shape");
+    let count = shape.element_count();
     let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
     for (index, item) in items.iter_mut().take(count).enumerate() {
         let value = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
@@ -27047,7 +27048,7 @@ pub(crate) fn coerce_user_type_array<'a>(
     }
     Ok(Datum::Array {
         element: target,
-        raw: crate::sql::array::build(&items[..count], arena)?,
+        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
     })
 }
 

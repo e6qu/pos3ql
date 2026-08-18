@@ -997,8 +997,22 @@ def test_extended_copy():
 
 
 def binary_array(element_oid, values):
-    body = struct.pack("!iii", 1, int(any(value is None for value in values)), element_oid)
-    body += struct.pack("!ii", len(values), 1)
+    return binary_array_shaped(element_oid, [len(values)], [1], values)
+
+
+def binary_array_shaped(element_oid, dimensions, lower_bounds, values):
+    if len(dimensions) != len(lower_bounds):
+        raise ValueError("array dimensions and lower bounds must align")
+    count = 1
+    for dimension in dimensions:
+        count *= dimension
+    if count != len(values):
+        raise ValueError("array values do not match dimensions")
+    body = struct.pack(
+        "!iii", len(dimensions), int(any(value is None for value in values)), element_oid
+    )
+    for dimension, lower_bound in zip(dimensions, lower_bounds):
+        body += struct.pack("!ii", dimension, lower_bound)
     for value in values:
         if value is None:
             body += struct.pack("!i", -1)
@@ -1035,6 +1049,20 @@ def extended_binary_parameter(s, text, oid, value):
     )
     execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
     s.sendall(parse + bind + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            return out
+
+
+def extended_binary_result(s, text):
+    parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1))
+    describe = frontend_message(b"D", b"P\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
     out = []
     while True:
         item = read_message(s)
@@ -1391,6 +1419,37 @@ def test_catalog_aware_binary_bind_parameters():
             None,
         ),
         (
+            "shaped domain array",
+            "SELECT $1::wire_binary_positive[]",
+            domain_array_oid,
+            binary_array_shaped(
+                domain_oid, [2], [-2], [struct.pack("!i", 3), struct.pack("!i", 5)]
+            ),
+            "[-2:-1]={3,5}",
+            None,
+        ),
+        (
+            "shaped integer array",
+            "SELECT $1::integer[]",
+            1007,
+            binary_array_shaped(
+                23,
+                [2, 2],
+                [2, 4],
+                [struct.pack("!i", value) for value in [1, 2, 3, 4]],
+            ),
+            "[2:3][4:5]={{1,2},{3,4}}",
+            None,
+        ),
+        (
+            "shaped enum array",
+            "SELECT $1::wire_binary_state[]",
+            enum_array_oid,
+            binary_array_shaped(enum_oid, [2, 2], [0, 5], [b"ready", b"blocked", b"blocked", b"ready"]),
+            "[0:1][5:6]={{ready,blocked},{blocked,ready}}",
+            None,
+        ),
+        (
             "array-valued domain array",
             "SELECT $1::wire_binary_vector[]",
             vector_array_oid,
@@ -1518,6 +1577,34 @@ def test_catalog_aware_binary_bind_parameters():
         and row == b"\x00\x01" + struct.pack("!i", len(expected_array)) + expected_array,
         messages,
     )
+    shaped_results = [
+        (
+            "enum array shape",
+            "SELECT '[0:1][5:6]={{ready,blocked},{blocked,ready}}'::wire_binary_state[]",
+            enum_array_oid,
+            binary_array_shaped(
+                enum_oid, [2, 2], [0, 5], [b"ready", b"blocked", b"blocked", b"ready"]
+            ),
+        ),
+        (
+            "domain array shape",
+            "SELECT '[-2:-1]={3,5}'::wire_binary_positive[]",
+            domain_array_oid,
+            binary_array_shaped(domain_oid, [2], [-2], [struct.pack("!i", 3), struct.pack("!i", 5)]),
+        ),
+    ]
+    for name, query, oid, expected in shaped_results:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        check(
+            f"binary Result preserves {name}",
+            description is not None
+            and row_description_type_oids(description) == [oid]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+            messages,
+        )
     simple_query(
         s,
         "CREATE TABLE wire_routine_values (id integer, value integer); "

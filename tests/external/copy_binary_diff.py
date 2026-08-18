@@ -10,9 +10,11 @@ with psycopg and checks three things against real PostgreSQL:
      reconstructs identical rows on both engines.
   3. pos3ql's own binary dump loads back into PostgreSQL to the same rows.
 
-Every supported column type (the scalar / numeric / temporal / uuid / bytea /
-json / catalog-identity tower, with NULLs) is exercised. Exit 0 on full
-agreement, 1 on any diff.
+Every supported scalar type (including catalog-stable identities) is checked
+byte-for-byte. Composite-domain arrays have per-cluster element OIDs, as they
+do in PostgreSQL, so their record bodies are compared after catalog-identity
+mapping and then loaded in both directions. Exit 0 on full agreement, 1 on
+any diff.
 
   copy_binary_diff.py --pg PORT --p3 PORT [--host HOST]
 """
@@ -25,11 +27,16 @@ except ImportError:
     print("psycopg not installed", file=sys.stderr)
     sys.exit(2)
 
-DDL = """DROP TABLE IF EXISTS cb;
+DDL = """DROP TABLE IF EXISTS cb_composite;
+DROP TABLE IF EXISTS cb;
+DROP DOMAIN IF EXISTS cb_point_value;
+DROP TYPE IF EXISTS cb_point;
 DROP TYPE IF EXISTS cb_mood;
 DROP DOMAIN IF EXISTS cb_positive;
 CREATE TYPE cb_mood AS ENUM ('sad', 'ok', 'happy');
 CREATE DOMAIN cb_positive AS int CHECK (VALUE > 0);
+CREATE TYPE cb_point AS (x integer, y integer);
+CREATE DOMAIN cb_point_value AS cb_point;
 CREATE TABLE cb (
   i2 smallint, i4 int, i8 bigint, f4 real, f8 float8, n numeric, bo bool,
   t text, vc varchar(10), bp char(5), d date, ts timestamp, tz timestamptz,
@@ -52,28 +59,74 @@ INSERT = """INSERT INTO cb VALUES
   (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
+COMPOSITE_DDL = """DROP TABLE IF EXISTS cb_composite;
+CREATE TABLE cb_composite (points cb_point_value[])"""
+
+COMPOSITE_INSERT = """INSERT INTO cb_composite VALUES
+  (ARRAY[ROW(3,4)::cb_point]::cb_point_value[]),
+  (ARRAY[ROW(-1,8)::cb_point]::cb_point_value[]),
+  (NULL)"""
+
 
 def connect(host, port):
     return psycopg.connect(host=host, port=port, user="postgres", dbname="postgres", autocommit=True)
 
 
-def dump(conn):
+def dump(conn, table="cb"):
     out = b""
-    with conn.cursor().copy("COPY cb TO STDOUT (FORMAT binary)") as cp:
+    with conn.cursor().copy("COPY %s TO STDOUT (FORMAT binary)" % table) as cp:
         for chunk in cp:
             out += bytes(chunk)
     return out
 
 
-def load(conn, data):
-    with conn.cursor().copy("COPY cb FROM STDIN (FORMAT binary)") as cp:
+def load(conn, data, table="cb"):
+    with conn.cursor().copy("COPY %s FROM STDIN (FORMAT binary)" % table) as cp:
         cp.write(data)
 
 
-def rows(conn):
+def rows(conn, table="cb"):
     cur = conn.cursor()
-    cur.execute("SELECT * FROM cb ORDER BY i4 NULLS LAST")
+    if table == "cb":
+        cur.execute("SELECT * FROM cb ORDER BY i4 NULLS LAST")
+    elif table == "cb_composite":
+        cur.execute("SELECT points::text FROM cb_composite ORDER BY points::text NULLS LAST")
+    else:
+        raise ValueError("unknown COPY differential fixture: %s" % table)
     return cur.fetchall()
+
+
+def composite_domain_oid(conn):
+    return conn.execute(
+        "SELECT oid FROM pg_type WHERE typname = 'cb_point_value'"
+    ).fetchone()[0]
+
+
+def remap_composite_array_domain_oid(data, source_oid, target_oid):
+    """Map every non-NULL array header in this fixed one-column fixture."""
+    out = bytearray(data)
+    if out[:19] != b"PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00":
+        raise AssertionError("invalid COPY binary signature")
+    offset = 19
+    while True:
+        field_count = int.from_bytes(out[offset:offset + 2], "big", signed=True)
+        offset += 2
+        if field_count == -1:
+            break
+        if field_count != 1:
+            raise AssertionError("expected one composite-array column")
+        field_length = int.from_bytes(out[offset:offset + 4], "big", signed=True)
+        offset += 4
+        if field_length == -1:
+            continue
+        if field_length < 12:
+            raise AssertionError("invalid composite-domain array field")
+        array_at = offset
+        if int.from_bytes(out[array_at + 8:array_at + 12], "big", signed=True) != source_oid:
+            raise AssertionError("unexpected composite-domain array element OID")
+        out[array_at + 8:array_at + 12] = target_oid.to_bytes(4, "big", signed=True)
+        offset += field_length
+    return bytes(out)
 
 
 def main():
@@ -124,6 +177,37 @@ def main():
     else:
         fails += 1
         print("DIVERGENCE: pos3ql binary dump does not round-trip through PostgreSQL")
+
+    # User-defined type OIDs are allocated independently per PostgreSQL
+    # cluster. Their array header is catalog identity, not portable value data.
+    for c in (pg, p3):
+        c.cursor().execute(COMPOSITE_DDL)
+        c.cursor().execute(COMPOSITE_INSERT)
+    pg_composite_oid, p3_composite_oid = composite_domain_oid(pg), composite_domain_oid(p3)
+    pg_composite_dump = dump(pg, "cb_composite")
+    p3_composite_dump = dump(p3, "cb_composite")
+    pg_body = remap_composite_array_domain_oid(pg_composite_dump, pg_composite_oid, 0)
+    p3_body = remap_composite_array_domain_oid(p3_composite_dump, p3_composite_oid, 0)
+    if pg_body == p3_body:
+        print("ok: composite-domain array COPY bodies match after catalog OID mapping")
+    else:
+        fails += 1
+        print("DIVERGENCE: composite-domain array COPY bodies differ")
+
+    # A client transferring a user-defined binary value maps its catalog OID.
+    # This checks that the remaining element is a composite record in both
+    # directions rather than a text-shaped stand-in.
+    for c, data, source_oid, target_oid in (
+        (p3, pg_composite_dump, pg_composite_oid, p3_composite_oid),
+        (pg, p3_composite_dump, p3_composite_oid, pg_composite_oid),
+    ):
+        c.cursor().execute("DELETE FROM cb_composite")
+        load(c, remap_composite_array_domain_oid(data, source_oid, target_oid), "cb_composite")
+    if rows(pg, "cb_composite") == rows(p3, "cb_composite"):
+        print("ok: catalog-mapped composite-domain array COPY loads in both directions")
+    else:
+        fails += 1
+        print("DIVERGENCE: catalog-mapped composite-domain array rows differ")
 
     print("copy-binary: %d check(s) failed" % fails)
     sys.exit(1 if fails else 0)

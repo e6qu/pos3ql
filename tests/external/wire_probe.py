@@ -1492,6 +1492,32 @@ def test_catalog_aware_binary_bind_parameters():
         has_sqlstate(messages, "23514"),
         messages,
     )
+    # A domain over a composite remains a domain at the array wire boundary:
+    # its array header names the domain OID while each element is a binary
+    # record, never the stored composite text.
+    query = "SELECT ARRAY[ROW(4,8)::wire_binary_coordinate]::wire_binary_coordinate_domain[]"
+    parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1))
+    describe = frontend_message(b"D", b"P\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    messages = []
+    while True:
+        item = read_message(s)
+        messages.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    expected_array = binary_array(coordinate_domain_oid, [coordinate])
+    check(
+        "binary Result preserves composite-domain array identity and records",
+        description is not None
+        and row_description_type_oids(description) == [coordinate_domain_array_oid]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01" + struct.pack("!i", len(expected_array)) + expected_array,
+        messages,
+    )
     simple_query(
         s,
         "CREATE TABLE wire_routine_values (id integer, value integer); "

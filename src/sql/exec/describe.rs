@@ -1047,13 +1047,31 @@ pub fn record_shape(
             };
             visit_composite_slot_shape(slot, visit)
         }
-        Expr::Subscript { .. } if matches!(infer_type_res(base, columns), Ok((oid, _)) if matches!(coltype_of_oid(oid), Some(ColType::Composite(_)))) =>
-        {
-            let Ok((type_oid, _)) = infer_type_res(base, columns) else {
-                unreachable!()
+        Expr::Subscript { base: array, .. } => {
+            let element = match &**array {
+                Expr::Column { qualifier, name } => columns
+                    .resolve(*qualifier, name)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
+                Expr::Field { base, field } => record_field_type(base, field, columns)
+                    .ok()
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
+                _ => infer_type_res(array, columns)
+                    .ok()
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .and_then(|ctype| match ctype {
+                        ColType::Array(element) => Some(element.to_coltype()),
+                        _ => None,
+                    }),
             };
-            let Some(ColType::Composite(slot)) = coltype_of_oid(type_oid) else {
-                unreachable!()
+            let Some(ColType::Composite(slot)) = element else {
+                return None;
             };
             visit_composite_slot_shape(slot, visit)
         }

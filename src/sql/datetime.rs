@@ -119,20 +119,37 @@ const MONTH_FULL: [&str; 12] = [
     "december",
 ];
 
-/// Parses `input` guided by a `to_date`/`to_timestamp` format string into
-/// `(year, month, day, hour, minute, second)`. Supports the common field codes
-/// (`YYYY`/`YYY`/`YY`/`Y`, `MM`, `DD`, `HH24`/`HH12`/`HH`, `MI`, `SS`,
-/// `MON`/`MONTH`) with any non-code characters treated as skippable separators;
-/// unrecognized letter codes are rejected loudly.
-pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i64, i64), SqlError> {
+/// A fully resolved date/time format-model result. Parsing produces this
+/// typed state before either `to_date` or `to_timestamp` consumes it, so the
+/// two entry points cannot disagree about a calendar interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormattedDateTime {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
+    pub microsecond: i64,
+}
+
+/// Parses `input` guided by a `to_date`/`to_timestamp` format string. Civil,
+/// ordinal, and ISO-week dates are resolved here rather than left as partially
+/// interpreted fields for callers to combine.
+pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlError> {
     let bad = || {
         sql_err!(
             sqlstate::INVALID_DATETIME_FORMAT,
             "invalid value for input string"
         )
     };
-    let (mut y, mut month, mut d, mut h, mut minute, mut s) =
-        (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64);
+    let (mut y, mut month, mut d, mut h, mut minute, mut s, mut us) =
+        (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64, 0i64);
+    let mut ordinal = None;
+    let (mut iso_year, mut iso_week, mut iso_day) = (None, None, None);
+    let mut twelve_hour = false;
+    let mut pm = None;
+    let mut bc = false;
     let input_bytes = input.as_bytes();
     let format_bytes = fmt.as_bytes();
     let mut input_position = 0usize;
@@ -162,11 +179,32 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
     };
     while format_index < format_bytes.len() {
         let up = format_bytes[format_index].to_ascii_uppercase();
+        if starts_with_ci(format_bytes, format_index, b"FM") {
+            format_index += 2;
+            continue;
+        }
         // Longest field codes first.
-        if starts_with_ci(format_bytes, format_index, b"HH24")
-            || starts_with_ci(format_bytes, format_index, b"HH12")
-        {
+        if starts_with_ci(format_bytes, format_index, b"IYYY") {
+            iso_year = Some(read_num(&mut input_position, 4).ok_or_else(bad)?);
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"HH24") {
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"HH12") {
+            h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            twelve_hour = true;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"SSSS") {
+            let seconds = read_num(&mut input_position, 5).ok_or_else(bad)?;
+            if !(0..86_400).contains(&seconds) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            h = seconds / 3600;
+            minute = (seconds / 60) % 60;
+            s = seconds % 60;
             format_index += 4;
         } else if starts_with_ci(format_bytes, format_index, b"YYYY") {
             y = read_num(&mut input_position, 4).ok_or_else(bad)?;
@@ -180,12 +218,26 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
         } else if starts_with_ci(format_bytes, format_index, b"YYY") {
             y = read_num(&mut input_position, 3).ok_or_else(bad)?;
             format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"DDD") {
+            ordinal = Some(read_num(&mut input_position, 3).ok_or_else(bad)?);
+            format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"IYY") {
+            iso_year = Some(read_num(&mut input_position, 3).ok_or_else(bad)?);
+            format_index += 3;
         } else if up == b'H' && starts_with_ci(format_bytes, format_index, b"HH") {
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            twelve_hour = true;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"YY") {
             let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
             y = if v < 70 { 2000 + v } else { 1900 + v };
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"IY") {
+            let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            iso_year = Some(if v < 70 { 2000 + v } else { 1900 + v });
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"IW") {
+            iso_week = Some(read_num(&mut input_position, 2).ok_or_else(bad)?);
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"MM") {
             month = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
@@ -199,8 +251,43 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
         } else if starts_with_ci(format_bytes, format_index, b"SS") {
             s = read_num(&mut input_position, 2).ok_or_else(bad)?;
             format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"MS") {
+            us = read_num(&mut input_position, 3).ok_or_else(bad)? * 1000;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"US") {
+            us = read_num(&mut input_position, 6).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"RM") {
+            month = read_roman_month(input, &mut input_position).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"A.M.")
+            || starts_with_ci(format_bytes, format_index, b"P.M.")
+        {
+            pm = Some(read_meridiem(input, &mut input_position, true).ok_or_else(bad)?);
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"AM")
+            || starts_with_ci(format_bytes, format_index, b"PM")
+        {
+            pm = Some(read_meridiem(input, &mut input_position, false).ok_or_else(bad)?);
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"A.D.")
+            || starts_with_ci(format_bytes, format_index, b"B.C.")
+        {
+            bc = read_era(input, &mut input_position, true).ok_or_else(bad)?;
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"AD")
+            || starts_with_ci(format_bytes, format_index, b"BC")
+        {
+            bc = read_era(input, &mut input_position, false).ok_or_else(bad)?;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"ID") {
+            iso_day = Some(read_num(&mut input_position, 1).ok_or_else(bad)?);
+            format_index += 2;
         } else if up == b'Y' {
             y = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            format_index += 1;
+        } else if up == b'I' {
+            iso_year = Some(read_num(&mut input_position, 1).ok_or_else(bad)?);
             format_index += 1;
         } else if up.is_ascii_alphabetic() {
             return Err(sql_err!(
@@ -217,13 +304,90 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<(i64, u32, u32, i64, i6
             format_index += 1;
         }
     }
-    if !(1..=12).contains(&month) || d < 1 || d > days_in_month(y, month) {
+    if let (Some(year), Some(week), Some(day)) = (iso_year, iso_week, iso_day) {
+        let jan4 = days_from_civil(year, 1, 4) - PG_EPOCH_DAYS;
+        let jan4_iso_day = ((day_of_week(jan4) + 6) % 7 + 1) as i64;
+        if !(1..=53).contains(&week) || !(1..=7).contains(&day) {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        let days = jan4 - (jan4_iso_day - 1) + (week - 1) * 7 + (day - 1);
+        let (actual_year, actual_week, _) = {
+            let iso_day = ((day_of_week(days) + 6) % 7 + 1) as i64;
+            let (actual_year, _, _) = civil_from_days(days + (4 - iso_day) + PG_EPOCH_DAYS);
+            let first = days_from_civil(actual_year, 1, 4) - PG_EPOCH_DAYS;
+            let first_iso_day = ((day_of_week(first) + 6) % 7 + 1) as i64;
+            (
+                actual_year,
+                (days - (first - (first_iso_day - 1))) / 7 + 1,
+                iso_day,
+            )
+        };
+        if actual_year != year || actual_week != week {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        (y, month, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    } else if iso_year.is_some() || iso_week.is_some() || iso_day.is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "ISO week date requires IYYY, IW, and ID"
+        ));
+    } else if let Some(day_of_year) = ordinal {
+        let max = if days_in_month(y, 2) == 29 { 366 } else { 365 };
+        if !(1..=max).contains(&(day_of_year as u32)) {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        let (resolved_year, resolved_month, resolved_day) =
+            civil_from_days(days_from_civil(y, 1, 1) + day_of_year - 1);
+        (y, month, d) = (resolved_year, resolved_month, resolved_day);
+    }
+    if bc {
+        y = 1 - y;
+    }
+    if twelve_hour {
+        if !(1..=12).contains(&h) {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        h = h % 12 + if pm.unwrap_or(false) { 12 } else { 0 };
+    } else if pm.is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "AM/PM requires an HH12 or HH format"
+        ));
+    }
+    if !(1..=12).contains(&month)
+        || d < 1
+        || d > days_in_month(y, month)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&s)
+        || !(0..1_000_000).contains(&us)
+    {
         return Err(sql_err!(
             sqlstate::DATETIME_FIELD_OVERFLOW,
             "date/time field value out of range"
         ));
     }
-    Ok((y, month, d, h, minute, s))
+    Ok(FormattedDateTime {
+        year: y,
+        month,
+        day: d,
+        hour: h,
+        minute,
+        second: s,
+        microsecond: us,
+    })
 }
 
 /// Reads a month name (abbreviated when `abbr`, else full) at `*input_position`, returning
@@ -259,17 +423,107 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
     None
 }
 
+fn read_roman_month(input: &str, input_position: &mut usize) -> Option<u32> {
+    const ROMAN: [&str; 12] = [
+        "XII", "XI", "IX", "VIII", "VII", "VI", "IV", "III", "II", "I", "V", "X",
+    ];
+    let bytes = input.as_bytes();
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
+    }
+    for token in ROMAN {
+        let end = *input_position + token.len();
+        if end <= bytes.len() && bytes[*input_position..end].eq_ignore_ascii_case(token.as_bytes())
+        {
+            *input_position = end;
+            return Some(match token {
+                "I" => 1,
+                "II" => 2,
+                "III" => 3,
+                "IV" => 4,
+                "V" => 5,
+                "VI" => 6,
+                "VII" => 7,
+                "VIII" => 8,
+                "IX" => 9,
+                "X" => 10,
+                "XI" => 11,
+                "XII" => 12,
+                _ => unreachable!(),
+            });
+        }
+    }
+    None
+}
+
+fn read_meridiem(input: &str, input_position: &mut usize, dotted: bool) -> Option<bool> {
+    let bytes = input.as_bytes();
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
+    }
+    let am = if dotted {
+        b"A.M.".as_slice()
+    } else {
+        b"AM".as_slice()
+    };
+    let pm = if dotted {
+        b"P.M.".as_slice()
+    } else {
+        b"PM".as_slice()
+    };
+    for (token, is_pm) in [(am, false), (pm, true)] {
+        let end = *input_position + token.len();
+        if end <= bytes.len() && bytes[*input_position..end].eq_ignore_ascii_case(token) {
+            *input_position = end;
+            return Some(is_pm);
+        }
+    }
+    None
+}
+
+fn read_era(input: &str, input_position: &mut usize, dotted: bool) -> Option<bool> {
+    let bytes = input.as_bytes();
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
+    }
+    let ad = if dotted {
+        b"A.D.".as_slice()
+    } else {
+        b"AD".as_slice()
+    };
+    let bc = if dotted {
+        b"B.C.".as_slice()
+    } else {
+        b"BC".as_slice()
+    };
+    for (token, is_bc) in [(ad, false), (bc, true)] {
+        let end = *input_position + token.len();
+        if end <= bytes.len() && bytes[*input_position..end].eq_ignore_ascii_case(token) {
+            *input_position = end;
+            return Some(is_bc);
+        }
+    }
+    None
+}
+
 /// `to_date`: parses a formatted date into days since 2000-01-01.
 pub fn to_date(input: &str, fmt: &str) -> Result<i32, SqlError> {
-    let (y, month, d, _, _, _) = parse_formatted(input, fmt)?;
-    make_date(y, month as i64, d as i64)
+    let value = parse_formatted(input, fmt)?;
+    make_date(value.year, value.month as i64, value.day as i64)
 }
 
 /// `to_timestamp`: parses a formatted timestamp into microseconds since
 /// 2000-01-01.
 pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
-    let (y, month, d, h, minute, s) = parse_formatted(input, fmt)?;
-    make_timestamp(y, month as i64, d as i64, h, minute, s as f64)
+    let value = parse_formatted(input, fmt)?;
+    make_timestamp(
+        value.year,
+        value.month as i64,
+        value.day as i64,
+        value.hour,
+        value.minute,
+        value.second as f64 + value.microsecond as f64 / 1_000_000.0,
+    )
 }
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
@@ -341,6 +595,14 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
         )
     };
     let t = s.trim();
+    // PostgreSQL's era marker applies to the date even when it follows a
+    // timestamp time component. Consume it before the ordinary zone parser,
+    // where `BC` would otherwise look like a named zone.
+    let (t, bc) = match t.rsplit_once(' ') {
+        Some((head, era)) if era.eq_ignore_ascii_case("BC") => (head.trim_end(), true),
+        Some((head, era)) if era.eq_ignore_ascii_case("AD") => (head.trim_end(), false),
+        _ => (t, false),
+    };
     // Split date and time parts.
     let (date_part, rest) = match t.find([' ', 'T']) {
         Some(i) => (&t[..i], &t[i + 1..]),
@@ -350,8 +612,12 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     // `date` error surfaced verbatim — so a 22007 from `parse_date` is remapped
     // to the timestamp type, while its 22008 out-of-range error is kept, since
     // an impossible date is an impossible timestamp too.
-    let date_days =
+    let mut date_days =
         parse_date(date_part).map_err(|e| if e.sqlstate == "22007" { bad() } else { e })? as i64;
+    if bc {
+        let (year, month, day) = civil_from_days(date_days + PG_EPOCH_DAYS);
+        date_days = days_from_civil(1 - year, month, day) - PG_EPOCH_DAYS;
+    }
 
     if rest.is_empty() {
         return Ok(date_days * 86_400 * 1_000_000);
@@ -1412,6 +1678,40 @@ mod tests {
             parse_timestamp("2024-06-15 12:30:45", false).unwrap()
         );
         assert!(to_date("2024-13-01", "YYYY-MM-DD").is_err());
+    }
+
+    #[test]
+    fn format_model_calendar_inputs_are_resolved_once() {
+        assert_eq!(
+            parse_timestamp("0001-01-01 BC", false).unwrap(),
+            make_timestamp(0, 1, 1, 0, 0, 0.0).unwrap()
+        );
+        let leap = make_date(2024, 2, 29).unwrap();
+        assert_eq!(to_date("2024-060", "YYYY-DDD").unwrap(), leap);
+        assert_eq!(
+            to_date("2020-53-5", "IYYY-IW-ID").unwrap(),
+            make_date(2021, 1, 1).unwrap()
+        );
+        assert_eq!(
+            to_date("XII-31-2024", "RM-DD-YYYY").unwrap(),
+            make_date(2024, 12, 31).unwrap()
+        );
+        assert_eq!(
+            to_date("0001 BC", "YYYY BC").unwrap(),
+            make_date(0, 1, 1).unwrap()
+        );
+        assert_eq!(
+            to_timestamp(
+                "2021-01-01 01:02:03.456789 PM",
+                "YYYY-MM-DD HH12:MI:SS.US AM"
+            )
+            .unwrap(),
+            make_timestamp(2021, 1, 1, 13, 2, 3.456789).unwrap()
+        );
+        assert_eq!(
+            to_timestamp("46923", "SSSS").unwrap(),
+            make_timestamp(2000, 1, 1, 13, 2, 3.0).unwrap()
+        );
     }
 
     #[test]

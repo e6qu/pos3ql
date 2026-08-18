@@ -3689,8 +3689,11 @@ impl Checkpointer {
                 | (u8::from(publication.publish_delete) << 3)
                 | (u8::from(publication.publish_truncate) << 4);
             let mut members = StackStr::<1024>::new();
-            for table in &publication.tables[..publication.table_count] {
-                let _ = write!(members, " {table}");
+            for (table, mask) in publication.tables[..publication.table_count]
+                .iter()
+                .zip(&publication.table_column_masks[..publication.table_count])
+            {
+                let _ = write!(members, " {table} {mask}");
             }
             let mut schemas = StackStr::<128>::new();
             for schema in &publication.schemas[..publication.schema_count] {
@@ -5252,6 +5255,10 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     for table in &mut tables[..count] {
         *table = parse_field(words.next(), "pub table")?;
     }
+    let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    for mask in &mut table_column_masks[..count] {
+        *mask = parse_field(words.next(), "pub table column mask")?;
+    }
     let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
     for schema in &mut schemas[..schema_count] {
         *schema = parse_field(words.next(), "pub schema")?;
@@ -5265,6 +5272,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 name: sql_name(&name)?,
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],
+                table_column_masks: &table_column_masks[..count],
                 schemas: &schemas[..schema_count],
                 publish_insert: flags & 2 != 0,
                 publish_update: flags & 4 != 0,

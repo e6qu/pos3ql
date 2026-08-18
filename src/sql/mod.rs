@@ -466,10 +466,19 @@ fn emit_replication_relation(
     storage: &Storage,
     definition: &crate::storage::TableDef,
     relation_id: u32,
+    column_mask: u64,
     responder: &mut Responder,
     end_lsn: u64,
 ) -> Result<(), SqlError> {
-    let columns = definition.columns();
+    let mut selected_columns = [crate::storage::ColumnMeta::EMPTY; crate::storage::MAX_COLUMNS];
+    let mut selected_count = 0usize;
+    for (index, column) in definition.columns().iter().enumerate() {
+        if column_mask & (1u64 << index) != 0 {
+            selected_columns[selected_count] = *column;
+            selected_count += 1;
+        }
+    }
+    let columns = &selected_columns[..selected_count];
     let (type_oids, types) = replication_column_types(storage, columns)?;
     let overflow = || {
         sql_err!(
@@ -544,7 +553,14 @@ fn emit_pending_truncates(
             }
             let definition = storage.table_def(table_slot, 0);
             let relation_id = table_slot as u32 + 1;
-            emit_replication_relation(storage, definition, relation_id, responder, end_lsn)?;
+            emit_replication_relation(
+                storage,
+                definition,
+                relation_id,
+                u64::MAX,
+                responder,
+                end_lsn,
+            )?;
             relation_ids[relation_count] = relation_id;
             relation_count += 1;
         }
@@ -592,6 +608,19 @@ fn publication_selects(
     table_slot: usize,
     operation: PublicationOperation,
 ) -> Result<bool, SqlError> {
+    Ok(publication_column_mask(storage, publication_names, table_slot, operation)?.is_some())
+}
+
+/// Computes the pgoutput projection selected by every subscribed publication.
+/// An all-table or schema membership has PostgreSQL's full-row meaning; masks
+/// from explicit relation members are otherwise unioned by attribute number.
+fn publication_column_mask(
+    storage: &Storage,
+    publication_names: &[SqlName],
+    table_slot: usize,
+    operation: PublicationOperation,
+) -> Result<Option<u64>, SqlError> {
+    let mut selected = 0u64;
     for name in publication_names {
         let publication = storage.publication(name.as_str()).ok_or_else(|| {
             sql_err!(
@@ -601,24 +630,50 @@ fn publication_selects(
             )
         })?;
         let table_schema = storage.table_def(table_slot, 0).schema;
-        let member = publication.all_tables
-            || publication.tables[..publication.table_count].contains(&(table_slot as u16))
-            || storage
-                .find_schema(table_schema.as_str())
-                .is_some_and(|slot| {
-                    publication.schemas[..publication.schema_count].contains(&(slot as u8))
-                });
+        let explicit = publication.tables[..publication.table_count]
+            .iter()
+            .position(|member| *member == table_slot as u16);
+        let schema_member = storage
+            .find_schema(table_schema.as_str())
+            .is_some_and(|slot| {
+                publication.schemas[..publication.schema_count].contains(&(slot as u8))
+            });
         let publishes = match operation {
             PublicationOperation::Insert => publication.publish_insert,
             PublicationOperation::Update => publication.publish_update,
             PublicationOperation::Delete => publication.publish_delete,
             PublicationOperation::Truncate => publication.publish_truncate,
         };
-        if member && publishes {
-            return Ok(true);
+        if !publishes {
+            continue;
+        }
+        if publication.all_tables || schema_member {
+            return Ok(Some(u64::MAX));
+        }
+        if let Some(index) = explicit {
+            let mask = publication.table_column_masks[index];
+            if mask == 0 {
+                return Ok(Some(u64::MAX));
+            }
+            selected |= mask;
         }
     }
-    Ok(false)
+    Ok((selected != 0).then_some(selected))
+}
+
+fn project_replication_values<'a>(
+    values: &[Datum<'a>],
+    column_mask: u64,
+) -> ([Datum<'a>; crate::storage::MAX_COLUMNS], usize) {
+    let mut projected = [Datum::Null; crate::storage::MAX_COLUMNS];
+    let mut count = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        if column_mask & (1u64 << index) != 0 {
+            projected[count] = *value;
+            count += 1;
+        }
+    }
+    (projected, count)
 }
 
 impl Engine {
@@ -715,8 +770,16 @@ impl Engine {
         binding: crate::pg::subscription_apply::RelationBinding,
         tuple: crate::pg::pginput::Tuple<'_>,
         arena: &Arena,
+        guc: &GucState,
     ) -> Result<(), SqlError> {
-        exec::apply_replication_insert(&mut self.storage, txn, binding, tuple, arena)
+        exec::apply_replication_insert(
+            &mut self.storage,
+            txn,
+            binding,
+            tuple,
+            arena,
+            guc.seq_session(),
+        )
     }
 
     pub fn apply_subscription_delete(
@@ -1410,7 +1473,7 @@ impl Engine {
                                 table
                             ));
                         };
-                        if publication_selects(
+                        if let Some(column_mask) = publication_column_mask(
                             storage,
                             publication_names,
                             table_slot,
@@ -1434,6 +1497,7 @@ impl Engine {
                                 storage,
                                 definition,
                                 relation_id,
+                                column_mask,
                                 responder,
                                 end_lsn,
                             )?;
@@ -1452,12 +1516,21 @@ impl Engine {
                                 )?;
                                 responder
                                     .copy_data(&|message| {
+                                        let (old_projected, old_count) = project_replication_values(
+                                            &old_values[..column_count],
+                                            column_mask,
+                                        );
+                                        let (projected, projected_count) =
+                                            project_replication_values(
+                                                &values[..column_count],
+                                                column_mask,
+                                            );
                                         pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                             pgoutput::update(
                                                 plugin,
                                                 relation_id,
-                                                &old_values[..column_count],
-                                                &values[..column_count],
+                                                &old_projected[..old_count],
+                                                &projected[..projected_count],
                                                 binary,
                                             )
                                         })
@@ -1466,11 +1539,16 @@ impl Engine {
                             } else {
                                 responder
                                     .copy_data(&|message| {
+                                        let (projected, projected_count) =
+                                            project_replication_values(
+                                                &values[..column_count],
+                                                column_mask,
+                                            );
                                         pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                             pgoutput::insert(
                                                 plugin,
                                                 relation_id,
-                                                &values[..column_count],
+                                                &projected[..projected_count],
                                                 binary,
                                             )
                                         })
@@ -1499,7 +1577,7 @@ impl Engine {
                                     && truncate.table_slots[..truncate.table_count]
                                         .contains(&(table_slot as u16))
                             });
-                        if publication_selects(
+                        if let Some(column_mask) = publication_column_mask(
                             storage,
                             publication_names,
                             table_slot,
@@ -1535,16 +1613,21 @@ impl Engine {
                                 storage,
                                 definition,
                                 relation_id,
+                                column_mask,
                                 responder,
                                 end_lsn,
                             )?;
                             responder
                                 .copy_data(&|message| {
+                                    let (projected, projected_count) = project_replication_values(
+                                        &values[..column_count],
+                                        column_mask,
+                                    );
                                     pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                         pgoutput::delete(
                                             plugin,
                                             relation_id,
-                                            &values[..column_count],
+                                            &projected[..projected_count],
                                             binary,
                                         )
                                     })
@@ -7468,6 +7551,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             owner,
             all_tables,
             tables,
+            table_column_masks,
             table_count,
             schemas,
             schema_count,
@@ -7481,6 +7565,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name: crate::storage::SqlName::parse(name)?,
                     all_tables,
                     tables: &tables[..table_count],
+                    table_column_masks: &table_column_masks[..table_count],
                     schemas: &schemas[..schema_count],
                     publish_insert,
                     publish_update,
@@ -7501,6 +7586,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             all_tables,
             tables,
+            table_column_masks,
             table_count,
             schemas,
             schema_count,
@@ -7512,6 +7598,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let definition = crate::storage::PublicationDefinition {
                 all_tables,
                 tables,
+                table_column_masks,
                 table_count,
                 schemas,
                 schema_count,

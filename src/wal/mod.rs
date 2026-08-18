@@ -388,6 +388,7 @@ pub(crate) enum WalOp<'a> {
         owner: u16,
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
+        table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
         schemas: [u8; crate::storage::MAX_SCHEMAS],
         schema_count: usize,
@@ -405,6 +406,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
+        table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
         schemas: [u8; crate::storage::MAX_SCHEMAS],
         schema_count: usize,
@@ -1523,14 +1525,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table_count,
             schema_count,
             ..
-        } => 1 + name.len() + 2 + 1 + 1 + 1 + table_count * 2 + schema_count,
+        } => 1 + name.len() + 2 + 1 + 1 + 1 + table_count * 10 + schema_count,
         WalOp::DropPublication { name } => 1 + name.len(),
         WalOp::AlterPublication {
             name,
             table_count,
             schema_count,
             ..
-        } => 1 + name.len() + 1 + 1 + 1 + table_count * 2 + schema_count,
+        } => 1 + name.len() + 1 + 1 + 1 + table_count * 10 + schema_count,
         WalOp::SetPublicationOwner { name, .. } => 1 + name.len() + 2,
         WalOp::RenamePublication { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::CreateSubscription {
@@ -2095,6 +2097,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             owner,
             all_tables,
             tables,
+            table_column_masks,
             table_count,
             publish_insert,
             publish_update,
@@ -2114,6 +2117,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
             }
+            for mask in &table_column_masks[..*table_count] {
+                ok = ok && buffer.append(&mask.to_le_bytes());
+            }
             ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
         }
@@ -2122,6 +2128,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             all_tables,
             tables,
+            table_column_masks,
             table_count,
             schemas,
             schema_count,
@@ -2139,6 +2146,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
+            }
+            for mask in &table_column_masks[..*table_count] {
+                ok = ok && buffer.append(&mask.to_le_bytes());
             }
             ok = ok && buffer.append(&schemas[..*schema_count]);
             ok
@@ -3336,6 +3346,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
+            let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+            for mask in &mut table_column_masks[..count] {
+                *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+            }
             let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
@@ -3344,6 +3359,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 owner,
                 all_tables: flags & 1 != 0,
                 tables,
+                table_column_masks,
                 table_count: count,
                 schemas,
                 schema_count,
@@ -3376,6 +3392,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
+            let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+            for mask in &mut table_column_masks[..count] {
+                *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+            }
             let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
@@ -3383,6 +3404,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 all_tables: flags & 1 != 0,
                 tables,
+                table_column_masks,
                 table_count: count,
                 schemas,
                 schema_count,
@@ -5650,6 +5672,7 @@ mod tests {
                     owner: 7,
                     all_tables: false,
                     tables: publication_tables,
+                    table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
                     schema_count: 0,
@@ -5666,6 +5689,7 @@ mod tests {
                     name: "changes",
                     all_tables: false,
                     tables: publication_tables,
+                    table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
                     schema_count: 0,

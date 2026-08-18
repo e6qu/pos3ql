@@ -77,7 +77,7 @@ impl RelationMap {
                 )
             })?;
         let definition = storage.table_def(table_slot, txid);
-        if relation.columns().len() != definition.n_columns {
+        if relation.columns().len() > definition.n_columns {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "subscription relation \"{}.{}\" has {} columns, local table has {}",
@@ -367,6 +367,7 @@ impl SubscriptionApply {
                     self.relations.binding(relation_id)?,
                     new,
                     &self.arena,
+                    &self.guc,
                 )?;
                 Ok(ApplyResult::None)
             }

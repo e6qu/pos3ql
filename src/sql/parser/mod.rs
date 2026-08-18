@@ -4655,9 +4655,27 @@ mod tests {
             };
             assert_eq!(tables.len(), 2);
             assert!(schemas.is_empty());
-            assert_eq!(tables[0].schema, Some("public"));
-            assert_eq!(tables[1].schema, Some("archive"));
+            assert_eq!(tables[0].relation.schema, Some("public"));
+            assert_eq!(tables[1].relation.schema, Some("archive"));
         });
+    }
+
+    #[test]
+    fn publication_column_lists_remain_attached_to_their_relation_without_allocation() {
+        with_parser(
+            "CREATE PUBLICATION changes FOR TABLE public.orders (id, total), archive.orders",
+            |parser| {
+                let Some(Stmt::CreatePublication { tables, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("publication column list did not parse")
+                };
+                assert_eq!(tables.len(), 2);
+                assert_eq!(tables[0].relation.schema, Some("public"));
+                assert_eq!(tables[0].relation.name, "orders");
+                assert_eq!(tables[0].columns, ["id", "total"]);
+                assert!(tables[1].columns.is_empty());
+            },
+        );
     }
 
     #[test]
@@ -4670,7 +4688,8 @@ mod tests {
             else {
                 panic!("SET TABLE parsed as another ALTER PUBLICATION action")
             };
-            assert_eq!(tables, [QualName::bare("orders")]);
+            assert_eq!(tables[0].relation, QualName::bare("orders"));
+            assert!(tables[0].columns.is_empty());
             assert!(schemas.is_empty());
         });
     }
@@ -4878,13 +4897,9 @@ mod tests {
             else {
                 panic!("publication schema targets did not parse")
             };
-            assert_eq!(
-                tables,
-                [QualName {
-                    schema: Some("public"),
-                    name: "orders"
-                }]
-            );
+            assert_eq!(tables[0].relation.schema, Some("public"));
+            assert_eq!(tables[0].relation.name, "orders");
+            assert!(tables[0].columns.is_empty());
             assert_eq!(schemas, ["archive", "public"]);
         });
     }

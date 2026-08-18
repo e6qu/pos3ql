@@ -26,8 +26,8 @@ use core::num::NonZeroU8;
 
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
-    Insert, LikeClause, Overriding, QualName, RoutineLanguage, Select, SelectItem, Stmt,
-    TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
+    Insert, LikeClause, Overriding, PublicationTarget, QualName, RoutineLanguage, Select,
+    SelectItem, Stmt, TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, datum_to_text,
@@ -5665,6 +5665,7 @@ fn remove_schema_from_publications(
                 name: name.as_str(),
                 all_tables: definition.all_tables,
                 tables: definition.tables,
+                table_column_masks: definition.table_column_masks,
                 table_count: definition.table_count,
                 schemas: definition.schemas,
                 schema_count: definition.schema_count,
@@ -5697,7 +5698,7 @@ pub fn create_publication(
     txn: &mut super::txn::TxnState,
     name: &str,
     all_tables: bool,
-    tables: &[QualName],
+    tables: &[PublicationTarget],
     schemas: &[&str],
     publish: crate::sql::ast::PublicationOperations,
     responder: &mut Responder,
@@ -5708,33 +5709,11 @@ pub fn create_publication(
             "FOR ALL TABLES cannot name tables"
         ));
     }
-    let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
-    for (index, table) in tables.iter().enumerate() {
-        let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(table.schema, table.name, txn.txid)
-        else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "relation \"{}\" does not exist",
-                table.name
-            ));
+    let (members, table_column_masks, table_count) =
+        match publication_members(storage, txn.txid, tables, publish.update || publish.delete) {
+            Ok(members) => members,
+            Err(error) => return sql_fail(error),
         };
-        if let Err(error) = storage.require_owner(
-            storage.table_access_object(slot, txn.txid),
-            txn.txid,
-            "table",
-        ) {
-            return sql_fail(error);
-        }
-        if members[..index].contains(&(slot as u16)) {
-            return sql_fail(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "relation \"{}\" is already in publication",
-                table.name
-            ));
-        }
-        members[index] = slot as u16;
-    }
     let schema_members = match publication_schemas(storage, txn.txid, schemas) {
         Ok(schemas) => schemas,
         Err(error) => return sql_fail(error),
@@ -5747,7 +5726,8 @@ pub fn create_publication(
         crate::storage::PublicationSpec {
             name,
             all_tables,
-            tables: &members[..tables.len()],
+            tables: &members[..table_count],
+            table_column_masks: &table_column_masks[..table_count],
             schemas: &schema_members[..schemas.len()],
             publish_insert: publish.insert,
             publish_update: publish.update,
@@ -5767,7 +5747,8 @@ pub fn create_publication(
                     owner,
                     all_tables,
                     tables: members,
-                    table_count: tables.len(),
+                    table_column_masks,
+                    table_count,
                     schemas: schema_members,
                     schema_count: schemas.len(),
                     publish_insert: publish.insert,
@@ -6403,11 +6384,17 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, count) = match publication_members(storage, txn.txid, tables) {
+            let (members, masks, count) = match publication_members(
+                storage,
+                txn.txid,
+                tables,
+                definition.publish_update || definition.publish_delete,
+            ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
             definition.tables = members;
+            definition.table_column_masks = masks;
             definition.table_count = count;
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
                 Ok(schemas) => schemas,
@@ -6424,7 +6411,12 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, count) = match publication_members(storage, txn.txid, tables) {
+            let (members, masks, count) = match publication_members(
+                storage,
+                txn.txid,
+                tables,
+                definition.publish_update || definition.publish_delete,
+            ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -6435,7 +6427,7 @@ pub fn alter_publication(
                     crate::storage::MAX_PUBLICATION_TABLES
                 ));
             }
-            for table in &members[..count] {
+            for (index, table) in members[..count].iter().enumerate() {
                 if definition.tables[..definition.table_count].contains(table) {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_OBJECT,
@@ -6444,6 +6436,7 @@ pub fn alter_publication(
                     ));
                 }
                 definition.tables[definition.table_count] = *table;
+                definition.table_column_masks[definition.table_count] = masks[index];
                 definition.table_count += 1;
             }
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
@@ -6469,6 +6462,12 @@ pub fn alter_publication(
             }
         }
         crate::sql::ast::AlterPublicationAction::DropTargets { tables, schemas } => {
+            if tables.iter().any(|table| !table.columns.is_empty()) {
+                return sql_fail(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "ALTER PUBLICATION DROP TABLE does not accept a column list"
+                ));
+            }
             if current.all_tables {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -6476,7 +6475,7 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, count) = match publication_members(storage, txn.txid, tables) {
+            let (members, _, count) = match publication_members(storage, txn.txid, tables, false) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -6494,8 +6493,12 @@ pub fn alter_publication(
                 definition
                     .tables
                     .copy_within(index + 1..definition.table_count, index);
+                definition
+                    .table_column_masks
+                    .copy_within(index + 1..definition.table_count, index);
                 definition.table_count -= 1;
                 definition.tables[definition.table_count] = u16::MAX;
+                definition.table_column_masks[definition.table_count] = 0;
             }
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
                 Ok(schemas) => schemas,
@@ -6520,6 +6523,9 @@ pub fn alter_publication(
             }
         }
     }
+    if let Err(error) = validate_publication_replica_identity(storage, &definition) {
+        return sql_fail(error);
+    }
     let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
         Ok(result) => result,
         Err(error) => return sql_fail(error),
@@ -6532,6 +6538,7 @@ pub fn alter_publication(
             name,
             all_tables: definition.all_tables,
             tables: definition.tables,
+            table_column_masks: definition.table_column_masks,
             table_count: definition.table_count,
             schemas: definition.schemas,
             schema_count: definition.schema_count,
@@ -6557,17 +6564,26 @@ pub fn alter_publication(
 fn publication_members(
     storage: &Storage,
     txid: u32,
-    tables: &[QualName],
-) -> Result<([u16; crate::storage::MAX_PUBLICATION_TABLES], usize), SqlError> {
+    tables: &[PublicationTarget],
+    require_replica_identity: bool,
+) -> Result<
+    (
+        [u16; crate::storage::MAX_PUBLICATION_TABLES],
+        [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        usize,
+    ),
+    SqlError,
+> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
     for (index, table) in tables.iter().enumerate() {
         let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(table.schema, table.name, txid)
+            storage.resolve_relation(table.relation.schema, table.relation.name, txid)
         else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "relation \"{}\" does not exist",
-                table.name
+                table.relation.name
             ));
         };
         storage.require_owner(storage.table_access_object(slot, txid), txid, "table")?;
@@ -6575,12 +6591,82 @@ fn publication_members(
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "relation \"{}\" is listed more than once",
-                table.name
+                table.relation.name
             ));
         }
+        let definition = storage.table_def(slot, txid);
+        let mut mask = 0u64;
+        for (column_index, column_name) in table.columns.iter().enumerate() {
+            let Some(column) = definition.column_index(column_name) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column_name,
+                    table.relation.name
+                ));
+            };
+            let bit = 1u64 << column;
+            if mask & bit != 0 {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "column \"{}\" is listed more than once",
+                    column_name
+                ));
+            }
+            mask |= bit;
+            debug_assert!(column_index < crate::storage::MAX_COLUMNS);
+        }
+        if require_replica_identity {
+            validate_publication_column_mask(definition, mask)?;
+        }
         members[index] = slot as u16;
+        masks[index] = mask;
     }
-    Ok((members, tables.len()))
+    Ok((members, masks, tables.len()))
+}
+
+fn validate_publication_replica_identity(
+    storage: &Storage,
+    definition: &crate::storage::PublicationDefinition,
+) -> Result<(), SqlError> {
+    if !definition.publish_update && !definition.publish_delete {
+        return Ok(());
+    }
+    for (table, mask) in definition.tables[..definition.table_count]
+        .iter()
+        .zip(&definition.table_column_masks[..definition.table_count])
+    {
+        validate_publication_column_mask(storage.table_def(*table as usize, 0), *mask)?;
+    }
+    Ok(())
+}
+
+fn validate_publication_column_mask(definition: &TableDef, mask: u64) -> Result<(), SqlError> {
+    if mask == 0 {
+        return Ok(());
+    }
+    let all_columns = if definition.n_columns == MAX_COLUMNS {
+        u64::MAX
+    } else {
+        (1u64 << definition.n_columns) - 1
+    };
+    let identity = definition
+        .columns()
+        .iter()
+        .enumerate()
+        .fold(0u64, |mask, (index, column)| {
+            mask | (u64::from(column.primary) << index)
+        });
+    if identity != 0 && mask & identity == identity {
+        return Ok(());
+    }
+    if identity == 0 && mask == all_columns {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "publication column list must include the replica identity"
+    ))
 }
 
 /// The user-supplied portion of CREATE VIEW, grouped to keep execution's
@@ -18873,16 +18959,15 @@ pub fn copy_row_binary(
     )
 }
 
-/// Applies one fully-described pgoutput INSERT tuple through the ordinary row
-/// core.  The relation binding was validated before the tuple arrived, so the
-/// only accepted tuple shape is the exact local table shape; unchanged TOAST
-/// is invalid for an INSERT and is never mistaken for NULL.
+/// Applies one pgoutput INSERT tuple through the ordinary row core. Omitted
+/// published columns take local defaults; unchanged TOAST is invalid here.
 pub fn apply_replication_insert(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
     tuple: Tuple<'_>,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<(), SqlError> {
     if tuple.columns().len() != binding.remote_to_local().len() {
         return Err(sql_err!(
@@ -18901,7 +18986,31 @@ pub fn apply_replication_insert(
     )?;
     let definition = *storage.table_def(table_index, txn.txid);
     let checks = parse_checks(&definition, arena)?;
-    let values = decode_replication_tuple(storage, txn, binding, tuple, arena, false)?;
+    let mut values = decode_replication_tuple(storage, txn, binding, tuple, arena, false)?;
+    let mut explicit = [false; MAX_COLUMNS];
+    for &local in binding.remote_to_local() {
+        explicit[local] = true;
+    }
+    let defaults = parse_defaults(&definition, arena)?;
+    fill_omitted_defaults(
+        storage,
+        txn.txid,
+        seq_session,
+        &definition,
+        &defaults,
+        &mut values,
+        &explicit,
+        arena,
+    )?;
+    let generated = parse_generated(&definition, arena)?;
+    compute_generated(
+        &definition,
+        &generated,
+        &mut values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
     check_not_null(&definition, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -18926,9 +19035,8 @@ pub fn apply_replication_insert(
     )
 }
 
-/// Decodes a complete pgoutput tuple according to an already verified local
-/// relation binding.  `allow_unchanged_toast` is explicit because it is legal
-/// only while constructing an UPDATE from a previous local row image.
+/// Decodes a pgoutput tuple according to an already verified local relation
+/// binding. `allow_unchanged_toast` is legal only while constructing UPDATE.
 fn decode_replication_tuple<'a>(
     storage: &Storage,
     txn: &TxnState,
@@ -19210,6 +19318,15 @@ pub fn apply_replication_update(
     let mut old_values = [Datum::Null; MAX_COLUMNS];
     rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
     let mut new_values = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+    let mut explicit = [false; MAX_COLUMNS];
+    for &local in binding.remote_to_local() {
+        explicit[local] = true;
+    }
+    for (column, value) in old_values[..definition.n_columns].iter().enumerate() {
+        if !explicit[column] {
+            new_values[column] = *value;
+        }
+    }
     for (remote, field) in new.columns().iter().enumerate() {
         if matches!(field, TupleColumn::UnchangedToast) {
             let local = binding.remote_to_local()[remote];

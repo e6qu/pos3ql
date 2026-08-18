@@ -385,6 +385,10 @@ pub(super) fn resolve_default(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
             ) => super::coerce_user_type_array(v, element, storage, txid, arena)?,
+            ColType::Array(element) if element.is_catalog_reference() => {
+                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                crate::sql::eval::reg_array_cast(v, element, Some(&catalog), arena)?
+            }
             target if target.is_reg_object() => {
                 let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
                 crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?

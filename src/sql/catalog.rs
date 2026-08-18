@@ -2291,7 +2291,7 @@ pub(crate) fn operator_name_by_oid(
     };
     if !signature {
         return arena
-            .alloc_str(operator.name)
+            .alloc_str_display(format_args!("pg_catalog.{}", operator.name))
             .map(Some)
             .map_err(|_| super::eval::arena_full());
     }

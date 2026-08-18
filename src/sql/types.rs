@@ -68,6 +68,14 @@ pub mod oid {
     pub const REGTYPE: i32 = 2206;
     pub const REGNAMESPACE: i32 = 4089;
     pub const REGROLE: i32 = 4096;
+    pub const REGPROC_ARRAY: i32 = 1008;
+    pub const REGPROCEDURE_ARRAY: i32 = 2207;
+    pub const REGOPER_ARRAY: i32 = 2208;
+    pub const REGOPERATOR_ARRAY: i32 = 2209;
+    pub const REGCLASS_ARRAY: i32 = 2210;
+    pub const REGTYPE_ARRAY: i32 = 2211;
+    pub const REGNAMESPACE_ARRAY: i32 = 4090;
+    pub const REGROLE_ARRAY: i32 = 4097;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Slots are catalog-local identities; the
     /// bands are deliberately disjoint from relation/composite OIDs.
@@ -414,36 +422,9 @@ impl ColType {
                 return Some(Self::Multirange(kind));
             }
         }
-        // Arrays: match the element type's array OID.
-        for element in [
-            ArrElem::Bool,
-            ArrElem::Int2,
-            ArrElem::Int4,
-            ArrElem::Int8,
-            ArrElem::Float4,
-            ArrElem::Float8,
-            ArrElem::Text,
-            ArrElem::Name,
-            ArrElem::Varchar,
-            ArrElem::Bpchar,
-            ArrElem::Date,
-            ArrElem::Timestamp,
-            ArrElem::Timestamptz,
-            ArrElem::Time,
-            ArrElem::Timetz,
-            ArrElem::Interval,
-            ArrElem::Json,
-            ArrElem::Jsonb,
-            ArrElem::Uuid,
-            ArrElem::Bytea,
-            ArrElem::Numeric,
-            ArrElem::Inet,
-            ArrElem::Cidr,
-            ArrElem::Macaddr,
-            ArrElem::Macaddr8,
-            ArrElem::Bit,
-            ArrElem::Varbit,
-        ] {
+        // The same inventory drives catalog synthesis, so every advertised
+        // built-in array OID is decodable at the wire boundary.
+        for element in ArrElem::BUILTIN {
             if type_oid == element.array_oid() {
                 return Some(Self::Array(element));
             }
@@ -804,6 +785,14 @@ pub enum ArrElem {
     Bit,
     /// A `bit varying` / `varbit` array element, with `_varbit` identity.
     Varbit,
+    Regtype,
+    Regproc,
+    Regprocedure,
+    Regoper,
+    Regoperator,
+    Regclass,
+    Regnamespace,
+    Regrole,
     /// An enum array keeps the catalog slot as its runtime identity. Table
     /// metadata also persists the type name and rebinds the slot on startup.
     Enum(u16),
@@ -830,7 +819,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 27] = [
+    pub const BUILTIN: [Self; 35] = [
         Self::Bool,
         Self::Int2,
         Self::Int4,
@@ -858,7 +847,30 @@ impl ArrElem {
         Self::Macaddr8,
         Self::Bit,
         Self::Varbit,
+        Self::Regtype,
+        Self::Regproc,
+        Self::Regprocedure,
+        Self::Regoper,
+        Self::Regoperator,
+        Self::Regclass,
+        Self::Regnamespace,
+        Self::Regrole,
     ];
+
+    /// Whether text input for this element needs catalog identity resolution.
+    pub const fn is_catalog_reference(self) -> bool {
+        matches!(
+            self,
+            Self::Regtype
+                | Self::Regproc
+                | Self::Regprocedure
+                | Self::Regoper
+                | Self::Regoperator
+                | Self::Regclass
+                | Self::Regnamespace
+                | Self::Regrole
+        )
+    }
 
     /// The array type's internal `pg_type.typname`.
     pub fn catalog_name(self) -> &'static str {
@@ -890,6 +902,14 @@ impl ArrElem {
             ArrElem::Macaddr8 => "_macaddr8",
             ArrElem::Bit => "_bit",
             ArrElem::Varbit => "_varbit",
+            ArrElem::Regtype => "_regtype",
+            ArrElem::Regproc => "_regproc",
+            ArrElem::Regprocedure => "_regprocedure",
+            ArrElem::Regoper => "_regoper",
+            ArrElem::Regoperator => "_regoperator",
+            ArrElem::Regclass => "_regclass",
+            ArrElem::Regnamespace => "_regnamespace",
+            ArrElem::Regrole => "_regrole",
             ArrElem::Enum(_) => "_enum",
             ArrElem::Composite(_) => "_record",
             ArrElem::Domain { .. } => "_domain",
@@ -928,6 +948,14 @@ impl ArrElem {
             ArrElem::Macaddr8 => "macaddr8[]",
             ArrElem::Bit => "bit[]",
             ArrElem::Varbit => "bit varying[]",
+            ArrElem::Regtype => "regtype[]",
+            ArrElem::Regproc => "regproc[]",
+            ArrElem::Regprocedure => "regprocedure[]",
+            ArrElem::Regoper => "regoper[]",
+            ArrElem::Regoperator => "regoperator[]",
+            ArrElem::Regclass => "regclass[]",
+            ArrElem::Regnamespace => "regnamespace[]",
+            ArrElem::Regrole => "regrole[]",
             ArrElem::Enum(_) => "enum[]",
             ArrElem::Composite(_) => "record[]",
             ArrElem::Domain { .. } => "domain[]",
@@ -971,6 +999,17 @@ impl ArrElem {
             Datum::Macaddr8(_) => ArrElem::Macaddr8,
             Datum::Bit { varying: false, .. } => ArrElem::Bit,
             Datum::Bit { varying: true, .. } => ArrElem::Varbit,
+            Datum::Regtype { .. } => ArrElem::Regtype,
+            Datum::RegObject { type_oid, .. } => match *type_oid {
+                oid::REGPROC => ArrElem::Regproc,
+                oid::REGPROCEDURE => ArrElem::Regprocedure,
+                oid::REGOPER => ArrElem::Regoper,
+                oid::REGOPERATOR => ArrElem::Regoperator,
+                oid::REGCLASS => ArrElem::Regclass,
+                oid::REGNAMESPACE => ArrElem::Regnamespace,
+                oid::REGROLE => ArrElem::Regrole,
+                _ => return None,
+            },
             Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
             Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
                 ArrElem::Composite(*slot)
@@ -993,6 +1032,14 @@ impl ArrElem {
             ColType::Bit { varying: true } => return Some(ArrElem::Varbit),
             ColType::Enum(slot) => return Some(ArrElem::Enum(slot)),
             ColType::Composite(slot) => return Some(ArrElem::Composite(slot)),
+            ColType::Regtype => return Some(ArrElem::Regtype),
+            ColType::Regproc => return Some(ArrElem::Regproc),
+            ColType::Regprocedure => return Some(ArrElem::Regprocedure),
+            ColType::Regoper => return Some(ArrElem::Regoper),
+            ColType::Regoperator => return Some(ArrElem::Regoperator),
+            ColType::Regclass => return Some(ArrElem::Regclass),
+            ColType::Regnamespace => return Some(ArrElem::Regnamespace),
+            ColType::Regrole => return Some(ArrElem::Regrole),
             _ => {}
         }
         Some(match c.storage() {
@@ -1050,6 +1097,14 @@ impl ArrElem {
             ArrElem::Macaddr8 => ColType::Macaddr8,
             ArrElem::Bit => ColType::Bit { varying: false },
             ArrElem::Varbit => ColType::Bit { varying: true },
+            ArrElem::Regtype => ColType::Regtype,
+            ArrElem::Regproc => ColType::Regproc,
+            ArrElem::Regprocedure => ColType::Regprocedure,
+            ArrElem::Regoper => ColType::Regoper,
+            ArrElem::Regoperator => ColType::Regoperator,
+            ArrElem::Regclass => ColType::Regclass,
+            ArrElem::Regnamespace => ColType::Regnamespace,
+            ArrElem::Regrole => ColType::Regrole,
             ArrElem::Enum(slot) => ColType::Enum(slot),
             ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
@@ -1098,6 +1153,14 @@ impl ArrElem {
             ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
             ArrElem::Bit => oid::BIT_ARRAY,
             ArrElem::Varbit => oid::VARBIT_ARRAY,
+            ArrElem::Regtype => oid::REGTYPE_ARRAY,
+            ArrElem::Regproc => oid::REGPROC_ARRAY,
+            ArrElem::Regprocedure => oid::REGPROCEDURE_ARRAY,
+            ArrElem::Regoper => oid::REGOPER_ARRAY,
+            ArrElem::Regoperator => oid::REGOPERATOR_ARRAY,
+            ArrElem::Regclass => oid::REGCLASS_ARRAY,
+            ArrElem::Regnamespace => oid::REGNAMESPACE_ARRAY,
+            ArrElem::Regrole => oid::REGROLE_ARRAY,
             ArrElem::Enum(slot) => oid::enum_array_oid(slot),
             ArrElem::Composite(slot) => oid::composite_array_oid(slot),
             ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
@@ -1143,6 +1206,14 @@ impl ArrElem {
             ArrElem::Macaddr8 => 24,
             ArrElem::Bit => 25,
             ArrElem::Varbit => 26,
+            ArrElem::Regtype => 27,
+            ArrElem::Regproc => 28,
+            ArrElem::Regprocedure => 29,
+            ArrElem::Regoper => 30,
+            ArrElem::Regoperator => 31,
+            ArrElem::Regclass => 48,
+            ArrElem::Regnamespace => 49,
+            ArrElem::Regrole => 50,
             ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
             ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
             ArrElem::Composite(slot) => Self::COMPOSITE_CODE_BASE + slot as u8,
@@ -1178,6 +1249,14 @@ impl ArrElem {
             24 => ArrElem::Macaddr8,
             25 => ArrElem::Bit,
             26 => ArrElem::Varbit,
+            27 => ArrElem::Regtype,
+            28 => ArrElem::Regproc,
+            29 => ArrElem::Regprocedure,
+            30 => ArrElem::Regoper,
+            31 => ArrElem::Regoperator,
+            48 => ArrElem::Regclass,
+            49 => ArrElem::Regnamespace,
+            50 => ArrElem::Regrole,
             c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
                 .contains(&c) =>
             {
@@ -2217,35 +2296,7 @@ mod tests {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
         }
-        for e in [
-            ArrElem::Bool,
-            ArrElem::Int2,
-            ArrElem::Int4,
-            ArrElem::Int8,
-            ArrElem::Float4,
-            ArrElem::Float8,
-            ArrElem::Text,
-            ArrElem::Name,
-            ArrElem::Varchar,
-            ArrElem::Bpchar,
-            ArrElem::Date,
-            ArrElem::Timestamp,
-            ArrElem::Timestamptz,
-            ArrElem::Time,
-            ArrElem::Timetz,
-            ArrElem::Interval,
-            ArrElem::Json,
-            ArrElem::Jsonb,
-            ArrElem::Uuid,
-            ArrElem::Bytea,
-            ArrElem::Numeric,
-            ArrElem::Inet,
-            ArrElem::Cidr,
-            ArrElem::Macaddr,
-            ArrElem::Macaddr8,
-            ArrElem::Bit,
-            ArrElem::Varbit,
-        ] {
+        for e in ArrElem::BUILTIN {
             types.push(ColType::Array(e));
         }
         for t in types {
@@ -2321,35 +2372,7 @@ mod code_roundtrip_tests {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
         }
-        for e in [
-            ArrElem::Bool,
-            ArrElem::Int2,
-            ArrElem::Int4,
-            ArrElem::Int8,
-            ArrElem::Float4,
-            ArrElem::Float8,
-            ArrElem::Text,
-            ArrElem::Name,
-            ArrElem::Varchar,
-            ArrElem::Bpchar,
-            ArrElem::Numeric,
-            ArrElem::Date,
-            ArrElem::Timestamp,
-            ArrElem::Timestamptz,
-            ArrElem::Time,
-            ArrElem::Timetz,
-            ArrElem::Interval,
-            ArrElem::Json,
-            ArrElem::Jsonb,
-            ArrElem::Uuid,
-            ArrElem::Bytea,
-            ArrElem::Inet,
-            ArrElem::Cidr,
-            ArrElem::Macaddr,
-            ArrElem::Macaddr8,
-            ArrElem::Bit,
-            ArrElem::Varbit,
-        ] {
+        for e in ArrElem::BUILTIN {
             types.push(ColType::Array(e));
         }
         // The layout this replaced could emit any code in 20..=40; a moved

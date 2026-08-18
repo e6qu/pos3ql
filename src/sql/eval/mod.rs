@@ -1266,6 +1266,11 @@ pub fn eval_full<'a>(
             {
                 return regobject_cast(v, target, hooks.catalog, arena);
             }
+            if let Some(ColType::Array(element)) = ColType::from_sql_name(type_name)
+                && element.is_catalog_reference()
+            {
+                return reg_array_cast(v, element, hooks.catalog, arena);
+            }
             // `::regtype` resolves a type name to the type and renders its
             // canonical SQL name (`'varchar(5)'::regtype` is `character
             // varying`); an OID renders the type it names, an unknown OID
@@ -4371,6 +4376,44 @@ pub(crate) fn regobject_cast<'a>(
         type_oid: target.oid(),
         referenced_oid: object_oid,
         name,
+    })
+}
+
+/// Resolves each text or already-typed member of a `reg*` array at the same
+/// catalog boundary as the scalar input function.  Keeping the array shape
+/// while rebuilding values avoids accepting unresolved object names into a
+/// durable array datum.
+pub(crate) fn reg_array_cast<'a>(
+    value: Datum<'a>,
+    target: ArrElem,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    debug_assert!(target.is_catalog_reference());
+    let (source, raw) = match value {
+        Datum::Array { element, raw } => (element, raw),
+        Datum::Text(text) | Datum::Bpchar(text) => (
+            ArrElem::Text,
+            crate::sql::array::parse_literal(text.trim_end_matches(' '), ArrElem::Text, arena)?,
+        ),
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(cast_unsupported(&other, target.array_name())),
+    };
+    let shape = crate::sql::array::shape(raw).expect("array datum carries a valid shape");
+    let count = shape.element_count();
+    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let element_type = target.to_coltype();
+    for (index, output) in items.iter_mut().take(count).enumerate() {
+        let input = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
+        *output = if element_type == ColType::Regtype {
+            cast_to(input, element_type, arena)?
+        } else {
+            regobject_cast(input, element_type, catalog, arena)?
+        };
+    }
+    Ok(Datum::Array {
+        element: target,
+        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
     })
 }
 

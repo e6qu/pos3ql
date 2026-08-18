@@ -29,6 +29,9 @@ except ImportError:
 
 DDL = """DROP TABLE IF EXISTS cb_composite;
 DROP TABLE IF EXISTS cb;
+DROP TABLE IF EXISTS cb_references;
+DROP TABLE IF EXISTS cb_reference_relation;
+DROP FUNCTION IF EXISTS cb_reference_routine(integer);
 DROP DOMAIN IF EXISTS cb_point_value;
 DROP TYPE IF EXISTS cb_point;
 DROP TYPE IF EXISTS cb_mood;
@@ -89,6 +92,22 @@ COMPOSITE_INSERT = """INSERT INTO cb_composite VALUES
   (ARRAY[ROW(-1,8)::cb_point]::cb_point_value[]),
   (NULL)"""
 
+REFERENCE_DDL = """CREATE TABLE cb_reference_relation (id integer);
+CREATE FUNCTION cb_reference_routine(value integer) RETURNS integer LANGUAGE SQL
+  AS 'SELECT value';
+CREATE TABLE cb_references (
+  types regtype[], procedures regproc[], procedure_signatures regprocedure[],
+  operators regoper[], operator_signatures regoperator[], relations regclass[],
+  namespaces regnamespace[], roles regrole[])"""
+
+REFERENCE_INSERT = """INSERT INTO cb_references VALUES (
+  ARRAY['integer'::regtype],
+  ARRAY['cb_reference_routine'::regproc],
+  ARRAY['cb_reference_routine(integer)'::regprocedure],
+  ARRAY[551::regoper], ARRAY['+(integer,integer)'::regoperator],
+  ARRAY['cb_reference_relation'::regclass], ARRAY['public'::regnamespace],
+  ARRAY[10::regrole])"""
+
 
 def connect(host, port):
     return psycopg.connect(host=host, port=port, user="postgres", dbname="postgres", autocommit=True)
@@ -132,6 +151,13 @@ def composite_domain_oid(conn):
     ).fetchone()[0]
 
 
+def reference_oids(conn):
+    return (
+        conn.execute("SELECT 'cb_reference_routine'::regproc::oid").fetchone()[0],
+        conn.execute("SELECT 'cb_reference_relation'::regclass::oid").fetchone()[0],
+    )
+
+
 def remap_composite_array_domain_oid(data, source_oid, target_oid):
     """Map every non-NULL array header in this fixed one-column fixture."""
     out = bytearray(data)
@@ -156,6 +182,45 @@ def remap_composite_array_domain_oid(data, source_oid, target_oid):
             raise AssertionError("unexpected composite-domain array element OID")
         out[array_at + 8:array_at + 12] = target_oid.to_bytes(4, "big", signed=True)
         offset += field_length
+    return bytes(out)
+
+
+def remap_reference_array_values(data, source_oids, target_oids):
+    """Map cluster-local routine and relation OIDs in the fixed reference fixture."""
+    out = bytearray(data)
+    if out[:19] != b"PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00":
+        raise AssertionError("invalid COPY binary signature")
+    offset = 19
+    while True:
+        fields = int.from_bytes(out[offset:offset + 2], "big", signed=True)
+        offset += 2
+        if fields == -1:
+            break
+        if fields != 8:
+            raise AssertionError("expected eight catalog-reference arrays")
+        for _ in range(fields):
+            length = int.from_bytes(out[offset:offset + 4], "big", signed=True)
+            offset += 4
+            if length == -1:
+                continue
+            end = offset + length
+            dimensions = int.from_bytes(out[offset:offset + 4], "big", signed=True)
+            if dimensions != 1:
+                raise AssertionError("expected rank-one catalog-reference array")
+            count = int.from_bytes(out[offset + 12:offset + 16], "big", signed=True)
+            at = offset + 20
+            for _ in range(count):
+                value_length = int.from_bytes(out[at:at + 4], "big", signed=True)
+                at += 4
+                if value_length == 4:
+                    value = int.from_bytes(out[at:at + 4], "big", signed=True)
+                    for source, target in zip(source_oids, target_oids):
+                        if value == source:
+                            out[at:at + 4] = target.to_bytes(4, "big", signed=True)
+                at += value_length
+            if at != end:
+                raise AssertionError("invalid catalog-reference array payload")
+            offset = end
     return bytes(out)
 
 
@@ -253,6 +318,33 @@ def main():
     else:
         fails += 1
         print("DIVERGENCE: catalog-mapped composite-domain array rows differ")
+
+    for c in (pg, p3):
+        c.cursor().execute(REFERENCE_DDL)
+        c.cursor().execute(REFERENCE_INSERT)
+    pg_reference_oids, p3_reference_oids = reference_oids(pg), reference_oids(p3)
+    pg_reference_dump = dump(pg, "cb_references")
+    p3_reference_dump = dump(p3, "cb_references")
+    if remap_reference_array_values(pg_reference_dump, pg_reference_oids, p3_reference_oids) == p3_reference_dump:
+        print("ok: catalog-reference array COPY bodies match after OID mapping")
+    else:
+        fails += 1
+        print("DIVERGENCE: catalog-reference array COPY bodies differ")
+    for c, data, source_oids, target_oids in (
+        (p3, pg_reference_dump, pg_reference_oids, p3_reference_oids),
+        (pg, p3_reference_dump, p3_reference_oids, pg_reference_oids),
+    ):
+        c.cursor().execute("DELETE FROM cb_references")
+        load(c, remap_reference_array_values(data, source_oids, target_oids), "cb_references")
+    pg_reference_rows = pg.execute("SELECT * FROM cb_references").fetchall()
+    p3_reference_rows = p3.execute("SELECT * FROM cb_references").fetchall()
+    if pg_reference_rows == p3_reference_rows:
+        print("ok: catalog-mapped reference-array COPY loads in both directions")
+    else:
+        fails += 1
+        print("DIVERGENCE: catalog-mapped reference-array COPY rows differ")
+        print("  PostgreSQL: %r" % (pg_reference_rows,))
+        print("  pos3ql:     %r" % (p3_reference_rows,))
 
     print("copy-binary: %d check(s) failed" % fails)
     sys.exit(1 if fails else 0)

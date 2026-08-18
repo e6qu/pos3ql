@@ -2177,6 +2177,10 @@ fn supported_operator_catalog_aliases_preserve_identity() {
         )),
         ["551"]
     );
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, "SELECT 551::regoper")),
+        ["pg_catalog.+"]
+    );
 }
 
 #[test]
@@ -2514,6 +2518,43 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .unwrap_err();
     assert_eq!(null_domain.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
+    let required_domain_array_oid = crate::sql::types::oid::domain_array_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_required", 0)
+            .unwrap() as u16,
+    );
+    let required_domain_array = [
+        0,
+        0,
+        0,
+        1, // dimensions
+        0,
+        0,
+        0,
+        1, // has NULL
+        required_domain_oid.to_be_bytes()[0],
+        required_domain_oid.to_be_bytes()[1],
+        required_domain_oid.to_be_bytes()[2],
+        required_domain_oid.to_be_bytes()[3],
+        0,
+        0,
+        0,
+        1, // length
+        0,
+        0,
+        0,
+        1, // lower bound
+        0xff,
+        0xff,
+        0xff,
+        0xff, // NULL element
+    ];
+    let null_domain_array = engine
+        .decode_binary_parameter(required_domain_array_oid, &required_domain_array, &arena, 0)
+        .unwrap_err();
+    assert_eq!(null_domain_array.sqlstate, sqlstate::NOT_NULL_VIOLATION);
+
     let mut enum_array = Vec::new();
     enum_array.extend_from_slice(&1_i32.to_be_bytes());
     enum_array.extend_from_slice(&0_i32.to_be_bytes());
@@ -2744,6 +2785,50 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .map(|field| field.value.to_string())
             .collect::<Vec<_>>(),
         ["ready", "7", "{3,5}", "wire text"]
+    );
+    let mut record_with_null_domain_array = Vec::new();
+    record_with_null_domain_array.extend_from_slice(&1_i32.to_be_bytes());
+    record_with_null_domain_array.extend_from_slice(&required_domain_array_oid.to_be_bytes());
+    record_with_null_domain_array
+        .extend_from_slice(&(required_domain_array.len() as i32).to_be_bytes());
+    record_with_null_domain_array.extend_from_slice(&required_domain_array);
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::RECORD,
+                &record_with_null_domain_array,
+                &arena,
+                0,
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::NOT_NULL_VIOLATION
+    );
+    let direct_null_domain_record = [
+        0,
+        0,
+        0,
+        1, // field count
+        required_domain_oid.to_be_bytes()[0],
+        required_domain_oid.to_be_bytes()[1],
+        required_domain_oid.to_be_bytes()[2],
+        required_domain_oid.to_be_bytes()[3],
+        0xff,
+        0xff,
+        0xff,
+        0xff, // NULL domain field
+    ];
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::RECORD,
+                &direct_null_domain_record,
+                &arena,
+                0,
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::NOT_NULL_VIOLATION
     );
     record[25..29].copy_from_slice(&(-1_i32).to_be_bytes());
     let invalid_record = engine
@@ -7245,6 +7330,84 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
     assert_eq!(
         row_description_type_oids(&output),
         [
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+}
+
+#[test]
+fn reg_arrays_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("reg-arrays-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE durable_reg_array_role; \
+             CREATE SCHEMA durable_reg_array_schema; \
+             CREATE TABLE durable_reg_array_relation (id integer); \
+             CREATE FUNCTION durable_reg_array_routine(value integer) RETURNS integer LANGUAGE SQL \
+                 AS 'SELECT value'; \
+             CREATE TABLE durable_reg_arrays ( \
+                 types regtype[], procedures regproc[], procedure_signatures regprocedure[], \
+                 operators regoper[], operator_signatures regoperator[], relations regclass[], \
+                 namespaces regnamespace[], roles regrole[] \
+             )",
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "
+             INSERT INTO durable_reg_arrays VALUES ( \
+                 ARRAY['integer'::regtype, 'text'::regtype], \
+                 ARRAY['durable_reg_array_routine'::regproc], \
+                 ARRAY['durable_reg_array_routine(integer)'::regprocedure], \
+                 ARRAY[NULL::regoper], \
+                 ARRAY['+(integer,integer)'::regoperator], \
+                 ARRAY['durable_reg_array_relation'::regclass], \
+                 ARRAY['durable_reg_array_schema'::regnamespace], \
+                 ARRAY['durable_reg_array_role'::regrole] \
+             )",
+        );
+        let before_restart = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT namespaces FROM durable_reg_arrays",
+        );
+        assert_eq!(data_rows(&before_restart), ["{durable_reg_array_schema}"]);
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT types, procedures, procedure_signatures, operators, operator_signatures, \
+                relations, namespaces, roles, pg_typeof(types), pg_typeof(relations) \
+         FROM durable_reg_arrays",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{integer,text}|{durable_reg_array_routine}|{durable_reg_array_routine(integer)}|{NULL}|{\"+(integer,integer)\"}|{durable_reg_array_relation}|{durable_reg_array_schema}|{durable_reg_array_role}|regtype[]|regclass[]"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [
+            crate::sql::types::oid::REGTYPE_ARRAY,
+            crate::sql::types::oid::REGPROC_ARRAY,
+            crate::sql::types::oid::REGPROCEDURE_ARRAY,
+            crate::sql::types::oid::REGOPER_ARRAY,
+            crate::sql::types::oid::REGOPERATOR_ARRAY,
+            crate::sql::types::oid::REGCLASS_ARRAY,
+            crate::sql::types::oid::REGNAMESPACE_ARRAY,
+            crate::sql::types::oid::REGROLE_ARRAY,
             crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGTYPE,
         ]
@@ -26266,6 +26429,64 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
     }
+}
+
+#[test]
+fn binary_copy_enforces_not_null_domain_array_elements() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN binary_copy_required AS integer NOT NULL; \
+         CREATE TABLE binary_copy_required_values (values binary_copy_required[])",
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "binary_copy_required", 0)
+            .unwrap() as u16,
+    );
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "binary copy domain send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "binary copy domain sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY binary_copy_required_values FROM STDIN (FORMAT binary)",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine.take_pending_copy().expect("COPY enters binary mode");
+    let mut array = Vec::new();
+    array.extend_from_slice(&1_i32.to_be_bytes());
+    array.extend_from_slice(&1_i32.to_be_bytes());
+    array.extend_from_slice(&domain_oid.to_be_bytes());
+    array.extend_from_slice(&1_i32.to_be_bytes());
+    array.extend_from_slice(&1_i32.to_be_bytes());
+    array.extend_from_slice(&(-1_i32).to_be_bytes());
+    let mut row = Vec::new();
+    row.extend_from_slice(&1_i16.to_be_bytes());
+    row.extend_from_slice(&(array.len() as i32).to_be_bytes());
+    row.extend_from_slice(&array);
+    assert_eq!(
+        engine
+            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, &row)
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::NOT_NULL_VIOLATION
+    );
 }
 
 #[test]

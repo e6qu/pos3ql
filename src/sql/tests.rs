@@ -16689,7 +16689,7 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         &mut engine,
         &mut budget,
         "CREATE TYPE domain_coordinate AS (x integer, y integer); \
-         CREATE DOMAIN coordinate_value AS domain_coordinate; \
+         CREATE DOMAIN coordinate_value AS domain_coordinate CHECK ((VALUE).x > 0); \
          CREATE TABLE domain_coordinates (value coordinate_value, values coordinate_value[])",
     );
     assert!(
@@ -16712,9 +16712,18 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT value::text, values::text, pg_typeof(values) FROM domain_coordinates",
+            "SELECT value::text, values::text, pg_typeof(values), pg_typeof(values[1]) \
+             FROM domain_coordinates",
         )),
-        ["(3,4)|{\"(5,6)\"}|coordinate_value[]"]
+        ["(3,4)|{\"(5,6)\"}|coordinate_value[]|coordinate_value"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO domain_coordinates VALUES (ROW(-1, 0)::domain_coordinate, NULL)",
+        ))
+        .contains("23514")
     );
 }
 

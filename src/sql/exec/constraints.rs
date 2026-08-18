@@ -10,7 +10,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
 use crate::sql::eval::{
-    ColumnLookup, SqlError, compare_datums_collated, eval, hash_key_collated,
+    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval, eval_full, hash_key_collated,
     resolved_expression_collation, sqlstate,
 };
 use crate::sql::txn::TxnState;
@@ -80,11 +80,13 @@ pub(crate) fn coerce_domain_value<'a>(
         }
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(&domain, value, arena, params)?;
+    validate_domain_value(storage, txid, &domain, value, arena, params)?;
     Ok(value)
 }
 
 fn validate_domain_value(
+    storage: &Storage,
+    txid: u32,
     domain: &crate::storage::DomainDef,
     value: Datum,
     arena: &Arena,
@@ -101,10 +103,15 @@ fn validate_domain_value(
         return Ok(());
     }
     let context = ValueLookup { value };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
     for check in domain.checks() {
         let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
         if matches!(
-            eval(expression, arena, params, &context)?,
+            eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
             return Err(sql_err!(

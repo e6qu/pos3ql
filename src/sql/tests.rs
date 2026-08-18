@@ -2813,6 +2813,19 @@ fn logical_replication_unions_multiple_publications() {
 }
 
 #[test]
+fn logical_replication_publication_column_lists_project_relation_and_tuple() {
+    std::thread::Builder::new()
+        .name("logical-publication-column-list".into())
+        .stack_size(4 << 20)
+        .spawn(
+            logical_replication_publication_column_lists_project_relation_and_tuple_on_sized_stack,
+        )
+        .expect("logical publication column list test thread starts")
+        .join()
+        .expect("logical publication column list test thread completes");
+}
+
+#[test]
 fn logical_replication_selects_a_quoted_publication_name() {
     std::thread::Builder::new()
         .name("logical-quoted-publication".into())
@@ -2934,6 +2947,57 @@ fn logical_replication_unions_multiple_publications_on_sized_stack() {
             .count(),
         2,
         "the publication union must emit each selected table change once"
+    );
+}
+
+fn logical_replication_publication_column_lists_project_relation_and_tuple_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE projected_table (id int PRIMARY KEY, visible text, hidden text); \
+         CREATE PUBLICATION projected_changes FOR TABLE projected_table (id, visible) \
+         WITH (publish = 'insert');",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO projected_table VALUES (7, 'shown', 'secret')",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("projected_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("projected publication transaction is retained");
+    assert!(emitted);
+    let wire = send.readable();
+    assert!(
+        wire.windows(b"visible".len())
+            .any(|bytes| bytes == b"visible")
+    );
+    assert!(wire.windows(b"shown".len()).any(|bytes| bytes == b"shown"));
+    assert!(
+        !wire
+            .windows(b"hidden".len())
+            .any(|bytes| bytes == b"hidden")
+    );
+    assert!(
+        !wire
+            .windows(b"secret".len())
+            .any(|bytes| bytes == b"secret")
     );
 }
 
@@ -21003,6 +21067,46 @@ fn publications_are_transactional_and_catalog_visible() {
 }
 
 #[test]
+fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
+    let mut config = test_config("publication-column-lists-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("publication-column-lists-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_projected (id int PRIMARY KEY, visible text, hidden text); \
+         CREATE PUBLICATION projected_changes FOR TABLE publication_projected (id, visible) \
+         WITH (publish = 'insert, update, delete')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT prattrs::text FROM pg_publication_rel"
+        )),
+        ["1 2"],
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT prattrs::text FROM pg_publication_rel"
+        )),
+        ["1 2"],
+        "publication projections are WAL-replayable catalog state"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn disabled_subscriptions_are_durable_catalog_objects() {
     let config = test_config("subscription-catalog-replay");
     let mut budget = Budget::new(1 << 27);
@@ -21455,7 +21559,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE replicated (id int PRIMARY KEY, body text); \
+        "CREATE TABLE replicated (id int PRIMARY KEY, body text, retained text DEFAULT 'local'); \
          CREATE SUBSCRIPTION apply_changes CONNECTION \
          'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION changes WITH (connect = false, slot_name = NONE)",
@@ -21505,7 +21609,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             &mut budget,
             "SELECT * FROM replicated"
         )),
-        ["1|first"]
+        ["1|first|local"]
     );
     assert_eq!(apply.confirmed_lsn(), 41);
 
@@ -21532,7 +21636,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             &mut budget,
             "SELECT * FROM replicated"
         )),
-        ["1|second"]
+        ["1|second|local"]
     );
 
     begin[8] = 100;
@@ -21666,7 +21770,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             &mut replay_budget,
             "SELECT * FROM replicated"
         )),
-        ["2|durable"]
+        ["2|durable|local"]
     );
     assert_eq!(
         replayed.subscription_confirmed_lsn("apply_changes"),

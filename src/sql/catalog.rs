@@ -3466,7 +3466,7 @@ fn pg_publication_rel<'a>(
             ("prpubid", ColType::Int4),
             ("prrelid", ColType::Int4),
             ("prqual", ColType::Text),
-            ("prattrs", ColType::Array(super::types::ArrElem::Int4)),
+            ("prattrs", ColType::Int2Vector),
         ],
     );
     let mut rows: [&[Datum]; 256] = [&[]; 256];
@@ -3476,7 +3476,10 @@ fn pg_publication_rel<'a>(
         if definition.all_tables {
             continue;
         }
-        for table_slot in &definition.tables[..definition.table_count] {
+        for (member, column_mask) in definition.tables[..definition.table_count]
+            .iter()
+            .zip(&definition.table_column_masks[..definition.table_count])
+        {
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -3484,14 +3487,27 @@ fn pg_publication_rel<'a>(
                     rows.len()
                 ));
             }
+            let prattrs = if *column_mask == 0 {
+                Datum::Null
+            } else {
+                let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
+                let mut attribute_count = 0usize;
+                for column in 0..crate::storage::MAX_COLUMNS {
+                    if column_mask & (1u64 << column) != 0 {
+                        attributes[attribute_count] = column as u16;
+                        attribute_count += 1;
+                    }
+                }
+                int2vector(&attributes[..attribute_count], arena)?
+            };
             rows[count] = row(
                 &[
                     Datum::Int4(6106),
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
-                    Datum::Int4(table_oid(storage, *table_slot as usize)),
+                    Datum::Int4(table_oid(storage, *member as usize)),
                     Datum::Null,
-                    Datum::Null,
+                    prattrs,
                 ],
                 arena,
             )?;

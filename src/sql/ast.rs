@@ -12,6 +12,16 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+/// One explicitly named relation in a publication.  An empty `columns` slice
+/// means the PostgreSQL default: publish every column.  Keeping the selected
+/// names beside their relation prevents later execution from losing a column
+/// list while resolving a batch of targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationTarget<'a> {
+    pub relation: QualName<'a>,
+    pub columns: &'a [&'a str],
+}
+
 /// A resolved built-in collation identity.  The parser resolves the spelling
 /// once, so execution cannot accept a `COLLATE` clause and accidentally lose
 /// its semantics.
@@ -266,12 +276,12 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
-    /// CREATE PUBLICATION name FOR { ALL TABLES | TABLE table [, ...] }
+    /// CREATE PUBLICATION name FOR { ALL TABLES | TABLE table [(column [, ...])] [, ...] }
     /// [WITH (publish = 'insert, update, delete, truncate')].
     CreatePublication {
         name: &'a str,
         all_tables: bool,
-        tables: &'a [QualName<'a>],
+        tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
         publish: PublicationOperations,
     },
@@ -820,15 +830,15 @@ pub enum AlterPublicationAction<'a> {
     SetOwner(&'a str),
     Rename(&'a str),
     SetTargets {
-        tables: &'a [QualName<'a>],
+        tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
     },
     AddTargets {
-        tables: &'a [QualName<'a>],
+        tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
     },
     DropTargets {
-        tables: &'a [QualName<'a>],
+        tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
     },
 }

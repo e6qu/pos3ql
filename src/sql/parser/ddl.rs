@@ -12,8 +12,8 @@ use super::{
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
     AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
-    CreateTrigger, DomainCheck, Expr, PublicationOperations, RoleOptions, RoutineArgument,
-    RoutineCreateKind, RoutineIdentity, RoutineTargetKind, SubscriptionOptions,
+    CreateTrigger, DomainCheck, Expr, PublicationOperations, PublicationTarget, RoleOptions,
+    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind, SubscriptionOptions,
     SubscriptionSlotName, TriggerEvent, TriggerIdentity, TriggerTiming, TriggerTransitionTables,
 };
 use crate::sql::eval::sqlstate;
@@ -1602,10 +1602,15 @@ impl<'a> Parser<'a> {
         Ok(Stmt::AlterPublication { name, action })
     }
 
-    fn publication_targets(&mut self) -> Result<(&'a [QualName<'a>], &'a [&'a str]), ParseError> {
-        let mut tables = [QualName {
-            schema: None,
-            name: "",
+    fn publication_targets(
+        &mut self,
+    ) -> Result<(&'a [PublicationTarget<'a>], &'a [&'a str]), ParseError> {
+        let mut tables = [PublicationTarget {
+            relation: QualName {
+                schema: None,
+                name: "",
+            },
+            columns: &[],
         }; MAX_LIST];
         let mut schemas = [""; MAX_LIST];
         let mut table_count = 0;
@@ -1616,7 +1621,26 @@ impl<'a> Parser<'a> {
                     if table_count == MAX_LIST {
                         return Err(self.limit("publication tables", MAX_LIST));
                     }
-                    tables[table_count] = self.qual_name("table name")?;
+                    let relation = self.qual_name("table name")?;
+                    let mut columns = [""; MAX_LIST];
+                    let mut column_count = 0usize;
+                    if self.eat_op("(")? {
+                        loop {
+                            if column_count == columns.len() {
+                                return Err(self.limit("publication columns", columns.len()));
+                            }
+                            columns[column_count] = self.any_ident("column name")?;
+                            column_count += 1;
+                            if !self.eat_op(",")? {
+                                break;
+                            }
+                        }
+                        self.expect_op(")")?;
+                    }
+                    tables[table_count] = PublicationTarget {
+                        relation,
+                        columns: self.arena_slice(&columns[..column_count])?,
+                    };
                     table_count += 1;
                     if !self.eat_op(",")? {
                         break;

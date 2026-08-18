@@ -1886,6 +1886,9 @@ pub struct PublicationDef {
     pending_name: Option<PendingPublicationName>,
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
+    /// A zero mask means the member publishes all columns; otherwise bit n
+    /// selects PostgreSQL attribute n + 1.
+    pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
     pub schema_count: usize,
@@ -1905,6 +1908,7 @@ pub struct PublicationDef {
 pub(crate) struct PublicationDefinition {
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
+    pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
     pub schema_count: usize,
@@ -1942,6 +1946,7 @@ pub struct PublicationSpec<'a> {
     pub name: SqlName,
     pub all_tables: bool,
     pub tables: &'a [u16],
+    pub table_column_masks: &'a [u64],
     pub schemas: &'a [u8],
     pub publish_insert: bool,
     pub publish_update: bool,
@@ -2120,6 +2125,7 @@ impl PublicationDef {
         PublicationDefinition {
             all_tables: self.all_tables,
             tables: self.tables,
+            table_column_masks: self.table_column_masks,
             table_count: self.table_count,
             schemas: self.schemas,
             schema_count: self.schema_count,
@@ -2139,6 +2145,7 @@ impl PublicationDef {
     fn set_definition(&mut self, definition: PublicationDefinition) {
         self.all_tables = definition.all_tables;
         self.tables = definition.tables;
+        self.table_column_masks = definition.table_column_masks;
         self.table_count = definition.table_count;
         self.schemas = definition.schemas;
         self.schema_count = definition.schema_count;
@@ -4670,6 +4677,7 @@ impl Storage {
                     pending_name: None,
                     all_tables: false,
                     tables: [u16::MAX; MAX_PUBLICATION_TABLES],
+                    table_column_masks: [0; MAX_PUBLICATION_TABLES],
                     table_count: 0,
                     schemas: [u8::MAX; MAX_SCHEMAS],
                     schema_count: 0,
@@ -11476,6 +11484,12 @@ impl Storage {
                 MAX_PUBLICATION_TABLES
             ));
         }
+        if spec.table_column_masks.len() != spec.tables.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "publication table projections do not match publication members"
+            ));
+        }
         if spec.schemas.len() > MAX_SCHEMAS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -11520,6 +11534,9 @@ impl Storage {
         };
         let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
         members[..spec.tables.len()].copy_from_slice(spec.tables);
+        let mut table_column_masks = [0u64; MAX_PUBLICATION_TABLES];
+        table_column_masks[..spec.table_column_masks.len()]
+            .copy_from_slice(spec.table_column_masks);
         let mut schemas = [u8::MAX; MAX_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
@@ -11529,6 +11546,7 @@ impl Storage {
             pending_name: None,
             all_tables: spec.all_tables,
             tables: members,
+            table_column_masks,
             table_count: spec.tables.len(),
             schemas,
             schema_count: spec.schemas.len(),

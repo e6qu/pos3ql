@@ -7,7 +7,7 @@ CREATE SCHEMA publication_schema;
 CREATE TABLE publication_schema.schema_selected (id integer PRIMARY KEY);
 
 CREATE PUBLICATION publication_changes
-  FOR TABLE publication_source, publication_second
+  FOR TABLE publication_source (id, value), publication_second
   WITH (publish = 'insert, update, delete');
 CREATE PUBLICATION publication_all FOR ALL TABLES;
 CREATE PUBLICATION publication_empty;
@@ -25,6 +25,10 @@ SELECT count(*) FROM pg_publication_namespace publication_namespace
 SELECT count(*) FROM pg_publication_rel rel
   JOIN pg_publication pub ON pub.oid = rel.prpubid
  WHERE pub.pubname = 'publication_empty';
+SELECT prattrs::text FROM pg_publication_rel rel
+ JOIN pg_publication pub ON pub.oid = rel.prpubid
+ JOIN pg_class cls ON cls.oid = rel.prrelid
+ WHERE pub.pubname = 'publication_changes' AND cls.relname = 'publication_source';
 ALTER PUBLICATION publication_empty ADD TABLE publication_source;
 SELECT count(*) FROM pg_publication_rel rel
   JOIN pg_publication pub ON pub.oid = rel.prpubid

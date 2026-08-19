@@ -2203,6 +2203,39 @@ fn routine_result_type_name(result: &crate::storage::RoutineResult) -> &str {
     }
 }
 
+fn write_routine_type<const N: usize>(
+    output: &mut StackStr<N>,
+    argument: &crate::storage::RoutineArgumentDef,
+) -> Result<(), core::fmt::Error> {
+    use core::fmt::Write;
+    if let Some(identity) = argument.user_type {
+        write!(
+            output,
+            "{}.{}",
+            identity.schema.as_str(),
+            identity.name.as_str()
+        )?;
+        if matches!(argument.ctype, ColType::Array(_)) {
+            output.write_str("[]")?;
+        }
+        Ok(())
+    } else {
+        output.write_str(argument.ctype.name())
+    }
+}
+
+fn write_routine_result_type<const N: usize>(
+    output: &mut StackStr<N>,
+    result: &crate::storage::RoutineResult,
+) -> Result<(), super::eval::SqlError> {
+    let argument = crate::storage::RoutineArgumentDef {
+        name: crate::storage::SqlName::EMPTY,
+        ctype: result.ctype,
+        user_type: result.user_type,
+    };
+    write_routine_type(output, &argument).map_err(|_| super::eval::arena_full())
+}
+
 /// Resolves the function catalog object types. `regproc` names a routine by
 /// unqualified name; `regprocedure` includes its complete argument signature.
 pub(crate) fn routine_oid_by_name(
@@ -2425,23 +2458,18 @@ pub fn function_def_text<'a>(
             write!(definition, "{} ", argument.name.as_str())
                 .map_err(|_| super::eval::arena_full())?;
         }
-        write!(definition, "{}", routine_declared_type_name(argument))
-            .map_err(|_| super::eval::arena_full())?;
+        write_routine_type(&mut definition, argument).map_err(|_| super::eval::arena_full())?;
     }
     match routine.kind {
         crate::storage::RoutineKind::Function { result } => {
-            write!(
-                definition,
-                ") RETURNS {} LANGUAGE sql AS '",
-                routine_result_type_name(&result)
-            )
+            write!(definition, ") RETURNS ").map_err(|_| super::eval::arena_full())?;
+            write_routine_result_type(&mut definition, &result)?;
+            write!(definition, " LANGUAGE sql AS '")
         }
         crate::storage::RoutineKind::SetFunction { result } => {
-            write!(
-                definition,
-                ") RETURNS SETOF {} LANGUAGE sql AS '",
-                routine_result_type_name(&result)
-            )
+            write!(definition, ") RETURNS SETOF ").map_err(|_| super::eval::arena_full())?;
+            write_routine_result_type(&mut definition, &result)?;
+            write!(definition, " LANGUAGE sql AS '")
         }
         crate::storage::RoutineKind::TableFunction => {
             write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;

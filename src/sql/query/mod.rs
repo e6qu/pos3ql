@@ -5103,12 +5103,7 @@ fn user_type_cast_description<'q>(
         return Some(if array {
             ColDesc::new(name, super::types::oid::domain_array_oid(slot as u16), -1)
         } else {
-            ColDesc::new(
-                name,
-                super::types::oid::domain_oid(slot as u16),
-                domain.base.typlen(),
-            )
-            .with_type_mod(domain.base_type_mod)
+            ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
         });
     }
     if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
@@ -5155,14 +5150,21 @@ fn user_type_expression_description<'q>(
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if args.len() <= argument_type_oids.len() {
             for (index, argument) in args.iter().enumerate() {
-                argument_type_oids[index] =
+                argument_type_oids[index] = match argument {
+                    Expr::Cast { type_name, .. } => {
+                        crate::sql::catalog::user_type_oid(storage, txid, type_name)
+                    }
+                    _ => None,
+                }
+                .or_else(|| {
                     user_type_expression_description(argument, "", storage, txid)
                         .map(|description| description.type_oid)
-                        .or_else(|| {
-                            super::exec::infer_type_res(argument, &super::exec::NoCols)
-                                .ok()
-                                .map(|(oid, _)| oid)
-                        })?;
+                })
+                .or_else(|| {
+                    super::exec::infer_type_res(argument, &super::exec::NoCols)
+                        .ok()
+                        .map(|(oid, _)| oid)
+                })?;
             }
             if let Some(routine) =
                 storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)

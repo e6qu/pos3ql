@@ -5067,6 +5067,14 @@ fn subquery_result_type<'a>(
                 (element_oid - super::types::oid::FIRST_ENUM) as u16,
             ))
         }
+        None if (super::types::oid::FIRST_COMPOSITE
+            ..super::types::oid::FIRST_COMPOSITE + u16::MAX as i32 + 1)
+            .contains(&element_oid) =>
+        {
+            Some(super::types::oid::composite_array_oid(
+                (element_oid - super::types::oid::FIRST_COMPOSITE) as u16,
+            ))
+        }
         None => None,
     };
     array_oid

@@ -27342,45 +27342,58 @@ pub(crate) fn coerce_user_type_array<'a>(
     let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
     for (index, item) in items.iter_mut().take(count).enumerate() {
         let value = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
-        *item = match target {
-            crate::sql::types::ArrElem::Enum(slot) => {
-                coerce_enum_value(value, slot, storage, txid, arena)?
-            }
-            crate::sql::types::ArrElem::Domain { slot, .. } => constraints::coerce_domain_value(
-                storage,
-                slot as usize,
-                value,
-                txid,
-                arena,
-                crate::sql::eval::NO_PARAMS,
-            )?,
-            crate::sql::types::ArrElem::Composite(slot) => {
-                let composite = match value {
-                    Datum::CompositeText {
-                        slot: actual,
-                        physical_fields: 0,
-                        text,
-                    } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
-                    Datum::CompositeText { slot: actual, .. } if actual == slot => value,
-                    Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
-                    value => coerce_composite_value(value, slot, storage, txid, arena)?,
-                };
-                match composite {
-                    value @ Datum::CompositeText { .. } => value,
-                    value @ Datum::Composite { .. } => Datum::CompositeText {
-                        slot,
-                        physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
-                        text: composite_storage_text(value, slot, storage, txid, arena)?,
-                    },
-                    _ => unreachable!("composite coercion returns a composite datum"),
-                }
-            }
-            _ => unreachable!("caller restricts user-defined array elements"),
-        };
+        *item = coerce_user_type_array_element(value, target, storage, txid, arena)?;
     }
     Ok(Datum::Array {
         element: target,
         raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
+    })
+}
+
+/// Coerces one element at the catalog-defined array boundary. Keeping this
+/// separate from array assembly lets streaming ARRAY(subquery) normalize
+/// named composites before its provider-neutral spool serializes the value.
+pub(crate) fn coerce_user_type_array_element<'a>(
+    value: Datum<'a>,
+    target: crate::sql::types::ArrElem,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    Ok(match target {
+        crate::sql::types::ArrElem::Enum(slot) => {
+            coerce_enum_value(value, slot, storage, txid, arena)?
+        }
+        crate::sql::types::ArrElem::Domain { slot, .. } => constraints::coerce_domain_value(
+            storage,
+            slot as usize,
+            value,
+            txid,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+        )?,
+        crate::sql::types::ArrElem::Composite(slot) => {
+            let composite = match value {
+                Datum::CompositeText {
+                    slot: actual,
+                    physical_fields: 0,
+                    text,
+                } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
+                Datum::CompositeText { slot: actual, .. } if actual == slot => value,
+                Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
+                value => coerce_composite_value(value, slot, storage, txid, arena)?,
+            };
+            match composite {
+                value @ Datum::CompositeText { .. } => value,
+                value @ Datum::Composite { .. } => Datum::CompositeText {
+                    slot,
+                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
+                    text: composite_storage_text(value, slot, storage, txid, arena)?,
+                },
+                _ => unreachable!("composite coercion returns a composite datum"),
+            }
+        }
+        _ => unreachable!("caller restricts user-defined array elements"),
     })
 }
 

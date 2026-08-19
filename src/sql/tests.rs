@@ -5719,6 +5719,52 @@ fn describe_array_subquery_uses_the_array_type() {
 }
 
 #[test]
+fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_sets() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE array_subquery_pair AS (x integer, y text); \
+         CREATE TABLE array_subquery_pairs (value array_subquery_pair); \
+         INSERT INTO array_subquery_pairs VALUES (ROW(1, 'one')::array_subquery_pair)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let type_oid = crate::sql::types::oid::composite_array_oid(
+        engine
+            .storage
+            .resolve_composite_slot("array_subquery_pair", 0)
+            .unwrap() as u16,
+    );
+    let nonempty = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs)::text",
+    );
+    assert_eq!(
+        data_rows(&nonempty),
+        ["{\"(1,one)\"}"],
+        "{}",
+        String::from_utf8_lossy(&nonempty)
+    );
+    let empty = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)",
+    );
+    assert_eq!(data_rows(&empty), ["{}"]);
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)",
+    );
+    assert_eq!(row_description_type_oids(&described), [type_oid]);
+}
+
+#[test]
 fn describe_correlated_scalar_subquery_uses_its_projection_type() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -17929,6 +17975,8 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
              CREATE TABLE domain_point_values (values point_value[], direct_values domain_point[]); \
              INSERT INTO domain_point_values VALUES \
                (ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point]); \
+             CREATE TABLE array_subquery_values AS \
+               SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
              ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
              CHECKPOINT",
@@ -17946,9 +17994,10 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT values::text,direct_values::text FROM domain_point_values",
+            "SELECT values::text,direct_values::text FROM domain_point_values; \
+             SELECT values::text FROM array_subquery_values",
         )),
-        ["{\"(7,8)\"}|{\"(9,10)\"}"]
+        ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

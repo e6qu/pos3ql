@@ -47,6 +47,22 @@ SELECT ARRAY(SELECT a FROM (VALUES (NULL::int[])) AS subquery_null(a));
 SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]];
 SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]] = '{{1,2},{3,4}}'::int[];
 
+-- ARRAY(subquery) retains a named composite element identity even when the
+-- subquery is empty; the result is usable for durable CTAS output too.
+CREATE TYPE array_subquery_pair AS (x integer, y text);
+CREATE TABLE array_subquery_pairs (value array_subquery_pair);
+INSERT INTO array_subquery_pairs VALUES (ROW(1, 'one')::array_subquery_pair);
+SELECT ARRAY(SELECT value FROM array_subquery_pairs)::text,
+       pg_typeof(ARRAY(SELECT value FROM array_subquery_pairs))::text;
+SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)::text,
+       pg_typeof(ARRAY(SELECT value FROM array_subquery_pairs WHERE false))::text;
+CREATE TABLE array_subquery_pairs_copy AS
+  SELECT ARRAY(SELECT value FROM array_subquery_pairs) AS values;
+SELECT values::text, pg_typeof(values)::text FROM array_subquery_pairs_copy;
+DROP TABLE array_subquery_pairs_copy;
+DROP TABLE array_subquery_pairs;
+DROP TYPE array_subquery_pair;
+
 -- Composes with || and other array functions.
 SELECT (ARRAY[1,2,3])[1:2] || (ARRAY[4,5])[1:1];
 SELECT array_agg(x) FROM unnest((ARRAY[10,20,30,40])[2:3]) AS x;

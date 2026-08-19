@@ -332,9 +332,11 @@ fn streaming_scalar_subquery<'a>(
                 ));
             }
             count += 1;
+            let value =
+                normalize_array_subquery_element(values[0], &witness, storage, txid, arena)?;
             storage
                 .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, 1, |_| values[0], &mut compare)
+                    sorter.push_projected_by(blocks, 1, |_| value, &mut compare)
                 })
                 .expect("external scalar-subquery run has a block store")
         },
@@ -450,7 +452,7 @@ fn streaming_array_subquery<'a>(
         }
         None => &[],
     };
-    let v = build_array_scalar(values, &witness, arena)?;
+    let v = build_array_scalar(values, &witness, storage, txid, arena)?;
     Ok((v, v))
 }
 
@@ -866,7 +868,7 @@ fn eval_subquery_nodes<'a>(
                 }
                 let (values, _, witness) =
                     run_subquery(select, storage, txid, arena, params, depth, outer, 1)?;
-                let v = build_array_scalar(values, &witness, arena)?;
+                let v = build_array_scalar(values, &witness, storage, txid, arena)?;
                 scalars_tmp[n_scalars] = (*node as *const _, v, v);
                 n_scalars += 1;
             }
@@ -1412,7 +1414,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     Some(outer),
                     1,
                 )?;
-                let v = build_array_scalar(values, &witness, arena)?;
+                let v = build_array_scalar(values, &witness, storage, txid, arena)?;
                 scalars[ns] = (*node as *const _, v, v);
                 ns += 1;
             }
@@ -1511,7 +1513,10 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Void => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.
         ColType::Record => Datum::Record(&[]),
-        ColType::Composite(_) => Datum::Record(&[]),
+        // A named composite is not an anonymous record: even an empty
+        // subquery must retain the catalog slot so ARRAY(subquery) chooses
+        // the named composite array OID.
+        ColType::Composite(slot) => Datum::Composite { slot, fields: &[] },
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
         ColType::Oid => Datum::Oid(0),
@@ -2218,9 +2223,32 @@ fn set_window<'a>(
 /// subquery's single-column `values`. The element type comes from the column's
 /// type `witness` (so an empty subquery still yields a correctly-typed empty
 /// array); each value is coerced to it before encoding.
+fn normalize_array_subquery_element<'a>(
+    value: Datum<'a>,
+    witness: &Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(element) = crate::sql::types::ArrElem::from_datum(witness) else {
+        return Ok(value);
+    };
+    if value.is_null() {
+        return Ok(value);
+    }
+    match element {
+        crate::sql::types::ArrElem::Composite(_) => {
+            crate::sql::exec::coerce_user_type_array_element(value, element, storage, txid, arena)
+        }
+        _ => crate::sql::eval::cast_to(value, element.to_coltype(), arena),
+    }
+}
+
 fn build_array_scalar<'a>(
     values: &[Datum<'a>],
     witness: &Datum<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     if matches!(witness, Datum::Array { .. })
@@ -2246,13 +2274,12 @@ fn build_array_scalar<'a>(
                 .find_map(crate::sql::types::ArrElem::from_datum)
         })
         .unwrap_or(crate::sql::types::ArrElem::Text);
-    let ct = element.to_coltype();
     let buffer = arena
         .alloc_slice_with(values.len(), |i| values[i])
         .map_err(|_| arena_full())?;
     for v in buffer.iter_mut() {
         if !v.is_null() {
-            *v = crate::sql::eval::cast_to(*v, ct, arena)?;
+            *v = normalize_array_subquery_element(*v, witness, storage, txid, arena)?;
         }
     }
     Ok(Datum::Array {

@@ -38,6 +38,8 @@ pub mod oid {
     pub const VARBIT: i32 = 1562;
     /// PostgreSQL's pseudo-type for an action-only function result.
     pub const VOID: i32 = 2278;
+    /// PostgreSQL's pseudo-type for trigger function results.
+    pub const TRIGGER: i32 = 2279;
     pub const BIT_ARRAY: i32 = 1561;
     pub const VARBIT_ARRAY: i32 = 1563;
     // Network address types.

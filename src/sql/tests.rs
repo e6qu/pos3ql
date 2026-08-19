@@ -11978,6 +11978,68 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         "{}",
         String::from_utf8_lossy(&altered)
     );
+    let moved = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA routine_type_target; \
+         ALTER DOMAIN routine_count RENAME TO routine_count_moved; \
+         ALTER DOMAIN routine_count_moved SET SCHEMA routine_type_target",
+    );
+    let moved_domain = engine
+        .storage
+        .domain_slot("routine_type_target", "routine_count_moved", 0)
+        .expect("moved domain remains visible");
+    let echo_count = engine
+        .storage
+        .routine_slot_by_signature("public", "echo_count", &[ColType::Int4], 0)
+        .expect("routine remains visible");
+    assert_eq!(
+        engine.storage.routine(echo_count).arguments()[0].user_type,
+        Some(crate::storage::UserTypeName {
+            schema: crate::storage::SqlName::parse("routine_type_target").unwrap(),
+            name: crate::storage::SqlName::parse("routine_count_moved").unwrap(),
+        })
+    );
+    assert_eq!(
+        engine.storage.routine_type_oid(
+            engine.storage.routine(echo_count).arguments()[0].ctype,
+            engine.storage.routine(echo_count).arguments()[0].user_type,
+            0,
+        ),
+        Some(crate::sql::types::oid::domain_oid(moved_domain as u16))
+    );
+    let echo_count_result = match engine.storage.routine(echo_count).kind {
+        crate::storage::RoutineKind::Function { result } => result,
+        _ => panic!("echo_count is a function"),
+    };
+    assert_eq!(
+        engine
+            .storage
+            .routine_type_oid(echo_count_result.ctype, echo_count_result.user_type, 0,),
+        Some(crate::sql::types::oid::domain_oid(moved_domain as u16))
+    );
+    let moved_catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_get_function_arguments(oid), pg_get_function_result(oid) \
+           FROM pg_proc WHERE proname = 'echo_count'; \
+         SELECT pg_get_function_arguments(oid), pg_get_function_result(oid) \
+           FROM pg_proc WHERE proname = 'echo_counts'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&moved).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&moved)
+    );
+    assert_eq!(
+        data_rows(&moved_catalog),
+        [
+            "value routine_count_moved|routine_count_moved",
+            "values routine_count_moved[]|routine_count_moved[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&moved_catalog)
+    );
 }
 
 #[test]

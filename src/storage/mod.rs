@@ -13157,6 +13157,7 @@ impl Storage {
                 comment.name = name;
             }
         }
+        self.move_routine_type_references(old_schema, old_name, schema, name, |_| true);
         self.rename_stored_query_dependency(DependencyClass::Domain, slot, schema, name);
     }
 

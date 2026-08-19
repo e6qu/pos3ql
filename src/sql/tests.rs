@@ -4745,7 +4745,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
     assert_eq!(
         data_rows(&owner_dependencies),
         [
-            "FOREIGN KEY (parent_id) REFERENCES renamed(id)",
+            "FOREIGN KEY (parent_id) REFERENCES public.renamed(id)",
             "original_id_idx",
             "stable identity"
         ],
@@ -4761,7 +4761,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
                FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
               WHERE r.relname = 'child' AND c.contype = 'f'",
         )),
-        ["FOREIGN KEY (parent_id) REFERENCES original(id)"]
+        ["FOREIGN KEY (parent_id) REFERENCES public.original(id)"]
     );
     let observer_new = run_txn(
         &mut engine,

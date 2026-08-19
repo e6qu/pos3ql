@@ -16,8 +16,21 @@ WORK=$(mktemp -d /tmp/pos3ql-diff.XXXXXX)
 KEEP=${1:-}
 
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
-PSQL="$PGBIN/psql"
-PG_PORT=${POS3QL_DIFF_PG_PORT:-15498}
+REFERENCE_HOST=${POS3QL_REFERENCE_PG_HOST:-}
+REFERENCE_PORT=${POS3QL_REFERENCE_PG_PORT:-}
+if [[ -n "$REFERENCE_HOST" ]]; then
+  if [[ -z "$REFERENCE_PORT" || -z "${POS3QL_REFERENCE_PSQL:-}" ]]; then
+    print -- "FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL"
+    exit 1
+  fi
+  PSQL=$POS3QL_REFERENCE_PSQL
+  PG_PORT=$REFERENCE_PORT
+  REFERENCE_MODE=external
+else
+  PSQL="$PGBIN/psql"
+  PG_PORT=${POS3QL_DIFF_PG_PORT:-15498}
+  REFERENCE_MODE=local
+fi
 P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
 FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
 FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
@@ -37,7 +50,9 @@ bad() { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
 
 cleanup() {
   [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
-  [[ -d "$WORK/pgdata" ]] && "$PGBIN/pg_ctl" -D "$WORK/pgdata" stop -m immediate >/dev/null 2>&1
+  if [[ "$REFERENCE_MODE" == local && -d "$WORK/pgdata" ]]; then
+    "$PGBIN/pg_ctl" -D "$WORK/pgdata" stop -m immediate >/dev/null 2>&1
+  fi
   [[ -n "${SOCKDIR:-}" ]] && rm -rf "$SOCKDIR"
   if [[ "$KEEP" == "--keep" ]]; then
     print -- "work dir kept: $WORK"
@@ -47,7 +62,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-print -- "=== reference: $("$PGBIN/postgres" --version) ==="
+if [[ "$REFERENCE_MODE" == local ]]; then
+  print -- "=== reference: $("$PGBIN/postgres" --version) ==="
+else
+  if ! reference_version=$("$PSQL" -h "$REFERENCE_HOST" -p "$PG_PORT" -U postgres -X -t -A -c 'SHOW server_version' 2>&1); then
+    print -- "FAIL: external PostgreSQL reference is unavailable: $reference_version"
+    exit 1
+  fi
+  print -- "=== reference: PostgreSQL $reference_version ==="
+fi
 
 if python3 "$EXT/result_diff.py" >/dev/null; then
   ok "differential result comparator"
@@ -56,16 +79,20 @@ else
   exit 1
 fi
 
-# Real PostgreSQL, hermetic cluster.
-if ! "$PGBIN/initdb" -D "$WORK/pgdata" -U postgres -A trust --encoding=UTF8 --lc-collate=C --lc-ctype=C \
-  > "$WORK/initdb.log" 2>&1; then
-  bad initdb
-  cat "$WORK/initdb.log"
-  exit 1
+# A local reference is hermetic. The explicitly configured external mode is
+# used only by CI's disposable PostgreSQL 18 service, avoiding a second server
+# installation in its five-minute coverage worker.
+if [[ "$REFERENCE_MODE" == local ]]; then
+  if ! "$PGBIN/initdb" -D "$WORK/pgdata" -U postgres -A trust --encoding=UTF8 --lc-collate=C --lc-ctype=C \
+    > "$WORK/initdb.log" 2>&1; then
+    bad initdb
+    cat "$WORK/initdb.log"
+    exit 1
+  fi
+  SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC" \
+    -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
-SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-"$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC" \
-  -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 
 # pos3ql (object storage off by default: this suite is pure SQL semantics).
 # POS3QL_EXTRA_CONF appends config lines — the forced-spill mode runs the

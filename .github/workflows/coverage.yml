@@ -34,8 +34,7 @@ jobs:
           - { name: lib, shards: "lib", needs_pg18: false }
           - { name: subscription, shards: "runtest:subscription", needs_pg18: true }
           - { name: sql-differential, shards: "sql", needs_pg18: true }
-          - { name: protocol-durability, shards: "run:proto,dur", needs_pg18: true }
-          - { name: diff, shards: "run:diff", needs_pg18: true }
+          - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
           # Forced-spill differential is a complete correctness workload, but
           # its PostgreSQL setup plus an instrumented server build cannot fit
           # in the fixed five-minute cap. Run the same workload uninstrumented;
@@ -52,19 +51,23 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Most shards need only the runner's PostgreSQL client.  Installing a
-      # complete PG18 server for TLS, overlay, ingest, or in-process tests
-      # consumed their entire five-minute job budget before a test began.
-      # Only differential, torture, and subscription need local PG18 binaries.
+      # Most shards need only the runner's PostgreSQL client. PostgreSQL 18's
+      # wire client is installed without the server for protocol coverage;
+      # only torture and subscription need local server binaries.
       - name: Install only the tools this shard needs
         run: |
-          sudo apt-get install -y zsh postgresql-client
-          if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
+          if [ "${{ matrix.needs_pg18 || matrix.needs_pg18_client }}" = "true" ]; then
             sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
             curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
             sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
             sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-            sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-18
+            if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
+              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-18
+            else
+              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-client-18
+            fi
+          else
+            sudo apt-get install -y zsh postgresql-client
           fi
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
@@ -93,8 +96,61 @@ jobs:
           # their upload find nothing rather than error.
           if-no-files-found: ignore
 
+  # The plain SQL differential workload needs PostgreSQL 18 as an oracle but
+  # not a host-installed server. A disposable service keeps the job's setup
+  # bounded; differential.sh enters this mode only when all reference settings
+  # are explicitly supplied.
+  reference-diff:
+    name: shard diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install PostgreSQL 18 client
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-client-18
+      - name: Python venv for the differential harnesses
+        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
+      - name: Measure
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          COVERAGE_SHARDS: "run:diff"
+        run: |
+          COVERAGE_SHARD="$COVERAGE_SHARDS" \
+          COVERAGE_LCOV="${{ github.workspace }}/coverage-run-diff.lcov" \
+          sh tools/coverage.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: lcov-diff
+          path: coverage-run-diff.lcov
+
   merge-and-gate:
-    needs: shard
+    needs: [shard, reference-diff]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

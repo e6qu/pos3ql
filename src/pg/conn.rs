@@ -3302,8 +3302,11 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 2] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Int4(i32::from(i16::from_be_bytes(b))))
         }
+        oids::OID => {
+            let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Oid(u32::from_be_bytes(b)))
+        }
         oids::INT4
-        | oids::OID
         | oids::REGPROC
         | oids::REGPROCEDURE
         | oids::REGOPER
@@ -3700,8 +3703,12 @@ mod tests {
         let mut budget = Budget::new(1024);
         let arena = Arena::new(&mut budget, "binary oid test", 16).expect("test arena");
         let bytes = 12_345i32.to_be_bytes();
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::OID, &u32::MAX.to_be_bytes(), &arena)
+                .expect("OID parameter decodes"),
+            Datum::Oid(u32::MAX)
+        );
         for oid in [
-            crate::sql::types::oid::OID,
             crate::sql::types::oid::REGCLASS,
             crate::sql::types::oid::REGTYPE,
             crate::sql::types::oid::REGROLE,

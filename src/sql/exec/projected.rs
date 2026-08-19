@@ -153,7 +153,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Float4(_) => 4,
-        Datum::Int4(_) | Datum::Date(_) => 4,
+        Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
         Datum::Int8(_)
         | Datum::Float8(_)
         | Datum::Timestamp(_)
@@ -233,6 +233,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         }
         Datum::Int4(x) => {
             out[0] = 2;
+            out[1..5].copy_from_slice(&x.to_le_bytes());
+            5
+        }
+        Datum::Oid(x) => {
+            out[0] = 35;
             out[1..5].copy_from_slice(&x.to_le_bytes());
             5
         }
@@ -517,6 +522,10 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         1 => (Datum::Bool(bytes[at] != 0), 1),
         2 => (
             Datum::Int4(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
+            4,
+        ),
+        35 => (
+            Datum::Oid(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
             4,
         ),
         3 => (

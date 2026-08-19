@@ -1572,6 +1572,14 @@ def test_catalog_aware_binary_bind_parameters():
             None,
         ),
         (
+            "unsigned oid array",
+            "SELECT $1::oid[]",
+            1028,
+            binary_array(26, [struct.pack("!I", 1), None, struct.pack("!I", 4294967295)]),
+            "{1,NULL,4294967295}",
+            None,
+        ),
+        (
             "range array",
             "SELECT $1::int4range[]",
             3905,
@@ -1767,6 +1775,18 @@ def test_catalog_aware_binary_bind_parameters():
             and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
             messages,
         )
+    messages = extended_binary_result(s, "SELECT ARRAY[1::oid, 4294967295::oid]")
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    expected = binary_array(26, [struct.pack("!I", 1), struct.pack("!I", 4294967295)])
+    check(
+        "binary Result preserves unsigned oid array identity and values",
+        description is not None
+        and row_description_type_oids(description) == [1028]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+        messages,
+    )
     range_array_results = [
         ("range", "SELECT ARRAY['[1,3)'::int4range]", 3905, 3904, binary_int4_range(1, 3)),
         (

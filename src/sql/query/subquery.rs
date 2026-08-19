@@ -1513,7 +1513,8 @@ fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Record => Datum::Record(&[]),
         ColType::Composite(_) => Datum::Record(&[]),
         ColType::Bool => Datum::Bool(false),
-        ColType::Int2 | ColType::Int4 | ColType::Oid => Datum::Int4(0),
+        ColType::Int2 | ColType::Int4 => Datum::Int4(0),
+        ColType::Oid => Datum::Oid(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,
             name: "-",

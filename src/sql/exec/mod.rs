@@ -19875,7 +19875,8 @@ fn decode_binary_field_with_context<'a>(
             Ok(Datum::Int2(i16::from_be_bytes(b)))
         }
         ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
-        ColType::Int4 | ColType::Oid => via(oids::INT4),
+        ColType::Int4 => via(oids::INT4),
+        ColType::Oid => via(oids::OID),
         ColType::Regtype => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena)

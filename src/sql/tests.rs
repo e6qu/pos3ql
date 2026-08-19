@@ -2356,6 +2356,14 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     {
         let mut budget = Budget::new(1 << 25);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT 4294967295::oid, (4294967295::oid)::text, 4294967295::oid = 4294967295::oid",
+            )),
+            ["4294967295|4294967295|t"],
+        );
         run_with(
             &mut engine,
             &mut budget,
@@ -2393,6 +2401,75 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
         ],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
+    let config = test_config("oid-array-restart");
+    {
+        let mut budget = Budget::new(1 << 25);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_oid_arrays (values oid[])",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_oid_defaults (value oid DEFAULT 4294967295::oid); \
+             INSERT INTO durable_oid_defaults DEFAULT VALUES",
+        );
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO durable_oid_arrays VALUES (ARRAY[1::oid, NULL, 4294967295::oid])",
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        let described = row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values FROM durable_oid_arrays",
+        ));
+        assert_eq!(described, [crate::sql::types::oid::OID_ARRAY]);
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT pg_typeof(values), values::text FROM durable_oid_arrays",
+            )),
+            ["oid[]|{1,NULL,4294967295}"],
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 25);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(values), values::text FROM durable_oid_arrays",
+        )),
+        ["oid[]|{1,NULL,4294967295}"],
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text FROM durable_oid_defaults",
+        )),
+        ["4294967295"],
     );
 }
 

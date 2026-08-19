@@ -29,7 +29,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
-            Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) => 4,
+            Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
             Datum::Int8(_)
@@ -117,6 +117,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 take = 1;
             }
             Datum::Int4(x) => {
+                rest[..4].copy_from_slice(&x.to_le_bytes());
+                take = 4;
+            }
+            Datum::Oid(x) => {
                 rest[..4].copy_from_slice(&x.to_le_bytes());
                 take = 4;
             }
@@ -394,10 +398,10 @@ pub(crate) fn decode<'a>(
                 let x = i32::from_le_bytes(b.try_into().unwrap());
                 // The 4-byte layout is historical; the schema narrows. A
                 // stored int2 is range-checked at write, so the cast holds.
-                out[i] = if matches!(schema[i], ColType::Int2) {
-                    Datum::Int2(x as i16)
-                } else {
-                    Datum::Int4(x)
+                out[i] = match schema[i] {
+                    ColType::Int2 => Datum::Int2(x as i16),
+                    ColType::Oid => Datum::Oid(u32::from_le_bytes(b.try_into().unwrap())),
+                    _ => Datum::Int4(x),
                 };
                 at += 4;
             }

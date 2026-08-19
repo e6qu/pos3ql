@@ -324,6 +324,7 @@ pub enum OwnedDatum {
     Null,
     Bool(bool),
     Int4(i32),
+    Oid(u32),
     Int8(i64),
     Regtype {
         referenced_oid: i32,
@@ -500,6 +501,7 @@ impl OwnedDatum {
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
             Datum::Int4(v) => Self::Int4(*v),
+            Datum::Oid(v) => Self::Oid(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
             // Widened like int2→int4; the column re-coerces the default back to
@@ -585,6 +587,7 @@ impl OwnedDatum {
             Self::Null => Datum::Null,
             Self::Bool(b) => Datum::Bool(*b),
             Self::Int4(v) => Datum::Int4(*v),
+            Self::Oid(v) => Datum::Oid(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Regtype {
                 referenced_oid,

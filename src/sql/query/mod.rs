@@ -2184,9 +2184,9 @@ pub(crate) fn describe_select<'a>(
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(sel.items, &scope, None, storage, txid, arena, out)
+            describe_select_items(sel.items, Some(&scope), storage, txid, arena, out)
         }
-        None => describe_catalog_items(sel.items, None, storage, txid, out),
+        None => describe_select_items(sel.items, None, storage, txid, arena, out),
     }
 }
 
@@ -3020,6 +3020,16 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = patch_array_subquery_field_types(
+        statement.items,
+        Some(&scope),
+        storage,
+        txid,
+        arena,
+        &mut columns[..n_cols],
+    ) {
+        return sql_fail(e);
+    }
     patch_subquery_column_types(
         statement.items,
         Some(&scope),
@@ -3441,6 +3451,16 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = patch_array_subquery_field_types(
+        statement.items,
+        None,
+        storage,
+        txid,
+        arena,
+        &mut columns[..n],
+    ) {
+        return sql_fail(e);
+    }
     patch_subquery_column_types(
         statement.items,
         None,
@@ -4986,7 +5006,106 @@ pub fn describe_select_items<'q>(
             }
         }
     }
+    patch_array_subquery_field_types(items, scope, storage, txid, arena, out)?;
     Ok(count)
+}
+
+/// Refines a field selected from an `ARRAY(subquery)` named-composite element.
+/// Generic expression inference has no catalog for the subquery's inner FROM
+/// scope; resolve that scope here, at the catalog-aware description boundary.
+fn patch_array_subquery_field_types<'q>(
+    items: &[SelectItem<'q>],
+    outer_scope: Option<&QueryScope<'q>>,
+    storage: &'q Storage,
+    txid: u32,
+    arena: &'q Arena,
+    out: &mut [ColDesc<'q>],
+) -> Result<(), SqlError> {
+    let mut column = 0;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => column += outer_scope.map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(table) => {
+                if let Some(scope) = outer_scope
+                    && let Ok(table) = scope.table_index(table)
+                {
+                    column += scope.defs[table].expect("resolved").n_columns;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                column += outer_scope.map_or(0, |scope| record_star_width(base, scope));
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some((ctype, type_mod)) =
+                    array_subquery_field_type(expression, outer_scope, storage, txid, arena)?
+                {
+                    out[column] = ColDesc::of_type(out[column].name, ctype).with_type_mod(type_mod);
+                }
+                column += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn array_subquery_field_type<'q>(
+    expression: &Expr<'q>,
+    outer_scope: Option<&QueryScope<'q>>,
+    storage: &'q Storage,
+    txid: u32,
+    arena: &'q Arena,
+) -> Result<Option<(ColType, i32)>, SqlError> {
+    let Expr::Field { base, field } = expression else {
+        return Ok(None);
+    };
+    let Expr::Subscript { base: array, .. } = &**base else {
+        return Ok(None);
+    };
+    let Expr::ArraySubquery(select) = &**array else {
+        return Ok(None);
+    };
+    let mut element = [ColDesc::new("", 0, 0); 1];
+    let count = match &select.from {
+        Some(from) => {
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            describe_scope_items(
+                select.items,
+                &scope,
+                outer_scope,
+                storage,
+                txid,
+                arena,
+                &mut element,
+            )?
+        }
+        None => describe_select_items(
+            select.items,
+            outer_scope,
+            storage,
+            txid,
+            arena,
+            &mut element,
+        )?,
+    };
+    if count != 1 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subquery must return only one column"
+        ));
+    }
+    let oid = element[0].type_oid;
+    if !(super::types::oid::FIRST_COMPOSITE
+        ..super::types::oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&oid)
+    {
+        return Ok(None);
+    }
+    let slot = (oid - super::types::oid::FIRST_COMPOSITE) as usize;
+    let composite = storage.composite_for(slot, txid);
+    Ok(composite
+        .active_fields()
+        .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
+        .map(|candidate| (candidate.ctype, candidate.type_mod)))
 }
 
 #[derive(Clone, Copy)]
@@ -5009,27 +5128,31 @@ fn subquery_result_type<'a>(
         _ => return Ok(None),
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = match &select.from {
-        Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(
+    let count = if let Some(body) = select.set_body {
+        describe_set_tree(body, storage, txid, arena, &mut columns)?
+    } else {
+        match &select.from {
+            Some(from) => {
+                let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+                describe_scope_items(
+                    select.items,
+                    &scope,
+                    outer_scope,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                )?
+            }
+            None => describe_select_items(
                 select.items,
-                &scope,
                 outer_scope,
                 storage,
                 txid,
                 arena,
                 &mut columns,
-            )?
+            )?,
         }
-        None => describe_select_items(
-            select.items,
-            outer_scope,
-            storage,
-            txid,
-            arena,
-            &mut columns,
-        )?,
     };
     if count != 1 {
         return Err(sql_err!(

@@ -5762,6 +5762,44 @@ fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_set
         "SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)",
     );
     assert_eq!(row_description_type_oids(&described), [type_oid]);
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE array_subquery_pairs_copy AS \
+         SELECT ARRAY(SELECT value FROM array_subquery_pairs) AS values",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values FROM array_subquery_pairs_copy",
+        )),
+        [type_oid]
+    );
+    let field = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x",
+    );
+    assert_eq!(
+        data_rows(&field),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&field)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
 }
 
 #[test]
@@ -17995,9 +18033,10 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             &mut engine,
             &mut budget,
             "SELECT values::text,direct_values::text FROM domain_point_values; \
-             SELECT values::text FROM array_subquery_values",
+             SELECT values::text FROM array_subquery_values; \
+             SELECT (values[1]).x FROM array_subquery_values",
         )),
-        ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}"]
+        ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}", "9"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

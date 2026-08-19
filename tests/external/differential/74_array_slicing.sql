@@ -56,6 +56,7 @@ SELECT ARRAY(SELECT value FROM array_subquery_pairs)::text,
        pg_typeof(ARRAY(SELECT value FROM array_subquery_pairs))::text;
 SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)::text,
        pg_typeof(ARRAY(SELECT value FROM array_subquery_pairs WHERE false))::text;
+SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x;
 CREATE TABLE array_subquery_pairs_copy AS
   SELECT ARRAY(SELECT value FROM array_subquery_pairs) AS values;
 SELECT values::text, pg_typeof(values)::text FROM array_subquery_pairs_copy;

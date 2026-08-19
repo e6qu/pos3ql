@@ -1978,6 +1978,22 @@ pub fn infer_type_res(
         Expr::Field { base, field } => match record_field_type(base, field, columns) {
             Ok(t) => of(t),
             Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
+            // The subquery executor preserves the element's named-composite
+            // identity, but this catalog-free inference boundary cannot
+            // resolve an inner FROM item. Query description refines this
+            // provisional type before exposing it to a client.
+            Err(e)
+                if e.sqlstate == "42703"
+                    && matches!(
+                        &**base,
+                        Expr::Subscript {
+                            base: array,
+                            ..
+                        } if matches!(&**array, Expr::ArraySubquery(_))
+                    ) =>
+            {
+                of(ColType::Text)
+            }
             Err(e) => return Err(e),
         },
         Expr::Call {

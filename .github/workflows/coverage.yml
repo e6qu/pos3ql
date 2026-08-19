@@ -43,7 +43,8 @@ jobs:
           - { name: spilldiff, shards: "runtest:spilldiff", needs_pg18: true }
           - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723, needs_pg18: true }
           - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725, needs_pg18: true }
-          - { name: spill-overlay-ingest, shards: "runtest:overlay,ingest", needs_pg18: false }
+          - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
+          - { name: ingest, shards: "runtest:ingest", needs_pg18: false }
           - { name: tls-correctness, shards: "runtest:tls", needs_pg18: false }
     steps:
       - uses: actions/checkout@v5

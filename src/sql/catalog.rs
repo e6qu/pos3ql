@@ -2180,7 +2180,7 @@ fn routine_declared_signature<'a>(
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
         }
-        write_routine_type_name(&mut text, argument.ctype, argument.user_type)
+        write_routine_type_name(&mut text, argument.ctype, argument.user_type, false)
             .map_err(|_| super::eval::arena_full())?;
     }
     write!(text, ")").map_err(|_| super::eval::arena_full())?;
@@ -2193,9 +2193,13 @@ fn write_routine_type_name(
     output: &mut impl core::fmt::Write,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
+    qualified: bool,
 ) -> Result<(), core::fmt::Error> {
     match user_type {
         Some(identity) => {
+            if qualified {
+                write!(output, "{}.", identity.schema.as_str())?;
+            }
             write!(output, "{}", identity.name.as_str())?;
             if matches!(ctype, ColType::Array(_)) {
                 write!(output, "[]")?;
@@ -2487,7 +2491,7 @@ pub fn function_def_text<'a>(
                 }
                 write!(definition, "{} ", column.name.as_str())
                     .map_err(|_| super::eval::arena_full())?;
-                write_routine_type_name(&mut definition, column.ctype, column.user_type)
+                write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
                     .map_err(|_| super::eval::arena_full())?;
             }
             write!(definition, ") LANGUAGE sql AS '")
@@ -2538,8 +2542,15 @@ pub fn function_arguments_text<'a>(
         if !identity && !argument.name.as_str().is_empty() {
             write!(output, "{} ", argument.name.as_str()).map_err(|_| super::eval::arena_full())?;
         }
-        write_routine_type_name(&mut output, argument.ctype, argument.user_type)
-            .map_err(|_| super::eval::arena_full())?;
+        write_routine_type_name(
+            &mut output,
+            argument.ctype,
+            argument.user_type,
+            argument
+                .user_type
+                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+        )
+        .map_err(|_| super::eval::arena_full())?;
     }
     if output.is_truncated() {
         return Err(super::eval::arena_full());
@@ -2564,13 +2575,27 @@ pub fn function_result_text<'a>(
     use core::fmt::Write;
     match &routine.kind {
         crate::storage::RoutineKind::Function { result } => {
-            write_routine_type_name(&mut output, result.ctype, result.user_type)
-                .map_err(|_| super::eval::arena_full())?;
+            write_routine_type_name(
+                &mut output,
+                result.ctype,
+                result.user_type,
+                result
+                    .user_type
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+            )
+            .map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::SetFunction { result } => {
             write!(output, "SETOF ").map_err(|_| super::eval::arena_full())?;
-            write_routine_type_name(&mut output, result.ctype, result.user_type)
-                .map_err(|_| super::eval::arena_full())?;
+            write_routine_type_name(
+                &mut output,
+                result.ctype,
+                result.user_type,
+                result
+                    .user_type
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+            )
+            .map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::TableFunction => {
             write!(output, "record").map_err(|_| super::eval::arena_full())?;

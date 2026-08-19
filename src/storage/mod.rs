@@ -7177,6 +7177,12 @@ impl Storage {
         None
     }
 
+    pub(crate) fn schema_is_on_path(&self, schema: SqlName) -> bool {
+        self.path.entries().iter().any(|entry| {
+            matches!(entry, PathEntry::Schema(slot) if self.schemas[*slot as usize].name == schema)
+        })
+    }
+
     fn relation_in(&self, schema: &str, name: &str, txid: u32) -> Option<ResolvedRelation> {
         if let Some(t) = self.find_visible(schema, name, txid) {
             return Some(ResolvedRelation::Table(t));

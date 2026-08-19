@@ -12034,8 +12034,8 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
     assert_eq!(
         data_rows(&moved_catalog),
         [
-            "value routine_count_moved|routine_count_moved",
-            "values routine_count_moved[]|routine_count_moved[]",
+            "value routine_type_target.routine_count_moved|routine_type_target.routine_count_moved",
+            "values routine_type_target.routine_count_moved[]|routine_type_target.routine_count_moved[]",
         ],
         "{}",
         String::from_utf8_lossy(&moved_catalog)

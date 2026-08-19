@@ -372,6 +372,66 @@ def test_binary_portal_preserves_catalog_identity():
     s.close()
 
 
+def test_binary_portal_paging_retains_result_shape_and_format():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_paged_portal (id integer PRIMARY KEY, value varchar(3)); "
+        "INSERT INTO wire_paged_portal VALUES (1, 'one'), (2, 'two'), (3, 'tri')",
+    )
+    check("binary portal paging setup", not any(kind == b"E" for kind, _ in setup), setup)
+    parse = frontend_message(
+        b"P",
+        b"paged_binary_statement\x00SELECT (wire_paged_portal).* FROM wire_paged_portal ORDER BY id\x00\x00\x00",
+    )
+    bind = frontend_message(
+        b"B",
+        b"paged_binary_portal\x00paged_binary_statement\x00" + struct.pack("!hhhhh", 0, 0, 2, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Ppaged_binary_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    describe_out = []
+    while True:
+        item = read_message(s)
+        describe_out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in describe_out if kind == b"T"), None)
+    check(
+        "binary paged portal Describe retains formats and varchar typmod",
+        description is not None
+        and row_description_type_oids(description) == [23, 1043]
+        and row_description_type_modifiers(description) == [-1, 7]
+        and row_description_formats(description) == [1, 1],
+        describe_out,
+    )
+
+    expected_rows = [
+        b"\x00\x02\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x03one",
+        b"\x00\x02\x00\x00\x00\x04\x00\x00\x00\x02\x00\x00\x00\x03two",
+        b"\x00\x02\x00\x00\x00\x04\x00\x00\x00\x03\x00\x00\x00\x03tri",
+    ]
+    for index, expected in enumerate(expected_rows):
+        execute = frontend_message(b"E", b"paged_binary_portal\x00\x00\x00\x00\x01")
+        s.sendall(execute + frontend_message(b"S"))
+        out = []
+        while True:
+            item = read_message(s)
+            out.append(item)
+            if item[0] == b"Z":
+                break
+        row = next((payload for kind, payload in out if kind == b"D"), None)
+        terminal = b"C" if index == len(expected_rows) - 1 else b"s"
+        check(
+            f"binary paged portal Execute {index + 1} retains row bytes and suspension",
+            row == expected and [kind for kind, _ in out] == [b"D", terminal, b"Z"],
+            out,
+        )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))

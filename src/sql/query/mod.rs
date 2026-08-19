@@ -5415,7 +5415,12 @@ fn describe_scope_record_star<'q>(
             for c in &scope.defs[t].expect("resolved").columns()
                 [..scope.defs[t].expect("resolved").n_columns]
             {
-                push(ColDesc::of_type(c.name.as_str(), c.ctype), &mut n)?;
+                push(
+                    ColDesc::of_type(c.name.as_str(), c.ctype)
+                        .with_type_mod(c.type_mod)
+                        .with_collation(c.collation),
+                    &mut n,
+                )?;
             }
         }
         // json_each family: `(key, value)` with statically-known names/types.

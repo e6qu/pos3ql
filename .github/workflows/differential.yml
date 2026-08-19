@@ -93,8 +93,10 @@ jobs:
       - name: Expose the PostgreSQL 18 client from the service image
         run: |
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
-          chmod +x .ci-bin/psql
+          for client in psql pg_dump pg_restore; do
+            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp postgres:18 $client \"\$@\"" > ".ci-bin/$client"
+          done
+          chmod +x .ci-bin/psql .ci-bin/pg_dump .ci-bin/pg_restore
           echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust build
@@ -145,4 +147,4 @@ jobs:
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward zero.
           FUZZ_BUDGET: "0"
-        run: bash tests/external/ci_diff.sh
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh

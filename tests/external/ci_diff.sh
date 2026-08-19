@@ -360,8 +360,8 @@ fi
 
 # --- PostgreSQL 15.18 custom archive through pg_restore --------------------
 echo "=== PostgreSQL 15.18 custom archive restore ==="
-# Version 15's archive format is readable by the client packages on every CI
-# runner we support. The ownerful archive exercises ALTER ... OWNER, while
+# Version 15's archive format is readable by the PostgreSQL 18 CI client. The
+# ownerful archive exercises ALTER ... OWNER, while
 # parallel restore exercises independent pg_restore worker connections.
 restart_p3_fresh || exit 1
 pg_restore --exit-on-error --jobs=4 \

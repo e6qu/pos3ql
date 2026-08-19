@@ -45,7 +45,7 @@ jobs:
       - name: Expose the PostgreSQL 18 client from its image
         run: |
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
           chmod +x .ci-bin/psql
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
@@ -103,7 +103,7 @@ jobs:
       - name: Expose the PostgreSQL 18 client from the service image
         run: |
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
           chmod +x .ci-bin/psql
       - name: Python venv for crash torture
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
@@ -131,7 +131,7 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 postgres:18 \
             -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/postgres
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/initdb
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/pg_ctl
@@ -167,7 +167,7 @@ jobs:
       - name: Expose the PostgreSQL 18 client from the service image
         run: |
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
           chmod +x .ci-bin/psql
       - name: Python venv for differential oracles
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
@@ -211,7 +211,7 @@ jobs:
       - name: Expose the PostgreSQL 18 client from the service image
         run: |
           mkdir -p .ci-bin
-          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
           chmod +x .ci-bin/psql
       - name: Python venv for the differential harnesses
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'

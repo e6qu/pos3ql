@@ -5802,6 +5802,33 @@ fn describe_scalar_subquery_preserves_the_inner_type_modifier() {
 }
 
 #[test]
+fn describe_whole_row_expansion_preserves_column_type_modifiers() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE describe_whole_row (value varchar(3), amount numeric(6,2), stamp timestamp(4))",
+    );
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (describe_whole_row).* FROM describe_whole_row",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [
+            crate::sql::types::oid::VARCHAR,
+            crate::sql::types::oid::NUMERIC,
+            crate::sql::types::oid::TIMESTAMP,
+        ]
+    );
+    assert_eq!(
+        row_description_type_modifiers(&description),
+        [7, 393_222, 4]
+    );
+}
+
+#[test]
 fn cursor_fetch_preserves_row_description_type_modifier() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

@@ -179,7 +179,11 @@ fn describe_record_star<'q>(
             .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, table)) =>
         {
             for c in def.expect("matched").columns() {
-                push(ColDesc::of_type(c.name.as_str(), c.ctype))?;
+                push(
+                    ColDesc::of_type(c.name.as_str(), c.ctype)
+                        .with_type_mod(c.type_mod)
+                        .with_collation(c.collation),
+                )?;
             }
             Ok(())
         }

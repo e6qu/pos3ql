@@ -834,16 +834,26 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
         return Ok(None);
     }
-    let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in args.iter().enumerate() {
-        argument_types[slot] = match crate::sql::eval::static_type_pub(argument, columns) {
-            Some(ctype) => ctype,
+        let statically_known = match argument {
+            // Do not erase a domain, enum, or composite to its storage type
+            // before overload resolution.
+            Expr::Cast { type_name, .. } => {
+                crate::sql::catalog::user_type_oid(storage, txid, type_name)
+                    .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+            }
+            _ => crate::sql::eval::static_type_pub(argument, columns).map(ColType::oid),
+        };
+        argument_type_oids[slot] = match statically_known {
+            Some(oid) => oid,
             None => {
-                let value = crate::sql::eval::eval(argument, arena, params, columns)?;
-                let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(value.type_oid()) else {
-                    return Ok(None);
-                };
-                ctype
+                crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?.type_oid()
             }
         };
     }
@@ -855,7 +865,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
         tref.table
     };
     let Some(slot) =
-        storage.routine_slot_for_table_call_types(name, &argument_types[..args.len()], txid)
+        storage.routine_slot_for_table_call_oids(name, &argument_type_oids[..args.len()], txid)
     else {
         return Ok(None);
     };
@@ -1413,11 +1423,17 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let table_columns = routine.table_columns();
         let scalar_result = routine.kind.function_result();
         let _formal_scope = crate::sql::exec::enter_routine_parameter_types(routine.arguments());
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
         let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in args.iter().enumerate() {
-            let value = crate::sql::eval::eval(argument, arena, params, columns)?;
+            let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
             let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            routine_params[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
+            routine_params[slot] =
+                crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
         }
         let program = super::parse_routine_function_program(
             routine.body.as_str(),

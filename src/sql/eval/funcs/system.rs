@@ -922,6 +922,37 @@ pub(crate) fn dispatch<'a>(
                     referenced_oid,
                     name,
                 };
+                if let crate::sql::ast::Expr::Call {
+                    name,
+                    args,
+                    star: false,
+                    ..
+                } = args[0]
+                    && let Some(cat) = hooks.catalog
+                    && args.len() <= crate::sql::parser::MAX_LIST
+                {
+                    let mut argument_oids =
+                        [crate::sql::types::oid::UNKNOWN; crate::sql::parser::MAX_LIST];
+                    for (index, argument) in args.iter().enumerate() {
+                        argument_oids[index] = match argument {
+                            crate::sql::ast::Expr::Cast { type_name, .. } => cat
+                                .user_type_oid(type_name)
+                                .unwrap_or(crate::sql::types::oid::UNKNOWN),
+                            _ => crate::sql::exec::infer_type_res(
+                                argument,
+                                &crate::sql::exec::NoCols,
+                            )
+                            .map(|(oid, _)| oid)
+                            .unwrap_or(crate::sql::types::oid::UNKNOWN),
+                        };
+                    }
+                    if let Some(referenced_oid) =
+                        cat.routine_result_oid(name, &argument_oids[..args.len()])
+                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
+                    {
+                        return Ok(regtype(referenced_oid, type_name));
+                    }
+                }
                 // A bare column of a domain type reports the domain name (an
                 // expression over it un-domains to the base, handled below).
                 if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]

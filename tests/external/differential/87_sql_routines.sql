@@ -16,6 +16,40 @@ DROP FUNCTION IF EXISTS routine_nested_write_result(integer);
 DROP TABLE IF EXISTS routine_created_in_function;
 DROP TABLE IF EXISTS routine_values;
 
+CREATE TYPE routine_contract_state AS ENUM ('ready', 'done');
+CREATE DOMAIN routine_contract_count AS integer CHECK (VALUE > 0);
+CREATE TYPE routine_contract_pair AS (value integer, label text);
+CREATE FUNCTION routine_contract_state_echo(value routine_contract_state) RETURNS routine_contract_state LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_count_echo(value routine_contract_count) RETURNS routine_contract_count LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_pair_echo(value routine_contract_pair) RETURNS routine_contract_pair LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_state_array_echo(value routine_contract_state[]) RETURNS routine_contract_state[] LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_count_array_echo(value routine_contract_count[]) RETURNS routine_contract_count[] LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_pair_array_echo(value routine_contract_pair[]) RETURNS routine_contract_pair[] LANGUAGE SQL AS 'SELECT $1';
+CREATE FUNCTION routine_contract_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer''';
+CREATE FUNCTION routine_contract_overload(value routine_contract_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain''';
+SELECT routine_contract_state_echo('ready'::routine_contract_state)::text,
+       routine_contract_count_echo(3::routine_contract_count)::text,
+       routine_contract_pair_echo(ROW(4, 'four')::routine_contract_pair)::text,
+       routine_contract_state_array_echo(ARRAY['done'::routine_contract_state])::text,
+       routine_contract_count_array_echo(ARRAY[5::routine_contract_count])::text,
+       routine_contract_pair_array_echo(ARRAY[ROW(6, 'six')::routine_contract_pair])::text,
+       routine_contract_overload(1), routine_contract_overload(1::routine_contract_count);
+SELECT pg_get_function_arguments('routine_contract_count_echo(routine_contract_count)'::regprocedure),
+       pg_get_function_result('routine_contract_count_echo(routine_contract_count)'::regprocedure),
+       'routine_contract_overload(integer)'::regprocedure::text,
+       'routine_contract_overload(routine_contract_count)'::regprocedure::text;
+DROP FUNCTION routine_contract_state_echo(routine_contract_state);
+DROP FUNCTION routine_contract_count_echo(routine_contract_count);
+DROP FUNCTION routine_contract_pair_echo(routine_contract_pair);
+DROP FUNCTION routine_contract_state_array_echo(routine_contract_state[]);
+DROP FUNCTION routine_contract_count_array_echo(routine_contract_count[]);
+DROP FUNCTION routine_contract_pair_array_echo(routine_contract_pair[]);
+DROP FUNCTION routine_contract_overload(integer);
+DROP FUNCTION routine_contract_overload(routine_contract_count);
+DROP TYPE routine_contract_pair;
+DROP DOMAIN routine_contract_count;
+DROP TYPE routine_contract_state;
+
 CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
 CREATE FUNCTION routine_increment(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
 

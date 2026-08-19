@@ -1071,6 +1071,10 @@ impl Engine {
                 }))?;
             apply_wal_op(&mut storage, *lsn, operator)?;
         }
+        // WAL carries catalog identities as names where runtime slots are not
+        // durable. Rebind only after every replayed catalog definition exists.
+        storage.rebind_domain_base_types()?;
+        storage.rebind_routine_types()?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload
@@ -3573,6 +3577,7 @@ impl Engine {
         text: &str,
         arena: &Arena,
         params: &[Datum],
+        parameter_type_oids: &[i32],
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -3581,6 +3586,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
         self.current_conn_id = conn_id;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
@@ -5404,24 +5410,23 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
         }
-        let mut types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (slot, value) in values[..arguments.len()].iter().enumerate() {
-            let Some(ctype) = exec::coltype_of_oid_pub(value.type_oid()) else {
-                return Ok(Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "procedure \"{}\" does not exist",
-                    name.name
-                )));
+        let mut type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (slot, argument) in arguments.iter().enumerate() {
+            type_oids[slot] = match argument {
+                ast::Expr::Cast { type_name, .. } => {
+                    crate::sql::catalog::user_type_oid(&self.storage, txn.txid, type_name)
+                        .unwrap_or_else(|| values[slot].type_oid())
+                }
+                _ => values[slot].type_oid(),
             };
-            types[slot] = ctype;
         }
         let qualified = match name.schema {
             Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
             None => stack_format!(260, "{}", name.name),
         };
-        let Some(slot) = self.storage.procedure_slot_for_call_types(
+        let Some(slot) = self.storage.procedure_slot_for_call_oids(
             qualified.as_str(),
-            &types[..arguments.len()],
+            &type_oids[..arguments.len()],
             txn.txid,
         ) else {
             return Ok(Err(sql_err!(
@@ -7427,6 +7432,97 @@ fn requalify_schema_element<'a>(
 }
 
 /// Reapplies one journal record to storage during recovery.
+fn decode_wal_routine_signature(
+    encoded: &[u8],
+) -> Result<
+    (
+        [crate::storage::RoutineArgumentDef; crate::storage::MAX_ROUTINE_ARGUMENTS],
+        usize,
+    ),
+    SqlError,
+> {
+    let count = usize::from(*encoded.first().ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "routine WAL signature is missing its argument count"
+        )
+    })?);
+    if count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine WAL signature has too many arguments"
+        ));
+    }
+    let mut arguments =
+        [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut at = 1;
+    for argument in &mut arguments[..count] {
+        argument.ctype =
+            crate::sql::types::ColType::from_code(*encoded.get(at).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "routine WAL signature is truncated"
+                )
+            })?)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "routine WAL signature has invalid type"
+                )
+            })?;
+        at += 1;
+        let tag = *encoded.get(at).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "routine WAL signature is truncated"
+            )
+        })?;
+        at += 1;
+        if tag == 1 {
+            let mut names = [crate::storage::SqlName::EMPTY; 2];
+            for name in &mut names {
+                let len = usize::from(*encoded.get(at).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "routine WAL type identity is truncated"
+                    )
+                })?);
+                at += 1;
+                let bytes = encoded.get(at..at + len).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "routine WAL type identity is truncated"
+                    )
+                })?;
+                *name =
+                    crate::storage::SqlName::parse(core::str::from_utf8(bytes).map_err(|_| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "routine WAL type identity is not UTF-8"
+                        )
+                    })?)?;
+                at += len;
+            }
+            argument.user_type = Some(crate::storage::UserTypeName {
+                schema: names[0],
+                name: names[1],
+            });
+        } else if tag != 0 {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "routine WAL signature has invalid identity tag"
+            ));
+        }
+    }
+    if at != encoded.len() {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "routine WAL signature has trailing bytes"
+        ));
+    }
+    Ok((arguments, count))
+}
+
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
         WalOp::Commit { .. } => {}
@@ -8047,31 +8143,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropRoutine {
             schema,
             name,
-            argument_type_codes,
+            argument_signature,
         } => {
-            let mut argument_types =
-                [crate::sql::types::ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            if argument_type_codes.len() > argument_types.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many routine arguments in WAL"
-                ));
-            }
-            for (index, code) in argument_type_codes.iter().enumerate() {
-                argument_types[index] =
-                    crate::sql::types::ColType::from_code(*code).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "invalid routine argument type in WAL"
-                        )
-                    })?;
-            }
-            if let Some(slot) = storage.routine_slot_by_signature(
-                schema,
-                name,
-                &argument_types[..argument_type_codes.len()],
-                0,
-            ) {
+            let (arguments, count) = decode_wal_routine_signature(argument_signature)?;
+            if let Some(slot) =
+                storage.routine_slot_by_declared_signature(schema, name, &arguments[..count], 0)
+            {
                 storage.drop_routine(slot, 0);
                 storage.commit_routine_drop(slot);
             }
@@ -8079,34 +8156,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::AlterRoutineIdentity {
             schema,
             name,
-            argument_type_codes,
+            argument_signature,
             new_schema,
             new_name,
         } => {
-            let mut argument_types =
-                [crate::sql::types::ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            if argument_type_codes.len() > argument_types.len() {
-                return Err(sql_err!(
-                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "journal routine has too many arguments"
-                ));
-            }
-            for (index, code) in argument_type_codes.iter().enumerate() {
-                argument_types[index] =
-                    crate::sql::types::ColType::from_code(*code).ok_or_else(|| {
-                        sql_err!(
-                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                            "journal routine has invalid argument type"
-                        )
-                    })?;
-            }
+            let (arguments, count) = decode_wal_routine_signature(argument_signature)?;
             let slot = storage
-                .routine_slot_by_signature(
-                    schema,
-                    name,
-                    &argument_types[..argument_type_codes.len()],
-                    0,
-                )
+                .routine_slot_by_declared_signature(schema, name, &arguments[..count], 0)
                 .ok_or_else(|| {
                     sql_err!(
                         crate::sql::eval::sqlstate::UNDEFINED_FUNCTION,

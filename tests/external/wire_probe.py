@@ -1461,7 +1461,13 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
         "CREATE TABLE wire_binary_regclass (id integer); "
         "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
-        "AS 'SELECT value'",
+        "AS 'SELECT value'; "
+        "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_binary_positive_echo(value wire_binary_positive) RETURNS wire_binary_positive LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_binary_coordinate_echo(value wire_binary_coordinate) RETURNS wire_binary_coordinate LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_binary_state_array_echo(value wire_binary_state[]) RETURNS wire_binary_state[] LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_binary_positive_array_echo(value wire_binary_positive[]) RETURNS wire_binary_positive[] LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_binary_coordinate_array_echo(value wire_binary_coordinate[]) RETURNS wire_binary_coordinate[] LANGUAGE SQL AS 'SELECT $1'",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
@@ -1595,6 +1601,33 @@ def test_catalog_aware_binary_bind_parameters():
         ("jsonb", "SELECT $1::jsonb", 3802, b'\x01{"b": 1, "a": 2}', '{"a": 2, "b": 1}', None),
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
+        ("routine enum", "SELECT wire_binary_state_echo($1)", enum_oid, b"ready", "ready", None),
+        ("routine domain", "SELECT wire_binary_positive_echo($1)", domain_oid, struct.pack("!i", 7), "7", None),
+        ("routine composite", "SELECT wire_binary_coordinate_echo($1)", coordinate_oid, coordinate, "(4,8)", None),
+        (
+            "routine enum array",
+            "SELECT wire_binary_state_array_echo($1)",
+            enum_array_oid,
+            binary_array(enum_oid, [b"ready", b"blocked"]),
+            "{ready,blocked}",
+            None,
+        ),
+        (
+            "routine domain array",
+            "SELECT wire_binary_positive_array_echo($1)",
+            domain_array_oid,
+            binary_array(domain_oid, [struct.pack("!i", 3), struct.pack("!i", 5)]),
+            "{3,5}",
+            None,
+        ),
+        (
+            "routine composite array",
+            "SELECT wire_binary_coordinate_array_echo($1)",
+            coordinate_array_oid,
+            binary_array(coordinate_oid, [coordinate]),
+            "{\"(4,8)\"}",
+            None,
+        ),
         (
             "composite domain",
             "SELECT $1::wire_binary_coordinate_domain",
@@ -1847,6 +1880,41 @@ def test_catalog_aware_binary_bind_parameters():
         row = next((payload for kind, payload in messages if kind == b"D"), None)
         check(
             f"binary Result preserves {name}",
+            description is not None
+            and row_description_type_oids(description) == [oid]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+            messages,
+        )
+    routine_results = [
+        ("enum", "SELECT wire_binary_state_echo('ready'::wire_binary_state)", enum_oid, b"ready"),
+        ("domain", "SELECT wire_binary_positive_echo(7::wire_binary_positive)", domain_oid, struct.pack("!i", 7)),
+        ("composite", "SELECT wire_binary_coordinate_echo(ROW(4,8)::wire_binary_coordinate)", coordinate_oid, coordinate),
+        (
+            "enum array",
+            "SELECT wire_binary_state_array_echo(ARRAY['ready'::wire_binary_state])",
+            enum_array_oid,
+            binary_array(enum_oid, [b"ready"]),
+        ),
+        (
+            "domain array",
+            "SELECT wire_binary_positive_array_echo(ARRAY[7::wire_binary_positive])",
+            domain_array_oid,
+            binary_array(domain_oid, [struct.pack("!i", 7)]),
+        ),
+        (
+            "composite array",
+            "SELECT wire_binary_coordinate_array_echo(ARRAY[ROW(4,8)::wire_binary_coordinate])",
+            coordinate_array_oid,
+            binary_array(coordinate_oid, [coordinate]),
+        ),
+    ]
+    for name, query, oid, expected in routine_results:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        check(
+            f"binary Result preserves routine {name} identity",
             description is not None
             and row_description_type_oids(description) == [oid]
             and row_description_formats(description) == [1]

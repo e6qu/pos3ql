@@ -149,7 +149,6 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 mod describe;
 pub(crate) use describe::AliasedDefCols;
-pub(crate) use describe::enter_routine_parameter_types;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -157,6 +156,9 @@ pub use describe::{
     record_shape, register_named_composite_shape, register_shape_for, reset_record_shapes,
     typeof_static, typeof_static_coltype, typeof_static_oid,
     visit_record_shape as visit_record_shape_pub,
+};
+pub(crate) use describe::{
+    bound_parameter_type_oid, enter_bound_parameter_types, enter_routine_parameter_types,
 };
 pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
 
@@ -4155,10 +4157,11 @@ pub fn drop_owned(
             continue;
         }
         let routine = *storage.routine(slot);
-        let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
-        for (index, argument) in routine.arguments().iter().enumerate() {
-            type_codes[index] = argument.ctype.code();
-        }
+        let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+        let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
+            Ok(signature) => signature,
+            Err(error) => return sql_fail(error),
+        };
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
             txn.txid,
@@ -4166,7 +4169,7 @@ pub fn drop_owned(
             &WalOp::DropRoutine {
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
-                argument_type_codes: &type_codes[..routine.argument_count],
+                argument_signature: signature,
             },
         ) {
             return sql_fail(error);
@@ -4255,21 +4258,11 @@ fn resolve_privilege_objects(
         PrivilegeTarget::Routines { kind, identities } => {
             for identity in identities {
                 let schema = identity.name.schema.unwrap_or("public");
-                let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-                for (index, type_name) in identity.argument_types.iter().enumerate() {
-                    let Some(ctype) = ColType::from_sql_name(type_name) else {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "type \"{}\" does not exist",
-                            type_name
-                        ));
-                    };
-                    argument_types[index] = ctype;
-                }
-                let Some(slot) = storage.routine_slot_by_signature(
+                let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
+                let Some(slot) = storage.routine_slot_by_declared_signature(
                     schema,
                     identity.name.name,
-                    &argument_types[..identity.argument_types.len()],
+                    &arguments[..identity.argument_types.len()],
                     txid,
                 ) else {
                     return Err(sql_err!(
@@ -12393,6 +12386,139 @@ pub fn alter_trigger(
     sql_ok()
 }
 
+/// Resolve a routine declaration at the catalog boundary.  The executor gets
+/// the concrete representation, while durability retains the schema-qualified
+/// identity needed to rebind it after recovery.
+pub(crate) fn resolve_routine_type(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    use crate::sql::types::ArrElem;
+
+    if let Some(ctype) = ColType::from_sql_name(written) {
+        return Ok(crate::storage::RoutineResult::builtin(ctype));
+    }
+    let (base, array) = written
+        .strip_suffix("[]")
+        .map_or((written, false), |base| (base, true));
+    let user_type = |schema, name| crate::storage::UserTypeName { schema, name };
+    let result = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
+        let domain = storage.domain(slot);
+        let ctype = if array {
+            ColType::Array(ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "type \"{}\" cannot be an array element",
+                    written
+                )
+            })?)
+        } else {
+            domain.base
+        };
+        crate::storage::RoutineResult {
+            ctype,
+            user_type: Some(user_type(domain.schema, domain.name)),
+        }
+    } else if let Some(slot) = storage.resolve_enum_slot(base, txid) {
+        let definition = storage.enum_for(slot, txid);
+        crate::storage::RoutineResult {
+            ctype: if array {
+                ColType::Array(ArrElem::Enum(slot as u16))
+            } else {
+                ColType::Enum(slot as u16)
+            },
+            user_type: Some(user_type(definition.schema, definition.name)),
+        }
+    } else if let Some(slot) = storage.resolve_composite_slot(base, txid) {
+        let definition = storage.composite_for(slot, txid);
+        crate::storage::RoutineResult {
+            ctype: if array {
+                ColType::Array(ArrElem::Composite(slot as u16))
+            } else {
+                ColType::Composite(slot as u16)
+            },
+            user_type: Some(user_type(definition.schema, definition.name)),
+        }
+    } else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            written
+        ));
+    };
+    let identity = result
+        .user_type
+        .expect("user type resolution produced identity");
+    storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
+    Ok(result)
+}
+
+/// Parses a routine identity into the same typed contract stored on its
+/// definition.  DDL targets must not compare only storage representations:
+/// two domains over `integer` are distinct PostgreSQL overloads.
+pub(crate) fn resolve_routine_signature(
+    storage: &Storage,
+    txid: u32,
+    type_names: &[&str],
+) -> Result<[crate::storage::RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS], SqlError> {
+    if type_names.len() > MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many routine arguments"
+        ));
+    }
+    let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    for (slot, type_name) in type_names.iter().enumerate() {
+        let resolved = resolve_routine_type(storage, txid, type_name)?;
+        arguments[slot].ctype = resolved.ctype;
+        arguments[slot].user_type = resolved.user_type;
+    }
+    Ok(arguments)
+}
+
+const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + 2 * (1 + 63));
+
+fn encode_routine_signature<'a>(
+    arguments: &[crate::storage::RoutineArgumentDef],
+    output: &'a mut [u8; ROUTINE_SIGNATURE_WAL_BYTES],
+) -> Result<&'a [u8], SqlError> {
+    let count = u8::try_from(arguments.len()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many routine arguments"
+        )
+    })?;
+    output[0] = count;
+    let mut at = 1;
+    for argument in arguments {
+        output[at] = argument.ctype.code();
+        at += 1;
+        match argument.user_type {
+            None => {
+                output[at] = 0;
+                at += 1;
+            }
+            Some(identity) => {
+                output[at] = 1;
+                at += 1;
+                for name in [identity.schema.as_str(), identity.name.as_str()] {
+                    output[at] = u8::try_from(name.len()).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "routine type name too long"
+                        )
+                    })?;
+                    at += 1;
+                    output[at..at + name.len()].copy_from_slice(name.as_bytes());
+                    at += name.len();
+                }
+            }
+        }
+    }
+    Ok(&output[..at])
+}
+
 pub fn create_routine(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -12424,12 +12550,9 @@ pub fn create_routine(
             result_type,
             set_returning,
         } => {
-            let Some(result) = ColType::from_sql_name(result_type) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    result_type
-                ));
+            let result = match resolve_routine_type(storage, txn.txid, result_type) {
+                Ok(result) => result,
+                Err(error) => return sql_fail(error),
             };
             if set_returning {
                 crate::storage::RoutineKind::SetFunction { result }
@@ -12444,13 +12567,11 @@ pub fn create_routine(
                     Ok(name) => name,
                     Err(error) => return sql_fail(error),
                 };
-                let Some(ctype) = ColType::from_sql_name(column.type_name) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        column.type_name
-                    ));
+                let resolved = match resolve_routine_type(storage, txn.txid, column.type_name) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return sql_fail(error),
                 };
+                let ctype = resolved.ctype;
                 if ctype.is_pseudo() {
                     return sql_fail(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -12459,7 +12580,11 @@ pub fn create_routine(
                         column.type_name
                     ));
                 }
-                output[slot] = RoutineArgumentDef { name, ctype };
+                output[slot] = RoutineArgumentDef {
+                    name,
+                    ctype,
+                    user_type: resolved.user_type,
+                };
             }
             result_columns = output;
             result_column_count = columns.len();
@@ -12482,16 +12607,11 @@ pub fn create_routine(
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         };
-        let ctype = match ColType::from_sql_name(argument.type_name) {
-            Some(ctype) => ctype,
-            None => {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    argument.type_name
-                ));
-            }
+        let resolved = match resolve_routine_type(storage, txn.txid, argument.type_name) {
+            Ok(resolved) => resolved,
+            Err(error) => return sql_fail(error),
         };
+        let ctype = resolved.ctype;
         if ctype.is_pseudo() {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -12503,16 +12623,13 @@ pub fn create_routine(
         arguments[slot] = RoutineArgumentDef {
             name: argument_name,
             ctype,
+            user_type: resolved.user_type,
         };
     }
-    let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-    for (slot, argument) in arguments[..routine.arguments.len()].iter().enumerate() {
-        argument_types[slot] = argument.ctype;
-    }
-    let replaced = storage.routine_slot_by_signature(
+    let replaced = storage.routine_slot_by_declared_signature(
         schema.as_str(),
         name.as_str(),
-        &argument_types[..routine.arguments.len()],
+        &arguments[..routine.arguments.len()],
         txn.txid,
     );
     if let Some(replaced_slot) = replaced {
@@ -12551,9 +12668,8 @@ pub fn create_routine(
         crate::storage::RoutineKind::Function { .. } => {
             let returns_void = matches!(
                 kind,
-                crate::storage::RoutineKind::Function {
-                    result: ColType::Void
-                }
+                crate::storage::RoutineKind::Function { result }
+                    if result.ctype == ColType::Void
             );
             if let Err(error) =
                 super::query::parse_routine_function_program(routine.body, arena, returns_void)
@@ -12565,9 +12681,8 @@ pub fn create_routine(
         | crate::storage::RoutineKind::TableFunction => {
             let returns_void = matches!(
                 kind,
-                crate::storage::RoutineKind::SetFunction {
-                    result: ColType::Void
-                }
+                crate::storage::RoutineKind::SetFunction { result }
+                    if result.ctype == ColType::Void
             );
             if let Err(error) =
                 super::query::parse_routine_function_program(routine.body, arena, returns_void)
@@ -12699,21 +12814,14 @@ pub fn alter_routine(
     responder: &mut Responder,
 ) -> Outcome {
     let schema = identity.name.schema.unwrap_or("public");
-    let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-    for (index, type_name) in identity.argument_types.iter().enumerate() {
-        let Some(ctype) = ColType::from_sql_name(type_name) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                type_name
-            ));
-        };
-        argument_types[index] = ctype;
-    }
-    let Some(slot) = storage.routine_slot_by_signature(
+    let arguments = match resolve_routine_signature(storage, txn.txid, identity.argument_types) {
+        Ok(arguments) => arguments,
+        Err(error) => return sql_fail(error),
+    };
+    let Some(slot) = storage.routine_slot_by_declared_signature(
         schema,
         identity.name.name,
-        &argument_types[..identity.argument_types.len()],
+        &arguments[..identity.argument_types.len()],
         txn.txid,
     ) else {
         return sql_fail(sql_err!(
@@ -12833,10 +12941,11 @@ pub fn alter_routine(
             new_name.as_str()
         ));
     }
-    let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
-    for (index, argument) in routine.arguments().iter().enumerate() {
-        type_codes[index] = argument.ctype.code();
-    }
+    let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+    let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
+        Ok(signature) => signature,
+        Err(error) => return sql_fail(error),
+    };
     let prior = match storage.alter_routine_identity(slot, new_schema, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -12848,7 +12957,7 @@ pub fn alter_routine(
         &WalOp::AlterRoutineIdentity {
             schema: old_schema.as_str(),
             name: old_name.as_str(),
-            argument_type_codes: &type_codes[..routine.argument_count],
+            argument_signature: signature,
             new_schema: new_schema.as_str(),
             new_name: new_name.as_str(),
         },
@@ -12886,27 +12995,15 @@ pub fn drop_routine(
     } = command;
     for identity in routines {
         let schema = identity.name.schema.unwrap_or("public");
-        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-        if identity.argument_types.len() > argument_types.len() {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many function arguments"
-            ));
-        }
-        for (index, type_name) in identity.argument_types.iter().enumerate() {
-            let Some(ctype) = ColType::from_sql_name(type_name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    type_name
-                ));
-            };
-            argument_types[index] = ctype;
-        }
-        let Some(slot) = storage.routine_slot_by_signature(
+        let arguments = match resolve_routine_signature(storage, txn.txid, identity.argument_types)
+        {
+            Ok(arguments) => arguments,
+            Err(error) => return sql_fail(error),
+        };
+        let Some(slot) = storage.routine_slot_by_declared_signature(
             schema,
             identity.name.name,
-            &argument_types[..identity.argument_types.len()],
+            &arguments[..identity.argument_types.len()],
             txn.txid,
         ) else {
             if if_exists {
@@ -12997,17 +13094,18 @@ pub fn drop_routine(
             }
         }
         let lsn = storage.bump_lsn();
-        let mut type_codes = [0_u8; MAX_ROUTINE_ARGUMENTS];
-        for (index, argument) in routine.arguments().iter().enumerate() {
-            type_codes[index] = argument.ctype.code();
-        }
+        let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+        let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
+            Ok(signature) => signature,
+            Err(error) => return sql_fail(error),
+        };
         if let Err(error) = wal.stage(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
-                argument_type_codes: &type_codes[..routine.argument_count],
+                argument_signature: signature,
             },
         ) {
             return sql_fail(error);

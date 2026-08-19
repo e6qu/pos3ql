@@ -2293,6 +2293,32 @@ pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
 pub(crate) struct RoutineArgumentDef {
     pub name: SqlName,
     pub ctype: ColType,
+    /// The declared catalog type identity when this is not a built-in type.
+    /// Slots are executor-local; this name is the durable routine contract.
+    pub user_type: Option<UserTypeName>,
+}
+
+/// A scalar routine result keeps its executor representation and its durable
+/// catalog identity together.  A bare `ColType::Enum(slot)` cannot survive a
+/// catalog rebuild because slots are allocation details, not identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoutineResult {
+    pub ctype: ColType,
+    pub user_type: Option<UserTypeName>,
+}
+
+impl RoutineResult {
+    pub(crate) const TEXT: Self = Self {
+        ctype: ColType::Text,
+        user_type: None,
+    };
+
+    pub(crate) const fn builtin(ctype: ColType) -> Self {
+        Self {
+            ctype,
+            user_type: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2313,8 +2339,8 @@ pub(crate) struct RoutineSpec {
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutineKind {
-    Function { result: ColType },
-    SetFunction { result: ColType },
+    Function { result: RoutineResult },
+    SetFunction { result: RoutineResult },
     TableFunction,
     Trigger,
     Procedure,
@@ -2323,7 +2349,7 @@ pub(crate) enum RoutineKind {
 impl RoutineKind {
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
-            Self::Function { result } | Self::SetFunction { result } => Some(result),
+            Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),
             Self::TableFunction => Some(ColType::Record),
             Self::Trigger | Self::Procedure => None,
         }
@@ -2353,7 +2379,7 @@ impl RoutineKind {
         }
     }
 
-    pub(crate) const fn from_wire_code(code: u8, result: ColType) -> Option<Self> {
+    pub(crate) const fn from_wire_code(code: u8, result: RoutineResult) -> Option<Self> {
         match code {
             0 => Some(Self::Function { result }),
             1 => Some(Self::Procedure),
@@ -2398,6 +2424,7 @@ impl RoutineArgumentDef {
     pub(crate) const EMPTY: Self = Self {
         name: SqlName::EMPTY,
         ctype: ColType::Text,
+        user_type: None,
     };
 }
 
@@ -2444,7 +2471,7 @@ impl RoutineDef {
         arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         argument_count: 0,
         kind: RoutineKind::Function {
-            result: ColType::Text,
+            result: RoutineResult::TEXT,
         },
         result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         result_column_count: 0,
@@ -12866,6 +12893,88 @@ impl Storage {
         Ok(())
     }
 
+    /// Rebind routine declaration representations from their durable type
+    /// names after a manifest rebuild.  Routine slots are deliberately never
+    /// used as identities: a dropped type may free its slot before recovery.
+    pub(crate) fn rebind_routine_types(&mut self) -> Result<(), SqlError> {
+        fn rebind(
+            storage: &Storage,
+            ctype: ColType,
+            identity: UserTypeName,
+        ) -> Result<ColType, SqlError> {
+            if let Some(slot) =
+                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+            {
+                let domain = storage.domain(slot);
+                return match ctype {
+                    ColType::Array(_) => {
+                        crate::sql::types::ArrElem::domain(slot as u16, domain.base)
+                            .map(ColType::Array)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROTOCOL_VIOLATION,
+                                    "routine domain array has invalid element type"
+                                )
+                            })
+                    }
+                    _ => Ok(domain.base),
+                };
+            }
+            if let Some(slot) =
+                storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+            {
+                return Ok(match ctype {
+                    ColType::Array(_) => {
+                        ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16))
+                    }
+                    _ => ColType::Enum(slot as u16),
+                });
+            }
+            if let Some(slot) =
+                storage.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+            {
+                return Ok(match ctype {
+                    ColType::Array(_) => {
+                        ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16))
+                    }
+                    _ => ColType::Composite(slot as u16),
+                });
+            }
+            Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "routine type \"{}.{}\" does not exist",
+                identity.schema.as_str(),
+                identity.name.as_str()
+            ))
+        }
+        for slot in 0..self.routines.len() {
+            if self.routines[slot].ddl_state != CatalogDdlState::Present {
+                continue;
+            }
+            let mut routine = self.routines[slot];
+            for argument in &mut routine.arguments[..routine.argument_count] {
+                if let Some(identity) = argument.user_type {
+                    argument.ctype = rebind(self, argument.ctype, identity)?;
+                }
+            }
+            for column in &mut routine.result_columns[..routine.result_column_count] {
+                if let Some(identity) = column.user_type {
+                    column.ctype = rebind(self, column.ctype, identity)?;
+                }
+            }
+            match &mut routine.kind {
+                RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
+                    if let Some(identity) = result.user_type {
+                        result.ctype = rebind(self, result.ctype, identity)?;
+                    }
+                }
+                RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {}
+            }
+            self.routines[slot] = routine;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stage_domain_alter(
         &mut self,
         slot: usize,
@@ -14250,57 +14359,68 @@ impl Storage {
             .position(|routine| routine.visible_to(txid) && routine_oid(routine) == oid)
     }
 
-    pub(crate) fn routine_slot_for_call(
+    /// Resolves a scalar call from its evaluated values and their SQL type
+    /// identities. Domains deliberately use their base representation at
+    /// runtime, so their OID belongs at this boundary rather than being
+    /// inferred from an erased datum.
+    pub(crate) fn routine_slot_for_call_oids(
         &self,
         name: &str,
-        arguments: &[crate::sql::types::Datum<'_>],
+        argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-        if arguments.len() > argument_types.len() {
+        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS {
             return None;
         }
-        for (slot, argument) in arguments.iter().enumerate() {
-            argument_types[slot] = crate::sql::exec::coltype_of_oid_pub(argument.type_oid())?;
-        }
-        self.routine_slot_for_call_types(name, &argument_types[..arguments.len()], txid)
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
     }
 
-    pub(crate) fn routine_for_call_types(
+    pub(crate) fn routine_for_call_oids(
         &self,
         name: &str,
-        argument_types: &[ColType],
+        argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<RoutineDef> {
-        self.routine_slot_for_call_types(name, argument_types, txid)
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
             .map(|slot| self.routine_for(slot, txid))
     }
 
-    pub(crate) fn routine_slot_for_call_types(
+    /// Resolves a set-returning call from declared argument identities.  This
+    /// is distinct from the datum representation because a domain's runtime
+    /// representation is its base type.
+    pub(crate) fn routine_slot_for_table_call_oids(
         &self,
         name: &str,
-        argument_types: &[ColType],
+        argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Scalar)
+        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS {
+            return None;
+        }
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
     }
 
-    pub(crate) fn routine_slot_for_table_call_types(
+    pub(crate) fn routine_function_result_oid(
         &self,
-        name: &str,
-        argument_types: &[ColType],
+        routine: &RoutineDef,
         txid: u32,
-    ) -> Option<usize> {
-        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Set)
+    ) -> Option<i32> {
+        let result = match routine.kind {
+            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
+            RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {
+                return None;
+            }
+        };
+        self.routine_type_oid(result.ctype, result.user_type, txid)
     }
 
-    pub(crate) fn procedure_slot_for_call_types(
+    pub(crate) fn procedure_slot_for_call_oids(
         &self,
         name: &str,
-        argument_types: &[ColType],
+        argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        self.routine_slot_on_path(name, argument_types, txid, RoutineCallKind::Procedure)
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Procedure)
     }
 
     pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
@@ -14331,6 +14451,30 @@ impl Storage {
         })
     }
 
+    fn routine_slot_on_path_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        txid: u32,
+        kind: RoutineCallKind,
+    ) -> Option<usize> {
+        if let Some((schema, name)) = name.split_once('.') {
+            return self.routine_slot_in_oids(schema, name, argument_type_oids, txid, kind);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            self.routine_slot_in_oids(
+                self.schemas[*slot as usize].name.as_str(),
+                name,
+                argument_type_oids,
+                txid,
+                kind,
+            )
+        })
+    }
+
     fn routine_slot_in(
         &self,
         schema: &str,
@@ -14354,6 +14498,69 @@ impl Storage {
         })
     }
 
+    fn routine_slot_in_oids(
+        &self,
+        schema: &str,
+        name: &str,
+        argument_type_oids: &[i32],
+        txid: u32,
+        kind: RoutineCallKind,
+    ) -> Option<usize> {
+        self.routines.iter().position(|routine| {
+            let definition = routine.definition_for(txid);
+            routine.visible_to(txid)
+                && kind.accepts(definition.kind)
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.argument_count == argument_type_oids.len()
+                && definition
+                    .arguments()
+                    .iter()
+                    .zip(argument_type_oids)
+                    .all(|(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid))
+        })
+    }
+
+    fn routine_argument_oid(&self, argument: &RoutineArgumentDef, txid: u32) -> Option<i32> {
+        self.routine_type_oid(argument.ctype, argument.user_type, txid)
+    }
+
+    fn routine_type_oid(
+        &self,
+        ctype: ColType,
+        user_type: Option<UserTypeName>,
+        txid: u32,
+    ) -> Option<i32> {
+        use crate::sql::types::oid;
+        let Some(identity) = user_type else {
+            return Some(ctype.oid());
+        };
+        let array = matches!(ctype, ColType::Array(_));
+        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        {
+            return Some(if array {
+                oid::domain_array_oid(slot as u16)
+            } else {
+                oid::domain_oid(slot as u16)
+            });
+        }
+        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+            return Some(if array {
+                oid::enum_array_oid(slot as u16)
+            } else {
+                oid::enum_oid(slot as u16)
+            });
+        }
+        self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+            .map(|slot| {
+                if array {
+                    oid::composite_array_oid(slot as u16)
+                } else {
+                    oid::composite_oid(slot as u16)
+                }
+            })
+    }
+
     pub(crate) fn routine_slot_by_signature(
         &self,
         schema: &str,
@@ -14372,6 +14579,29 @@ impl Storage {
                     .iter()
                     .zip(argument_types)
                     .all(|(argument, ctype)| argument.ctype == *ctype)
+        })
+    }
+
+    pub(crate) fn routine_slot_by_declared_signature(
+        &self,
+        schema: &str,
+        name: &str,
+        arguments: &[RoutineArgumentDef],
+        txid: u32,
+    ) -> Option<usize> {
+        self.routines.iter().position(|routine| {
+            let definition = routine.definition_for(txid);
+            routine.visible_to(txid)
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.argument_count == arguments.len()
+                && definition
+                    .arguments()
+                    .iter()
+                    .zip(arguments)
+                    .all(|(left, right)| {
+                        left.ctype == right.ctype && left.user_type == right.user_type
+                    })
         })
     }
 
@@ -14398,7 +14628,9 @@ impl Storage {
                     .arguments()
                     .iter()
                     .zip(routine.arguments())
-                    .all(|(left, right)| left.ctype == right.ctype)
+                    .all(|(left, right)| {
+                        left.ctype == right.ctype && left.user_type == right.user_type
+                    })
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
@@ -14419,11 +14651,11 @@ impl Storage {
                             && pending.schema == schema
                             && pending.name == name
                             && candidate.argument_count == routine.argument_count
-                            && candidate
-                                .arguments()
-                                .iter()
-                                .zip(routine.arguments())
-                                .all(|(left, right)| left.ctype == right.ctype)
+                            && candidate.arguments().iter().zip(routine.arguments()).all(
+                                |(left, right)| {
+                                    left.ctype == right.ctype && left.user_type == right.user_type
+                                },
+                            )
                     })
                     .map(|pending| pending.txid)
             })
@@ -14525,7 +14757,9 @@ impl Storage {
                 && routine.arguments()[..argument_count]
                     .iter()
                     .zip(&arguments[..argument_count])
-                    .all(|(left, right)| left.ctype == right.ctype))
+                    .all(|(left, right)| {
+                        left.ctype == right.ctype && left.user_type == right.user_type
+                    }))
             .then_some(routine.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
@@ -14539,7 +14773,9 @@ impl Storage {
                 && routine.arguments()[..argument_count]
                     .iter()
                     .zip(&arguments[..argument_count])
-                    .all(|(left, right)| left.ctype == right.ctype)
+                    .all(|(left, right)| {
+                        left.ctype == right.ctype && left.user_type == right.user_type
+                    })
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
@@ -14955,14 +15191,10 @@ impl Storage {
         mut definition: RoutineDef,
     ) -> Result<(), SqlError> {
         definition.ownership = definition.ownership.committed();
-        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-        for (slot, argument) in definition.arguments().iter().enumerate() {
-            argument_types[slot] = argument.ctype;
-        }
-        if let Some(slot) = self.routine_slot_by_signature(
+        if let Some(slot) = self.routine_slot_by_declared_signature(
             definition.schema.as_str(),
             definition.name.as_str(),
-            &argument_types[..definition.argument_count],
+            definition.arguments(),
             0,
         ) {
             // CREATE OR REPLACE keeps its routine object identifier.  WAL uses

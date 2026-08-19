@@ -1968,70 +1968,108 @@ impl Checkpointer {
                     let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY;
                         crate::storage::MAX_ROUTINE_ARGUMENTS];
                     for argument in &mut arguments[..argument_count] {
-                        argument.name = sql_name(&decode_hex_name(words.next().ok_or(
-                            CheckpointSetupError::Corrupt("routine argument name missing"),
-                        )?)?)?;
-                        let type_code: u8 = parse_field(words.next(), "routine argument type")?;
+                        let argument_name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine argument name missing",
+                        ))?;
+                        let type_word = words.next();
+                        argument.name = sql_name(&decode_hex_name(argument_name)?)?;
+                        let type_code: u8 = parse_field(type_word, "routine argument type")?;
                         argument.ctype = ColType::from_code(type_code).ok_or(
                             CheckpointSetupError::Corrupt("invalid routine argument type"),
                         )?;
+                        let schema = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine argument type schema missing",
+                        ))?;
+                        let name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine argument type name missing",
+                        ))?;
+                        argument.user_type = if schema == "-" && name == "-" {
+                            None
+                        } else {
+                            Some(crate::storage::UserTypeName {
+                                schema: sql_name(&decode_hex_name(schema)?)?,
+                                name: sql_name(&decode_hex_name(name)?)?,
+                            })
+                        };
                     }
                     let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
                         crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let mut result_column_count = 0;
-                    let kind = match words.next() {
-                        None => crate::storage::RoutineKind::Function {
-                            result: ColType::from_code(result_code).ok_or(
-                                CheckpointSetupError::Corrupt("invalid routine result type"),
-                            )?,
-                        },
-                        Some(code) => {
-                            let code: u8 = parse_field(Some(code), "routine kind")?;
-                            if code == 3 {
-                                result_column_count =
-                                    parse_field(words.next(), "routine result column count")?;
-                                if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "too many routine result columns",
-                                    ));
-                                }
-                                for column in &mut result_columns[..result_column_count] {
-                                    column.name = sql_name(&decode_hex_name(
-                                        words.next().ok_or(CheckpointSetupError::Corrupt(
-                                            "routine result column name missing",
-                                        ))?,
-                                    )?)?;
-                                    let type_code: u8 =
-                                        parse_field(words.next(), "routine result column type")?;
-                                    column.ctype = ColType::from_code(type_code).ok_or(
-                                        CheckpointSetupError::Corrupt(
-                                            "invalid routine result column type",
-                                        ),
-                                    )?;
-                                }
-                                if words.next().is_some() {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "malformed routine record",
-                                    ));
-                                }
-                                crate::storage::RoutineKind::TableFunction
-                            } else {
-                                let kind = crate::storage::RoutineKind::from_wire_code(
-                                    code,
-                                    ColType::from_code(result_code).ok_or(
-                                        CheckpointSetupError::Corrupt(
-                                            "invalid routine result type",
-                                        ),
-                                    )?,
-                                )
-                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
-                                if words.next().is_some() {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "malformed routine record",
-                                    ));
-                                }
-                                kind
+                    let kind_code = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("routine kind missing"))?;
+                    let result_schema = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "routine result type schema missing",
+                    ))?;
+                    let result_name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "routine result type name missing",
+                    ))?;
+                    let result_user_type = if result_schema == "-" && result_name == "-" {
+                        None
+                    } else {
+                        Some(crate::storage::UserTypeName {
+                            schema: sql_name(&decode_hex_name(result_schema)?)?,
+                            name: sql_name(&decode_hex_name(result_name)?)?,
+                        })
+                    };
+                    let result = crate::storage::RoutineResult {
+                        ctype: ColType::from_code(result_code)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid routine result type"))?,
+                        user_type: result_user_type,
+                    };
+                    let kind = {
+                        let code: u8 = parse_field(Some(kind_code), "routine kind")?;
+                        if code == 3 {
+                            result_column_count =
+                                parse_field(words.next(), "routine result column count")?;
+                            if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "too many routine result columns",
+                                ));
                             }
+                            for column in &mut result_columns[..result_column_count] {
+                                column.name = sql_name(&decode_hex_name(words.next().ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "routine result column name missing",
+                                    ),
+                                )?)?)?;
+                                let type_code: u8 =
+                                    parse_field(words.next(), "routine result column type")?;
+                                column.ctype = ColType::from_code(type_code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "invalid routine result column type",
+                                    ),
+                                )?;
+                                let schema = words.next().ok_or(CheckpointSetupError::Corrupt(
+                                    "routine result column type schema missing",
+                                ))?;
+                                let name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                                    "routine result column type name missing",
+                                ))?;
+                                column.user_type = if schema == "-" && name == "-" {
+                                    None
+                                } else {
+                                    Some(crate::storage::UserTypeName {
+                                        schema: sql_name(&decode_hex_name(schema)?)?,
+                                        name: sql_name(&decode_hex_name(name)?)?,
+                                    })
+                                };
+                            }
+                            if words.next().is_some() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "malformed routine record",
+                                ));
+                            }
+                            crate::storage::RoutineKind::TableFunction
+                        } else {
+                            let kind = crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
+                            if words.next().is_some() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "malformed routine record",
+                                ));
+                            }
+                            kind
                         }
                     };
                     let owner = storage
@@ -2693,6 +2731,12 @@ impl Checkpointer {
         storage.rebind_domain_base_types().map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
                 "manifest domain base type rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+        storage.rebind_routine_types().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest routine type rejected: {}",
                 error.message.as_str()
             ))
         })?;
@@ -3939,7 +3983,7 @@ impl Checkpointer {
             for byte in routine.body.as_str().as_bytes() {
                 let _ = write!(body, "{byte:02x}");
             }
-            let mut arguments = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 132 }>::new();
+            let mut arguments = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
             for argument in routine.arguments() {
                 let mut argument_name = StackStr::<130>::new();
                 for byte in argument.name.as_str().as_bytes() {
@@ -3951,9 +3995,22 @@ impl Checkpointer {
                     argument_name.as_str(),
                     argument.ctype.code()
                 );
+                if let Some(identity) = argument.user_type {
+                    let mut schema = StackStr::<130>::new();
+                    let mut name = StackStr::<130>::new();
+                    for byte in identity.schema.as_str().as_bytes() {
+                        let _ = write!(schema, "{byte:02x}");
+                    }
+                    for byte in identity.name.as_str().as_bytes() {
+                        let _ = write!(name, "{byte:02x}");
+                    }
+                    let _ = write!(arguments, " {} {}", schema.as_str(), name.as_str());
+                } else {
+                    let _ = write!(arguments, " - -");
+                }
             }
             let mut result_columns =
-                StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 132 }>::new();
+                StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
             if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
                 let _ = write!(result_columns, " {}", routine.result_column_count);
                 for column in &routine.result_columns[..routine.result_column_count] {
@@ -3967,25 +4024,61 @@ impl Checkpointer {
                         column_name.as_str(),
                         column.ctype.code()
                     );
+                    if let Some(identity) = column.user_type {
+                        let mut schema = StackStr::<130>::new();
+                        let mut name = StackStr::<130>::new();
+                        for byte in identity.schema.as_str().as_bytes() {
+                            let _ = write!(schema, "{byte:02x}");
+                        }
+                        for byte in identity.name.as_str().as_bytes() {
+                            let _ = write!(name, "{byte:02x}");
+                        }
+                        let _ = write!(result_columns, " {} {}", schema.as_str(), name.as_str());
+                    } else {
+                        let _ = write!(result_columns, " - -");
+                    }
                 }
+            }
+            let result_identity = match routine.kind {
+                crate::storage::RoutineKind::Function { result }
+                | crate::storage::RoutineKind::SetFunction { result } => result.user_type,
+                _ => None,
+            };
+            let mut result_schema = StackStr::<130>::new();
+            let mut result_name = StackStr::<130>::new();
+            if let Some(identity) = result_identity {
+                for byte in identity.schema.as_str().as_bytes() {
+                    let _ = write!(result_schema, "{byte:02x}");
+                }
+                for byte in identity.name.as_str().as_bytes() {
+                    let _ = write!(result_name, "{byte:02x}");
+                }
+            } else {
+                let _ = write!(result_schema, "-");
+                let _ = write!(result_name, "-");
             }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{} {}{}",
+                    "rtn {} {} {} {} {} {} {}{} {} {} {}{}",
                     routine.created_at,
                     owner.as_str(),
-                    routine
-                        .kind
-                        .function_result()
-                        .unwrap_or(ColType::Text)
-                        .code(),
+                    match routine.kind {
+                        crate::storage::RoutineKind::Function { result }
+                        | crate::storage::RoutineKind::SetFunction { result } => result.ctype,
+                        crate::storage::RoutineKind::TableFunction
+                        | crate::storage::RoutineKind::Trigger
+                        | crate::storage::RoutineKind::Procedure => ColType::Text,
+                    }
+                    .code(),
                     routine.argument_count,
                     schema.as_str(),
                     name.as_str(),
                     body.as_str(),
                     arguments.as_str(),
                     routine.kind.wire_code(),
+                    result_schema.as_str(),
+                    result_name.as_str(),
                     result_columns.as_str(),
                 ),
             )?;

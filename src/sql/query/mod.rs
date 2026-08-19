@@ -607,11 +607,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         name: &str,
         arguments: &[Datum<'a>],
+        argument_type_oids: &[i32],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        let Some(slot) = self
-            .storage
-            .routine_slot_for_call(name, arguments, self.txid)
+        let Some(slot) =
+            self.storage
+                .routine_slot_for_call_oids(name, argument_type_oids, self.txid)
         else {
             return Ok(None);
         };
@@ -649,7 +650,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         for (slot, argument) in arguments.iter().enumerate() {
             let encoded =
                 crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
-            parameters[slot] = crate::sql::exec::decode_projected_pub(encoded, 0);
+            parameters[slot] =
+                crate::sql::exec::decode_projected_col_record(encoded, 0, self.routine_workspace)?;
         }
         for step in function_program.preceding {
             let RoutinePrelude::Statement(statement) = step else {
@@ -726,11 +728,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     return Ok(());
                 }
                 let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                result = Some(crate::sql::exec::decode_projected_pub(encoded, 0));
+                result = Some(crate::sql::exec::decode_projected_col_record(
+                    encoded, 0, arena,
+                )?);
                 Ok(())
             },
         )?;
         super::eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena).map(Some)
+    }
+
+    fn routine_result_oid(&self, name: &str, argument_type_oids: &[i32]) -> Option<i32> {
+        let routine = self
+            .storage
+            .routine_for_call_oids(name, argument_type_oids, self.txid)?;
+        self.storage
+            .routine_function_result_oid(&routine, self.txid)
     }
 
     fn rewind_routine_invocation_cursor(&self) {
@@ -1037,28 +1049,32 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => (function, ""),
         };
         let (schema, name) = split_catalog_name(written_name.trim());
-        let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let written_arguments = written_arguments.trim();
+        let mut written_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let argument_count = if written_arguments.is_empty() {
-            0
+            0usize
         } else {
             let mut count = 0usize;
             for type_name in written_arguments.split(',') {
-                if count == argument_types.len() {
+                if count == written_types.len() {
                     return Ok(None);
                 }
-                let Some(ctype) = ColType::from_sql_name(type_name.trim()) else {
-                    return Ok(None);
-                };
-                argument_types[count] = ctype;
+                written_types[count] = type_name.trim();
                 count += 1;
             }
             count
         };
-        let Some(slot) = self.storage.routine_slot_by_signature(
+        let Ok(arguments) = crate::sql::exec::resolve_routine_signature(
+            self.storage,
+            self.txid,
+            &written_types[..argument_count],
+        ) else {
+            return Ok(None);
+        };
+        let Some(slot) = self.storage.routine_slot_by_declared_signature(
             schema.unwrap_or("public"),
             name,
-            &argument_types[..argument_count],
+            &arguments[..argument_count],
             self.txid,
         ) else {
             return Ok(None);
@@ -4889,8 +4905,9 @@ pub fn describe_catalog_items_as<'q>(
                         },
                         None => &super::exec::NoCols,
                     };
-                    let mut argument_types = [ColType::Text; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    if args.len() <= argument_types.len() {
+                    let mut argument_type_oids =
+                        [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    if args.len() <= argument_type_oids.len() {
                         let mut known = true;
                         for (argument_index, argument) in args.iter().enumerate() {
                             let Ok((oid, _)) = super::exec::infer_type_res(argument, resolver)
@@ -4898,31 +4915,26 @@ pub fn describe_catalog_items_as<'q>(
                                 known = false;
                                 break;
                             };
-                            let Some(ctype) = super::exec::coltype_of_oid_pub(oid) else {
-                                known = false;
-                                break;
-                            };
-                            argument_types[argument_index] = ctype;
+                            argument_type_oids[argument_index] = oid;
                         }
                         if known
-                            && let Some(routine) = storage.routine_for_call_types(
+                            && let Some(routine) = storage.routine_for_call_oids(
                                 name,
-                                &argument_types[..args.len()],
+                                &argument_type_oids[..args.len()],
                                 txid,
                             )
                         {
+                            let result_oid = storage
+                                .routine_function_result_oid(&routine, txid)
+                                .expect("scalar routine used as an expression has a result");
+                            let result = routine
+                                .kind
+                                .function_result()
+                                .expect("scalar routine used as an expression has a result");
                             out[column] = ColDesc::new(
                                 alias.unwrap_or(super::exec::derived_name(expression)),
-                                routine
-                                    .kind
-                                    .function_result()
-                                    .expect("scalar routine used as an expression has a result")
-                                    .oid(),
-                                routine
-                                    .kind
-                                    .function_result()
-                                    .expect("scalar routine used as an expression has a result")
-                                    .typlen(),
+                                result_oid,
+                                result.typlen(),
                             );
                         }
                     }
@@ -5091,14 +5103,31 @@ fn user_type_cast_description<'q>(
         return Some(if array {
             ColDesc::new(name, super::types::oid::domain_array_oid(slot as u16), -1)
         } else {
-            ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
+            ColDesc::new(
+                name,
+                super::types::oid::domain_oid(slot as u16),
+                domain.base.typlen(),
+            )
+            .with_type_mod(domain.base_type_mod)
         });
     }
-    let slot = storage.resolve_enum_slot(base_name, txid)?;
-    Some(if array {
-        ColDesc::new(name, super::types::oid::enum_array_oid(slot as u16), -1)
-    } else {
-        ColDesc::new(name, super::types::oid::enum_oid(slot as u16), 4)
+    if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
+        return Some(if array {
+            ColDesc::new(name, super::types::oid::enum_array_oid(slot as u16), -1)
+        } else {
+            ColDesc::new(name, super::types::oid::enum_oid(slot as u16), 4)
+        });
+    }
+    storage.resolve_composite_slot(base_name, txid).map(|slot| {
+        if array {
+            ColDesc::new(
+                name,
+                super::types::oid::composite_array_oid(slot as u16),
+                -1,
+            )
+        } else {
+            ColDesc::new(name, super::types::oid::composite_oid(slot as u16), -1)
+        }
     })
 }
 
@@ -5114,6 +5143,38 @@ fn user_type_expression_description<'q>(
 ) -> Option<ColDesc<'q>> {
     if let Some(description) = user_type_cast_description(expression, name, storage, txid) {
         return Some(description);
+    }
+    if let Expr::Call {
+        name: routine_name,
+        args,
+        star: false,
+        ..
+    } = expression
+    {
+        let mut argument_type_oids =
+            [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() <= argument_type_oids.len() {
+            for (index, argument) in args.iter().enumerate() {
+                argument_type_oids[index] =
+                    user_type_expression_description(argument, "", storage, txid)
+                        .map(|description| description.type_oid)
+                        .or_else(|| {
+                            super::exec::infer_type_res(argument, &super::exec::NoCols)
+                                .ok()
+                                .map(|(oid, _)| oid)
+                        })?;
+            }
+            if let Some(routine) =
+                storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)
+            {
+                let result = routine.kind.function_result()?;
+                return Some(ColDesc::new(
+                    name,
+                    storage.routine_function_result_oid(&routine, txid)?,
+                    result.typlen(),
+                ));
+            }
+        }
     }
     match expression {
         Expr::Call {
@@ -5554,11 +5615,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         }
     }
 
-    fn routine_result(&self, name: &str, arguments: &[ColType]) -> Option<ColType> {
-        self.storage
-            .routine_for_call_types(name, arguments, self.txid)?
-            .kind
-            .function_result()
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+        let routine = self
+            .storage
+            .routine_for_call_oids(name, arguments, self.txid)?;
+        Some((
+            self.storage
+                .routine_function_result_oid(&routine, self.txid)?,
+            routine.kind.function_result()?.typlen(),
+        ))
     }
 
     fn named_composite_field(

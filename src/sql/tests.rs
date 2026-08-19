@@ -2616,6 +2616,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                     "INSERT INTO binary_coordinate_arrays VALUES ($1)",
                     &arena,
                     &[composite_array],
+                    &[composite_array.type_oid()],
                     &mut transaction,
                     &mut pool,
                     &mut cursors,
@@ -11887,6 +11888,204 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
 }
 
 #[test]
+fn routines_retain_catalog_defined_signature_and_result_types() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE routine_state AS ENUM ('ready', 'done'); \
+         CREATE DOMAIN routine_count AS integer CHECK (VALUE > 0); \
+         CREATE TYPE routine_pair AS (value integer, label text); \
+         CREATE FUNCTION echo_state(value routine_state) RETURNS routine_state LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_count(value routine_count) RETURNS routine_count LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_counts(values routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_counts_unnamed(routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_pair(value routine_pair) RETURNS routine_pair LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION routine_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
+         CREATE FUNCTION routine_overload(value routine_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \
+         CREATE PROCEDURE accept_state(value routine_state) LANGUAGE SQL AS 'SELECT $1'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let invoked = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT echo_state('ready'::routine_state)::text, \
+                echo_count(3::routine_count)::text, \
+                echo_counts(ARRAY[1::routine_count, 2::routine_count]::routine_count[])::text, \
+                echo_counts_unnamed(ARRAY[4::routine_count]::routine_count[])::text, \
+                echo_pair(ROW(7, 'seven')::routine_pair)::text, \
+                routine_overload(1), routine_overload(1::routine_count); \
+         SELECT pg_typeof(echo_state('done'::routine_state)), \
+                pg_typeof(echo_count(1::routine_count)), \
+                pg_typeof(echo_counts(ARRAY[1::routine_count]::routine_count[])), \
+                pg_typeof(echo_pair(ROW(1, 'one')::routine_pair))",
+    );
+    assert!(
+        !String::from_utf8_lossy(&invoked).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&invoked)
+    );
+    assert_eq!(
+        data_rows(&invoked),
+        [
+            "ready|3|{1,2}|{4}|(7,seven)|integer|domain",
+            "routine_state|routine_count|routine_count[]|routine_pair",
+        ]
+    );
+    let called = run_with(
+        &mut engine,
+        &mut budget,
+        "CALL accept_state('ready'::routine_state)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&called).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&called)
+    );
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_get_function_arguments('echo_state(routine_state)'::regprocedure), \
+                pg_get_function_result('echo_state(routine_state)'::regprocedure), \
+                pg_get_function_arguments('echo_pair(routine_pair)'::regprocedure), \
+                pg_get_function_result('echo_pair(routine_pair)'::regprocedure), \
+                'echo_state(routine_state)'::regprocedure::text, \
+                'routine_overload(integer)'::regprocedure::text, \
+                'routine_overload(routine_count)'::regprocedure::text",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        [
+            "value routine_state|routine_state|value routine_pair|routine_pair|echo_state(routine_state)|routine_overload(integer)|routine_overload(routine_count)"
+        ],
+        "{}",
+        String::from_utf8_lossy(&catalog)
+    );
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_overload(routine_count) RENAME TO routine_overload_domain; \
+         DROP FUNCTION routine_overload(integer); \
+         SELECT routine_overload_domain(1::routine_count)",
+    );
+    assert_eq!(
+        data_rows(&altered),
+        ["domain"],
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+}
+
+#[test]
+fn table_routines_accept_and_return_catalog_types() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE routine_table_state AS ENUM ('ready', 'done'); \
+         CREATE FUNCTION routine_table_rows(value routine_table_state) RETURNS TABLE (state routine_table_state) LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE DOMAIN routine_table_count AS integer CHECK (VALUE > 0); \
+         CREATE FUNCTION routine_table_overload(value integer) RETURNS TABLE (label text) LANGUAGE SQL AS 'SELECT ''integer'''; \
+         CREATE FUNCTION routine_table_overload(value routine_table_count) RETURNS TABLE (label text) LANGUAGE SQL AS 'SELECT ''domain'''",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT state::text FROM routine_table_rows('done'::routine_table_state); \
+         SELECT label FROM routine_table_overload(1::routine_table_count)",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["done", "domain"],
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+}
+
+#[test]
+fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
+    let mut config = test_config("routine-user-types-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-user-types-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE recovered_state AS ENUM ('ready', 'done'); \
+             CREATE DOMAIN recovered_count AS integer CHECK (VALUE > 0); \
+             CREATE TYPE recovered_pair AS (value integer, label text); \
+             CREATE FUNCTION recovered_state_echo(value recovered_state) RETURNS recovered_state LANGUAGE SQL AS 'SELECT $1'; \
+             CREATE FUNCTION recovered_counts_echo(values recovered_count[]) RETURNS recovered_count[] LANGUAGE SQL AS 'SELECT $1'; \
+             CREATE FUNCTION recovered_pair_echo(value recovered_pair) RETURNS recovered_pair LANGUAGE SQL AS 'SELECT $1'; \
+             CREATE FUNCTION recovered_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
+             CREATE FUNCTION recovered_overload(value recovered_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \
+             ALTER FUNCTION recovered_overload(recovered_count) RENAME TO recovered_domain_overload; \
+             DROP FUNCTION recovered_overload(integer)",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT recovered_state_echo('done'::recovered_state)::text, \
+                recovered_counts_echo(ARRAY[3::recovered_count]::recovered_count[])::text, \
+                recovered_pair_echo(ROW(9, 'nine')::recovered_pair)::text, \
+                recovered_domain_overload(1::recovered_count); \
+         SELECT pg_typeof(recovered_state_echo('ready'::recovered_state)), \
+                pg_typeof(recovered_counts_echo(ARRAY[1::recovered_count]::recovered_count[])), \
+                pg_typeof(recovered_pair_echo(ROW(1, 'one')::recovered_pair))",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "done|{3}|(9,nine)|domain",
+            "recovered_state|recovered_count[]|recovered_pair",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+    let mut checkpoint_budget = Budget::new(1 << 29);
+    let mut checkpointed = Engine::new(&config, &mut checkpoint_budget).unwrap();
+    let checkpoint_output = run_with(
+        &mut checkpointed,
+        &mut checkpoint_budget,
+        "SELECT recovered_state_echo('ready'::recovered_state)::text, \
+                recovered_counts_echo(ARRAY[4::recovered_count]::recovered_count[])::text, \
+                recovered_pair_echo(ROW(2, 'two')::recovered_pair)::text",
+    );
+    assert_eq!(
+        data_rows(&checkpoint_output),
+        ["ready|{4}|(2,two)"],
+        "{}",
+        String::from_utf8_lossy(&checkpoint_output)
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn routine_acls_are_signature_typed_enforced_and_durable() {
     let config = test_config("routine_acls");
     {
@@ -13622,7 +13821,7 @@ fn value_index_matches_uniqueness_oracle() {
     // Each statement gets a fresh scratch budget: the harness's per-statement
     // draws are not reclaimed, and this workload runs a thousand of them.
     let run = |e: &mut Engine, sql: &str| {
-        String::from_utf8_lossy(&run_with(e, &mut Budget::new(1 << 20), sql)).to_string()
+        String::from_utf8_lossy(&run_with(e, &mut Budget::new(2 << 20), sql)).to_string()
     };
 
     {
@@ -13670,7 +13869,7 @@ fn value_index_matches_uniqueness_oracle() {
     // Restart: the index is gone and must be rebuilt from the replayed rows.
     let mut b = Budget::new(1 << 25);
     let mut e = Engine::new(&config, &mut b).unwrap();
-    let bytes = run_with(&mut e, &mut Budget::new(1 << 20), "SELECT count(*) FROM t");
+    let bytes = run_with(&mut e, &mut Budget::new(2 << 20), "SELECT count(*) FROM t");
     assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
     for _ in 0..200 {
         let key = (next() % 50) as i64;
@@ -16576,6 +16775,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
                 "SELECT value FROM addresses",
                 &arena,
                 &[],
+                &[],
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
@@ -16608,6 +16808,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
             e.execute_extended(
                 "SELECT values FROM address_arrays",
                 &arena,
+                &[],
                 &[],
                 &mut transaction,
                 &mut pool,
@@ -17561,6 +17762,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
                 .execute_extended(
                     "SELECT values FROM binary_domain_points",
                     &arena,
+                    &[],
                     &[],
                     &mut transaction,
                     &mut pool,

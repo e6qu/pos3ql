@@ -12094,6 +12094,43 @@ fn drop_function_without_signature_removes_a_unique_typed_routine() {
 }
 
 #[test]
+fn drop_function_distinguishes_omitted_and_empty_signatures() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION drop_signature_shape(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let explicit_empty = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION drop_signature_shape()",
+    );
+    assert!(
+        String::from_utf8_lossy(&explicit_empty).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&explicit_empty)
+    );
+    let preserved = run_with(&mut engine, &mut budget, "SELECT drop_signature_shape(7)");
+    assert_eq!(data_rows(&preserved), ["7"]);
+    let omitted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION drop_signature_shape",
+    );
+    assert!(
+        !String::from_utf8_lossy(&omitted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&omitted)
+    );
+}
+
+#[test]
 fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
     let mut config = test_config("routine-user-types-recovery");
     config.object_store_on = true;

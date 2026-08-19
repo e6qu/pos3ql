@@ -13007,7 +13007,7 @@ pub fn drop_routine(
             txn.txid,
         ) {
             Some(slot) => Ok(Some(slot)),
-            None if identity.argument_types.is_empty() => {
+            None if !identity.signature_is_explicit => {
                 storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
             }
             None => Ok(None),

@@ -328,7 +328,7 @@ else
              (outbound_dump.echo_marked_location(ROW(11,12)::outbound_dump.location_domain)).y,
              outbound_dump.echo_moods(ARRAY['great'::outbound_type_target.mood])::text,
              ((outbound_dump.echo_locations(ARRAY[ROW(13,14)::outbound_type_target.location]))[1]).y,
-             (outbound_dump.echo_marked_locations(ARRAY[ROW(15,16)::outbound_dump.location_domain])[1]).x;
+             ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16)::outbound_dump.location_domain]))[1]).x;
     " 2>/dev/null)
   expected_outbound_observed=$'1|ok|1|2|ok|8|10|200|one\n2|great|3|4|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then

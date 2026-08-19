@@ -1910,6 +1910,7 @@ impl<'a> Parser<'a> {
         let mut routines = [RoutineIdentity {
             name: QualName::bare(""),
             argument_types: &[],
+            signature_is_explicit: false,
         }; MAX_LIST];
         let mut count = 0;
         loop {
@@ -1919,7 +1920,8 @@ impl<'a> Parser<'a> {
             let name = self.qual_name("function name")?;
             let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0;
-            if self.eat_op("(")? && !self.eat_op(")")? {
+            let signature_is_explicit = self.eat_op("(")?;
+            if signature_is_explicit && !self.eat_op(")")? {
                 loop {
                     if argument_count == argument_types.len() {
                         return Err(self.limit("function arguments", argument_types.len()));
@@ -1935,6 +1937,7 @@ impl<'a> Parser<'a> {
             routines[count] = RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..argument_count])?,
+                signature_is_explicit,
             };
             count += 1;
             if !self.eat_op(",")? {
@@ -2042,6 +2045,7 @@ impl<'a> Parser<'a> {
             routine: RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..count])?,
+                signature_is_explicit: true,
             },
             action,
         })

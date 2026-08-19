@@ -2748,6 +2748,7 @@ impl<'a> Parser<'a> {
         let mut identities = [RoutineIdentity {
             name: QualName::bare(""),
             argument_types: &[],
+            signature_is_explicit: true,
         }; MAX_LIST];
         let mut count = 0usize;
         loop {
@@ -2774,6 +2775,7 @@ impl<'a> Parser<'a> {
             identities[count] = RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..argument_count])?,
+                signature_is_explicit: true,
             };
             count += 1;
             if !self.eat_op(",")? {

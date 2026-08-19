@@ -6161,6 +6161,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         "CREATE TABLE child (id int PRIMARY KEY, pa int, pb int, email text UNIQUE, \
          FOREIGN KEY (pa,pb) REFERENCES parent(a,b))",
     );
+    drop(run);
     // Index relations exist with PostgreSQL-style names.
     let index = data_rows(&run_with_txn_bytes(
         &mut e,
@@ -6206,6 +6207,51 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         "SELECT conname FROM pg_constraint WHERE contype = 'u' ORDER BY conname",
     ));
     assert_eq!(uq, ["child_email_key"], "unique constraints: {uq:?}");
+
+    run_txn(&mut e, &mut b, &mut t, "CREATE SCHEMA \"Odd Schema\"");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE \"Odd Schema\".\"Parent Table\" (\"Key Value\" integer PRIMARY KEY)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE \"Odd Schema\".\"Child Table\" (\"Child Value\" integer \
+         REFERENCES \"Odd Schema\".\"Parent Table\"(\"Key Value\"))",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE INDEX \"Index Name\" ON \"Odd Schema\".\"Child Table\" (\"Child Value\")",
+    );
+    let quoted_index = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'Index Name'",
+    );
+    assert!(
+        quoted_index.contains(
+            "CREATE INDEX \"Index Name\" ON \"Odd Schema\".\"Child Table\" USING btree (\"Child Value\")"
+        ),
+        "quoted indexdef: {quoted_index}",
+    );
+    let quoted_fk = run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'Child Table_Child Value_fkey'",
+    );
+    assert!(
+        quoted_fk.contains(
+            "FOREIGN KEY (\"Child Value\") REFERENCES \"Odd Schema\".\"Parent Table\"(\"Key Value\")"
+        ),
+        "quoted constraintdef: {quoted_fk}",
+    );
 }
 
 #[test]

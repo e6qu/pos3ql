@@ -11,7 +11,9 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, SqlName, St
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
-use super::eval::{ColumnLookup, SqlError, resolved_expression_collation, sqlstate};
+use super::eval::{
+    ColumnLookup, SqlError, ident_needs_quotes, resolved_expression_collation, sqlstate,
+};
 use super::types::{ColType, Datum, TypeMod};
 
 /// A materialized catalog relation: its shape plus rows in the arena.
@@ -2993,19 +2995,18 @@ pub fn constraint_def_text<'a>(
             if k > 0 {
                 let _ = s.write_str(", ");
             }
-            let _ = s.write_str(child.columns()[c as usize].name.as_str());
+            write_identifier(&mut s, child.columns()[c as usize].name.as_str());
         }
-        let _ = write!(
-            s,
-            ") REFERENCES {}.{}(",
-            parent.schema.as_str(),
-            parent.name.as_str(),
-        );
+        let _ = s.write_str(") REFERENCES ");
+        write_identifier(&mut s, parent.schema.as_str());
+        let _ = s.write_char('.');
+        write_identifier(&mut s, parent.name.as_str());
+        let _ = s.write_char('(');
         for (k, &c) in fk.parent_cols[..fk.n_parent_cols].iter().enumerate() {
             if k > 0 {
                 let _ = s.write_str(", ");
             }
-            let _ = s.write_str(parent.columns()[c as usize].name.as_str());
+            write_identifier(&mut s, parent.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
@@ -3135,12 +3136,15 @@ pub fn index_def_text<'a>(
         use core::fmt::Write as _;
         let _ = write!(
             s,
-            "CREATE {}INDEX {} ON {}.{} USING btree (",
-            if info.is_unique { "UNIQUE " } else { "" },
-            info.name.as_str(),
-            def.schema.as_str(),
-            def.name.as_str(),
+            "CREATE {}INDEX ",
+            if info.is_unique { "UNIQUE " } else { "" }
         );
+        write_identifier(&mut s, info.name.as_str());
+        let _ = s.write_str(" ON ");
+        write_identifier(&mut s, def.schema.as_str());
+        let _ = s.write_char('.');
+        write_identifier(&mut s, def.name.as_str());
+        let _ = s.write_str(" USING btree (");
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -3148,7 +3152,7 @@ pub fn index_def_text<'a>(
             if let Some(expression) = index_expression_source(storage, info, k, txid) {
                 let _ = s.write_str(expression.as_str());
             } else {
-                let _ = s.write_str(col_name(k));
+                write_identifier(&mut s, col_name(k));
             }
             if info.descending[k] {
                 let _ = s.write_str(" DESC");
@@ -3168,7 +3172,8 @@ pub fn index_def_text<'a>(
                 if k > 0 {
                     let _ = s.write_str(", ");
                 }
-                let _ = s.write_str(
+                write_identifier(
+                    &mut s,
                     def.columns()[info.include_columns[k] as usize]
                         .name
                         .as_str(),
@@ -6138,12 +6143,15 @@ fn pg_indexes<'a>(
             use core::fmt::Write as _;
             let _ = write!(
                 indexdef,
-                "CREATE {}INDEX {} ON {}.{} USING btree (",
+                "CREATE {}INDEX ",
                 if info.is_unique { "UNIQUE " } else { "" },
-                info.name.as_str(),
-                table_def.schema.as_str(),
-                table_def.name.as_str()
             );
+            write_identifier(&mut indexdef, info.name.as_str());
+            let _ = indexdef.write_str(" ON ");
+            write_identifier(&mut indexdef, table_def.schema.as_str());
+            let _ = indexdef.write_char('.');
+            write_identifier(&mut indexdef, table_def.name.as_str());
+            let _ = indexdef.write_str(" USING btree (");
             for k in 0..info.n_cols {
                 if k > 0 {
                     let _ = indexdef.write_str(", ");
@@ -6151,8 +6159,10 @@ fn pg_indexes<'a>(
                 if let Some(expression) = index_expression_source(storage, info, k, txid) {
                     let _ = indexdef.write_str(expression.as_str());
                 } else {
-                    let _ = indexdef
-                        .write_str(table_def.columns()[info.columns[k] as usize].name.as_str());
+                    write_identifier(
+                        &mut indexdef,
+                        table_def.columns()[info.columns[k] as usize].name.as_str(),
+                    );
                 }
                 if info.descending[k] {
                     let _ = indexdef.write_str(" DESC");
@@ -6172,7 +6182,8 @@ fn pg_indexes<'a>(
                     if k > 0 {
                         let _ = indexdef.write_str(", ");
                     }
-                    let _ = indexdef.write_str(
+                    write_identifier(
+                        &mut indexdef,
                         table_def.columns()[info.include_columns[k] as usize]
                             .name
                             .as_str(),
@@ -9656,4 +9667,19 @@ fn alloc_rendered<'a, const N: usize>(
         return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", too_long));
     }
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
+}
+
+fn write_identifier(out: &mut impl core::fmt::Write, name: &str) {
+    if !ident_needs_quotes(name) {
+        let _ = out.write_str(name);
+        return;
+    }
+    let _ = out.write_char('"');
+    for character in name.chars() {
+        if character == '"' {
+            let _ = out.write_char('"');
+        }
+        let _ = out.write_char(character);
+    }
+    let _ = out.write_char('"');
 }

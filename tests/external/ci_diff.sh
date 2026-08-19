@@ -211,6 +211,8 @@ ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
 CREATE INDEX outbound_items_note_idx ON outbound_dump.items (note DESC)
   INCLUDE (mood) WHERE note IS NOT NULL;
+CREATE TABLE outbound_dump."Odd Table" ("Key Value" integer PRIMARY KEY, "select" text);
+CREATE INDEX "Odd Index" ON outbound_dump."Odd Table" ("select" DESC);
 COMMENT ON TABLE outbound_dump.items IS 'dumped table comment';
 COMMENT ON COLUMN outbound_dump.items.note IS 'dumped column comment';
 CREATE VIEW outbound_dump.item_view AS
@@ -299,6 +301,8 @@ else
        WHERE conrelid = 'outbound_dump.items'::regclass AND contype = 'c';
       SELECT indexdef LIKE '%INCLUDE (mood)%' AND indexdef LIKE '%WHERE (note IS NOT NULL)%'
         FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='outbound_items_note_idx';
+      SELECT indexdef = 'CREATE INDEX \"Odd Index\" ON outbound_dump.\"Odd Table\" USING btree (\"select\" DESC)'
+        FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='Odd Index';
       SELECT obj_description('outbound_dump.items'::regclass),
              col_description('outbound_dump.items'::regclass, 6);
       SELECT count FROM outbound_dump.item_count;
@@ -308,7 +312,7 @@ else
              has_sequence_privilege('outbound_reader', 'outbound_dump.manual_sequence', 'USAGE'),
              has_function_privilege('outbound_reader', 'outbound_dump.dump_answer()', 'EXECUTE');
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t'
+  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

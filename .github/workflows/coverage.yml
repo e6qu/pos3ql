@@ -31,36 +31,39 @@ jobs:
           # Coverage and crash-torture builds use incompatible instrumentation.
           # Keep them in distinct jobs: serializing either pair can exceed the
           # hard five-minute bound even though each workload fits on its own.
-          - { name: lib, shards: "lib" }
-          - { name: subscription, shards: "runtest:subscription" }
-          - { name: sql-wire, shards: "sql run:proto,dur" }
-          - { name: diff, shards: "run:diff" }
+          - { name: lib, shards: "lib", needs_pg18: false }
+          - { name: subscription, shards: "runtest:subscription", needs_pg18: true }
+          - { name: sql-wire, shards: "sql run:proto,dur", needs_pg18: true }
+          - { name: diff, shards: "run:diff", needs_pg18: true }
           # Forced-spill differential is a complete correctness workload, but
           # its PostgreSQL setup plus an instrumented server build cannot fit
           # in the fixed five-minute cap. Run the same workload uninstrumented;
           # the other external shards retain the coverage trace.
-          - { name: spilldiff, shards: "runtest:spilldiff" }
-          - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723 }
-          - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725 }
-          - { name: spill-overlay-ingest, shards: "runtest:overlay,ingest" }
-          - { name: tls-correctness, shards: "runtest:tls" }
+          - { name: spilldiff, shards: "runtest:spilldiff", needs_pg18: true }
+          - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723, needs_pg18: true }
+          - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725, needs_pg18: true }
+          - { name: spill-overlay-ingest, shards: "runtest:overlay,ingest", needs_pg18: false }
+          - { name: tls-correctness, shards: "runtest:tls", needs_pg18: false }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The suites are zsh scripts (`#!/bin/zsh`), which the Linux runner does
-      # not have by default; the differential workflow reaches them through a
-      # bash-compatible CI wrapper instead and so never needed it.
-      - name: Install PostgreSQL 18 (the differential oracle) and zsh
+      # Most shards need only the runner's PostgreSQL client.  Installing a
+      # complete PG18 server for TLS, overlay, ingest, or in-process tests
+      # consumed their entire five-minute job budget before a test began.
+      # Only differential, torture, and subscription need local PG18 binaries.
+      - name: Install only the tools this shard needs
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          # Runner-image Microsoft feeds are unrelated to the PostgreSQL oracle and
-          # occasionally reject apt metadata requests.
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update && sudo apt-get install -y postgresql-18 zsh
+          sudo apt-get install -y zsh postgresql-client
+          if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
+            sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+            sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
+            sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+            sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-18
+          fi
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
@@ -69,7 +72,7 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
-          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_PSQL: ${{ matrix.needs_pg18 && '/usr/lib/postgresql/18/bin/psql' || 'psql' }}
           COVERAGE_SHARDS: ${{ matrix.shards }}
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}

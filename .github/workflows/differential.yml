@@ -92,14 +92,14 @@ jobs:
 
       - name: Install PostgreSQL 18 client and Python
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc |
             sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           # Runner-image Microsoft feeds are unrelated to the PostgreSQL oracle and
           # occasionally reject apt metadata requests.
           sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-18 python3-venv
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18 python3-venv
           echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust build

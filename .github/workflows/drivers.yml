@@ -37,12 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install PostgreSQL client
+      - name: Verify runner PostgreSQL client
         run: |
-          # Runner-image Microsoft feeds are unrelated to this client install and
-          # occasionally reject apt metadata requests.
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update && sudo apt-get install -y postgresql-client
+          command -v psql
+          command -v pg_dump
+          psql --version
 
       - name: Cache Rust build
         uses: actions/cache@v5

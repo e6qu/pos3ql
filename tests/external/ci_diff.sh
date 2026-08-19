@@ -188,6 +188,7 @@ echo "=== pos3ql outbound pg_dump round trip ==="
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/outbound_setup.out" 2>&1 <<'SQL'
 CREATE SCHEMA outbound_dump;
+CREATE ROLE outbound_reader;
 CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
 CREATE TYPE outbound_dump.location AS (x integer, y integer);
 CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location;
@@ -197,7 +198,8 @@ CREATE TABLE outbound_dump.items (
   location outbound_dump.location NOT NULL,
   marked_location outbound_dump.location_domain NOT NULL,
   marked_locations outbound_dump.location_domain[] NOT NULL,
-  note text DEFAULT 'hello'
+  note text DEFAULT 'hello',
+  CONSTRAINT outbound_items_note_check CHECK (char_length(note) > 0)
 );
 INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,note) VALUES
   ('ok', ROW(1,2)::outbound_dump.location, ROW(10,20)::outbound_dump.location_domain,
@@ -207,6 +209,10 @@ INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,n
 CREATE SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
+CREATE INDEX outbound_items_note_idx ON outbound_dump.items (note DESC)
+  INCLUDE (mood) WHERE note IS NOT NULL;
+COMMENT ON TABLE outbound_dump.items IS 'dumped table comment';
+COMMENT ON COLUMN outbound_dump.items.note IS 'dumped column comment';
 CREATE VIEW outbound_dump.item_view AS
   SELECT id,mood,location,marked_location,marked_locations,note FROM outbound_dump.items;
 CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
@@ -230,14 +236,30 @@ CREATE TRIGGER writable_view_write INSTEAD OF INSERT OR UPDATE OR DELETE
   EXECUTE FUNCTION outbound_dump.write_writable_view();
 CREATE TABLE outbound_dump.view_source (id integer PRIMARY KEY, value integer NOT NULL);
 INSERT INTO outbound_dump.view_source VALUES (2, 200), (3, 300);
+CREATE TABLE outbound_dump.tags (id integer PRIMARY KEY, label text UNIQUE NOT NULL);
+INSERT INTO outbound_dump.tags VALUES (1, 'primary');
+CREATE TABLE outbound_dump.item_tags (
+  item_id integer NOT NULL REFERENCES outbound_dump.items(id) ON DELETE CASCADE,
+  tag_id integer NOT NULL REFERENCES outbound_dump.tags(id),
+  PRIMARY KEY (item_id, tag_id)
+);
+INSERT INTO outbound_dump.item_tags VALUES (1, 1);
+CREATE SEQUENCE outbound_dump.manual_sequence START WITH 41;
+SELECT nextval('outbound_dump.manual_sequence');
+CREATE MATERIALIZED VIEW outbound_dump.item_count AS SELECT count(*) AS count FROM outbound_dump.items;
+CREATE FUNCTION outbound_dump.dump_answer() RETURNS integer LANGUAGE sql AS 'SELECT 42';
+GRANT USAGE ON SCHEMA outbound_dump TO outbound_reader;
+GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
+GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
+GRANT EXECUTE ON FUNCTION outbound_dump.dump_answer() TO outbound_reader;
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  --schema=outbound_dump --schema=outbound_type_target --no-owner --no-acl \
+  --schema=outbound_dump --schema=outbound_type_target --no-owner \
   -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
 outbound_dump_status=$?
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE' \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader; CREATE ROLE outbound_reader' \
   > "$WORK/outbound_drop.out" 2>&1
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -f "$WORK/outbound.sql" \
@@ -273,8 +295,20 @@ else
       DELETE FROM outbound_dump.writable_view AS target USING outbound_dump.view_source AS source
         WHERE target.id = source.id AND source.id = 2 RETURNING target.id,target.value;
       SELECT id,value FROM outbound_dump.view_base ORDER BY id;
+      SELECT conname FROM pg_constraint
+       WHERE conrelid = 'outbound_dump.items'::regclass AND contype = 'c';
+      SELECT indexdef LIKE '%INCLUDE (mood)%' AND indexdef LIKE '%WHERE (note IS NOT NULL)%'
+        FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='outbound_items_note_idx';
+      SELECT obj_description('outbound_dump.items'::regclass),
+             col_description('outbound_dump.items'::regclass, 6);
+      SELECT count FROM outbound_dump.item_count;
+      SELECT nextval('outbound_dump.manual_sequence');
+      SELECT count(*) FROM outbound_dump.item_tags;
+      SELECT has_table_privilege('outbound_reader', 'outbound_dump.items', 'SELECT'),
+             has_sequence_privilege('outbound_reader', 'outbound_dump.manual_sequence', 'USAGE'),
+             has_function_privilege('outbound_reader', 'outbound_dump.dump_answer()', 'EXECUTE');
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300'
+  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else
@@ -287,7 +321,7 @@ fi
 # name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
 # so pg_type cardinality probes do not inherit this tooling fixture.
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE' \
+  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
   > "$WORK/outbound_cleanup.out" 2>&1 || {
     bad "clean outbound pg_dump fixture from PostgreSQL"
     tail -40 "$WORK/outbound_cleanup.out"

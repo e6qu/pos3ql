@@ -2966,8 +2966,8 @@ fn collect_fkeys<'a>(
     Ok(foreign_keys)
 }
 
-/// The `FOREIGN KEY (...) REFERENCES parent(...)` definition psql prints from
-/// `pg_get_constraintdef` for a foreign-key constraint OID.
+/// The schema-qualified foreign-key definition used by catalog clients and
+/// dump/restore.
 pub fn constraint_def_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -2995,7 +2995,12 @@ pub fn constraint_def_text<'a>(
             }
             let _ = s.write_str(child.columns()[c as usize].name.as_str());
         }
-        let _ = write!(s, ") REFERENCES {}(", fk.parent.as_str());
+        let _ = write!(
+            s,
+            ") REFERENCES {}.{}(",
+            parent.schema.as_str(),
+            parent.name.as_str(),
+        );
         for (k, &c) in fk.parent_cols[..fk.n_parent_cols].iter().enumerate() {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -3099,8 +3104,7 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
     }
 }
 
-/// The `btree (col, ...)` index definition psql extracts from `pg_get_indexdef`
-/// (it takes everything after `USING`, or the whole string when absent).
+/// The complete `CREATE INDEX` statement returned by `pg_get_indexdef`.
 pub fn index_def_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -3127,14 +3131,25 @@ pub fn index_def_text<'a>(
                 .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
-        let mut s = StackStr::<640>::new();
+        let mut s = StackStr::<896>::new();
         use core::fmt::Write as _;
-        let _ = s.write_str("btree (");
+        let _ = write!(
+            s,
+            "CREATE {}INDEX {} ON {}.{} USING btree (",
+            if info.is_unique { "UNIQUE " } else { "" },
+            info.name.as_str(),
+            def.schema.as_str(),
+            def.name.as_str(),
+        );
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
             }
-            let _ = s.write_str(col_name(k));
+            if let Some(expression) = index_expression_source(storage, info, k, txid) {
+                let _ = s.write_str(expression.as_str());
+            } else {
+                let _ = s.write_str(col_name(k));
+            }
             if info.descending[k] {
                 let _ = s.write_str(" DESC");
             }
@@ -3147,6 +3162,23 @@ pub fn index_def_text<'a>(
             }
         }
         let _ = s.write_str(")");
+        if info.n_include_cols != 0 {
+            let _ = s.write_str(" INCLUDE (");
+            for k in 0..info.n_include_cols {
+                if k > 0 {
+                    let _ = s.write_str(", ");
+                }
+                let _ = s.write_str(
+                    def.columns()[info.include_columns[k] as usize]
+                        .name
+                        .as_str(),
+                );
+            }
+            let _ = s.write_str(")");
+        }
+        if info.nulls_not_distinct {
+            let _ = s.write_str(" NULLS NOT DISTINCT");
+        }
         if let Some(predicate) = info.predicate {
             let _ = write!(s, " WHERE {}", predicate.as_str());
         }

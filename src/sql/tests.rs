@@ -6173,7 +6173,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         ["child_email_key", "child_pkey", "parent_pkey"],
         "index rels: {index:?}"
     );
-    // pg_get_indexdef reconstructs the btree column list.
+    // `pg_get_indexdef` returns directly executable DDL, as pg_dump requires.
     let pk = run_txn(
         &mut e,
         &mut b,
@@ -6181,7 +6181,10 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         "SELECT pg_get_indexdef(indexrelid, 0, true) FROM pg_index i \
          JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'parent_pkey'",
     );
-    assert!(pk.contains("btree (a, b)"), "indexdef: {pk}");
+    assert!(
+        pk.contains("CREATE UNIQUE INDEX parent_pkey ON public.parent USING btree (a, b)"),
+        "indexdef: {pk}"
+    );
     // The foreign key: constraint def + parent name via oid::regclass.
     let fk = data_rows(&run_with_txn_bytes(
         &mut e,
@@ -6192,7 +6195,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
     ));
     assert_eq!(
         fk,
-        ["parent|FOREIGN KEY (pa, pb) REFERENCES parent(a, b)"],
+        ["parent|FOREIGN KEY (pa, pb) REFERENCES public.parent(a, b)"],
         "fk: {fk:?}"
     );
     // A UNIQUE constraint is backed by an index (conindid links them).
@@ -6203,6 +6206,26 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         "SELECT conname FROM pg_constraint WHERE contype = 'u' ORDER BY conname",
     ));
     assert_eq!(uq, ["child_email_key"], "unique constraints: {uq:?}");
+}
+
+#[test]
+fn catalog_oid_inputs_reject_wide_integers_without_wrapping() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    let mut run = |sql: &str| run_txn(&mut engine, &mut budget, &mut transaction, sql);
+    run("CREATE TABLE oid_boundary (id integer PRIMARY KEY)");
+
+    for statement in [
+        "SELECT pg_get_userbyid(9223372036854775807)",
+        "SELECT pg_get_indexdef(9223372036854775807)",
+        "SELECT pg_get_constraintdef(9223372036854775807)",
+        "SELECT pg_get_viewdef(9223372036854775807)",
+        "SELECT pg_table_size(9223372036854775807)",
+        "SELECT has_table_privilege(9223372036854775807, 'SELECT')",
+    ] {
+        let result = run(statement);
+        assert!(result.contains("OID out of range"), "{statement}: {result}");
+    }
 }
 
 #[test]

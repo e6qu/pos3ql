@@ -113,14 +113,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install client tools only
-        run: sudo apt-get install -y postgresql-client python3-venv
+      - name: Expose the PostgreSQL 18 client from the service image
+        run: |
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       - name: Python venv for crash torture
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
       - name: Run crash torture against the PostgreSQL 18 service
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
-          POS3QL_PSQL: psql
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_TORTURE_ROUNDS: "6"

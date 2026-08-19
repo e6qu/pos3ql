@@ -23,18 +23,24 @@ use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sql
 #[derive(Clone, Copy)]
 struct CatalogOid(i32);
 
-impl<'a> TryFrom<Datum<'a>> for CatalogOid {
-    type Error = ();
-
-    fn try_from(value: Datum<'a>) -> Result<Self, Self::Error> {
-        let oid = match value {
-            Datum::Int4(oid) => oid,
-            Datum::Oid(oid) => i32::try_from(oid).map_err(|_| ())?,
-            Datum::Int8(oid) => i32::try_from(oid).map_err(|_| ())?,
-            Datum::RegObject { referenced_oid, .. } => referenced_oid,
-            _ => return Err(()),
-        };
-        Ok(Self(oid))
+impl CatalogOid {
+    /// Parse the SQL identity boundary once: wide SQL integers and unsigned
+    /// wire OIDs must not wrap into a different internal catalog object.
+    fn parse(value: Datum<'_>) -> Result<Option<Self>, SqlError> {
+        match value {
+            Datum::Null => Ok(None),
+            Datum::Int4(oid) => Ok(Some(Self(oid))),
+            Datum::Oid(oid) => i32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
+            Datum::Int8(oid) => i32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
+            Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid))),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -45,14 +51,10 @@ fn privilege_role_name<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     match value {
         Datum::Text(role) => Ok(Some(role)),
-        Datum::Int4(oid) => catalog.role_name(oid, arena),
-        Datum::Oid(oid) => catalog.role_name(
-            i32::try_from(oid)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "oid out of range"))?,
-            arena,
-        ),
-        Datum::Int8(oid) => catalog.role_name(oid as i32, arena),
-        Datum::RegObject { referenced_oid, .. } => catalog.role_name(referenced_oid, arena),
+        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. }) => {
+            let oid = CatalogOid::parse(value)?.expect("identity datum is non-null");
+            catalog.role_name(oid.0, arena)
+        }
         Datum::Null => Ok(None),
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -69,7 +71,10 @@ fn privilege_object_name<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     match value {
         Datum::Text(object) => Ok(Some(object)),
-        Datum::Int4(oid) => {
+        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. }) => {
+            let oid = CatalogOid::parse(value)?
+                .expect("identity datum is non-null")
+                .0;
             if function == "has_type_privilege" {
                 catalog.type_name(oid, arena)
             } else if function == "has_schema_privilege" {
@@ -78,41 +83,6 @@ fn privilege_object_name<'a>(
                 Ok(Some("pos3ql"))
             } else {
                 catalog.relname(oid, arena)
-            }
-        }
-        Datum::Oid(oid) => {
-            let oid = i32::try_from(oid)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "oid out of range"))?;
-            if function == "has_type_privilege" {
-                catalog.type_name(oid, arena)
-            } else if function == "has_schema_privilege" {
-                catalog.schema_name(oid, arena)
-            } else if function == "has_database_privilege" {
-                Ok(Some("pos3ql"))
-            } else {
-                catalog.relname(oid, arena)
-            }
-        }
-        Datum::Int8(oid) => {
-            if function == "has_type_privilege" {
-                catalog.type_name(oid as i32, arena)
-            } else if function == "has_schema_privilege" {
-                catalog.schema_name(oid as i32, arena)
-            } else if function == "has_database_privilege" {
-                Ok(Some("pos3ql"))
-            } else {
-                catalog.relname(oid as i32, arena)
-            }
-        }
-        Datum::RegObject { referenced_oid, .. } => {
-            if function == "has_type_privilege" {
-                catalog.type_name(referenced_oid, arena)
-            } else if function == "has_schema_privilege" {
-                catalog.schema_name(referenced_oid, arena)
-            } else if function == "has_database_privilege" {
-                Ok(Some("pos3ql"))
-            } else {
-                catalog.relname(referenced_oid, arena)
             }
         }
         Datum::Null => Ok(None),
@@ -534,14 +504,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(value) => value,
-                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(value) => value as i32,
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => {
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "pg_get_userbyid() requires an oid"
@@ -645,15 +610,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Null => return Ok(Datum::Null),
-                    Datum::Int8(value) if i32::try_from(value).is_err() => {
-                        return Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range"));
-                    }
-                    value => match CatalogOid::try_from(value) {
-                        Ok(oid) => oid,
-                        Err(()) => return Ok(Datum::Null),
-                    },
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid,
+                    None => return Ok(Datum::Null),
                 };
                 Ok(match name {
                     "pg_table_is_visible" => cat.relation_is_visible(oid.0),
@@ -667,20 +626,13 @@ pub(crate) fn dispatch<'a>(
                 .unwrap_or(Datum::Null))
             }
             "pg_get_indexdef" => {
-                // `pg_get_indexdef(oid)` / `(oid, 0, _)` reconstruct the whole
-                // `btree (columns)` definition; `(oid, n, _)` with n>0 returns the name
-                // of the n-th (1-based) indexed column (used by JDBC getIndexInfo).
+                // `(oid, n, _)` with n>0 returns the n-th indexed column.
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(v) => v,
-                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(v) => v as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 let col = if args.len() >= 2 {
                     match eval_full(args[1], arena, params, row, hooks)? {
@@ -702,14 +654,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(v) => v,
-                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(v) => v as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 Ok(cat
                     .constraint_def(oid, arena)?
@@ -721,17 +668,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(value) => value,
-                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 match cat.function_def(oid, arena)? {
                     Some(definition) => Ok(Datum::Text(definition)),
@@ -748,17 +687,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(value) => value,
-                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 let value = if name == "pg_get_function_result" {
                     cat.function_result(oid, arena)?
@@ -785,14 +716,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(v) => v,
-                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(v) => v as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 let catalog_name = if args.len() >= 2 {
                     match eval_full(args[1], arena, params, row, hooks)? {
@@ -813,14 +739,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(v) => v,
-                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(v) => v as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 let col = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
@@ -855,15 +776,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(oid) => oid,
-                    Datum::Oid(oid) => i32::try_from(oid).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(oid) => oid as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 Ok(cat
                     .view_def(oid, arena)?
@@ -875,15 +790,9 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(oid) => oid,
-                    Datum::Oid(oid) => i32::try_from(oid).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(oid) => oid as i32,
-                    Datum::RegObject { referenced_oid, .. } => referenced_oid,
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => return Ok(Datum::Null),
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
                 };
                 Ok(cat
                     .relation_size(oid)?
@@ -931,13 +840,11 @@ pub(crate) fn dispatch<'a>(
                 // format_type(typoid, typmod): map the common base-type oids back to
                 // their SQL spelling; unknown oids render as "???".
                 let o = match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(v) => v,
-                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
-                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
-                    })?,
-                    Datum::Int8(v) => v as i32,
                     Datum::Null => return Ok(Datum::Null),
-                    _ => -1,
+                    value => match CatalogOid::parse(value)? {
+                        Some(oid) => oid.0,
+                        None => -1,
+                    },
                 };
                 let type_mod = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,

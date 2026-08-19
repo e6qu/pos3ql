@@ -1142,6 +1142,53 @@ def has_sqlstate(messages, state):
     return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
 
 
+def test_catalog_definition_oid_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_catalog_definition (id integer PRIMARY KEY, value text); "
+        "CREATE INDEX wire_catalog_definition_value_idx ON wire_catalog_definition (value DESC)",
+    )
+    check("raw wire: catalog definition setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    index_oid = int(
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT c.oid FROM pg_class c WHERE c.relname = 'wire_catalog_definition_value_idx'",
+            )
+        )
+    )
+
+    def query_oid(oid):
+        parse = frontend_message(
+            b"P", b"\x00SELECT pg_get_indexdef($1)\x00" + struct.pack("!hi", 1, 26)
+        )
+        bind = frontend_message(
+            b"B",
+            b"\x00\x00" + struct.pack("!hhh", 1, 1, 1) + struct.pack("!i", 4) + struct.pack("!I", oid) + struct.pack("!h", 0),
+        )
+        s.sendall(parse + bind + frontend_message(b"E", b"\x00\x00\x00\x00\x00") + frontend_message(b"S"))
+        out = []
+        while True:
+            item = read_message(s)
+            out.append(item)
+            if item[0] == b"Z":
+                return out
+
+    definition = query_oid(index_oid)
+    check(
+        "raw wire: binary oid reaches executable pg_get_indexdef",
+        first_text_row(definition)
+        == "CREATE INDEX wire_catalog_definition_value_idx ON public.wire_catalog_definition USING btree (value DESC)",
+        definition,
+    )
+    overflow = query_oid(0xFFFFFFFF)
+    check("raw wire: unsigned OID overflow is loud", has_sqlstate(overflow, "22003"), overflow)
+    s.close()
+
+
 def test_row_trigger_body_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

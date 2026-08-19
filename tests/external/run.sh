@@ -726,7 +726,7 @@ fi # tls
 if want diff; then
 
 step "differential vs real PostgreSQL 18 (when installed)"
-if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
+if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
   if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then
     ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
   else
@@ -748,7 +748,7 @@ step "forced-spill differential: the whole suite with a 256KiB memtable over the
 # continuously spill, checkpoint (paced merges included), and read rows back
 # through the cache tiers — while the reference PostgreSQL sees plain SQL.
 # Pure-SQL semantics must be indistinguishable from the in-memory run.
-if [[ -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
+if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
   if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
 object_store_namespace = pos3ql-external
 wal_upload = on

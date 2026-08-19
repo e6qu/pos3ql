@@ -11,10 +11,10 @@ with psycopg and checks three things against real PostgreSQL:
   3. pos3ql's own binary dump loads back into PostgreSQL to the same rows.
 
 Every supported scalar type (including catalog-stable identities) is checked
-byte-for-byte. Composite-domain arrays have per-cluster element OIDs, as they
-do in PostgreSQL, so their record bodies are compared after catalog-identity
-mapping and then loaded in both directions. Exit 0 on full agreement, 1 on
-any diff.
+byte-for-byte. User-defined array elements have per-cluster OIDs, as they do
+in PostgreSQL, so direct composite/enum arrays and domains over each are
+compared after catalog-identity mapping and then loaded in both directions.
+Exit 0 on full agreement, 1 on any diff.
 
   copy_binary_diff.py --pg PORT --p3 PORT [--host HOST]
 """
@@ -32,6 +32,7 @@ DROP TABLE IF EXISTS cb;
 DROP TABLE IF EXISTS cb_references;
 DROP TABLE IF EXISTS cb_reference_relation;
 DROP FUNCTION IF EXISTS cb_reference_routine(integer);
+DROP DOMAIN IF EXISTS cb_mood_value;
 DROP DOMAIN IF EXISTS cb_point_value;
 DROP TYPE IF EXISTS cb_point;
 DROP TYPE IF EXISTS cb_mood;
@@ -85,12 +86,17 @@ INSERT = """INSERT INTO cb VALUES
    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
 COMPOSITE_DDL = """DROP TABLE IF EXISTS cb_composite;
-CREATE TABLE cb_composite (points cb_point_value[])"""
+CREATE DOMAIN cb_mood_value AS cb_mood;
+CREATE TABLE cb_composite (
+  points cb_point[], marked_points cb_point_value[],
+  moods cb_mood[], marked_moods cb_mood_value[])"""
 
 COMPOSITE_INSERT = """INSERT INTO cb_composite VALUES
-  (ARRAY[ROW(3,4)::cb_point]::cb_point_value[]),
-  (ARRAY[ROW(-1,8)::cb_point]::cb_point_value[]),
-  (NULL)"""
+  (ARRAY[ROW(3,4)::cb_point], ARRAY[ROW(3,4)::cb_point]::cb_point_value[],
+   ARRAY['sad'::cb_mood,'ok'::cb_mood], ARRAY['sad'::cb_mood]::cb_mood_value[]),
+  (ARRAY[ROW(-1,8)::cb_point], ARRAY[ROW(-1,8)::cb_point]::cb_point_value[],
+   ARRAY['happy'::cb_mood], ARRAY['happy'::cb_mood]::cb_mood_value[]),
+  (NULL, NULL, NULL, NULL)"""
 
 BUILTIN_ARRAY_DDL = """CREATE TABLE cb_builtin_arrays (
   int4_values int4range[], int8_values int8range[], numeric_values numrange[],
@@ -162,16 +168,22 @@ def rows(conn, table="cb"):
     if table == "cb":
         cur.execute("SELECT * FROM cb ORDER BY i4 NULLS LAST")
     elif table == "cb_composite":
-        cur.execute("SELECT points::text FROM cb_composite ORDER BY points::text NULLS LAST")
+        cur.execute(
+            "SELECT points::text, marked_points::text, moods::text, marked_moods::text "
+            "FROM cb_composite ORDER BY points::text NULLS LAST"
+        )
     else:
         raise ValueError("unknown COPY differential fixture: %s" % table)
     return cur.fetchall()
 
 
-def composite_domain_oid(conn):
-    return conn.execute(
-        "SELECT oid FROM pg_type WHERE typname = 'cb_point_value'"
-    ).fetchone()[0]
+def user_array_element_oids(conn):
+    names = ("cb_point", "cb_point_value", "cb_mood", "cb_mood_value")
+    rows = conn.execute(
+        "SELECT typname, oid FROM pg_type WHERE typname = ANY(%s)", (list(names),)
+    ).fetchall()
+    by_name = {name: oid for name, oid in rows}
+    return tuple(by_name[name] for name in names)
 
 
 def reference_oids(conn):
@@ -181,8 +193,8 @@ def reference_oids(conn):
     )
 
 
-def remap_composite_array_domain_oid(data, source_oid, target_oid):
-    """Map every non-NULL array header in this fixed one-column fixture."""
+def remap_user_array_element_oids(data, source_oids, target_oids):
+    """Map the user-defined array headers in the fixed composite fixture."""
     out = bytearray(data)
     if out[:19] != b"PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00":
         raise AssertionError("invalid COPY binary signature")
@@ -192,19 +204,23 @@ def remap_composite_array_domain_oid(data, source_oid, target_oid):
         offset += 2
         if field_count == -1:
             break
-        if field_count != 1:
-            raise AssertionError("expected one composite-array column")
-        field_length = int.from_bytes(out[offset:offset + 4], "big", signed=True)
-        offset += 4
-        if field_length == -1:
-            continue
-        if field_length < 12:
-            raise AssertionError("invalid composite-domain array field")
-        array_at = offset
-        if int.from_bytes(out[array_at + 8:array_at + 12], "big", signed=True) != source_oid:
-            raise AssertionError("unexpected composite-domain array element OID")
-        out[array_at + 8:array_at + 12] = target_oid.to_bytes(4, "big", signed=True)
-        offset += field_length
+        if field_count != 4:
+            raise AssertionError("expected four user-type array columns")
+        for _ in range(field_count):
+            field_length = int.from_bytes(out[offset:offset + 4], "big", signed=True)
+            offset += 4
+            if field_length == -1:
+                continue
+            if field_length < 12:
+                raise AssertionError("invalid user-type array field")
+            array_at = offset
+            source_oid = int.from_bytes(out[array_at + 8:array_at + 12], "big", signed=True)
+            try:
+                target_oid = target_oids[source_oids.index(source_oid)]
+            except ValueError as error:
+                raise AssertionError("unexpected user-type array element OID") from error
+            out[array_at + 8:array_at + 12] = target_oid.to_bytes(4, "big", signed=True)
+            offset += field_length
     return bytes(out)
 
 
@@ -312,35 +328,35 @@ def main():
         print("DIVERGENCE: pos3ql binary dump does not round-trip through PostgreSQL")
 
     # User-defined type OIDs are allocated independently per PostgreSQL
-    # cluster. Their array header is catalog identity, not portable value data.
+    # cluster. Their array headers are catalog identity, not portable value data.
     for c in (pg, p3):
         c.cursor().execute(COMPOSITE_DDL)
         c.cursor().execute(COMPOSITE_INSERT)
-    pg_composite_oid, p3_composite_oid = composite_domain_oid(pg), composite_domain_oid(p3)
+    pg_composite_oids, p3_composite_oids = user_array_element_oids(pg), user_array_element_oids(p3)
     pg_composite_dump = dump(pg, "cb_composite")
     p3_composite_dump = dump(p3, "cb_composite")
-    pg_body = remap_composite_array_domain_oid(pg_composite_dump, pg_composite_oid, 0)
-    p3_body = remap_composite_array_domain_oid(p3_composite_dump, p3_composite_oid, 0)
+    pg_body = remap_user_array_element_oids(pg_composite_dump, pg_composite_oids, (0, 0, 0, 0))
+    p3_body = remap_user_array_element_oids(p3_composite_dump, p3_composite_oids, (0, 0, 0, 0))
     if pg_body == p3_body:
-        print("ok: composite-domain array COPY bodies match after catalog OID mapping")
+        print("ok: user-type array COPY bodies match after catalog OID mapping")
     else:
         fails += 1
-        print("DIVERGENCE: composite-domain array COPY bodies differ")
+        print("DIVERGENCE: user-type array COPY bodies differ")
 
     # A client transferring a user-defined binary value maps its catalog OID.
-    # This checks that the remaining element is a composite record in both
-    # directions rather than a text-shaped stand-in.
+    # This checks that direct and domain identities retain their composite
+    # records or enum labels rather than becoming text-shaped stand-ins.
     for c, data, source_oid, target_oid in (
-        (p3, pg_composite_dump, pg_composite_oid, p3_composite_oid),
-        (pg, p3_composite_dump, p3_composite_oid, pg_composite_oid),
+        (p3, pg_composite_dump, pg_composite_oids, p3_composite_oids),
+        (pg, p3_composite_dump, p3_composite_oids, pg_composite_oids),
     ):
         c.cursor().execute("DELETE FROM cb_composite")
-        load(c, remap_composite_array_domain_oid(data, source_oid, target_oid), "cb_composite")
+        load(c, remap_user_array_element_oids(data, source_oid, target_oid), "cb_composite")
     if rows(pg, "cb_composite") == rows(p3, "cb_composite"):
-        print("ok: catalog-mapped composite-domain array COPY loads in both directions")
+        print("ok: catalog-mapped user-type arrays load in both directions")
     else:
         fails += 1
-        print("DIVERGENCE: catalog-mapped composite-domain array rows differ")
+        print("DIVERGENCE: catalog-mapped user-type array rows differ")
 
     # These built-in array OIDs are portable, so their dumps must agree
     # byte-for-byte and cross-load unchanged.

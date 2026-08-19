@@ -34,11 +34,6 @@ jobs:
           - { name: lib, shards: "lib", needs_pg18: false }
           - { name: subscription, shards: "runtest:subscription", needs_pg18: true }
           - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
-          # Forced-spill differential is a complete correctness workload, but
-          # its PostgreSQL setup plus an instrumented server build cannot fit
-          # in the fixed five-minute cap. Run the same workload uninstrumented;
-          # the other external shards retain the coverage trace.
-          - { name: spilldiff, shards: "runtest:spilldiff", needs_pg18: true }
           - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723, needs_pg18: true }
           - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725, needs_pg18: true }
           - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
@@ -94,6 +89,41 @@ jobs:
           # The runtest:* (torture) shards write no tracefile by design; let
           # their upload find nothing rather than error.
           if-no-files-found: ignore
+
+  spill-differential:
+    name: shard spilldiff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install client tools
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-client-18
+      - name: Run forced-spill differential
+        env:
+          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          COVERAGE_SHARD: runtest:spilldiff
+        run: sh tools/coverage.sh
 
   # The plain SQL differential workload needs PostgreSQL 18 as an oracle but
   # not a host-installed server. A disposable service keeps the job's setup

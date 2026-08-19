@@ -157,9 +157,17 @@ ok "server up (pid $SERVER_PID)"
 
 psql_run() { # <name>
   local name=$1
+  # psql writes echoed SQL and result rows to stdout but errors to stderr.
+  # Their ordering after `2>&1` is scheduler-dependent, so compare each
+  # stream against the corresponding portion of the established golden file.
+  local expected_out="$WORK/$name.expected.out" expected_err="$WORK/$name.expected.err"
+  awk -v out="$expected_out" -v err="$expected_err" \
+    '/^psql:/ { print > err; next } { print > out }' \
+    "$EXT/expected/$name.out"
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -a -q -P pager=off \
-    -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2>&1
-  if diff -u "$EXT/expected/$name.out" "$WORK/$name.out" > "$WORK/$name.diff"; then
+    -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2> "$WORK/$name.err"
+  if diff -u "$expected_out" "$WORK/$name.out" > "$WORK/$name.diff" \
+    && diff -u "$expected_err" "$WORK/$name.err" >> "$WORK/$name.diff"; then
     ok "psql golden: $name"
   else
     bad "psql golden: $name (see $WORK/$name.diff)"

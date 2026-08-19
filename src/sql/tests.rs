@@ -5083,6 +5083,20 @@ fn client_min_messages_filters_by_severity() {
 }
 
 #[test]
+fn rollback_without_transaction_emits_postgresql_warning() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget, "ROLLBACK");
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(message_types(&output), [b'N', b'C'], "{text}");
+    assert!(
+        text.contains("WARNING")
+            && text.contains("25P01")
+            && text.contains("there is no transaction in progress"),
+        "{text}"
+    );
+}
+
+#[test]
 fn session_gucs_honored_or_rejected_faithfully() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();

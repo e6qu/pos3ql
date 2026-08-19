@@ -5725,6 +5725,7 @@ fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_set
         &mut engine,
         &mut budget,
         "CREATE TYPE array_subquery_pair AS (x integer, y text); \
+         CREATE DOMAIN array_subquery_pair_value AS array_subquery_pair; \
          CREATE TABLE array_subquery_pairs (value array_subquery_pair); \
          INSERT INTO array_subquery_pairs VALUES (ROW(1, 'one')::array_subquery_pair)",
     );
@@ -5797,6 +5798,55 @@ fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_set
             &mut engine,
             &mut budget,
             "SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    let constructed_element = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]::text",
+    );
+    assert_eq!(
+        data_rows(&constructed_element),
+        ["(7,8)"],
+        "{}",
+        String::from_utf8_lossy(&constructed_element)
+    );
+    let constructed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]).x",
+    );
+    assert_eq!(
+        data_rows(&constructed),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&constructed)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    let constructed_domain = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY[ROW(9,10)::array_subquery_pair_value]::array_subquery_pair_value[])[1]).x",
+    );
+    assert_eq!(
+        data_rows(&constructed_domain),
+        ["9"],
+        "{}",
+        String::from_utf8_lossy(&constructed_domain)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY[ROW(9,10)::array_subquery_pair_value]::array_subquery_pair_value[])[1]).x",
         )),
         [crate::sql::types::oid::INT4]
     );
@@ -17739,13 +17789,19 @@ fn domains_enforce_and_report() {
         data_rows(&run_with(&mut e, &mut b, "SELECT xs FROM nested")),
         ["{3,4}"]
     );
+    let altered = run_with(
+        &mut e,
+        &mut b,
+        "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)",
+    );
     assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut e,
-            &mut b,
-            "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)"
-        ))
-        .contains("2BP01")
+        String::from_utf8_lossy(&altered).contains("ALTER DOMAIN"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,9]::smallpos[]"))
+            .contains("23514")
     );
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,10]::smallpos[]"))

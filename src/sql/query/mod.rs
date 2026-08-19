@@ -2965,7 +2965,11 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             txid,
         };
         let check = |e: &Expr| -> Result<(), SqlError> {
-            super::exec::infer_type_res(e, &columns).map(|_| ())
+            if user_type_expression_description(e, "", storage, txid).is_some() {
+                Ok(())
+            } else {
+                super::exec::infer_type_res(e, &columns).map(|_| ())
+            }
         };
         let analyze = || -> Result<(), SqlError> {
             // SELECT-list items first: PostgreSQL analyzes types before it folds
@@ -4887,7 +4891,39 @@ pub fn describe_catalog_items_as<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    let count = describe_items(items, definition, alias, Some(storage), txid, out)?;
+    // User-defined casts carry identity and, for named composites, field
+    // shape through the catalog. Resolve them before the catalog-free
+    // descriptor pass: static inference deliberately cannot reconstruct that
+    // information from an expression such as `(composite_array[1]).field`.
+    let mut count = 0;
+    for item in items {
+        if let SelectItem::Expr { expression, alias } = item
+            && let Some(description) = user_type_expression_description(
+                expression,
+                alias.unwrap_or(super::exec::derived_name(expression)),
+                storage,
+                txid,
+            )
+        {
+            if count == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "select list too wide"
+                ));
+            }
+            out[count] = description;
+            count += 1;
+            continue;
+        }
+        count += describe_items(
+            core::slice::from_ref(item),
+            definition,
+            alias,
+            Some(storage),
+            txid,
+            &mut out[count..],
+        )?;
+    }
     let mut column = 0;
     for item in items {
         match item {
@@ -5415,24 +5451,23 @@ fn user_type_expression_description<'q>(
             return matches!(ctype, super::types::ColType::Array(_)).then_some(array);
         }
         Expr::Field { base, field } => {
-            let base = user_type_expression_description(base, name, storage, txid)?;
-            let (super::types::ColType::Composite(slot), _) =
-                super::exec::catalog_column_type(storage, txid, base.type_oid)?
-            else {
-                return None;
-            };
-            let composite = storage.composite_for(slot as usize, txid);
-            let field = composite
-                .active_fields()
-                .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
-            return Some(
-                ColDesc::new(
-                    name,
-                    catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
-                    field.ctype.typlen(),
-                )
-                .with_type_mod(field.type_mod),
-            );
+            if let Some(base) = user_type_expression_description(base, name, storage, txid)
+                && let Some((super::types::ColType::Composite(slot), _)) =
+                    super::exec::catalog_column_type(storage, txid, base.type_oid)
+                && let Some(field) = storage
+                    .composite_for(slot as usize, txid)
+                    .active_fields()
+                    .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
+            {
+                return Some(
+                    ColDesc::new(
+                        name,
+                        catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
+                        field.ctype.typlen(),
+                    )
+                    .with_type_mod(field.type_mod),
+                );
+            }
         }
         _ => {}
     }
@@ -5504,6 +5539,11 @@ fn catalog_array_element_description<'q>(
         super::types::ColType::Array(super::types::ArrElem::Enum(slot)) => {
             Some(ColDesc::new(name, super::types::oid::enum_oid(slot), 4))
         }
+        super::types::ColType::Array(super::types::ArrElem::Composite(slot)) => Some(ColDesc::new(
+            name,
+            super::types::oid::composite_oid(slot),
+            -1,
+        )),
         super::types::ColType::Array(super::types::ArrElem::Domain { slot, .. }) => {
             let domain = storage.domain(slot as usize);
             Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))

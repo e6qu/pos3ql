@@ -5483,10 +5483,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             if index > 0 {
                 let _ = core::fmt::Write::write_str(&mut argument_types, " ");
             }
-            let _ = core::fmt::Write::write_fmt(
-                &mut argument_types,
-                format_args!("{}", argument.ctype.oid()),
-            );
+            let argument_oid = storage
+                .routine_type_oid(argument.ctype, argument.user_type, txid)
+                .expect("visible routine types are rebound");
+            let _ =
+                core::fmt::Write::write_fmt(&mut argument_types, format_args!("{argument_oid}"));
         }
         rows[count] = row(
             &[
@@ -5496,10 +5497,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(
-                    routine
-                        .kind
-                        .function_result()
-                        .map(ColType::oid)
+                    storage
+                        .routine_function_result_oid(&routine, txid)
                         .unwrap_or(2278),
                 ),
                 Datum::Bool(routine.kind.is_set_returning()),

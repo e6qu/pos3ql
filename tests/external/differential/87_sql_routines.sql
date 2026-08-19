@@ -41,9 +41,9 @@ SELECT pg_get_function_arguments('routine_contract_count_echo(routine_contract_c
 DROP FUNCTION routine_contract_state_echo(routine_contract_state);
 DROP FUNCTION routine_contract_count_echo(routine_contract_count);
 DROP FUNCTION routine_contract_pair_echo(routine_contract_pair);
-DROP FUNCTION routine_contract_state_array_echo(routine_contract_state []);
-DROP FUNCTION routine_contract_count_array_echo(routine_contract_count []);
-DROP FUNCTION routine_contract_pair_array_echo(routine_contract_pair []);
+DROP FUNCTION routine_contract_state_array_echo;
+DROP FUNCTION routine_contract_count_array_echo;
+DROP FUNCTION routine_contract_pair_array_echo;
 DROP FUNCTION routine_contract_overload(integer);
 DROP FUNCTION routine_contract_overload(routine_contract_count);
 DROP TYPE routine_contract_pair;

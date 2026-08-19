@@ -14525,7 +14525,7 @@ impl Storage {
         self.routine_type_oid(argument.ctype, argument.user_type, txid)
     }
 
-    fn routine_type_oid(
+    pub(crate) fn routine_type_oid(
         &self,
         ctype: ColType,
         user_type: Option<UserTypeName>,

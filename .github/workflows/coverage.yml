@@ -42,23 +42,11 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Most shards need only the runner's PostgreSQL client. PostgreSQL 18's
-      # wire client is installed without the server for protocol coverage;
-      # only torture and subscription need local server binaries.
-      - name: Install only the tools this shard needs
+      - name: Expose the PostgreSQL 18 client from its image
         run: |
-          if [ "${{ matrix.needs_pg18 || matrix.needs_pg18_client }}" = "true" ]; then
-            sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-            sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-            if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
-              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y --no-install-recommends postgresql-18
-            else
-              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
-            fi
-          else
-            sudo apt-get install -y postgresql-client
-          fi
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
@@ -67,7 +55,7 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
-          POS3QL_PSQL: ${{ matrix.needs_pg18 && '/usr/lib/postgresql/18/bin/psql' || 'psql' }}
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           COVERAGE_SHARDS: ${{ matrix.shards }}
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
@@ -176,21 +164,20 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
-      - name: Install client tools
+      - name: Expose the PostgreSQL 18 client from the service image
         run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       - name: Python venv for differential oracles
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
       - name: Run forced-spill differential
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
-          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
-          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_REFERENCE_PSQL: ${{ github.workspace }}/.ci-bin/psql
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 
@@ -221,19 +208,18 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install PostgreSQL 18 client
+      - name: Expose the PostgreSQL 18 client from the service image
         run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       - name: Python venv for the differential harnesses
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
       - name: Measure
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
-          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
-          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
+          POS3QL_REFERENCE_PSQL: ${{ github.workspace }}/.ci-bin/psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
           COVERAGE_SHARDS: "run:diff"

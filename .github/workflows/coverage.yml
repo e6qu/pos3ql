@@ -42,6 +42,12 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Expose PostgreSQL 18 psql for protocol coverage
+        if: matrix.needs_pg18_client
+        run: |
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
@@ -50,7 +56,7 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
-          POS3QL_PSQL: psql
+          POS3QL_PSQL: ${{ matrix.needs_pg18_client && format('{0}/.ci-bin/psql', github.workspace) || 'psql' }}
           COVERAGE_SHARDS: ${{ matrix.shards }}
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}

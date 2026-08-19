@@ -13599,6 +13599,9 @@ impl Storage {
                 comment.name = new_name;
             }
         }
+        self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
+            matches!(ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
+        });
         self.rename_stored_query_dependency(DependencyClass::Enum, slot, new_schema, new_name);
     }
 
@@ -13926,7 +13929,84 @@ impl Storage {
                 comment.name = new_name;
             }
         }
+        self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
+            matches!(ctype, ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate)) if candidate as usize == slot)
+        });
         self.rename_stored_query_dependency(DependencyClass::Composite, slot, new_schema, new_name);
+    }
+
+    fn move_routine_type_references(
+        &mut self,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+        uses: impl Fn(ColType) -> bool,
+    ) {
+        let move_argument = |argument: &mut RoutineArgumentDef| {
+            if uses(argument.ctype)
+                && argument.user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+            {
+                argument.user_type = Some(UserTypeName {
+                    schema: new_schema,
+                    name: new_name,
+                });
+            }
+        };
+        let move_result = |result: &mut RoutineResult| {
+            if uses(result.ctype)
+                && result.user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+            {
+                result.user_type = Some(UserTypeName {
+                    schema: new_schema,
+                    name: new_name,
+                });
+            }
+        };
+        for routine in self.routines.iter_mut() {
+            for argument in routine.arguments.iter_mut().take(routine.argument_count) {
+                move_argument(argument);
+            }
+            for column in routine
+                .result_columns
+                .iter_mut()
+                .take(routine.result_column_count)
+            {
+                move_argument(column);
+            }
+            match &mut routine.kind {
+                RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
+                    move_result(result)
+                }
+                _ => {}
+            }
+            if let Some(pending) = &mut routine.pending_definition {
+                for argument in pending.arguments.iter_mut().take(pending.argument_count) {
+                    move_argument(argument);
+                }
+                for column in pending
+                    .result_columns
+                    .iter_mut()
+                    .take(pending.result_column_count)
+                {
+                    move_argument(column);
+                }
+                match &mut pending.kind {
+                    RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
+                        move_result(result)
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn rollback_composite_alter(

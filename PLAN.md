@@ -42,6 +42,7 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 - A collation is either absent or a resolved identity; it cannot be accepted and discarded. Columns, derived relations, CTEs, set operations, indexes, WAL, checkpoints, catalogs, and comparison compatibility retain that identity.
 - Persisted default tags and bounded payloads are parsed as typed states; malformed lengths and type codes are rejected rather than reinterpreted.
 - Binary arrays and records resolve catalog domain identities before accepting NULLs, so a domain `NOT NULL` or CHECK cannot be bypassed inside a Bind value or binary COPY field.
+- Accepted built-in array OIDs resolve through one inventory for binary input, catalog projection, and Result descriptions; a newly modeled array cannot disappear at one boundary.
 - A sequence's staged parameters and value state are visible only to the owning transaction; rollback restores the exact savepoint image and WAL publishes only the final committed image.
 - Every engine error and dynamic trigger code carries a validated five-character SQLSTATE value; arbitrary text cannot reach a handler, stacked diagnostic, or wire response.
 - A publisher transaction has matching typed `BEGIN`/`COMMIT` positions; its local row changes and subscription frontier become durable together before a status acknowledgement can leave the worker.

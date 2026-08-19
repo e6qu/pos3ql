@@ -6,6 +6,19 @@
 
 use super::*;
 
+#[test]
+fn result_description_decodes_the_complete_builtin_array_inventory() {
+    for element in crate::sql::types::ArrElem::BUILTIN {
+        assert_eq!(
+            super::exec::coltype_of_oid(element.array_oid()),
+            Some(crate::sql::types::ColType::Array(element)),
+            "array OID {} ({}) must survive result description",
+            element.array_oid(),
+            element.array_name(),
+        );
+    }
+}
+
 fn test_config(name: &str) -> Config {
     let dir = std::env::temp_dir().join(format!("pos3ql-engine-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&dir);

@@ -456,8 +456,8 @@ impl ColType {
                 (type_oid - oid::FIRST_COMPOSITE_ARRAY) as u16,
             )));
         }
-        // Bit-string arrays have no array-element type here, so they (and any
-        // other unmodeled OID) fall through unsupported.
+        // Domain-array OIDs are catalog-owned and require their direct domain
+        // identity, so catalog-aware paths resolve them separately.
         None
     }
 

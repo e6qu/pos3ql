@@ -2356,14 +2356,6 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     {
         let mut budget = Budget::new(1 << 25);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
-        assert_eq!(
-            data_rows(&run_with(
-                &mut engine,
-                &mut budget,
-                "SELECT 4294967295::oid, (4294967295::oid)::text, 4294967295::oid = 4294967295::oid",
-            )),
-            ["4294967295|4294967295|t"],
-        );
         run_with(
             &mut engine,
             &mut budget,
@@ -2435,6 +2427,27 @@ fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
             !String::from_utf8_lossy(&inserted).contains("ERROR"),
             "{}",
             String::from_utf8_lossy(&inserted)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT 4294967295::oid, (4294967295::oid)::text, 4294967295::oid = 4294967295::oid",
+            )),
+            ["4294967295|4294967295|t"],
+        );
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE VIEW durable_oid_view AS SELECT values FROM durable_oid_arrays",
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT pg_get_viewdef(oid) IS NOT NULL FROM pg_class WHERE relname = 'durable_oid_view'",
+            )),
+            ["t"],
         );
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         let described = row_description_type_oids(&run_with(

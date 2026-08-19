@@ -536,6 +536,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(value) => value,
+                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(value) => value as i32,
                     Datum::Null => return Ok(Datum::Null),
                     _ => {
@@ -672,6 +675,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
+                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(v) => v as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
@@ -698,6 +704,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
+                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(v) => v as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
@@ -714,6 +723,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(value) => value,
+                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(value) => i32::try_from(value).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
                     })?,
@@ -738,6 +750,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(value) => value,
+                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(value) => i32::try_from(value).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
                     })?,
@@ -772,6 +787,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
+                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(v) => v as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
@@ -797,6 +815,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
+                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(v) => v as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     _ => return Ok(Datum::Null),
@@ -836,6 +857,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
+                    Datum::Oid(oid) => i32::try_from(oid).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(oid) => oid as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
@@ -853,6 +877,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(oid) => oid,
+                    Datum::Oid(oid) => i32::try_from(oid).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(oid) => oid as i32,
                     Datum::RegObject { referenced_oid, .. } => referenced_oid,
                     Datum::Null => return Ok(Datum::Null),
@@ -887,7 +914,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Int4(_) | Datum::Int8(_) | Datum::Text(_) => {
+                    Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::Text(_) => {
                         Ok(Datum::Int8(cat.database_size()?))
                     }
                     Datum::Null => Ok(Datum::Null),
@@ -905,6 +932,9 @@ pub(crate) fn dispatch<'a>(
                 // their SQL spelling; unknown oids render as "???".
                 let o = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Int4(v) => v,
+                    Datum::Oid(v) => i32::try_from(v).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?,
                     Datum::Int8(v) => v as i32,
                     Datum::Null => return Ok(Datum::Null),
                     _ => -1,

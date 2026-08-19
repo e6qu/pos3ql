@@ -15503,17 +15503,15 @@ pub fn alter_domain(
     sql_ok()
 }
 
-/// Re-validates every stored scalar value whose declared domain is `target` or
-/// a descendant of it. PostgreSQL refuses to ALTER a domain while an array of
-/// that domain exists; scalar columns are scanned before the catalog change is
-/// made visible.
+/// Re-validates every stored value whose declared domain is `target` or a
+/// descendant of it. Array domains validate each element, not the array
+/// container: a NULL array has no element value to validate.
 fn validate_domain_rows(
     storage: &Storage,
     target: usize,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let target_name = storage.domain(target).name;
     for (table_index, table) in storage.live_tables() {
         let def = table.def;
         let mut affected = [false; MAX_COLUMNS];
@@ -15529,18 +15527,6 @@ fn validate_domain_rows(
             };
             if !domain_depends_on(storage, domain_slot, target, txid) {
                 continue;
-            }
-            if matches!(
-                column.ctype,
-                ColType::Array(crate::sql::types::ArrElem::Domain { .. })
-            ) {
-                return Err(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot alter type \"{}\" because column \"{}.{}\" uses it",
-                    target_name.as_str(),
-                    def.name.as_str(),
-                    column.name.as_str()
-                ));
             }
             affected[column_index] = true;
             any = true;
@@ -15568,17 +15554,66 @@ fn validate_domain_rows(
                 let leaf = storage
                     .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                     .expect("affected domain remains visible");
-                let _ = coerce_domain_value(
+                validate_stored_domain_value(
                     storage,
                     leaf,
+                    def.columns()[column_index].ctype,
                     values[column_index],
                     txid,
                     arena,
-                    crate::sql::eval::NO_PARAMS,
                 )?;
             }
             Ok(ControlFlow::Continue(()))
         })?;
+    }
+    Ok(())
+}
+
+/// Validates a scalar domain value or every element of a domain-array value
+/// through the same catalog coercion boundary used by writes and Bind.
+fn validate_stored_domain_value(
+    storage: &Storage,
+    leaf: usize,
+    ctype: ColType,
+    value: Datum,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let validate = |value| {
+        coerce_domain_value(
+            storage,
+            leaf,
+            value,
+            txid,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+        )
+        .map(|_| ())
+    };
+    let ColType::Array(element @ crate::sql::types::ArrElem::Domain { .. }) = ctype else {
+        return validate(value);
+    };
+    let Datum::Array { raw, .. } = value else {
+        return matches!(value, Datum::Null).then_some(()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored domain array has invalid representation"
+            )
+        });
+    };
+    let shape = crate::sql::array::shape(raw).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored domain array has invalid shape"
+        )
+    })?;
+    for index in 0..shape.element_count() {
+        validate(crate::sql::array::get(raw, element, index).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored domain array has invalid element"
+            )
+        })?)?;
     }
     Ok(())
 }

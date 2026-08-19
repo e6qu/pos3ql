@@ -17840,6 +17840,57 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
 }
 
 #[test]
+fn alter_domain_revalidates_scalar_and_array_elements() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE checked_point AS (x integer, y integer); \
+         CREATE DOMAIN checked_point_value AS checked_point CHECK ((VALUE).x > 0); \
+         CREATE DOMAIN checked_point_child AS checked_point_value; \
+         CREATE TABLE checked_points (point checked_point_child, points checked_point_child[]); \
+         INSERT INTO checked_points VALUES \
+           (ROW(1, 1)::checked_point, \
+            ARRAY[ROW(2, 2)::checked_point, ROW(5, 5)::checked_point]::checked_point_child[]), \
+           (ROW(3, 3)::checked_point, NULL)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let tightened = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).y > 0)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tightened).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tightened)
+    );
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).x < 5)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let post_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO checked_points VALUES (ROW(8, 1)::checked_point, NULL); \
+         SELECT (point).x FROM checked_points ORDER BY (point).x",
+    );
+    assert_eq!(data_rows(&post_rollback), ["1", "3", "8"]);
+}
+
+#[test]
 fn composite_domain_arrays_keep_the_domain_binary_boundary() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -18009,10 +18060,11 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             &mut budget,
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
-             CREATE DOMAIN point_value AS domain_point; \
+             CREATE DOMAIN point_value AS domain_point CHECK ((VALUE).x > 0); \
              CREATE TABLE domain_point_values (values point_value[], direct_values domain_point[]); \
              INSERT INTO domain_point_values VALUES \
                (ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point]); \
+             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE TABLE array_subquery_values AS \
                SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
@@ -18024,6 +18076,17 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "{}",
             String::from_utf8_lossy(&output)
         );
+        let domain = engine.storage.domain(
+            engine
+                .storage
+                .domain_slot("public", "point_value", 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            domain.base_user_type.unwrap().schema.as_str(),
+            "durable_domain"
+        );
+        assert_eq!(domain.base_user_type.unwrap().name.as_str(), "moved_point");
         engine.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 29);
@@ -18037,6 +18100,26 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
              SELECT (values[1]).x FROM array_subquery_values",
         )),
         ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}", "9"]
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN point_value ADD CHECK ((VALUE).x < 7)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let post_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY[ROW(9,1)::durable_domain.moved_point]::point_value[])::text",
+    );
+    assert_eq!(
+        data_rows(&post_rollback),
+        ["{\"(9,1)\"}"],
+        "{post_rollback:?}"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

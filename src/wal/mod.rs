@@ -114,8 +114,20 @@ const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
 const LAST_KIND: u8 = KIND_ALTER_ENUM_IDENTITY;
-const DOMAIN_PAYLOAD_WITH_PARENT: u8 = u8::MAX;
-const DOMAIN_PAYLOAD_WITH_BASE_IDENTITY: u8 = u8::MAX - 1;
+const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
+const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
+
+/// A domain's direct enum/composite base uses its durable catalog slot during
+/// replay. Names are catalog projections and can change after an older domain
+/// image was written.
+fn domain_base_slot(def: &crate::storage::DomainDef) -> u16 {
+    match (def.base_user_type, def.base) {
+        (Some(_), crate::sql::types::ColType::Enum(slot))
+        | (Some(_), crate::sql::types::ColType::Composite(slot)) => slot,
+        (None, _) => NO_DOMAIN_BASE_SLOT,
+        (Some(_), _) => NO_DOMAIN_BASE_SLOT,
+    }
+}
 
 /// SQLSTATE 53100 disk_full.
 const JOURNAL_FULL: &str = "53100";
@@ -1790,6 +1802,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + base_schema
                 + 1
+                + 2
                 + 4
                 + 1
                 + 2
@@ -2438,7 +2451,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
             let mut ok = name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[DOMAIN_PAYLOAD_WITH_BASE_IDENTITY])
+                && buffer.append(&[DOMAIN_PAYLOAD_WITH_BASE_SLOT])
                 && name_bytes(
                     buffer,
                     def.base_domain
@@ -2468,6 +2481,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                         .unwrap_or(""),
                 )
                 && buffer.append(&[def.base.code()])
+                && buffer.append(&domain_base_slot(def).to_le_bytes())
                 && buffer.append(&def.base_type_mod.to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
                 && buffer.append(&(de.len() as u16).to_le_bytes())
@@ -4074,51 +4088,55 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let version = *payload.get(at)?;
-            let has_base_identity = version == DOMAIN_PAYLOAD_WITH_BASE_IDENTITY;
-            let base_domain = if matches!(
-                version,
-                DOMAIN_PAYLOAD_WITH_PARENT | DOMAIN_PAYLOAD_WITH_BASE_IDENTITY
-            ) {
-                at += 1;
-                let base_domain_name = take_name(&mut at)?;
-                let base_domain = if base_domain_name.is_empty() {
-                    None
-                } else {
-                    Some(SqlName::parse(base_domain_name).ok()?)
-                };
-                let base_domain_schema_name = take_name(&mut at)?;
-                let base_domain_schema = if base_domain_schema_name.is_empty() {
-                    None
-                } else {
-                    Some(SqlName::parse(base_domain_schema_name).ok()?)
-                };
-                match (base_domain, base_domain_schema) {
-                    (None, None) => None,
-                    (Some(name), Some(schema)) => {
-                        Some(crate::storage::UserTypeName { schema, name })
-                    }
-                    _ => return None,
-                }
-            } else {
+            if *payload.get(at)? != DOMAIN_PAYLOAD_WITH_BASE_SLOT {
+                return None;
+            }
+            at += 1;
+            let base_domain_name = take_name(&mut at)?;
+            let base_domain = if base_domain_name.is_empty() {
                 None
+            } else {
+                Some(SqlName::parse(base_domain_name).ok()?)
             };
-            let base_user_type = if has_base_identity {
-                let name = take_name(&mut at)?;
-                let schema = take_name(&mut at)?;
-                match (name.is_empty(), schema.is_empty()) {
-                    (true, true) => None,
-                    (false, false) => Some(crate::storage::UserTypeName {
-                        schema: SqlName::parse(schema).ok()?,
-                        name: SqlName::parse(name).ok()?,
-                    }),
-                    _ => return None,
-                }
-            } else {
+            let base_domain_schema_name = take_name(&mut at)?;
+            let base_domain_schema = if base_domain_schema_name.is_empty() {
                 None
+            } else {
+                Some(SqlName::parse(base_domain_schema_name).ok()?)
+            };
+            let base_domain = match (base_domain, base_domain_schema) {
+                (None, None) => None,
+                (Some(name), Some(schema)) => Some(crate::storage::UserTypeName { schema, name }),
+                _ => return None,
+            };
+            let base_name = take_name(&mut at)?;
+            let base_schema = take_name(&mut at)?;
+            let base_user_type = match (base_name.is_empty(), base_schema.is_empty()) {
+                (true, true) => None,
+                (false, false) => Some(crate::storage::UserTypeName {
+                    schema: SqlName::parse(base_schema).ok()?,
+                    name: SqlName::parse(base_name).ok()?,
+                }),
+                _ => return None,
             };
             let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
             at += 1;
+            let base_slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let base = match (base_user_type, base, base_slot) {
+                (Some(_), crate::sql::types::ColType::Enum(_), slot)
+                    if slot != NO_DOMAIN_BASE_SLOT =>
+                {
+                    crate::sql::types::ColType::Enum(slot)
+                }
+                (Some(_), crate::sql::types::ColType::Composite(_), slot)
+                    if slot != NO_DOMAIN_BASE_SLOT =>
+                {
+                    crate::sql::types::ColType::Composite(slot)
+                }
+                (None, base, NO_DOMAIN_BASE_SLOT) => base,
+                _ => return None,
+            };
             let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
             at += 4;
             let not_null = *payload.get(at)? != 0;
@@ -6234,7 +6252,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_domain_payload_without_parent_fields_still_decodes() {
+    fn domain_payload_without_durable_base_slot_is_rejected() {
         fn push_name(payload: &mut Vec<u8>, value: &str) {
             payload.push(value.len() as u8);
             payload.extend_from_slice(value.as_bytes());
@@ -6253,17 +6271,7 @@ mod tests {
         payload.extend_from_slice(&(9_u16).to_le_bytes());
         payload.extend_from_slice(b"VALUE > 0");
 
-        let WalOp::CreateDomain(domain) =
-            decode_op(KIND_CREATE_DOMAIN, &payload).expect("legacy domain payload")
-        else {
-            panic!("decoded the wrong WAL operation");
-        };
-        assert_eq!(domain.schema.as_str(), "public");
-        assert_eq!(domain.name.as_str(), "positive");
-        assert_eq!(domain.base, ColType::Int4);
-        assert_eq!(domain.base_domain, None);
-        assert_eq!(domain.default_expr.expect("domain default").as_str(), "7");
-        assert_eq!(domain.checks()[0].expression.as_str(), "VALUE > 0");
+        assert!(decode_op(KIND_CREATE_DOMAIN, &payload).is_none());
     }
 
     #[test]
@@ -6276,7 +6284,7 @@ mod tests {
         let mut payload = Vec::new();
         push_name(&mut payload, "child");
         push_name(&mut payload, "public");
-        payload.push(DOMAIN_PAYLOAD_WITH_PARENT);
+        payload.push(DOMAIN_PAYLOAD_WITH_BASE_SLOT);
         push_name(&mut payload, "parent");
         push_name(&mut payload, "");
         payload.push(ColType::Int4.code());

@@ -5414,6 +5414,26 @@ fn user_type_expression_description<'q>(
             let (ctype, _) = super::exec::catalog_column_type(storage, txid, array.type_oid)?;
             return matches!(ctype, super::types::ColType::Array(_)).then_some(array);
         }
+        Expr::Field { base, field } => {
+            let base = user_type_expression_description(base, name, storage, txid)?;
+            let (super::types::ColType::Composite(slot), _) =
+                super::exec::catalog_column_type(storage, txid, base.type_oid)?
+            else {
+                return None;
+            };
+            let composite = storage.composite_for(slot as usize, txid);
+            let field = composite
+                .active_fields()
+                .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
+            return Some(
+                ColDesc::new(
+                    name,
+                    catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
+                    field.ctype.typlen(),
+                )
+                .with_type_mod(field.type_mod),
+            );
+        }
         _ => {}
     }
     let Expr::Field { base, field } = expression else {
@@ -5432,6 +5452,45 @@ fn user_type_expression_description<'q>(
         .iter()
         .position(|candidate| candidate.eq_ignore_ascii_case(field))?;
     user_type_cast_description(args.get(position)?, name, storage, txid)
+}
+
+/// Maps stored user-type identity back to its PostgreSQL OID.  A field's
+/// runtime `ColType` is its executable representation; its identity controls
+/// the descriptor exposed through a composite boundary.
+fn catalog_declared_type_oid(
+    storage: &Storage,
+    ctype: super::types::ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+    txid: u32,
+) -> Option<i32> {
+    let Some(identity) = user_type else {
+        return Some(ctype.oid());
+    };
+    if let Some(slot) =
+        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
+            super::types::oid::domain_array_oid(slot as u16)
+        } else {
+            super::types::oid::domain_oid(slot as u16)
+        });
+    }
+    if let Some(slot) = storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
+            super::types::oid::enum_array_oid(slot as u16)
+        } else {
+            super::types::oid::enum_oid(slot as u16)
+        });
+    }
+    storage
+        .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        .map(|slot| {
+            if matches!(ctype, super::types::ColType::Array(_)) {
+                super::types::oid::composite_array_oid(slot as u16)
+            } else {
+                super::types::oid::composite_oid(slot as u16)
+            }
+        })
 }
 
 fn catalog_array_element_description<'q>(

@@ -53,8 +53,7 @@ jobs:
           if [ "${{ matrix.needs_pg18 || matrix.needs_pg18_client }}" = "true" ]; then
             sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
             curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-            sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-            sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+            sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
             if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
               sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-18
             else
@@ -113,8 +112,7 @@ jobs:
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
           sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-client-18
       - name: Python venv for differential oracles
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
@@ -159,8 +157,7 @@ jobs:
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
           sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y zsh postgresql-client-18
       - name: Python venv for the differential harnesses
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'

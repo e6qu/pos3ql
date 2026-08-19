@@ -95,10 +95,9 @@ jobs:
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc |
             sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          # Runner-image Microsoft feeds are unrelated to the PostgreSQL oracle and
-          # occasionally reject apt metadata requests.
-          sudo rm -f /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/microsoft-prod.list
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
+          # Refresh only the added PGDG source. The runner already has current
+          # Ubuntu indexes; updating every unrelated feed exceeds the job bound.
+          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
           sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18 python3-venv
           echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
 

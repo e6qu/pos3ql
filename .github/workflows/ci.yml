@@ -18,12 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install zsh (for the no-op guard)
-        run: |
-          if ! command -v zsh >/dev/null 2>&1; then
-            sudo apt-get install -y zsh
-          fi
-
       - name: Cache Rust build
         uses: actions/cache@v5
         with:
@@ -42,18 +36,18 @@ jobs:
       # Fail fast on any new silent accept-and-ignore of SQL/protocol
       # semantics. See tools/check-noops.sh.
       - name: No-op guard
-        run: zsh tools/check-noops.sh
+        run: bash tools/check-noops.sh
 
       # BUGS.md is not a backlog: every `open` bug must state why it is
       # intractable and must not read as a deferral. See tools/check-bugs.sh.
       - name: BUGS.md discipline guard
-        run: zsh tools/check-bugs.sh
+        run: bash tools/check-bugs.sh
 
       - name: External harness liveness guard
         run: sh tests/external/liveness_test.sh
 
       - name: CI timeout guard
-        run: zsh tools/check-ci-timeouts.sh
+        run: bash tools/check-ci-timeouts.sh
 
       # Copy-paste gate: fails if source duplication exceeds the ratchet in
       # .jscpd.json. See tools/check-dups.sh.

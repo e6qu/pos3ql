@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # No-op guard: fails if the source silently accepts-and-ignores SQL/protocol
 # semantics. A "no-op" here means code that reports success while skipping
 # behavior a client can observe — the class of bug that lets us quietly skip
@@ -30,24 +30,23 @@ while IFS= read -r hit; do
   [[ -z "$hit" ]] && continue
   if [[ "$hit" == *'NOOP-DEBT'* ]]; then
     debt=$((debt + 1))
-    print -- "  debt   $hit"
+    printf '  debt   %s\n' "$hit"
   else
     violations=$((violations + 1))
-    print -- "  NEW    $hit"
+    printf '  NEW    %s\n' "$hit"
   fi
 done < <(grep -rniE "$BANNED" src --include='*.rs')
 
-print -- ""
-print -- "no-op guard: $violations untracked, $debt tracked debt (budget $DEBT_BUDGET)"
+printf '\nno-op guard: %s untracked, %s tracked debt (budget %s)\n' "$violations" "$debt" "$DEBT_BUDGET"
 
 if (( violations > 0 )); then
-  print -- "FAIL: untracked no-op(s). Implement it, reject it loudly, or (during"
-  print -- "burn-down) tag the line with a NOOP-DEBT marker and log it in BUGS.md."
+  printf '%s\n' 'FAIL: untracked no-op(s). Implement it, reject it loudly, or (during'
+  printf '%s\n' 'burn-down) tag the line with a NOOP-DEBT marker and log it in BUGS.md.'
   exit 1
 fi
 if (( debt > DEBT_BUDGET )); then
-  print -- "FAIL: tracked no-op debt $debt exceeds budget $DEBT_BUDGET (ratchet only down)."
+  printf 'FAIL: tracked no-op debt %s exceeds budget %s (ratchet only down).\n' "$debt" "$DEBT_BUDGET"
   exit 1
 fi
-print -- "OK"
+printf '%s\n' OK
 exit 0

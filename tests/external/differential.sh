@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Differential conformance: run the same SQL corpus against REAL
 # PostgreSQL 18 and against pos3ql, normalize, and diff.
 #
@@ -20,7 +20,7 @@ REFERENCE_HOST=${POS3QL_REFERENCE_PG_HOST:-}
 REFERENCE_PORT=${POS3QL_REFERENCE_PG_PORT:-}
 if [[ -n "$REFERENCE_HOST" ]]; then
   if [[ -z "$REFERENCE_PORT" || -z "${POS3QL_REFERENCE_PSQL:-}" ]]; then
-    print -- "FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL"
+    printf '%s\n' 'FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL'
     exit 1
   fi
   PSQL=$POS3QL_REFERENCE_PSQL
@@ -37,14 +37,14 @@ FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
 DIFF_OBJECT_PREFIX=${POS3QL_DIFF_OBJECT_STORE_PREFIX:-}
 
 if [[ "${POS3QL_DIFF_OBJECT_STORE:-off}" == "on" && -z "$DIFF_OBJECT_PREFIX" ]]; then
-  print -- "FAIL: durable differential runs require POS3QL_DIFF_OBJECT_STORE_PREFIX"
+  printf '%s\n' 'FAIL: durable differential runs require POS3QL_DIFF_OBJECT_STORE_PREFIX'
   exit 1
 fi
 
 PASS=0
 FAIL=0
-ok()  { PASS=$((PASS+1)); print -- "PASS: $1"; }
-bad() { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
+ok()  { PASS=$((PASS+1)); printf 'PASS: %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 
 . "$EXT/liveness.sh"
 
@@ -55,7 +55,7 @@ cleanup() {
   fi
   [[ -n "${SOCKDIR:-}" ]] && rm -rf "$SOCKDIR"
   if [[ "$KEEP" == "--keep" ]]; then
-    print -- "work dir kept: $WORK"
+    printf 'work dir kept: %s\n' "$WORK"
   else
     rm -rf "$WORK"
   fi
@@ -63,13 +63,13 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$REFERENCE_MODE" == local ]]; then
-  print -- "=== reference: $("$PGBIN/postgres" --version) ==="
+  printf '=== reference: %s ===\n' "$("$PGBIN/postgres" --version)"
 else
   if ! reference_version=$("$PSQL" -h "$REFERENCE_HOST" -p "$PG_PORT" -U postgres -X -t -A -c 'SHOW server_version' 2>&1); then
-    print -- "FAIL: external PostgreSQL reference is unavailable: $reference_version"
+    printf 'FAIL: external PostgreSQL reference is unavailable: %s\n' "$reference_version"
     exit 1
   fi
-  print -- "=== reference: PostgreSQL $reference_version ==="
+  printf '=== reference: PostgreSQL %s ===\n' "$reference_version"
 fi
 
 if python3 "$EXT/result_diff.py" >/dev/null; then
@@ -110,7 +110,7 @@ memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 ${POS3QL_EXTRA_CONF:-}
 EOF
 if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
-  print -- "object_store_prefix = ${DIFF_OBJECT_PREFIX}corpus/" >> "$WORK/p3.conf"
+  printf 'object_store_prefix = %scorpus/\n' "$DIFF_OBJECT_PREFIX" >> "$WORK/p3.conf"
 fi
 # A leftover server on our port would silently answer the readiness probe
 # below and the whole run would test a stale binary. Refuse to start.
@@ -173,7 +173,7 @@ run_corpus() { # port name file
   fi
 }
 
-print -- "=== corpus diffs (real PostgreSQL vs pos3ql) ==="
+printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 for f in $EXT/differential/*.sql; do
   name=$(basename "$f" .sql)
   run_corpus $PG_PORT "$name.pg" "$f"
@@ -206,7 +206,7 @@ run_exact() { # port name file
     -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
 }
 
-print -- "\n=== exact-error corpora (message wording must match) ==="
+printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
 for f in $EXT/differential_exact/*.sql; do
   name=$(basename "$f" .sql)
   run_exact $PG_PORT "$name.pg" "$f"
@@ -219,7 +219,7 @@ for f in $EXT/differential_exact/*.sql; do
   fi
 done
 
-print -- "\n=== binary COPY (wire bytes + cross-load) ==="
+printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/copy_binary_diff.py" \
        --pg $PG_PORT --p3 $P3_PORT > "$WORK/copy-binary.out" 2>&1; then
@@ -229,10 +229,10 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
     cat "$WORK/copy-binary.out"
   fi
 else
-  print -- "SKIP: COPY BINARY differential (need a psycopg venv at \$POS3QL_VENV)"
+  printf '%s\n' 'SKIP: COPY BINARY differential (need a psycopg venv at $POS3QL_VENV)'
 fi
 
-print -- "\n=== accepted-type fidelity matrix ==="
+printf '%s\n' '' '=== accepted-type fidelity matrix ==='
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg $PG_PORT --p3 $P3_PORT > "$WORK/type-fidelity.out" 2>&1; then
@@ -242,10 +242,10 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
     cat "$WORK/type-fidelity.out"
   fi
 else
-  print -- "SKIP: accepted-type fidelity matrix (need a psycopg venv at \$POS3QL_VENV)"
+  printf '%s\n' 'SKIP: accepted-type fidelity matrix (need a psycopg venv at $POS3QL_VENV)'
 fi
 
-print -- "\n=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==="
+printf '%s\n' '' '=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==='
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then
   # The curated corpus deliberately retains trigger targets and audit tables,
@@ -257,7 +257,7 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   SLT_CONF="$WORK/p3-slt.conf"
   if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
     sed '/^object_store_prefix = /d' "$WORK/p3.conf" > "$SLT_CONF"
-    print -- "object_store_prefix = ${DIFF_OBJECT_PREFIX}slt/" >> "$SLT_CONF"
+    printf 'object_store_prefix = %sslt/\n' "$DIFF_OBJECT_PREFIX" >> "$SLT_CONF"
   else
     cp "$WORK/p3.conf" "$SLT_CONF"
   fi
@@ -288,11 +288,11 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
     tail -30 "$WORK/slt.out"
   fi
 else
-  print -- "SKIP: sqllogictest replay (need a psycopg venv at \$POS3QL_VENV and vendor/)"
+  printf '%s\n' 'SKIP: sqllogictest replay (need a psycopg venv at $POS3QL_VENV and vendor/)'
 fi
 
 if (( FUZZ_COUNT > 0 )); then
-  print -- "\n=== generated SQL differential (PostgreSQL is the oracle) ==="
+  printf '%s\n' '' '=== generated SQL differential (PostgreSQL is the oracle) ==='
   if "$SLT_VENV/bin/python" "$EXT/fuzz_diff.py" --pg $PG_PORT --p3 $P3_PORT \
       --count $FUZZ_COUNT --seed $FUZZ_SEED --max-unsupported 0 > "$WORK/fuzz.out" 2>&1; then
     ok "generated SQL differential ($(grep '^TOTAL' "$WORK/fuzz.out"))"
@@ -302,5 +302,5 @@ if (( FUZZ_COUNT > 0 )); then
   fi
 fi
 
-print -- "\npassed: $PASS  failed: $FAIL"
+printf '\npassed: %s  failed: %s\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

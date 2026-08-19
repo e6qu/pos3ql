@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # External conformance suite for pos3ql.
 #
 # Everything here tests from the OUTSIDE: the newest psql client (18.x)
@@ -42,19 +42,18 @@ FAIL=0
 #   diff       the plain differential suite against PostgreSQL
 #   spilldiff  the forced-spill differential suite against PostgreSQL
 SELECTED_GROUPS=${POS3QL_RUN_GROUPS:-all}
-want() { [[ "$SELECTED_GROUPS" == all || ",$SELECTED_GROUPS," == *",$1,"* ]] }
+want() { [[ "$SELECTED_GROUPS" == all || ",$SELECTED_GROUPS," == *",$1,"* ]]; }
 
 # Every step reports its wall-clock cost so a slow CI shard names its
 # culprit instead of being a 15-minute mystery.
-typeset -F SECONDS
 STEP_TITLE=""
-STEP_STARTED=0.0
+STEP_STARTED=0
 step_close() {
   [[ -n "$STEP_TITLE" ]] && printf 'step time: %.1fs  (%s)\n' $((SECONDS - STEP_STARTED)) "$STEP_TITLE"
 }
-step() { step_close; STEP_TITLE=$1; STEP_STARTED=$SECONDS; print -- "\n=== $1 ==="; }
-ok()   { PASS=$((PASS+1)); print -- "PASS: $1"; }
-bad()  { FAIL=$((FAIL+1)); print -- "FAIL: $1"; }
+step() { step_close; STEP_TITLE=$1; STEP_STARTED=$SECONDS; printf '\n=== %s ===\n' "$1"; }
+ok()   { PASS=$((PASS+1)); printf 'PASS: %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 
 # Start a pos3ql server and wait for it to answer. A listener already on the
 # port is never ours — a server leaked by an earlier interrupted run would
@@ -99,7 +98,7 @@ cleanup() {
     kill "$GATEWAY_PID" 2>/dev/null
   fi
   if [[ "$KEEP" == "--keep" ]]; then
-    print -- "work dir kept: $WORK"
+    printf 'work dir kept: %s\n' "$WORK"
   else
     rm -rf "$WORK"
   fi
@@ -550,7 +549,7 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
   else
     bad "crash torture"
     tail -40 "$WORK/torture.out"
-    print -- "--- pos3ql server log after crash torture ---"
+    printf '%s\n' '--- pos3ql server log after crash torture ---'
     tail -80 "$WORK/server.log"
   fi
   "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1
@@ -561,7 +560,7 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
   start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
   SERVER_PID=$START_PID
 else
-  print -- "SKIP: torture needs POS3QL_VENV and a reference PostgreSQL"
+  printf '%s\n' 'SKIP: torture needs POS3QL_VENV and a reference PostgreSQL'
 fi
 
 fi # torture
@@ -614,13 +613,13 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
       [[ "$actual" == "$expected" ]] && return 0
       sleep 0.1
     done
-    print -- "$actual"
+    printf '%s\n' "$actual"
     return 1
   }
   subscription_diagnostics() {
-    print -- "--- pos3ql subscription server log ---"
+    printf '%s\n' '--- pos3ql subscription server log ---'
     tail -100 "$WORK/server.log"
-    print -- "--- PostgreSQL publisher log ---"
+    printf '%s\n' '--- PostgreSQL publisher log ---'
     tail -100 "$WORK/subscription-pg.log"
   }
   if subscription_wait $'1|first\n2|second'; then
@@ -735,7 +734,7 @@ if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/op
     tail -30 "$WORK/differential.out"
   fi
 else
-  print -- "SKIP: real PostgreSQL 18 not installed"
+  printf '%s\n' 'SKIP: real PostgreSQL 18 not installed'
 fi
 
 fi # diff
@@ -761,12 +760,12 @@ work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out
     tail -30 "$WORK/spilldiff.out"
   fi
 else
-  print -- "SKIP: forced-spill differential needs real PostgreSQL 18"
+  printf '%s\n' 'SKIP: forced-spill differential needs real PostgreSQL 18'
 fi
 
 fi # spilldiff
 
 step "summary"
-print -- "groups: $SELECTED_GROUPS"
-print -- "passed: $PASS  failed: $FAIL"
+printf 'groups: %s\n' "$SELECTED_GROUPS"
+printf 'passed: %s  failed: %s\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

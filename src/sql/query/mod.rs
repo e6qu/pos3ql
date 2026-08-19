@@ -1199,6 +1199,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
                 .map(Some);
             }
+            if let Some(slot) = self.storage.resolve_composite_slot(element_name, self.txid) {
+                return super::exec::coerce_user_type_array(
+                    value,
+                    super::types::ArrElem::Composite(slot as u16),
+                    self.storage,
+                    self.txid,
+                    arena,
+                )
+                .map(Some);
+            }
             return Ok(None);
         }
         if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {

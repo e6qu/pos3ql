@@ -2522,7 +2522,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .domain_slot("public", "binary_coordinate_domain", 0)
             .unwrap() as u16,
     );
-    let transaction = TxnState::new(&mut budget, 64).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 64).unwrap();
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
     let inferred = engine.infer_param_types(
@@ -2580,13 +2580,54 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
     composite_array_binary.extend_from_slice(&(composite_binary.len() as i32).to_be_bytes());
     composite_array_binary.extend_from_slice(&composite_binary);
+    let composite_array = engine
+        .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+        .unwrap();
+    assert_eq!(composite_array.to_string(), "{\"(4,8)\"}");
+    let Datum::Array { element, raw } = composite_array else {
+        panic!("named-composite array decoded as a non-array")
+    };
+    let Some(Datum::CompositeText {
+        physical_fields, ..
+    }) = crate::sql::array::get(raw, element, 0)
+    else {
+        panic!("named-composite array element lost its stored layout")
+    };
     assert_eq!(
-        engine
-            .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
-            .unwrap()
-            .to_string(),
-        "{\"(4,8)\"}"
+        physical_fields, 2,
+        "binary input retains the composite layout"
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE binary_coordinate_arrays (values binary_coordinate[])",
+    );
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "binary parameter send", 1 << 16).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder =
+            Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
+        assert!(matches!(
+            engine
+                .execute_extended(
+                    "INSERT INTO binary_coordinate_arrays VALUES ($1)",
+                    &arena,
+                    &[composite_array],
+                    &mut transaction,
+                    &mut pool,
+                    &mut cursors,
+                    &mut guc,
+                    &mut responder,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
     let mut composite_domain_array_binary = composite_array_binary.clone();
     composite_domain_array_binary[8..12].copy_from_slice(&composite_domain_oid.to_be_bytes());
     let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
@@ -2611,6 +2652,15 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         &mut engine,
         &mut budget,
         "ALTER TYPE binary_coordinate ADD ATTRIBUTE z integer",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (values[1]).x, (values[1]).z FROM binary_coordinate_arrays",
+        )),
+        ["4|NULL"],
+        "binary Bound composite arrays preserve their pre-evolution layout"
     );
     let evolved_composite_binary = [
         0, 0, 0, 3, // field count
@@ -17528,8 +17578,9 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
              CREATE DOMAIN point_value AS domain_point; \
-             CREATE TABLE domain_point_values (values point_value[]); \
-             INSERT INTO domain_point_values VALUES (ARRAY[ROW(7,8)::domain_point]::point_value[]); \
+             CREATE TABLE domain_point_values (values point_value[], direct_values domain_point[]); \
+             INSERT INTO domain_point_values VALUES \
+               (ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point]); \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
              ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
              CHECKPOINT",
@@ -17547,9 +17598,9 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT values::text FROM domain_point_values",
+            "SELECT values::text,direct_values::text FROM domain_point_values",
         )),
-        ["{\"(7,8)\"}"]
+        ["{\"(7,8)\"}|{\"(9,10)\"}"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

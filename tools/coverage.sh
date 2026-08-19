@@ -51,7 +51,7 @@ run_groups_strict() {
     echo "=== external suite, groups: $groups ==="
     {
         if POS3QL_BIN="$BIN" POS3QL_RUN_GROUPS="$groups" \
-            zsh tests/external/run.sh 2>&1; then
+            bash tests/external/run.sh 2>&1; then
             echo 0 > "$TMP/run.status"
         else
             echo $? > "$TMP/run.status"
@@ -154,7 +154,7 @@ run_differential() {
     # stale server on the port, say) produces no profile at all -- which shows
     # up as a plausible-looking but far too low coverage figure rather than as
     # a failure. Fail loudly instead.
-    if ! POS3QL_BIN="$BIN" zsh tests/external/differential.sh > "$TMP/differential.log" 2>&1; then
+    if ! POS3QL_BIN="$BIN" bash tests/external/differential.sh > "$TMP/differential.log" 2>&1; then
         tail -6 "$TMP/differential.log"
         echo "FAIL: tests/external/differential.sh did not pass; coverage would understate"
         exit 1
@@ -174,7 +174,7 @@ case "$SHARD" in
         run_differential
         # run.sh adds durability and cold-start coverage.  When its required
         # local services are present, a failed check must fail coverage too.
-        if ! POS3QL_BIN="$BIN" zsh tests/external/run.sh > "$TMP/run.log" 2>&1; then
+        if ! POS3QL_BIN="$BIN" bash tests/external/run.sh > "$TMP/run.log" 2>&1; then
             tail -20 "$TMP/run.log"
             echo "FAIL: tests/external/run.sh did not pass"
             exit 1

@@ -1419,6 +1419,10 @@ def test_catalog_aware_binary_bind_parameters():
             simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate_domain'")
         )
     )
+    coordinate_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate'"))
+    )
+    coordinate_array_oid = 240000 + coordinate_oid - 230000
     coordinate_domain_array_oid = 150000 + coordinate_domain_oid - 110000
     coordinate = binary_record([(23, struct.pack("!i", 4)), (23, struct.pack("!i", 8))])
     regclass_oid = int(
@@ -1592,6 +1596,14 @@ def test_catalog_aware_binary_bind_parameters():
             vector_array_oid,
             binary_array(vector_oid, [binary_array(23, [struct.pack("!i", 3), struct.pack("!i", 4)])]),
             '{"{3,4}"}',
+            None,
+        ),
+        (
+            "named composite array",
+            "SELECT $1::wire_binary_coordinate[]",
+            coordinate_array_oid,
+            binary_array(coordinate_oid, [coordinate]),
+            '{"(4,8)"}',
             None,
         ),
         (

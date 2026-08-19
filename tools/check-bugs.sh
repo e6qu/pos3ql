@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # BUGS.md discipline guard: BUGS.md is not a backlog. It is reserved for bugs
 # that genuinely cannot be fixed right now, and every `open` row must say *why*
 # it is intractable. This guard fails if an `open` row either (a) carries no
@@ -34,25 +34,24 @@ while IFS= read -r line; do
   open_rows=$((open_rows + 1))
   id="${line#*B-}"; id="B-${id%% *}"; id="${id%%|*}"; id="${id// /}"
 
-  if print -r -- "$line" | grep -qiE "$DEFERRAL"; then
+  if printf '%s\n' "$line" | grep -qiE "$DEFERRAL"; then
     violations=$((violations + 1))
-    print -- "  DEFERRAL  $id — open row reads as a deferral of fixable work; fix it, don't park it"
+    printf "%s\n" "  DEFERRAL  $id — open row reads as a deferral of fixable work; fix it, don't park it"
     continue
   fi
-  if ! print -r -- "$line" | grep -qiE "$JUSTIFY"; then
+  if ! printf '%s\n' "$line" | grep -qiE "$JUSTIFY"; then
     violations=$((violations + 1))
-    print -- "  UNJUSTIFIED  $id — open row has no stated reason it can't be fixed now"
+    printf "%s\n" "  UNJUSTIFIED  $id — open row has no stated reason it can't be fixed now"
   fi
 done < BUGS.md
 
-print -- ""
-print -- "BUGS.md guard: $open_rows open, $violations unjustified/deferred"
+printf '\nBUGS.md guard: %s open, %s unjustified/deferred\n' "$open_rows" "$violations"
 
 if (( violations > 0 )); then
-  print -- "FAIL: an open bug is either unjustified or a deferral. BUGS.md is for"
-  print -- "genuinely-intractable bugs only — fix it in this PR, or state loudly why"
-  print -- "it cannot be fixed now (see AGENTS.md, the Boyscout Rule)."
+  printf '%s\n' 'FAIL: an open bug is either unjustified or a deferral. BUGS.md is for'
+  printf '%s\n' 'genuinely-intractable bugs only — fix it in this PR, or state loudly why'
+  printf '%s\n' 'it cannot be fixed now (see AGENTS.md, the Boyscout Rule).'
   exit 1
 fi
-print -- "OK"
+printf '%s\n' OK
 exit 0

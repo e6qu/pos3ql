@@ -20185,9 +20185,15 @@ fn decode_binary_array<'a>(
                 let Datum::Composite { .. } = value else {
                     return Err(bad());
                 };
+                let BinaryDecodeContext::Catalog { storage, txid } = context else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "binary input of a named-composite array requires catalog context"
+                    ));
+                };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: 0,
+                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
                     text: arena.alloc_str_display(value).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,

@@ -196,15 +196,19 @@ CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   mood outbound_dump.mood NOT NULL,
   location outbound_dump.location NOT NULL,
+  moods outbound_dump.mood[] NOT NULL,
+  locations outbound_dump.location[] NOT NULL,
   marked_location outbound_dump.location_domain NOT NULL,
   marked_locations outbound_dump.location_domain[] NOT NULL,
   note text DEFAULT 'hello',
   CONSTRAINT outbound_items_note_check CHECK (char_length(note) > 0)
 );
-INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,note) VALUES
-  ('ok', ROW(1,2)::outbound_dump.location, ROW(10,20)::outbound_dump.location_domain,
+INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note) VALUES
+  ('ok', ROW(1,2)::outbound_dump.location, ARRAY['ok'::outbound_dump.mood],
+   ARRAY[ROW(7,8)::outbound_dump.location], ROW(10,20)::outbound_dump.location_domain,
    ARRAY[ROW(100,200)::outbound_dump.location_domain], 'one'),
-  ('great', ROW(3,4)::outbound_dump.location, ROW(30,40)::outbound_dump.location_domain,
+  ('great', ROW(3,4)::outbound_dump.location, ARRAY['great'::outbound_dump.mood],
+   ARRAY[ROW(9,10)::outbound_dump.location], ROW(30,40)::outbound_dump.location_domain,
    ARRAY[ROW(300,400)::outbound_dump.location_domain], 'two');
 CREATE SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
@@ -216,7 +220,7 @@ CREATE INDEX "Odd Index" ON outbound_dump."Odd Table" ("select" DESC);
 COMMENT ON TABLE outbound_dump.items IS 'dumped table comment';
 COMMENT ON COLUMN outbound_dump.items.note IS 'dumped column comment';
 CREATE VIEW outbound_dump.item_view AS
-  SELECT id,mood,location,marked_location,marked_locations,note FROM outbound_dump.items;
+  SELECT id,mood,location,moods,locations,marked_location,marked_locations,note FROM outbound_dump.items;
 CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
 INSERT INTO outbound_dump.view_base VALUES (1, 10), (2, 20);
 CREATE VIEW outbound_dump.writable_view AS
@@ -275,10 +279,12 @@ if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_r
 else
   outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
-      SELECT id,mood,(location).x,(location).y,(marked_location).x,
+      SELECT id,mood,(location).x,(location).y,moods[1],(locations[1]).y,(marked_location).x,
              (marked_locations[1]).y,note FROM outbound_dump.item_view ORDER BY id;
-      INSERT INTO outbound_dump.items(mood,location,marked_location,marked_locations,note)
+      INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note)
         VALUES ('ok', ROW(5,6)::outbound_type_target.location,
+                ARRAY['ok'::outbound_type_target.mood],
+                ARRAY[ROW(11,12)::outbound_type_target.location],
                 ROW(50,60)::outbound_dump.location_domain,
                 ARRAY[ROW(500,600)::outbound_dump.location_domain], 'three') RETURNING id;
       SELECT is_identity,identity_generation
@@ -304,7 +310,7 @@ else
       SELECT indexdef = 'CREATE INDEX \"Odd Index\" ON outbound_dump.\"Odd Table\" USING btree (\"select\" DESC)'
         FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='Odd Index';
       SELECT obj_description('outbound_dump.items'::regclass),
-             col_description('outbound_dump.items'::regclass, 6);
+             col_description('outbound_dump.items'::regclass, 8);
       SELECT count FROM outbound_dump.item_count;
       SELECT nextval('outbound_dump.manual_sequence');
       SELECT count(*) FROM outbound_dump.item_tags;
@@ -312,7 +318,7 @@ else
              has_sequence_privilege('outbound_reader', 'outbound_dump.manual_sequence', 'USAGE'),
              has_function_privilege('outbound_reader', 'outbound_dump.dump_answer()', 'EXECUTE');
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|10|200|one\n2|great|3|4|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t'
+  expected_outbound_observed=$'1|ok|1|2|ok|8|10|200|one\n2|great|3|4|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

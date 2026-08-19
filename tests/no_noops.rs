@@ -8,10 +8,10 @@ use std::process::Command;
 #[test]
 fn no_untracked_noops() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/check-noops.sh");
-    let output = Command::new("zsh")
+    let output = Command::new("bash")
         .arg(script)
         .output()
-        .expect("run the no-op guard (needs zsh on PATH)");
+        .expect("run the no-op guard (needs Bash on PATH)");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

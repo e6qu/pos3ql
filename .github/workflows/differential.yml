@@ -90,13 +90,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Expose the PostgreSQL 18 client from the service image
+      - name: Expose PostgreSQL 18 dump tools from the service image
         run: |
           mkdir -p .ci-bin
-          for client in psql pg_dump pg_restore; do
+          for client in pg_dump pg_restore; do
             printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp postgres:18 $client \"\$@\"" > ".ci-bin/$client"
           done
-          chmod +x .ci-bin/psql .ci-bin/pg_dump .ci-bin/pg_restore
+          chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
           echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust build

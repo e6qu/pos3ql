@@ -1556,6 +1556,8 @@ pub enum AlterRoutineAction<'a> {
 pub struct RoutineIdentity<'a> {
     pub name: QualName<'a>,
     pub argument_types: &'a [&'a str],
+    /// `false` only for the PostgreSQL shorthand `DROP FUNCTION name`.
+    pub signature_is_explicit: bool,
 }
 
 /// One domain `[CONSTRAINT name] CHECK (expr)` — `name` is `None` when the

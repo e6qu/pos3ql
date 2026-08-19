@@ -543,9 +543,11 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
 pub trait ColTypeResolver {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError>;
 
-    /// SQL-routine result type resolved from already-inferred argument types.
+    /// SQL-routine result type resolved from already-inferred argument type
+    /// identities. OIDs retain a domain identity that its runtime value does
+    /// not carry.
     /// Plain column resolvers have no catalog and therefore expose none.
-    fn routine_result(&self, _name: &str, _arguments: &[ColType]) -> Option<ColType> {
+    fn routine_result(&self, _name: &str, _arguments: &[i32]) -> Option<(i32, i16)> {
         None
     }
 
@@ -604,6 +606,41 @@ impl RoutineParameterTypes {
 std::thread_local! {
     static ROUTINE_PARAMETER_TYPES: Cell<RoutineParameterTypes> =
         const { Cell::new(RoutineParameterTypes::EMPTY) };
+    static BOUND_PARAMETER_TYPES: Cell<BoundParameterTypes> =
+        const { Cell::new(BoundParameterTypes::EMPTY) };
+}
+
+#[derive(Clone, Copy)]
+struct BoundParameterTypes {
+    oids: [Option<i32>; MAX_ROUTINE_ARGUMENTS],
+}
+
+impl BoundParameterTypes {
+    const EMPTY: Self = Self {
+        oids: [None; MAX_ROUTINE_ARGUMENTS],
+    };
+}
+
+pub(crate) struct BoundParameterScope(BoundParameterTypes);
+
+pub(crate) fn enter_bound_parameter_types(oids: &[i32]) -> BoundParameterScope {
+    let mut current = BoundParameterTypes::EMPTY;
+    for (slot, oid) in oids.iter().copied().enumerate().take(MAX_ROUTINE_ARGUMENTS) {
+        current.oids[slot] = (oid != 0).then_some(oid);
+    }
+    BoundParameterScope(BOUND_PARAMETER_TYPES.with(|slot| slot.replace(current)))
+}
+
+impl Drop for BoundParameterScope {
+    fn drop(&mut self) {
+        BOUND_PARAMETER_TYPES.with(|slot| slot.set(self.0));
+    }
+}
+
+pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
+    index.checked_sub(1).and_then(|index| {
+        BOUND_PARAMETER_TYPES.with(|types| types.get().oids.get(index as usize).copied().flatten())
+    })
 }
 
 /// Restores the enclosing routine's declaration when nested SQL routines
@@ -1501,31 +1538,29 @@ pub fn infer_type_res(
         ..
     } = expression
     {
-        let mut argument_types = [ColType::Text; MAX_ROUTINE_ARGUMENTS];
-        if args.len() <= argument_types.len() {
+        let mut argument_type_oids = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        if args.len() <= argument_type_oids.len() {
             let mut known = true;
             for (index, argument) in args.iter().enumerate() {
                 let Ok((type_oid, _)) = infer_type_res(argument, columns) else {
                     known = false;
                     break;
                 };
-                let Some(ctype) = coltype_of_oid(type_oid) else {
-                    known = false;
-                    break;
-                };
-                argument_types[index] = ctype;
+                argument_type_oids[index] = type_oid;
             }
             if known
-                && let Some(result) = columns.routine_result(name, &argument_types[..args.len()])
+                && let Some(result) =
+                    columns.routine_result(name, &argument_type_oids[..args.len()])
             {
-                return Ok(of(result));
+                return Ok(result);
             }
         }
     }
     Ok(match expression {
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
-        Expr::Param(index) => routine_parameter_type(*index)
-            .map(of)
+        Expr::Param(index) => bound_parameter_type_oid(*index)
+            .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
+            .or_else(|| routine_parameter_type(*index).map(of))
             .unwrap_or((oid::UNKNOWN, -2)),
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.

@@ -2055,6 +2055,37 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     })
 }
 
+/// Resolves the exact OID for a visible user-defined type spelling, including
+/// the automatically-created array type.  Call sites that dispatch routines
+/// use this instead of reducing a domain to its storage representation.
+pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Option<i32> {
+    use crate::sql::types::oid;
+    let (base, array) = type_name
+        .strip_suffix("[]")
+        .map_or((type_name, false), |base| (base, true));
+    if let Some(slot) = storage.resolve_domain_slot(base, txid) {
+        return Some(if array {
+            oid::domain_array_oid(slot as u16)
+        } else {
+            oid::domain_oid(slot as u16)
+        });
+    }
+    if let Some(slot) = storage.resolve_enum_slot(base, txid) {
+        return Some(if array {
+            oid::enum_array_oid(slot as u16)
+        } else {
+            oid::enum_oid(slot as u16)
+        });
+    }
+    storage.resolve_composite_slot(base, txid).map(|slot| {
+        if array {
+            oid::composite_array_oid(slot as u16)
+        } else {
+            oid::composite_oid(slot as u16)
+        }
+    })
+}
+
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
 }
@@ -2068,7 +2099,9 @@ fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
 
 fn parse_routine_signature<'a>(
     written: &'a str,
-    arguments: &mut [ColType; MAX_ROUTINE_ARGUMENTS],
+    storage: &Storage,
+    txid: u32,
+    arguments: &mut [crate::storage::RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
 ) -> Option<(&'a str, usize)> {
     let (name, written_arguments) = written.strip_suffix(')')?.split_once('(')?;
     let written_arguments = written_arguments.trim();
@@ -2084,13 +2117,25 @@ fn parse_routine_signature<'a>(
         if count == arguments.len() {
             return None;
         }
-        arguments[count] = ColType::from_sql_name(written_type)?;
+        let resolved = if let Some(ctype) = ColType::from_sql_name(written_type) {
+            crate::storage::RoutineResult::builtin(ctype)
+        } else {
+            super::exec::resolve_routine_type(storage, txid, written_type).ok()?
+        };
+        arguments[count] = crate::storage::RoutineArgumentDef {
+            name: crate::storage::SqlName::EMPTY,
+            ctype: resolved.ctype,
+            user_type: resolved.user_type,
+        };
         count += 1;
     }
     Some((name.trim(), count))
 }
 
-fn intrinsic_argument_matches(routine: IntrinsicRoutine, arguments: &[ColType]) -> bool {
+fn intrinsic_argument_matches(
+    routine: IntrinsicRoutine,
+    arguments: &[crate::storage::RoutineArgumentDef],
+) -> bool {
     if routine.argument_count != arguments.len() as i32 {
         return false;
     }
@@ -2098,7 +2143,9 @@ fn intrinsic_argument_matches(routine: IntrinsicRoutine, arguments: &[ColType]) 
         .argument_types
         .split_ascii_whitespace()
         .zip(arguments)
-        .all(|(oid, argument)| oid.parse::<i32>().ok() == Some(argument.oid()))
+        .all(|(oid, argument)| {
+            argument.user_type.is_none() && oid.parse::<i32>().ok() == Some(argument.ctype.oid())
+        })
 }
 
 fn routine_signature<'a>(
@@ -2121,6 +2168,81 @@ fn routine_signature<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
+fn routine_declared_signature<'a>(
+    name: &str,
+    arguments: &[crate::storage::RoutineArgumentDef],
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use core::fmt::Write;
+    let mut text = StackStr::<256>::new();
+    write!(text, "{}(", name).map_err(|_| super::eval::arena_full())?;
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            write!(text, ",").map_err(|_| super::eval::arena_full())?;
+        }
+        write_routine_type_name(&mut text, argument.ctype, argument.user_type, false)
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    write!(text, ")").map_err(|_| super::eval::arena_full())?;
+    arena
+        .alloc_str(text.as_str())
+        .map_err(|_| super::eval::arena_full())
+}
+
+fn write_routine_type_name(
+    output: &mut impl core::fmt::Write,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+    qualified: bool,
+) -> Result<(), core::fmt::Error> {
+    match user_type {
+        Some(identity) => {
+            if qualified {
+                write!(output, "{}.", identity.schema.as_str())?;
+            }
+            write!(output, "{}", identity.name.as_str())?;
+            if matches!(ctype, ColType::Array(_)) {
+                write!(output, "[]")?;
+            }
+        }
+        None => write!(output, "{}", ctype.name())?,
+    }
+    Ok(())
+}
+
+fn write_routine_type<const N: usize>(
+    output: &mut StackStr<N>,
+    argument: &crate::storage::RoutineArgumentDef,
+) -> Result<(), core::fmt::Error> {
+    use core::fmt::Write;
+    if let Some(identity) = argument.user_type {
+        write!(
+            output,
+            "{}.{}",
+            identity.schema.as_str(),
+            identity.name.as_str()
+        )?;
+        if matches!(argument.ctype, ColType::Array(_)) {
+            output.write_str("[]")?;
+        }
+        Ok(())
+    } else {
+        output.write_str(argument.ctype.name())
+    }
+}
+
+fn write_routine_result_type<const N: usize>(
+    output: &mut StackStr<N>,
+    result: &crate::storage::RoutineResult,
+) -> Result<(), super::eval::SqlError> {
+    let argument = crate::storage::RoutineArgumentDef {
+        name: crate::storage::SqlName::EMPTY,
+        ctype: result.ctype,
+        user_type: result.user_type,
+    };
+    write_routine_type(output, &argument).map_err(|_| super::eval::arena_full())
+}
+
 /// Resolves the function catalog object types. `regproc` names a routine by
 /// unqualified name; `regprocedure` includes its complete argument signature.
 pub(crate) fn routine_oid_by_name(
@@ -2129,9 +2251,9 @@ pub(crate) fn routine_oid_by_name(
     written: &str,
     signature: bool,
 ) -> Result<Option<i32>, SqlError> {
-    let mut arguments = [ColType::Bool; MAX_ROUTINE_ARGUMENTS];
+    let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let (name, argument_count) = if signature {
-        let Some(parsed) = parse_routine_signature(written, &mut arguments) else {
+        let Some(parsed) = parse_routine_signature(written, storage, txid, &mut arguments) else {
             return Ok(None);
         };
         parsed
@@ -2171,7 +2293,10 @@ pub(crate) fn routine_oid_by_name(
                         .arguments()
                         .iter()
                         .zip(&arguments[..argument_count])
-                        .all(|(defined, argument)| defined.ctype == *argument)))
+                        .all(|(defined, argument)| {
+                            defined.ctype == argument.ctype
+                                && defined.user_type == argument.user_type
+                        })))
         {
             continue;
         }
@@ -2213,12 +2338,7 @@ pub(crate) fn routine_name_by_oid<'a>(
             .map(Some)
             .map_err(|_| super::eval::arena_full());
     }
-    routine_signature(
-        name,
-        routine.arguments().iter().map(|argument| argument.ctype),
-        arena,
-    )
-    .map(Some)
+    routine_declared_signature(name, routine.arguments(), arena).map(Some)
 }
 
 fn parse_operator_signature(written: &str) -> Option<(&str, ColType, ColType)> {
@@ -2345,18 +2465,18 @@ pub fn function_def_text<'a>(
             write!(definition, "{} ", argument.name.as_str())
                 .map_err(|_| super::eval::arena_full())?;
         }
-        write!(definition, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
+        write_routine_type(&mut definition, argument).map_err(|_| super::eval::arena_full())?;
     }
     match routine.kind {
         crate::storage::RoutineKind::Function { result } => {
-            write!(definition, ") RETURNS {} LANGUAGE sql AS '", result.name())
+            write!(definition, ") RETURNS ").map_err(|_| super::eval::arena_full())?;
+            write_routine_result_type(&mut definition, &result)?;
+            write!(definition, " LANGUAGE sql AS '")
         }
         crate::storage::RoutineKind::SetFunction { result } => {
-            write!(
-                definition,
-                ") RETURNS SETOF {} LANGUAGE sql AS '",
-                result.name()
-            )
+            write!(definition, ") RETURNS SETOF ").map_err(|_| super::eval::arena_full())?;
+            write_routine_result_type(&mut definition, &result)?;
+            write!(definition, " LANGUAGE sql AS '")
         }
         crate::storage::RoutineKind::TableFunction => {
             write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;
@@ -2369,13 +2489,10 @@ pub fn function_def_text<'a>(
                 if index != 0 {
                     write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
                 }
-                write!(
-                    definition,
-                    "{} {}",
-                    column.name.as_str(),
-                    column.ctype.name()
-                )
-                .map_err(|_| super::eval::arena_full())?;
+                write!(definition, "{} ", column.name.as_str())
+                    .map_err(|_| super::eval::arena_full())?;
+                write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
+                    .map_err(|_| super::eval::arena_full())?;
             }
             write!(definition, ") LANGUAGE sql AS '")
         }
@@ -2425,7 +2542,15 @@ pub fn function_arguments_text<'a>(
         if !identity && !argument.name.as_str().is_empty() {
             write!(output, "{} ", argument.name.as_str()).map_err(|_| super::eval::arena_full())?;
         }
-        write!(output, "{}", argument.ctype.name()).map_err(|_| super::eval::arena_full())?;
+        write_routine_type_name(
+            &mut output,
+            argument.ctype,
+            argument.user_type,
+            argument
+                .user_type
+                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+        )
+        .map_err(|_| super::eval::arena_full())?;
     }
     if output.is_truncated() {
         return Err(super::eval::arena_full());
@@ -2446,23 +2571,44 @@ pub fn function_result_text<'a>(
         return Ok(None);
     };
     let routine = storage.routine_for(slot, txid);
-    let result = match routine.kind {
-        crate::storage::RoutineKind::Function { result } => result.name(),
-        crate::storage::RoutineKind::SetFunction { result } => {
-            let mut output = StackStr::<64>::new();
-            use core::fmt::Write;
-            write!(output, "SETOF {}", result.name()).map_err(|_| super::eval::arena_full())?;
-            return arena
-                .alloc_str(output.as_str())
-                .map(Some)
-                .map_err(|_| super::eval::arena_full());
+    let mut output = StackStr::<256>::new();
+    use core::fmt::Write;
+    match &routine.kind {
+        crate::storage::RoutineKind::Function { result } => {
+            write_routine_type_name(
+                &mut output,
+                result.ctype,
+                result.user_type,
+                result
+                    .user_type
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+            )
+            .map_err(|_| super::eval::arena_full())?;
         }
-        crate::storage::RoutineKind::TableFunction => "record",
-        crate::storage::RoutineKind::Trigger => "trigger",
-        crate::storage::RoutineKind::Procedure => "void",
-    };
+        crate::storage::RoutineKind::SetFunction { result } => {
+            write!(output, "SETOF ").map_err(|_| super::eval::arena_full())?;
+            write_routine_type_name(
+                &mut output,
+                result.ctype,
+                result.user_type,
+                result
+                    .user_type
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+            )
+            .map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineKind::TableFunction => {
+            write!(output, "record").map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineKind::Trigger => {
+            write!(output, "trigger").map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineKind::Procedure => {
+            write!(output, "void").map_err(|_| super::eval::arena_full())?;
+        }
+    }
     arena
-        .alloc_str(result)
+        .alloc_str(output.as_str())
         .map(Some)
         .map_err(|_| super::eval::arena_full())
 }
@@ -5368,10 +5514,16 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             if index > 0 {
                 let _ = core::fmt::Write::write_str(&mut argument_types, " ");
             }
-            let _ = core::fmt::Write::write_fmt(
-                &mut argument_types,
-                format_args!("{}", argument.ctype.oid()),
-            );
+            let argument_oid = storage
+                .routine_type_oid(argument.ctype, argument.user_type, txid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "routine {} has an unresolved declared argument type",
+                        routine.name.as_str()
+                    )
+                });
+            let _ =
+                core::fmt::Write::write_fmt(&mut argument_types, format_args!("{argument_oid}"));
         }
         rows[count] = row(
             &[
@@ -5380,13 +5532,20 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(routine.name_for(txid).as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
                 Datum::Int4(routine.argument_count as i32),
-                Datum::Int4(
-                    routine
-                        .kind
-                        .function_result()
-                        .map(ColType::oid)
-                        .unwrap_or(2278),
-                ),
+                Datum::Int4(match routine.kind {
+                    crate::storage::RoutineKind::Function { .. }
+                    | crate::storage::RoutineKind::SetFunction { .. } => storage
+                        .routine_function_result_oid(&routine, txid)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "routine {} has an unresolved declared result type",
+                                routine.name.as_str()
+                            )
+                        }),
+                    crate::storage::RoutineKind::TableFunction => crate::sql::types::oid::RECORD,
+                    crate::storage::RoutineKind::Trigger => crate::sql::types::oid::TRIGGER,
+                    crate::storage::RoutineKind::Procedure => crate::sql::types::oid::VOID,
+                }),
                 Datum::Bool(routine.kind.is_set_returning()),
                 Datum::Bpchar(routine.kind.catalog_kind()),
                 text(argument_types.as_str(), arena)?,

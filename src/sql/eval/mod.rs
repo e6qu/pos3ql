@@ -520,9 +520,15 @@ pub trait CatalogAccess {
         &self,
         _name: &str,
         _arguments: &[Datum<'a>],
+        _argument_type_oids: &[i32],
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
+    }
+    /// The declared result identity of a catalog routine. This is separate
+    /// from execution because a domain result shares its base datum layout.
+    fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
+        None
     }
     fn rewind_routine_invocation_cursor(&self) {}
     /// Whether this OID names a relation visible to the current query.
@@ -2402,11 +2408,36 @@ fn call<'a>(
     }
     if !star && let Some(catalog) = hooks.catalog {
         let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];
+        let mut argument_type_oids =
+            [crate::sql::types::oid::UNKNOWN; crate::sql::parser::MAX_LIST];
         if args.len() <= arguments.len() {
             for (slot, argument) in args.iter().enumerate() {
                 arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
+                argument_type_oids[slot] = match argument {
+                    Expr::Cast { type_name, .. } => catalog
+                        .user_type_oid(type_name)
+                        .unwrap_or_else(|| arguments[slot].type_oid()),
+                    Expr::Array(elements) => elements
+                        .first()
+                        .and_then(|element| match element {
+                            Expr::Cast { type_name, .. } => {
+                                let array_name = stack_format!(128, "{}[]", type_name);
+                                catalog.user_type_oid(array_name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| arguments[slot].type_oid()),
+                    Expr::Param(index) => crate::sql::exec::bound_parameter_type_oid(*index)
+                        .unwrap_or_else(|| arguments[slot].type_oid()),
+                    _ => arguments[slot].type_oid(),
+                };
             }
-            if let Some(result) = catalog.call_routine(name, &arguments[..args.len()], arena)? {
+            if let Some(result) = catalog.call_routine(
+                name,
+                &arguments[..args.len()],
+                &argument_type_oids[..args.len()],
+                arena,
+            )? {
                 return Ok(result);
             }
         }

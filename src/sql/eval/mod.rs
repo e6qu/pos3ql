@@ -1290,6 +1290,7 @@ pub fn eval_full<'a>(
                         return regtype_of_name(name);
                     }
                     Datum::Int4(x) => return regtype_of_oid(x as i64, arena),
+                    Datum::Oid(x) => return regtype_of_oid(i64::from(x), arena),
                     Datum::Int8(x) => return regtype_of_oid(x, arena),
                     _ => {}
                 }
@@ -1299,7 +1300,7 @@ pub fn eval_full<'a>(
             // length coercion (which left-aligns), so it is handled here where
             // the source type is known.
             if let Some(ct @ ColType::Bit { varying }) = ColType::from_sql_name(type_name)
-                && matches!(v, Datum::Int4(_) | Datum::Int8(_))
+                && matches!(v, Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_))
             {
                 let n = match crate::sql::types::TypeMod::decode(ct, type_mod) {
                     crate::sql::types::TypeMod::Length(n) => n,
@@ -1308,6 +1309,7 @@ pub fn eval_full<'a>(
                 let value = match v {
                     Datum::Int2(x) => x as u16 as u64,
                     Datum::Int4(x) => x as u32 as u64,
+                    Datum::Oid(x) => u64::from(x),
                     Datum::Int8(x) => x as u64,
                     _ => unreachable!(),
                 };
@@ -4020,6 +4022,7 @@ fn num_factor(d: &Datum) -> Option<f64> {
     match d {
         Datum::Int2(x) => Some(f64::from(*x)),
         Datum::Int4(x) => Some(f64::from(*x)),
+        Datum::Oid(x) => Some(f64::from(*x)),
         Datum::Int8(x) => Some(*x as f64),
         Datum::Float4(x) => Some(f64::from(*x)),
         Datum::Float8(x) => Some(*x),
@@ -4107,6 +4110,7 @@ fn to_numeric<'a>(d: &Datum, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> 
         }),
         Datum::Int2(x) => Numeric::from_i64(*x as i64, arena),
         Datum::Int4(x) => Numeric::from_i64(*x as i64, arena),
+        Datum::Oid(x) => Numeric::from_i64(i64::from(*x), arena),
         Datum::Int8(x) => Numeric::from_i64(*x, arena),
         other => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -4235,10 +4239,9 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 }
 
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
-/// type carries renders as the number itself, and 0 as `-` — PostgreSQL's own
-/// fallbacks.
+/// type carries renders as the number itself, and 0 as `-`.
 pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let referenced_oid = i32::try_from(o).unwrap_or(i32::MAX);
+    let referenced_oid = i32::try_from(o).map_err(|_| overflow("regtype"))?;
     let name = if o == 0 {
         "-"
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
@@ -4278,6 +4281,7 @@ pub(crate) fn regobject_cast<'a>(
         Datum::RegObject { .. } => return Err(cast_unsupported(&value, target.name())),
         Datum::Int2(value) => i32::from(value),
         Datum::Int4(value) => value,
+        Datum::Oid(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
         Datum::Int8(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
         Datum::Text(name) | Datum::Bpchar(name) => {
             let name = name.trim_end_matches(' ');
@@ -4582,6 +4586,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
+        Datum::Oid(_) => "oid",
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",
@@ -4629,6 +4634,7 @@ fn as_i64(d: &Datum) -> Option<i64> {
     match d {
         Datum::Int2(x) => Some(i64::from(*x)),
         Datum::Int4(x) => Some(i64::from(*x)),
+        Datum::Oid(x) => Some(i64::from(*x)),
         Datum::Int8(x) => Some(*x),
         _ => None,
     }

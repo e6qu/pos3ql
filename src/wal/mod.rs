@@ -4582,7 +4582,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     1 + match d {
         None | Some(OwnedDatum::Null) => 0,
         Some(OwnedDatum::Bool(_)) => 1,
-        Some(OwnedDatum::Int4(_)) => 4,
+        Some(OwnedDatum::Int4(_)) | Some(OwnedDatum::Oid(_)) => 4,
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::RegObject { len, .. }) => 9 + *len as usize,
@@ -4634,6 +4634,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::Int4(v)) => {
             out[0] = 3;
+            out[1..5].copy_from_slice(&v.to_le_bytes());
+            5
+        }
+        Some(OwnedDatum::Oid(v)) => {
+            out[0] = 27;
             out[1..5].copy_from_slice(&v.to_le_bytes());
             5
         }
@@ -4841,6 +4846,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 4)?;
             *at += 4;
             Some(OwnedDatum::Int4(i32::from_le_bytes(b.try_into().unwrap())))
+        }
+        27 => {
+            let b = payload.get(*at..*at + 4)?;
+            *at += 4;
+            Some(OwnedDatum::Oid(u32::from_le_bytes(b.try_into().unwrap())))
         }
         4 => {
             let b = payload.get(*at..*at + 8)?;

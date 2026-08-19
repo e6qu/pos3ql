@@ -51,6 +51,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Regtype => match v {
             Datum::Regtype { .. } => v,
             Datum::Text(name) => super::regtype_of_name(name)?,
+            Datum::Oid(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int4(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int8(oid) => super::regtype_of_oid(oid, arena)?,
             _ => return Err(cast_unsupported(&v, "regtype")),
@@ -78,6 +79,17 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                     .alloc_str_display(referenced_oid)
                     .map_err(|_| arena_full())?,
             },
+            Datum::Oid(referenced_oid) => {
+                let referenced_oid =
+                    i32::try_from(referenced_oid).map_err(|_| overflow(target.name()))?;
+                Datum::RegObject {
+                    type_oid: target.oid(),
+                    referenced_oid,
+                    name: arena
+                        .alloc_str_display(referenced_oid)
+                        .map_err(|_| arena_full())?,
+                }
+            }
             Datum::Int8(referenced_oid) => {
                 let referenced_oid =
                     i32::try_from(referenced_oid).map_err(|_| overflow(target.name()))?;
@@ -111,7 +123,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Text(s) => Datum::Bool(parse_bool(s)?),
             _ => return Err(cast_unsupported(&v, "boolean")),
         },
-        ColType::Int4 | ColType::Oid => {
+        ColType::Int4 => {
             if let Datum::Bit { bits, .. } = v {
                 // bit -> integer: the bits are the low bits of the result
                 // (two's complement), so a full 32-bit string round-trips.
@@ -129,6 +141,16 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
             }
         }
+        ColType::Oid => match v {
+            Datum::Oid(_) => v,
+            Datum::Bit { bits, .. } => Datum::Oid(bits_to_uint(bits, 32, "oid")? as u32),
+            Datum::Text(s) => Datum::Oid(parse_oid(s)?),
+            Datum::RegObject { referenced_oid, .. } => Datum::Oid(referenced_oid as u32),
+            Datum::Int2(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
+            Datum::Int4(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
+            Datum::Int8(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
+            _ => return Err(cast_unsupported(&v, "oid")),
+        },
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {
                 Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
@@ -140,6 +162,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         }
         ColType::Float8 => match v {
             Datum::Int4(x) => Datum::Float8(f64::from(x)),
+            Datum::Oid(x) => Datum::Float8(f64::from(x)),
             Datum::Int8(x) => Datum::Float8(x as f64),
             Datum::Float4(x) => Datum::Float8(f64::from(x)),
             Datum::Float8(_) => v,
@@ -158,6 +181,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             let f = match v {
                 Datum::Float4(_) => return Ok(v),
                 Datum::Int4(x) => x as f32,
+                Datum::Oid(x) => x as f32,
                 Datum::Int8(x) => x as f32,
                 Datum::Float8(x) => finite_to_f32(x).ok_or_else(|| {
                     sql_err!(
@@ -335,6 +359,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Numeric => match v {
             Datum::Numeric(_) => v,
             Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
+            Datum::Oid(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
             Datum::Float8(x) => {
                 // float8 -> numeric via the shortest round-trip decimal.
@@ -370,6 +395,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             // width; `apply_cast_typmod` then keeps the low N bits for bit(N).
             Datum::Int4(x) => Datum::Bit {
                 bits: int_to_bits(x as u32 as u64, 32, arena)?,
+                varying,
+            },
+            Datum::Oid(x) => Datum::Bit {
+                bits: int_to_bits(x as u64, 32, arena)?,
                 varying,
             },
             Datum::Int8(x) => Datum::Bit {
@@ -660,6 +689,7 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
     match v {
         Datum::Int2(x) => Ok(i64::from(*x)),
         Datum::Int4(x) => Ok(i64::from(*x)),
+        Datum::Oid(x) => Ok(i64::from(*x)),
         Datum::Int8(x) => Ok(*x),
         Datum::RegObject { referenced_oid, .. } => Ok(i64::from(*referenced_oid)),
         Datum::Bool(b) => Ok(i64::from(*b)),
@@ -708,6 +738,16 @@ pub(crate) fn parse_int_bounded(
         IntLiteral::Value(v) if (lo..=hi).contains(&v) => Ok(v),
         IntLiteral::Value(_) | IntLiteral::Overflow => Err(out_of_range(s.trim(), target)),
         IntLiteral::Malformed => Err(bad_text(s, target)),
+    }
+}
+
+/// Parses PostgreSQL's unsigned four-byte object identifier. Keeping this
+/// separate from `int4` preserves the valid upper half of the OID domain.
+pub(crate) fn parse_oid(s: &str) -> Result<u32, SqlError> {
+    match classify_int_literal(s) {
+        IntLiteral::Value(value) if (0..=i64::from(u32::MAX)).contains(&value) => Ok(value as u32),
+        IntLiteral::Value(_) | IntLiteral::Overflow => Err(out_of_range(s.trim(), "oid")),
+        IntLiteral::Malformed => Err(bad_text(s, "oid")),
     }
 }
 

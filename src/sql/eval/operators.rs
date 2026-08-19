@@ -594,6 +594,10 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[2]);
             hasher.write(&(*v as i64).to_le_bytes());
         }
+        Datum::Oid(v) => {
+            hasher.write(&[35]);
+            hasher.write(&v.to_le_bytes());
+        }
         Datum::Int8(v) => {
             hasher.write(&[2]);
             hasher.write(&v.to_le_bytes());
@@ -897,8 +901,8 @@ pub(crate) fn compare_datums_as(
             range::cmp_multiranges(a, b, *ka)?
         }
         // Numeric vs integer: compare exactly via numeric.
-        (Datum::Numeric(_), Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_))
-        | (Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_), Datum::Numeric(_)) => {
+        (Datum::Numeric(_), Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_))
+        | (Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_), Datum::Numeric(_)) => {
             // Fall through to the float comparison below only if exactness is
             // not required; integers convert to numeric exactly.
             return compare_numeric_int(l, r);
@@ -944,6 +948,7 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
             Datum::Int2(i16::try_from(x).map_err(|_| overflow("smallint"))?)
         }
         Datum::Int4(_) => Datum::Int4(s.trim().parse().map_err(|_| bad_text(s, "integer"))?),
+        Datum::Oid(_) => Datum::Oid(super::cast::parse_oid(s)?),
         Datum::Int8(_) => Datum::Int8(s.trim().parse().map_err(|_| bad_text(s, "bigint"))?),
         Datum::Float8(_) => Datum::Float8(
             s.trim()

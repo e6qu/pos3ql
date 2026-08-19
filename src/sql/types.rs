@@ -15,6 +15,7 @@ pub mod oid {
     pub const INT2VECTOR: i32 = 22;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
+    pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
     pub const NAME: i32 = 19;
     pub const FLOAT4: i32 = 700;
@@ -756,6 +757,7 @@ impl ColType {
 pub enum ArrElem {
     Bool,
     Int4,
+    Oid,
     Int8,
     Float8,
     Text,
@@ -824,10 +826,11 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 47] = [
+    pub const BUILTIN: [Self; 48] = [
         Self::Bool,
         Self::Int2,
         Self::Int4,
+        Self::Oid,
         Self::Int8,
         Self::Float4,
         Self::Float8,
@@ -894,6 +897,7 @@ impl ArrElem {
         match self {
             ArrElem::Bool => "_bool",
             ArrElem::Int4 => "_int4",
+            ArrElem::Oid => "_oid",
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
@@ -956,6 +960,7 @@ impl ArrElem {
         match self {
             ArrElem::Bool => "boolean[]",
             ArrElem::Int4 => "integer[]",
+            ArrElem::Oid => "oid[]",
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
@@ -1026,6 +1031,7 @@ impl ArrElem {
             Datum::Bool(_) => ArrElem::Bool,
             Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
+            Datum::Oid(_) => ArrElem::Oid,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float4(_) => ArrElem::Float4,
             Datum::Float8(_) => ArrElem::Float8,
@@ -1077,6 +1083,7 @@ impl ArrElem {
             ColType::Varchar => return Some(ArrElem::Varchar),
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
+            ColType::Oid => return Some(ArrElem::Oid),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
             ColType::Bit { varying: false } => return Some(ArrElem::Bit),
@@ -1125,6 +1132,7 @@ impl ArrElem {
         match self {
             ArrElem::Bool => ColType::Bool,
             ArrElem::Int4 => ColType::Int4,
+            ArrElem::Oid => ColType::Oid,
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
@@ -1183,6 +1191,7 @@ impl ArrElem {
         match self {
             ArrElem::Bool => 1000,
             ArrElem::Int4 => 1007,
+            ArrElem::Oid => oid::OID_ARRAY,
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
@@ -1238,6 +1247,7 @@ impl ArrElem {
         match self {
             ArrElem::Bool => 0,
             ArrElem::Int4 => 1,
+            ArrElem::Oid => 63,
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
@@ -1283,6 +1293,7 @@ impl ArrElem {
         Some(match c {
             0 => ArrElem::Bool,
             1 => ArrElem::Int4,
+            63 => ArrElem::Oid,
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
@@ -1634,6 +1645,9 @@ pub enum Datum<'a> {
     /// rows keep the historical 4-byte layout; decode narrows by schema.
     Int2(i16),
     Int4(i32),
+    /// PostgreSQL's unsigned object identifier. This is distinct from int4:
+    /// its upper half is valid and must not be rendered or ordered as negative.
+    Oid(u32),
     Int8(i64),
     /// `real`/`float4`. The width is the type: an f32 holds exactly what
     /// PostgreSQL's real does, so casts round through it and arithmetic between
@@ -1777,6 +1791,7 @@ impl<'a> Datum<'a> {
             Datum::Bool(_) => oid::BOOL,
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
+            Datum::Oid(_) => oid::OID,
             Datum::Int8(_) => oid::INT8,
             Datum::Float4(_) => oid::FLOAT4,
             Datum::Float8(_) => oid::FLOAT8,
@@ -1932,6 +1947,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Bool(false) => f.write_str("f"),
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
+            Datum::Oid(v) => write!(f, "{v}"),
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
@@ -2282,6 +2298,7 @@ mod tests {
         assert_eq!(Datum::Bool(true).to_string(), "t");
         assert_eq!(Datum::Bool(false).to_string(), "f");
         assert_eq!(Datum::Int8(-42).to_string(), "-42");
+        assert_eq!(Datum::Oid(u32::MAX).to_string(), "4294967295");
         assert_eq!(Datum::Float8(2.5).to_string(), "2.5");
         assert_eq!(Datum::Float8(f64::INFINITY).to_string(), "Infinity");
         assert_eq!(Datum::Text("hi").to_string(), "hi");

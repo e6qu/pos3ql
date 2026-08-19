@@ -92,13 +92,14 @@ COMPOSITE_INSERT = """INSERT INTO cb_composite VALUES
   (ARRAY[ROW(-1,8)::cb_point]::cb_point_value[]),
   (NULL)"""
 
-RANGE_ARRAY_DDL = """CREATE TABLE cb_range_arrays (
+BUILTIN_ARRAY_DDL = """CREATE TABLE cb_builtin_arrays (
   int4_values int4range[], int8_values int8range[], numeric_values numrange[],
   date_values daterange[], timestamp_values tsrange[], timestamptz_values tstzrange[],
   int4_multi int4multirange[], int8_multi int8multirange[], numeric_multi nummultirange[],
-  date_multi datemultirange[], timestamp_multi tsmultirange[], timestamptz_multi tstzmultirange[])"""
+  date_multi datemultirange[], timestamp_multi tsmultirange[], timestamptz_multi tstzmultirange[],
+  oid_values oid[])"""
 
-RANGE_ARRAY_INSERT = """INSERT INTO cb_range_arrays VALUES
+BUILTIN_ARRAY_INSERT = """INSERT INTO cb_builtin_arrays VALUES
   (ARRAY['[1,3)'::int4range], ARRAY['[1,3)'::int8range], ARRAY['[1.5,3.5)'::numrange],
    ARRAY['[2021-03-04,2021-03-06)'::daterange],
    ARRAY['[2021-03-04 05:06:07,2021-03-05 05:06:07)'::tsrange],
@@ -106,11 +107,13 @@ RANGE_ARRAY_INSERT = """INSERT INTO cb_range_arrays VALUES
    ARRAY['{[1,3)}'::int4multirange], ARRAY['{[1,3)}'::int8multirange],
    ARRAY['{[1.5,3.5)}'::nummultirange], ARRAY['{[2021-03-04,2021-03-06)}'::datemultirange],
    ARRAY['{[2021-03-04 05:06:07,2021-03-05 05:06:07)}'::tsmultirange],
-   ARRAY['{[2021-03-04 05:06:07+00,2021-03-05 05:06:07+00)}'::tstzmultirange]),
+   ARRAY['{[2021-03-04 05:06:07+00,2021-03-05 05:06:07+00)}'::tstzmultirange],
+   ARRAY[1::oid, 4294967295::oid]),
   (ARRAY[]::int4range[], ARRAY[]::int8range[], ARRAY[]::numrange[], ARRAY[]::daterange[],
    ARRAY[]::tsrange[], ARRAY[]::tstzrange[], ARRAY[]::int4multirange[], ARRAY[]::int8multirange[],
-   ARRAY[]::nummultirange[], ARRAY[]::datemultirange[], ARRAY[]::tsmultirange[], ARRAY[]::tstzmultirange[]),
-  (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
+   ARRAY[]::nummultirange[], ARRAY[]::datemultirange[], ARRAY[]::tsmultirange[], ARRAY[]::tstzmultirange[],
+   ARRAY[]::oid[]),
+  (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
 REFERENCE_DDL = """CREATE TABLE cb_reference_relation (id integer);
 CREATE FUNCTION cb_reference_routine(value integer) RETURNS integer LANGUAGE SQL
@@ -339,43 +342,44 @@ def main():
         fails += 1
         print("DIVERGENCE: catalog-mapped composite-domain array rows differ")
 
-    # The complete range/multirange array family has ordinary, portable type
-    # OIDs, so its dumps must agree byte-for-byte and cross-load unchanged.
+    # These built-in array OIDs are portable, so their dumps must agree
+    # byte-for-byte and cross-load unchanged.
     for c in (pg, p3):
-        c.cursor().execute(RANGE_ARRAY_DDL)
-        c.cursor().execute(RANGE_ARRAY_INSERT)
-    pg_range_dump = dump(pg, "cb_range_arrays")
-    p3_range_dump = dump(p3, "cb_range_arrays")
+        c.cursor().execute(BUILTIN_ARRAY_DDL)
+        c.cursor().execute(BUILTIN_ARRAY_INSERT)
+    pg_range_dump = dump(pg, "cb_builtin_arrays")
+    p3_range_dump = dump(p3, "cb_builtin_arrays")
     if pg_range_dump == p3_range_dump:
-        print("ok: range-array COPY bodies are byte-identical")
+        print("ok: built-in range and oid array COPY bodies are byte-identical")
     else:
         fails += 1
-        print("DIVERGENCE: range-array COPY bodies differ")
+        print("DIVERGENCE: built-in range and oid array COPY bodies differ")
     for c, data in ((pg, pg_range_dump), (p3, pg_range_dump)):
-        c.cursor().execute("DELETE FROM cb_range_arrays")
-        load(c, data, "cb_range_arrays")
+        c.cursor().execute("DELETE FROM cb_builtin_arrays")
+        load(c, data, "cb_builtin_arrays")
     range_text = "SELECT " + ", ".join(
         name + "::text"
         for name in (
             "int4_values", "int8_values", "numeric_values", "date_values",
             "timestamp_values", "timestamptz_values", "int4_multi", "int8_multi",
             "numeric_multi", "date_multi", "timestamp_multi", "timestamptz_multi",
+            "oid_values",
         )
-    ) + " FROM cb_range_arrays ORDER BY int4_values::text NULLS LAST"
+    ) + " FROM cb_builtin_arrays ORDER BY int4_values::text NULLS LAST"
     pg_range_rows = pg.execute(range_text).fetchall()
     p3_range_rows = p3.execute(range_text).fetchall()
     if pg_range_rows == p3_range_rows:
-        print("ok: PostgreSQL range-array COPY input reconstructs identical rows")
+        print("ok: PostgreSQL built-in array COPY input reconstructs identical rows")
     else:
         fails += 1
-        print("DIVERGENCE: PostgreSQL range-array COPY input rows differ")
-    pg.cursor().execute("DELETE FROM cb_range_arrays")
-    load(pg, p3_range_dump, "cb_range_arrays")
+        print("DIVERGENCE: PostgreSQL built-in array COPY input rows differ")
+    pg.cursor().execute("DELETE FROM cb_builtin_arrays")
+    load(pg, p3_range_dump, "cb_builtin_arrays")
     if pg.execute(range_text).fetchall() == p3_range_rows:
-        print("ok: pos3ql range-array binary dump loads into PostgreSQL")
+        print("ok: pos3ql built-in array binary dump loads into PostgreSQL")
     else:
         fails += 1
-        print("DIVERGENCE: pos3ql range-array dump does not round-trip through PostgreSQL")
+        print("DIVERGENCE: pos3ql built-in array dump does not round-trip through PostgreSQL")
 
     for c in (pg, p3):
         c.cursor().execute(REFERENCE_DDL)

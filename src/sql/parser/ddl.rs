@@ -1917,10 +1917,9 @@ impl<'a> Parser<'a> {
                 return Err(self.limit("routines", routines.len()));
             }
             let name = self.qual_name("function name")?;
-            self.expect_op("(")?;
             let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0;
-            if !self.eat_op(")")? {
+            if self.eat_op("(")? && !self.eat_op(")")? {
                 loop {
                     if argument_count == argument_types.len() {
                         return Err(self.limit("function arguments", argument_types.len()));

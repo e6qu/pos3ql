@@ -13000,20 +13000,37 @@ pub fn drop_routine(
             Ok(arguments) => arguments,
             Err(error) => return sql_fail(error),
         };
-        let Some(slot) = storage.routine_slot_by_declared_signature(
+        let slot = match storage.routine_slot_by_declared_signature(
             schema,
             identity.name.name,
             &arguments[..identity.argument_types.len()],
             txn.txid,
-        ) else {
-            if if_exists {
-                continue;
+        ) {
+            Some(slot) => Ok(Some(slot)),
+            None if identity.argument_types.is_empty() => {
+                storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
             }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function \"{}\" does not exist",
-                identity.name.name
-            ));
+            None => Ok(None),
+        };
+        let slot = match slot {
+            Ok(Some(slot)) => slot,
+            Err(()) => {
+                return sql_fail(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function name \"{}\" is not unique",
+                    identity.name.name
+                ));
+            }
+            Ok(None) => {
+                if if_exists {
+                    continue;
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function \"{}\" does not exist",
+                    identity.name.name
+                ));
+            }
         };
         let actual_kind = if matches!(
             storage.routine(slot).kind,

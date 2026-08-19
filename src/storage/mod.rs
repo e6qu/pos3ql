@@ -14686,6 +14686,29 @@ impl Storage {
         })
     }
 
+    /// Resolves PostgreSQL's omitted-argument `DROP FUNCTION name` form.  It
+    /// is valid only when exactly one visible routine has that identity.
+    pub(crate) fn routine_slot_by_name_unambiguous(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<Option<usize>, ()> {
+        let mut found = None;
+        for (slot, routine) in self.routines.iter().enumerate() {
+            if !routine.visible_to(txid)
+                || routine.schema_for(txid).as_str() != schema
+                || routine.name_for(txid).as_str() != name
+            {
+                continue;
+            }
+            if found.replace(slot).is_some() {
+                return Err(());
+            }
+        }
+        Ok(found)
+    }
+
     pub(crate) fn alter_routine_identity(
         &mut self,
         slot: usize,

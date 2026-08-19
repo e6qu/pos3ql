@@ -12074,6 +12074,26 @@ fn table_routines_accept_and_return_catalog_types() {
 }
 
 #[test]
+fn drop_function_without_signature_removes_a_unique_typed_routine() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE drop_routine_state AS ENUM ('ready'); \
+         CREATE FUNCTION drop_routine_state_echo(value drop_routine_state) RETURNS drop_routine_state LANGUAGE SQL AS 'SELECT $1'; \
+         DROP FUNCTION drop_routine_state_echo; \
+         DROP TYPE drop_routine_state; \
+         SELECT count(*) FROM pg_type WHERE typname = 'drop_routine_state'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
     let mut config = test_config("routine-user-types-recovery");
     config.object_store_on = true;

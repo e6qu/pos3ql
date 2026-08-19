@@ -332,8 +332,12 @@ fn streaming_scalar_subquery<'a>(
                 ));
             }
             count += 1;
-            let value =
-                normalize_array_subquery_element(values[0], &witness, storage, txid, arena)?;
+            // Scalar subqueries preserve the datum produced by their select.
+            // Array constructors have a target element type and normalize each
+            // member separately; applying that rule here can turn a runtime
+            // aggregate result (for example numeric) into its static text
+            // witness before an enclosing comparison sees it.
+            let value = values[0];
             storage
                 .with_block_store(|blocks| {
                     sorter.push_projected_by(blocks, 1, |_| value, &mut compare)
@@ -1073,12 +1077,11 @@ impl ScopeChain<'_, '_> {
 }
 
 /// Whether a top-level subquery node references any column from the enclosing
-/// query — i.e. is correlated and must be re-evaluated per outer row. A node
-/// unresolvable against its own (and any nested subquery's) scope is treated
-/// as correlated; false positives only cost a redundant per-row evaluation.
+/// query — i.e. is correlated and must be re-evaluated per outer row.
 fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     let select = match node {
@@ -1091,21 +1094,22 @@ fn subquery_node_correlated<'a>(
     let scope = select
         .from
         .as_ref()
-        .map(|from| correlation_schema(storage, from, arena))
+        .map(|from| correlation_schema(storage, txid, from, arena))
         .transpose()?
         .flatten();
     let chain = ScopeChain {
         scope: scope.as_ref(),
         parent: None,
     };
-    select_has_outer_ref(select, &chain, storage, arena)
+    select_has_outer_ref(select, &chain, storage, txid, arena)
 }
 
 /// A scope that needs an enclosing row cannot be described as a stand-alone
 /// schema. Preserve that state explicitly so correlation analysis can inspect
-/// its outer references; fully static sources still resolve their errors now.
+/// its outer references in the statement's catalog snapshot.
 fn correlation_schema<'a>(
     storage: &'a Storage,
+    txid: u32,
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
@@ -1114,7 +1118,7 @@ fn correlation_schema<'a>(
     if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
         return Ok(None);
     }
-    QueryScope::resolve_schema(storage, from, 0, arena).map(Some)
+    QueryScope::resolve_schema(storage, from, txid, arena).map(Some)
 }
 
 /// Whether any column in this select (WHERE or projection) fails to resolve
@@ -1123,17 +1127,18 @@ fn select_has_outer_ref<'a>(
     select: &'a Select<'a>,
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     if let Some(from) = select.from.as_ref() {
-        if table_ref_has_outer_ref(&from.base, chain, storage, arena)? {
+        if table_ref_has_outer_ref(&from.base, chain, storage, txid, arena)? {
             return Ok(true);
         }
         for join in from.joins {
-            if table_ref_has_outer_ref(&join.table, chain, storage, arena)?
+            if table_ref_has_outer_ref(&join.table, chain, storage, txid, arena)?
                 || join
                     .on
-                    .map(|on| expr_has_outer_ref(on, chain, storage, arena))
+                    .map(|on| expr_has_outer_ref(on, chain, storage, txid, arena))
                     .transpose()?
                     .unwrap_or(false)
             {
@@ -1142,29 +1147,29 @@ fn select_has_outer_ref<'a>(
         }
     }
     if let Some(predicate) = select.where_clause
-        && expr_has_outer_ref(predicate, chain, storage, arena)?
+        && expr_has_outer_ref(predicate, chain, storage, txid, arena)?
     {
         return Ok(true);
     }
     if let Some(predicate) = select.having
-        && expr_has_outer_ref(predicate, chain, storage, arena)?
+        && expr_has_outer_ref(predicate, chain, storage, txid, arena)?
     {
         return Ok(true);
     }
     for expression in select.group_by {
-        if expr_has_outer_ref(expression, chain, storage, arena)? {
+        if expr_has_outer_ref(expression, chain, storage, txid, arena)? {
             return Ok(true);
         }
     }
     for order in select.order_by {
-        if expr_has_outer_ref(order.expression, chain, storage, arena)? {
+        if expr_has_outer_ref(order.expression, chain, storage, txid, arena)? {
             return Ok(true);
         }
     }
     for item in select.items {
         if match item {
             SelectItem::Expr { expression, .. } => {
-                expr_has_outer_ref(expression, chain, storage, arena)?
+                expr_has_outer_ref(expression, chain, storage, txid, arena)?
             }
             _ => false,
         } {
@@ -1182,11 +1187,12 @@ fn table_ref_has_outer_ref<'a>(
     table: &'a crate::sql::ast::TableRef<'a>,
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     if let Some(arguments) = table.func_args {
         for argument in arguments {
-            if expr_has_outer_ref(argument, chain, storage, arena)? {
+            if expr_has_outer_ref(argument, chain, storage, txid, arena)? {
                 return Ok(true);
             }
         }
@@ -1197,14 +1203,14 @@ fn table_ref_has_outer_ref<'a>(
     let scope = select
         .from
         .as_ref()
-        .map(|from| correlation_schema(storage, from, arena))
+        .map(|from| correlation_schema(storage, txid, from, arena))
         .transpose()?
         .flatten();
     let child = ScopeChain {
         scope: scope.as_ref(),
         parent: Some(chain),
     };
-    select_has_outer_ref(select, &child, storage, arena)
+    select_has_outer_ref(select, &child, storage, txid, arena)
 }
 
 /// Whether any column reference in `expression` resolves only in an enclosing scope
@@ -1214,6 +1220,7 @@ fn expr_has_outer_ref<'a>(
     expression: &'a Expr<'a>,
     chain: &ScopeChain<'_, 'a>,
     storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
     match expression {
@@ -1222,14 +1229,14 @@ fn expr_has_outer_ref<'a>(
             let sscope = s
                 .from
                 .as_ref()
-                .map(|from| correlation_schema(storage, from, arena))
+                .map(|from| correlation_schema(storage, txid, from, arena))
                 .transpose()?
                 .flatten();
             let child = ScopeChain {
                 scope: sscope.as_ref(),
                 parent: Some(chain),
             };
-            select_has_outer_ref(s, &child, storage, arena)
+            select_has_outer_ref(s, &child, storage, txid, arena)
         }
         Expr::InSubquery {
             operand, select, ..
@@ -1237,20 +1244,20 @@ fn expr_has_outer_ref<'a>(
             let sscope = select
                 .from
                 .as_ref()
-                .map(|from| correlation_schema(storage, from, arena))
+                .map(|from| correlation_schema(storage, txid, from, arena))
                 .transpose()?
                 .flatten();
             let child = ScopeChain {
                 scope: sscope.as_ref(),
                 parent: Some(chain),
             };
-            Ok(select_has_outer_ref(select, &child, storage, arena)?
-                || expr_has_outer_ref(operand, chain, storage, arena)?)
+            Ok(select_has_outer_ref(select, &child, storage, txid, arena)?
+                || expr_has_outer_ref(operand, chain, storage, txid, arena)?)
         }
         _ => {
             let mut found = false;
             walk_children(expression, &mut |child| {
-                if expr_has_outer_ref(child, chain, storage, arena)? {
+                if expr_has_outer_ref(child, chain, storage, txid, arena)? {
                     found = true;
                 }
                 Ok(())
@@ -1286,7 +1293,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
     let mut corr: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
     let mut n_corr = 0;
     for node in nodes[..n].iter().flatten() {
-        if subquery_node_correlated(node, storage, arena)? {
+        if subquery_node_correlated(node, storage, txid, arena)? {
             corr[n_corr] = Some(*node);
             n_corr += 1;
         } else {

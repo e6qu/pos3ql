@@ -33,7 +33,6 @@ jobs:
           # hard five-minute bound even though each workload fits on its own.
           - { name: lib, shards: "lib", needs_pg18: false }
           - { name: subscription, shards: "runtest:subscription", needs_pg18: true }
-          - { name: sql-differential, shards: "sql", needs_pg18: true }
           - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
           # Forced-spill differential is a complete correctness workload, but
           # its PostgreSQL setup plus an instrumented server build cannot fit

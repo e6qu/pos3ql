@@ -1320,15 +1320,17 @@ pub(crate) fn select_hash_join_plan<'a>(
         return Ok(None);
     }
     // A partitioned source owns rows in several leaf maps. Its physical row
-    // identity is not representable by the hash run's rowid-only payload, so
-    // choose the ordinary bounded join implementation before execution.
-    if matches!(
-        storage.table_def(scope.slots[probe_table], txid).partition,
-        crate::storage::PartitionDef::Parent { .. }
-    ) || matches!(
-        storage.table_def(scope.slots[build_table], txid).partition,
-        crate::storage::PartitionDef::Parent { .. }
-    ) {
+    // identity is not representable by the hash run's rowid-only payload.
+    // Derived sources have no storage slot, so classify that boundary before
+    // asking storage for partition metadata.
+    let is_partition_parent = |source: usize| {
+        scope.derived[source].is_none()
+            && matches!(
+                storage.table_def(scope.slots[source], txid).partition,
+                crate::storage::PartitionDef::Parent { .. }
+            )
+    };
+    if is_partition_parent(probe_table) || is_partition_parent(build_table) {
         return Ok(None);
     }
     let on = join.on.or(scope.join_on[0]);
@@ -2363,10 +2365,11 @@ fn scan_source_mode<'a>(
                 }
             }
         } else if depth == 0
-            || matches!(
-                storage.table_def(scope.slots[order[depth]], txid).partition,
-                crate::storage::PartitionDef::Parent { .. }
-            )
+            || (scope.derived[order[depth]].is_none()
+                && matches!(
+                    storage.table_def(scope.slots[order[depth]], txid).partition,
+                    crate::storage::PartitionDef::Parent { .. }
+                ))
         {
             // Outermost scan: iterate in heap-offset (insertion) order so a
             // per-row error surfaces on the same row as PostgreSQL, whose heap

@@ -26698,6 +26698,18 @@ fn common_table_expressions() {
         )),
         ["1", "2", "3"]
     );
+    // A recursive CTE is a derived source, not a catalog relation.  Joining
+    // it to a table must not inspect partition metadata through its sentinel
+    // slot while choosing a physical join implementation.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
+             SELECT t.id, c.n FROM t JOIN c ON t.id = c.n ORDER BY t.id",
+        )),
+        ["1|1", "2|2", "3|3", "4|4"]
+    );
     // The CTE's materialized descriptor must retain the declared varchar
     // modifier through the outer Describe response.
     let description = describe_with(

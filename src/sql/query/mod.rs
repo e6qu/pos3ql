@@ -2184,9 +2184,9 @@ pub(crate) fn describe_select<'a>(
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(sel.items, &scope, None, storage, txid, arena, out)
+            describe_select_items(sel.items, Some(&scope), storage, txid, arena, out)
         }
-        None => describe_catalog_items(sel.items, None, storage, txid, out),
+        None => describe_select_items(sel.items, None, storage, txid, arena, out),
     }
 }
 
@@ -2965,7 +2965,11 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             txid,
         };
         let check = |e: &Expr| -> Result<(), SqlError> {
-            super::exec::infer_type_res(e, &columns).map(|_| ())
+            if user_type_expression_description(e, "", storage, txid).is_some() {
+                Ok(())
+            } else {
+                super::exec::infer_type_res(e, &columns).map(|_| ())
+            }
         };
         let analyze = || -> Result<(), SqlError> {
             // SELECT-list items first: PostgreSQL analyzes types before it folds
@@ -3020,6 +3024,16 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = patch_array_subquery_field_types(
+        statement.items,
+        Some(&scope),
+        storage,
+        txid,
+        arena,
+        &mut columns[..n_cols],
+    ) {
+        return sql_fail(e);
+    }
     patch_subquery_column_types(
         statement.items,
         Some(&scope),
@@ -3441,6 +3455,16 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = patch_array_subquery_field_types(
+        statement.items,
+        None,
+        storage,
+        txid,
+        arena,
+        &mut columns[..n],
+    ) {
+        return sql_fail(e);
+    }
     patch_subquery_column_types(
         statement.items,
         None,
@@ -4867,7 +4891,39 @@ pub fn describe_catalog_items_as<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    let count = describe_items(items, definition, alias, Some(storage), txid, out)?;
+    // User-defined casts carry identity and, for named composites, field
+    // shape through the catalog. Resolve them before the catalog-free
+    // descriptor pass: static inference deliberately cannot reconstruct that
+    // information from an expression such as `(composite_array[1]).field`.
+    let mut count = 0;
+    for item in items {
+        if let SelectItem::Expr { expression, alias } = item
+            && let Some(description) = user_type_expression_description(
+                expression,
+                alias.unwrap_or(super::exec::derived_name(expression)),
+                storage,
+                txid,
+            )
+        {
+            if count == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "select list too wide"
+                ));
+            }
+            out[count] = description;
+            count += 1;
+            continue;
+        }
+        count += describe_items(
+            core::slice::from_ref(item),
+            definition,
+            alias,
+            Some(storage),
+            txid,
+            &mut out[count..],
+        )?;
+    }
     let mut column = 0;
     for item in items {
         match item {
@@ -4986,7 +5042,106 @@ pub fn describe_select_items<'q>(
             }
         }
     }
+    patch_array_subquery_field_types(items, scope, storage, txid, arena, out)?;
     Ok(count)
+}
+
+/// Refines a field selected from an `ARRAY(subquery)` named-composite element.
+/// Generic expression inference has no catalog for the subquery's inner FROM
+/// scope; resolve that scope here, at the catalog-aware description boundary.
+fn patch_array_subquery_field_types<'q>(
+    items: &[SelectItem<'q>],
+    outer_scope: Option<&QueryScope<'q>>,
+    storage: &'q Storage,
+    txid: u32,
+    arena: &'q Arena,
+    out: &mut [ColDesc<'q>],
+) -> Result<(), SqlError> {
+    let mut column = 0;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => column += outer_scope.map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(table) => {
+                if let Some(scope) = outer_scope
+                    && let Ok(table) = scope.table_index(table)
+                {
+                    column += scope.defs[table].expect("resolved").n_columns;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                column += outer_scope.map_or(0, |scope| record_star_width(base, scope));
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some((ctype, type_mod)) =
+                    array_subquery_field_type(expression, outer_scope, storage, txid, arena)?
+                {
+                    out[column] = ColDesc::of_type(out[column].name, ctype).with_type_mod(type_mod);
+                }
+                column += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn array_subquery_field_type<'q>(
+    expression: &Expr<'q>,
+    outer_scope: Option<&QueryScope<'q>>,
+    storage: &'q Storage,
+    txid: u32,
+    arena: &'q Arena,
+) -> Result<Option<(ColType, i32)>, SqlError> {
+    let Expr::Field { base, field } = expression else {
+        return Ok(None);
+    };
+    let Expr::Subscript { base: array, .. } = &**base else {
+        return Ok(None);
+    };
+    let Expr::ArraySubquery(select) = &**array else {
+        return Ok(None);
+    };
+    let mut element = [ColDesc::new("", 0, 0); 1];
+    let count = match &select.from {
+        Some(from) => {
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            describe_scope_items(
+                select.items,
+                &scope,
+                outer_scope,
+                storage,
+                txid,
+                arena,
+                &mut element,
+            )?
+        }
+        None => describe_select_items(
+            select.items,
+            outer_scope,
+            storage,
+            txid,
+            arena,
+            &mut element,
+        )?,
+    };
+    if count != 1 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subquery must return only one column"
+        ));
+    }
+    let oid = element[0].type_oid;
+    if !(super::types::oid::FIRST_COMPOSITE
+        ..super::types::oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        .contains(&oid)
+    {
+        return Ok(None);
+    }
+    let slot = (oid - super::types::oid::FIRST_COMPOSITE) as usize;
+    let composite = storage.composite_for(slot, txid);
+    Ok(composite
+        .active_fields()
+        .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
+        .map(|candidate| (candidate.ctype, candidate.type_mod)))
 }
 
 #[derive(Clone, Copy)]
@@ -5009,27 +5164,31 @@ fn subquery_result_type<'a>(
         _ => return Ok(None),
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = match &select.from {
-        Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(
+    let count = if let Some(body) = select.set_body {
+        describe_set_tree(body, storage, txid, arena, &mut columns)?
+    } else {
+        match &select.from {
+            Some(from) => {
+                let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+                describe_scope_items(
+                    select.items,
+                    &scope,
+                    outer_scope,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                )?
+            }
+            None => describe_select_items(
                 select.items,
-                &scope,
                 outer_scope,
                 storage,
                 txid,
                 arena,
                 &mut columns,
-            )?
+            )?,
         }
-        None => describe_select_items(
-            select.items,
-            outer_scope,
-            storage,
-            txid,
-            arena,
-            &mut columns,
-        )?,
     };
     if count != 1 {
         return Err(sql_err!(
@@ -5065,6 +5224,14 @@ fn subquery_result_type<'a>(
         {
             Some(super::types::oid::enum_array_oid(
                 (element_oid - super::types::oid::FIRST_ENUM) as u16,
+            ))
+        }
+        None if (super::types::oid::FIRST_COMPOSITE
+            ..super::types::oid::FIRST_COMPOSITE + u16::MAX as i32 + 1)
+            .contains(&element_oid) =>
+        {
+            Some(super::types::oid::composite_array_oid(
+                (element_oid - super::types::oid::FIRST_COMPOSITE) as u16,
             ))
         }
         None => None,
@@ -5283,6 +5450,25 @@ fn user_type_expression_description<'q>(
             let (ctype, _) = super::exec::catalog_column_type(storage, txid, array.type_oid)?;
             return matches!(ctype, super::types::ColType::Array(_)).then_some(array);
         }
+        Expr::Field { base, field } => {
+            if let Some(base) = user_type_expression_description(base, name, storage, txid)
+                && let Some((super::types::ColType::Composite(slot), _)) =
+                    super::exec::catalog_column_type(storage, txid, base.type_oid)
+                && let Some(field) = storage
+                    .composite_for(slot as usize, txid)
+                    .active_fields()
+                    .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
+            {
+                return Some(
+                    ColDesc::new(
+                        name,
+                        catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
+                        field.ctype.typlen(),
+                    )
+                    .with_type_mod(field.type_mod),
+                );
+            }
+        }
         _ => {}
     }
     let Expr::Field { base, field } = expression else {
@@ -5303,6 +5489,45 @@ fn user_type_expression_description<'q>(
     user_type_cast_description(args.get(position)?, name, storage, txid)
 }
 
+/// Maps stored user-type identity back to its PostgreSQL OID.  A field's
+/// runtime `ColType` is its executable representation; its identity controls
+/// the descriptor exposed through a composite boundary.
+fn catalog_declared_type_oid(
+    storage: &Storage,
+    ctype: super::types::ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+    txid: u32,
+) -> Option<i32> {
+    let Some(identity) = user_type else {
+        return Some(ctype.oid());
+    };
+    if let Some(slot) =
+        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
+            super::types::oid::domain_array_oid(slot as u16)
+        } else {
+            super::types::oid::domain_oid(slot as u16)
+        });
+    }
+    if let Some(slot) = storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
+            super::types::oid::enum_array_oid(slot as u16)
+        } else {
+            super::types::oid::enum_oid(slot as u16)
+        });
+    }
+    storage
+        .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        .map(|slot| {
+            if matches!(ctype, super::types::ColType::Array(_)) {
+                super::types::oid::composite_array_oid(slot as u16)
+            } else {
+                super::types::oid::composite_oid(slot as u16)
+            }
+        })
+}
+
 fn catalog_array_element_description<'q>(
     array: ColDesc<'q>,
     name: &'q str,
@@ -5314,6 +5539,11 @@ fn catalog_array_element_description<'q>(
         super::types::ColType::Array(super::types::ArrElem::Enum(slot)) => {
             Some(ColDesc::new(name, super::types::oid::enum_oid(slot), 4))
         }
+        super::types::ColType::Array(super::types::ArrElem::Composite(slot)) => Some(ColDesc::new(
+            name,
+            super::types::oid::composite_oid(slot),
+            -1,
+        )),
         super::types::ColType::Array(super::types::ArrElem::Domain { slot, .. }) => {
             let domain = storage.domain(slot as usize);
             Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))

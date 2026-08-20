@@ -304,81 +304,15 @@ fn describe_record_star<'q>(
     }
 }
 
-/// Maps a type oid back to a ColType (numeric tower + common types).
+/// Maps a type OID back to its modeled column type. The canonical decoder owns
+/// scalar, range, and array identities; this boundary adds only PostgreSQL's
+/// internal `"char"` catalog type.
 pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
-    Some(match o {
-        oid::BOOL => ColType::Bool,
-        oid::INT2 => ColType::Int2,
-        oid::INT4 => ColType::Int4,
-        oid::OID => ColType::Oid,
-        oid::INT8 => ColType::Int8,
-        oid::NUMERIC => ColType::Numeric,
-        oid::FLOAT4 => ColType::Float4,
-        oid::FLOAT8 => ColType::Float8,
-        oid::TEXT => ColType::Text,
-        oid::VARCHAR => ColType::Varchar,
-        oid::BPCHAR => ColType::Bpchar,
-        oid::DATE => ColType::Date,
-        oid::TIMESTAMP => ColType::Timestamp,
-        oid::TIMESTAMPTZ => ColType::Timestamptz,
-        oid::TIME => ColType::Time,
-        oid::TIMETZ => ColType::Timetz,
-        oid::INTERVAL => ColType::Interval,
-        oid::JSON => ColType::Json,
-        oid::JSONB => ColType::Jsonb,
-        oid::UUID => ColType::Uuid,
-        oid::BYTEA => ColType::Bytea,
-        oid::INET => ColType::Inet,
-        oid::CIDR => ColType::Cidr,
-        oid::MACADDR => ColType::Macaddr,
-        oid::MACADDR8 => ColType::Macaddr8,
-        oid::INT4MULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Int4),
-        oid::INT8MULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Int8),
-        oid::NUMMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Num),
-        oid::DATEMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Date),
-        oid::TSMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Ts),
-        oid::TSTZMULTIRANGE => ColType::Multirange(crate::sql::types::RangeKind::Tstz),
-        oid::BIT => ColType::Bit { varying: false },
-        oid::VARBIT => ColType::Bit { varying: true },
-        oid::RECORD => ColType::Record,
-        // `"char"` (internal single-byte) appears in catalog columns; treat it
-        // as text so catalog-derived tables describe.
-        18 => ColType::Text,
-        oid::NAME => ColType::Name,
-        // Array OIDs (catalog columns like indkey/conkey/indoption are arrays).
-        1000 => ColType::Array(crate::sql::types::ArrElem::Bool),
-        1005 => ColType::Array(crate::sql::types::ArrElem::Int2),
-        1007 => ColType::Array(crate::sql::types::ArrElem::Int4),
-        1016 => ColType::Array(crate::sql::types::ArrElem::Int8),
-        1021 => ColType::Array(crate::sql::types::ArrElem::Float4),
-        1022 => ColType::Array(crate::sql::types::ArrElem::Float8),
-        1009 | 1002 => ColType::Array(crate::sql::types::ArrElem::Text),
-        1015 => ColType::Array(crate::sql::types::ArrElem::Varchar),
-        1014 => ColType::Array(crate::sql::types::ArrElem::Bpchar),
-        1003 => ColType::Array(crate::sql::types::ArrElem::Name),
-        1231 => ColType::Array(crate::sql::types::ArrElem::Numeric),
-        1182 => ColType::Array(crate::sql::types::ArrElem::Date),
-        1115 => ColType::Array(crate::sql::types::ArrElem::Timestamp),
-        1185 => ColType::Array(crate::sql::types::ArrElem::Timestamptz),
-        1183 => ColType::Array(crate::sql::types::ArrElem::Time),
-        1270 => ColType::Array(crate::sql::types::ArrElem::Timetz),
-        1187 => ColType::Array(crate::sql::types::ArrElem::Interval),
-        2951 => ColType::Array(crate::sql::types::ArrElem::Uuid),
-        1001 => ColType::Array(crate::sql::types::ArrElem::Bytea),
-        199 => ColType::Array(crate::sql::types::ArrElem::Json),
-        3807 => ColType::Array(crate::sql::types::ArrElem::Jsonb),
-        oid::INET_ARRAY => ColType::Array(crate::sql::types::ArrElem::Inet),
-        oid::CIDR_ARRAY => ColType::Array(crate::sql::types::ArrElem::Cidr),
-        oid::MACADDR_ARRAY => ColType::Array(crate::sql::types::ArrElem::Macaddr),
-        oid::MACADDR8_ARRAY => ColType::Array(crate::sql::types::ArrElem::Macaddr8),
-        3904 => ColType::Range(crate::sql::types::RangeKind::Int4),
-        3926 => ColType::Range(crate::sql::types::RangeKind::Int8),
-        3906 => ColType::Range(crate::sql::types::RangeKind::Num),
-        3912 => ColType::Range(crate::sql::types::RangeKind::Date),
-        3908 => ColType::Range(crate::sql::types::RangeKind::Ts),
-        3910 => ColType::Range(crate::sql::types::RangeKind::Tstz),
-        _ => return ColType::from_oid(o),
-    })
+    if o == 18 {
+        Some(ColType::Text)
+    } else {
+        ColType::from_oid(o)
+    }
 }
 
 /// Unifies two types by PostgreSQL's numeric preference (int4<int8<numeric<
@@ -1978,6 +1912,22 @@ pub fn infer_type_res(
         Expr::Field { base, field } => match record_field_type(base, field, columns) {
             Ok(t) => of(t),
             Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
+            // The subquery executor preserves the element's named-composite
+            // identity, but this catalog-free inference boundary cannot
+            // resolve an inner FROM item. Query description refines this
+            // provisional type before exposing it to a client.
+            Err(e)
+                if e.sqlstate == "42703"
+                    && matches!(
+                        &**base,
+                        Expr::Subscript {
+                            base: array,
+                            ..
+                        } if matches!(&**array, Expr::ArraySubquery(_))
+                    ) =>
+            {
+                of(ColType::Text)
+            }
             Err(e) => return Err(e),
         },
         Expr::Call {

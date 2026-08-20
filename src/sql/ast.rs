@@ -2202,9 +2202,13 @@ impl Expr<'_> {
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
+            // Catalog-defined casts need the query catalog for both their
+            // validation and their runtime representation. They are not
+            // foldable through the catalog-free evaluator.
             Expr::Cast { type_name, .. }
                 if type_name.eq_ignore_ascii_case("regclass")
-                    || type_name.eq_ignore_ascii_case("regtype") =>
+                    || type_name.eq_ignore_ascii_case("regtype")
+                    || crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
             {
                 false
             }

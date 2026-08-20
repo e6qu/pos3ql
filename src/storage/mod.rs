@@ -12688,6 +12688,20 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         if let Some(identity) = spec.base_user_type {
             spec.base = match spec.base {
+                ColType::Enum(slot)
+                    if slot != ColType::ENUM_SLOT_UNRESOLVED
+                        && (slot as usize) < self.enums.len()
+                        && self.enum_for(slot as usize, txid).visible_to(txid) =>
+                {
+                    // WAL preserves the catalog slot. Its spelling can be stale
+                    // after an older domain image is replayed over a moved type.
+                    let definition = self.enum_for(slot as usize, txid);
+                    spec.base_user_type = Some(UserTypeName {
+                        schema: definition.schema,
+                        name: definition.name,
+                    });
+                    ColType::Enum(slot)
+                }
                 ColType::Enum(_) => {
                     match self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
                         Some(slot) => ColType::Enum(slot as u16),
@@ -12703,6 +12717,20 @@ impl Storage {
                             ));
                         }
                     }
+                }
+                ColType::Composite(slot)
+                    if slot != ColType::COMPOSITE_SLOT_UNRESOLVED
+                        && (slot as usize) < self.composites.len()
+                        && self.composite_for(slot as usize, txid).visible_to(txid) =>
+                {
+                    // See the enum case: slot identity is durable; names are a
+                    // rebindable catalog projection.
+                    let definition = self.composite_for(slot as usize, txid);
+                    spec.base_user_type = Some(UserTypeName {
+                        schema: definition.schema,
+                        name: definition.name,
+                    });
+                    ColType::Composite(slot)
                 }
                 ColType::Composite(_) => match self.composite_slot(
                     identity.schema.as_str(),

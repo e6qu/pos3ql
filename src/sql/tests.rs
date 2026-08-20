@@ -6,6 +6,19 @@
 
 use super::*;
 
+#[test]
+fn result_description_decodes_the_complete_builtin_array_inventory() {
+    for element in crate::sql::types::ArrElem::BUILTIN {
+        assert_eq!(
+            super::exec::coltype_of_oid(element.array_oid()),
+            Some(crate::sql::types::ColType::Array(element)),
+            "array OID {} ({}) must survive result description",
+            element.array_oid(),
+            element.array_name(),
+        );
+    }
+}
+
 fn test_config(name: &str) -> Config {
     let dir = std::env::temp_dir().join(format!("pos3ql-engine-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&dir);
@@ -5083,6 +5096,20 @@ fn client_min_messages_filters_by_severity() {
 }
 
 #[test]
+fn rollback_without_transaction_emits_postgresql_warning() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget, "ROLLBACK");
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(message_types(&output), [b'N', b'C'], "{text}");
+    assert!(
+        text.contains("WARNING")
+            && text.contains("25P01")
+            && text.contains("there is no transaction in progress"),
+        "{text}"
+    );
+}
+
+#[test]
 fn session_gucs_honored_or_rejected_faithfully() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -5715,6 +5742,140 @@ fn describe_array_subquery_uses_the_array_type() {
             "SELECT ARRAY(SELECT values FROM describe_arrays)",
         )),
         [crate::sql::types::ArrElem::Int4.array_oid()]
+    );
+}
+
+#[test]
+fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_sets() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE array_subquery_pair AS (x integer, y text); \
+         CREATE DOMAIN array_subquery_pair_value AS array_subquery_pair; \
+         CREATE TABLE array_subquery_pairs (value array_subquery_pair); \
+         INSERT INTO array_subquery_pairs VALUES (ROW(1, 'one')::array_subquery_pair)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let type_oid = crate::sql::types::oid::composite_array_oid(
+        engine
+            .storage
+            .resolve_composite_slot("array_subquery_pair", 0)
+            .unwrap() as u16,
+    );
+    let nonempty = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs)::text",
+    );
+    assert_eq!(
+        data_rows(&nonempty),
+        ["{\"(1,one)\"}"],
+        "{}",
+        String::from_utf8_lossy(&nonempty)
+    );
+    let empty = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)",
+    );
+    assert_eq!(data_rows(&empty), ["{}"]);
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY(SELECT value FROM array_subquery_pairs WHERE false)",
+    );
+    assert_eq!(row_description_type_oids(&described), [type_oid]);
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE array_subquery_pairs_copy AS \
+         SELECT ARRAY(SELECT value FROM array_subquery_pairs) AS values",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values FROM array_subquery_pairs_copy",
+        )),
+        [type_oid]
+    );
+    let field = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x",
+    );
+    assert_eq!(
+        data_rows(&field),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&field)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY(SELECT value FROM array_subquery_pairs))[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    let constructed_element = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]::text",
+    );
+    assert_eq!(
+        data_rows(&constructed_element),
+        ["(7,8)"],
+        "{}",
+        String::from_utf8_lossy(&constructed_element)
+    );
+    let constructed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]).x",
+    );
+    assert_eq!(
+        data_rows(&constructed),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&constructed)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY[ROW(7,8)::array_subquery_pair]::array_subquery_pair[])[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
+    );
+    let constructed_domain = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ((ARRAY[ROW(9,10)::array_subquery_pair_value]::array_subquery_pair_value[])[1]).x",
+    );
+    assert_eq!(
+        data_rows(&constructed_domain),
+        ["9"],
+        "{}",
+        String::from_utf8_lossy(&constructed_domain)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ((ARRAY[ROW(9,10)::array_subquery_pair_value]::array_subquery_pair_value[])[1]).x",
+        )),
+        [crate::sql::types::oid::INT4]
     );
 }
 
@@ -17655,13 +17816,19 @@ fn domains_enforce_and_report() {
         data_rows(&run_with(&mut e, &mut b, "SELECT xs FROM nested")),
         ["{3,4}"]
     );
+    let altered = run_with(
+        &mut e,
+        &mut b,
+        "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)",
+    );
     assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut e,
-            &mut b,
-            "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)"
-        ))
-        .contains("2BP01")
+        String::from_utf8_lossy(&altered).contains("ALTER DOMAIN"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,9]::smallpos[]"))
+            .contains("23514")
     );
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT ARRAY[1,10]::smallpos[]"))
@@ -17753,6 +17920,57 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         ))
         .contains("23514")
     );
+}
+
+#[test]
+fn alter_domain_revalidates_scalar_and_array_elements() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE checked_point AS (x integer, y integer); \
+         CREATE DOMAIN checked_point_value AS checked_point CHECK ((VALUE).x > 0); \
+         CREATE DOMAIN checked_point_child AS checked_point_value; \
+         CREATE TABLE checked_points (point checked_point_child, points checked_point_child[]); \
+         INSERT INTO checked_points VALUES \
+           (ROW(1, 1)::checked_point, \
+            ARRAY[ROW(2, 2)::checked_point, ROW(5, 5)::checked_point]::checked_point_child[]), \
+           (ROW(3, 3)::checked_point, NULL)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let tightened = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).y > 0)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tightened).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tightened)
+    );
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).x < 5)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let post_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO checked_points VALUES (ROW(8, 1)::checked_point, NULL); \
+         SELECT (point).x FROM checked_points ORDER BY (point).x",
+    );
+    assert_eq!(data_rows(&post_rollback), ["1", "3", "8"]);
 }
 
 #[test]
@@ -17925,10 +18143,13 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             &mut budget,
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
-             CREATE DOMAIN point_value AS domain_point; \
+             CREATE DOMAIN point_value AS domain_point CHECK ((VALUE).x > 0); \
              CREATE TABLE domain_point_values (values point_value[], direct_values domain_point[]); \
              INSERT INTO domain_point_values VALUES \
                (ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point]); \
+             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
+             CREATE TABLE array_subquery_values AS \
+               SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
              ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
              CHECKPOINT",
@@ -17938,6 +18159,17 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "{}",
             String::from_utf8_lossy(&output)
         );
+        let domain = engine.storage.domain(
+            engine
+                .storage
+                .domain_slot("public", "point_value", 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            domain.base_user_type.unwrap().schema.as_str(),
+            "durable_domain"
+        );
+        assert_eq!(domain.base_user_type.unwrap().name.as_str(), "moved_point");
         engine.commit_wal().unwrap();
     }
     let mut budget = Budget::new(1 << 29);
@@ -17946,9 +18178,31 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT values::text,direct_values::text FROM domain_point_values",
+            "SELECT values::text,direct_values::text FROM domain_point_values; \
+             SELECT values::text FROM array_subquery_values; \
+             SELECT (values[1]).x FROM array_subquery_values",
         )),
-        ["{\"(7,8)\"}|{\"(9,10)\"}"]
+        ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}", "9"]
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN point_value ADD CHECK ((VALUE).x < 7)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let post_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (ARRAY[ROW(9,1)::durable_domain.moved_point]::point_value[])::text",
+    );
+    assert_eq!(
+        data_rows(&post_rollback),
+        ["{\"(9,1)\"}"],
+        "{post_rollback:?}"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

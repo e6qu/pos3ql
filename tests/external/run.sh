@@ -157,9 +157,17 @@ ok "server up (pid $SERVER_PID)"
 
 psql_run() { # <name>
   local name=$1
+  # psql writes echoed SQL and result rows to stdout but errors to stderr.
+  # Their ordering after `2>&1` is scheduler-dependent, so compare each
+  # stream against the corresponding portion of the established golden file.
+  local expected_out="$WORK/$name.expected.out" expected_err="$WORK/$name.expected.err"
+  awk -v out="$expected_out" -v err="$expected_err" \
+    '/^psql:/ { print > err; next } { print > out }' \
+    "$EXT/expected/$name.out"
   "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -a -q -P pager=off \
-    -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2>&1
-  if diff -u "$EXT/expected/$name.out" "$WORK/$name.out" > "$WORK/$name.diff"; then
+    -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2> "$WORK/$name.err"
+  if diff -u "$expected_out" "$WORK/$name.out" > "$WORK/$name.diff" \
+    && diff -u "$expected_err" "$WORK/$name.err" >> "$WORK/$name.diff"; then
     ok "psql golden: $name"
   else
     bad "psql golden: $name (see $WORK/$name.diff)"
@@ -530,18 +538,29 @@ if want torture; then
 
 step "crash torture: random DML + kill -9 + cold starts vs real PostgreSQL"
 TORTURE_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
-if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBIN/postgres" ]]; then
-  # A hermetic reference cluster, as the differential suite builds one.
+if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && ( -x "$TORTURE_PGBIN/postgres" || -n "${POS3QL_REFERENCE_PG_HOST:-}" ) ]]; then
+  # Local runs own a hermetic cluster. CI supplies the same PostgreSQL 18
+  # service used by the other oracle jobs, avoiding a slow package download
+  # before the bounded torture workload begins.
+  TORTURE_PG_HOST=127.0.0.1
   TORTURE_PG_PORT=15497
+  TORTURE_OWNS_REFERENCE=true
+  if [[ ! -x "$TORTURE_PGBIN/postgres" ]]; then
+    TORTURE_PG_HOST=$POS3QL_REFERENCE_PG_HOST
+    TORTURE_PG_PORT=${POS3QL_REFERENCE_PG_PORT:-5432}
+    TORTURE_OWNS_REFERENCE=false
+  fi
+  if [[ $TORTURE_OWNS_REFERENCE == true ]]; then
   "$TORTURE_PGBIN/initdb" -D "$WORK/torture-pgdata" -U postgres -A trust \
     --encoding=UTF8 --lc-collate=C --lc-ctype=C >/dev/null 2>&1
   TORTURE_SOCK=$(mktemp -d /tmp/pos3ql-torture-sock.XXXX)
   "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" \
     -o "-p $TORTURE_PG_PORT -k $TORTURE_SOCK -c listen_addresses=127.0.0.1 -c timezone=UTC" \
     -l "$WORK/torture-pg.log" start >/dev/null
+  fi
   if P3_BIN="${POS3QL_BIN:-./target/release/pos3ql}" P3_CONF="$WORK/server.conf" \
      P3_PORT=$PG_PORT P3_DATADIR="$WORK/data" P3_LOG="$WORK/server.log" P3_INITIAL_PID=$SERVER_PID \
-     PGHOST=127.0.0.1 PGPORT=$TORTURE_PG_PORT PGUSER=postgres PGDATABASE=postgres \
+     PGHOST=$TORTURE_PG_HOST PGPORT=$TORTURE_PG_PORT PGUSER=postgres PGDATABASE=postgres \
      "$POS3QL_VENV/bin/python" tests/external/torture_diff.py \
        --rounds "${POS3QL_TORTURE_ROUNDS:-12}" --seed "${POS3QL_TORTURE_SEED:-20260723}" \
        > "$WORK/torture.out" 2>&1; then
@@ -552,8 +571,10 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && -x "$TORTURE_PGBI
     printf '%s\n' '--- pos3ql server log after crash torture ---'
     tail -80 "$WORK/server.log"
   fi
-  "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1
-  rm -rf "$TORTURE_SOCK"
+  if [[ $TORTURE_OWNS_REFERENCE == true ]]; then
+    "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1
+    rm -rf "$TORTURE_SOCK"
+  fi
   # The torture script may have restarted the server under its own pid.
   lsof -ti tcp:$PG_PORT -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
   sleep 0.3

@@ -90,16 +90,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install PostgreSQL 18 client and Python
+      - name: Expose PostgreSQL 18 dump tools from the service image
         run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc |
-            sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          # Refresh only the added PGDG source. The runner already has current
-          # Ubuntu indexes; updating every unrelated feed exceeds the job bound.
-          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18 python3-venv
-          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+          mkdir -p .ci-bin
+          for client in pg_dump pg_restore; do
+            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp postgres:18 $client \"\$@\"" > ".ci-bin/$client"
+          done
+          chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
+          echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust build
         uses: actions/cache@v5
@@ -149,4 +147,4 @@ jobs:
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward zero.
           FUZZ_BUDGET: "0"
-        run: bash tests/external/ci_diff.sh
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh

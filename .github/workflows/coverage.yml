@@ -32,10 +32,7 @@ jobs:
           # Keep them in distinct jobs: serializing either pair can exceed the
           # hard five-minute bound even though each workload fits on its own.
           - { name: lib, shards: "lib", needs_pg18: false }
-          - { name: subscription, shards: "runtest:subscription", needs_pg18: true }
           - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
-          - { name: torture-a, shards: "runtest:torture", torture_seed: 20260723, needs_pg18: true }
-          - { name: torture-b, shards: "runtest:torture", torture_seed: 20260725, needs_pg18: true }
           - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
           - { name: ingest, shards: "runtest:ingest", needs_pg18: false }
           - { name: tls-correctness, shards: "runtest:tls", needs_pg18: false }
@@ -45,23 +42,12 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Most shards need only the runner's PostgreSQL client. PostgreSQL 18's
-      # wire client is installed without the server for protocol coverage;
-      # only torture and subscription need local server binaries.
-      - name: Install only the tools this shard needs
+      - name: Expose PostgreSQL 18 psql for protocol coverage
+        if: matrix.needs_pg18_client
         run: |
-          if [ "${{ matrix.needs_pg18 || matrix.needs_pg18_client }}" = "true" ]; then
-            sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-            sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-            if [ "${{ matrix.needs_pg18 }}" = "true" ]; then
-              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-18
-            else
-              sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
-            fi
-          else
-            sudo apt-get install -y postgresql-client
-          fi
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
+          chmod +x .ci-bin/psql
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
@@ -70,7 +56,7 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
-          POS3QL_PSQL: ${{ matrix.needs_pg18 && '/usr/lib/postgresql/18/bin/psql' || 'psql' }}
+          POS3QL_PSQL: ${{ matrix.needs_pg18_client && format('{0}/.ci-bin/psql', github.workspace) || 'psql' }}
           COVERAGE_SHARDS: ${{ matrix.shards }}
           POS3QL_TORTURE_ROUNDS: ${{ matrix.torture_seed && 6 || '' }}
           POS3QL_TORTURE_SEED: ${{ matrix.torture_seed || '' }}
@@ -88,6 +74,72 @@ jobs:
           # The runtest:* (torture) shards write no tracefile by design; let
           # their upload find nothing rather than error.
           if-no-files-found: ignore
+
+  torture:
+    name: shard torture-${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: a, seed: 20260723 }
+          - { name: b, seed: 20260725 }
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Python venv for crash torture
+        run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
+      - name: Run crash torture against the PostgreSQL 18 service
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PSQL: psql
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_TORTURE_ROUNDS: "6"
+          POS3QL_TORTURE_SEED: ${{ matrix.seed }}
+          COVERAGE_SHARD: runtest:torture
+        run: sh tools/coverage.sh
+
+  subscription:
+    name: shard subscription
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Expose PostgreSQL 18 publisher and client adapters
+        run: |
+          docker run --rm --detach --name pos3ql-subscription-publisher \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 postgres:18 \
+            -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/bin/sh' 'exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"' > .ci-bin/psql
+          printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/postgres
+          printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/initdb
+          printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/pg_ctl
+          chmod +x .ci-bin/psql .ci-bin/postgres .ci-bin/initdb .ci-bin/pg_ctl
+          for _ in $(seq 1 50); do .ci-bin/psql -h 127.0.0.1 -p 15496 -U postgres -X -q -c 'SELECT 1' >/dev/null 2>&1 && exit 0; sleep 0.1; done
+          exit 1
+      - name: Run logical-subscription recovery against PostgreSQL 18
+        env:
+          POS3QL_PGBIN: ${{ github.workspace }}/.ci-bin
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
+          COVERAGE_SHARD: runtest:subscription
+        run: sh tools/coverage.sh
 
   spill-differential:
     name: shard spilldiff
@@ -108,21 +160,15 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
-      - name: Install client tools
-        run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
       - name: Python venv for differential oracles
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
       - name: Run forced-spill differential
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
-          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_PSQL: psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
-          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_REFERENCE_PSQL: psql
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 
@@ -153,19 +199,13 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install PostgreSQL 18 client
-        run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo timeout 30s apt-get -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -o Acquire::Retries=0 -o Acquire::https::Timeout=20 update
-          sudo timeout 90s apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=20 install -y postgresql-client-18
       - name: Python venv for the differential harnesses
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
       - name: Measure
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
-          POS3QL_PSQL: /usr/lib/postgresql/18/bin/psql
-          POS3QL_REFERENCE_PSQL: /usr/lib/postgresql/18/bin/psql
+          POS3QL_PSQL: psql
+          POS3QL_REFERENCE_PSQL: psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
           COVERAGE_SHARDS: "run:diff"

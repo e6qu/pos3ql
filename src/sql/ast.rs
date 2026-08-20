@@ -1691,6 +1691,12 @@ pub struct CopyStmt<'a> {
     /// `TO STDOUT` when true; `FROM STDIN` otherwise.
     pub to: bool,
     pub options: CopyOptions<'a>,
+    /// `COPY FROM ... WHERE` predicate, parsed with the statement so invalid
+    /// syntax cannot enter the streaming protocol.
+    pub where_clause: Option<&'a Expr<'a>>,
+    /// The parsed predicate's exact source. COPY input outlives the statement
+    /// arena, so execution owns this bounded source in its setup.
+    pub where_text: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

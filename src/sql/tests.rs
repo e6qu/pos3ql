@@ -27470,6 +27470,119 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
 }
 
 #[test]
+fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_where (id integer DEFAULT 9, payload text NOT NULL)",
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy where send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "copy where sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_where (payload) FROM STDIN WHERE id = 9 AND payload <> 'skip'",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters streaming mode");
+    arena.reset();
+    assert_eq!(
+        engine
+            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"skip")
+            .unwrap(),
+        crate::sql::exec::CopyRowOutcome::Filtered
+    );
+    arena.reset();
+    assert_eq!(
+        engine
+            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"\\N")
+            .unwrap(),
+        crate::sql::exec::CopyRowOutcome::Filtered,
+        "a NULL predicate filters before the row's NOT NULL constraint"
+    );
+    arena.reset();
+    assert_eq!(
+        engine
+            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"keep")
+            .unwrap(),
+        crate::sql::exec::CopyRowOutcome::Stored
+    );
+    engine.copy_finish(&mut txn, &guc).unwrap();
+
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "copy where binary send", 1 << 18).unwrap();
+    arena.reset();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_where (id, payload) FROM STDIN (FORMAT binary) WHERE id > 10",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("binary COPY enters streaming mode");
+    let binary_row = [
+        0, 2, // field count
+        0, 0, 0, 4, 0, 0, 0, 10, // id
+        0, 0, 0, 4, b's', b'k', b'i', b'p', // payload
+    ];
+    arena.reset();
+    assert_eq!(
+        engine
+            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, &binary_row)
+            .unwrap(),
+        crate::sql::exec::CopyRowOutcome::Filtered
+    );
+    engine.copy_finish(&mut txn, &guc).unwrap();
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, payload FROM copy_where ORDER BY payload"
+        )),
+        ["9|keep"]
+    );
+    for sql in [
+        "COPY copy_where TO STDOUT WHERE id = 9",
+        "COPY copy_where FROM STDIN WHERE EXISTS (SELECT 1)",
+        "CREATE TABLE copy_where_generated (id integer, doubled integer GENERATED ALWAYS AS (id * 2) STORED); COPY copy_where_generated FROM STDIN WHERE doubled = 2",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains('E'),
+            "{sql} must be rejected before COPY input"
+        );
+    }
+}
+
+#[test]
 fn binary_copy_rows_reject_malformed_frames_without_panicking() {
     let (mut engine, mut budget) = test_engine();
     run_with(

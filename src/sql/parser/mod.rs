@@ -2107,6 +2107,8 @@ impl<'a> Parser<'a> {
                 query: Some(query),
                 to: true,
                 options,
+                where_clause: None,
+                where_text: None,
             }));
         }
         let table = self.qual_name("table name")?;
@@ -2144,6 +2146,16 @@ impl<'a> Parser<'a> {
         };
         let options = self.copy_options()?;
         self.validate_copy_options(&options)?;
+        let (where_clause, where_text) = if self.eat_ident("where")? {
+            let start = self.peek_at;
+            let predicate = self.expression(0)?;
+            (
+                Some(predicate),
+                Some(self.text[start..self.peek_at].trim_end()),
+            )
+        } else {
+            (None, None)
+        };
         let columns = self.arena_slice(&columns[..n_columns])?;
         Ok(Stmt::Copy(crate::sql::ast::CopyStmt {
             table,
@@ -2151,6 +2163,8 @@ impl<'a> Parser<'a> {
             query: None,
             to,
             options,
+            where_clause,
+            where_text,
         }))
     }
 

@@ -17,8 +17,9 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, ROUTINE_SQL_MAX, RoutineArgumentDef,
-    RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, ROUTINE_SQL_MAX,
+    RoutineArgumentDef, RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage,
+    TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -18833,6 +18834,283 @@ pub struct CopySetup {
     pub on_error: crate::sql::ast::CopyErrorAction,
     pub reject_limit: Option<u64>,
     pub log_verbosity: crate::sql::ast::CopyLogVerbosity,
+    filter: CopyFilter,
+}
+
+/// COPY FROM either admits every decoded candidate or evaluates the one
+/// startup-validated predicate retained in connection-owned fixed storage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyFilterMode {
+    All,
+    Predicate,
+}
+
+#[derive(Clone, Copy)]
+struct CopyFilter {
+    mode: CopyFilterMode,
+    source: StackStr<CHECK_SQL_MAX>,
+}
+
+/// The only two successful COPY-row outcomes. Keeping filtering distinct from
+/// storage prevents the wire command tag from counting rows COPY WHERE did
+/// not insert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyRowOutcome {
+    Stored,
+    Filtered,
+}
+
+impl CopyFilter {
+    fn resolve(statement: &crate::sql::ast::CopyStmt, def: &TableDef) -> Result<Self, SqlError> {
+        let Some(predicate) = statement.where_clause else {
+            return Ok(Self {
+                mode: CopyFilterMode::All,
+                source: StackStr::new(),
+            });
+        };
+        if statement.to {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY WHERE cannot be used with COPY TO"
+            ));
+        }
+        validate_copy_predicate(predicate, def)?;
+        let row = RowCtx {
+            def,
+            values: &[],
+            alias: None,
+        };
+        if let Some(ctype) = crate::sql::eval::static_type_pub(predicate, &row)
+            && ctype != ColType::Bool
+        {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of COPY WHERE must be type boolean, not type {}",
+                ctype.name()
+            ));
+        }
+        let source = statement
+            .where_text
+            .expect("COPY WHERE AST retains its parsed source");
+        let source = StackStr::<CHECK_SQL_MAX>::from_str(source);
+        if source.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "COPY WHERE predicate exceeds {} bytes",
+                CHECK_SQL_MAX
+            ));
+        }
+        Ok(Self {
+            mode: CopyFilterMode::Predicate,
+            source,
+        })
+    }
+
+    /// Evaluates after input coercion, defaults, and generated values, but
+    /// before constraints or a durable write. The source was parsed before
+    /// CopyInResponse and is re-parsed only because streamed rows recycle the
+    /// statement arena between protocol chunks.
+    fn accepts(
+        self,
+        storage: &Storage,
+        txid: u32,
+        seq_session: &crate::sql::guc::SeqSession,
+        def: &TableDef,
+        values: &[Datum],
+        arena: &Arena,
+    ) -> Result<bool, SqlError> {
+        if self.mode == CopyFilterMode::All {
+            return Ok(true);
+        }
+        let predicate = crate::sql::parser::parse_expr(self.source.as_str(), arena)?;
+        let row = RowCtx {
+            def,
+            values,
+            alias: None,
+        };
+        let sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequence),
+            ..NO_HOOKS
+        };
+        match eval_full(predicate, arena, &[], &row, &hooks)? {
+            Datum::Bool(value) => Ok(value),
+            Datum::Null => Ok(false),
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of COPY WHERE must be type boolean, not type {}",
+                crate::sql::eval::static_type_pub(predicate, &row)
+                    .map(ColType::name)
+                    .unwrap_or("unknown")
+            )),
+        }
+    }
+}
+
+/// COPY WHERE is a row-local predicate. PostgreSQL rejects both subqueries
+/// and generated columns before accepting any CopyData.
+fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
+    let column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
+        if let Some(qualifier) = qualifier
+            && !crate::sql::eval::qualifier_answers_target(def, None, qualifier)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                qualifier
+            ));
+        }
+        let Some(index) = def.column_index(name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ));
+        };
+        if def.columns()[index].default.is_generated() {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "cannot use generated column \"{}\" in COPY WHERE",
+                name
+            ));
+        }
+        Ok(())
+    };
+    match expression {
+        Expr::Column { qualifier, name } => column(*qualifier, name),
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+            ..
+        } => {
+            if *schema != def.schema.as_str() || *table != def.name.as_str() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}.{}\"",
+                    schema,
+                    table
+                ));
+            }
+            column(None, name)
+        }
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+            Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in COPY WHERE"
+            ))
+        }
+        Expr::Call { over: Some(_), .. } => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use window function in COPY WHERE"
+        )),
+        Expr::Call { name, .. } if expression.is_aggregate() => Err(sql_err!(
+            sqlstate::GROUPING_ERROR,
+            "aggregate functions are not allowed in COPY WHERE"
+        )),
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Field { base: operand, .. }
+        | Expr::Subscript { base: operand, .. } => validate_copy_predicate(operand, def),
+        Expr::Binary { left, right, .. }
+        | Expr::Match {
+            operand: left,
+            pattern: right,
+            ..
+        }
+        | Expr::AnyAll {
+            operand: left,
+            array: right,
+            ..
+        } => {
+            validate_copy_predicate(left, def)?;
+            validate_copy_predicate(right, def)
+        }
+        Expr::Like {
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_copy_predicate(operand, def)?;
+            validate_copy_predicate(pattern, def)?;
+            if let Some(escape) = escape {
+                validate_copy_predicate(escape, def)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            validate_copy_predicate(operand, def)?;
+            validate_copy_predicate(low, def)?;
+            validate_copy_predicate(high, def)
+        }
+        Expr::Slice { base, lower, upper } => {
+            validate_copy_predicate(base, def)?;
+            if let Some(lower) = lower {
+                validate_copy_predicate(lower, def)?;
+            }
+            if let Some(upper) = upper {
+                validate_copy_predicate(upper, def)?;
+            }
+            Ok(())
+        }
+        Expr::InList { operand, list, .. } => {
+            validate_copy_predicate(operand, def)?;
+            for expression in *list {
+                validate_copy_predicate(expression, def)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_copy_predicate(operand, def)?;
+            }
+            for (when, then) in *whens {
+                validate_copy_predicate(when, def)?;
+                validate_copy_predicate(then, def)?;
+            }
+            if let Some(otherwise) = otherwise {
+                validate_copy_predicate(otherwise, def)?;
+            }
+            Ok(())
+        }
+        Expr::Call { args, filter, .. } => {
+            for argument in *args {
+                validate_copy_predicate(argument, def)?;
+            }
+            if let Some(filter) = filter {
+                validate_copy_predicate(filter, def)?;
+            }
+            Ok(())
+        }
+        Expr::Array(items) => {
+            for item in *items {
+                validate_copy_predicate(item, def)?;
+            }
+            Ok(())
+        }
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_)
+        | Expr::Param(_)
+        | Expr::DefaultMarker
+        | Expr::WholeRow(_) => Ok(()),
+    }
 }
 
 /// The resolved, owned form of a COPY's format options — owned because a COPY
@@ -19002,6 +19280,7 @@ pub fn copy_begin(
         ));
     }
     let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
+    let filter = CopyFilter::resolve(statement, def)?;
     if !statement.to {
         for &target in &targets[..n_targets] {
             if def.columns()[target].default.is_generated() {
@@ -19022,6 +19301,7 @@ pub fn copy_begin(
         on_error: opts.on_error,
         reject_limit: opts.reject_limit,
         log_verbosity: opts.log_verbosity,
+        filter,
     })
 }
 
@@ -19100,7 +19380,7 @@ pub fn copy_row(
     setup: &CopySetup,
     line: &[u8],
     arena: &Arena,
-) -> Result<(), SqlError> {
+) -> Result<CopyRowOutcome, SqlError> {
     let def = *storage.table_def(setup.table_index, txn.txid);
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let fmt = &setup.fmt;
@@ -19191,6 +19471,16 @@ pub fn copy_row(
         txn.txid,
         arena,
     )?;
+    if !setup.filter.accepts(
+        storage,
+        txn.txid,
+        seq_session,
+        &def,
+        &values[..def.n_columns],
+        arena,
+    )? {
+        return Ok(CopyRowOutcome::Filtered);
+    }
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -19212,7 +19502,8 @@ pub fn copy_row(
         setup.table_index,
         None,
         &values[..def.n_columns],
-    )
+    )?;
+    Ok(CopyRowOutcome::Stored)
 }
 
 /// One COPY FROM binary row: `row` is the int16 field count followed by each
@@ -19226,7 +19517,7 @@ pub fn copy_row_binary(
     setup: &CopySetup,
     row: &[u8],
     arena: &Arena,
-) -> Result<(), SqlError> {
+) -> Result<CopyRowOutcome, SqlError> {
     let def = *storage.table_def(setup.table_index, txn.txid);
     let malformed = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid COPY binary row");
     let mut reader = crate::pg::wire::MsgIn::new(row);
@@ -19291,6 +19582,16 @@ pub fn copy_row_binary(
         txn.txid,
         arena,
     )?;
+    if !setup.filter.accepts(
+        storage,
+        txn.txid,
+        seq_session,
+        &def,
+        &values[..def.n_columns],
+        arena,
+    )? {
+        return Ok(CopyRowOutcome::Filtered);
+    }
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -19312,7 +19613,8 @@ pub fn copy_row_binary(
         setup.table_index,
         None,
         &values[..def.n_columns],
-    )
+    )?;
+    Ok(CopyRowOutcome::Stored)
 }
 
 /// Applies one pgoutput INSERT tuple through the ordinary row core. Omitted

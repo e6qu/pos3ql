@@ -1420,7 +1420,8 @@ impl Conn {
                         &self.arena,
                         line,
                     ) {
-                        Ok(()) => copy.count += 1,
+                        Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
+                        Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                         Err(error) => record_copy_input_error(&mut self.send, copy, error),
                     }
                 }
@@ -1500,7 +1501,8 @@ impl Conn {
                             &self.arena,
                             row,
                         ) {
-                            Ok(()) => copy.count += 1,
+                            Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
+                            Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                             Err(e) => copy.failed = Some(e),
                         }
                     }
@@ -1546,7 +1548,8 @@ impl Conn {
                     &self.arena,
                     line,
                 ) {
-                    Ok(()) => copy.count += 1,
+                    Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
+                    Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                     Err(error) => record_copy_input_error(&mut self.send, copy, error),
                 }
             }

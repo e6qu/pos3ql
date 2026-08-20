@@ -3242,6 +3242,49 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
 }
 
 #[test]
+fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE publication_parent (id int PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE publication_leaf PARTITION OF publication_parent FOR VALUES FROM (0) TO (10); \
+         CREATE PUBLICATION partition_changes FOR TABLE publication_parent WHERE (id > 10)",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_parent VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("partition_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("partitioned publication transaction is retained");
+    assert!(emitted);
+    assert!(
+        send.readable()
+            .windows(b"publication_leaf".len())
+            .any(|window| window == b"publication_leaf"),
+        "default publication identity and row filter are those of the physical partition"
+    );
+    assert!(send.readable().windows(1).any(|byte| byte == b"I"));
+}
+
+#[test]
 fn logical_replication_row_filter_suppresses_unmatched_rows() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();

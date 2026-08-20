@@ -11,7 +11,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, SqlName, Storage};
+use crate::storage::{MAX_COLUMNS, Storage};
 
 #[derive(Clone, Copy)]
 pub struct RelationBinding {
@@ -196,7 +196,7 @@ pub enum ApplyResult {
 /// local transaction, relation cache, and scratch arena so a remote commit is
 /// either entirely applied and durable or entirely rolled back.
 pub struct SubscriptionApply {
-    name: SqlName,
+    stream: crate::storage::SubscriptionStream,
     txn: TxnState,
     guc: GucState,
     relations: RelationMap,
@@ -216,16 +216,16 @@ impl SubscriptionApply {
             + arena_bytes
     }
 
-    pub fn new(
+    pub(crate) fn new(
         budget: &mut Budget,
-        name: SqlName,
+        stream: crate::storage::SubscriptionStream,
         relation_capacity: usize,
         txn_rows: usize,
         arena_bytes: usize,
         confirmed_lsn: u64,
     ) -> Result<Self, BudgetError> {
         Ok(Self {
-            name,
+            stream,
             txn: TxnState::new(budget, txn_rows)?,
             guc: GucState::new(),
             relations: RelationMap::new(budget, relation_capacity)?,
@@ -242,13 +242,17 @@ impl SubscriptionApply {
     /// Rebinds a preallocated worker after its former transport has stopped.
     /// The worker must be idle, so no transaction, row lock, relation mapping,
     /// or arena reference can cross a subscription identity change.
-    pub fn bind(&mut self, name: SqlName, confirmed_lsn: u64) -> Result<(), SqlError> {
+    pub(crate) fn bind(
+        &mut self,
+        stream: crate::storage::SubscriptionStream,
+        confirmed_lsn: u64,
+    ) -> Result<(), SqlError> {
         if self.remote != RemoteTransaction::Idle || self.txn.is_active() {
             return Err(Self::protocol_error(
                 "subscription worker cannot change binding during a remote transaction",
             ));
         }
-        self.name = name;
+        self.stream = stream;
         self.confirmed_lsn = confirmed_lsn;
         self.relations.clear();
         self.arena.reset();
@@ -258,7 +262,7 @@ impl SubscriptionApply {
     pub fn unbind(&mut self) {
         debug_assert_eq!(self.remote, RemoteTransaction::Idle);
         debug_assert!(!self.txn.is_active());
-        self.name = SqlName::EMPTY;
+        self.stream = crate::storage::SubscriptionStream::EMPTY;
         self.confirmed_lsn = 0;
         self.relations.clear();
         self.arena.reset();
@@ -314,11 +318,7 @@ impl SubscriptionApply {
                 RemoteTransaction::Applying { final_lsn }
                     if commit_lsn == final_lsn && end_lsn <= frame_end_lsn =>
                 {
-                    if !engine.stage_subscription_advance(
-                        &mut self.txn,
-                        self.name.as_str(),
-                        end_lsn,
-                    )? {
+                    if !engine.stage_subscription_advance(&mut self.txn, self.stream, end_lsn)? {
                         return Err(Self::protocol_error(
                             "subscription received a non-monotonic commit after apply began",
                         ));

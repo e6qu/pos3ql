@@ -67,7 +67,7 @@ type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), Sq
 /// borrow while it drives a network socket or applies a remote transaction.
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionRuntime {
-    pub name: SqlName,
+    pub stream: crate::storage::SubscriptionStream,
     pub endpoint: crate::pg::replication_client::ConnectionInfo,
     pub publications: [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
@@ -758,17 +758,18 @@ impl Engine {
                 subscription.enabled_to(0) && subscription.slot_name != SqlName::EMPTY
             })
             .and_then(|(_, subscription)| {
-                subscription
-                    .connection
-                    .endpoint()
-                    .map(|endpoint| SubscriptionRuntime {
-                        name: subscription.name,
-                        endpoint,
-                        publications: subscription.publications,
-                        publication_count: subscription.publication_count,
-                        slot: subscription.slot_name,
-                        confirmed_lsn: subscription.confirmed_lsn,
-                    })
+                subscription.connection.endpoint().and_then(|endpoint| {
+                    self.storage
+                        .subscription_stream(slot, 0)
+                        .map(|stream| SubscriptionRuntime {
+                            stream,
+                            endpoint,
+                            publications: subscription.publications,
+                            publication_count: subscription.publication_count,
+                            slot: subscription.slot_name,
+                            confirmed_lsn: subscription.confirmed_lsn,
+                        })
+                })
             })
     }
     /// Returns the startup-bounded endpoint retained for a durable
@@ -789,6 +790,16 @@ impl Engine {
             .map(|(_, subscription)| subscription.confirmed_lsn)
     }
 
+    #[cfg(test)]
+    pub(crate) fn subscription_stream(
+        &self,
+        name: &str,
+    ) -> Option<crate::storage::SubscriptionStream> {
+        self.storage
+            .subscription(name, 0)
+            .and_then(|(slot, _)| self.storage.subscription_stream(slot, 0))
+    }
+
     /// Opens the local transaction that will receive one publisher commit.
     /// The worker uses the ordinary engine transaction and durability path;
     /// replication cannot create a second, weaker write path.
@@ -804,10 +815,10 @@ impl Engine {
     /// Couples a publisher commit position to the active local transaction.
     /// `false` means the position was already committed locally, so a replayed
     /// remote transaction must be skipped before it can mutate rows.
-    pub fn stage_subscription_advance(
+    pub(crate) fn stage_subscription_advance(
         &mut self,
         txn: &mut TxnState,
-        name: &str,
+        stream: crate::storage::SubscriptionStream,
         confirmed_lsn: u64,
     ) -> Result<bool, SqlError> {
         if !txn.is_active() {
@@ -818,7 +829,7 @@ impl Engine {
         }
         let Some(advance) = self
             .storage
-            .subscription_advance(name, confirmed_lsn, txn.txid)?
+            .subscription_advance(stream, confirmed_lsn, txn.txid)?
         else {
             return Ok(false);
         };
@@ -2298,6 +2309,8 @@ impl Engine {
                 lsn,
                 &WalOp::AdvanceSubscription {
                     name: advance.name(),
+                    created_at: advance.stream().created_at(),
+                    definition_generation: advance.stream().definition_generation(),
                     confirmed_lsn: advance.confirmed_lsn(),
                 },
             ) {
@@ -7951,9 +7964,30 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::AdvanceSubscription {
             name,
+            created_at,
+            definition_generation,
             confirmed_lsn,
         } => {
-            if let Some(advance) = storage.subscription_advance(name, confirmed_lsn, 0)? {
+            let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal subscription advance for unknown subscription \"{}\"",
+                    name
+                )
+            })?;
+            let stream = storage
+                .subscription_stream(slot, 0)
+                .filter(|stream| {
+                    stream.created_at() == created_at
+                        && stream.definition_generation() == definition_generation
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "journal subscription advance targets a replaced stream definition"
+                    )
+                })?;
+            if let Some(advance) = storage.subscription_advance(stream, confirmed_lsn, 0)? {
                 storage.apply_subscription_advance(advance);
             }
         }

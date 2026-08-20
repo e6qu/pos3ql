@@ -3929,6 +3929,15 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
+            "SELECT partrelid FROM pg_partitioned_table WHERE 0 = ANY(partclass)",
+        )),
+        Vec::<String>::new(),
+        "pg_dump probes partition operator classes through this catalog column"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
             "SELECT parent.relname FROM pg_inherits i \
              JOIN pg_class child ON child.oid = i.inhrelid \
              JOIN pg_class parent ON parent.oid = i.inhparent \

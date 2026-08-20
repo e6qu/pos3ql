@@ -3881,6 +3881,7 @@ fn pg_partitioned_table<'a>(
             ("partrelid", ColType::Int4),
             ("partstrat", ColType::Bpchar),
             ("partattrs", ColType::Text),
+            ("partclass", ColType::Array(super::types::ArrElem::Oid)),
             ("partexprs", ColType::Text),
         ],
     );
@@ -3919,6 +3920,7 @@ fn pg_partitioned_table<'a>(
                 Datum::Int4(table_oid(storage, slot)),
                 text(strategy, arena)?,
                 text(attributes.as_str(), arena)?,
+                Datum::Null,
                 Datum::Null,
             ],
             arena,

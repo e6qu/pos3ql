@@ -56,7 +56,13 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 . "$EXT/liveness.sh"
 
-cleanup() { [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null; rm -rf "$WORK"; }
+cleanup() {
+  local status=$?
+  [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
+  rm -rf "$WORK"
+  trap - EXIT
+  exit "$status"
+}
 trap cleanup EXIT
 
 # --- psycopg venv (the differential/fuzz scripts need it) -------------------

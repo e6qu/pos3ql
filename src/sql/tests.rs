@@ -27370,6 +27370,106 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
 }
 
 #[test]
+fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_controls (id integer DEFAULT 9, note text)",
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy controls send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "copy controls sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_controls FROM STDIN \
+                 (FORMAT csv, HEADER match, DEFAULT 'DEFAULT', \
+                  ON_ERROR ignore, REJECT_LIMIT 2, LOG_VERBOSITY verbose)",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters streaming mode");
+    assert!(matches!(
+        setup.on_error,
+        crate::sql::ast::CopyErrorAction::Ignore
+    ));
+    assert_eq!(setup.reject_limit, Some(2));
+    assert!(matches!(
+        setup.log_verbosity,
+        crate::sql::ast::CopyLogVerbosity::Verbose
+    ));
+    arena.reset();
+    engine
+        .copy_match_header(&setup, b"id,note", &arena)
+        .expect("matching header");
+    arena.reset();
+    let bad_header = engine
+        .copy_match_header(&setup, b"note,id", &arena)
+        .expect_err("reordered header must fail");
+    assert_eq!(bad_header.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    arena.reset();
+    engine
+        .copy_row_line(
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            b"DEFAULT,loaded",
+        )
+        .expect("DEFAULT marker uses the column default");
+    arena.reset();
+    let conversion = engine
+        .copy_row_line(
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            b"not-an-integer,rejected",
+        )
+        .expect_err("bad integer must remain a typed conversion error");
+    assert!(crate::sql::exec::copy_ignorable_error(&conversion));
+    assert!(conversion.message.as_str().contains("COPY column \"id\""));
+    engine.copy_finish(&mut txn, &guc).unwrap();
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, note FROM copy_controls"
+        )),
+        ["9|loaded"]
+    );
+    for sql in [
+        "COPY copy_controls TO STDOUT (ON_ERROR ignore)",
+        "COPY (SELECT id FROM copy_controls) TO STDOUT (ON_ERROR ignore)",
+        "COPY copy_controls FROM STDIN (FORMAT binary, ON_ERROR ignore)",
+        "COPY copy_controls FROM STDIN (FORMAT binary, DEFAULT 'DEFAULT')",
+        "COPY copy_controls FROM STDIN (REJECT_LIMIT 1)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains('E'),
+            "{sql} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn binary_copy_rows_reject_malformed_frames_without_panicking() {
     let (mut engine, mut budget) = test_engine();
     run_with(

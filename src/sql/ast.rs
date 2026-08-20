@@ -1703,6 +1703,29 @@ pub enum CopyFormat {
     Binary,
 }
 
+/// The header contract for text or CSV COPY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyHeader {
+    None,
+    Skip,
+    Match,
+}
+
+/// COPY FROM's conversion-error policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyErrorAction {
+    Stop,
+    Ignore,
+}
+
+/// Notices emitted for rows discarded by `ON_ERROR ignore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyLogVerbosity {
+    Default,
+    Verbose,
+    Silent,
+}
+
 /// The `WITH (...)` options of a COPY, as written. Character options are stored
 /// as given; the effective values (format defaults filled in) are resolved at
 /// execution. The `force_*` column lists name columns, resolved against the
@@ -1715,8 +1738,16 @@ pub struct CopyOptions<'a> {
     /// The string that stands for NULL; `None` = the format default (`\N` text,
     /// empty CSV).
     pub null_string: Option<&'a str>,
-    /// CSV only: emit / expect a header line of column names.
-    pub header: bool,
+    /// CSV/text header handling. `MATCH` validates names during COPY FROM.
+    pub header: CopyHeader,
+    /// Text/CSV COPY FROM conversion-error handling.
+    pub on_error: CopyErrorAction,
+    /// Maximum discarded conversion errors when `on_error` is `Ignore`.
+    pub reject_limit: Option<u64>,
+    /// Reporting policy for discarded conversion errors.
+    pub log_verbosity: CopyLogVerbosity,
+    /// COPY FROM text/CSV sentinel that selects a column default.
+    pub default_string: Option<&'a str>,
     /// CSV only: the quoting character (default `"`).
     pub quote: Option<u8>,
     /// CSV only: the character that escapes a quote inside a quoted field
@@ -1739,7 +1770,11 @@ impl CopyOptions<'_> {
         format: CopyFormat::Text,
         delimiter: None,
         null_string: None,
-        header: false,
+        header: CopyHeader::None,
+        on_error: CopyErrorAction::Stop,
+        reject_limit: None,
+        log_verbosity: CopyLogVerbosity::Default,
+        default_string: None,
         quote: None,
         escape: None,
         force_quote_all: false,

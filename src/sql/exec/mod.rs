@@ -18826,9 +18826,13 @@ pub fn reindex(
 #[derive(Clone, Copy)]
 pub struct CopySetup {
     pub table_index: usize,
+    pub txid: u32,
     pub targets: [usize; MAX_COLUMNS],
     pub n_targets: usize,
     pub fmt: CopyFmt,
+    pub on_error: crate::sql::ast::CopyErrorAction,
+    pub reject_limit: Option<u64>,
+    pub log_verbosity: crate::sql::ast::CopyLogVerbosity,
 }
 
 /// The resolved, owned form of a COPY's format options — owned because a COPY
@@ -18841,8 +18845,9 @@ pub struct CopyFmt {
     pub delimiter: u8,
     pub quote: u8,
     pub escape: u8,
-    pub header: bool,
+    pub header: crate::sql::ast::CopyHeader,
     pub null: StackStr<64>,
+    pub default: Option<StackStr<64>>,
     pub force_quote_all: bool,
     pub force_quote: u64,
     pub force_not_null: u64,
@@ -18862,6 +18867,17 @@ impl CopyFmt {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "COPY NULL string is too long"
+            ));
+        }
+        let default = options.default_string.map(|text| {
+            let mut value = StackStr::<64>::new();
+            let _ = value.write_str(text);
+            value
+        });
+        if default.is_some_and(|value| value.is_truncated()) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY DEFAULT string is too long"
             ));
         }
         // Resolve a FORCE column list into a bitmask over table columns.
@@ -18896,6 +18912,7 @@ impl CopyFmt {
             escape: options.escape_byte(),
             header: options.header,
             null,
+            default,
             force_quote_all: options.force_quote_all,
             force_quote: mask(options.force_quote)?,
             force_not_null: mask(options.force_not_null)?,
@@ -18954,6 +18971,24 @@ pub fn copy_begin(
             "COPY FORCE_QUOTE cannot be used with COPY FROM"
         ));
     }
+    if statement.to && matches!(opts.header, crate::sql::ast::CopyHeader::Match) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY HEADER MATCH cannot be used with COPY TO"
+        ));
+    }
+    if statement.to && !matches!(opts.on_error, crate::sql::ast::CopyErrorAction::Stop) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY ON_ERROR cannot be used with COPY TO"
+        ));
+    }
+    if statement.to && opts.default_string.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY DEFAULT cannot be used with COPY TO"
+        ));
+    }
     if statement.to && !opts.force_not_null.is_empty() {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
@@ -18980,10 +19015,78 @@ pub fn copy_begin(
     }
     Ok(CopySetup {
         table_index,
+        txid,
         targets,
         n_targets,
         fmt,
+        on_error: opts.on_error,
+        reject_limit: opts.reject_limit,
+        log_verbosity: opts.log_verbosity,
     })
+}
+
+/// Validates a `HEADER MATCH` line against COPY's resolved target columns.
+/// This runs before any row mutation, so a mismatched header cannot leave a
+/// partially loaded statement behind.
+pub fn copy_match_header(
+    storage: &Storage,
+    setup: &CopySetup,
+    line: &[u8],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let def = storage.table_def(setup.table_index, setup.txid);
+    let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let count = if setup.fmt.csv {
+        crate::sql::copy::decode_row_csv(
+            line,
+            arena,
+            &mut fields[..setup.n_targets],
+            setup.fmt.delimiter,
+            setup.fmt.quote,
+            setup.fmt.escape,
+            setup.fmt.null.as_str(),
+            &|_| false,
+            &|_| false,
+        )?
+    } else {
+        crate::sql::copy::decode_row_text(
+            line,
+            arena,
+            &mut fields[..setup.n_targets],
+            setup.fmt.delimiter,
+            setup.fmt.null.as_str(),
+        )?
+    };
+    if count != setup.n_targets {
+        return Err(sql_err!(
+            sqlstate::BAD_COPY_FILE_FORMAT,
+            "COPY header has {} columns, expected {}",
+            count,
+            setup.n_targets
+        ));
+    }
+    for (index, field) in fields.iter().enumerate().take(count) {
+        let actual = field.ok_or_else(|| {
+            sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "COPY header column is NULL")
+        })?;
+        let expected = def.columns()[setup.targets[index]].name.as_str();
+        if actual != expected {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "COPY header column {} is \"{}\", expected \"{}\"",
+                index + 1,
+                actual,
+                expected
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `ON_ERROR ignore` only discards data-conversion failures. Constraint,
+/// transaction, storage, and protocol errors remain statement failures.
+pub fn copy_ignorable_error(error: &SqlError) -> bool {
+    error.sqlstate.starts_with("22") && error.sqlstate != sqlstate::BAD_COPY_FILE_FORMAT
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -19014,7 +19117,13 @@ pub fn copy_row(
             &|i| CopyFmt::forced(fmt.force_null, setup.targets[i]),
         )?
     } else {
-        crate::sql::copy::decode_row(line, arena, &mut fields[..setup.n_targets])?
+        crate::sql::copy::decode_row_text(
+            line,
+            arena,
+            &mut fields[..setup.n_targets],
+            fmt.delimiter,
+            fmt.null.as_str(),
+        )?
     };
     if n_fields < setup.n_targets {
         return Err(sql_err!(
@@ -19031,11 +19140,29 @@ pub fn copy_row(
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
         let col_index = setup.targets[i];
         let col = &def.columns()[col_index];
+        let use_default = field.is_some_and(|text| {
+            fmt.default
+                .as_ref()
+                .is_some_and(|default| text == default.as_str())
+        });
         values[col_index] = match field {
             None => Datum::Null,
-            Some(text) => coerce(Datum::Text(text), col, storage, txn.txid, arena)?,
+            Some(_) if use_default => Datum::Null,
+            Some(text) => {
+                coerce(Datum::Text(text), col, storage, txn.txid, arena).map_err(|error| {
+                    SqlError {
+                        sqlstate: error.sqlstate,
+                        message: stack_format!(
+                            192,
+                            "COPY column \"{}\": {}",
+                            col.name.as_str(),
+                            error.message.as_str()
+                        ),
+                    }
+                })?
+            }
         };
-        explicit[col_index] = true;
+        explicit[col_index] = !use_default;
     }
     fill_omitted_defaults(
         storage,
@@ -20521,7 +20648,7 @@ pub fn copy_out(
         responder.copy_binary_header().map_err(wire_to_sql)?;
     }
     // A header line of column names, in the same field format as the data.
-    if fmt.header {
+    if !matches!(fmt.header, crate::sql::ast::CopyHeader::None) {
         responder
             .copy_data_row(&|out| {
                 for i in 0..setup.n_targets {
@@ -20684,6 +20811,24 @@ fn copy_fmt_for_columns(
     options: &crate::sql::ast::CopyOptions,
 ) -> Result<CopyFmt, SqlError> {
     use core::fmt::Write as _;
+    if !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Stop) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY ON_ERROR cannot be used with COPY TO"
+        ));
+    }
+    if options.default_string.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY DEFAULT cannot be used with COPY TO"
+        ));
+    }
+    if matches!(options.header, crate::sql::ast::CopyHeader::Match) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY HEADER MATCH cannot be used with COPY TO"
+        ));
+    }
     // FORCE_NOT_NULL / FORCE_NULL are COPY FROM-only, as for a table source.
     if !options.force_not_null.is_empty() || !options.force_null.is_empty() {
         return Err(sql_err!(
@@ -20729,6 +20874,7 @@ fn copy_fmt_for_columns(
         escape: options.escape_byte(),
         header: options.header,
         null,
+        default: None,
         force_quote_all: options.force_quote_all,
         force_quote: mask(options.force_quote)?,
         force_not_null: 0,
@@ -20774,7 +20920,7 @@ pub fn copy_out_query(
     if fmt.binary {
         responder.copy_binary_header().map_err(wire_to_sql)?;
     }
-    if fmt.header {
+    if !matches!(fmt.header, crate::sql::ast::CopyHeader::None) {
         responder
             .copy_data_row(&|out| {
                 for (i, c) in columns[..n].iter().enumerate() {

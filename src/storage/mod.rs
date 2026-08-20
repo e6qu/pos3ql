@@ -1004,6 +1004,10 @@ pub struct TableDef {
 /// A resolved partitioning role.  Parent links are storage slots, never names:
 /// renaming a relation cannot leave routing metadata stale.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounds stay inline in fixed startup catalog storage; boxing would add post-startup allocation"
+)]
 pub enum PartitionDef {
     None,
     Parent {
@@ -1128,12 +1132,12 @@ fn partition_bound_matches(
         (PartitionStrategy::Range, PartitionBound::Range { lower, upper, .. }) => {
             let mut lower_ok = true;
             let mut upper_ok = true;
-            for i in 0..usize::from(n_keys) {
+            for (i, bound_value) in lower.iter().copied().enumerate().take(usize::from(n_keys)) {
                 let value = key(i)?;
                 if value.is_null() {
                     return Ok(false);
                 }
-                match lower[i] {
+                match bound_value {
                     PartitionBoundValue::MinValue => {}
                     PartitionBoundValue::MaxValue => lower_ok = false,
                     PartitionBoundValue::Value(bound) => {
@@ -1147,9 +1151,9 @@ fn partition_bound_matches(
                     }
                 }
             }
-            for i in 0..usize::from(n_keys) {
+            for (i, bound_value) in upper.iter().copied().enumerate().take(usize::from(n_keys)) {
                 let value = key(i)?;
-                match upper[i] {
+                match bound_value {
                     PartitionBoundValue::MaxValue => {}
                     PartitionBoundValue::MinValue => upper_ok = false,
                     PartitionBoundValue::Value(bound) => {
@@ -9564,14 +9568,14 @@ impl Storage {
                     default = Some(child);
                     continue;
                 }
-                if partition_bound_matches(strategy, keys, n_keys, bound, values)? {
-                    if match_slot.replace(child).is_some() {
-                        return Err(sql_err!(
-                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                            "overlapping partition bounds in relation \"{}\"",
-                            self.table_def(current, txid).name.as_str()
-                        ));
-                    }
+                if partition_bound_matches(strategy, keys, n_keys, bound, values)?
+                    && match_slot.replace(child).is_some()
+                {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                        "overlapping partition bounds in relation \"{}\"",
+                        self.table_def(current, txid).name.as_str()
+                    ));
                 }
             }
             current = match_slot.or(default).ok_or_else(|| {

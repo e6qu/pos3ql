@@ -658,6 +658,10 @@ fn partition_bounds_overlap(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "partition bound resolution needs the typed parent layout and statement coercion context"
+)]
 fn resolve_partition_bound(
     storage: &Storage,
     strategy: StoredPartitionStrategy,

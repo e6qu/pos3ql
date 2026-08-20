@@ -41,12 +41,8 @@ impl<'a> Parser<'a> {
         let action = if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             AlterTriggerAction::Rename(self.col_ident("new trigger name")?)
-        } else if self.eat_ident("enable")? {
-            AlterTriggerAction::Enable
-        } else if self.eat_ident("disable")? {
-            AlterTriggerAction::Disable
         } else {
-            return Err(self.err_here("expected RENAME, ENABLE, or DISABLE after ALTER TRIGGER"));
+            return Err(self.err_here("expected RENAME after ALTER TRIGGER"));
         };
         Ok(Stmt::AlterTrigger {
             trigger: TriggerIdentity { name, table },

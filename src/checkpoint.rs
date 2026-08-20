@@ -4186,7 +4186,7 @@ impl Checkpointer {
                         "-"
                     },
                     harguments.as_str(),
-                    u8::from(trigger.enabled),
+                    trigger.enabled.code(),
                 ),
             )?;
         }
@@ -5595,11 +5595,11 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 error.message.as_str()
             ))
         })?;
-    let enabled = match parse_field::<u8>(words.next(), "trigger enabled")? {
-        0 => false,
-        1 => true,
-        _ => return Err(CheckpointSetupError::Corrupt("trigger enabled")),
-    };
+    let enabled = crate::storage::TriggerEnabled::from_code(parse_field::<u8>(
+        words.next(),
+        "trigger enabled",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("trigger enabled"))?;
     if timing > 2
         || (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
         || !transition_tables.is_valid_for(timing, level, events)

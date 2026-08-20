@@ -811,8 +811,6 @@ pub struct CreateTrigger<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterTriggerAction<'a> {
     Rename(&'a str),
-    Enable,
-    Disable,
 }
 
 /// PostgreSQL's SET PUBLICATION refresh choice. A fresh copy is distinct from
@@ -2012,6 +2010,28 @@ pub enum AlterAction<'a> {
         from: &'a str,
         to: &'a str,
     },
+    /// ALTER TABLE trigger-state command with a parser-classified target.
+    SetTriggerEnabled {
+        target: TriggerEnableTarget<'a>,
+        enabled: TriggerEnableMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEnableMode {
+    Origin,
+    Replica,
+    Always,
+    Disabled,
+}
+
+/// `ALL` and `USER` are command selectors, not trigger names. Keeping them
+/// distinct preserves quoted names such as `"all"` at the parse boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEnableTarget<'a> {
+    Name(&'a str),
+    All,
+    User,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

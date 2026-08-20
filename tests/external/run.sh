@@ -15,8 +15,41 @@ WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
 KEEP=${1:-}
 
 PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
-GATEWAY_PORT=${POS3QL_GATEWAY_PORT:-19311}
-PG_PORT=${POS3QL_PG_PORT:-15433}
+
+. "$EXT/liveness.sh"
+
+select_port() { # explicit value, first automatic value, last automatic value
+  local explicit=$1 first=$2 last=$3 selected
+  if [[ -n "$explicit" ]]; then
+    if nc -z 127.0.0.1 "$explicit" >/dev/null 2>&1; then
+      printf 'FAIL: requested test port %s is already in use\n' "$explicit" >&2
+      exit 1
+    fi
+    printf '%s\n' "$explicit"
+    return
+  fi
+  selected=$(choose_free_port "$first" "$last") || {
+    printf 'FAIL: no free loopback test port in %s..%s\n' "$first" "$last" >&2
+    exit 1
+  }
+  printf '%s\n' "$selected"
+}
+
+GATEWAY_PORT=$(select_port "${POS3QL_GATEWAY_PORT:-}" 19311 19331)
+PG_PORT=$(select_port "${POS3QL_PG_PORT:-}" 15433 15463)
+TORTURE_PG_PORT=$(select_port "${POS3QL_TORTURE_PG_PORT:-}" 15470 15490)
+# An externally managed publisher is an explicit fixture. When configured, its
+# listener must already exist; otherwise this harness starts a local publisher.
+if [[ -n "${POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT:-}" ]]; then
+  SUB_PG_PORT=$POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT
+  if ! nc -z 127.0.0.1 "$SUB_PG_PORT" >/dev/null 2>&1; then
+    printf 'FAIL: external subscription publisher port %s is not listening\n' "$SUB_PG_PORT" >&2
+    exit 1
+  fi
+else
+  SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516)
+fi
+STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540)
 
 PASS=0
 FAIL=0
@@ -62,7 +95,6 @@ bad()  { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 # profile). Refuse instead. And the probe succeeding only proves *a*
 # server answered, so the started process must still be alive afterwards.
 START_PID=0
-. "$EXT/liveness.sh"
 
 start_pos3ql() { # <config> <log> <port>
   local conf=$1 log=$2 port=$3
@@ -138,7 +170,9 @@ wal_upload_sync = on
 sql_arena_bytes = 4MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
-table_rows = 8192
+# The spill-ingest scenario writes 24,000 rows; this is the fixed per-table
+# capacity, not a cache bound, so it must cover the declared workload.
+table_rows = 32768
 max_value_indexes = 64
 max_subscriptions = 2
 subscription_relation_capacity = 16
@@ -543,7 +577,6 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && ( -x "$TORTURE_PG
   # service used by the other oracle jobs, avoiding a slow package download
   # before the bounded torture workload begins.
   TORTURE_PG_HOST=127.0.0.1
-  TORTURE_PG_PORT=15497
   TORTURE_OWNS_REFERENCE=true
   if [[ ! -x "$TORTURE_PGBIN/postgres" ]]; then
     TORTURE_PG_HOST=$POS3QL_REFERENCE_PG_HOST
@@ -590,7 +623,6 @@ if want subscription; then
 
 step "logical subscription apply from a real PostgreSQL publisher"
 SUB_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
-SUB_PG_PORT=15496
 if [[ -x "$SUB_PGBIN/postgres" ]]; then
   if ! "$SUB_PGBIN/initdb" -D "$WORK/subscription-pgdata" -U postgres -A trust \
     --encoding=UTF8 --lc-collate=C --lc-ctype=C > "$WORK/subscription-initdb.log" 2>&1; then
@@ -703,7 +735,6 @@ else
 fi
 # --- Server-side TLS: the client connects over TLS (no object store needed) --
 step "server-side TLS: psql connects with sslmode=require"
-STLS_PORT=$((PG_PORT + 2))
 mkdir -p "$WORK/server-tls"
 openssl req -x509 -newkey rsa:2048 -keyout "$WORK/server-tls/key.pem" \
   -out "$WORK/server-tls/cert.pem" -days 30 -nodes -subj "/CN=localhost" \

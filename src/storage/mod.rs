@@ -2657,7 +2657,7 @@ pub(crate) struct TriggerDef {
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) arguments: TriggerArguments,
-    pub(crate) enabled: bool,
+    pub(crate) enabled: TriggerEnabled,
     pending_definition: Option<PendingTriggerDefinition>,
     pub(crate) ownership: Ownership,
     pub(crate) ddl_state: CatalogDdlState,
@@ -2667,7 +2667,46 @@ pub(crate) struct TriggerDef {
 pub(crate) struct PendingTriggerDefinition {
     pub(crate) txid: u32,
     pub(crate) name: SqlName,
-    pub(crate) enabled: bool,
+    pub(crate) enabled: TriggerEnabled,
+}
+
+/// PostgreSQL's durable `pg_trigger.tgenabled` state.  A boolean cannot
+/// represent the distinct origin, replication, and always execution modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerEnabled {
+    Origin,
+    Replica,
+    Always,
+    Disabled,
+}
+
+impl TriggerEnabled {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Origin => b'O',
+            Self::Replica => b'R',
+            Self::Always => b'A',
+            Self::Disabled => b'D',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'O' => Some(Self::Origin),
+            b'R' => Some(Self::Replica),
+            b'A' => Some(Self::Always),
+            b'D' => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn fires_for_origin(self) -> bool {
+        matches!(self, Self::Origin | Self::Always)
+    }
+
+    pub(crate) const fn fires_for_replication(self) -> bool {
+        matches!(self, Self::Replica | Self::Always)
+    }
 }
 
 /// Separates an unchanged ALTER from a changed definition whose previous
@@ -2723,7 +2762,7 @@ impl TriggerDef {
         transition_tables: TriggerTransitionTables::None,
         when: None,
         arguments: TriggerArguments::EMPTY,
-        enabled: false,
+        enabled: TriggerEnabled::Disabled,
         pending_definition: None,
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
@@ -2739,7 +2778,7 @@ impl TriggerDef {
             .map_or(self.name, |pending| pending.name)
     }
 
-    pub(crate) fn enabled_to(&self, txid: u32) -> bool {
+    pub(crate) fn enabled_to(&self, txid: u32) -> TriggerEnabled {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(self.enabled, |pending| pending.enabled)
@@ -15247,7 +15286,7 @@ impl Storage {
             transition_tables: spec.transition_tables,
             when: spec.when,
             arguments: spec.arguments,
-            enabled: true,
+            enabled: TriggerEnabled::Origin,
             pending_definition: None,
             ownership: self.initial_ownership(txid),
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -15263,7 +15302,7 @@ impl Storage {
         &mut self,
         slot: usize,
         name: SqlName,
-        enabled: bool,
+        enabled: TriggerEnabled,
         txid: u32,
     ) -> Result<TriggerAlter, SqlError> {
         let blocker = self.triggers[slot].pending_definition;
@@ -15314,7 +15353,7 @@ impl Storage {
         created_at: u64,
         owner: u16,
         spec: TriggerSpec,
-        enabled: bool,
+        enabled: TriggerEnabled,
     ) -> Result<usize, SqlError> {
         if spec.timing > 2
             || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)

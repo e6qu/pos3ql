@@ -26,6 +26,19 @@ CREATE TRIGGER row_trigger_after_write AFTER INSERT OR UPDATE ON row_trigger_tar
   FOR EACH ROW EXECUTE FUNCTION row_trigger_after_write();
 CREATE TRIGGER row_trigger_after_delete AFTER DELETE ON row_trigger_target
   FOR EACH ROW EXECUTE FUNCTION row_trigger_after_delete();
+ALTER TABLE row_trigger_target DISABLE TRIGGER a_row_trigger_normalize;
+INSERT INTO row_trigger_target VALUES (9, 4);
+ALTER TABLE row_trigger_target ENABLE REPLICA TRIGGER a_row_trigger_normalize;
+INSERT INTO row_trigger_target VALUES (10, 4);
+ALTER TABLE row_trigger_target ENABLE ALWAYS TRIGGER a_row_trigger_normalize;
+INSERT INTO row_trigger_target VALUES (11, 4);
+SELECT id, value FROM row_trigger_target WHERE id >= 9 ORDER BY id;
+SELECT tgenabled FROM pg_trigger WHERE tgname = 'a_row_trigger_normalize';
+ALTER TABLE row_trigger_target DISABLE TRIGGER ALL;
+SELECT count(*) FROM pg_trigger WHERE tgrelid = 'row_trigger_target'::regclass AND tgenabled = 'D';
+ALTER TABLE row_trigger_target ENABLE TRIGGER USER;
+SELECT count(*) FROM pg_trigger WHERE tgrelid = 'row_trigger_target'::regclass AND tgenabled = 'O';
+ALTER TABLE row_trigger_target ENABLE TRIGGER a_row_trigger_normalize;
 INSERT INTO row_trigger_target VALUES (1, 4);
 UPDATE row_trigger_target SET value = 8 WHERE id = 1;
 SELECT id, value, doubled FROM row_trigger_target;

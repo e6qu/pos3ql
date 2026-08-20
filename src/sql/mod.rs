@@ -3289,7 +3289,7 @@ impl Engine {
         seq_session: &guc::SeqSession,
         arena: &Arena,
         line: &[u8],
-    ) -> Result<(), SqlError> {
+    ) -> Result<exec::CopyRowOutcome, SqlError> {
         exec::copy_row(&mut self.storage, txn, seq_session, setup, line, arena)
     }
 
@@ -3312,7 +3312,7 @@ impl Engine {
         seq_session: &guc::SeqSession,
         arena: &Arena,
         row: &[u8],
-    ) -> Result<(), SqlError> {
+    ) -> Result<exec::CopyRowOutcome, SqlError> {
         exec::copy_row_binary(&mut self.storage, txn, seq_session, setup, row, arena)
     }
 

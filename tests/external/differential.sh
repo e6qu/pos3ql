@@ -217,20 +217,29 @@ run_corpus() { # port name file
   fi
 }
 
-# The corpus is intentionally cumulative at the SQL level, but the fixture
-# has a fixed 64-table catalog.  Drop only user relations between independent
-# corpora: this frees slots without replacing `public`, whose identity and
-# ACLs are themselves PostgreSQL-visible test state.
+# Independent external suites share one bounded catalog. Drop their user
+# relations between suites without replacing `public`, whose identity and ACLs
+# are PostgreSQL-visible state.
 reset_user_relations() { # port
   "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -A -t -q \
-    -c "SELECT relname FROM pg_class WHERE relnamespace = 2200 AND relkind IN ('r', 'p')" |
-  while IFS= read -r relation; do
-    [[ -z "$relation" ]] || "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
-      -c "DROP TABLE $relation CASCADE" >/dev/null 2>&1
+    -F $'\t' \
+    -c "SELECT n.nspname, c.relname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p')" |
+  while IFS=$'\t' read -r schema relation; do
+    [[ -z "$relation" ]] && continue
+    schema=${schema//\"/\"\"}
+    relation=${relation//\"/\"\"}
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
+      -c "DROP TABLE \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
 
+reset_pair() {
+  reset_user_relations "$PG_PORT"
+  reset_user_relations "$P3_PORT"
+}
+
 printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
+reset_pair
 for f in $EXT/differential/*.sql; do
   name=$(basename "$f" .sql)
   run_corpus $PG_PORT "$name.pg" "$f"
@@ -241,8 +250,7 @@ for f in $EXT/differential/*.sql; do
     bad "differential: $name"
     head -30 "$WORK/$name.diff"
   fi
-  reset_user_relations "$PG_PORT"
-  reset_user_relations "$P3_PORT"
+  reset_pair
 done
 
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
@@ -276,8 +284,7 @@ for f in $EXT/differential_exact/*.sql; do
     bad "exact errors: $name"
     head -30 "$WORK/$name.diff"
   fi
-  reset_user_relations "$PG_PORT"
-  reset_user_relations "$P3_PORT"
+  reset_pair
 done
 
 printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='
@@ -292,6 +299,7 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
 else
   printf '%s\n' 'SKIP: COPY BINARY differential (need a psycopg venv at $POS3QL_VENV)'
 fi
+reset_pair
 
 printf '%s\n' '' '=== accepted-type fidelity matrix ==='
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
@@ -305,6 +313,7 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
 else
   printf '%s\n' 'SKIP: accepted-type fidelity matrix (need a psycopg venv at $POS3QL_VENV)'
 fi
+reset_pair
 
 printf '%s\n' '' '=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==='
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}

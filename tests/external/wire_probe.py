@@ -2211,6 +2211,60 @@ def test_typed_trigger_query_program_over_raw_simple_query():
     s.close()
 
 
+def test_trigger_enablement_modes_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_trigger_modes (id integer PRIMARY KEY); "
+        "CREATE FUNCTION wire_trigger_mode_fn() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN RETURN NEW; END'; "
+        "CREATE TRIGGER wire_trigger_mode BEFORE INSERT ON wire_trigger_modes "
+        "FOR EACH ROW EXECUTE FUNCTION wire_trigger_mode_fn(); "
+        "ALTER TABLE wire_trigger_modes ENABLE REPLICA TRIGGER wire_trigger_mode; "
+        "ALTER TABLE wire_trigger_modes ENABLE ALWAYS TRIGGER wire_trigger_mode",
+    )
+    check("raw wire: trigger mode DDL completes", not any(kind == b"E" for kind, _ in setup), setup)
+    check(
+        "raw wire: trigger mode reaches pg_trigger",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT tgenabled FROM pg_trigger WHERE tgname = 'wire_trigger_mode'",
+            )
+        )
+        == "A",
+    )
+    disabled = simple_query(
+        s,
+        "ALTER TABLE wire_trigger_modes DISABLE TRIGGER wire_trigger_mode; "
+        "SELECT tgenabled FROM pg_trigger WHERE tgname = 'wire_trigger_mode'",
+    )
+    check(
+        "raw wire: disabled trigger mode reaches pg_trigger",
+        first_text_row(disabled) == "D",
+        disabled,
+    )
+    selectors = simple_query(
+        s,
+        "CREATE TRIGGER wire_trigger_mode_second BEFORE INSERT ON wire_trigger_modes "
+        "FOR EACH ROW EXECUTE FUNCTION wire_trigger_mode_fn(); "
+        "ALTER TABLE wire_trigger_modes DISABLE TRIGGER ALL; "
+        "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'wire_trigger_modes'::regclass "
+        "AND tgenabled = 'D'; "
+        "ALTER TABLE wire_trigger_modes ENABLE TRIGGER USER; "
+        "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'wire_trigger_modes'::regclass "
+        "AND tgenabled = 'O'",
+    )
+    check(
+        "raw wire: ALL and USER trigger selectors reach pg_trigger",
+        [first_text_row([message]) for message in selectors if message[0] == b"D"] == ["2", "2"],
+        selectors,
+    )
+    s.close()
+
+
 def test_type_schema_moves_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

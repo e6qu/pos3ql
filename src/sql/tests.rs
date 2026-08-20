@@ -181,7 +181,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
             END'; \
          CREATE TRIGGER recovered_view_trigger INSTEAD OF INSERT OR UPDATE OR DELETE ON recovered_view \
            FOR EACH ROW EXECUTE FUNCTION recovered_view_trigger(); \
-         ALTER TRIGGER recovered_view_trigger ON recovered_view DISABLE;",
+         ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
     assert!(engine.checkpoint().unwrap());
@@ -199,7 +199,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "ALTER TRIGGER recovered_view_trigger ON recovered_view ENABLE; \
+            "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
              INSERT INTO recovered_view VALUES (7, 70); \
              UPDATE recovered_view AS target SET value = source.value \
                FROM recovered_view_source AS source WHERE target.id = source.id \
@@ -6394,13 +6394,19 @@ fn catalog_indexes_and_constraints_for_psql_d() {
     // verified against PostgreSQL 18.4's rendering.
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
-    run("CREATE TABLE parent (a int, b int, PRIMARY KEY (a,b))");
-    run(
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "CREATE TABLE parent (a int, b int, PRIMARY KEY (a,b))",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
         "CREATE TABLE child (id int PRIMARY KEY, pa int, pb int, email text UNIQUE, \
          FOREIGN KEY (pa,pb) REFERENCES parent(a,b))",
     );
-    drop(run);
     // Index relations exist with PostgreSQL-style names.
     let index = data_rows(&run_with_txn_bytes(
         &mut e,
@@ -9274,12 +9280,62 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
         &mut engine,
         &mut budget,
         "BEGIN;
-         ALTER TRIGGER keep_target ON trigger_target DISABLE;
+         ALTER TABLE trigger_target DISABLE TRIGGER keep_target;
          SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';
          ROLLBACK;
          SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';",
     );
     assert_eq!(data_rows(&rollback), ["D", "O"]);
+    let modes = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE trigger_target ENABLE REPLICA TRIGGER keep_target;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';
+         ALTER TABLE trigger_target ENABLE ALWAYS TRIGGER keep_target;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';
+         ALTER TABLE trigger_target DISABLE TRIGGER keep_target;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';
+         ALTER TABLE trigger_target ENABLE TRIGGER keep_target;
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'keep_target';",
+    );
+    assert_eq!(data_rows(&modes), ["R", "A", "D", "O"]);
+    let selectors = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRIGGER keep_target_second BEFORE INSERT ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION keep_row();
+         CREATE TRIGGER \"all\" BEFORE INSERT ON trigger_target
+           FOR EACH ROW EXECUTE FUNCTION keep_row();
+         ALTER TABLE trigger_target DISABLE TRIGGER ALL;
+         SELECT tgenabled FROM pg_trigger WHERE tgname LIKE 'keep_target%' ORDER BY tgname;
+         ALTER TABLE trigger_target ENABLE TRIGGER USER;
+         SELECT tgenabled FROM pg_trigger WHERE tgname LIKE 'keep_target%' ORDER BY tgname;
+         ALTER TABLE trigger_target DISABLE TRIGGER \"all\";
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'all';
+         ALTER TABLE trigger_target ENABLE TRIGGER \"all\";
+         SELECT tgenabled FROM pg_trigger WHERE tgname = 'all';",
+    );
+    assert_eq!(data_rows(&selectors), ["D", "D", "O", "O", "D", "O"]);
+    let firing = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_mode_target (id integer PRIMARY KEY);
+         CREATE TABLE trigger_mode_audit (mode text);
+         CREATE FUNCTION record_trigger_mode() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO trigger_mode_audit VALUES (''fired''); RETURN NEW; END';
+         CREATE TRIGGER record_trigger_mode BEFORE INSERT ON trigger_mode_target
+           FOR EACH ROW EXECUTE FUNCTION record_trigger_mode();
+         ALTER TABLE trigger_mode_target ENABLE REPLICA TRIGGER record_trigger_mode;
+         INSERT INTO trigger_mode_target VALUES (100);
+         ALTER TABLE trigger_mode_target ENABLE ALWAYS TRIGGER record_trigger_mode;
+         INSERT INTO trigger_mode_target VALUES (101);
+         ALTER TABLE trigger_mode_target DISABLE TRIGGER record_trigger_mode;
+         INSERT INTO trigger_mode_target VALUES (102);
+         ALTER TABLE trigger_mode_target ENABLE TRIGGER record_trigger_mode;
+         INSERT INTO trigger_mode_target VALUES (103);
+         SELECT mode FROM trigger_mode_audit ORDER BY mode;",
+    );
+    assert_eq!(data_rows(&firing), ["fired", "fired"]);
     let created_then_rolled_back = run_with(
         &mut engine,
         &mut budget,
@@ -9343,7 +9399,7 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
     let cascaded = run_with(
         &mut engine,
         &mut budget,
-        "DROP FUNCTION keep_row(), skip_delete(), after_null() CASCADE;
+        "DROP FUNCTION keep_row(), skip_delete(), after_null(), record_trigger_mode() CASCADE;
          SELECT count(*) FROM pg_trigger",
     );
     assert_eq!(data_rows(&cascaded), ["0"]);
@@ -11667,6 +11723,7 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
          CREATE TRIGGER durable_target_update BEFORE UPDATE OF value ON durable_trigger_target
            FOR EACH ROW WHEN (NEW.value > OLD.value) EXECUTE FUNCTION durable_update_qualification();
          ALTER TRIGGER durable_target ON durable_trigger_target RENAME TO durable_target_renamed;
+         ALTER TABLE durable_trigger_target ENABLE REPLICA TRIGGER durable_target_renamed;
          CREATE TABLE durable_join_driver (id integer PRIMARY KEY, value integer);
          CREATE FUNCTION durable_join_trigger() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN
@@ -11692,9 +11749,10 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
         &mut restarted,
         &mut restarted_budget,
         "SELECT trigger_catalog.tgname, trigger_catalog.tgenabled, relation_catalog.relhastriggers
-           FROM pg_trigger trigger_catalog
+          FROM pg_trigger trigger_catalog
            JOIN pg_class relation_catalog ON trigger_catalog.tgrelid = relation_catalog.oid
           WHERE relation_catalog.relname = 'durable_trigger_target';
+         ALTER TABLE durable_trigger_target ENABLE TRIGGER durable_target_renamed;
          INSERT INTO durable_trigger_target VALUES (1, 1), (2, 4);
          UPDATE durable_trigger_target SET value = 1 WHERE id = 1;
          UPDATE durable_trigger_target SET value = 10 WHERE id = 1;
@@ -11710,7 +11768,7 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     assert_eq!(
         data_rows(&output),
         [
-            "durable_target_renamed|O|t",
+            "durable_target_renamed|R|t",
             "durable_target_update|O|t",
             "1|10",
             "2|5",
@@ -22896,6 +22954,17 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &mut engine,
         &mut budget,
         "CREATE TABLE replicated (id int PRIMARY KEY, body text, retained text DEFAULT 'local'); \
+         CREATE TABLE replication_trigger_audit (note text); \
+         CREATE FUNCTION audit_replication_insert() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
+         CREATE FUNCTION audit_replication_statement() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
+         CREATE TRIGGER replicated_replica_insert BEFORE INSERT ON replicated \
+         FOR EACH ROW EXECUTE FUNCTION audit_replication_insert(); \
+         CREATE TRIGGER replicated_replica_statement AFTER INSERT ON replicated \
+         FOR EACH STATEMENT EXECUTE FUNCTION audit_replication_statement(); \
+         ALTER TABLE replicated ENABLE REPLICA TRIGGER replicated_replica_insert; \
+         ALTER TABLE replicated ENABLE REPLICA TRIGGER replicated_replica_statement; \
          CREATE SUBSCRIPTION apply_changes CONNECTION \
          'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION changes WITH (connect = false, slot_name = NONE)",
@@ -22948,6 +23017,14 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         ["1|first|local"]
     );
     assert_eq!(apply.confirmed_lsn(), 41);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT note FROM replication_trigger_audit"
+        )),
+        ["replica insert"]
+    );
 
     begin[8] = 80;
     begin[20] = 2;

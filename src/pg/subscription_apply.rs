@@ -5,13 +5,21 @@
 
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::pg::pginput::{CopyData, Message, Relation, ReplicaIdentity};
+use crate::pg::respond::Responder;
+use crate::sql::ast::ExplainSerialize;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage};
+use crate::storage::{MAX_COLUMNS, RowHome, Storage};
+
+/// Internal trigger execution never exposes query output to the publisher.
+/// This fixed buffer only retains protocol framing required by the shared
+/// executor while discarded output prevents remote rows from consuming it.
+const TRIGGER_RESPONSE_BYTES: usize = 4096;
 
 #[derive(Clone, Copy)]
 pub struct RelationBinding {
@@ -201,6 +209,8 @@ pub struct SubscriptionApply {
     guc: GucState,
     relations: RelationMap,
     arena: Arena,
+    trigger_response: FixedBuf,
+    trigger_scratch: FixedVec<(u64, RowHome)>,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
 }
@@ -214,6 +224,8 @@ impl SubscriptionApply {
         relation_capacity * core::mem::size_of::<RelationBinding>()
             + TxnState::budget_bytes(txn_rows)
             + arena_bytes
+            + TRIGGER_RESPONSE_BYTES
+            + txn_rows * core::mem::size_of::<(u64, RowHome)>()
     }
 
     pub(crate) fn new(
@@ -230,6 +242,12 @@ impl SubscriptionApply {
             guc: GucState::new(),
             relations: RelationMap::new(budget, relation_capacity)?,
             arena: Arena::new(budget, "subscription_apply_arena", arena_bytes)?,
+            trigger_response: FixedBuf::new(
+                budget,
+                "subscription_trigger_response",
+                TRIGGER_RESPONSE_BYTES,
+            )?,
+            trigger_scratch: FixedVec::new(budget, "subscription_trigger_scratch", txn_rows)?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,
         })
@@ -256,6 +274,8 @@ impl SubscriptionApply {
         self.confirmed_lsn = confirmed_lsn;
         self.relations.clear();
         self.arena.reset();
+        self.trigger_response.clear();
+        self.trigger_scratch.clear();
         Ok(())
     }
 
@@ -266,6 +286,8 @@ impl SubscriptionApply {
         self.confirmed_lsn = 0;
         self.relations.clear();
         self.arena.reset();
+        self.trigger_response.clear();
+        self.trigger_scratch.clear();
     }
 
     /// Stops a worker at a transport boundary.  Losing a publisher connection
@@ -362,13 +384,26 @@ impl SubscriptionApply {
                         "subscription INSERT is outside BEGIN/COMMIT",
                     ));
                 }
-                engine.apply_subscription_insert(
-                    &mut self.txn,
-                    self.relations.binding(relation_id)?,
-                    new,
-                    &self.arena,
-                    &self.guc,
-                )?;
+                self.trigger_response.clear();
+                self.trigger_scratch.clear();
+                let mut responder = Responder::new(&mut self.trigger_response);
+                responder.begin_discard_query_output(ExplainSerialize::None);
+                let result = {
+                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                        self.guc.seq_session(),
+                        &mut responder,
+                        &mut self.trigger_scratch,
+                    );
+                    engine.apply_subscription_insert(
+                        &mut self.txn,
+                        self.relations.binding(relation_id)?,
+                        new,
+                        &self.arena,
+                        &mut trigger_context,
+                    )
+                };
+                let _ = responder.finish_discard_query_output();
+                result?;
                 Ok(ApplyResult::None)
             }
             Message::Update {
@@ -387,14 +422,27 @@ impl SubscriptionApply {
                 let old = old.ok_or_else(|| {
                     Self::protocol_error("subscription UPDATE lacks a replica identity tuple")
                 })?;
-                engine.apply_subscription_update(
-                    &mut self.txn,
-                    self.relations.binding(relation_id)?,
-                    old,
-                    new,
-                    &self.arena,
-                    &self.guc,
-                )?;
+                self.trigger_response.clear();
+                self.trigger_scratch.clear();
+                let mut responder = Responder::new(&mut self.trigger_response);
+                responder.begin_discard_query_output(ExplainSerialize::None);
+                let result = {
+                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                        self.guc.seq_session(),
+                        &mut responder,
+                        &mut self.trigger_scratch,
+                    );
+                    engine.apply_subscription_update(
+                        &mut self.txn,
+                        self.relations.binding(relation_id)?,
+                        old,
+                        new,
+                        &self.arena,
+                        &mut trigger_context,
+                    )
+                };
+                let _ = responder.finish_discard_query_output();
+                result?;
                 Ok(ApplyResult::None)
             }
             Message::Delete { relation_id, old } => {
@@ -406,13 +454,26 @@ impl SubscriptionApply {
                         "subscription DELETE is outside BEGIN/COMMIT",
                     ));
                 }
-                engine.apply_subscription_delete(
-                    &mut self.txn,
-                    self.relations.binding(relation_id)?,
-                    old,
-                    &self.arena,
-                    &self.guc,
-                )?;
+                self.trigger_response.clear();
+                self.trigger_scratch.clear();
+                let mut responder = Responder::new(&mut self.trigger_response);
+                responder.begin_discard_query_output(ExplainSerialize::None);
+                let result = {
+                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                        self.guc.seq_session(),
+                        &mut responder,
+                        &mut self.trigger_scratch,
+                    );
+                    engine.apply_subscription_delete(
+                        &mut self.txn,
+                        self.relations.binding(relation_id)?,
+                        old,
+                        &self.arena,
+                        &mut trigger_context,
+                    )
+                };
+                let _ = responder.finish_discard_query_output();
+                result?;
                 Ok(ApplyResult::None)
             }
             // Relation carries the complete OID/type-modifier contract used by

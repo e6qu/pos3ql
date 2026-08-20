@@ -107,6 +107,10 @@ pub struct TxnState {
     pub isolation: IsolationLevel,
     pub read_only: bool,
     pub deferrable: bool,
+    /// True only while pgoutput applies one remote transaction. Trigger
+    /// dispatch reads this typed execution origin instead of guessing from a
+    /// connection or statement string.
+    pub replication_apply: bool,
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
     /// PostgreSQL's command-id: a monotonically increasing counter bumped once
@@ -345,6 +349,7 @@ impl TxnState {
             isolation: IsolationLevel::ReadCommitted,
             read_only: false,
             deferrable: false,
+            replication_apply: false,
             snapshot_lsn: None,
             snapshot_taken: false,
             command_id: 1,
@@ -770,6 +775,7 @@ impl TxnState {
         self.isolation = IsolationLevel::ReadCommitted;
         self.read_only = false;
         self.deferrable = false;
+        self.replication_apply = false;
         self.snapshot_lsn = None;
         self.snapshot_taken = false;
         self.touched.clear();

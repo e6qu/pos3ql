@@ -5366,7 +5366,12 @@ fn pg_trigger<'a>(
                 Datum::Int4(crate::storage::trigger_oid(trigger)),
                 text(trigger.name_to(txid).as_str(), arena)?,
                 Datum::Int4(relation_oid),
-                Datum::Bpchar(if trigger.enabled_to(txid) { "O" } else { "D" }),
+                Datum::Bpchar(match trigger.enabled_to(txid) {
+                    crate::storage::TriggerEnabled::Origin => "O",
+                    crate::storage::TriggerEnabled::Replica => "R",
+                    crate::storage::TriggerEnabled::Always => "A",
+                    crate::storage::TriggerEnabled::Disabled => "D",
+                }),
                 Datum::Bool(false),
                 Datum::Int4(0),
                 Datum::Int4(crate::storage::routine_oid(function)),

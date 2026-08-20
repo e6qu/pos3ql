@@ -39,6 +39,29 @@ use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
 
+/// Fixed resources needed when logical apply invokes the ordinary trigger
+/// executor. The worker owns all three at startup, so a remote row cannot
+/// create an unbounded execution path.
+pub struct ReplicationTriggerContext<'a, 'response> {
+    seq_session: &'a crate::sql::guc::SeqSession,
+    responder: &'a mut Responder<'response>,
+    scratch: &'a mut FixedVec<(u64, RowHome)>,
+}
+
+impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
+    pub fn new(
+        seq_session: &'a crate::sql::guc::SeqSession,
+        responder: &'a mut Responder<'response>,
+        scratch: &'a mut FixedVec<(u64, RowHome)>,
+    ) -> Self {
+        Self {
+            seq_session,
+            responder,
+            scratch,
+        }
+    }
+}
+
 /// Column resolution over one decoded row. The datum lifetime `'v` (heap /
 /// arena bytes) is independent of the borrow of the value slice itself, so
 /// looked-up datums may outlive the decode buffer.
@@ -11607,8 +11630,11 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
             break;
         };
         trigger_at += 1;
-        if !trigger.enabled_to(context.txn.txid)
-            || !matches!(trigger.level, TriggerLevel::Row)
+        if !(if context.txn.replication_apply {
+            trigger.enabled_to(context.txn.txid).fires_for_replication()
+        } else {
+            trigger.enabled_to(context.txn.txid).fires_for_origin()
+        }) || !matches!(trigger.level, TriggerLevel::Row)
             || trigger.timing
                 != if matches!(target, crate::storage::TriggerTarget::View(_)) {
                     2
@@ -11857,8 +11883,11 @@ fn fire_statement_triggers_with_rows<'a>(
             break;
         };
         trigger_at += 1;
-        if !trigger.enabled_to(context.txn.txid)
-            || !matches!(trigger.level, TriggerLevel::Statement)
+        if !(if context.txn.replication_apply {
+            trigger.enabled_to(context.txn.txid).fires_for_replication()
+        } else {
+            trigger.enabled_to(context.txn.txid).fires_for_origin()
+        }) || !matches!(trigger.level, TriggerLevel::Statement)
             || trigger.timing != u8::from(!before)
             || !trigger.events.contains(event)
             || (event == 2
@@ -11985,7 +12014,7 @@ fn statement_transition_capture_required(
     event: u8,
 ) -> bool {
     storage.triggers_for_table(table, txid).any(|(_, trigger)| {
-        trigger.enabled_to(txid)
+        trigger.enabled_to(txid).fires_for_origin()
             && matches!(trigger.level, TriggerLevel::Statement)
             && trigger.timing == 1
             && trigger.events.contains(event)
@@ -12349,8 +12378,6 @@ pub fn alter_trigger(
             }
             (name, trigger.enabled_to(txn.txid))
         }
-        super::ast::AlterTriggerAction::Enable => (trigger.name_to(txn.txid), true),
-        super::ast::AlterTriggerAction::Disable => (trigger.name_to(txn.txid), false),
     };
     let prior = match storage.alter_trigger(slot, new_name, enabled, txn.txid) {
         Ok(crate::storage::TriggerAlter::Changed { prior }) => prior,
@@ -12370,7 +12397,7 @@ pub fn alter_trigger(
             table_schema: schema.as_str(),
             table: relation.as_str(),
             new_name: new_name.as_str(),
-            enabled,
+            enabled: enabled.code(),
         },
     ) {
         storage.rollback_trigger_alter(slot, prior);
@@ -19625,7 +19652,7 @@ pub fn apply_replication_insert(
     binding: RelationBinding,
     tuple: Tuple<'_>,
     arena: &Arena,
-    seq_session: &crate::sql::guc::SeqSession,
+    context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     if tuple.columns().len() != binding.remote_to_local().len() {
         return Err(sql_err!(
@@ -19653,7 +19680,7 @@ pub fn apply_replication_insert(
     fill_omitted_defaults(
         storage,
         txn.txid,
-        seq_session,
+        context.seq_session,
         &definition,
         &defaults,
         &mut values,
@@ -19661,6 +19688,33 @@ pub fn apply_replication_insert(
         arena,
     )?;
     let generated = parse_generated(&definition, arena)?;
+    compute_generated(
+        &definition,
+        &generated,
+        &mut values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
+    if !fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::INSERT,
+        true,
+        0,
+        None,
+        Some(&mut values[..definition.n_columns]),
+    )? {
+        return Ok(());
+    }
     compute_generated(
         &definition,
         &generated,
@@ -19690,7 +19744,25 @@ pub fn apply_replication_insert(
         table_index,
         None,
         &values[..definition.n_columns],
-    )
+    )?;
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::INSERT,
+        false,
+        0,
+        None,
+        Some(&mut values[..definition.n_columns]),
+    )?;
+    Ok(())
 }
 
 /// Decodes a pgoutput tuple according to an already verified local relation
@@ -19866,7 +19938,7 @@ pub fn apply_replication_delete(
     binding: RelationBinding,
     old: OldTuple<'_>,
     arena: &Arena,
-    seq_session: &crate::sql::guc::SeqSession,
+    context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row = locate_replication_row(storage, txn, binding, old, arena)?;
     let table_index = binding.table_slot();
@@ -19888,6 +19960,25 @@ pub fn apply_replication_delete(
     }
     let definition = *storage.table_def(table_index, txn.txid);
     let old_values = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    if !fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::DELETE,
+        true,
+        0,
+        Some(&old_values[..definition.n_columns]),
+        None,
+    )? {
+        return Ok(());
+    }
     if table_is_referenced(
         storage,
         definition.schema.as_str(),
@@ -19903,7 +19994,7 @@ pub fn apply_replication_delete(
             None,
             arena,
             &[],
-            seq_session,
+            context.seq_session,
             MAX_FK_CASCADE_DEPTH,
         )?;
     }
@@ -19913,6 +20004,23 @@ pub fn apply_replication_delete(
         storage.restore_pending(table_index, row.rowid(), txn.txid, prior);
         return Err(error);
     }
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::DELETE,
+        false,
+        0,
+        Some(&old_values[..definition.n_columns]),
+        None,
+    )?;
     Ok(())
 }
 
@@ -19927,7 +20035,7 @@ pub fn apply_replication_update(
     old: OldTuple<'_>,
     new: Tuple<'_>,
     arena: &Arena,
-    seq_session: &crate::sql::guc::SeqSession,
+    context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row = locate_replication_row(storage, txn, binding, old, arena)?;
     let table_index = binding.table_slot();
@@ -20001,6 +20109,33 @@ pub fn apply_replication_update(
         txn.txid,
         arena,
     )?;
+    if !fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::UPDATE,
+        true,
+        0,
+        Some(&old_values[..definition.n_columns]),
+        Some(&mut new_values[..definition.n_columns]),
+    )? {
+        return Ok(());
+    }
+    compute_generated(
+        &definition,
+        &generated,
+        &mut new_values,
+        storage,
+        txn.txid,
+        arena,
+    )?;
     check_not_null(&definition, &new_values)?;
     enforce_row_constraints(
         storage,
@@ -20038,10 +20173,27 @@ pub fn apply_replication_update(
             Some(&new_values[..definition.n_columns]),
             arena,
             &[],
-            seq_session,
+            context.seq_session,
             MAX_FK_CASCADE_DEPTH,
         )?;
     }
+    fire_row_triggers(
+        TriggerExecContext {
+            storage,
+            txn,
+            arena,
+            seq_session: context.seq_session,
+            responder: context.responder,
+            scratch: context.scratch,
+        },
+        table_index,
+        &definition,
+        TriggerEvents::UPDATE,
+        false,
+        0,
+        Some(&old_values[..definition.n_columns]),
+        Some(&mut new_values[..definition.n_columns]),
+    )?;
     Ok(())
 }
 
@@ -22929,7 +23081,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     if !storage
         .triggers_for_target(target, txn.txid)
         .any(|(_, trigger)| {
-            trigger.enabled_to(txn.txid)
+            trigger.enabled_to(txn.txid).fires_for_origin()
                 && matches!(trigger.level, TriggerLevel::Row)
                 && trigger.timing == 2
                 && trigger.events.contains(event)
@@ -25788,6 +25940,83 @@ pub fn alter_table(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn alter_trigger_enabled(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    target: crate::storage::TriggerTarget,
+    target_kind: crate::wal::TriggerTargetKind,
+    schema: &str,
+    relation: &str,
+    trigger_target: crate::sql::ast::TriggerEnableTarget<'_>,
+    enabled: crate::sql::ast::TriggerEnableMode,
+    responder: &mut Responder,
+    emit_completion: bool,
+) -> Outcome {
+    let mode = match enabled {
+        crate::sql::ast::TriggerEnableMode::Origin => crate::storage::TriggerEnabled::Origin,
+        crate::sql::ast::TriggerEnableMode::Replica => crate::storage::TriggerEnabled::Replica,
+        crate::sql::ast::TriggerEnableMode::Always => crate::storage::TriggerEnabled::Always,
+        crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::TriggerEnabled::Disabled,
+    };
+    let count = storage.triggers_for_target(target, txn.txid).count();
+    let mut matched = false;
+    for ordinal in 0..count {
+        let (slot, trigger) = storage
+            .triggers_for_target(target, txn.txid)
+            .nth(ordinal)
+            .map(|(slot, trigger)| (slot, *trigger))
+            .expect("trigger catalog count remains stable during a state change");
+        if let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target
+            && trigger.name_to(txn.txid).as_str() != name
+        {
+            continue;
+        }
+        matched = true;
+        let prior = match storage.alter_trigger(slot, trigger.name_to(txn.txid), mode, txn.txid) {
+            Ok(crate::storage::TriggerAlter::Changed { prior }) => prior,
+            Ok(crate::storage::TriggerAlter::Unchanged) => continue,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterTrigger {
+                name: trigger.name_to(txn.txid).as_str(),
+                target: target_kind,
+                table_schema: schema,
+                table: relation,
+                new_name: trigger.name_to(txn.txid).as_str(),
+                enabled: mode.code(),
+            },
+        ) {
+            storage.rollback_trigger_alter(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_trigger_alter(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    if !matched && let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "trigger \"{}\" for relation \"{}\" does not exist",
+            name,
+            relation
+        ));
+    }
+    if emit_completion {
+        responder.command_complete("ALTER TABLE")?;
+    }
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn alter_table_inner(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -25802,6 +26031,42 @@ fn alter_table_inner(
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
+            Some(crate::storage::ResolvedRelation::View(view))
+                if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) =>
+            {
+                if emit_completion
+                    && let Err(error) = storage.require_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::View,
+                            slot: view as u16,
+                        },
+                        txn.txid,
+                        "view",
+                    )
+                {
+                    return sql_fail(error);
+                }
+                let (schema, relation) = {
+                    let definition = storage.view(view);
+                    (definition.schema, definition.name)
+                };
+                let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions else {
+                    unreachable!("view ALTER TABLE action was checked above")
+                };
+                return alter_trigger_enabled(
+                    storage,
+                    wal,
+                    txn,
+                    crate::storage::TriggerTarget::View(view as u16),
+                    crate::wal::TriggerTargetKind::View,
+                    schema.as_str(),
+                    relation.as_str(),
+                    *target,
+                    *enabled,
+                    responder,
+                    emit_completion,
+                );
+            }
             None if statement.if_exists => {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -25937,6 +26202,22 @@ fn alter_table_inner(
         return sql_ok();
     }
 
+    if let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions {
+        return alter_trigger_enabled(
+            storage,
+            wal,
+            txn,
+            crate::storage::TriggerTarget::Table(table_index as u16),
+            crate::wal::TriggerTargetKind::Table,
+            def.schema.as_str(),
+            def.name.as_str(),
+            *target,
+            *enabled,
+            responder,
+            emit_completion,
+        );
+    }
+
     // Collect every committed row up front: the row count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer
@@ -25995,6 +26276,9 @@ fn alter_table_inner(
     for action in statement.actions {
         match action {
             AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
+            AlterAction::SetTriggerEnabled { .. } => {
+                unreachable!("trigger enablement is a standalone action")
+            }
             AlterAction::RenameTable(new_name) => {
                 if storage.relation_name_taken(def.schema.as_str(), new_name, txn.txid) {
                     return sql_fail(sql_err!(

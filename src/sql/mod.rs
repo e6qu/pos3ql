@@ -805,6 +805,7 @@ impl Engine {
     /// replication cannot create a second, weaker write path.
     pub fn begin_subscription_apply(&mut self, txn: &mut TxnState, guc: &GucState) {
         self.ensure_txn(txn, TxnMode::Implicit, guc);
+        txn.replication_apply = true;
         txn.begin_command();
         // pgoutput messages form one remote transaction, not independent SQL
         // statements.  Each later row operation must therefore see every
@@ -854,7 +855,7 @@ impl Engine {
         binding: crate::pg::subscription_apply::RelationBinding,
         tuple: crate::pg::pginput::Tuple<'_>,
         arena: &Arena,
-        guc: &GucState,
+        trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
         exec::apply_replication_insert(
             &mut self.storage,
@@ -862,7 +863,7 @@ impl Engine {
             binding,
             tuple,
             arena,
-            guc.seq_session(),
+            trigger_context,
         )
     }
 
@@ -872,16 +873,9 @@ impl Engine {
         binding: crate::pg::subscription_apply::RelationBinding,
         old: crate::pg::pginput::OldTuple<'_>,
         arena: &Arena,
-        guc: &GucState,
+        trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
-        exec::apply_replication_delete(
-            &mut self.storage,
-            txn,
-            binding,
-            old,
-            arena,
-            guc.seq_session(),
-        )
+        exec::apply_replication_delete(&mut self.storage, txn, binding, old, arena, trigger_context)
     }
 
     pub fn apply_subscription_update(
@@ -891,7 +885,7 @@ impl Engine {
         old: crate::pg::pginput::OldTuple<'_>,
         new: crate::pg::pginput::Tuple<'_>,
         arena: &Arena,
-        guc: &GucState,
+        trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
         exec::apply_replication_update(
             &mut self.storage,
@@ -900,7 +894,7 @@ impl Engine {
             old,
             new,
             arena,
-            guc.seq_session(),
+            trigger_context,
         )
     }
 
@@ -7712,7 +7706,17 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
-            storage.alter_trigger(slot, crate::storage::SqlName::parse(new_name)?, enabled, 0)?;
+            storage.alter_trigger(
+                slot,
+                crate::storage::SqlName::parse(new_name)?,
+                crate::storage::TriggerEnabled::from_code(enabled).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "journal trigger has invalid enabled mode"
+                    )
+                })?,
+                0,
+            )?;
             storage.commit_trigger_alter(slot, 0);
         }
         WalOp::CreateTable(def) => {

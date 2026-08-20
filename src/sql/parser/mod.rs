@@ -79,6 +79,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
+        | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetSchema(_) => 5,
     }
 }
@@ -3101,6 +3102,47 @@ impl<'a> Parser<'a> {
                 actions: self.arena_slice(&[action])?,
             }));
         }
+        let trigger_mode = if self.eat_ident("enable")? {
+            if self.eat_ident("replica")? {
+                Some(crate::sql::ast::TriggerEnableMode::Replica)
+            } else if self.eat_ident("always")? {
+                Some(crate::sql::ast::TriggerEnableMode::Always)
+            } else {
+                Some(crate::sql::ast::TriggerEnableMode::Origin)
+            }
+        } else if self.eat_ident("disable")? {
+            Some(crate::sql::ast::TriggerEnableMode::Disabled)
+        } else {
+            None
+        };
+        if let Some(enabled) = trigger_mode {
+            self.expect_ident("trigger")?;
+            let target = match (enabled, self.peeked) {
+                (
+                    crate::sql::ast::TriggerEnableMode::Origin
+                    | crate::sql::ast::TriggerEnableMode::Disabled,
+                    Tok::Ident("all"),
+                ) => {
+                    self.advance()?;
+                    crate::sql::ast::TriggerEnableTarget::All
+                }
+                (
+                    crate::sql::ast::TriggerEnableMode::Origin
+                    | crate::sql::ast::TriggerEnableMode::Disabled,
+                    Tok::Ident("user"),
+                ) => {
+                    self.advance()?;
+                    crate::sql::ast::TriggerEnableTarget::User
+                }
+                _ => crate::sql::ast::TriggerEnableTarget::Name(self.col_ident("trigger name")?),
+            };
+            let action = AlterAction::SetTriggerEnabled { target, enabled };
+            return Ok(Stmt::AlterTable(AlterTable {
+                table,
+                if_exists,
+                actions: self.arena_slice(&[action])?,
+            }));
+        }
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
         let mut buffer = [AlterAction::DropDefault { column: "" }; MAX_ALTER_ACTIONS];
         let mut count = 0usize;
@@ -4832,7 +4874,7 @@ mod tests {
         let mut parser = Parser::new(
             "CREATE TRIGGER audit_change BEFORE INSERT OR UPDATE OR DELETE ON public.orders \
              FOR EACH ROW EXECUTE FUNCTION audit_row('audit'); \
-             ALTER TRIGGER audit_change ON public.orders DISABLE; \
+             ALTER TABLE public.orders DISABLE TRIGGER audit_change; \
              DROP TRIGGER IF EXISTS audit_change ON public.orders",
             &arena,
         )
@@ -4860,11 +4902,23 @@ mod tests {
             );
             assert_eq!(trigger.function, QualName::bare("audit_row"));
             assert_eq!(trigger.arguments, ["audit"]);
-            let Some(Stmt::AlterTrigger { trigger, action }) = parser.next_stmt().unwrap() else {
-                panic!("ALTER TRIGGER did not parse")
+            let Some(Stmt::AlterTable(alter)) = parser.next_stmt().unwrap() else {
+                panic!("ALTER TABLE trigger mode did not parse")
             };
-            assert_eq!(trigger.name, "audit_change");
-            assert_eq!(action, crate::sql::ast::AlterTriggerAction::Disable);
+            assert_eq!(
+                alter.table,
+                QualName {
+                    schema: Some("public"),
+                    name: "orders"
+                }
+            );
+            assert_eq!(
+                alter.actions,
+                [crate::sql::ast::AlterAction::SetTriggerEnabled {
+                    target: crate::sql::ast::TriggerEnableTarget::Name("audit_change"),
+                    enabled: crate::sql::ast::TriggerEnableMode::Disabled,
+                }]
+            );
             let Some(Stmt::DropTrigger {
                 triggers,
                 if_exists,

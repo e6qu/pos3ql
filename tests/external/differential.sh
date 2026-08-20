@@ -28,10 +28,54 @@ if [[ -n "$REFERENCE_HOST" ]]; then
   REFERENCE_MODE=external
 else
   PSQL="$PGBIN/psql"
-  PG_PORT=${POS3QL_DIFF_PG_PORT:-15498}
   REFERENCE_MODE=local
 fi
-P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
+
+# A developer machine can already have a PostgreSQL or pos3ql instance on the
+# historical defaults. Pick an unused pair for the hermetic local run; an
+# explicit port remains an explicit contract and fails before startup if busy.
+port_is_free() {
+  ! nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+choose_local_ports() {
+  local requested_pg=${POS3QL_DIFF_PG_PORT:-}
+  local requested_p3=${POS3QL_DIFF_P3_PORT:-}
+  local candidate
+
+  if [[ -n "$requested_pg" ]] && ! port_is_free "$requested_pg"; then
+    printf 'FAIL: requested PostgreSQL reference port %s is already in use\n' "$requested_pg"
+    exit 1
+  fi
+  if [[ -n "$requested_p3" ]] && ! port_is_free "$requested_p3"; then
+    printf 'FAIL: requested pos3ql port %s is already in use\n' "$requested_p3"
+    exit 1
+  fi
+
+  if [[ -n "$requested_pg" && -n "$requested_p3" ]]; then
+    PG_PORT=$requested_pg
+    P3_PORT=$requested_p3
+    return
+  fi
+
+  for ((candidate = 15498; candidate <= 15598; candidate += 2)); do
+    local pg=${requested_pg:-$candidate}
+    local p3=${requested_p3:-$((candidate + 1))}
+    if port_is_free "$pg" && port_is_free "$p3"; then
+      PG_PORT=$pg
+      P3_PORT=$p3
+      return
+    fi
+  done
+  printf '%s\n' 'FAIL: no free local loopback port pair for differential testing'
+  exit 1
+}
+
+if [[ "$REFERENCE_MODE" == local ]]; then
+  choose_local_ports
+else
+  P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
+fi
 FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
 FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
 DIFF_OBJECT_PREFIX=${POS3QL_DIFF_OBJECT_STORE_PREFIX:-}

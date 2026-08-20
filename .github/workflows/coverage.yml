@@ -138,6 +138,7 @@ jobs:
         env:
           POS3QL_PGBIN: ${{ github.workspace }}/.ci-bin
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
+          POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT: "15496"
           COVERAGE_SHARD: runtest:subscription
         run: sh tools/coverage.sh
 

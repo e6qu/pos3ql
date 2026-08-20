@@ -500,7 +500,7 @@ pub(crate) enum WalOp<'a> {
         table_schema: &'a str,
         table: &'a str,
         new_name: &'a str,
-        enabled: bool,
+        enabled: u8,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -2838,7 +2838,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, new_name)
-                && buffer.append(&[u8::from(*enabled)])
+                && buffer.append(&[*enabled])
         }
     }
 }
@@ -3742,11 +3742,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
-            let enabled = match *payload.get(at)? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
+            let enabled = *payload.get(at)?;
+            crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::AlterTrigger {
                 name,
@@ -6018,7 +6015,7 @@ mod tests {
                     table_schema: "public",
                     table: "orders",
                     new_name: "audit_row_disabled",
-                    enabled: false,
+                    enabled: b'D',
                 },
             )
             .unwrap();

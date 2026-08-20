@@ -1,6 +1,6 @@
 # Known bugs
 
-There are no known unresolved bugs. Last reviewed: 2026-08-20 after partitioned parent DML gained typed physical leaf identities through updates, deletes, matched merges, and recovery. Details belong in tests and git history, not this blocker register.
+There are no known unresolved bugs. Last reviewed: 2026-08-20 after parent publications began selecting routed leaf changes without losing PostgreSQL’s default leaf identity or filtering. Details belong in tests and git history, not this blocker register.
 
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 

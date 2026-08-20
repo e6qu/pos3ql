@@ -2389,11 +2389,11 @@ impl<'a> Parser<'a> {
     }
 
     fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {
-        self.expect_ident("for")?;
-        self.expect_ident("values")?;
         if self.eat_ident("default")? {
             return Ok(PartitionBound::Default);
         }
+        self.expect_ident("for")?;
+        self.expect_ident("values")?;
         if self.eat_ident("from")? {
             let from = self.partition_bound_values()?;
             self.expect_ident("to")?;

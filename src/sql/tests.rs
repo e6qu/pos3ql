@@ -3800,7 +3800,7 @@ fn partitioned_parent_routes_rows_and_scans_its_leaves() {
         &mut budget,
         "CREATE TABLE measurements (id int, value int) PARTITION BY RANGE (id); \
          CREATE TABLE measurements_low PARTITION OF measurements FOR VALUES FROM (MINVALUE) TO (10); \
-         CREATE TABLE measurements_other PARTITION OF measurements FOR VALUES DEFAULT; \
+         CREATE TABLE measurements_other PARTITION OF measurements DEFAULT; \
          INSERT INTO measurements VALUES (1, 11), (20, 22); \
          SELECT id, value FROM measurements ORDER BY id",
     );
@@ -3823,7 +3823,7 @@ fn list_hash_and_default_partitions_route_typed_integer_keys() {
         &mut budget,
         "CREATE TABLE list_parent (id int) PARTITION BY LIST (id); \
          CREATE TABLE list_one PARTITION OF list_parent FOR VALUES IN (1, 3); \
-         CREATE TABLE list_other PARTITION OF list_parent FOR VALUES DEFAULT; \
+         CREATE TABLE list_other PARTITION OF list_parent DEFAULT; \
          INSERT INTO list_parent VALUES (1), (2), (3); \
          CREATE TABLE hash_parent (id int) PARTITION BY HASH (id); \
          CREATE TABLE hash_zero PARTITION OF hash_parent FOR VALUES WITH (MODULUS 2, REMAINDER 0); \
@@ -3859,7 +3859,7 @@ fn direct_partition_inserts_enforce_the_declared_bound() {
         &mut budget,
         "CREATE TABLE direct_parent (id int) PARTITION BY RANGE (id); \
          CREATE TABLE direct_low PARTITION OF direct_parent FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE direct_default PARTITION OF direct_parent FOR VALUES DEFAULT",
+         CREATE TABLE direct_default PARTITION OF direct_parent DEFAULT",
     );
     for statement in [
         "INSERT INTO direct_low VALUES (20)",
@@ -3946,7 +3946,7 @@ fn copy_to_partitioned_parent_scans_every_leaf() {
         &mut budget,
         "CREATE TABLE copy_parent (id int) PARTITION BY RANGE (id); \
          CREATE TABLE copy_low PARTITION OF copy_parent FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE copy_default PARTITION OF copy_parent FOR VALUES DEFAULT; \
+         CREATE TABLE copy_default PARTITION OF copy_parent DEFAULT; \
          INSERT INTO copy_parent VALUES (1), (20)",
     );
     let output = run_with(&mut engine, &mut budget, "COPY copy_parent TO STDOUT");
@@ -3962,7 +3962,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         &mut budget,
         "CREATE TABLE copy_from_parent (id int) PARTITION BY RANGE (id); \
          CREATE TABLE copy_from_low PARTITION OF copy_from_parent FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE copy_from_other PARTITION OF copy_from_parent FOR VALUES DEFAULT",
+         CREATE TABLE copy_from_other PARTITION OF copy_from_parent DEFAULT",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -8335,7 +8335,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
             &mut budget,
             "CREATE TABLE restart_parent (id int) PARTITION BY RANGE (id); \
              CREATE TABLE restart_low PARTITION OF restart_parent FOR VALUES FROM (MINVALUE) TO (10); \
-             CREATE TABLE restart_default PARTITION OF restart_parent FOR VALUES DEFAULT; \
+             CREATE TABLE restart_default PARTITION OF restart_parent DEFAULT; \
              INSERT INTO restart_parent VALUES (1), (20); \
              UPDATE restart_parent SET id = 12 WHERE id = 1",
         );
@@ -14077,18 +14077,23 @@ fn merge_statement() {
         .contains("21000")
     );
     // VALUES source.
-    run_with(
+    let values_merge = run_with_arena_bytes(
         &mut e,
         &mut b,
         "MERGE INTO tgt t USING (VALUES (10,'x')) s(id,v) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v,n) VALUES (s.id, s.v, 99)",
+        1 << 20,
     );
+    assert!(
+        String::from_utf8_lossy(&values_merge).contains("MERGE 1"),
+        "{}",
+        String::from_utf8_lossy(&values_merge)
+    );
+    let inserted = run_with(&mut e, &mut b, "SELECT v, n FROM tgt WHERE id=10");
     assert_eq!(
-        data_rows(&run_with(
-            &mut e,
-            &mut b,
-            "SELECT v, n FROM tgt WHERE id=10"
-        )),
-        ["x|99"]
+        data_rows(&inserted),
+        ["x|99"],
+        "{}",
+        String::from_utf8_lossy(&inserted)
     );
 
     let no_action = run_with(

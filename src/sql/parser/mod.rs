@@ -4710,7 +4710,7 @@ mod tests {
         with_parser(
             "CREATE TABLE sales (sold_on date, amount int) PARTITION BY RANGE (sold_on); \
              CREATE TABLE sales_2026 PARTITION OF sales FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
-             CREATE TABLE sales_other PARTITION OF sales FOR VALUES DEFAULT",
+             CREATE TABLE sales_other PARTITION OF sales DEFAULT",
             |p| {
                 let Stmt::CreateTable(parent) = p.next_stmt().unwrap().unwrap() else {
                     panic!()
@@ -4735,6 +4735,14 @@ mod tests {
                     }
                 ));
             },
+        );
+    }
+
+    #[test]
+    fn default_partition_uses_postgresqls_bound_syntax() {
+        with_parser(
+            "CREATE TABLE leaf PARTITION OF parent FOR VALUES DEFAULT",
+            |p| assert!(p.next_stmt().is_err()),
         );
     }
 

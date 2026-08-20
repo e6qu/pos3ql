@@ -217,6 +217,19 @@ run_corpus() { # port name file
   fi
 }
 
+# The corpus is intentionally cumulative at the SQL level, but the fixture
+# has a fixed 64-table catalog.  Drop only user relations between independent
+# corpora: this frees slots without replacing `public`, whose identity and
+# ACLs are themselves PostgreSQL-visible test state.
+reset_user_relations() { # port
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -A -t -q \
+    -c "SELECT relname FROM pg_class WHERE relnamespace = 2200 AND relkind IN ('r', 'p')" |
+  while IFS= read -r relation; do
+    [[ -z "$relation" ]] || "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
+      -c "DROP TABLE $relation CASCADE" >/dev/null 2>&1
+  done
+}
+
 printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 for f in $EXT/differential/*.sql; do
   name=$(basename "$f" .sql)
@@ -228,6 +241,8 @@ for f in $EXT/differential/*.sql; do
     bad "differential: $name"
     head -30 "$WORK/$name.diff"
   fi
+  reset_user_relations "$PG_PORT"
+  reset_user_relations "$P3_PORT"
 done
 
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
@@ -261,6 +276,8 @@ for f in $EXT/differential_exact/*.sql; do
     bad "exact errors: $name"
     head -30 "$WORK/$name.diff"
   fi
+  reset_user_relations "$PG_PORT"
+  reset_user_relations "$P3_PORT"
 done
 
 printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='

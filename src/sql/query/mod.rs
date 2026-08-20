@@ -6038,7 +6038,7 @@ pub fn first_from_match<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    scan_source_with_pax_columns(
+    scan_source_recycling_with_pax_columns(
         storage,
         &scope,
         from,

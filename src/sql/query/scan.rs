@@ -1110,6 +1110,7 @@ pub(super) fn scan_source_with_pax_columns<'a>(
         hooks,
         outer,
         false,
+        None,
         pax_demand,
         f,
     )
@@ -1142,6 +1143,41 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
         hooks,
         outer,
         true,
+        None,
+        pax_demand,
+        f,
+    )
+}
+
+/// A recycling scan whose terminating callback retains its accepted row.
+/// Rejected candidates are still reclaimed immediately.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_demand: PaxReadDemand,
+    retain_match: &core::cell::Cell<bool>,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    scan_source_mode(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        true,
+        Some(retain_match),
         pax_demand,
         f,
     )
@@ -1380,6 +1416,7 @@ fn scan_source_mode<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
     pax_demand: PaxReadDemand,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
@@ -1421,10 +1458,17 @@ fn scan_source_mode<'a>(
             storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
-    fn recycled<R>(arena: &Arena, enabled: bool, operation: impl FnOnce() -> R) -> R {
+    fn recycled<R>(
+        arena: &Arena,
+        enabled: bool,
+        retain_match: Option<&core::cell::Cell<bool>>,
+        operation: impl FnOnce() -> R,
+    ) -> R {
         let mark = enabled.then(|| arena.mark());
         let result = operation();
-        if let Some(mark) = mark {
+        if let Some(mark) = mark
+            && !retain_match.is_some_and(core::cell::Cell::get)
+        {
             // SAFETY: recycling callers consume their source row inside
             // `operation`; no reference into its arena suffix is observed
             // after this point.
@@ -1861,7 +1905,7 @@ fn scan_source_mode<'a>(
                 crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
             });
             for &(rowid, home) in &probe_ordered[..probe_fill] {
-                let keep = recycled(arena, recycle_rows, || -> Result<bool, SqlError> {
+                let keep = recycled(arena, recycle_rows, None, || -> Result<bool, SqlError> {
                     check_timeout()?;
                     let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
                     let mut buffer = [Datum::Null; MAX_COLUMNS];
@@ -2143,6 +2187,7 @@ fn scan_source_mode<'a>(
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
+        retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -2224,6 +2269,7 @@ fn scan_source_mode<'a>(
                         indexed,
                         decode_buffers,
                         recycle_rows,
+                        retain_match,
                         pax_demand,
                         f,
                     )
@@ -2242,20 +2288,21 @@ fn scan_source_mode<'a>(
                             check_timeout()?;
                             let this = $index;
                             $index += 1;
-                            let keep_scanning = recycled(arena, recycle_rows, || {
-                                visit_candidate!(
-                                    this,
-                                    match spilled.representation {
-                                        crate::storage::SpilledRowRepresentation::Encoded(
-                                            bytes,
-                                        ) => BoundRow::Encoded(bytes),
-                                        crate::storage::SpilledRowRepresentation::Values(
-                                            values,
-                                        ) => BoundRow::Values(values),
-                                    },
-                                    Some(spilled.rowid)
-                                )
-                            })?;
+                            let keep_scanning =
+                                recycled(arena, recycle_rows, retain_match, || {
+                                    visit_candidate!(
+                                        this,
+                                        match spilled.representation {
+                                            crate::storage::SpilledRowRepresentation::Encoded(
+                                                bytes,
+                                            ) => BoundRow::Encoded(bytes),
+                                            crate::storage::SpilledRowRepresentation::Values(
+                                                values,
+                                            ) => BoundRow::Values(values),
+                                        },
+                                        Some(spilled.rowid)
+                                    )
+                                })?;
                             if !keep_scanning {
                                 $aborted = true;
                                 return Ok(core::ops::ControlFlow::Break(()));
@@ -2318,7 +2365,7 @@ fn scan_source_mode<'a>(
                 LateralRows::Local(rows) => {
                     for (index, bytes) in rows.iter().enumerate() {
                         check_timeout()?;
-                        let keep_scanning = recycled(arena, recycle_rows, || {
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                             visit_candidate!(index, BoundRow::Encoded(bytes), None)
                         })?;
                         if !keep_scanning {
@@ -2339,7 +2386,7 @@ fn scan_source_mode<'a>(
                     check_timeout()?;
                     let this = index;
                     index += 1;
-                    recycled(arena, recycle_rows, || {
+                    recycled(arena, recycle_rows, retain_match, || {
                         // The cursor replaces its row buffer on advance, so
                         // deeper join levels retain this row in recycling
                         // statement storage only for the callback's lifetime.
@@ -2357,7 +2404,7 @@ fn scan_source_mode<'a>(
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
-                let keep_scanning = recycled(arena, recycle_rows, || {
+                let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     visit_candidate!(index, BoundRow::Encoded(bytes), None)
                 })?;
                 if !keep_scanning {
@@ -2398,7 +2445,7 @@ fn scan_source_mode<'a>(
                         };
                         let this = index;
                         index += 1;
-                        let keep_scanning = recycled(arena, recycle_rows, || {
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                             let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
                             visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                         })?;
@@ -2472,7 +2519,7 @@ fn scan_source_mode<'a>(
             });
             for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
-                let keep_scanning = recycled(arena, recycle_rows, || {
+                let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
                     visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                 })?;
@@ -2495,7 +2542,7 @@ fn scan_source_mode<'a>(
                     };
                     let this = index;
                     index += 1;
-                    let keep_scanning = recycled(arena, recycle_rows, || {
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                     })?;
@@ -2535,6 +2582,7 @@ fn scan_source_mode<'a>(
                 indexed,
                 decode_buffers,
                 recycle_rows,
+                retain_match,
                 pax_demand,
                 f,
             )? {
@@ -2674,8 +2722,11 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    let hash_plan =
-        select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?;
+    let hash_plan = if retain_match.is_none() {
+        select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?
+    } else {
+        None
+    };
     if let Some(hash_plan) = hash_plan {
         execute_hash_join_plan(
             storage,
@@ -2727,6 +2778,7 @@ fn scan_source_mode<'a>(
             indexed.as_ref(),
             decode_buffers,
             recycle_rows,
+            retain_match,
             pax_demand,
             f,
         )?;
@@ -2817,6 +2869,7 @@ fn scan_source_mode<'a>(
                         indexed.as_ref(),
                         decode_buffers,
                         recycle_rows,
+                        retain_match,
                         pax_demand,
                         f,
                     )
@@ -2832,7 +2885,7 @@ fn scan_source_mode<'a>(
                         let Some(bytes) = reader.row() else { break };
                         let this = index;
                         index += 1;
-                        recycled(arena, recycle_rows, || {
+                        recycled(arena, recycle_rows, retain_match, || {
                             let already_matched = if external_match_map {
                                 match external_match_reader.as_deref_mut() {
                                     Some(reader) => {
@@ -2861,7 +2914,7 @@ fn scan_source_mode<'a>(
                 }
             } else if let Some(rows) = scope.derived[d] {
                 for (index, bytes) in rows.iter().enumerate() {
-                    let keep_scanning = recycled(arena, recycle_rows, || {
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let already_matched = if external_match_map {
                             match external_match_reader.as_deref_mut() {
                                 Some(reader) => external_match_contains(storage, reader, d, index)?,
@@ -2894,21 +2947,22 @@ fn scan_source_mode<'a>(
                         for spilled in rows {
                             let this = index;
                             index += 1;
-                            let keep_scanning = recycled(arena, recycle_rows, || {
-                                let already_matched = if external_match_map {
-                                    match external_match_reader.as_deref_mut() {
-                                        Some(reader) => {
-                                            external_match_contains(storage, reader, d, this)?
+                            let keep_scanning =
+                                recycled(arena, recycle_rows, retain_match, || {
+                                    let already_matched = if external_match_map {
+                                        match external_match_reader.as_deref_mut() {
+                                            Some(reader) => {
+                                                external_match_contains(storage, reader, d, this)?
+                                            }
+                                            None => false,
                                         }
-                                        None => false,
-                                    }
-                                } else {
-                                    local_matches.expect("local match map")[this].get()
-                                };
-                                if already_matched {
-                                    Ok(true)
-                                } else {
-                                    emit_unmatched(
+                                    } else {
+                                        local_matches.expect("local match map")[this].get()
+                                    };
+                                    if already_matched {
+                                        Ok(true)
+                                    } else {
+                                        emit_unmatched(
                                         match spilled.representation {
                                             crate::storage::SpilledRowRepresentation::Encoded(
                                                 bytes,
@@ -2920,8 +2974,8 @@ fn scan_source_mode<'a>(
                                         Some(spilled.rowid),
                                         f,
                                     )
-                                }
-                            })?;
+                                    }
+                                })?;
                             if !keep_scanning {
                                 done = true;
                                 return Ok(core::ops::ControlFlow::Break(()));
@@ -2945,7 +2999,7 @@ fn scan_source_mode<'a>(
                     };
                     let this = index;
                     index += 1;
-                    let keep_scanning = recycled(arena, recycle_rows, || {
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let already_matched = if external_match_map {
                             match external_match_reader.as_deref_mut() {
                                 Some(reader) => external_match_contains(storage, reader, d, this)?,

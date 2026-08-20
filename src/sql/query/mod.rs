@@ -42,7 +42,8 @@ mod scan;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
-    Chained, PaxReadDemand, pax_column_demand, scan_source_recycling_with_pax_columns,
+    Chained, PaxReadDemand, pax_column_demand,
+    scan_source_recycling_retaining_match_with_pax_columns, scan_source_recycling_with_pax_columns,
     scan_source_with_pax_columns,
 };
 
@@ -6038,7 +6039,8 @@ pub fn first_from_match<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    scan_source_recycling_with_pax_columns(
+    let retain_match = core::cell::Cell::new(false);
+    scan_source_recycling_retaining_match_with_pax_columns(
         storage,
         &scope,
         from,
@@ -6049,12 +6051,14 @@ pub fn first_from_match<'a>(
         &hooks,
         Some(target),
         pax_columns,
+        &retain_match,
         &mut |jr| {
             let chained_row = Chained {
                 inner: jr,
                 outer: Some(target),
             };
             on_match(&chained_row)?;
+            retain_match.set(true);
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },

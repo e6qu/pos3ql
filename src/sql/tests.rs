@@ -7704,6 +7704,16 @@ fn update_from_and_delete_using() {
         "UPDATE alias RETURNING: {}",
         String::from_utf8_lossy(&returned)
     );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT id, label FROM t WHERE id IN (1, 2) ORDER BY id",
+        )),
+        ["1|one", "2|two"],
+        "UPDATE FROM must retain the accepted source row through row encoding"
+    );
     let wildcard = data_rows(&run_with_txn_bytes(
         &mut e,
         &mut b,

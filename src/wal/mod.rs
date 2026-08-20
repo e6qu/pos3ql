@@ -16,8 +16,8 @@ use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
     ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics,
-    OwnedDatum, RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics,
-    UniqueKey,
+    OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy,
+    RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -1488,6 +1488,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 n += 1 + fk.parent_schema.as_str().len();
             }
             n += def.n_columns;
+            n += encoded_partition_len(def.partition);
             n
         }
         WalOp::BeginTableRewrite {
@@ -1995,6 +1996,104 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
     }
 }
 
+fn encoded_partition_len(partition: PartitionDef) -> usize {
+    match partition {
+        PartitionDef::None => 1,
+        PartitionDef::Parent { n_keys, .. } => 3 + usize::from(n_keys) * 2,
+        PartitionDef::Child { bound, .. } => {
+            3 + match bound {
+                PartitionBound::Default => 1,
+                PartitionBound::Hash { .. } => 1 + 8,
+                PartitionBound::List { n_values, values } => {
+                    2 + values[..usize::from(n_values)]
+                        .iter()
+                        .map(|value| encoded_default_len(&Some(*value)))
+                        .sum::<usize>()
+                }
+                PartitionBound::Range {
+                    n_keys,
+                    lower,
+                    upper,
+                } => {
+                    2 + (0..usize::from(n_keys))
+                        .map(|i| {
+                            encoded_bound_value_len(lower[i]) + encoded_bound_value_len(upper[i])
+                        })
+                        .sum::<usize>()
+                }
+            }
+        }
+    }
+}
+
+fn encoded_bound_value_len(value: PartitionBoundValue) -> usize {
+    match value {
+        PartitionBoundValue::MinValue | PartitionBoundValue::MaxValue => 1,
+        PartitionBoundValue::Value(value) => 1 + encoded_default_len(&Some(value)),
+    }
+}
+
+fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
+    match partition {
+        PartitionDef::None => buffer.append(&[0]),
+        PartitionDef::Parent {
+            strategy,
+            keys,
+            n_keys,
+        } => {
+            let strategy = match strategy {
+                PartitionStrategy::Range => 0,
+                PartitionStrategy::List => 1,
+                PartitionStrategy::Hash => 2,
+            };
+            let mut ok = buffer.append(&[1, strategy, n_keys]);
+            for key in &keys[..usize::from(n_keys)] {
+                ok &= buffer.append(&key.to_le_bytes());
+            }
+            ok
+        }
+        PartitionDef::Child { parent, bound } => {
+            let mut ok = buffer.append(&[2]) && buffer.append(&parent.to_le_bytes());
+            match bound {
+                PartitionBound::Default => ok &= buffer.append(&[0]),
+                PartitionBound::Range {
+                    lower,
+                    upper,
+                    n_keys,
+                } => {
+                    ok &= buffer.append(&[1, n_keys]);
+                    for i in 0..usize::from(n_keys) {
+                        ok &= append_bound_value(buffer, lower[i])
+                            && append_bound_value(buffer, upper[i]);
+                    }
+                }
+                PartitionBound::List { values, n_values } => {
+                    ok &= buffer.append(&[2, n_values]);
+                    for value in &values[..usize::from(n_values)] {
+                        ok &= append_default(buffer, &Some(*value));
+                    }
+                }
+                PartitionBound::Hash { modulus, remainder } => {
+                    ok &= buffer.append(&[3])
+                        && buffer.append(&modulus.to_le_bytes())
+                        && buffer.append(&remainder.to_le_bytes())
+                }
+            }
+            ok
+        }
+    }
+}
+
+fn append_bound_value(buffer: &mut FixedBuf, value: PartitionBoundValue) -> bool {
+    match value {
+        PartitionBoundValue::MinValue => buffer.append(&[0]),
+        PartitionBoundValue::Value(value) => {
+            buffer.append(&[1]) && append_default(buffer, &Some(value))
+        }
+        PartitionBoundValue::MaxValue => buffer.append(&[2]),
+    }
+}
+
 /// Bytes this operation occupies in the journal, including its fixed record
 /// header. EXPLAIN uses the production codec's sizing rule so WAL telemetry
 /// cannot drift from the bytes commit will write.
@@ -2081,6 +2180,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     crate::sql::ast::Collation::UcsBasic => 3,
                 }]);
             }
+            ok &= append_partition(buffer, def.partition);
             ok
         }
         WalOp::BeginTableRewrite {
@@ -3251,6 +3351,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     };
                 }
             }
+            def.partition = decode_partition(payload, &mut at)?;
             (at == payload.len()).then_some(WalOp::CreateTable(def))
         }
         KIND_REWRITE_TABLE => {
@@ -5214,6 +5315,99 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
     })
 }
 
+fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
+    let tag = *payload.get(*at)?;
+    *at += 1;
+    match tag {
+        0 => Some(PartitionDef::None),
+        1 => {
+            let strategy = match *payload.get(*at)? {
+                0 => PartitionStrategy::Range,
+                1 => PartitionStrategy::List,
+                2 => PartitionStrategy::Hash,
+                _ => return None,
+            };
+            *at += 1;
+            let n_keys = *payload.get(*at)?;
+            *at += 1;
+            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                return None;
+            }
+            let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+            for key in &mut keys[..usize::from(n_keys)] {
+                *key = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+                *at += 2;
+            }
+            Some(PartitionDef::Parent {
+                strategy,
+                keys,
+                n_keys,
+            })
+        }
+        2 => {
+            let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+            *at += 2;
+            let tag = *payload.get(*at)?;
+            *at += 1;
+            let bound = match tag {
+                0 => PartitionBound::Default,
+                1 => {
+                    let n_keys = *payload.get(*at)?;
+                    *at += 1;
+                    if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                        return None;
+                    }
+                    let mut lower =
+                        [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
+                    let mut upper = lower;
+                    for i in 0..usize::from(n_keys) {
+                        lower[i] = decode_bound_value(payload, at)?;
+                        upper[i] = decode_bound_value(payload, at)?;
+                    }
+                    PartitionBound::Range {
+                        lower,
+                        upper,
+                        n_keys,
+                    }
+                }
+                2 => {
+                    let n_values = *payload.get(*at)?;
+                    *at += 1;
+                    if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
+                        return None;
+                    }
+                    let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+                    for value in &mut values[..usize::from(n_values)] {
+                        *value = decode_default(payload, at)??;
+                    }
+                    PartitionBound::List { values, n_values }
+                }
+                3 => {
+                    let modulus = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                    *at += 4;
+                    let remainder = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                    *at += 4;
+                    PartitionBound::Hash { modulus, remainder }
+                }
+                _ => return None,
+            };
+            Some(PartitionDef::Child { parent, bound })
+        }
+        _ => None,
+    }
+}
+
+fn decode_bound_value(payload: &[u8], at: &mut usize) -> Option<PartitionBoundValue> {
+    let tag = *payload.get(*at)?;
+    *at += 1;
+    match tag {
+        0 => Some(PartitionBoundValue::MinValue),
+        1 => Some(PartitionBoundValue::Value(decode_default(payload, at)??)),
+        2 => Some(PartitionBoundValue::MaxValue),
+        _ => None,
+    }
+}
+
 fn decode_bounded_default_bytes(
     payload: &[u8],
     at: &mut usize,
@@ -5543,7 +5737,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_table_payload_restores_collation_only_for_textual_columns() {
+    fn truncated_table_payload_is_rejected() {
         let definition = sample_def();
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "legacy table payload", 4096).unwrap();
@@ -5552,20 +5746,52 @@ mod tests {
             &WalOp::CreateTable(definition)
         ));
         let legacy_len = payload.len() - definition.n_columns;
-        let WalOp::CreateTable(restored) =
-            decode_op(KIND_CREATE, &payload.readable()[..legacy_len])
-                .expect("legacy table payload decodes")
-        else {
-            panic!("expected table definition");
+        assert!(decode_op(KIND_CREATE, &payload.readable()[..legacy_len]).is_none());
+    }
+
+    #[test]
+    fn table_payload_round_trip_preserves_typed_partition_bounds() {
+        let mut definition = sample_def();
+        definition.partition = PartitionDef::Child {
+            parent: 4,
+            bound: PartitionBound::Range {
+                lower: [PartitionBoundValue::Value(OwnedDatum::Int4(10));
+                    crate::storage::MAX_PARTITION_KEYS],
+                upper: [PartitionBoundValue::Value(OwnedDatum::Int4(20));
+                    crate::storage::MAX_PARTITION_KEYS],
+                n_keys: 1,
+            },
         };
-        assert_eq!(
-            restored.columns()[0].collation,
-            crate::sql::ast::Collation::None
-        );
-        assert_eq!(
-            restored.columns()[1].collation,
-            crate::sql::ast::Collation::Default
-        );
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable(definition)
+        ));
+        let Some(WalOp::CreateTable(restored)) = decode_op(KIND_CREATE, payload.readable()) else {
+            panic!("partition table definition did not decode")
+        };
+        let PartitionDef::Child {
+            parent,
+            bound:
+                PartitionBound::Range {
+                    lower,
+                    upper,
+                    n_keys,
+                },
+        } = restored.partition
+        else {
+            panic!("partition metadata lost")
+        };
+        assert_eq!((parent, n_keys), (4, 1));
+        assert!(matches!(
+            lower[0],
+            PartitionBoundValue::Value(OwnedDatum::Int4(10))
+        ));
+        assert!(matches!(
+            upper[0],
+            PartitionBoundValue::Value(OwnedDatum::Int4(20))
+        ));
     }
 
     #[test]

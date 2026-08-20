@@ -2781,13 +2781,22 @@ pub(crate) fn lock_result_row(
             let Some(rowid) = rowid else {
                 continue;
             };
-            match storage.acquire_row_lock(
-                scope.slots[table],
-                rowid,
-                txid,
-                clause.strength,
-                clause.wait,
-            )? {
+            let slot = if matches!(
+                storage.table_def(scope.slots[table], txid).partition,
+                crate::storage::PartitionDef::Parent { .. }
+            ) {
+                storage
+                    .partition_row_owner(scope.slots[table], rowid, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "partitioned scan returned a row without a physical owner"
+                        )
+                    })?
+            } else {
+                scope.slots[table]
+            };
+            match storage.acquire_row_lock(slot, rowid, txid, clause.strength, clause.wait)? {
                 crate::sql::lock::LockDecision::Acquired => {}
                 crate::sql::lock::LockDecision::Skipped => return Ok(false),
                 crate::sql::lock::LockDecision::Waiting => {

@@ -7,7 +7,10 @@
 //! and joins all work against them.
 
 use crate::mem::arena::Arena;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, SqlName, Storage, TableDef};
+use crate::storage::{
+    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, PartitionDef, PartitionStrategy, SqlName,
+    Storage, TableDef,
+};
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
@@ -595,19 +598,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_inherits") => finish(
-            def_of(
-                "pg_inherits",
-                &[
-                    ("inhrelid", ColType::Int4),
-                    ("inhparent", ColType::Int4),
-                    ("inhseqno", ColType::Int4),
-                    ("inhdetachpending", ColType::Bool),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_inherits") => pg_inherits(storage, txid, arena),
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
         (false, "pg_event_trigger") => finish(
@@ -674,19 +665,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_partitioned_table") => finish(
-            def_of(
-                "pg_partitioned_table",
-                &[
-                    ("partrelid", ColType::Int4),
-                    ("partstrat", ColType::Bpchar),
-                    ("partattrs", ColType::Text),
-                    ("partexprs", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_partitioned_table") => pg_partitioned_table(storage, txid, arena),
         (false, "pg_settings") => finish(
             def_of(
                 "pg_settings",
@@ -3851,6 +3830,104 @@ fn pg_subscription<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn pg_inherits<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_inherits",
+        &[
+            ("inhrelid", ColType::Int4),
+            ("inhparent", ColType::Int4),
+            ("inhseqno", ColType::Int4),
+            ("inhdetachpending", ColType::Bool),
+        ],
+    );
+    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut n = 0;
+    for child in 0..storage.table_count() {
+        if !storage.table(child).visible_to(txid) {
+            continue;
+        }
+        let PartitionDef::Child { parent, .. } = storage.table_def(child, txid).partition else {
+            continue;
+        };
+        if n == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_inherits"));
+        }
+        rows[n] = row(
+            &[
+                Datum::Int4(table_oid(storage, child)),
+                Datum::Int4(table_oid(storage, usize::from(parent))),
+                Datum::Int4(1),
+                Datum::Bool(false),
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &rows[..n], arena)
+}
+
+fn pg_partitioned_table<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_partitioned_table",
+        &[
+            ("partrelid", ColType::Int4),
+            ("partstrat", ColType::Bpchar),
+            ("partattrs", ColType::Text),
+            ("partexprs", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut n = 0;
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let PartitionDef::Parent {
+            strategy,
+            keys,
+            n_keys,
+        } = storage.table_def(slot, txid).partition
+        else {
+            continue;
+        };
+        if n == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_partitioned_table"));
+        }
+        let strategy = match strategy {
+            PartitionStrategy::Range => "r",
+            PartitionStrategy::List => "l",
+            PartitionStrategy::Hash => "h",
+        };
+        let mut attributes = StackStr::<128>::new();
+        use core::fmt::Write;
+        for (i, key) in keys[..usize::from(n_keys)].iter().enumerate() {
+            if i != 0 {
+                let _ = write!(attributes, " ");
+            }
+            let _ = write!(attributes, "{}", key + 1);
+        }
+        rows[n] = row(
+            &[
+                Datum::Int4(table_oid(storage, slot)),
+                text(strategy, arena)?,
+                text(attributes.as_str(), arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    finish(def, &rows[..n], arena)
+}
+
 fn pg_class<'a>(
     storage: &Storage,
     txid: u32,
@@ -3929,7 +4006,9 @@ fn pg_class<'a>(
         };
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
-        let relkind = if storage
+        let relkind = if matches!(table_def.partition, PartitionDef::Parent { .. }) {
+            "p"
+        } else if storage
             .find_matview(table_def.schema.as_str(), table_def.name.as_str(), txid)
             .is_some()
         {
@@ -3967,12 +4046,12 @@ fn pg_class<'a>(
                 Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
                 Datum::Bool(false),        // relrowsecurity
                 Datum::Bool(false),        // relforcerowsecurity
-                Datum::Bool(false),        // relispartition
-                Datum::Int4(0),            // reltablespace
-                Datum::Int4(0),            // reloftype
-                Datum::Int4(0),            // reltoastrelid
-                text("p", arena)?,         // relpersistence: permanent
-                text("d", arena)?,         // relreplident: default
+                Datum::Bool(matches!(table_def.partition, PartitionDef::Child { .. })),
+                Datum::Int4(0),    // reltablespace
+                Datum::Int4(0),    // reloftype
+                Datum::Int4(0),    // reltoastrelid
+                text("p", arena)?, // relpersistence: permanent
+                text("d", arena)?, // relreplident: default
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
                 acl(storage, relation_object, txid, arena)?,

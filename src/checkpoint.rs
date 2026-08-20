@@ -13,7 +13,8 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, RowHome, SqlName, Storage, TableDef,
+    ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, PartitionBound, PartitionBoundValue,
+    PartitionDef, PartitionStrategy, RowHome, SqlName, Storage, TableDef,
 };
 use crate::store::{
     BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
@@ -1399,6 +1400,12 @@ impl Checkpointer {
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("tsch name missing"))?;
                     def.schema = sql_name(&decode_hex_name(hex)?)?;
+                }
+                Some("part") => {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("part outside table"));
+                    };
+                    def.partition = parse_partition_manifest(&mut words)?;
                 }
                 Some("nsp") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -3356,6 +3363,7 @@ impl Checkpointer {
                     format_args!("tsch {}", hex.as_str()),
                 )?;
             }
+            write_partition_manifest(&mut self.manifest_buf, table.def.partition)?;
             for c in table.def.columns() {
                 use core::fmt::Write as _;
                 let default_value = c.default.constant().copied();
@@ -6035,6 +6043,164 @@ fn default_from_hex(hex: &str) -> Result<Option<OwnedDatum>, CheckpointSetupErro
         return Err(corrupt());
     }
     Ok(d)
+}
+
+fn write_partition_manifest(
+    buffer: &mut FixedBuf,
+    partition: PartitionDef,
+) -> Result<(), SqlError> {
+    match partition {
+        PartitionDef::None => write_manifest(buffer, "part n"),
+        PartitionDef::Parent {
+            strategy,
+            keys,
+            n_keys,
+        } => {
+            let strategy = match strategy {
+                PartitionStrategy::Range => "r",
+                PartitionStrategy::List => "l",
+                PartitionStrategy::Hash => "h",
+            };
+            let mut line = StackStr::<512>::new();
+            use core::fmt::Write;
+            let _ = write!(line, "part p {strategy} {n_keys}");
+            for key in &keys[..usize::from(n_keys)] {
+                let _ = write!(line, " {key}");
+            }
+            write_manifest(buffer, line.as_str())
+        }
+        PartitionDef::Child { parent, bound } => match bound {
+            PartitionBound::Default => write_manifest(buffer, format_args!("part c {parent} d")),
+            PartitionBound::Hash { modulus, remainder } => write_manifest(
+                buffer,
+                format_args!("part c {parent} h {modulus} {remainder}"),
+            ),
+            PartitionBound::List { values, n_values } => {
+                let mut line = StackStr::<2048>::new();
+                use core::fmt::Write;
+                let _ = write!(line, "part c {parent} l {n_values}");
+                for value in &values[..usize::from(n_values)] {
+                    let _ = write!(line, " {}", default_to_hex(&Some(*value)).as_str());
+                }
+                write_manifest(buffer, line.as_str())
+            }
+            PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            } => {
+                let mut line = StackStr::<2048>::new();
+                use core::fmt::Write;
+                let _ = write!(line, "part c {parent} r {n_keys}");
+                for i in 0..usize::from(n_keys) {
+                    let _ = write!(
+                        line,
+                        " {} {}",
+                        partition_bound_value_text(lower[i]).as_str(),
+                        partition_bound_value_text(upper[i]).as_str()
+                    );
+                }
+                write_manifest(buffer, line.as_str())
+            }
+        },
+    }
+}
+
+fn partition_bound_value_text(
+    value: PartitionBoundValue,
+) -> StackStr<{ 2 * crate::wal::MAX_DEFAULT_ENCODED }> {
+    match value {
+        PartitionBoundValue::MinValue => StackStr::from_str("min"),
+        PartitionBoundValue::MaxValue => StackStr::from_str("max"),
+        PartitionBoundValue::Value(value) => default_to_hex(&Some(value)),
+    }
+}
+
+fn partition_bound_value_from_text(
+    text: &str,
+) -> Result<PartitionBoundValue, CheckpointSetupError> {
+    match text {
+        "min" => Ok(PartitionBoundValue::MinValue),
+        "max" => Ok(PartitionBoundValue::MaxValue),
+        _ => Ok(PartitionBoundValue::Value(
+            default_from_hex(text)?.ok_or(CheckpointSetupError::Corrupt("bad partition bound"))?,
+        )),
+    }
+}
+
+fn parse_partition_manifest(
+    words: &mut core::str::Split<'_, char>,
+) -> Result<PartitionDef, CheckpointSetupError> {
+    let corrupt = || CheckpointSetupError::Corrupt("bad partition metadata");
+    match words.next().ok_or_else(corrupt)? {
+        "n" => Ok(PartitionDef::None),
+        "p" => {
+            let strategy = match words.next().ok_or_else(corrupt)? {
+                "r" => PartitionStrategy::Range,
+                "l" => PartitionStrategy::List,
+                "h" => PartitionStrategy::Hash,
+                _ => return Err(corrupt()),
+            };
+            let n_keys: u8 = parse_field(words.next(), "partition key count")?;
+            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                return Err(corrupt());
+            }
+            let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+            for key in &mut keys[..usize::from(n_keys)] {
+                *key = parse_field(words.next(), "partition key")?;
+            }
+            Ok(PartitionDef::Parent {
+                strategy,
+                keys,
+                n_keys,
+            })
+        }
+        "c" => {
+            let parent: u16 = parse_field(words.next(), "partition parent")?;
+            let bound = match words.next().ok_or_else(corrupt)? {
+                "d" => PartitionBound::Default,
+                "h" => PartitionBound::Hash {
+                    modulus: parse_field(words.next(), "partition modulus")?,
+                    remainder: parse_field(words.next(), "partition remainder")?,
+                },
+                "l" => {
+                    let n_values: u8 = parse_field(words.next(), "partition list count")?;
+                    if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
+                        return Err(corrupt());
+                    }
+                    let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+                    for value in &mut values[..usize::from(n_values)] {
+                        *value = default_from_hex(words.next().ok_or_else(corrupt)?)?
+                            .ok_or_else(corrupt)?;
+                    }
+                    PartitionBound::List { values, n_values }
+                }
+                "r" => {
+                    let n_keys: u8 = parse_field(words.next(), "partition key count")?;
+                    if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                        return Err(corrupt());
+                    }
+                    let mut lower =
+                        [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
+                    let mut upper = lower;
+                    for i in 0..usize::from(n_keys) {
+                        lower[i] =
+                            partition_bound_value_from_text(words.next().ok_or_else(corrupt)?)?;
+                        upper[i] =
+                            partition_bound_value_from_text(words.next().ok_or_else(corrupt)?)?;
+                    }
+                    PartitionBound::Range {
+                        lower,
+                        upper,
+                        n_keys,
+                    }
+                }
+                _ => return Err(corrupt()),
+            };
+            Ok(PartitionDef::Child { parent, bound })
+        }
+        _ => Err(corrupt()),
+    }
 }
 
 #[cfg(test)]

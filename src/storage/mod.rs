@@ -998,7 +998,66 @@ pub struct TableDef {
     pub n_checks: usize,
     pub fkeys: [ForeignKey; MAX_FKEYS],
     pub n_fkeys: usize,
+    pub partition: PartitionDef,
 }
+
+/// A resolved partitioning role.  Parent links are storage slots, never names:
+/// renaming a relation cannot leave routing metadata stale.
+#[derive(Debug, Clone, Copy)]
+pub enum PartitionDef {
+    None,
+    Parent {
+        strategy: PartitionStrategy,
+        keys: [u16; MAX_PARTITION_KEYS],
+        n_keys: u8,
+    },
+    Child {
+        parent: u16,
+        bound: PartitionBound,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    Range,
+    List,
+    Hash,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PartitionBoundValue {
+    MinValue,
+    Value(OwnedDatum),
+    MaxValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PartitionBound {
+    Default,
+    Range {
+        lower: [PartitionBoundValue; MAX_PARTITION_KEYS],
+        upper: [PartitionBoundValue; MAX_PARTITION_KEYS],
+        n_keys: u8,
+    },
+    /// List bounds have one key; tuple-list grammar is rejected at DDL time
+    /// rather than stored ambiguously.
+    List {
+        values: [OwnedDatum; MAX_PARTITION_LIST_VALUES],
+        n_values: u8,
+    },
+    Hash {
+        modulus: u32,
+        remainder: u32,
+    },
+}
+
+impl PartitionDef {
+    pub const NONE: Self = Self::None;
+}
+
+/// Inline catalog bounds have an explicit, startup-bounded capacity.
+pub(crate) const MAX_PARTITION_KEYS: usize = 4;
+pub(crate) const MAX_PARTITION_LIST_VALUES: usize = 8;
 
 impl TableDef {
     /// A table with a name and no columns or constraints, for spread-init of
@@ -1015,6 +1074,7 @@ impl TableDef {
             n_checks: 0,
             fkeys: [ForeignKey::EMPTY; MAX_FKEYS],
             n_fkeys: 0,
+            partition: PartitionDef::None,
         }
     }
 
@@ -1044,6 +1104,100 @@ impl TableDef {
             out[i] = c.ctype;
         }
         self.n_columns
+    }
+}
+
+fn partition_bound_matches(
+    strategy: PartitionStrategy,
+    keys: [u16; MAX_PARTITION_KEYS],
+    n_keys: u8,
+    bound: PartitionBound,
+    values: &[crate::sql::types::Datum],
+) -> Result<bool, SqlError> {
+    use crate::sql::eval::compare_datums;
+    use core::cmp::Ordering;
+    let key = |i: usize| {
+        values.get(usize::from(keys[i])).copied().ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "partition key is outside row width"
+            )
+        })
+    };
+    match (strategy, bound) {
+        (PartitionStrategy::Range, PartitionBound::Range { lower, upper, .. }) => {
+            let mut lower_ok = true;
+            let mut upper_ok = true;
+            for i in 0..usize::from(n_keys) {
+                let value = key(i)?;
+                if value.is_null() {
+                    return Ok(false);
+                }
+                match lower[i] {
+                    PartitionBoundValue::MinValue => {}
+                    PartitionBoundValue::MaxValue => lower_ok = false,
+                    PartitionBoundValue::Value(bound) => {
+                        let ord = compare_datums(&value, &bound.as_datum())?;
+                        if ord.is_lt() {
+                            lower_ok = false;
+                        }
+                        if !ord.is_eq() {
+                            break;
+                        }
+                    }
+                }
+            }
+            for i in 0..usize::from(n_keys) {
+                let value = key(i)?;
+                match upper[i] {
+                    PartitionBoundValue::MaxValue => {}
+                    PartitionBoundValue::MinValue => upper_ok = false,
+                    PartitionBoundValue::Value(bound) => {
+                        let ord = compare_datums(&value, &bound.as_datum())?;
+                        if ord.is_gt() || ord.is_eq() {
+                            upper_ok = false;
+                        }
+                        if !ord.is_eq() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(lower_ok && upper_ok)
+        }
+        (
+            PartitionStrategy::List,
+            PartitionBound::List {
+                values: list,
+                n_values,
+            },
+        ) => {
+            let value = key(0)?;
+            Ok((0..usize::from(n_values))
+                .any(|i| compare_datums(&value, &list[i].as_datum()).is_ok_and(Ordering::is_eq)))
+        }
+        (PartitionStrategy::Hash, PartitionBound::Hash { modulus, remainder }) => {
+            let value = key(0)?;
+            if value.is_null() {
+                return Ok(false);
+            }
+            // PostgreSQL's integer hash is stable for integer datums.  Other
+            // key types are rejected at definition time until their exact hash
+            // support is available rather than routed by an approximation.
+            let hash = match value {
+                crate::sql::types::Datum::Int2(v) => v as i64 as u64,
+                crate::sql::types::Datum::Int4(v) => v as i64 as u64,
+                crate::sql::types::Datum::Int8(v) => v as u64,
+                _ => {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "HASH partitioning is supported for integer partition keys only"
+                    ));
+                }
+            };
+            Ok(hash % u64::from(modulus) == u64::from(remainder))
+        }
+        _ => Ok(false),
     }
 }
 
@@ -9325,6 +9479,196 @@ impl Storage {
 
     pub fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    /// Resolves a logical insert target to its owning leaf.  One typed catalog
+    /// representation drives VALUES, COPY, MERGE and logical apply alike.
+    pub fn partition_target(
+        &self,
+        table: usize,
+        values: &[crate::sql::types::Datum],
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let mut current = table;
+        loop {
+            let definition = self.table_def(current, txid);
+            let PartitionDef::Parent {
+                strategy,
+                keys,
+                n_keys,
+            } = definition.partition
+            else {
+                if let PartitionDef::Child { parent, bound } = definition.partition {
+                    let parent_def = self.table_def(usize::from(parent), txid);
+                    let PartitionDef::Parent {
+                        strategy,
+                        keys,
+                        n_keys,
+                    } = parent_def.partition
+                    else {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                            "partition parent is not partitioned"
+                        ));
+                    };
+                    let violates = if matches!(bound, PartitionBound::Default) {
+                        let mut matches_sibling = false;
+                        for sibling in 0..self.table_count() {
+                            if sibling == current || !self.table(sibling).visible_to(txid) {
+                                continue;
+                            }
+                            let PartitionDef::Child {
+                                parent: sibling_parent,
+                                bound,
+                            } = self.table_def(sibling, txid).partition
+                            else {
+                                continue;
+                            };
+                            if usize::from(sibling_parent) == usize::from(parent)
+                                && !matches!(bound, PartitionBound::Default)
+                                && partition_bound_matches(strategy, keys, n_keys, bound, values)?
+                            {
+                                matches_sibling = true;
+                                break;
+                            }
+                        }
+                        matches_sibling
+                    } else {
+                        !partition_bound_matches(strategy, keys, n_keys, bound, values)?
+                    };
+                    if violates {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                            "new row for relation \"{}\" violates partition constraint",
+                            definition.name.as_str()
+                        ));
+                    }
+                }
+                return Ok(current);
+            };
+            let mut default = None;
+            let mut match_slot = None;
+            for child in 0..self.table_count() {
+                let candidate = self.table(child);
+                if !candidate.visible_to(txid) {
+                    continue;
+                }
+                let PartitionDef::Child { parent, bound } = self.table_def(child, txid).partition
+                else {
+                    continue;
+                };
+                if usize::from(parent) != current {
+                    continue;
+                }
+                if matches!(bound, PartitionBound::Default) {
+                    default = Some(child);
+                    continue;
+                }
+                if partition_bound_matches(strategy, keys, n_keys, bound, values)? {
+                    if match_slot.replace(child).is_some() {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                            "overlapping partition bounds in relation \"{}\"",
+                            self.table_def(current, txid).name.as_str()
+                        ));
+                    }
+                }
+            }
+            current = match_slot.or(default).ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                    "no partition of relation \"{}\" found for row",
+                    self.table_def(current, txid).name.as_str()
+                )
+            })?;
+        }
+    }
+
+    /// Expands a logical relation to physical scan leaves without allocating.
+    /// The caller supplies startup-bounded/statement-arena storage sized from
+    /// the configured table catalog.
+    pub fn partition_leaf_slots(
+        &self,
+        root: usize,
+        txid: u32,
+        out: &mut [usize],
+    ) -> Result<usize, SqlError> {
+        fn visit(
+            storage: &Storage,
+            root: usize,
+            txid: u32,
+            out: &mut [usize],
+            n: &mut usize,
+        ) -> Result<(), SqlError> {
+            let mut found = false;
+            for child in 0..storage.table_count() {
+                if !storage.table(child).visible_to(txid) {
+                    continue;
+                }
+                let PartitionDef::Child { parent, .. } = storage.table_def(child, txid).partition
+                else {
+                    continue;
+                };
+                if usize::from(parent) != root {
+                    continue;
+                }
+                found = true;
+                visit(storage, child, txid, out, n)?;
+            }
+            if !found
+                && !matches!(
+                    storage.table_def(root, txid).partition,
+                    PartitionDef::Parent { .. }
+                )
+            {
+                if *n == out.len() {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "partition scan exceeds configured table capacity"
+                    ));
+                }
+                out[*n] = root;
+                *n += 1;
+            }
+            Ok(())
+        }
+        let mut n = 0;
+        visit(self, root, txid, out, &mut n)?;
+        Ok(n)
+    }
+
+    /// Finds the physical owner of a row identity emitted while scanning a
+    /// logical partitioned relation. Row identifiers are cluster-wide, so the
+    /// search cannot confuse identically numbered rows from two leaves.
+    pub fn partition_row_owner(
+        &self,
+        root: usize,
+        rowid: u64,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        for candidate in 0..self.table_count() {
+            if !self.table(candidate).visible_to(txid)
+                || matches!(
+                    self.table_def(candidate, txid).partition,
+                    PartitionDef::Parent { .. }
+                )
+                || self.row_state(candidate, rowid)?.is_none()
+            {
+                continue;
+            }
+            let mut current = candidate;
+            loop {
+                if current == root {
+                    return Ok(Some(candidate));
+                }
+                let PartitionDef::Child { parent, .. } = self.table_def(current, txid).partition
+                else {
+                    break;
+                };
+                current = usize::from(parent);
+            }
+        }
+        Ok(None)
     }
 
     /// Clears only table images captured by a published checkpoint.

@@ -14,7 +14,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, RowHome, Storage};
+use crate::storage::{MAX_COLUMNS, Storage};
 
 /// Internal trigger execution never exposes query output to the publisher.
 /// This fixed buffer only retains protocol framing required by the shared
@@ -210,7 +210,7 @@ pub struct SubscriptionApply {
     relations: RelationMap,
     arena: Arena,
     trigger_response: FixedBuf,
-    trigger_scratch: FixedVec<(u64, RowHome)>,
+    trigger_scratch: crate::sql::exec::DmlScratch,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
 }
@@ -225,7 +225,7 @@ impl SubscriptionApply {
             + TxnState::budget_bytes(txn_rows)
             + arena_bytes
             + TRIGGER_RESPONSE_BYTES
-            + txn_rows * core::mem::size_of::<(u64, RowHome)>()
+            + txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
     }
 
     pub(crate) fn new(

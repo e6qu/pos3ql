@@ -149,9 +149,12 @@ pub struct Engine {
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
-    /// Scratch for materializing scans (ORDER BY, UPDATE, DELETE) and for
-    /// sorting SST entries at checkpoint.
+    /// Scratch for sorting SST entries at checkpoint.
     scratch: FixedVec<(u64, RowHome)>,
+    /// Mutable physical-row identities selected by DML. Kept separate from
+    /// checkpoint sort entries because a logical partitioned relation needs
+    /// its leaf owner alongside the row identifier.
+    dml_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, u8, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
@@ -1121,6 +1124,7 @@ impl Engine {
             wal_upload: config.wal_upload && config.object_store_on,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
+            dml_scratch: FixedVec::new(budget, "dml_scratch", config.table_rows)?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -4225,7 +4229,7 @@ impl Engine {
             };
             let outcome = Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 dml,
                 txn,
@@ -4275,7 +4279,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn execute_data_modification<'a, 'capture>(
         storage: &mut Storage,
-        scratch: &mut FixedVec<(u64, RowHome)>,
+        scratch: &mut exec::DmlScratch,
         arena: &Arena,
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
@@ -5254,7 +5258,7 @@ impl Engine {
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -5266,7 +5270,7 @@ impl Engine {
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 merge,
                 &self.work,
                 params,
@@ -5317,7 +5321,7 @@ impl Engine {
         match statement {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -5329,7 +5333,7 @@ impl Engine {
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 merge,
                 &self.work,
                 params,
@@ -6163,7 +6167,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6204,7 +6208,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6271,7 +6275,7 @@ impl Engine {
             ),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -6283,7 +6287,7 @@ impl Engine {
             Stmt::Merge(m) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 m,
                 arena,
                 params,
@@ -6306,7 +6310,7 @@ impl Engine {
             } => exec::truncate(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 arena,
                 guc.seq_session(),
                 tables,
@@ -6400,7 +6404,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6548,7 +6552,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 roles,
                 *cascade,
                 arena,
@@ -7089,7 +7093,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 a,
                 arena,
                 guc.seq_session(),

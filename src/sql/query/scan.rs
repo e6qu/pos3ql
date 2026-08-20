@@ -1288,6 +1288,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     from: &'a FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
     order: &[usize],
+    txid: u32,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
     if scope.n != 2 || from.joins.len() != 1 {
         return Ok(None);
@@ -1316,6 +1317,18 @@ pub(crate) fn select_hash_join_plan<'a>(
         (first_table, second_table)
     };
     if scope.derived[probe_table].is_some() {
+        return Ok(None);
+    }
+    // A partitioned source owns rows in several leaf maps. Its physical row
+    // identity is not representable by the hash run's rowid-only payload, so
+    // choose the ordinary bounded join implementation before execution.
+    if matches!(
+        storage.table_def(scope.slots[probe_table], txid).partition,
+        crate::storage::PartitionDef::Parent { .. }
+    ) || matches!(
+        storage.table_def(scope.slots[build_table], txid).partition,
+        crate::storage::PartitionDef::Parent { .. }
+    ) {
         return Ok(None);
     }
     let on = join.on.or(scope.join_on[0]);
@@ -2349,7 +2362,12 @@ fn scan_source_mode<'a>(
                     return Ok(false);
                 }
             }
-        } else if depth == 0 {
+        } else if depth == 0
+            || matches!(
+                storage.table_def(scope.slots[order[depth]], txid).partition,
+                crate::storage::PartitionDef::Parent { .. }
+            )
+        {
             // Outermost scan: iterate in heap-offset (insertion) order so a
             // per-row error surfaces on the same row as PostgreSQL, whose heap
             // scan is physical (insertion) order for a freshly-loaded table.
@@ -2358,6 +2376,41 @@ fn scan_source_mode<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
+            if matches!(
+                storage.table_def(slot, txid).partition,
+                crate::storage::PartitionDef::Parent { .. }
+            ) {
+                let leaves = arena
+                    .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+                    .map_err(|_| arena_full())?;
+                let n_leaves = storage.partition_leaf_slots(slot, txid, leaves)?;
+                let mut index = 0usize;
+                let mut aborted = false;
+                for &leaf in &leaves[..n_leaves] {
+                    storage.for_each_row_state(leaf, &mut |rowid, state| {
+                        use core::ops::ControlFlow;
+                        check_timeout()?;
+                        let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                            return Ok(ControlFlow::Continue(()));
+                        };
+                        let this = index;
+                        index += 1;
+                        let keep_scanning = recycled(arena, recycle_rows, || {
+                            let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                        })?;
+                        if !keep_scanning {
+                            aborted = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    })?;
+                    if aborted {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
             let candidates = indexed
                 .filter(|access| access.table == order[depth])
                 .map(|access| access.rowids);
@@ -2618,7 +2671,8 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    let hash_plan = select_hash_join_plan(storage, scope, from, planning_where_clause, order)?;
+    let hash_plan =
+        select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?;
     if let Some(hash_plan) = hash_plan {
         execute_hash_join_plan(
             storage,

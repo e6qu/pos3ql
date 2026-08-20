@@ -3242,6 +3242,49 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
 }
 
 #[test]
+fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE publication_parent (id int PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE publication_leaf PARTITION OF publication_parent FOR VALUES FROM (0) TO (10); \
+         CREATE PUBLICATION partition_changes FOR TABLE publication_parent WHERE (id > 10)",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_parent VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("partition_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("partitioned publication transaction is retained");
+    assert!(emitted);
+    assert!(
+        send.readable()
+            .windows(b"publication_leaf".len())
+            .any(|window| window == b"publication_leaf"),
+        "default publication identity and row filter are those of the physical partition"
+    );
+    assert!(send.readable().windows(1).any(|byte| byte == b"I"));
+}
+
+#[test]
 fn logical_replication_row_filter_suppresses_unmatched_rows() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -3746,6 +3789,515 @@ fn explicit_rollback_discards_writes() {
     assert!(
         out.contains("keep") && !out.contains("discard") && !out.contains("changed"),
         "{out}"
+    );
+}
+
+#[test]
+fn partitioned_parent_routes_rows_and_scans_its_leaves() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE measurements (id int, value int) PARTITION BY RANGE (id); \
+         CREATE TABLE measurements_low PARTITION OF measurements FOR VALUES FROM (MINVALUE) TO (10); \
+         CREATE TABLE measurements_other PARTITION OF measurements DEFAULT; \
+         INSERT INTO measurements VALUES (1, 11), (20, 22); \
+         SELECT id, value FROM measurements ORDER BY id",
+    );
+    assert_eq!(data_rows(&output), ["1|11", "20|22"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM measurements_low ORDER BY id"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
+fn list_hash_and_default_partitions_route_typed_integer_keys() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE list_parent (id int) PARTITION BY LIST (id); \
+         CREATE TABLE list_one PARTITION OF list_parent FOR VALUES IN (1, 3); \
+         CREATE TABLE list_other PARTITION OF list_parent DEFAULT; \
+         INSERT INTO list_parent VALUES (1), (2), (3); \
+         CREATE TABLE hash_parent (id int) PARTITION BY HASH (id); \
+         CREATE TABLE hash_zero PARTITION OF hash_parent FOR VALUES WITH (MODULUS 2, REMAINDER 0); \
+         CREATE TABLE hash_one PARTITION OF hash_parent FOR VALUES WITH (MODULUS 2, REMAINDER 1); \
+         INSERT INTO hash_parent VALUES (2), (3); \
+         SELECT count(*) FROM list_one; SELECT count(*) FROM list_other; SELECT count(*) FROM hash_parent",
+    );
+    assert_eq!(data_rows(&output), ["2", "1", "2"]);
+}
+
+#[test]
+fn multi_column_partition_keys_fail_before_a_partial_catalog_definition_exists() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unsupported_partition_key (a int, b int) PARTITION BY RANGE (a, b)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("multi-column partition keys are not supported"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class WHERE relname = 'unsupported_partition_key'",
+        )),
+        ["0"]
+    );
+}
+
+#[test]
+fn partition_creation_rejects_overlapping_typed_bounds() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE partitions (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE partitions_first PARTITION OF partitions FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE partitions_overlap PARTITION OF partitions FOR VALUES FROM (5) TO (15)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("would overlap partition"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn direct_partition_inserts_enforce_the_declared_bound() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE direct_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE direct_low PARTITION OF direct_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE direct_default PARTITION OF direct_parent DEFAULT",
+    );
+    for statement in [
+        "INSERT INTO direct_low VALUES (20)",
+        "INSERT INTO direct_default VALUES (1)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("violates partition constraint"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn partitioned_unique_keys_must_include_the_partition_key() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unique_parent (id int, code int UNIQUE) PARTITION BY RANGE (id)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("must include all partitioning columns"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unique_parent_ok (id int, code int, UNIQUE (id, code)) PARTITION BY RANGE (id)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("CREATE TABLE"));
+}
+
+#[test]
+fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_partition_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE catalog_partition_leaf PARTITION OF catalog_partition_parent \
+           FOR VALUES FROM (0) TO (10)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relkind, relispartition FROM pg_class \
+             WHERE relname IN ('catalog_partition_parent', 'catalog_partition_leaf') \
+             ORDER BY relname"
+        )),
+        ["r|t", "p|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT partstrat, partattrs FROM pg_partitioned_table p \
+             JOIN pg_class c ON c.oid = p.partrelid \
+             WHERE c.relname = 'catalog_partition_parent'"
+        )),
+        ["r|1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT partrelid FROM pg_partitioned_table WHERE 0 = ANY(partclass)",
+        )),
+        Vec::<String>::new(),
+        "pg_dump probes partition operator classes through this catalog column"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT parent.relname FROM pg_inherits i \
+             JOIN pg_class child ON child.oid = i.inhrelid \
+             JOIN pg_class parent ON parent.oid = i.inhparent \
+             WHERE child.relname = 'catalog_partition_leaf'"
+        )),
+        ["catalog_partition_parent"]
+    );
+}
+
+#[test]
+fn copy_to_partitioned_parent_scans_every_leaf() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE copy_low PARTITION OF copy_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE copy_default PARTITION OF copy_parent DEFAULT; \
+         INSERT INTO copy_parent VALUES (1), (20)",
+    );
+    let output = run_with(&mut engine, &mut budget, "COPY copy_parent TO STDOUT");
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("1\n") && text.contains("20\n"), "{text}");
+}
+
+#[test]
+fn copy_from_partitioned_parent_routes_each_streamed_row() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_from_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE copy_from_low PARTITION OF copy_from_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE copy_from_other PARTITION OF copy_from_parent DEFAULT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 16).unwrap();
+    let mut arena = Arena::new(&mut budget, "copy partition sql", 1 << 16).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    let setup = {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_from_parent FROM STDIN",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+        engine.take_pending_copy().unwrap_or_else(|| {
+            panic!(
+                "COPY enters streaming mode: {}",
+                String::from_utf8_lossy(send.readable())
+            )
+        })
+    };
+    arena.reset();
+    engine
+        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"1")
+        .unwrap();
+    engine
+        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"20")
+        .unwrap();
+    engine.copy_finish(&mut txn, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM copy_from_low; SELECT count(*) FROM copy_from_other"
+        )),
+        ["1", "1"]
+    );
+}
+
+#[test]
+fn writable_partitioned_parent_updates_and_deletes_leaf_rows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE writable_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE writable_leaf PARTITION OF writable_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE writable_other PARTITION OF writable_parent FOR VALUES FROM (10) TO (20); \
+         INSERT INTO writable_parent VALUES (1)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE writable_parent SET id = 12 WHERE id = 1",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("UPDATE 1"));
+    let output = run_with(&mut engine, &mut budget, "SELECT * FROM writable_other");
+    assert!(String::from_utf8_lossy(&output).contains("12"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM writable_parent WHERE id = 12",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("DELETE 1"));
+    let output = run_with(&mut engine, &mut budget, "SELECT * FROM writable_parent");
+    assert!(String::from_utf8_lossy(&output).contains("SELECT 0"));
+}
+
+#[test]
+fn partitioned_parent_update_from_keeps_the_leaf_owner_with_the_match() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE update_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE update_low PARTITION OF update_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE update_high PARTITION OF update_parent FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE update_source (id int, next_id int); \
+         INSERT INTO update_parent VALUES (1); \
+         INSERT INTO update_source VALUES (1, 11)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE update_parent AS target SET id = source.next_id \
+         FROM update_source AS source WHERE target.id = source.id",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("UPDATE 1"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM update_high"
+        )),
+        ["11"]
+    );
+}
+
+#[test]
+fn merge_matches_rows_stored_in_partitioned_target_leaves() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_parent (id int, value text) PARTITION BY RANGE (id); \
+         CREATE TABLE merge_low PARTITION OF merge_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE merge_high PARTITION OF merge_parent FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE merge_source (id int, next_id int, value text); \
+         INSERT INTO merge_parent VALUES (1, 'old'); \
+         INSERT INTO merge_source VALUES (1, 11, 'new')",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO merge_parent AS target USING merge_source AS source ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("MERGE 1"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM merge_parent"
+        )),
+        ["11|new"]
+    );
+}
+
+#[test]
+fn partitioned_relations_scan_as_inner_join_sources() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE join_outer (id int); \
+         CREATE TABLE join_parent (id int, value text) PARTITION BY RANGE (id); \
+         CREATE TABLE join_leaf PARTITION OF join_parent FOR VALUES FROM (0) TO (10); \
+         INSERT INTO join_outer VALUES (1); \
+         INSERT INTO join_parent VALUES (1, 'leaf')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT parent.value FROM join_outer AS outer_row \
+             JOIN join_parent AS parent ON parent.id = outer_row.id"
+        )),
+        ["leaf"]
+    );
+}
+
+#[test]
+fn parent_before_insert_trigger_runs_before_partition_routing() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_audit (id int); \
+         CREATE TABLE trigger_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE trigger_low PARTITION OF trigger_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE trigger_high PARTITION OF trigger_parent FOR VALUES FROM (10) TO (20); \
+         CREATE FUNCTION move_partition() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN NEW.id := 11; INSERT INTO trigger_audit VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TRIGGER parent_route BEFORE INSERT ON trigger_parent \
+           FOR EACH ROW EXECUTE FUNCTION move_partition(); \
+         INSERT INTO trigger_parent VALUES (1)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM trigger_high"
+        )),
+        ["11"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM trigger_audit"
+        )),
+        ["11"]
+    );
+}
+
+#[test]
+fn direct_leaf_insert_runs_parent_trigger_but_keeps_leaf_bound() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE direct_trigger_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE direct_trigger_low PARTITION OF direct_trigger_parent FOR VALUES FROM (0) TO (10); \
+         CREATE FUNCTION move_direct_partition() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN NEW.id := 11; RETURN NEW; END'; \
+         CREATE TRIGGER direct_parent_route BEFORE INSERT ON direct_trigger_parent \
+           FOR EACH ROW EXECUTE FUNCTION move_direct_partition()",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO direct_trigger_low VALUES (1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("violates partition constraint"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn parent_for_update_locks_the_physical_leaf_row() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE lock_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE lock_leaf PARTITION OF lock_parent FOR VALUES FROM (0) TO (10); \
+         INSERT INTO lock_parent VALUES (1)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT id FROM lock_parent FOR UPDATE"
+        )
+        .contains("SELECT 1")
+    );
+    let output = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM lock_leaf FOR UPDATE NOWAIT",
+    );
+    assert!(output.contains("55P03"), "{output}");
+}
+
+#[test]
+fn parent_before_update_trigger_can_move_a_row_to_another_leaf() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE update_trigger_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE update_trigger_low PARTITION OF update_trigger_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE update_trigger_high PARTITION OF update_trigger_parent FOR VALUES FROM (10) TO (20); \
+         CREATE FUNCTION move_updated_partition() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN NEW.id := 11; RETURN NEW; END'; \
+         CREATE TRIGGER parent_update_route BEFORE UPDATE ON update_trigger_parent \
+           FOR EACH ROW EXECUTE FUNCTION move_updated_partition(); \
+         INSERT INTO update_trigger_parent VALUES (1); \
+         UPDATE update_trigger_parent SET id = 2 WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM update_trigger_high"
+        )),
+        ["11"]
+    );
+}
+
+#[test]
+fn parent_after_delete_trigger_observes_leaf_rows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE delete_audit (id int); \
+         CREATE TABLE delete_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE delete_leaf PARTITION OF delete_parent FOR VALUES FROM (0) TO (10); \
+         CREATE FUNCTION audit_partition_delete() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO delete_audit VALUES (OLD.id); RETURN OLD; END'; \
+         CREATE TRIGGER parent_delete AFTER DELETE ON delete_parent \
+           FOR EACH ROW EXECUTE FUNCTION audit_partition_delete(); \
+         INSERT INTO delete_parent VALUES (1); \
+         DELETE FROM delete_parent WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM delete_audit"
+        )),
+        ["1"]
     );
 }
 
@@ -7184,6 +7736,16 @@ fn update_from_and_delete_using() {
         "UPDATE alias RETURNING: {}",
         String::from_utf8_lossy(&returned)
     );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT id, label FROM t WHERE id IN (1, 2) ORDER BY id",
+        )),
+        ["1|one", "2|two"],
+        "UPDATE FROM must retain the accepted source row through row encoding"
+    );
     let wildcard = data_rows(&run_with_txn_bytes(
         &mut e,
         &mut b,
@@ -7798,6 +8360,52 @@ fn data_survives_engine_restart() {
     run_with(&mut e, &mut budget, "INSERT INTO t VALUES (4,'d')");
     let bytes = run_with(&mut e, &mut budget, "SELECT id FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1", "2", "4"]);
+}
+
+#[test]
+fn partition_routing_survives_checkpoint_and_cold_restart() {
+    let mut config = test_config("partition-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("partition-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE restart_parent (id int) PARTITION BY RANGE (id); \
+             CREATE TABLE restart_low PARTITION OF restart_parent FOR VALUES FROM (MINVALUE) TO (10); \
+             CREATE TABLE restart_default PARTITION OF restart_parent DEFAULT; \
+             INSERT INTO restart_parent VALUES (1), (20); \
+             UPDATE restart_parent SET id = 12 WHERE id = 1",
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM restart_parent ORDER BY id"
+        )),
+        ["12", "20"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO restart_parent VALUES (2)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM restart_low ORDER BY id"
+        )),
+        ["2"]
+    );
 }
 
 #[test]
@@ -13511,18 +14119,23 @@ fn merge_statement() {
         .contains("21000")
     );
     // VALUES source.
-    run_with(
+    let values_merge = run_with_arena_bytes(
         &mut e,
         &mut b,
         "MERGE INTO tgt t USING (VALUES (10,'x')) s(id,v) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v,n) VALUES (s.id, s.v, 99)",
+        1 << 20,
     );
+    assert!(
+        String::from_utf8_lossy(&values_merge).contains("MERGE 1"),
+        "{}",
+        String::from_utf8_lossy(&values_merge)
+    );
+    let inserted = run_with(&mut e, &mut b, "SELECT v, n FROM tgt WHERE id=10");
     assert_eq!(
-        data_rows(&run_with(
-            &mut e,
-            &mut b,
-            "SELECT v, n FROM tgt WHERE id=10"
-        )),
-        ["x|99"]
+        data_rows(&inserted),
+        ["x|99"],
+        "{}",
+        String::from_utf8_lossy(&inserted)
     );
 
     let no_action = run_with(
@@ -26277,6 +26890,18 @@ fn common_table_expressions() {
              SELECT * FROM c ORDER BY n"
         )),
         ["1", "2", "3"]
+    );
+    // A recursive CTE is a derived source, not a catalog relation.  Joining
+    // it to a table must not inspect partition metadata through its sentinel
+    // slot while choosing a physical join implementation.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
+             SELECT t.id, c.n FROM t JOIN c ON t.id = c.n ORDER BY t.id",
+        )),
+        ["1|1", "2|2", "3|3", "4|4"]
     );
     // The CTE's materialized descriptor must retain the declared varchar
     // modifier through the outer Describe response.

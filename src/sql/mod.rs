@@ -149,9 +149,12 @@ pub struct Engine {
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
-    /// Scratch for materializing scans (ORDER BY, UPDATE, DELETE) and for
-    /// sorting SST entries at checkpoint.
+    /// Scratch for sorting SST entries at checkpoint.
     scratch: FixedVec<(u64, RowHome)>,
+    /// Mutable physical-row identities selected by DML. Kept separate from
+    /// checkpoint sort entries because a logical partitioned relation needs
+    /// its leaf owner alongside the row identifier.
+    dml_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, u8, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
@@ -602,6 +605,57 @@ enum PublicationOperation {
     Truncate,
 }
 
+/// Finds the explicit publication member that makes `table_slot` publishable.
+/// PostgreSQL makes every partition an implicit member when an ancestor is
+/// published; the leaf itself wins when both appear explicitly.
+fn publication_partition_member(
+    storage: &Storage,
+    publication: &crate::storage::PublicationDef,
+    table_slot: usize,
+) -> Option<usize> {
+    let mut current = table_slot;
+    loop {
+        if let Some(index) = publication.tables[..publication.table_count]
+            .iter()
+            .position(|member| usize::from(*member) == current)
+        {
+            return Some(index);
+        }
+        let crate::storage::PartitionDef::Child { parent, .. } =
+            storage.table_def(current, 0).partition
+        else {
+            return None;
+        };
+        current = usize::from(parent);
+    }
+}
+
+/// Schema publications inherit through a partition tree too: a parent in the
+/// selected schema publishes a leaf even when that leaf lives in another one.
+fn publication_partition_schema_member(
+    storage: &Storage,
+    publication: &crate::storage::PublicationDef,
+    table_slot: usize,
+) -> bool {
+    let mut current = table_slot;
+    loop {
+        let schema_selected = storage
+            .find_schema(storage.table_def(current, 0).schema.as_str())
+            .is_some_and(|slot| {
+                publication.schemas[..publication.schema_count].contains(&(slot as u8))
+            });
+        if schema_selected {
+            return true;
+        }
+        let crate::storage::PartitionDef::Child { parent, .. } =
+            storage.table_def(current, 0).partition
+        else {
+            return false;
+        };
+        current = usize::from(parent);
+    }
+}
+
 fn publication_selects(
     storage: &Storage,
     publication_names: &[SqlName],
@@ -629,15 +683,8 @@ fn publication_column_mask(
                 name.as_str()
             )
         })?;
-        let table_schema = storage.table_def(table_slot, 0).schema;
-        let explicit = publication.tables[..publication.table_count]
-            .iter()
-            .position(|member| *member == table_slot as u16);
-        let schema_member = storage
-            .find_schema(table_schema.as_str())
-            .is_some_and(|slot| {
-                publication.schemas[..publication.schema_count].contains(&(slot as u8))
-            });
+        let explicit = publication_partition_member(storage, publication, table_slot);
+        let schema_member = publication_partition_schema_member(storage, publication, table_slot);
         let publishes = match operation {
             PublicationOperation::Insert => publication.publish_insert,
             PublicationOperation::Update => publication.publish_update,
@@ -651,6 +698,11 @@ fn publication_column_mask(
             return Ok(Some(u64::MAX));
         }
         if let Some(index) = explicit {
+            if usize::from(publication.tables[index]) != table_slot {
+                // Default pgoutput identity is the physical leaf, whose
+                // implicit membership has no ancestor column projection.
+                return Ok(Some(u64::MAX));
+            }
             let mask = publication.table_column_masks[index];
             if mask == 0 {
                 return Ok(Some(u64::MAX));
@@ -674,13 +726,6 @@ fn publication_row_matches(
     arena: &Arena,
 ) -> Result<bool, SqlError> {
     let definition = storage.table_def(table_slot, 0);
-    let schema_member = |publication: &crate::storage::PublicationDef| {
-        storage
-            .find_schema(definition.schema.as_str())
-            .is_some_and(|slot| {
-                publication.schemas[..publication.schema_count].contains(&(slot as u8))
-            })
-    };
     for name in publication_names {
         let publication = storage.publication(name.as_str()).ok_or_else(|| {
             sql_err!(
@@ -698,15 +743,20 @@ fn publication_row_matches(
         if !publishes {
             continue;
         }
-        if publication.all_tables || schema_member(publication) {
+        if publication.all_tables
+            || publication_partition_schema_member(storage, publication, table_slot)
+        {
             return Ok(true);
         }
-        let Some(index) = publication.tables[..publication.table_count]
-            .iter()
-            .position(|member| *member == table_slot as u16)
-        else {
+        let Some(index) = publication_partition_member(storage, publication, table_slot) else {
             continue;
         };
+        // With PostgreSQL's default leaf identity, an ancestor's row filter
+        // does not become the leaf's filter.  Only an explicitly named leaf
+        // has a filter in this representation.
+        if usize::from(publication.tables[index]) != table_slot {
+            return Ok(true);
+        }
         let filter = publication.table_filters.get(index);
         if filter.is_empty() {
             return Ok(true);
@@ -1121,6 +1171,7 @@ impl Engine {
             wal_upload: config.wal_upload && config.object_store_on,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
+            dml_scratch: FixedVec::new(budget, "dml_scratch", config.table_rows)?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -4225,7 +4276,7 @@ impl Engine {
             };
             let outcome = Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 dml,
                 txn,
@@ -4275,7 +4326,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn execute_data_modification<'a, 'capture>(
         storage: &mut Storage,
-        scratch: &mut FixedVec<(u64, RowHome)>,
+        scratch: &mut exec::DmlScratch,
         arena: &Arena,
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
@@ -5254,7 +5305,7 @@ impl Engine {
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -5266,7 +5317,7 @@ impl Engine {
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 merge,
                 &self.work,
                 params,
@@ -5317,7 +5368,7 @@ impl Engine {
         match statement {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -5329,7 +5380,7 @@ impl Engine {
             Stmt::Merge(merge) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 merge,
                 &self.work,
                 params,
@@ -6163,7 +6214,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6204,7 +6255,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6271,7 +6322,7 @@ impl Engine {
             ),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -6283,7 +6334,7 @@ impl Engine {
             Stmt::Merge(m) => exec::merge(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 m,
                 arena,
                 params,
@@ -6306,7 +6357,7 @@ impl Engine {
             } => exec::truncate(
                 &mut self.storage,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 arena,
                 guc.seq_session(),
                 tables,
@@ -6400,7 +6451,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
@@ -6548,7 +6599,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 roles,
                 *cascade,
                 arena,
@@ -7089,7 +7140,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                &mut self.scratch,
+                &mut self.dml_scratch,
                 a,
                 arena,
                 guc.seq_session(),

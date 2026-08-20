@@ -17,9 +17,10 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, ROUTINE_SQL_MAX,
-    RoutineArgumentDef, RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage,
-    TableDef,
+    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
+    PartitionBound as StoredPartitionBound, PartitionBoundValue, PartitionDef,
+    PartitionStrategy as StoredPartitionStrategy, ROUTINE_SQL_MAX, RoutineArgumentDef,
+    RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -27,14 +28,27 @@ use core::num::NonZeroU8;
 
 use super::ast::{
     AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
-    Insert, LikeClause, Overriding, PublicationTarget, QualName, RoutineLanguage, Select,
-    SelectItem, Stmt, TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
+    Insert, LikeClause, Overriding, PartitionBound, PartitionClause, PartitionStrategy,
+    PublicationTarget, QualName, RoutineLanguage, Select, SelectItem, Stmt, TriggerEvent,
+    TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, datum_to_text,
     eval, eval_full, sqlstate,
 };
 use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
+
+/// One mutable physical row selected by a DML statement. A logical relation
+/// can span several leaf tables, so a row identifier is meaningful only with
+/// the table that owns it.
+#[derive(Clone, Copy)]
+pub struct PhysicalRow {
+    pub(crate) table_index: usize,
+    pub(crate) rowid: u64,
+    pub(crate) home: RowHome,
+}
+
+pub(crate) type DmlScratch = FixedVec<PhysicalRow>;
 
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
@@ -45,14 +59,14 @@ pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
 pub struct ReplicationTriggerContext<'a, 'response> {
     seq_session: &'a crate::sql::guc::SeqSession,
     responder: &'a mut Responder<'response>,
-    scratch: &'a mut FixedVec<(u64, RowHome)>,
+    scratch: &'a mut DmlScratch,
 }
 
 impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
     pub fn new(
         seq_session: &'a crate::sql::guc::SeqSession,
         responder: &'a mut Responder<'response>,
-        scratch: &'a mut FixedVec<(u64, RowHome)>,
+        scratch: &'a mut DmlScratch,
     ) -> Self {
         Self {
             seq_session,
@@ -326,7 +340,7 @@ pub fn create_table(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut def = match build_def_with_likes(storage, statement, txn.txid, arena) {
+    let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -344,6 +358,9 @@ pub fn create_table(
         return sql_fail(e);
     }
     if let Err(e) = attach_constraints(storage, &mut def, statement.constraints, txn.txid, arena) {
+        return sql_fail(e);
+    }
+    if let Err(e) = validate_partitioned_unique_keys(&def) {
         return sql_fail(e);
     }
     match storage.create_table_in(def, txn.txid) {
@@ -419,6 +436,354 @@ pub fn create_table(
     }
     responder.command_complete("CREATE TABLE")?;
     sql_ok()
+}
+
+fn validate_partitioned_unique_keys(def: &TableDef) -> Result<(), SqlError> {
+    let PartitionDef::Parent { keys, n_keys, .. } = def.partition else {
+        return Ok(());
+    };
+    let includes_keys = |columns: &[u16]| {
+        keys[..usize::from(n_keys)]
+            .iter()
+            .all(|key| columns.contains(key))
+    };
+    for (column, metadata) in def.columns().iter().enumerate() {
+        if (metadata.unique || metadata.primary) && !includes_keys(&[column as u16]) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "unique constraint on partitioned table must include all partitioning columns"
+            ));
+        }
+    }
+    for unique in def.uniques() {
+        if !includes_keys(unique.columns()) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "unique constraint on partitioned table must include all partitioning columns"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the parsed partition declaration while the parent definition is
+/// available.  The durable table definition contains only column offsets,
+/// typed values and a table slot; no later executor path parses SQL text.
+fn build_partitioned_table_def(
+    storage: &Storage,
+    statement: &CreateTable,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
+    match statement.partition {
+        PartitionClause::None => build_def_with_likes(storage, statement, txid, arena),
+        PartitionClause::By { strategy, columns } => {
+            let mut def = build_def_with_likes(storage, statement, txid, arena)?;
+            if columns.is_empty() || columns.len() > crate::storage::MAX_PARTITION_KEYS {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "partition key must contain between 1 and {} columns",
+                    crate::storage::MAX_PARTITION_KEYS
+                ));
+            }
+            if columns.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "multi-column partition keys are not supported"
+                ));
+            }
+            let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+            for (i, name) in columns.iter().enumerate() {
+                keys[i] = def.column_index(name).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" named in partition key does not exist",
+                        name
+                    )
+                })? as u16;
+            }
+            def.partition = PartitionDef::Parent {
+                strategy: match strategy {
+                    PartitionStrategy::Range => StoredPartitionStrategy::Range,
+                    PartitionStrategy::List => StoredPartitionStrategy::List,
+                    PartitionStrategy::Hash => StoredPartitionStrategy::Hash,
+                },
+                keys,
+                n_keys: columns.len() as u8,
+            };
+            Ok(def)
+        }
+        PartitionClause::Of { parent, bound } => {
+            let parent_slot = resolve_dml_table(storage, &parent, txid)?;
+            let parent_def = *storage.table_def(parent_slot, txid);
+            let PartitionDef::Parent {
+                strategy,
+                keys,
+                n_keys,
+            } = parent_def.partition
+            else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "relation \"{}\" is not partitioned",
+                    parent.name
+                ));
+            };
+            if !statement.columns.is_empty()
+                || !statement.constraints.is_empty()
+                || !statement.likes.is_empty()
+            {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "a partition cannot declare columns or table constraints"
+                ));
+            }
+            let mut def = parent_def;
+            def.name = SqlName::parse(statement.name.name)?;
+            def.schema =
+                storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
+            let resolved_bound = resolve_partition_bound(
+                storage,
+                strategy,
+                keys,
+                n_keys,
+                bound,
+                &parent_def,
+                txid,
+                arena,
+            )?;
+            validate_partition_bound(storage, parent_slot, resolved_bound, txid)?;
+            def.partition = PartitionDef::Child {
+                parent: u16::try_from(parent_slot)
+                    .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many tables"))?,
+                bound: resolved_bound,
+            };
+            Ok(def)
+        }
+    }
+}
+
+fn validate_partition_bound(
+    storage: &Storage,
+    parent: usize,
+    candidate: StoredPartitionBound,
+    txid: u32,
+) -> Result<(), SqlError> {
+    for slot in 0..storage.table_count() {
+        if !storage.table(slot).visible_to(txid) {
+            continue;
+        }
+        let PartitionDef::Child {
+            parent: sibling_parent,
+            bound,
+        } = storage.table_def(slot, txid).partition
+        else {
+            continue;
+        };
+        if usize::from(sibling_parent) != parent || !partition_bounds_overlap(candidate, bound)? {
+            continue;
+        }
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "partition \"{}\" would overlap partition \"{}\"",
+            storage.table_def(parent, txid).name.as_str(),
+            storage.table_def(slot, txid).name.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn partition_bounds_overlap(
+    left: StoredPartitionBound,
+    right: StoredPartitionBound,
+) -> Result<bool, SqlError> {
+    use crate::sql::eval::compare_datums;
+    use core::cmp::Ordering;
+    match (left, right) {
+        (StoredPartitionBound::Default, StoredPartitionBound::Default) => Ok(true),
+        (StoredPartitionBound::Default, _) | (_, StoredPartitionBound::Default) => Ok(false),
+        (
+            StoredPartitionBound::Hash {
+                modulus: lm,
+                remainder: lr,
+            },
+            StoredPartitionBound::Hash {
+                modulus: rm,
+                remainder: rr,
+            },
+        ) => Ok(lm == rm && lr == rr),
+        (
+            StoredPartitionBound::List {
+                values: lv,
+                n_values: ln,
+            },
+            StoredPartitionBound::List {
+                values: rv,
+                n_values: rn,
+            },
+        ) => {
+            for left in &lv[..usize::from(ln)] {
+                for right in &rv[..usize::from(rn)] {
+                    if compare_datums(&left.as_datum(), &right.as_datum())?.is_eq() {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        (
+            StoredPartitionBound::Range {
+                lower: ll,
+                upper: lu,
+                n_keys: ln,
+            },
+            StoredPartitionBound::Range {
+                lower: rl,
+                upper: ru,
+                n_keys: rn,
+            },
+        ) if ln == rn && ln == 1 => {
+            let lower = |value: PartitionBoundValue| -> Result<Option<crate::storage::OwnedDatum>, SqlError> { match value { PartitionBoundValue::MinValue => Ok(None), PartitionBoundValue::Value(value) => Ok(Some(value)), PartitionBoundValue::MaxValue => Err(sql_err!(sqlstate::INVALID_OBJECT_DEFINITION, "invalid range partition lower bound")) } };
+            let upper = |value: PartitionBoundValue| -> Result<Option<crate::storage::OwnedDatum>, SqlError> { match value { PartitionBoundValue::MaxValue => Ok(None), PartitionBoundValue::Value(value) => Ok(Some(value)), PartitionBoundValue::MinValue => Err(sql_err!(sqlstate::INVALID_OBJECT_DEFINITION, "invalid range partition upper bound")) } };
+            let left_before_right = match (upper(lu[0])?, lower(rl[0])?) {
+                (Some(upper), Some(lower)) => {
+                    compare_datums(&upper.as_datum(), &lower.as_datum())? != Ordering::Greater
+                }
+                (Some(_), None) => false,
+                (None, _) => false,
+            };
+            let right_before_left = match (upper(ru[0])?, lower(ll[0])?) {
+                (Some(upper), Some(lower)) => {
+                    compare_datums(&upper.as_datum(), &lower.as_datum())? != Ordering::Greater
+                }
+                (Some(_), None) => false,
+                (None, _) => false,
+            };
+            Ok(!left_before_right && !right_before_left)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "partition bound resolution needs the typed parent layout and statement coercion context"
+)]
+fn resolve_partition_bound(
+    storage: &Storage,
+    strategy: StoredPartitionStrategy,
+    keys: [u16; crate::storage::MAX_PARTITION_KEYS],
+    n_keys: u8,
+    bound: PartitionBound,
+    parent: &TableDef,
+    txid: u32,
+    arena: &Arena,
+) -> Result<StoredPartitionBound, SqlError> {
+    let constant =
+        |expression: &Expr, column: usize| -> Result<crate::storage::OwnedDatum, SqlError> {
+            let value = eval_full(
+                expression,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &NoColumns,
+                &NO_HOOKS,
+            )?;
+            let value = coerce(value, &parent.columns()[column], storage, txid, arena)?;
+            crate::storage::OwnedDatum::from_datum(&value)
+        };
+    match (strategy, bound) {
+        (_, PartitionBound::Default) => Ok(StoredPartitionBound::Default),
+        (StoredPartitionStrategy::Range, PartitionBound::Range { from, to }) => {
+            if from.len() != usize::from(n_keys) || to.len() != usize::from(n_keys) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "partition bound must specify every partition key column"
+                ));
+            }
+            let mut lower = [PartitionBoundValue::Value(crate::storage::OwnedDatum::Null);
+                crate::storage::MAX_PARTITION_KEYS];
+            let mut upper = lower;
+            for i in 0..usize::from(n_keys) {
+                lower[i] = partition_range_value(from[i], usize::from(keys[i]), &constant)?;
+                upper[i] = partition_range_value(to[i], usize::from(keys[i]), &constant)?;
+            }
+            Ok(StoredPartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            })
+        }
+        (StoredPartitionStrategy::List, PartitionBound::List { values }) => {
+            if n_keys != 1 || values.len() > crate::storage::MAX_PARTITION_LIST_VALUES {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "multi-column LIST partition bounds are not supported"
+                ));
+            }
+            let mut out =
+                [crate::storage::OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+            for (i, value) in values.iter().enumerate() {
+                out[i] = constant(value, usize::from(keys[0]))?;
+            }
+            Ok(StoredPartitionBound::List {
+                values: out,
+                n_values: values.len() as u8,
+            })
+        }
+        (StoredPartitionStrategy::Hash, PartitionBound::Hash { modulus, remainder }) => {
+            let modulus = eval_full(
+                modulus,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &NoColumns,
+                &NO_HOOKS,
+            )?;
+            let remainder = eval_full(
+                remainder,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &NoColumns,
+                &NO_HOOKS,
+            )?;
+            let (Datum::Int4(modulus), Datum::Int4(remainder)) = (modulus, remainder) else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "hash partition modulus and remainder must be integers"
+                ));
+            };
+            if modulus <= 0 || remainder < 0 || remainder >= modulus {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "invalid hash partition modulus or remainder"
+                ));
+            }
+            Ok(StoredPartitionBound::Hash {
+                modulus: modulus as u32,
+                remainder: remainder as u32,
+            })
+        }
+        _ => Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "partition bound does not match partition strategy"
+        )),
+    }
+}
+
+fn partition_range_value(
+    expression: &Expr,
+    column: usize,
+    constant: &impl Fn(&Expr, usize) -> Result<crate::storage::OwnedDatum, SqlError>,
+) -> Result<PartitionBoundValue, SqlError> {
+    match expression {
+        Expr::Column {
+            qualifier: None,
+            name: "minvalue",
+        } => Ok(PartitionBoundValue::MinValue),
+        Expr::Column {
+            qualifier: None,
+            name: "maxvalue",
+        } => Ok(PartitionBoundValue::MaxValue),
+        _ => Ok(PartitionBoundValue::Value(constant(expression, column)?)),
+    }
 }
 
 /// A table gets one primary key. A column-level `PRIMARY KEY` sets the column's
@@ -1359,7 +1724,7 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<ConflictOutcome<'a>, SqlError>
@@ -3840,7 +4205,7 @@ pub fn drop_owned(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     roles: &[&str],
     cascade: bool,
     arena: &Arena,
@@ -4801,7 +5166,7 @@ pub fn drop_schema(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -9834,7 +10199,7 @@ struct TriggerExecContext<'s, 'a, 'b> {
     // The caller owns this startup-sized workspace for the duration of the
     // trigger dispatch. Nested DML temporarily borrows it through this raw
     // pointer only after saving the outer scan; no two uses overlap.
-    scratch: *mut FixedVec<(u64, RowHome)>,
+    scratch: *mut DmlScratch,
 }
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
@@ -14992,7 +15357,7 @@ pub fn drop_domain(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
@@ -15085,7 +15450,7 @@ fn drop_domain_selection(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     selected: &[bool; crate::storage::MAX_DOMAINS],
     selected_enum: Option<usize>,
     cascade: bool,
@@ -15259,7 +15624,7 @@ fn cascade_drop_type_column(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     table_schema: SqlName,
     table_name: SqlName,
     column_names: &[SqlName],
@@ -15937,7 +16302,7 @@ pub fn drop_type(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
@@ -16163,7 +16528,7 @@ fn drop_composite_type(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     slot: usize,
     cascade: bool,
     arena: &Arena,
@@ -19508,12 +19873,14 @@ pub fn copy_row(
     )? {
         return Ok(CopyRowOutcome::Filtered);
     }
+    let target_table =
+        storage.partition_target(setup.table_index, &values[..def.n_columns], txn.txid)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     enforce_row_constraints(
         storage,
-        setup.table_index,
+        target_table,
         &def,
         &schema[..def.n_columns],
         &values[..def.n_columns],
@@ -19523,13 +19890,7 @@ pub fn copy_row(
         arena,
         &[],
     )?;
-    store_row(
-        storage,
-        txn,
-        setup.table_index,
-        None,
-        &values[..def.n_columns],
-    )?;
+    store_row(storage, txn, target_table, None, &values[..def.n_columns])?;
     Ok(CopyRowOutcome::Stored)
 }
 
@@ -19619,12 +19980,14 @@ pub fn copy_row_binary(
     )? {
         return Ok(CopyRowOutcome::Filtered);
     }
+    let target_table =
+        storage.partition_target(setup.table_index, &values[..def.n_columns], txn.txid)?;
     check_not_null(&def, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     enforce_row_constraints(
         storage,
-        setup.table_index,
+        target_table,
         &def,
         &schema[..def.n_columns],
         &values[..def.n_columns],
@@ -19634,13 +19997,7 @@ pub fn copy_row_binary(
         arena,
         &[],
     )?;
-    store_row(
-        storage,
-        txn,
-        setup.table_index,
-        None,
-        &values[..def.n_columns],
-    )?;
+    store_row(storage, txn, target_table, None, &values[..def.n_columns])?;
     Ok(CopyRowOutcome::Stored)
 }
 
@@ -21130,19 +21487,31 @@ pub fn copy_out(
     // Rowid order is insertion order (rowids are monotonic), which is the
     // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
     // the visible tokens first, sort, then stream.
+    let leaves = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "COPY TO partition scan exceeds the statement arena"
+            )
+        })?;
+    let n_leaves = storage.partition_leaf_slots(setup.table_index, txid, leaves)?;
     let mut visible = 0usize;
-    storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
-        if storage
-            .visible_row_home(setup.table_index, rowid, state, txid)?
-            .is_some()
-        {
-            visible += 1;
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
+    for &leaf in &leaves[..n_leaves] {
+        storage.for_each_row_state(leaf, &mut |rowid, state| {
+            if storage
+                .visible_row_home(leaf, rowid, state, txid)?
+                .is_some()
+            {
+                visible += 1;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    }
     let tokens = arena
         .alloc_slice_with(visible, |_| {
             (
+                usize::MAX,
                 0u64,
                 crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
             )
@@ -21154,17 +21523,19 @@ pub fn copy_out(
             )
         })?;
     let mut fill = 0usize;
-    storage.for_each_row_state(setup.table_index, &mut |rowid, state| {
-        if let Some(home) = storage.visible_row_home(setup.table_index, rowid, state, txid)? {
-            tokens[fill] = (rowid, home);
-            fill += 1;
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
-    tokens.sort_unstable_by_key(|(rowid, _)| *rowid);
+    for &leaf in &leaves[..n_leaves] {
+        storage.for_each_row_state(leaf, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+                tokens[fill] = (leaf, rowid, home);
+                fill += 1;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    }
+    tokens.sort_unstable_by_key(|(_, rowid, _)| *rowid);
     let mut count = 0u64;
-    for &(rowid, home) in tokens.iter() {
-        storage.with_row_bytes(setup.table_index, rowid, home, |bytes| {
+    for &(leaf, rowid, home) in tokens.iter() {
+        storage.with_row_bytes(leaf, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             if fmt.binary {
@@ -21934,7 +22305,7 @@ fn merge_source_columns(
 pub fn merge(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &crate::sql::ast::Merge,
     arena: &Arena,
     params: &[Datum],
@@ -22185,11 +22556,25 @@ pub fn merge(
     let mut target_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut target_schema);
     let target_schema = &target_schema[..def.n_columns];
-    let n_target = match storage.visible_row_count(table_index, txn.txid) {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
+    let leaves = match dml_leaf_slots(storage, table_index, txn.txid, arena) {
+        Ok(leaves) => leaves,
+        Err(error) => return sql_fail(error),
     };
+    let mut n_target = 0usize;
+    for &leaf in leaves {
+        n_target = match storage.visible_row_count(leaf, txn.txid) {
+            Ok(n) => match n_target.checked_add(n) {
+                Some(total) => total,
+                None => return sql_fail(super::query::arena_full_pub()),
+            },
+            Err(error) => return sql_fail(error),
+        };
+    }
     let target_ids: &mut [u64] = match arena.alloc_slice_with(n_target, |_| 0u64) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let target_tables: &mut [usize] = match arena.alloc_slice_with(n_target, |_| usize::MAX) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -22211,26 +22596,30 @@ pub fn merge(
             commit_lsn: 0,
         };
         let ids: &mut [u64] = target_ids;
+        let tables: &mut [usize] = target_tables;
         let hms: &mut [crate::storage::RowHome] =
             match arena.alloc_slice_with(n_target, |_| placeholder) {
                 Ok(s) => s,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
         let mut k = 0usize;
-        if let Err(e) = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)?
-                && k < ids.len()
-            {
-                ids[k] = rowid;
-                hms[k] = home;
-                k += 1;
+        for &leaf in leaves {
+            if let Err(e) = storage.for_each_row_state(leaf, &mut |rowid, state| {
+                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txn.txid)?
+                    && k < ids.len()
+                {
+                    ids[k] = rowid;
+                    tables[k] = leaf;
+                    hms[k] = home;
+                    k += 1;
+                }
+                Ok(ControlFlow::Continue(()))
+            }) {
+                return sql_fail(e);
             }
-            Ok(ControlFlow::Continue(()))
-        }) {
-            return sql_fail(e);
         }
         for j in 0..k {
-            let fetched = match storage.row_bytes(table_index, ids[j], hms[j], arena) {
+            let fetched = match storage.row_bytes(tables[j], ids[j], hms[j], arena) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -22359,14 +22748,15 @@ pub fn merge(
                         }
                         affected[j] = true;
                         match storage.write_pending(
-                            table_index,
+                            target_tables[j],
                             target_ids[j],
                             txn.txid,
                             txn.command_id(),
                             None,
                         ) {
                             Ok(prior) => {
-                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior)
+                                if let Err(e) =
+                                    txn.touch(target_tables[j] as u32, target_ids[j], prior)
                                 {
                                     return sql_fail(e);
                                 }
@@ -22465,9 +22855,17 @@ pub fn merge(
                         if let Err(e) = check_not_null(&def, &new_values) {
                             return sql_fail(e);
                         }
+                        let updated_table = match storage.partition_target(
+                            table_index,
+                            &new_values[..def.n_columns],
+                            txn.txid,
+                        ) {
+                            Ok(target) => target,
+                            Err(error) => return sql_fail(error),
+                        };
                         if let Err(e) = enforce_row_constraints(
                             storage,
-                            table_index,
+                            updated_table,
                             &def,
                             target_schema,
                             &new_values[..def.n_columns],
@@ -22490,26 +22888,73 @@ pub fn merge(
                             Err(e) => return sql_fail(e),
                         };
                         slice.copy_from_slice(out);
-                        match storage.write_pending(
-                            table_index,
-                            target_ids[j],
-                            txn.txid,
-                            txn.command_id(),
-                            Some(loc),
-                        ) {
-                            Ok(prior) => {
-                                if let Err(e) = txn.touch(table_index as u32, target_ids[j], prior)
-                                {
-                                    storage.restore_pending(
-                                        table_index,
-                                        target_ids[j],
-                                        txn.txid,
-                                        prior,
-                                    );
-                                    return sql_fail(e);
+                        if updated_table == target_tables[j] {
+                            match storage.write_pending(
+                                updated_table,
+                                target_ids[j],
+                                txn.txid,
+                                txn.command_id(),
+                                Some(loc),
+                            ) {
+                                Ok(prior) => {
+                                    if let Err(e) =
+                                        txn.touch(updated_table as u32, target_ids[j], prior)
+                                    {
+                                        storage.restore_pending(
+                                            updated_table,
+                                            target_ids[j],
+                                            txn.txid,
+                                            prior,
+                                        );
+                                        return sql_fail(e);
+                                    }
                                 }
+                                Err(e) => return sql_fail(e),
                             }
-                            Err(e) => return sql_fail(e),
+                        } else {
+                            let inserted_rowid = storage.next_rowid();
+                            let prior = match storage.write_pending(
+                                updated_table,
+                                inserted_rowid,
+                                txn.txid,
+                                txn.command_id(),
+                                Some(loc),
+                            ) {
+                                Ok(prior) => prior,
+                                Err(error) => return sql_fail(error),
+                            };
+                            if let Err(error) =
+                                txn.touch(updated_table as u32, inserted_rowid, prior)
+                            {
+                                storage.restore_pending(
+                                    updated_table,
+                                    inserted_rowid,
+                                    txn.txid,
+                                    prior,
+                                );
+                                return sql_fail(error);
+                            }
+                            let prior = match storage.write_pending(
+                                target_tables[j],
+                                target_ids[j],
+                                txn.txid,
+                                txn.command_id(),
+                                None,
+                            ) {
+                                Ok(prior) => prior,
+                                Err(error) => return sql_fail(error),
+                            };
+                            if let Err(error) =
+                                txn.touch(target_tables[j] as u32, target_ids[j], prior)
+                            {
+                                storage.restore_pending(
+                                    target_tables[j],
+                                    target_ids[j],
+                                    txn.txid,
+                                    prior,
+                                );
+                                return sql_fail(error);
+                            }
                         }
                         if let Err(error) = fire_row_triggers(
                             TriggerExecContext {
@@ -22684,7 +23129,7 @@ fn merge_insert<'a>(
     params: &[Datum<'a>],
     checks: &ParsedChecks,
     responder: &mut Responder,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<bool, SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
@@ -22786,12 +23231,14 @@ fn merge_insert<'a>(
         return Ok(false);
     }
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
+    let target_table =
+        storage.partition_target(table_index, &row_arr[..def.n_columns], txn.txid)?;
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     enforce_row_constraints(
         storage,
-        table_index,
+        target_table,
         def,
         &schema[..def.n_columns],
         &row_arr[..def.n_columns],
@@ -22801,7 +23248,7 @@ fn merge_insert<'a>(
         arena,
         params,
     )?;
-    store_row(storage, txn, table_index, None, &row_arr[..def.n_columns])?;
+    store_row(storage, txn, target_table, None, &row_arr[..def.n_columns])?;
     fire_row_triggers(
         TriggerExecContext {
             storage,
@@ -22829,6 +23276,7 @@ fn merge_insert<'a>(
 fn finish_insert_row<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
+    logical_table_index: usize,
     table_index: usize,
     definition: &TableDef,
     values: &mut [Datum<'a>; MAX_COLUMNS],
@@ -22843,7 +23291,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
     conflict_transition_capture: Option<&mut TransitionCapture<'a>>,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
 ) -> Result<Result<bool, SqlError>, WireFull>
 where
@@ -22852,6 +23300,45 @@ where
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
         return Ok(Err(error));
     }
+    let mut table_index = table_index;
+    let trigger_table = match definition.partition {
+        PartitionDef::Child { parent, .. } if logical_table_index == table_index => {
+            usize::from(parent)
+        }
+        _ => logical_table_index,
+    };
+    if trigger_table != table_index
+        && !match fire_row_triggers(
+            TriggerExecContext {
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch: scratch as *mut _,
+            },
+            trigger_table,
+            definition,
+            1,
+            true,
+            0,
+            None,
+            Some(&mut values[..definition.n_columns]),
+        ) {
+            Ok(run) => run,
+            Err(error) => return Ok(Err(error)),
+        }
+    {
+        return Ok(Ok(false));
+    }
+    table_index = match storage.partition_target(
+        logical_table_index,
+        &values[..definition.n_columns],
+        txn.txid,
+    ) {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(error)),
+    };
     if !match fire_row_triggers(
         TriggerExecContext {
             storage,
@@ -22997,7 +23484,7 @@ where
 pub(crate) fn instead_of_view_dml<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &'a Stmt<'a>,
     view_slot: usize,
     arena: &'a Arena,
@@ -23628,7 +24115,7 @@ fn materialize_view_rows<'a>(
 fn fire_view_row_trigger<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
@@ -23661,7 +24148,7 @@ fn fire_view_row_trigger<'a>(
 fn finish_instead_of_view_new_row<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
@@ -23709,7 +24196,7 @@ fn finish_instead_of_view_new_row<'a>(
 pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &Insert<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -24039,10 +24526,16 @@ where
             ) {
                 return sql_fail(e);
             }
+            let target_table =
+                match storage.partition_target(table_index, &values[..def.n_columns], txn.txid) {
+                    Ok(slot) => slot,
+                    Err(error) => return sql_fail(error),
+                };
             match finish_insert_row(
                 storage,
                 txn,
                 table_index,
+                target_table,
                 &def,
                 &mut values,
                 &generated_exprs,
@@ -24264,10 +24757,16 @@ where
         ) {
             return sql_fail(e);
         }
+        let target_table =
+            match storage.partition_target(table_index, &values[..def.n_columns], txn.txid) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
+            };
         match finish_insert_row(
             storage,
             txn,
             table_index,
+            target_table,
             &def,
             &mut values,
             &generated_exprs,
@@ -24503,7 +25002,7 @@ fn emit_projected(
 pub(crate) fn update<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &Update<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -24687,10 +25186,10 @@ pub(crate) fn update<'a>(
     } else {
         crate::sql::ast::LockStrength::NoKeyUpdate
     };
-    for &(rowid, _) in scratch.iter() {
+    for row in scratch.iter().copied() {
         match storage.acquire_row_lock(
-            table_index,
-            rowid,
+            row.table_index,
+            row.rowid,
             txn.txid,
             lock_strength,
             crate::sql::ast::LockWait::Wait,
@@ -24740,13 +25239,17 @@ pub(crate) fn update<'a>(
 
     let mut updated = 0u64;
     for i in 0..scratch.len() {
-        let (rowid, home) = scratch[i];
+        let PhysicalRow {
+            table_index: row_table,
+            rowid,
+            home,
+        } = scratch[i];
         // Build the new row image in the statement arena so the heap
         // borrow ends before the heap is appended to.
         // An arena-owned copy of the old row bytes: the referential-action
         // pass below needs the old values after storage mutates.
         let row_bytes = match (|| {
-            let fetched = storage.row_bytes(table_index, rowid, home, arena)?;
+            let fetched = storage.row_bytes(row_table, rowid, home, arena)?;
             arena
                 .alloc_slice_copy(fetched)
                 .map(|bytes| &*bytes)
@@ -24905,6 +25408,30 @@ pub(crate) fn update<'a>(
                 Ok(values) => values,
                 Err(error) => return sql_fail(error),
             };
+            if table_index != row_table
+                && !match fire_row_triggers(
+                    TriggerExecContext {
+                        storage,
+                        txn,
+                        arena,
+                        seq_session,
+                        responder,
+                        scratch: scratch as *mut _,
+                    },
+                    table_index,
+                    &def,
+                    2,
+                    true,
+                    updated_columns,
+                    Some(old_transition),
+                    Some(new_values),
+                ) {
+                    Ok(run) => run,
+                    Err(error) => return sql_fail(error),
+                }
+            {
+                continue;
+            }
             if !match fire_row_triggers(
                 TriggerExecContext {
                     storage,
@@ -24914,7 +25441,7 @@ pub(crate) fn update<'a>(
                     responder,
                     scratch: scratch as *mut _,
                 },
-                table_index,
+                row_table,
                 &def,
                 2,
                 true,
@@ -24937,7 +25464,7 @@ pub(crate) fn update<'a>(
             }
             if let Err(e) = enforce_row_constraints(
                 storage,
-                table_index,
+                row_table,
                 &def,
                 schema,
                 &new_values[..def.n_columns],
@@ -24962,25 +25489,59 @@ pub(crate) fn update<'a>(
             rowenc::encode(&new_values[..def.n_columns], out);
             &*out
         };
+        let target_table = if matches!(def.partition, PartitionDef::Parent { .. }) {
+            let mut target_values = [Datum::Null; MAX_COLUMNS];
+            if let Err(error) = rowenc::decode(new_bytes, schema, &mut target_values) {
+                return sql_fail(error);
+            }
+            match storage.partition_target(table_index, &target_values[..def.n_columns], txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            }
+        } else {
+            row_table
+        };
         let (new_loc, slice) = match storage.heap.append(new_bytes.len()) {
             Ok(x) => x,
             Err(e) => return sql_fail(e),
         };
         slice.copy_from_slice(new_bytes);
-        match storage.write_pending(
-            table_index,
-            rowid,
-            txn.txid,
-            txn.command_id(),
-            Some(new_loc),
-        ) {
-            Ok(prior) => {
-                if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-                    storage.restore_pending(table_index, rowid, txn.txid, prior);
-                    return sql_fail(e);
+        if target_table == row_table {
+            match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), Some(new_loc))
+            {
+                Ok(prior) => {
+                    if let Err(e) = txn.touch(row_table as u32, rowid, prior) {
+                        storage.restore_pending(row_table, rowid, txn.txid, prior);
+                        return sql_fail(e);
+                    }
                 }
+                Err(e) => return sql_fail(e),
             }
-            Err(e) => return sql_fail(e),
+        } else {
+            let inserted_rowid = storage.next_rowid();
+            let insert_prior = match storage.write_pending(
+                target_table,
+                inserted_rowid,
+                txn.txid,
+                txn.command_id(),
+                Some(new_loc),
+            ) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.touch(target_table as u32, inserted_rowid, insert_prior) {
+                storage.restore_pending(target_table, inserted_rowid, txn.txid, insert_prior);
+                return sql_fail(error);
+            }
+            let delete_prior =
+                match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), None) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                };
+            if let Err(error) = txn.touch(row_table as u32, rowid, delete_prior) {
+                storage.restore_pending(row_table, rowid, txn.txid, delete_prior);
+                return sql_fail(error);
+            }
         }
         // With the new parent row in place, apply each referencing key's
         // ON UPDATE action when a referenced column changed (NO ACTION /
@@ -25033,6 +25594,27 @@ pub(crate) fn update<'a>(
         if let Err(error) = rowenc::decode(new_bytes, schema, &mut new_transition) {
             return sql_fail(error);
         }
+        if table_index != row_table
+            && let Err(error) = fire_row_triggers(
+                TriggerExecContext {
+                    storage,
+                    txn,
+                    arena,
+                    seq_session,
+                    responder,
+                    scratch: scratch as *mut _,
+                },
+                table_index,
+                &def,
+                2,
+                false,
+                updated_columns,
+                Some(&old_transition[..def.n_columns]),
+                Some(&mut new_transition[..def.n_columns]),
+            )
+        {
+            return sql_fail(error);
+        }
         if let Err(error) = fire_row_triggers(
             TriggerExecContext {
                 storage,
@@ -25042,7 +25624,7 @@ pub(crate) fn update<'a>(
                 responder,
                 scratch: scratch as *mut _,
             },
-            table_index,
+            row_table,
             &def,
             2,
             false,
@@ -25115,7 +25697,7 @@ pub(crate) fn update<'a>(
 pub(crate) fn delete<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &Delete<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -25237,10 +25819,10 @@ pub(crate) fn delete<'a>(
     if let Err(e) = collect {
         return sql_fail(e);
     }
-    for &(rowid, _) in scratch.iter() {
+    for row in scratch.iter().copied() {
         match storage.acquire_row_lock(
-            table_index,
-            rowid,
+            row.table_index,
+            row.rowid,
             txn.txid,
             crate::sql::ast::LockStrength::Update,
             crate::sql::ast::LockWait::Wait,
@@ -25291,11 +25873,20 @@ pub(crate) fn delete<'a>(
         .next()
         .is_some();
     for i in 0..scratch.len() {
-        let (rowid, old_home) = scratch[i];
-        if !statement.returning.is_empty() || referenced || has_triggers {
+        let PhysicalRow {
+            table_index: row_table,
+            rowid,
+            home: old_home,
+        } = scratch[i];
+        let row_has_triggers = has_triggers
+            || storage
+                .triggers_for_table(row_table, txn.txid)
+                .next()
+                .is_some();
+        if !statement.returning.is_empty() || referenced || row_has_triggers {
             // The cascade below mutates storage, so the row image is decoded
             // from an arena-owned copy.
-            let fetched = match storage.row_bytes(table_index, rowid, old_home, arena) {
+            let fetched = match storage.row_bytes(row_table, rowid, old_home, arena) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -25312,6 +25903,30 @@ pub(crate) fn delete<'a>(
             if let Err(e) = rowenc::decode(old_copy, schema, &mut old_values) {
                 return sql_fail(e);
             }
+            if table_index != row_table
+                && !match fire_row_triggers(
+                    TriggerExecContext {
+                        storage,
+                        txn,
+                        arena,
+                        seq_session,
+                        responder,
+                        scratch: scratch as *mut _,
+                    },
+                    table_index,
+                    &def,
+                    4,
+                    true,
+                    0,
+                    Some(&old_values[..def.n_columns]),
+                    None,
+                ) {
+                    Ok(run) => run,
+                    Err(error) => return sql_fail(error),
+                }
+            {
+                continue;
+            }
             if !match fire_row_triggers(
                 TriggerExecContext {
                     storage,
@@ -25321,7 +25936,7 @@ pub(crate) fn delete<'a>(
                     responder,
                     scratch: scratch as *mut _,
                 },
-                table_index,
+                row_table,
                 &def,
                 4,
                 true,
@@ -25370,19 +25985,19 @@ pub(crate) fn delete<'a>(
                 return sql_fail(e);
             }
         }
-        match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
+        match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), None) {
             Ok(prior) => {
-                if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-                    storage.restore_pending(table_index, rowid, txn.txid, prior);
+                if let Err(e) = txn.touch(row_table as u32, rowid, prior) {
+                    storage.restore_pending(row_table, rowid, txn.txid, prior);
                     return sql_fail(e);
                 }
             }
             Err(e) => return sql_fail(e),
         }
-        if has_triggers {
+        if row_has_triggers {
             let mut old_transition = [Datum::Null; MAX_COLUMNS];
             {
-                let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                let old_bytes = match storage.row_bytes(row_table, rowid, old_home, arena) {
                     Ok(bytes) => bytes,
                     Err(error) => return sql_fail(error),
                 };
@@ -25399,6 +26014,27 @@ pub(crate) fn delete<'a>(
                     return sql_fail(error);
                 }
             }
+            if table_index != row_table
+                && let Err(error) = fire_row_triggers(
+                    TriggerExecContext {
+                        storage,
+                        txn,
+                        arena,
+                        seq_session,
+                        responder,
+                        scratch: scratch as *mut _,
+                    },
+                    table_index,
+                    &def,
+                    4,
+                    false,
+                    0,
+                    Some(&old_transition[..def.n_columns]),
+                    None,
+                )
+            {
+                return sql_fail(error);
+            }
             if let Err(error) = fire_row_triggers(
                 TriggerExecContext {
                     storage,
@@ -25408,7 +26044,7 @@ pub(crate) fn delete<'a>(
                     responder,
                     scratch: scratch as *mut _,
                 },
-                table_index,
+                row_table,
                 &def,
                 4,
                 false,
@@ -25467,7 +26103,7 @@ pub(crate) fn delete<'a>(
 pub fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     tables: &[QualName],
@@ -25920,7 +26556,7 @@ pub fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &AlterTable,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
@@ -26021,7 +26657,7 @@ fn alter_table_inner(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     statement: &AlterTable,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
@@ -26238,7 +26874,14 @@ fn alter_table_inner(
             else {
                 return Ok(ControlFlow::Continue(()));
             };
-            if scratch.push((rowid, loc)).is_err() {
+            if scratch
+                .push(PhysicalRow {
+                    table_index,
+                    rowid,
+                    home: loc,
+                })
+                .is_err()
+            {
                 overflow = true;
                 return Ok(ControlFlow::Break(()));
             }
@@ -26757,7 +27400,11 @@ fn alter_table_inner(
         Err(e) => return sql_fail(e),
     };
     for i in 0..scratch.len() {
-        let (rowid, old_home) = scratch[i];
+        let PhysicalRow {
+            rowid,
+            home: old_home,
+            ..
+        } = scratch[i];
         let new_loc = if has_rewrite {
             // Build the new image in the statement arena so the heap borrow
             // (decoded text refs) ends before the heap append.
@@ -26907,7 +27554,11 @@ fn alter_table_inner(
                 }
             }
         };
-        scratch[i] = (rowid, RowHome::Heap(new_loc));
+        scratch[i] = PhysicalRow {
+            table_index,
+            rowid,
+            home: RowHome::Heap(new_loc),
+        };
     }
 
     // A uniqueness constraint added alongside a rewrite is validated across the
@@ -26915,7 +27566,7 @@ fn alter_table_inner(
     // that cannot run against the stored (still old) rows. NULLs are distinct.
     if has_rewrite && has_added_unique {
         for a in 0..scratch.len() {
-            let RowHome::Heap(la) = scratch[a].1 else {
+            let RowHome::Heap(la) = scratch[a].home else {
                 unreachable!()
             };
             let abytes = storage.heap.get(la);
@@ -26924,7 +27575,7 @@ fn alter_table_inner(
                 return sql_fail(e);
             }
             for b in (a + 1)..scratch.len() {
-                let RowHome::Heap(lb) = scratch[b].1 else {
+                let RowHome::Heap(lb) = scratch[b].home else {
                     unreachable!()
                 };
                 let bbytes = storage.heap.get(lb);
@@ -26980,7 +27631,11 @@ fn alter_table_inner(
         return sql_fail(e);
     }
     for i in 0..scratch.len() {
-        let (rowid, new_home) = scratch[i];
+        let PhysicalRow {
+            rowid,
+            home: new_home,
+            ..
+        } = scratch[i];
         let RowHome::Heap(new_loc) = new_home else {
             unreachable!("the rewrite pass re-homes every row to the heap");
         };
@@ -27171,7 +27826,11 @@ fn alter_table_inner(
         }
     }
     for i in 0..scratch.len() {
-        let (rowid, new_home) = scratch[i];
+        let PhysicalRow {
+            rowid,
+            home: new_home,
+            ..
+        } = scratch[i];
         let RowHome::Heap(new_loc) = new_home else {
             unreachable!("the rewrite pass re-homes every row to the heap");
         };
@@ -27424,6 +28083,27 @@ fn row_matches_values<'a>(
     }
 }
 
+/// Resolves a writable target once into its physical leaves. The arena is
+/// statement-bounded and the catalog capacity is fixed at startup, so parent
+/// DML cannot create an unbounded work list.
+fn dml_leaf_slots<'a>(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let slots = arena
+        .alloc_slice_with(storage.table_count(), |_| 0usize)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "partition target list exceeds the statement arena"
+            )
+        })?;
+    let n = storage.partition_leaf_slots(table_index, txid, slots)?;
+    Ok(&slots[..n])
+}
+
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 fn collect_matches<'a>(
     storage: &Storage,
@@ -27435,45 +28115,53 @@ fn collect_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    storage.record_serializable_read(txid, table_index);
     let def = storage.table_def(table_index, txid);
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        if row_matches(
-            storage,
-            table_index,
-            rowid,
-            def,
-            alias,
-            schema,
-            loc,
-            where_clause,
-            arena,
-            params,
-            hooks,
-            transition,
-        )? {
-            scratch.push((rowid, loc)).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement touches more than {} rows",
-                    scratch.capacity()
-                )
-            })?;
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+        storage.record_serializable_read(txid, leaf);
+        storage.for_each_row_state(leaf, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            if row_matches(
+                storage,
+                leaf,
+                rowid,
+                def,
+                alias,
+                schema,
+                loc,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                transition,
+            )? {
+                scratch
+                    .push(PhysicalRow {
+                        table_index: leaf,
+                        rowid,
+                        home: loc,
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement touches more than {} rows",
+                            scratch.capacity()
+                        )
+                    })?;
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+    }
     // DML RETURNING follows the target table's physical row order. The row
     // map is hash-addressed, so restore the monotonic row identity assigned
     // when the heap image was first appended before locks and writes begin.
-    scratch.sort_unstable_by_key(|(rowid, _)| *rowid);
+    scratch.sort_unstable_by_key(|row| row.rowid);
     Ok(())
 }
 
@@ -27492,48 +28180,56 @@ fn collect_join_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    storage.record_serializable_read(txid, table_index);
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        // Consume-in-place, as in row_matches: the joined-row probe reads
-        // this row's values only while it runs.
-        let found = storage.with_row_bytes(table_index, rowid, loc, |bytes| {
-            let mut tv = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut tv)?;
-            let context = RowCtx {
-                def,
-                values: &tv[..def.n_columns],
-                alias,
+    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+        storage.record_serializable_read(txid, leaf);
+        storage.for_each_row_state(leaf, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
             };
-            super::query::first_from_match(
-                storage,
-                from,
-                txid,
-                where_clause,
-                &[],
-                arena,
-                params,
-                &context,
-                &mut |_| Ok(()),
-            )
-        })?;
-        if found {
-            scratch.push((rowid, loc)).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement touches more than {} rows",
-                    scratch.capacity()
+            // Consume-in-place, as in row_matches: the joined-row probe reads
+            // this row's values only while it runs.
+            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                let mut tv = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut tv)?;
+                let context = RowCtx {
+                    def,
+                    values: &tv[..def.n_columns],
+                    alias,
+                };
+                super::query::first_from_match(
+                    storage,
+                    from,
+                    txid,
+                    where_clause,
+                    &[],
+                    arena,
+                    params,
+                    &context,
+                    &mut |_| Ok(()),
                 )
             })?;
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+            if found {
+                scratch
+                    .push(PhysicalRow {
+                        table_index: leaf,
+                        rowid,
+                        home: loc,
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement touches more than {} rows",
+                            scratch.capacity()
+                        )
+                    })?;
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+    }
     Ok(())
 }
 
@@ -27552,51 +28248,59 @@ fn collect_join_matches_with_transition<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
-    scratch: &mut FixedVec<(u64, RowHome)>,
+    scratch: &mut DmlScratch,
     outer: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
     scratch.clear();
-    storage.record_serializable_read(txid, table_index);
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(loc) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let found = storage.with_row_bytes(table_index, rowid, loc, |bytes| {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut values)?;
-            let context = RowCtx {
-                def,
-                values: &values[..def.n_columns],
-                alias,
+    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+        storage.record_serializable_read(txid, leaf);
+        storage.for_each_row_state(leaf, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
             };
-            let scope = JoinedTriggerDmlScope {
-                row: &context,
-                outer,
-            };
-            super::query::first_from_match(
-                storage,
-                from,
-                txid,
-                where_clause,
-                &[],
-                arena,
-                params,
-                &scope,
-                &mut |_| Ok(()),
-            )
-        })?;
-        if found {
-            scratch.push((rowid, loc)).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement touches more than {} rows",
-                    scratch.capacity()
+            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                let context = RowCtx {
+                    def,
+                    values: &values[..def.n_columns],
+                    alias,
+                };
+                let scope = JoinedTriggerDmlScope {
+                    row: &context,
+                    outer,
+                };
+                super::query::first_from_match(
+                    storage,
+                    from,
+                    txid,
+                    where_clause,
+                    &[],
+                    arena,
+                    params,
+                    &scope,
+                    &mut |_| Ok(()),
                 )
             })?;
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+            if found {
+                scratch
+                    .push(PhysicalRow {
+                        table_index: leaf,
+                        rowid,
+                        home: loc,
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement touches more than {} rows",
+                            scratch.capacity()
+                        )
+                    })?;
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+    }
     Ok(())
 }
 

@@ -187,6 +187,26 @@ assert [r[0] for r in bcur.fetchall()] == [-32768, 32767], "smallint binary form
 bcur.close()
 print("smallint wire ok")
 
+# Declarative partitioning must preserve extended-protocol parameter typing and
+# RETURNING while physical storage changes leaf.  Updating the key crosses a
+# range boundary through the parent.
+cur.execute("CREATE TABLE drv_partitioned (id int PRIMARY KEY, note text) PARTITION BY RANGE (id)")
+cur.execute("CREATE TABLE drv_partitioned_low PARTITION OF drv_partitioned FOR VALUES FROM (0) TO (10)")
+cur.execute("CREATE TABLE drv_partitioned_high PARTITION OF drv_partitioned FOR VALUES FROM (10) TO (20)")
+cur.execute(
+    "INSERT INTO drv_partitioned VALUES (%s, %s) RETURNING id, note",
+    (1, "low"),
+)
+assert cur.fetchone() == (1, "low")
+cur.execute(
+    "UPDATE drv_partitioned SET id = %s, note = %s WHERE id = %s RETURNING id, note",
+    (11, "high", 1),
+)
+assert cur.fetchone() == (11, "high")
+cur.execute("SELECT id, note FROM drv_partitioned")
+assert cur.fetchone() == (11, "high")
+print("partitioned extended protocol routing ok")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

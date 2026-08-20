@@ -1386,7 +1386,46 @@ pub struct CreateTable<'a> {
     /// `LIKE source [INCLUDING ...]` elements, expanded against the catalog
     /// when the statement runs.
     pub likes: &'a [LikeClause<'a>],
+    /// The table's partitioning role.  This is structured at parse time so
+    /// execution never needs to reinterpret a SQL fragment as a bound.
+    pub partition: PartitionClause<'a>,
     pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PartitionClause<'a> {
+    None,
+    By {
+        strategy: PartitionStrategy,
+        columns: &'a [&'a str],
+    },
+    Of {
+        parent: QualName<'a>,
+        bound: PartitionBound<'a>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    Range,
+    List,
+    Hash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PartitionBound<'a> {
+    Default,
+    Range {
+        from: &'a [&'a Expr<'a>],
+        to: &'a [&'a Expr<'a>],
+    },
+    List {
+        values: &'a [&'a Expr<'a>],
+    },
+    Hash {
+        modulus: &'a Expr<'a>,
+        remainder: &'a Expr<'a>,
+    },
 }
 
 /// One `LIKE source [INCLUDING ...]` element of a `CREATE TABLE`. The copied

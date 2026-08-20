@@ -12,9 +12,10 @@ use super::{
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
     AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
-    CreateTrigger, DomainCheck, Expr, PublicationOperations, PublicationTarget, RoleOptions,
-    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind, SubscriptionOptions,
-    SubscriptionSlotName, TriggerEvent, TriggerIdentity, TriggerTiming, TriggerTransitionTables,
+    CreateTrigger, DomainCheck, Expr, PartitionBound, PartitionClause, PartitionStrategy,
+    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
+    RoutineIdentity, RoutineTargetKind, SubscriptionOptions, SubscriptionSlotName, TriggerEvent,
+    TriggerIdentity, TriggerTiming, TriggerTransitionTables,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -1203,6 +1204,7 @@ impl<'a> Parser<'a> {
                 columns: &[],
                 constraints: &[],
                 likes: &[],
+                partition: PartitionClause::None,
                 if_not_exists: false,
             });
         let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
@@ -2088,6 +2090,21 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.qual_name("table name")?;
+        // A partition is a table whose column layout is inherited from its
+        // parent; unlike ordinary CREATE TABLE it has no column list here.
+        if self.eat_ident("partition")? {
+            self.expect_ident("of")?;
+            let parent = self.qual_name("partitioned table name")?;
+            let bound = self.partition_bound()?;
+            return Ok(Stmt::CreateTable(CreateTable {
+                name,
+                columns: &[],
+                constraints: &[],
+                likes: &[],
+                partition: PartitionClause::Of { parent, bound },
+                if_not_exists,
+            }));
+        }
         // `CREATE TABLE name AS <query>` — no explicit column list.
         if self.eat_ident("as")? {
             return self.create_table_as(name, &[], if_not_exists, false);
@@ -2326,6 +2343,38 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
+        let partition = if self.eat_ident("partition")? {
+            self.expect_ident("by")?;
+            let strategy = if self.eat_ident("range")? {
+                PartitionStrategy::Range
+            } else if self.eat_ident("list")? {
+                PartitionStrategy::List
+            } else if self.eat_ident("hash")? {
+                PartitionStrategy::Hash
+            } else {
+                return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
+            };
+            self.expect_op("(")?;
+            let mut columns = [""; MAX_LIST];
+            let mut n_columns = 0;
+            loop {
+                if n_columns == MAX_LIST {
+                    return Err(self.limit("partition key", MAX_LIST));
+                }
+                columns[n_columns] = self.col_ident("partition key column")?;
+                n_columns += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            PartitionClause::By {
+                strategy,
+                columns: self.arena_slice(&columns[..n_columns])?,
+            }
+        } else {
+            PartitionClause::None
+        };
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
         let likes = self.arena_slice(&likes[..n_likes])?;
@@ -2334,8 +2383,55 @@ impl<'a> Parser<'a> {
             columns,
             constraints,
             likes,
+            partition,
             if_not_exists,
         }))
+    }
+
+    fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {
+        if self.eat_ident("default")? {
+            return Ok(PartitionBound::Default);
+        }
+        self.expect_ident("for")?;
+        self.expect_ident("values")?;
+        if self.eat_ident("from")? {
+            let from = self.partition_bound_values()?;
+            self.expect_ident("to")?;
+            let to = self.partition_bound_values()?;
+            return Ok(PartitionBound::Range { from, to });
+        }
+        if self.eat_ident("in")? {
+            return Ok(PartitionBound::List {
+                values: self.partition_bound_values()?,
+            });
+        }
+        self.expect_ident("with")?;
+        self.expect_op("(")?;
+        self.expect_ident("modulus")?;
+        let modulus = self.expression(0)?;
+        self.expect_op(",")?;
+        self.expect_ident("remainder")?;
+        let remainder = self.expression(0)?;
+        self.expect_op(")")?;
+        Ok(PartitionBound::Hash { modulus, remainder })
+    }
+
+    fn partition_bound_values(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        self.expect_op("(")?;
+        let mut values: [&'a Expr<'a>; MAX_LIST] = [&Expr::Null; MAX_LIST];
+        let mut n = 0;
+        loop {
+            if n == MAX_LIST {
+                return Err(self.limit("partition bound", MAX_LIST));
+            }
+            values[n] = self.expression(0)?;
+            n += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        self.arena_slice(&values[..n])
     }
 
     /// The rest of a `LIKE source [ { INCLUDING | EXCLUDING } option ]...`

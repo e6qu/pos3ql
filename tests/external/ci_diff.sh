@@ -56,7 +56,13 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 . "$EXT/liveness.sh"
 
-cleanup() { [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null; rm -rf "$WORK"; }
+cleanup() {
+  local status=$?
+  [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
+  rm -rf "$WORK"
+  trap - EXIT
+  exit "$status"
+}
 trap cleanup EXIT
 
 # --- psycopg venv (the differential/fuzz scripts need it) -------------------
@@ -450,6 +456,9 @@ for f in "$EXT"/differential/*.sql; do
 done
 
 # --- exact-error corpora (message wording must match) -----------------------
+# Each phase owns its fixed 64-table test budget.  Reusing the curated corpus
+# server made otherwise independent checks fail only after its catalog filled.
+restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
 normalize_exact() {
   sed -E \
@@ -471,6 +480,7 @@ for f in "$EXT"/differential_exact/*.sql; do
 done
 
 # --- COPY binary round-trip (binary data cannot be fed through a psql corpus) -
+restart_p3_fresh || exit 1
 echo "=== COPY binary round-trip (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/copy_binary_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/copybin.out" 2>&1; then
   ok "COPY binary round-trip ($(tail -1 "$WORK/copybin.out"))"
@@ -479,6 +489,7 @@ else
 fi
 
 # --- generated type fidelity matrix ----------------------------------------
+restart_p3_fresh || exit 1
 echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
   ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
@@ -487,6 +498,7 @@ else
 fi
 
 # --- LISTEN / NOTIFY (cross-connection; needs two live connections per engine) -
+restart_p3_fresh || exit 1
 echo "=== LISTEN / NOTIFY (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/listen_notify_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/listen.out" 2>&1; then
   ok "LISTEN / NOTIFY ($(grep '^ok:' "$WORK/listen.out" | tail -1))"
@@ -495,6 +507,7 @@ else
 fi
 
 # --- extended-protocol binary composites (parameters and results) -------------
+restart_p3_fresh || exit 1
 echo "=== binary composites (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/binary_param_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/binparam.out" 2>&1; then
   ok "binary composites ($(tail -1 "$WORK/binparam.out"))"

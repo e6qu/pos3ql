@@ -635,6 +635,7 @@ pub(super) fn plan_select(
                 from,
                 statement.where_clause,
                 &table_order[..scope.n],
+                txid,
             )?
             .is_some();
         }

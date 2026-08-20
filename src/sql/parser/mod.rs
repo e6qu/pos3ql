@@ -4706,6 +4706,47 @@ mod tests {
     }
 
     #[test]
+    fn partition_declarations_are_typed_at_the_parse_boundary() {
+        with_parser(
+            "CREATE TABLE sales (sold_on date, amount int) PARTITION BY RANGE (sold_on); \
+             CREATE TABLE sales_2026 PARTITION OF sales FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             CREATE TABLE sales_other PARTITION OF sales DEFAULT",
+            |p| {
+                let Stmt::CreateTable(parent) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(
+                    matches!(parent.partition, PartitionClause::By { strategy: PartitionStrategy::Range, columns } if columns == ["sold_on"])
+                );
+                let Stmt::CreateTable(child) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(
+                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to }, .. } if from.len() == 1 && to.len() == 1)
+                );
+                let Stmt::CreateTable(default) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    default.partition,
+                    PartitionClause::Of {
+                        bound: PartitionBound::Default,
+                        ..
+                    }
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn default_partition_uses_postgresqls_bound_syntax() {
+        with_parser(
+            "CREATE TABLE leaf PARTITION OF parent FOR VALUES DEFAULT",
+            |p| assert!(p.next_stmt().is_err()),
+        );
+    }
+
+    #[test]
     fn publication_options_parse_without_heap_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();

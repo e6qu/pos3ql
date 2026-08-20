@@ -2288,6 +2288,31 @@ def test_type_schema_moves_over_raw_wire():
     s.close()
 
 
+def test_partitioned_tables_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_partition_parent (id integer PRIMARY KEY, note text) PARTITION BY RANGE (id); "
+        "CREATE TABLE wire_partition_low PARTITION OF wire_partition_parent FOR VALUES FROM (0) TO (10); "
+        "CREATE TABLE wire_partition_high PARTITION OF wire_partition_parent FOR VALUES FROM (10) TO (20); "
+        "INSERT INTO wire_partition_parent VALUES (1, 'low')",
+    )
+    check("raw wire: partition DDL and routed insert complete", not any(kind == b"E" for kind, _ in setup), setup)
+    moved = simple_query(
+        s,
+        "UPDATE wire_partition_parent SET id = 11, note = 'high' WHERE id = 1; "
+        "SELECT id || ':' || note FROM wire_partition_parent",
+    )
+    check(
+        "raw wire: partition-key update moves the physical row",
+        first_text_row(moved) == "11:high",
+        moved,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

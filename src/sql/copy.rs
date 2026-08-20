@@ -19,6 +19,18 @@ pub fn decode_row<'a>(
     arena: &'a Arena,
     fields: &mut [Option<&'a str>],
 ) -> Result<usize, SqlError> {
+    decode_row_text(line, arena, fields, b'\t', "\\N")
+}
+
+/// Decodes one text COPY row using its resolved delimiter and NULL sentinel.
+/// The sentinel is compared before escape processing, as PostgreSQL requires.
+pub fn decode_row_text<'a>(
+    line: &[u8],
+    arena: &'a Arena,
+    fields: &mut [Option<&'a str>],
+    delimiter: u8,
+    null: &str,
+) -> Result<usize, SqlError> {
     let mut n = 0usize;
     let mut at = 0usize;
     loop {
@@ -37,7 +49,7 @@ pub fn decode_row<'a>(
         let mut out_len = 0usize;
         // First pass over the raw span to find the field's end.
         let mut end = start;
-        while end < line.len() && line[end] != b'\t' {
+        while end < line.len() && line[end] != delimiter {
             if line[end] == b'\\' && end + 1 < line.len() {
                 end += 2;
             } else {
@@ -45,7 +57,7 @@ pub fn decode_row<'a>(
             }
         }
         let raw = &line[start..end];
-        if raw == b"\\N" {
+        if raw == null.as_bytes() {
             is_null = true;
         } else if raw.contains(&b'\\') {
             let buf = arena
@@ -144,7 +156,7 @@ pub fn decode_row<'a>(
         if end == line.len() {
             return Ok(n);
         }
-        at = end + 1; // past the tab
+        at = end + 1;
     }
 }
 

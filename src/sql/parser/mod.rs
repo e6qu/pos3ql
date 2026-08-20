@@ -2078,8 +2078,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `COPY table [(col, ...)] FROM STDIN | TO STDOUT [[WITH] (options)]`.
-    /// Text format with default delimiters is what this engine speaks (what
-    /// psql and pg_dump emit); every other option is refused loudly.
+    /// The resolved option state is typed before execution so streaming COPY
+    /// cannot accept an option then lose it between protocol messages.
     fn copy_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("copy")?;
         // `COPY (query) TO STDOUT`: a parenthesized query stands in for a table
@@ -2204,7 +2204,7 @@ impl<'a> Parser<'a> {
             "null" => options.null_string = Some(self.copy_string("NULL")?),
             "quote" => options.quote = Some(self.copy_char("QUOTE")?),
             "escape" => options.escape = Some(self.copy_char("ESCAPE")?),
-            "header" => options.header = self.copy_bool_default_true()?,
+            "header" => options.header = self.copy_header()?,
             "encoding" => self.copy_encoding()?,
             "force_quote" => {
                 if self.eat_op("*")? {
@@ -2215,7 +2215,33 @@ impl<'a> Parser<'a> {
             }
             "force_not_null" => options.force_not_null = self.copy_column_list()?,
             "force_null" => options.force_null = self.copy_column_list()?,
-            "freeze" | "oids" | "on_error" | "log_verbosity" | "default" => {
+            "on_error" => {
+                options.on_error = match self.any_ident("COPY ON_ERROR action")? {
+                    "stop" => crate::sql::ast::CopyErrorAction::Stop,
+                    "ignore" => crate::sql::ast::CopyErrorAction::Ignore,
+                    action => return Err(self.copy_unsupported_option(action)),
+                };
+            }
+            "reject_limit" => {
+                let Tok::Num(text) = self.peeked else {
+                    return Err(self.unexpected("expected positive COPY REJECT_LIMIT"));
+                };
+                self.advance()?;
+                options.reject_limit = text.parse::<u64>().ok().filter(|limit| *limit > 0);
+                if options.reject_limit.is_none() {
+                    return Err(self.unexpected("COPY REJECT_LIMIT must be a positive bigint"));
+                }
+            }
+            "log_verbosity" => {
+                options.log_verbosity = match self.any_ident("COPY LOG_VERBOSITY")? {
+                    "default" => crate::sql::ast::CopyLogVerbosity::Default,
+                    "verbose" => crate::sql::ast::CopyLogVerbosity::Verbose,
+                    "silent" => crate::sql::ast::CopyLogVerbosity::Silent,
+                    value => return Err(self.copy_unsupported_option(value)),
+                };
+            }
+            "default" => options.default_string = Some(self.copy_string("DEFAULT")?),
+            "freeze" | "oids" => {
                 return Err(self.copy_unsupported_option(option));
             }
             _ => return Err(self.copy_unsupported_option(option)),
@@ -2230,7 +2256,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("csv")? {
             options.format = CopyFormat::Csv;
         } else if self.eat_ident("header")? {
-            options.header = true;
+            options.header = crate::sql::ast::CopyHeader::Skip;
         } else if self.eat_ident("delimiter")? {
             let _ = self.eat_ident("as")?;
             options.delimiter = Some(self.copy_char("DELIMITER")?);
@@ -2275,8 +2301,10 @@ impl<'a> Parser<'a> {
                 Some("DELIMITER")
             } else if options.null_string.is_some() {
                 Some("NULL")
-            } else if options.header {
+            } else if !matches!(options.header, crate::sql::ast::CopyHeader::None) {
                 Some("HEADER")
+            } else if options.default_string.is_some() {
+                Some("DEFAULT")
             } else {
                 None
             };
@@ -2309,6 +2337,23 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             }
+        }
+        if matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
+            && options.is_binary()
+        {
+            return Err(self.copy_unsupported("COPY ON_ERROR ignore in BINARY mode"));
+        }
+        if options.reject_limit.is_some()
+            && !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
+        {
+            return Err(self.unexpected("COPY REJECT_LIMIT requires ON_ERROR ignore"));
+        }
+        if !matches!(
+            options.log_verbosity,
+            crate::sql::ast::CopyLogVerbosity::Default
+        ) && !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
+        {
+            return Err(self.unexpected("COPY LOG_VERBOSITY requires ON_ERROR ignore"));
         }
         Ok(())
     }
@@ -2358,16 +2403,24 @@ impl<'a> Parser<'a> {
     }
 
     /// `HEADER` with an optional boolean (`true`/`false`/`on`/`off`); bare = true.
-    fn copy_bool_default_true(&mut self) -> Result<bool, ParseError> {
+    fn copy_header(&mut self) -> Result<crate::sql::ast::CopyHeader, ParseError> {
+        if self.eat_ident("match")? {
+            return Ok(crate::sql::ast::CopyHeader::Match);
+        }
         if self.eat_ident("true")? || self.eat_ident("on")? {
-            Ok(true)
+            Ok(crate::sql::ast::CopyHeader::Skip)
         } else if self.eat_ident("false")? || self.eat_ident("off")? {
-            Ok(false)
+            Ok(crate::sql::ast::CopyHeader::None)
         } else if let Tok::Str(s) = self.peeked {
             self.advance()?;
-            Ok(matches!(s, "true" | "on" | "1"))
+            match s {
+                "true" | "on" | "1" => Ok(crate::sql::ast::CopyHeader::Skip),
+                "false" | "off" | "0" => Ok(crate::sql::ast::CopyHeader::None),
+                "match" => Ok(crate::sql::ast::CopyHeader::Match),
+                _ => Err(self.unexpected("COPY HEADER requires a boolean or MATCH")),
+            }
         } else {
-            Ok(true)
+            Ok(crate::sql::ast::CopyHeader::Skip)
         }
     }
 

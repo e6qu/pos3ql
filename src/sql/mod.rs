@@ -3293,6 +3293,17 @@ impl Engine {
         exec::copy_row(&mut self.storage, txn, seq_session, setup, line, arena)
     }
 
+    /// Checks a `COPY ... HEADER MATCH` line through the same decoded field
+    /// grammar as the following data rows.
+    pub fn copy_match_header(
+        &self,
+        setup: &exec::CopySetup,
+        line: &[u8],
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        exec::copy_match_header(&self.storage, setup, line, arena)
+    }
+
     /// One complete COPY FROM binary row (int16 field count + fields).
     pub fn copy_row_binary(
         &mut self,

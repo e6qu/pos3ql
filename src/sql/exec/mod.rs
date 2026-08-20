@@ -486,6 +486,12 @@ fn build_partitioned_table_def(
                     crate::storage::MAX_PARTITION_KEYS
                 ));
             }
+            if columns.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "multi-column partition keys are not supported"
+                ));
+            }
             let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
             for (i, name) in columns.iter().enumerate() {
                 keys[i] = def.column_index(name).ok_or_else(|| {

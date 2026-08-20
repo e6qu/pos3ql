@@ -3835,6 +3835,29 @@ fn list_hash_and_default_partitions_route_typed_integer_keys() {
 }
 
 #[test]
+fn multi_column_partition_keys_fail_before_a_partial_catalog_definition_exists() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unsupported_partition_key (a int, b int) PARTITION BY RANGE (a, b)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("multi-column partition keys are not supported"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class WHERE relname = 'unsupported_partition_key'",
+        )),
+        ["0"]
+    );
+}
+
+#[test]
 fn partition_creation_rejects_overlapping_typed_bounds() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

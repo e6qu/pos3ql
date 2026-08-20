@@ -3896,6 +3896,49 @@ fn partitioned_unique_keys_must_include_the_partition_key() {
 }
 
 #[test]
+fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_partition_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE catalog_partition_leaf PARTITION OF catalog_partition_parent \
+           FOR VALUES FROM (0) TO (10)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relkind, relispartition FROM pg_class \
+             WHERE relname IN ('catalog_partition_parent', 'catalog_partition_leaf') \
+             ORDER BY relname"
+        )),
+        ["r|t", "p|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT partstrat, partattrs FROM pg_partitioned_table p \
+             JOIN pg_class c ON c.oid = p.partrelid \
+             WHERE c.relname = 'catalog_partition_parent'"
+        )),
+        ["r|1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT parent.relname FROM pg_inherits i \
+             JOIN pg_class child ON child.oid = i.inhrelid \
+             JOIN pg_class parent ON parent.oid = i.inhparent \
+             WHERE child.relname = 'catalog_partition_leaf'"
+        )),
+        ["catalog_partition_parent"]
+    );
+}
+
+#[test]
 fn copy_to_partitioned_parent_scans_every_leaf() {
     let (mut engine, mut budget) = test_engine();
     run_with(

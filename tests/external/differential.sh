@@ -238,6 +238,20 @@ reset_pair() {
   reset_user_relations "$P3_PORT"
 }
 
+restart_pos3ql_clean() {
+  kill "$P3_PID" 2>/dev/null
+  wait "$P3_PID" 2>/dev/null
+  rm -rf "$WORK/p3data"
+  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  P3_PID=$!
+  for _ in {1..50}; do
+    "$PSQL" -h 127.0.0.1 -p "$P3_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && return
+    sleep 0.1
+  done
+  bad "pos3ql did not restart with clean differential state"
+  exit 1
+}
+
 printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 reset_pair
 for f in $EXT/differential/*.sql; do
@@ -274,6 +288,7 @@ run_exact() { # port name file
 }
 
 printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
+restart_pos3ql_clean
 for f in $EXT/differential_exact/*.sql; do
   name=$(basename "$f" .sql)
   run_exact $PG_PORT "$name.pg" "$f"
@@ -288,6 +303,7 @@ for f in $EXT/differential_exact/*.sql; do
 done
 
 printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='
+restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/copy_binary_diff.py" \
        --pg $PG_PORT --p3 $P3_PORT > "$WORK/copy-binary.out" 2>&1; then
@@ -302,6 +318,7 @@ fi
 reset_pair
 
 printf '%s\n' '' '=== accepted-type fidelity matrix ==='
+restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg $PG_PORT --p3 $P3_PORT > "$WORK/type-fidelity.out" 2>&1; then

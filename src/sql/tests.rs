@@ -3955,6 +3955,66 @@ fn copy_to_partitioned_parent_scans_every_leaf() {
 }
 
 #[test]
+fn copy_from_partitioned_parent_routes_each_streamed_row() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_from_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE copy_from_low PARTITION OF copy_from_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE copy_from_other PARTITION OF copy_from_parent FOR VALUES DEFAULT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 16).unwrap();
+    let mut arena = Arena::new(&mut budget, "copy partition sql", 1 << 16).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    let setup = {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY copy_from_parent FROM STDIN",
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+        engine.take_pending_copy().unwrap_or_else(|| {
+            panic!(
+                "COPY enters streaming mode: {}",
+                String::from_utf8_lossy(send.readable())
+            )
+        })
+    };
+    arena.reset();
+    engine
+        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"1")
+        .unwrap();
+    engine
+        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"20")
+        .unwrap();
+    engine.copy_finish(&mut txn, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM copy_from_low; SELECT count(*) FROM copy_from_other"
+        )),
+        ["1", "1"]
+    );
+}
+
+#[test]
 fn writable_partitioned_parent_updates_and_deletes_leaf_rows() {
     let (mut engine, mut budget) = test_engine();
     run_with(

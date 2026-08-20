@@ -457,6 +457,8 @@ pub(crate) enum WalOp<'a> {
     /// images, never from a transport-side acknowledgement alone.
     AdvanceSubscription {
         name: &'a str,
+        created_at: u64,
+        definition_generation: u64,
         confirmed_lsn: u64,
     },
     SetSubscriptionEnabled {
@@ -1599,7 +1601,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + slot_name.len()
         }
         WalOp::DropSubscription { name } => 1 + name.len(),
-        WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8,
+        WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8 + 8 + 8,
         WalOp::SetSubscriptionEnabled { name, .. } => 1 + name.len() + 1,
         WalOp::AlterSubscription {
             name,
@@ -2263,8 +2265,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropSubscription { name } => name_bytes(buffer, name),
         WalOp::AdvanceSubscription {
             name,
+            created_at,
+            definition_generation,
             confirmed_lsn,
-        } => name_bytes(buffer, name) && buffer.append(&confirmed_lsn.to_le_bytes()),
+        } => {
+            name_bytes(buffer, name)
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&definition_generation.to_le_bytes())
+                && buffer.append(&confirmed_lsn.to_le_bytes())
+        }
         WalOp::SetSubscriptionEnabled { name, enabled } => {
             name_bytes(buffer, name) && buffer.append(&[u8::from(*enabled)])
         }
@@ -3600,10 +3609,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_ADVANCE_SUBSCRIPTION => {
             let name = take_name(&mut at)?;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition_generation =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
             let confirmed_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             (at == payload.len()).then_some(WalOp::AdvanceSubscription {
                 name,
+                created_at,
+                definition_generation,
                 confirmed_lsn,
             })
         }
@@ -5318,6 +5334,36 @@ mod tests {
             "WalOp grew to {} bytes",
             core::mem::size_of::<WalOp<'static>>()
         );
+    }
+
+    #[test]
+    fn subscription_advance_codec_retains_its_complete_stream_identity() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "subscription advance wal", 1024).unwrap();
+        append_record(
+            &mut buffer,
+            9,
+            &WalOp::AdvanceSubscription {
+                name: "apply_changes",
+                created_at: 41,
+                definition_generation: 7,
+                confirmed_lsn: 99,
+            },
+        )
+        .unwrap();
+        let WalOp::AdvanceSubscription {
+            name,
+            created_at,
+            definition_generation,
+            confirmed_lsn,
+        } = decode_record(&buffer.readable()[16..]).unwrap()
+        else {
+            panic!("expected subscription advance WAL operation");
+        };
+        assert_eq!(name, "apply_changes");
+        assert_eq!(created_at, 41);
+        assert_eq!(definition_generation, 7);
+        assert_eq!(confirmed_lsn, 99);
     }
 
     #[test]

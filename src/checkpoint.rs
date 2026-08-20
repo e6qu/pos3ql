@@ -3838,12 +3838,14 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sub {} {} {} {} {} {} {}{}",
+                    "sub {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
                     subscription.ownership.owner,
                     u8::from(subscription.enabled),
                     connection.as_str(),
                     slot_name.as_str(),
+                    subscription.created_at,
+                    subscription.definition_generation,
                     subscription.confirmed_lsn,
                     subscription.publication_count,
                     publications.as_str(),
@@ -5715,6 +5717,8 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
         .ok_or(CheckpointSetupError::Corrupt("subscription slot name"))
         .and_then(decode_hex_name)
         .and_then(|value| sql_name(&value))?;
+    let created_at = parse_field(words.next(), "subscription creation stamp")?;
+    let definition_generation = parse_field(words.next(), "subscription definition generation")?;
     let confirmed_lsn = parse_field(words.next(), "subscription confirmed LSN")?;
     let count: usize = parse_field(words.next(), "subscription publication count")?;
     if count == 0 || count > crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS {
@@ -5764,9 +5768,22 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
         })?;
     storage.restore_subscription_owner(slot, owner);
     storage.commit_subscription_create(slot);
+    storage
+        .restore_subscription_stream_identity(slot, created_at, definition_generation)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest subscription stream identity rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
     if confirmed_lsn != 0 {
+        let stream = storage
+            .subscription_stream(slot, 0)
+            .ok_or(CheckpointSetupError::Corrupt(
+                "subscription stream identity",
+            ))?;
         let advance = storage
-            .subscription_advance(&name, confirmed_lsn, 0)
+            .subscription_advance(stream, confirmed_lsn, 0)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
                     "manifest subscription position rejected: {}",

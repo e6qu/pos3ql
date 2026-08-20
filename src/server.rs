@@ -85,7 +85,7 @@ struct SubscriptionWorker {
 /// definition must reconnect the publisher session.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SubscriptionBinding {
-    name: crate::storage::SqlName,
+    stream: crate::storage::SubscriptionStream,
     endpoint: crate::pg::replication_client::ConnectionInfo,
     publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     publication_count: usize,
@@ -95,7 +95,7 @@ struct SubscriptionBinding {
 impl From<crate::sql::SubscriptionRuntime> for SubscriptionBinding {
     fn from(runtime: crate::sql::SubscriptionRuntime) -> Self {
         Self {
-            name: runtime.name,
+            stream: runtime.stream,
             endpoint: runtime.endpoint,
             publications: runtime.publications,
             publication_count: runtime.publication_count,
@@ -232,7 +232,7 @@ impl Server {
                     })?,
                     apply: crate::pg::subscription_apply::SubscriptionApply::new(
                         budget,
-                        crate::storage::SqlName::EMPTY,
+                        crate::storage::SubscriptionStream::EMPTY,
                         config.subscription_relation_capacity,
                         config.txn_rows,
                         config.subscription_arena_bytes,
@@ -741,7 +741,7 @@ impl Server {
                     let worker = &mut self.subscriptions[slot];
                     worker
                         .apply
-                        .bind(runtime.name, runtime.confirmed_lsn)
+                        .bind(runtime.stream, runtime.confirmed_lsn)
                         .map_err(|_| std::io::Error::other("bind subscription apply"))?;
                     let setup = crate::pg::replication_client::ReplicationClientSetup {
                         endpoint: runtime.endpoint,
@@ -752,7 +752,7 @@ impl Server {
                     };
                     match worker.client.bind(setup) {
                         Ok(()) => {
-                            worker.name = Some(runtime.name);
+                            worker.name = Some(runtime.stream.name());
                             worker.definition = Some(runtime.into());
                             worker.retry_at = None;
                             let fd = worker.client.raw_fd();
@@ -1154,7 +1154,10 @@ mod tests {
             [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[0] = crate::storage::SqlName::parse("sales").unwrap();
         let runtime = crate::sql::SubscriptionRuntime {
-            name: crate::storage::SqlName::parse("apply").unwrap(),
+            stream: crate::storage::SubscriptionStream::for_test(
+                crate::storage::SqlName::parse("apply").unwrap(),
+                7,
+            ),
             endpoint,
             publications,
             publication_count: 1,
@@ -1165,6 +1168,12 @@ mod tests {
         let mut advanced = runtime;
         advanced.confirmed_lsn = 13;
         assert!(binding == SubscriptionBinding::from(advanced));
+        let mut replaced = runtime;
+        replaced.stream = crate::storage::SubscriptionStream::for_test(
+            crate::storage::SqlName::parse("apply").unwrap(),
+            8,
+        );
+        assert!(binding != SubscriptionBinding::from(replaced));
         let mut altered = runtime;
         altered.publications[0] = crate::storage::SqlName::parse("inventory").unwrap();
         assert!(binding != SubscriptionBinding::from(altered));

@@ -2040,6 +2040,9 @@ pub(crate) struct ReplicationSlotDef {
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionDef {
     pub created_at: u64,
+    /// Increments only when a committed publisher stream definition changes.
+    /// An acknowledgement is valid for exactly one such definition.
+    pub definition_generation: u64,
     pub name: SqlName,
     pub connection: SubscriptionConnInfo,
     pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
@@ -2054,6 +2057,47 @@ pub(crate) struct SubscriptionDef {
     pub confirmed_lsn: u64,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
+}
+
+/// The complete durable identity of a publisher stream.  This is constructed
+/// from a committed catalog entry and is required to advance its frontier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubscriptionStream {
+    slot: usize,
+    created_at: u64,
+    definition_generation: u64,
+    name: SqlName,
+}
+
+impl SubscriptionStream {
+    pub(crate) const EMPTY: Self = Self {
+        slot: usize::MAX,
+        created_at: 0,
+        definition_generation: 0,
+        name: SqlName::EMPTY,
+    };
+
+    pub(crate) fn created_at(self) -> u64 {
+        self.created_at
+    }
+
+    pub(crate) fn name(self) -> SqlName {
+        self.name
+    }
+
+    pub(crate) fn definition_generation(self) -> u64 {
+        self.definition_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(name: SqlName, definition_generation: u64) -> Self {
+        Self {
+            slot: 0,
+            created_at: 1,
+            definition_generation,
+            name,
+        }
+    }
 }
 
 /// One transaction-private subscription lifecycle change.  Keeping the owner
@@ -2152,15 +2196,17 @@ impl SubscriptionDef {
 /// subscription after a delayed worker event.
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionAdvance {
-    slot: usize,
-    created_at: u64,
-    name: SqlName,
+    stream: SubscriptionStream,
     confirmed_lsn: u64,
 }
 
 impl SubscriptionAdvance {
     pub(crate) fn name(&self) -> &str {
-        self.name.as_str()
+        self.stream.name.as_str()
+    }
+
+    pub(crate) fn stream(&self) -> SubscriptionStream {
+        self.stream
     }
 
     pub(crate) fn confirmed_lsn(&self) -> u64 {
@@ -4808,6 +4854,7 @@ impl Storage {
             subscriptions
                 .push(SubscriptionDef {
                     created_at: 0,
+                    definition_generation: 0,
                     name: SqlName::EMPTY,
                     connection: SubscriptionConnInfo::parse(
                         "host=127.0.0.1 port=1 user=disabled dbname=disabled sslmode=disable",
@@ -11322,6 +11369,7 @@ impl Storage {
         self.catalog_seq += 1;
         self.subscriptions[slot] = SubscriptionDef {
             created_at: self.catalog_seq,
+            definition_generation: 1,
             name: spec.name,
             connection: spec.connection,
             publications,
@@ -11378,6 +11426,25 @@ impl Storage {
 
     pub(crate) fn commit_subscription_create(&mut self, slot: usize) {
         self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn restore_subscription_stream_identity(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        definition_generation: u64,
+    ) -> Result<(), SqlError> {
+        if created_at == 0 || definition_generation == 0 {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "subscription stream identity must be nonzero"
+            ));
+        }
+        let subscription = &mut self.subscriptions[slot];
+        subscription.created_at = created_at;
+        subscription.definition_generation = definition_generation;
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_subscription_owner(&mut self, slot: usize, owner: u16) {
@@ -11524,6 +11591,10 @@ impl Storage {
             subscription.connection = pending.connection;
             subscription.publications = pending.publications;
             subscription.publication_count = pending.publication_count;
+            subscription.definition_generation = subscription
+                .definition_generation
+                .checked_add(1)
+                .expect("subscription definition generation exhausted");
             subscription.pending_definition = None;
         }
     }
@@ -11540,26 +11611,44 @@ impl Storage {
     /// Returning `None` makes re-delivery after a lost acknowledgement
     /// explicitly idempotent; callers must not apply that remote transaction
     /// again.
+    pub(crate) fn subscription_stream(&self, slot: usize, txid: u32) -> Option<SubscriptionStream> {
+        self.subscriptions
+            .get(slot)
+            .filter(|subscription| subscription.visible_to(txid))
+            .map(|subscription| SubscriptionStream {
+                slot,
+                created_at: subscription.created_at,
+                definition_generation: subscription.definition_generation,
+                name: subscription.name,
+            })
+    }
+
     pub(crate) fn subscription_advance(
         &self,
-        name: &str,
+        stream: SubscriptionStream,
         confirmed_lsn: u64,
         txid: u32,
     ) -> Result<Option<SubscriptionAdvance>, SqlError> {
-        let (slot, subscription) = self.subscription(name, txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription \"{}\" does not exist",
-                name
-            )
-        })?;
+        let subscription = self
+            .subscriptions
+            .get(stream.slot)
+            .filter(|subscription| {
+                subscription.visible_to(txid)
+                    && subscription.created_at == stream.created_at
+                    && subscription.definition_generation == stream.definition_generation
+                    && subscription.name == stream.name
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "subscription stream definition changed before its remote transaction committed"
+                )
+            })?;
         if confirmed_lsn <= subscription.confirmed_lsn {
             return Ok(None);
         }
         Ok(Some(SubscriptionAdvance {
-            slot,
-            created_at: subscription.created_at,
-            name: subscription.name,
+            stream,
             confirmed_lsn,
         }))
     }
@@ -11567,11 +11656,12 @@ impl Storage {
     pub(crate) fn apply_subscription_advance(&mut self, advance: SubscriptionAdvance) {
         let subscription = self
             .subscriptions
-            .get_mut(advance.slot)
+            .get_mut(advance.stream.slot)
             .filter(|subscription| {
                 subscription.ddl_state == CatalogDdlState::Present
-                    && subscription.created_at == advance.created_at
-                    && subscription.name == advance.name
+                    && subscription.created_at == advance.stream.created_at
+                    && subscription.definition_generation == advance.stream.definition_generation
+                    && subscription.name == advance.stream.name
             })
             .expect("validated subscription must remain live until its WAL commit");
         subscription.confirmed_lsn = advance.confirmed_lsn;

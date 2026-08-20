@@ -22549,7 +22549,7 @@ fn enabled_subscription_has_one_complete_durable_worker_description() {
     let runtime = engine
         .subscription_runtime(0)
         .expect("enabled subscription has a complete worker binding");
-    assert_eq!(runtime.name.as_str(), "apply_changes");
+    assert_eq!(runtime.stream.name().as_str(), "apply_changes");
     assert_eq!(runtime.slot.as_str(), "publisher_slot");
     assert_eq!(
         runtime.publications[..runtime.publication_count],
@@ -22673,6 +22673,7 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
          COMMIT",
     );
     let runtime = engine.subscription_runtime(0).unwrap();
+    assert_eq!(runtime.stream.definition_generation(), 2);
     assert_eq!(runtime.endpoint.host(), "127.0.0.2");
     assert_eq!(runtime.endpoint.port(), 5433);
     assert_eq!(
@@ -22706,6 +22707,15 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
     drop(engine);
     let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        replayed
+            .subscription_runtime(0)
+            .unwrap()
+            .stream
+            .definition_generation(),
+        2,
+        "checkpoint recovery retains the acknowledged stream generation"
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut replayed,
@@ -22780,10 +22790,11 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
     );
     let guc = GucState::new();
     let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    let stream = engine.subscription_stream("apply_changes").unwrap();
     engine.begin_subscription_apply(&mut txn, &guc);
     assert!(
         engine
-            .stage_subscription_advance(&mut txn, "apply_changes", 41)
+            .stage_subscription_advance(&mut txn, stream, 41)
             .unwrap()
     );
     engine.commit_txn(&mut txn, &guc).unwrap();
@@ -22799,7 +22810,7 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
     engine.begin_subscription_apply(&mut txn, &guc);
     assert!(
         !engine
-            .stage_subscription_advance(&mut txn, "apply_changes", 41)
+            .stage_subscription_advance(&mut txn, stream, 41)
             .unwrap()
     );
     engine.rollback_txn(&mut txn, &guc);
@@ -22817,6 +22828,41 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
         41,
         "the acknowledgement frontier is recovered with the local transaction"
     );
+}
+
+#[test]
+fn replaced_subscription_stream_cannot_acknowledge_an_old_remote_transaction() {
+    let config = test_config("subscription-stream-generation");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION apply_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    let old_stream = engine.subscription_stream("apply_changes").unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes SET PUBLICATION inventory WITH (refresh = false)",
+    );
+    let replacement = engine.subscription_stream("apply_changes").unwrap();
+    assert_ne!(
+        old_stream.definition_generation(),
+        replacement.definition_generation()
+    );
+
+    let guc = GucState::new();
+    let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    engine.begin_subscription_apply(&mut txn, &guc);
+    let error = engine
+        .stage_subscription_advance(&mut txn, old_stream, 41)
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    engine.rollback_txn(&mut txn, &guc);
+    assert_eq!(engine.subscription_confirmed_lsn("apply_changes"), Some(0));
 }
 
 #[test]
@@ -22856,7 +22902,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     );
     let mut apply = SubscriptionApply::new(
         &mut budget,
-        SqlName::parse("apply_changes").unwrap(),
+        engine.subscription_stream("apply_changes").unwrap(),
         8,
         config.txn_rows,
         1 << 16,
@@ -23049,6 +23095,35 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             flushed_lsn: 121,
             reply_requested: false
         }
+    );
+    // An ALTER replaces the publisher stream before this worker can process
+    // its next raw pgoutput transaction. The stale worker may decode frames,
+    // but it cannot commit rows or an acknowledgement for the new stream.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes SET PUBLICATION replacement WITH (refresh = false)",
+    );
+    begin[8] = 130;
+    begin[20] = 7;
+    receive(&mut apply, &mut engine, 130, &begin);
+    let mut stale_insert = durable_insert;
+    stale_insert[13] = b'3';
+    receive(&mut apply, &mut engine, 130, &stale_insert);
+    commit[9] = 130;
+    commit[17] = 131;
+    let bytes = frame(131, &commit);
+    let parsed = copy_data(&bytes[..25 + commit.len()]).unwrap();
+    let error = apply.receive(&mut engine, parsed).unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    assert_eq!(apply.confirmed_lsn(), 121);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM replicated"
+        )),
+        ["2|durable|local"]
     );
     drop(apply);
     drop(engine);

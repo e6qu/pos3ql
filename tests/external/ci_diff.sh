@@ -450,12 +450,30 @@ run_corpus() { # host port outfile file
     exit 1
   fi
 }
+reset_user_relations() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -F $'\t' \
+    -c "SELECT n.nspname, c.relname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p')" |
+  while IFS=$'\t' read -r schema relation; do
+    [[ -z "$relation" ]] && continue
+    schema=${schema//\"/\"\"}
+    relation=${relation//\"/\"\"}
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+      -c "DROP TABLE \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
+  done
+}
+reset_corpus_pair() {
+  reset_user_relations "$PGHOST" "$PGPORT"
+  reset_user_relations 127.0.0.1 "$P3_PORT"
+}
+reset_corpus_pair
 for f in "$EXT"/differential/*.sql; do
   n=$(basename "$f" .sql)
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
   else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
+  reset_corpus_pair
 done
 
 # --- exact-error corpora (message wording must match) -----------------------

@@ -17991,6 +17991,63 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
 }
 
 #[test]
+fn dropped_composite_attribute_recovers_without_retired_identity() {
+    let mut config = test_config("dropped-composite-attribute-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("dropped-composite-attribute-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE dropped_attribute_root AS (value integer); \
+             CREATE TYPE dropped_attribute_leaf AS (root dropped_attribute_root); \
+             DROP TYPE dropped_attribute_root CASCADE; \
+             CHECKPOINT",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let leaf = engine
+            .storage
+            .resolve_composite_slot("dropped_attribute_leaf", 0)
+            .unwrap();
+        assert!(engine.storage.composite(leaf).fields()[0].dropped);
+        assert!(
+            engine.storage.composite(leaf).fields()[0]
+                .user_type
+                .is_none()
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('dropped_attribute_root', 'dropped_attribute_leaf') ORDER BY typname",
+        )),
+        ["dropped_attribute_leaf"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'dropped_attribute_leaf') AND attnum > 0 AND NOT attisdropped",
+        )),
+        ["0"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn named_types_move_schema_without_changing_typed_identity() {
     let (mut engine, mut budget) = test_engine();
     run_with(

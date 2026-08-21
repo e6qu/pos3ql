@@ -16898,6 +16898,7 @@ fn cascade_drop_composite_fields(
             dropped_count += 1;
             field.dropped = true;
             field.not_null = false;
+            field.user_type = None;
             field.name = SqlName::parse(
                 stack_format!(64, "........pg.dropped.{}........", field.attribute_number).as_str(),
             )?;
@@ -17922,6 +17923,7 @@ fn alter_composite_type(
             };
             altered.fields[index].dropped = true;
             altered.fields[index].not_null = false;
+            altered.fields[index].user_type = None;
             altered.fields[index].name = match SqlName::parse(
                 stack_format!(
                     64,

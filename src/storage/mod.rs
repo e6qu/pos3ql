@@ -13540,6 +13540,9 @@ impl Storage {
             let n_fields = self.composites[composite].n_fields;
             for field in 0..n_fields {
                 let definition = self.composites[composite].fields[field];
+                if definition.dropped {
+                    continue;
+                }
                 let Some(identity) = definition.user_type else {
                     continue;
                 };

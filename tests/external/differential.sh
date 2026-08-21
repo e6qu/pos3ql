@@ -249,6 +249,7 @@ restart_pos3ql_clean() {
     sleep 0.1
   done
   bad "pos3ql did not restart with clean differential state"
+  tail -40 "$WORK/p3.log"
   exit 1
 }
 

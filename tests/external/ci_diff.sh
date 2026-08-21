@@ -197,7 +197,7 @@ CREATE SCHEMA outbound_dump;
 CREATE ROLE outbound_reader;
 CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
 CREATE TYPE outbound_dump.location AS (x integer, y integer);
-CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location;
+CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location CHECK ((VALUE).x > 0);
 CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   mood outbound_dump.mood NOT NULL,
@@ -216,6 +216,8 @@ INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,ma
   ('great', ROW(3,4)::outbound_dump.location, ARRAY['great'::outbound_dump.mood],
    ARRAY[ROW(9,10)::outbound_dump.location], ROW(30,40)::outbound_dump.location_domain,
    ARRAY[ROW(300,400)::outbound_dump.location_domain], 'two');
+ALTER TYPE outbound_dump.location ADD ATTRIBUTE z integer;
+ALTER TYPE outbound_dump.location RENAME ATTRIBUTE x TO east;
 CREATE SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
@@ -291,14 +293,15 @@ if [[ $outbound_setup_status -ne 0 || $outbound_dump_status -ne 0 || $outbound_r
 else
   outbound_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
     -X -At -F '|' -v ON_ERROR_STOP=1 -c "
-      SELECT id,mood,(location).x,(location).y,moods[1],(locations[1]).y,(marked_location).x,
-             (marked_locations[1]).y,note FROM outbound_dump.item_view ORDER BY id;
+      SELECT id,mood,(location).east,(location).y,(location).z IS NULL,moods[1],
+             (locations[1]).y,(marked_location).east,(marked_locations[1]).y,note
+        FROM outbound_dump.item_view ORDER BY id;
       INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note)
-        VALUES ('ok', ROW(5,6)::outbound_type_target.location,
+        VALUES ('ok', ROW(5,6,NULL)::outbound_type_target.location,
                 ARRAY['ok'::outbound_type_target.mood],
-                ARRAY[ROW(11,12)::outbound_type_target.location],
-                ROW(50,60)::outbound_dump.location_domain,
-                ARRAY[ROW(500,600)::outbound_dump.location_domain], 'three') RETURNING id;
+                ARRAY[ROW(11,12,NULL)::outbound_type_target.location],
+                ROW(50,60,NULL)::outbound_dump.location_domain,
+                ARRAY[ROW(500,600,NULL)::outbound_dump.location_domain], 'three') RETURNING id;
       SELECT is_identity,identity_generation
         FROM information_schema.columns
        WHERE table_schema='outbound_dump'
@@ -330,13 +333,13 @@ else
              has_sequence_privilege('outbound_reader', 'outbound_dump.manual_sequence', 'USAGE'),
              has_function_privilege('outbound_reader', 'outbound_dump.dump_answer()', 'EXECUTE');
       SELECT outbound_dump.echo_mood('ok'::outbound_type_target.mood),
-             (outbound_dump.echo_location(ROW(9,10)::outbound_type_target.location)).x,
-             (outbound_dump.echo_marked_location(ROW(11,12)::outbound_dump.location_domain)).y,
+             (outbound_dump.echo_location(ROW(9,10,NULL)::outbound_type_target.location)).east,
+             (outbound_dump.echo_marked_location(ROW(11,12,NULL)::outbound_dump.location_domain)).y,
              outbound_dump.echo_moods(ARRAY['great'::outbound_type_target.mood])::text,
-             ((outbound_dump.echo_locations(ARRAY[ROW(13,14)::outbound_type_target.location]))[1]).y,
-             ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16)::outbound_dump.location_domain]))[1]).x;
+             ((outbound_dump.echo_locations(ARRAY[ROW(13,14,NULL)::outbound_type_target.location]))[1]).y,
+             ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16,NULL)::outbound_dump.location_domain]))[1]).east;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|ok|8|10|200|one\n2|great|3|4|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else
@@ -447,12 +450,30 @@ run_corpus() { # host port outfile file
     exit 1
   fi
 }
+reset_user_relations() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -F $'\t' \
+    -c "SELECT n.nspname, c.relname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p')" |
+  while IFS=$'\t' read -r schema relation; do
+    [[ -z "$relation" ]] && continue
+    schema=${schema//\"/\"\"}
+    relation=${relation//\"/\"\"}
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+      -c "DROP TABLE \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
+  done
+}
+reset_corpus_pair() {
+  reset_user_relations "$PGHOST" "$PGPORT"
+  reset_user_relations 127.0.0.1 "$P3_PORT"
+}
+reset_corpus_pair
 for f in "$EXT"/differential/*.sql; do
   n=$(basename "$f" .sql)
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
   else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
+  reset_corpus_pair
 done
 
 # --- exact-error corpora (message wording must match) -----------------------

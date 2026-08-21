@@ -2741,6 +2741,12 @@ impl Checkpointer {
                 error.message.as_str()
             ))
         })?;
+        storage.rebind_user_type_declarations().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest user-type declaration rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
         storage.rebind_routine_types().map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
                 "manifest routine type rejected: {}",

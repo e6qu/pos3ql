@@ -244,40 +244,19 @@ pub struct Parser<'a> {
     stop_default_at_not_null: bool,
 }
 
-/// Parses a stored view definition (a single SELECT) into a `Select` in the
-/// arena, for expansion as a derived table. Set-operation view bodies are not
-/// supported yet.
+/// Parses a stored view definition across PostgreSQL's complete query body,
+/// including set operations and VALUES leaves.
 pub fn parse_view_select<'a>(
     sql: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, super::eval::SqlError> {
-    let to_sql = |m: &str| super::eval::SqlError {
-        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
-        message: crate::stack_format!(192, "invalid view definition: {}", m),
-    };
-    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
-    let statement = parser
-        .next_stmt()
-        .map_err(|e| to_sql(e.message.as_str()))?
-        .ok_or_else(|| to_sql("empty"))?;
-    match statement {
-        Stmt::Select(s) => arena
-            .alloc(s)
-            .map(|r| &*r)
-            .map_err(|_| super::eval::SqlError {
-                sqlstate: super::eval::SqlState::known(
-                    super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                ),
-                message: crate::stack_format!(192, "view too large for SQL arena"),
-            }),
-        _ => Err(to_sql("view body must be a plain SELECT")),
-    }
+    parse_query(sql, arena)
 }
 
 /// Parses a query body — a SELECT, a set-operation tree (UNION/INTERSECT/
 /// EXCEPT), or a VALUES list — into a `Select` (a genuine set-operation lands
-/// in `set_body`). Unlike [`parse_view_select`], this accepts the full query
-/// surface, for CREATE TABLE AS and materialized-view style bodies.
+/// in `set_body`). Stored views, CREATE TABLE AS, and materialized-view style
+/// bodies share this boundary.
 pub fn parse_query<'a>(
     sql: &'a str,
     arena: &'a Arena,

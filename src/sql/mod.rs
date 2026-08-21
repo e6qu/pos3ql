@@ -1129,6 +1129,7 @@ impl Engine {
         // WAL carries catalog identities as names where runtime slots are not
         // durable. Rebind only after every replayed catalog definition exists.
         storage.rebind_domain_base_types()?;
+        storage.rebind_user_type_declarations()?;
         storage.rebind_routine_types()?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
@@ -5636,7 +5637,7 @@ impl Engine {
         // every name resolution below reads it from storage.
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
-        for (slot, composite) in self.storage.live_composites() {
+        for (slot, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             exec::register_named_composite_shape(
                 slot as u16,
                 composite.name.as_str(),
@@ -7781,9 +7782,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::BeginTableRewrite {
             previous_schema,
             previous_name,
+            preserve_rows,
             column_mapping,
         } => {
-            storage.begin_replay_table_rewrite(previous_schema, previous_name, column_mapping)?;
+            storage.begin_replay_table_rewrite(
+                previous_schema,
+                previous_name,
+                preserve_rows,
+                column_mapping,
+            )?;
         }
         WalOp::SequenceSet {
             schema,

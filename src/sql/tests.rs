@@ -17991,6 +17991,63 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
 }
 
 #[test]
+fn dropped_composite_attribute_recovers_without_retired_identity() {
+    let mut config = test_config("dropped-composite-attribute-restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("dropped-composite-attribute-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE dropped_attribute_root AS (value integer); \
+             CREATE TYPE dropped_attribute_leaf AS (root dropped_attribute_root); \
+             DROP TYPE dropped_attribute_root CASCADE; \
+             CHECKPOINT",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let leaf = engine
+            .storage
+            .resolve_composite_slot("dropped_attribute_leaf", 0)
+            .unwrap();
+        assert!(engine.storage.composite(leaf).fields()[0].dropped);
+        assert!(
+            engine.storage.composite(leaf).fields()[0]
+                .user_type
+                .is_none()
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT typname FROM pg_type WHERE typname IN ('dropped_attribute_root', 'dropped_attribute_leaf') ORDER BY typname",
+        )),
+        ["dropped_attribute_leaf"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'dropped_attribute_leaf') AND attnum > 0 AND NOT attisdropped",
+        )),
+        ["0"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn named_types_move_schema_without_changing_typed_identity() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -18594,6 +18651,101 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
 }
 
 #[test]
+fn composite_attribute_rename_rewrites_domain_chain_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE renamed_domain_point AS (x integer, y integer); \
+         CREATE DOMAIN renamed_domain_root AS renamed_domain_point CHECK ((VALUE).x > 0); \
+         CREATE DOMAIN renamed_domain_child AS renamed_domain_root CHECK ((VALUE).y < 10); \
+         CREATE TABLE renamed_domain_values (value renamed_domain_child); \
+         INSERT INTO renamed_domain_values VALUES (ROW(3,4)::renamed_domain_point)",
+    );
+
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER TYPE renamed_domain_point RENAME ATTRIBUTE x TO east; \
+         INSERT INTO renamed_domain_values VALUES (ROW(1,14)::renamed_domain_point); \
+         ROLLBACK",
+    );
+    assert!(String::from_utf8_lossy(&failed).contains("23514"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (value).x FROM renamed_domain_values",
+        )),
+        ["3"]
+    );
+    let original_constraint = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO renamed_domain_values VALUES (ROW(-1,4)::renamed_domain_point)",
+    );
+    assert!(String::from_utf8_lossy(&original_constraint).contains("23514"));
+}
+
+#[test]
+fn composite_attribute_rename_rewrites_nested_and_set_operation_views() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE nested_rename_point AS (x integer, y integer); \
+         CREATE TABLE nested_rename_values (value nested_rename_point); \
+         INSERT INTO nested_rename_values VALUES (ROW(7,8)::nested_rename_point)",
+    );
+    let nested = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).x AS observed FROM nested_rename_values \
+          WHERE EXISTS (SELECT 1 FROM nested_rename_values AS nested \
+                         WHERE (nested.value).x = 7)",
+    );
+    assert_eq!(
+        data_rows(&nested),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&nested)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW nested_rename_view AS \
+           SELECT (value).x AS observed FROM nested_rename_values \
+            WHERE EXISTS (SELECT 1 FROM nested_rename_values AS nested \
+                           WHERE (nested.value).x = 7); \
+         CREATE VIEW set_rename_view AS \
+           SELECT (value).x AS observed FROM nested_rename_values \
+           UNION ALL SELECT (value).x FROM nested_rename_values; \
+         CREATE VIEW distinct_rename_view AS \
+           SELECT DISTINCT ON ((value).x) (value).x AS observed \
+             FROM nested_rename_values; \
+         SELECT observed FROM nested_rename_view; \
+         ALTER TYPE nested_rename_point RENAME ATTRIBUTE x TO east; \
+         SELECT definition FROM pg_views \
+          WHERE viewname IN ('nested_rename_view','set_rename_view','distinct_rename_view') \
+          ORDER BY viewname; \
+         SELECT (value).east FROM nested_rename_values \
+          WHERE EXISTS (SELECT 1 FROM nested_rename_values AS nested \
+                         WHERE (nested.value).east = 7); \
+         SELECT observed FROM nested_rename_view; \
+         SELECT observed FROM set_rename_view ORDER BY observed; \
+         SELECT observed FROM distinct_rename_view",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(
+        &rows[rows.len().saturating_sub(5)..],
+        ["7", "7", "7", "7", "7"],
+        "rows={rows:?}; output={}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn alter_domain_revalidates_scalar_and_array_elements() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
@@ -18815,12 +18967,16 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
              CREATE DOMAIN point_value AS domain_point CHECK ((VALUE).x > 0); \
-             CREATE TABLE domain_point_values (values point_value[], direct_values domain_point[]); \
+             CREATE DOMAIN point_child AS point_value CHECK ((VALUE).y < 20); \
+             CREATE TYPE domain_point_wrapper AS (value point_child); \
+             CREATE TABLE domain_point_values (value point_value, values point_value[], direct_values domain_point[], child point_child, child_values point_child[], wrapped domain_point_wrapper); \
              INSERT INTO domain_point_values VALUES \
-               (ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point]); \
+               (ROW(6,7)::point_value, ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point], ROW(11,12)::point_child, ARRAY[ROW(13,14)::domain_point]::point_child[], ROW(ROW(15,16)::point_child)::domain_point_wrapper); \
              ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE TABLE array_subquery_values AS \
                SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
+             ALTER TYPE domain_point ADD ATTRIBUTE z integer; \
+             ALTER TYPE domain_point RENAME ATTRIBUTE x TO east; \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
              ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
              CHECKPOINT",
@@ -18845,20 +19001,55 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
     }
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT values::text,direct_values::text FROM domain_point_values; \
-             SELECT values::text FROM array_subquery_values; \
-             SELECT (values[1]).x FROM array_subquery_values",
-        )),
-        ["{\"(7,8)\"}|{\"(9,10)\"}", "{\"(9,10)\"}", "9"]
+    for (query, expected) in [
+        (
+            "SELECT (value).east,(value).z IS NULL,(values[1]).y,(direct_values[1]).east FROM domain_point_values",
+            "6|t|8|9",
+        ),
+        (
+            "SELECT (child).east,(child_values[1]).y FROM domain_point_values",
+            "11|14",
+        ),
+        ("SELECT ((wrapped).value).y FROM domain_point_values", "16"),
+        (
+            "SELECT (values[1]).east,(values[1]).z IS NULL FROM array_subquery_values",
+            "9|t",
+        ),
+        (
+            "SELECT value::text,values::text,child_values::text FROM domain_point_values",
+            "(6,7,)|{\"(7,8,)\"}|{\"(13,14,)\"}",
+        ),
+    ] {
+        let recovered = run_with(&mut engine, &mut budget, query);
+        assert_eq!(
+            data_rows(&recovered),
+            [expected],
+            "{query}: {}",
+            String::from_utf8_lossy(&recovered)
+        );
+    }
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO domain_point_values(value) VALUES (ROW(-1,2,NULL)::durable_domain.moved_point)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{rejected:?}"
     );
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "ALTER DOMAIN point_value ADD CHECK ((VALUE).x < 7)",
+        "INSERT INTO domain_point_values(child) VALUES (ROW(1,25,NULL)::point_child)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{rejected:?}"
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN point_value ADD CHECK ((VALUE).east < 7)",
     );
     assert!(
         String::from_utf8_lossy(&rejected).contains("23514"),
@@ -18868,13 +19059,9 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
     let post_rollback = run_with(
         &mut engine,
         &mut budget,
-        "SELECT (ARRAY[ROW(9,1)::durable_domain.moved_point]::point_value[])::text",
+        "SELECT ((ARRAY[ROW(9,1,NULL)::durable_domain.moved_point]::point_value[])[1]).east",
     );
-    assert_eq!(
-        data_rows(&post_rollback),
-        ["{\"(9,1)\"}"],
-        "{post_rollback:?}"
-    );
+    assert_eq!(data_rows(&post_rollback), ["9"], "{post_rollback:?}");
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 

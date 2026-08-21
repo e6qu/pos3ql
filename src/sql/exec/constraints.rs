@@ -1022,7 +1022,7 @@ pub(crate) fn enforce_row_constraints(
         txid,
         arena,
     )?;
-    check_row_checks(def, checks, values, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
     Ok(())
@@ -1046,7 +1046,7 @@ pub(crate) fn check_row_content(
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_index_tuple_sizes(storage, def, values, txid)?;
-    check_row_checks(def, checks, values, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
     Ok(())
@@ -1055,9 +1055,11 @@ pub(crate) fn check_row_content(
 /// Evaluates each CHECK predicate against the candidate row. A predicate that
 /// is FALSE raises 23514; NULL and TRUE both pass, per SQL three-valued logic.
 fn check_row_checks(
+    storage: &Storage,
     def: &TableDef,
     checks: &ParsedChecks,
     values: &[Datum],
+    txid: u32,
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
@@ -1066,12 +1068,17 @@ fn check_row_checks(
         values,
         alias: None,
     };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
     for (i, c) in def.checks().iter().enumerate() {
         let Some(expression) = checks[i] else {
             continue;
         };
         if matches!(
-            eval(expression, arena, params, &context)?,
+            eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
             return Err(sql_err!(

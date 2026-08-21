@@ -17794,6 +17794,7 @@ fn alter_composite_type(
         return sql_fail(error);
     }
     let mut altered = storage.composite_for(slot, txn.txid);
+    let mut renamed_attribute = None;
     let wrong_type = || {
         sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -17953,10 +17954,15 @@ fn alter_composite_type(
                     altered.name.as_str()
                 ));
             }
-            altered.fields[index].name = match SqlName::parse(to) {
+            let renamed = match SqlName::parse(to) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
+            renamed_attribute = Some(CompositeFieldRename {
+                from: altered.fields[index].name,
+                to: renamed,
+            });
+            altered.fields[index].name = renamed;
         }
         A::AlterAttributeType {
             name,
@@ -18045,8 +18051,647 @@ fn alter_composite_type(
         storage.rollback_composite_alter(slot, prior);
         return sql_fail(error);
     }
+    if let Some(rename) = renamed_attribute
+        && let Err(error) =
+            rewrite_composite_dependents(storage, wal, txn, slot as u16, rename, arena)
+    {
+        return sql_fail(error);
+    }
     responder.command_complete("ALTER TYPE")?;
     sql_ok()
+}
+
+#[derive(Clone, Copy)]
+struct CompositeFieldRename {
+    from: SqlName,
+    to: SqlName,
+}
+
+/// Rewrites CHECK expressions whose VALUE has the renamed composite as its
+/// ultimate base. Domain constraints are stored SQL, so the field dependency
+/// must move in the same transaction as the physical attribute name.
+fn rewrite_composite_dependent_domains(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for domain_slot in 0..storage.domain_count() {
+        let current = storage.domain_for(domain_slot, txn.txid);
+        if !current.visible_to(txn.txid)
+            || domain_composite_base(storage, domain_slot, txn.txid) != Some(composite_slot)
+        {
+            continue;
+        }
+        let mut spec = crate::storage::DomainSpec {
+            base_domain: current.base_domain,
+            base_user_type: current.base_user_type,
+            base: current.base,
+            base_type_mod: current.base_type_mod,
+            not_null: current.not_null,
+            default_expr: current.default_expr,
+            checks: current.checks,
+            n_checks: current.n_checks,
+        };
+        let mut changed = false;
+        let columns = DomainValueCols(composite_slot);
+        for check in spec.checks.iter_mut().take(spec.n_checks) {
+            let rewritten = rewrite_typed_composite_field_selectors(
+                check.expression.as_str(),
+                &columns,
+                composite_slot,
+                rename,
+                arena,
+            )?;
+            if rewritten != check.expression {
+                check.expression = rewritten;
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let prior = storage.stage_domain_alter(domain_slot, spec, txn.txid)?;
+        if let Err(error) = validate_domain_rows(storage, domain_slot, txn.txid, arena) {
+            storage.rollback_domain_alter(domain_slot, prior);
+            return Err(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateDomain(storage.domain_for(domain_slot, txn.txid)),
+        ) {
+            storage.rollback_domain_alter(domain_slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
+            slot: domain_slot as u32,
+            prior,
+        }) {
+            storage.rollback_domain_alter(domain_slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_composite_dependents(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    rewrite_composite_dependent_domains(storage, wal, txn, composite_slot, rename, arena)?;
+    rewrite_composite_dependent_tables(storage, wal, txn, composite_slot, rename, arena)?;
+    rewrite_composite_dependent_indexes(storage, wal, txn, composite_slot, rename, arena)?;
+    rewrite_composite_dependent_views(storage, wal, txn, composite_slot, rename, arena)
+}
+
+fn rewrite_composite_dependent_tables(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for table_slot in 0..storage.table_count() {
+        if !storage.table(table_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let current = *storage.table_def(table_slot, txn.txid);
+        let columns = DefCols(&current);
+        let mut altered = current;
+        let mut changed = false;
+        for column in altered.columns.iter_mut().take(altered.n_columns) {
+            column.default = match column.default {
+                crate::storage::ColumnDefault::None
+                | crate::storage::ColumnDefault::LegacyConstant(_) => column.default,
+                crate::storage::ColumnDefault::Constant { value, expression } => {
+                    let rewritten = rewrite_typed_composite_field_selectors(
+                        expression.as_str(),
+                        &columns,
+                        composite_slot,
+                        rename,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Constant {
+                        value,
+                        expression: rewritten,
+                    }
+                }
+                crate::storage::ColumnDefault::Expression(expression) => {
+                    let rewritten = rewrite_typed_composite_field_selectors(
+                        expression.as_str(),
+                        &columns,
+                        composite_slot,
+                        rename,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Expression(rewritten)
+                }
+                crate::storage::ColumnDefault::Generated(expression) => {
+                    let rewritten = rewrite_typed_composite_field_selectors(
+                        expression.as_str(),
+                        &columns,
+                        composite_slot,
+                        rename,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Generated(rewritten)
+                }
+            };
+        }
+        for check in altered.checks.iter_mut().take(altered.n_checks) {
+            let rewritten = rewrite_typed_composite_field_selectors(
+                check.expression.as_str(),
+                &columns,
+                composite_slot,
+                rename,
+                arena,
+            )?;
+            changed |= rewritten != check.expression;
+            check.expression = rewritten;
+        }
+        if !changed {
+            continue;
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        for (position, column) in current.columns().iter().enumerate() {
+            mapping[position] = Some(column.name);
+        }
+        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for (position, target) in wal_mapping.iter_mut().enumerate().take(current.n_columns) {
+            *target = position as u16;
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: current.schema.as_str(),
+                previous_name: current.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        ) {
+            storage.rollback_table_def(table_slot, txn.txid);
+            return Err(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered)) {
+            storage.rollback_table_def(table_slot, txn.txid);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
+            storage.rollback_table_def(table_slot, txn.txid);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_composite_dependent_views(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for view_slot in 0..storage.view_count() {
+        if !storage.view(view_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let view = storage.view(view_slot).clone();
+        let dependencies = *storage.view_dependencies(view_slot);
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txn.txid);
+        let mut sites = [false; crate::storage::VIEW_SQL_MAX];
+        let site_count = super::query::stored_query_composite_field_rename_sites(
+            view.sql.as_str(),
+            path,
+            &dependencies,
+            &super::query::StoredQueryCompositeFieldRename {
+                storage,
+                txid: txn.txid,
+                composite_slot,
+                from: rename.from.as_str(),
+                arena,
+            },
+            &mut sites,
+        )?;
+        let rewritten = rewrite_composite_field_site_flags(
+            view.sql.as_str(),
+            rename,
+            &sites,
+            site_count,
+            arena,
+        )?;
+        if rewritten == view.sql {
+            continue;
+        }
+        let dependencies = super::query::stored_query_dependencies(
+            rewritten.as_str(),
+            storage,
+            txn.txid,
+            path,
+            arena,
+        )?;
+        let (new_slot, old_slot) = storage.create_view(
+            view.schema,
+            view.name,
+            crate::storage::StoredQueryDefinition {
+                sql: rewritten,
+                creation_path: view.creation_path,
+                dependencies,
+            },
+            true,
+            txn.txid,
+        )?;
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateView {
+                schema: view.schema.as_str(),
+                name: view.name.as_str(),
+                sql: rewritten.as_str(),
+                path: view.creation_path.as_str(),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
+            },
+        ) {
+            storage.rollback_view_create(new_slot);
+            if let Some(old_slot) = old_slot {
+                storage.rollback_view_drop(old_slot, txn.txid);
+            }
+            return Err(error);
+        }
+        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
+        let new_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: new_slot as u16,
+        };
+        let old_slot = old_slot.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored view replacement lost its prior definition"
+            )
+        })?;
+        let old_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: old_slot as u16,
+        };
+        let owner = storage.object_owner(old_object, txn.txid);
+        storage.set_object_owner(new_object, owner, txn.txid);
+        preserve_object_acl(storage, txn, old_object, new_object)?;
+        txn.record_ddl(super::txn::DdlUndo::ViewDropped(old_slot as u32))?;
+    }
+    Ok(())
+}
+
+fn rewrite_composite_dependent_indexes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for index_slot in 0..storage.index_count() {
+        let Some(current) = storage.index_visible_to(index_slot, txn.txid) else {
+            continue;
+        };
+        let Some(table_slot) =
+            storage.find_visible(current.schema.as_str(), current.table.as_str(), txn.txid)
+        else {
+            continue;
+        };
+        let table = *storage.table_def(table_slot, txn.txid);
+        let columns = DefCols(&table);
+        let mut altered = current;
+        let mut changed = false;
+        for expression in altered.expressions.iter_mut().take(altered.n_cols) {
+            let Some(source) = *expression else {
+                continue;
+            };
+            let rewritten = rewrite_typed_composite_field_selectors(
+                source.as_str(),
+                &columns,
+                composite_slot,
+                rename,
+                arena,
+            )?;
+            changed |= rewritten != source;
+            *expression = Some(rewritten);
+        }
+        if let Some(predicate) = altered.predicate {
+            let rewritten = rewrite_typed_composite_field_selectors(
+                predicate.as_str(),
+                &columns,
+                composite_slot,
+                rename,
+                arena,
+            )?;
+            changed |= rewritten != predicate;
+            altered.predicate = Some(rewritten);
+        }
+        if !changed {
+            continue;
+        }
+
+        let dropped = storage
+            .drop_index(current.schema.as_str(), current.name.as_str(), txn.txid)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored index replacement lost its prior definition"
+                )
+            })?;
+        let new_slot = match storage.create_index(altered, txn.txid) {
+            Ok(slot) => slot,
+            Err(error) => {
+                storage.rollback_index_drop(dropped, txn.txid);
+                return Err(error);
+            }
+        };
+        let old_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Index,
+            slot: dropped as u16,
+        };
+        let new_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Index,
+            slot: new_slot as u16,
+        };
+        let owner = storage.object_owner(old_object, txn.txid);
+        storage.set_object_owner(new_object, owner, txn.txid);
+        preserve_object_acl(storage, txn, old_object, new_object)?;
+
+        let drop_lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            drop_lsn,
+            &WalOp::DropIndex {
+                schema: current.schema.as_str(),
+                name: current.name.as_str(),
+            },
+        ) {
+            storage.rollback_index_create(new_slot);
+            storage.rollback_index_drop(dropped, txn.txid);
+            return Err(error);
+        }
+        let create_lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            create_lsn,
+            &WalOp::CreateIndex {
+                schema: altered.schema.as_str(),
+                name: altered.name.as_str(),
+                table: altered.table.as_str(),
+                columns: altered.columns,
+                expressions: altered
+                    .expressions
+                    .each_ref()
+                    .map(|expression| expression.as_ref().map(|text| text.as_str())),
+                include_columns: altered.include_columns,
+                descending: altered.descending,
+                nulls_first: altered.nulls_first,
+                n_cols: altered.n_cols,
+                n_include_cols: altered.n_include_cols,
+                nulls_not_distinct: altered.nulls_not_distinct,
+                predicate: altered.predicate.as_ref().map(|text| text.as_str()),
+                unique: altered.unique,
+            },
+        ) {
+            storage.rollback_index_create(new_slot);
+            storage.rollback_index_drop(dropped, txn.txid);
+            return Err(error);
+        }
+        txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32))?;
+        txn.record_ddl(super::txn::DdlUndo::IndexCreated(new_slot as u32))?;
+    }
+    Ok(())
+}
+
+fn domain_composite_base(storage: &Storage, mut slot: usize, txid: u32) -> Option<u16> {
+    for _ in 0..crate::storage::MAX_DOMAINS {
+        let domain = storage.domain_for(slot, txid);
+        let Some(parent) = domain.base_domain else {
+            return match domain.base {
+                ColType::Composite(slot) => Some(slot),
+                _ => None,
+            };
+        };
+        slot = storage.domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)?;
+    }
+    None
+}
+
+struct DomainValueCols(u16);
+
+impl ColTypeResolver for DomainValueCols {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        if qualifier.is_none() && name.eq_ignore_ascii_case("value") {
+            Ok(ColType::Composite(self.0))
+        } else {
+            Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ))
+        }
+    }
+}
+
+pub(crate) fn collect_composite_field_rename_sites(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    composite_slot: u16,
+    from: &str,
+    sites: &mut [bool],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    super::query::walk_children(expression, &mut |child| {
+        collect_composite_field_rename_sites(child, columns, composite_slot, from, sites, count)
+    })?;
+    collect_composite_field_rename_site(expression, columns, composite_slot, from, sites, count)
+}
+
+pub(crate) fn collect_composite_field_rename_site(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    composite_slot: u16,
+    from: &str,
+    sites: &mut [bool],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    let Expr::Field { base, field } = expression else {
+        return Ok(());
+    };
+    let site = sites.get_mut(*count).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored expression has too many composite field selectors"
+        )
+    })?;
+    *site = field.eq_ignore_ascii_case(from)
+        && infer_type_res(base, columns)
+            .ok()
+            .and_then(|(type_oid, _)| coltype_of_oid(type_oid))
+            == Some(ColType::Composite(composite_slot));
+    *count += 1;
+    Ok(())
+}
+
+fn rewrite_typed_composite_field_selectors<const N: usize>(
+    text: &str,
+    columns: &dyn ColTypeResolver,
+    composite_slot: u16,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    let expression = crate::sql::parser::parse_expr(text, arena)?;
+    let mut sites = [false; N];
+    let mut site_count = 0usize;
+    collect_composite_field_rename_sites(
+        expression,
+        columns,
+        composite_slot,
+        rename.from.as_str(),
+        &mut sites,
+        &mut site_count,
+    )?;
+    rewrite_composite_field_site_flags(text, rename, &sites, site_count, arena)
+}
+
+fn rewrite_composite_field_site_flags<const N: usize>(
+    text: &str,
+    rename: CompositeFieldRename,
+    sites: &[bool],
+    site_count: usize,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write;
+
+    fn raw_identifier_end(text: &str, start: usize) -> Option<usize> {
+        if text.as_bytes().get(start) == Some(&b'"') {
+            let mut at = start + 1;
+            while at < text.len() {
+                if text.as_bytes()[at] == b'"' {
+                    if text.as_bytes().get(at + 1) == Some(&b'"') {
+                        at += 2;
+                    } else {
+                        return Some(at + 1);
+                    }
+                } else {
+                    at += text[at..].chars().next()?.len_utf8();
+                }
+            }
+            return None;
+        }
+        let length = text[start..]
+            .char_indices()
+            .find(|(_, character)| {
+                !(character.is_alphanumeric() || *character == '_' || *character == '$')
+            })
+            .map_or(text.len() - start, |(offset, _)| offset);
+        Some(start + length)
+    }
+
+    let mut output = crate::util::StackStr::<N>::new();
+    let mut lexer = Lexer::new(text, arena);
+    let mut previous = None;
+    let mut before_previous = None;
+    let mut copied = 0usize;
+    let mut selector = 0usize;
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?;
+        if token == Tok::Eof {
+            break;
+        }
+        let start = lexer.token_start();
+        let is_selector = matches!(previous, Some(Tok::Op(".")))
+            && matches!(before_previous, Some(Tok::Op(")") | Tok::Op("]")));
+        if is_selector {
+            let replace = *sites.get(selector).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored expression field-selector binding is inconsistent"
+                )
+            })?;
+            if replace {
+                let matches_name = match token {
+                    Tok::Ident(name) | Tok::QuotedIdent(name) => {
+                        name.eq_ignore_ascii_case(rename.from.as_str())
+                    }
+                    _ => false,
+                };
+                if !matches_name {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "stored expression field-selector identity is inconsistent"
+                    ));
+                }
+                let end = raw_identifier_end(text, start).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "invalid stored expression identifier"
+                    )
+                })?;
+                let _ = output.write_str(&text[copied..start]);
+                if !super::eval::ident_needs_quotes(rename.to.as_str()) {
+                    let _ = output.write_str(rename.to.as_str());
+                } else {
+                    let _ = output.write_char('"');
+                    for character in rename.to.as_str().chars() {
+                        if character == '"' {
+                            let _ = output.write_char('"');
+                        }
+                        let _ = output.write_char(character);
+                    }
+                    let _ = output.write_char('"');
+                }
+                copied = end;
+            }
+            selector += 1;
+        }
+        before_previous = previous;
+        previous = Some(token);
+    }
+    if selector != site_count {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored expression has {} lexical field selectors but {} typed selectors",
+            selector,
+            site_count
+        ));
+    }
+    let _ = output.write_str(&text[copied..]);
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewritten stored expression exceeds {} bytes",
+            N
+        ));
+    }
+    Ok(output)
 }
 
 /// Proves a newly-added composite NOT NULL constraint before publishing its
@@ -21581,7 +22226,13 @@ pub fn copy_out(
                 // The wire-text output function, exactly as a SELECT would
                 // render it — styled timestamps, GUC-honoring bytea, `t`
                 // for booleans — then COPY's escapes on top below.
-                *texts_slot = Responder::datum_wire_text(&values[setup.targets[i]], render, arena)?;
+                let catalog = super::query::storage_catalog(storage, arena, txid);
+                let output = super::eval::materialize_composite_text_output(
+                    values[setup.targets[i]],
+                    &catalog,
+                    arena,
+                )?;
+                *texts_slot = Responder::datum_wire_text(&output, render, arena)?;
             }
             responder
                 .copy_data_row(&|out| {
@@ -21788,8 +22439,11 @@ pub fn copy_out_query(
                 .map_err(wire_to_sql)?;
         } else {
             let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            let catalog = super::query::storage_catalog(storage, arena, txid);
             for (i, slot) in texts.iter_mut().enumerate().take(n) {
-                *slot = Responder::datum_wire_text(&vals[i], render, arena)?;
+                let output =
+                    super::eval::materialize_composite_text_output(vals[i], &catalog, arena)?;
+                *slot = Responder::datum_wire_text(&output, render, arena)?;
             }
             responder
                 .copy_data_row(&|out| {
@@ -22041,9 +22695,14 @@ fn compute_generated<'a>(
         values: &snapshot[..def.n_columns],
         alias: None,
     };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..NO_HOOKS
+    };
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
-            let v = eval(expr, arena, crate::sql::eval::NO_PARAMS, &context)?;
+            let v = eval_full(expr, arena, crate::sql::eval::NO_PARAMS, &context, &hooks)?;
             values[i] = coerce(v, &def.columns()[i], storage, txid, arena)?;
         }
     }
@@ -27621,6 +28280,7 @@ fn alter_table_inner(
         &WalOp::BeginTableRewrite {
             previous_schema: def.schema.as_str(),
             previous_name: def.name.as_str(),
+            preserve_rows: false,
             column_mapping: wal_column_mapping,
         },
     ) {
@@ -29336,6 +29996,29 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn composite_field_rename_rewrites_only_bound_selectors() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "composite field rename", 1 << 12).unwrap();
+        let rename = CompositeFieldRename {
+            from: SqlName::parse("old_field").unwrap(),
+            to: SqlName::parse("New Field").unwrap(),
+        };
+        let rewritten: StackStr<{ crate::storage::CHECK_SQL_MAX }> =
+            rewrite_composite_field_site_flags(
+            "(VALUE).old_field > 0 AND note = '.old_field' /* (VALUE).old_field */ AND other.old_field = 1",
+            rename,
+            &[true],
+            1,
+            &arena,
+        )
+            .unwrap();
+        assert_eq!(
+            rewritten.as_str(),
+            "(VALUE).\"New Field\" > 0 AND note = '.old_field' /* (VALUE).old_field */ AND other.old_field = 1"
+        );
+    }
 
     #[test]
     fn binary_int2vector_uses_postgres_array_wire_format() {

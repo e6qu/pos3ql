@@ -47,12 +47,40 @@ CREATE TABLE composite_evolving_values (value composite_evolving, values composi
 INSERT INTO composite_evolving_values VALUES
   (ROW(7, 'old')::composite_evolving, ARRAY[ROW(8, 'array-old')::composite_evolving]);
 CREATE INDEX composite_evolving_value_idx ON composite_evolving_values (value);
+CREATE INDEX composite_evolving_field_idx ON composite_evolving_values (((value).left_value));
+CREATE VIEW composite_evolving_view AS
+  SELECT (value).left_value AS observed FROM composite_evolving_values;
+CREATE VIEW composite_evolving_nested_view AS
+  SELECT (value).left_value AS observed
+    FROM composite_evolving_values
+   WHERE EXISTS (
+     SELECT 1 FROM composite_evolving_values AS nested
+      WHERE (nested.value).left_value = 7
+   )
+  UNION ALL
+  SELECT (value).left_value FROM composite_evolving_values;
+CREATE VIEW composite_evolving_distinct_view AS
+  SELECT DISTINCT ON ((value).left_value) (value).left_value AS observed
+    FROM composite_evolving_values;
+CREATE TABLE composite_evolving_rules (
+  value composite_evolving,
+  observed integer GENERATED ALWAYS AS ((value).left_value) STORED,
+  CHECK ((value).left_value > 0)
+);
+INSERT INTO composite_evolving_rules(value) VALUES (ROW(6, 'rule')::composite_evolving);
 ALTER TYPE composite_evolving ADD ATTRIBUTE right_value integer;
 ALTER TYPE composite_evolving RENAME ATTRIBUTE left_value TO retained_value;
 ALTER TYPE composite_evolving DROP ATTRIBUTE removed_value;
 SELECT (value).retained_value, (value).right_value IS NULL,
        (values[1]).retained_value, (values[1]).right_value IS NULL
   FROM composite_evolving_values;
+SELECT observed FROM composite_evolving_view;
+SELECT observed FROM composite_evolving_nested_view ORDER BY observed;
+SELECT observed FROM composite_evolving_distinct_view;
+SELECT observed FROM composite_evolving_rules;
+INSERT INTO composite_evolving_rules(value) VALUES (ROW(-1, 2)::composite_evolving);
+SELECT indexdef FROM pg_indexes
+ WHERE indexname = 'composite_evolving_field_idx';
 SELECT attnum, attisdropped
   FROM pg_attribute
  WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_evolving')
@@ -88,14 +116,22 @@ SELECT attname FROM pg_attribute
 CREATE TYPE composite_domain_coordinate AS (x integer, y integer);
 CREATE DOMAIN composite_domain_coordinate_value AS composite_domain_coordinate
   CHECK ((VALUE).x > 0);
+CREATE DOMAIN composite_domain_coordinate_child AS composite_domain_coordinate_value
+  CHECK ((VALUE).y < 10);
 CREATE TABLE composite_domain_coordinates (
   value composite_domain_coordinate_value,
-  values composite_domain_coordinate_value[]
+  values composite_domain_coordinate_value[],
+  descendant composite_domain_coordinate_child,
+  descendants composite_domain_coordinate_child[]
 );
 INSERT INTO composite_domain_coordinates VALUES
   (ROW(3, 4)::composite_domain_coordinate,
-   ARRAY[ROW(5, 6)::composite_domain_coordinate]::composite_domain_coordinate_value[]);
-SELECT (value).x, (values[1]).y, pg_typeof(value), pg_typeof(values), pg_typeof(values[1])
+   ARRAY[ROW(5, 6)::composite_domain_coordinate]::composite_domain_coordinate_value[],
+   ROW(7, 8)::composite_domain_coordinate,
+   ARRAY[ROW(9, 9)::composite_domain_coordinate]::composite_domain_coordinate_child[]);
+SELECT (value).x, (values[1]).y, (descendant).x, (descendants[1]).y,
+       pg_typeof(value), pg_typeof(values), pg_typeof(values[1]),
+       pg_typeof(descendant), pg_typeof(descendants), pg_typeof(descendants[1])
   FROM composite_domain_coordinates;
 SELECT t.typtype, t.typbasetype = b.oid, a.typelem = t.oid
   FROM pg_type t
@@ -106,11 +142,18 @@ INSERT INTO composite_domain_coordinates VALUES
   (ROW(-1, 4)::composite_domain_coordinate, NULL);
 ALTER TYPE composite_domain_coordinate ADD ATTRIBUTE z integer;
 SELECT (value).z IS NULL, (values[1]).z IS NULL FROM composite_domain_coordinates;
+ALTER TYPE composite_domain_coordinate RENAME ATTRIBUTE x TO east;
+SELECT (value).east, (values[1]).east, (descendant).east, (descendants[1]).east
+  FROM composite_domain_coordinates;
+INSERT INTO composite_domain_coordinates(descendant) VALUES
+  (ROW(1, 14, NULL)::composite_domain_coordinate_child);
 CREATE SCHEMA composite_domain_schema;
 ALTER TYPE composite_domain_coordinate SET SCHEMA composite_domain_schema;
 ALTER TYPE composite_domain_schema.composite_domain_coordinate RENAME TO composite_domain_point;
-SELECT (value).x, (values[1]).y FROM composite_domain_coordinates;
+SELECT (value).east, (values[1]).y, (descendant).east, (descendants[1]).y
+  FROM composite_domain_coordinates;
 DROP TABLE composite_domain_coordinates;
+DROP DOMAIN composite_domain_coordinate_child;
 DROP DOMAIN composite_domain_coordinate_value;
 DROP TYPE composite_domain_schema.composite_domain_point;
 DROP SCHEMA composite_domain_schema;

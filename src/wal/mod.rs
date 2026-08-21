@@ -346,6 +346,7 @@ pub(crate) enum WalOp<'a> {
     BeginTableRewrite {
         previous_schema: &'a str,
         previous_name: &'a str,
+        preserve_rows: bool,
         column_mapping: [u16; MAX_COLUMNS],
     },
     DropTable {
@@ -1494,8 +1495,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::BeginTableRewrite {
             previous_schema,
             previous_name,
-            column_mapping,
-        } => 1 + previous_schema.len() + 1 + previous_name.len() + column_mapping.len() * 2,
+            ..
+        } => 1 + previous_schema.len() + 1 + previous_name.len() + 1 + MAX_COLUMNS * 2,
         WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::Upsert {
             schema,
@@ -2186,9 +2187,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::BeginTableRewrite {
             previous_schema,
             previous_name,
+            preserve_rows,
             column_mapping,
         } => {
-            let mut ok = name_bytes(buffer, previous_schema) && name_bytes(buffer, previous_name);
+            let mut ok = name_bytes(buffer, previous_schema)
+                && name_bytes(buffer, previous_name)
+                && buffer.append(&[u8::from(*preserve_rows)]);
             for column in column_mapping {
                 ok &= buffer.append(&column.to_le_bytes());
             }
@@ -3357,6 +3361,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_REWRITE_TABLE => {
             let previous_schema = take_name(&mut at)?;
             let previous_name = take_name(&mut at)?;
+            let preserve_rows = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
             let mut column_mapping = [u16::MAX; MAX_COLUMNS];
             for target in &mut column_mapping {
                 *target = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
@@ -3365,6 +3375,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (at == payload.len()).then_some(WalOp::BeginTableRewrite {
                 previous_schema,
                 previous_name,
+                preserve_rows,
                 column_mapping,
             })
         }
@@ -6401,6 +6412,7 @@ mod tests {
                 &WalOp::BeginTableRewrite {
                     previous_schema: "public",
                     previous_name: "t",
+                    preserve_rows: true,
                     column_mapping,
                 },
             )
@@ -6414,6 +6426,7 @@ mod tests {
             let WalOp::BeginTableRewrite {
                 previous_schema,
                 previous_name,
+                preserve_rows,
                 column_mapping,
             } = decode_record(record).unwrap()
             else {
@@ -6422,6 +6435,7 @@ mod tests {
             assert_eq!(lsn, 1);
             assert_eq!(previous_schema, "public");
             assert_eq!(previous_name, "t");
+            assert!(preserve_rows);
             assert_eq!(column_mapping[0], 0);
             assert_eq!(column_mapping[1], 1);
             assert!(column_mapping[2..].iter().all(|column| *column == u16::MAX));

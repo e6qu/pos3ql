@@ -1266,7 +1266,26 @@ pub fn eval_full<'a>(
             type_name,
             type_mod,
         } => {
-            let v = eval_full(operand, arena, params, row, hooks)?;
+            let mut v = eval_full(operand, arena, params, row, hooks)?;
+            let catalog_text = matches!(v, Datum::CompositeText { .. })
+                || matches!(
+                    v,
+                    Datum::Array { element, .. }
+                        if matches!(element.to_coltype(), ColType::Composite(_))
+                );
+            if matches!(
+                ColType::from_sql_name(type_name),
+                Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name)
+            ) && catalog_text
+            {
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    )
+                })?;
+                v = materialize_composite_text_output(v, catalog, arena)?;
+            }
             if let Some(target) = ColType::from_sql_name(type_name)
                 && target.is_reg_object()
             {
@@ -3439,6 +3458,44 @@ fn materialize_named_composite<'a>(
         )
     })?;
     catalog.materialize_composite(slot, physical_fields, text, arena)
+}
+
+/// Converts durable composite payloads to their current catalog layout before
+/// a text output function can observe them. Arrays retain dimensions, lower
+/// bounds, and domain element identity while every historical element gains
+/// newly-added NULL attributes.
+pub(crate) fn materialize_composite_text_output<'a>(
+    value: Datum<'a>,
+    catalog: &dyn CatalogAccess,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => catalog.materialize_composite(slot, physical_fields, text, arena),
+        Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Composite(_)) => {
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            let mut items = [Datum::Null; super::array::MAX_ELEMENTS];
+            for (index, item) in items.iter_mut().take(shape.element_count()).enumerate() {
+                *item = match super::array::get(raw, element, index).unwrap_or(Datum::Null) {
+                    Datum::CompositeText {
+                        slot,
+                        physical_fields,
+                        text,
+                    } => catalog.materialize_composite(slot, physical_fields, text, arena)?,
+                    value => value,
+                };
+            }
+            Ok(Datum::Text(super::array::format_shaped(
+                &items[..shape.element_count()],
+                shape,
+                arena,
+            )?))
+        }
+        value => Ok(value),
+    }
 }
 
 /// The `(key, value)` members a `json_each` / `jsonb_each` family call yields

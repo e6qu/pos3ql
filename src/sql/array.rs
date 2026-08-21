@@ -609,6 +609,69 @@ pub fn write(f: &mut core::fmt::Formatter<'_>, element: ArrElem, raw: &[u8]) -> 
     write_level(f, element, raw, shape, 0, &mut index)
 }
 
+/// Renders already-decoded elements under an existing shape. Catalog-aware
+/// output uses this after expanding historical composite layouts; rebuilding
+/// the array blob would incorrectly require transient composites to become
+/// durable row values again.
+pub(crate) fn format_shaped<'a>(
+    items: &[Datum],
+    shape: Shape,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    if items.len() != shape.element_count() {
+        return Err(invalid_shape());
+    }
+    struct Shaped<'a> {
+        items: &'a [Datum<'a>],
+        shape: Shape,
+    }
+    impl core::fmt::Display for Shaped<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            if self.shape.dimension_count() == 0 {
+                return f.write_str("{}");
+            }
+            if (0..self.shape.dimension_count())
+                .any(|index| self.shape.lower_bound(index) != Some(1))
+            {
+                for index in 0..self.shape.dimension_count() {
+                    write!(
+                        f,
+                        "[{}:{}]",
+                        self.shape.lower_bound(index).unwrap(),
+                        self.shape.upper_bound(index).unwrap()
+                    )?;
+                }
+                f.write_str("=")?;
+            }
+            fn level(
+                f: &mut core::fmt::Formatter<'_>,
+                shaped: &Shaped<'_>,
+                depth: usize,
+                index: &mut usize,
+            ) -> core::fmt::Result {
+                f.write_str("{")?;
+                for member in 0..shaped.shape.dimension(depth).unwrap() {
+                    if member > 0 {
+                        f.write_str(",")?;
+                    }
+                    if depth + 1 == shaped.shape.dimension_count() {
+                        super::types::write_array_elem(f, &shaped.items[*index])?;
+                        *index += 1;
+                    } else {
+                        level(f, shaped, depth + 1, index)?;
+                    }
+                }
+                f.write_str("}")
+            }
+            let mut index = 0;
+            level(f, self, 0, &mut index)
+        }
+    }
+    arena
+        .alloc_str_display(Shaped { items, shape })
+        .map_err(|_| arena_full())
+}
+
 fn write_level(
     f: &mut core::fmt::Formatter<'_>,
     element: ArrElem,

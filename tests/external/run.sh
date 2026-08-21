@@ -286,7 +286,21 @@ step "durability: kill -9, restart, data intact"
   -c "CREATE TABLE crashy_enum (id int, m crashy_mood, ms crashy_mood[])" \
   -c "INSERT INTO crashy_enum VALUES (1,'happy',ARRAY['happy','ok']::crashy_mood[]),(2,'sad',ARRAY['sad']::crashy_mood[])" \
   -c "ALTER TYPE crashy_mood RENAME VALUE 'happy' TO 'glad'" \
-  -c "ALTER TYPE crashy_mood RENAME TO crashy_feeling"
+  -c "ALTER TYPE crashy_mood RENAME TO crashy_feeling" \
+  -c "CREATE TYPE crashy_coordinate AS (x integer, y integer)" \
+  -c "CREATE DOMAIN crashy_coordinate_value AS crashy_coordinate CHECK ((VALUE).x > 0)" \
+  -c "CREATE DOMAIN crashy_coordinate_child AS crashy_coordinate_value CHECK ((VALUE).y < 10)" \
+  -c "CREATE TABLE crashy_composites (direct crashy_coordinate, direct_values crashy_coordinate[], marked crashy_coordinate_value, marked_values crashy_coordinate_value[], child crashy_coordinate_child, child_values crashy_coordinate_child[])" \
+  -c "INSERT INTO crashy_composites VALUES (ROW(1,2)::crashy_coordinate, ARRAY[ROW(3,4)::crashy_coordinate], ROW(5,6)::crashy_coordinate_value, ARRAY[ROW(7,8)::crashy_coordinate_value], ROW(9,9)::crashy_coordinate_child, ARRAY[ROW(8,8)::crashy_coordinate_child])" \
+  -c "CREATE INDEX crashy_composite_field_idx ON crashy_composites (((direct).x))" \
+  -c "CREATE VIEW crashy_composite_view AS SELECT (direct).x AS observed FROM crashy_composites" \
+  -c "CREATE TABLE crashy_composite_rules (value crashy_coordinate, observed integer GENERATED ALWAYS AS ((value).x) STORED, CHECK ((value).x > 0))" \
+  -c "INSERT INTO crashy_composite_rules(value) VALUES (ROW(6,7)::crashy_coordinate)" \
+  -c "ALTER TYPE crashy_coordinate ADD ATTRIBUTE z integer" \
+  -c "ALTER TYPE crashy_coordinate RENAME ATTRIBUTE x TO east" \
+  -c "CREATE SCHEMA crashy_types" \
+  -c "ALTER TYPE crashy_coordinate SET SCHEMA crashy_types" \
+  -c "ALTER TYPE crashy_types.crashy_coordinate RENAME TO crashy_point"
 # WAL upload is synchronous in durable mode. The trailing query still gives
 # the event loop an ordinary turn before this broader crash/restart fixture;
 # local recovery below replays the on-disk journal.
@@ -344,6 +358,25 @@ enm_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
   -c "INSERT INTO crashy_enum VALUES (3,'bogus',NULL)" 2>&1 | grep -c 'invalid input value for enum')
 [[ "$enm" == "crashy_feeling|2;crashy_feeling|1;" && "$enm_bad" -ge 1 ]] && ok "enums survive restart" \
   || bad "enums after restart: '$enm' / '$enm_bad'"
+# A composite type and a domain over it preserve their separate identities
+# through a physical attribute change and schema/name move.  The arrays prove
+# that the same rewrite reaches nested row payloads, not merely column metadata.
+composites=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+  -c "SELECT (direct).east,(direct).z IS NULL,(direct_values[1]).y,(marked).east,(marked_values[1]).y,(child).east,(child_values[1]).y FROM crashy_composites" 2>&1)
+composite_dependents=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+  -c "SELECT (SELECT observed FROM crashy_composite_view),(SELECT observed FROM crashy_composite_rules),(SELECT position('((direct).east)' in indexdef) > 0 FROM pg_indexes WHERE indexname = 'crashy_composite_field_idx')" 2>&1)
+if composite_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+  -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+  -c "INSERT INTO crashy_composites(marked) VALUES (ROW(-1,2,NULL)::crashy_types.crashy_point)" 2>&1); then
+  composite_error="invalid composite-domain value was accepted"
+fi
+if composite_child_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+  -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+  -c "INSERT INTO crashy_composites(child) VALUES (ROW(1,12,NULL)::crashy_coordinate_child)" 2>&1); then
+  composite_child_error="invalid child-domain value was accepted"
+fi
+[[ "$composites" == "1|t|4|5|8|9|8" && "$composite_dependents" == "1|6|t" && "$composite_error" == *23514* && "$composite_child_error" == *23514* ]] && ok "composite dependents survive restart and type move" \
+  || bad "composite dependents after restart: '$composites' / '$composite_dependents' / '$composite_error' / '$composite_child_error'"
 # Object comments survive the crash: the journal replays the COMMENT records.
 cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
@@ -411,6 +444,25 @@ ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
   -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
 [[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
   || bad "schema objects after cold start: '$ns'"
+# The manifest and replayed object batches retain evolved composite layouts,
+# direct-composite arrays, and arrays whose element is a domain over the same
+# moved composite type.
+composites=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+  -c "SELECT (direct).east,(direct).z IS NULL,(direct_values[1]).y,(marked).east,(marked_values[1]).y,(child).east,(child_values[1]).y FROM crashy_composites" 2>&1)
+composite_dependents=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+  -c "SELECT (SELECT observed FROM crashy_composite_view),(SELECT observed FROM crashy_composite_rules),(SELECT position('((direct).east)' in indexdef) > 0 FROM pg_indexes WHERE indexname = 'crashy_composite_field_idx')" 2>&1)
+if composite_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+  -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+  -c "INSERT INTO crashy_composites(marked) VALUES (ROW(-1,2,NULL)::crashy_types.crashy_point)" 2>&1); then
+  composite_error="invalid composite-domain value was accepted"
+fi
+if composite_child_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+  -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+  -c "INSERT INTO crashy_composites(child) VALUES (ROW(1,12,NULL)::crashy_coordinate_child)" 2>&1); then
+  composite_child_error="invalid child-domain value was accepted"
+fi
+[[ "$composites" == "1|t|4|5|8|9|8" && "$composite_dependents" == "1|6|t" && "$composite_error" == *23514* && "$composite_child_error" == *23514* ]] && ok "composite dependents survive a cold start" \
+  || bad "composite dependents after cold start: '$composites' / '$composite_dependents' / '$composite_error' / '$composite_child_error'"
 # Object comments rebuild from the manifest alone (the `cmt` line), wiped disk.
 cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)

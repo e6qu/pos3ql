@@ -4288,6 +4288,7 @@ impl TableLock {
 #[derive(Clone, Copy)]
 struct ReplayTableRewrite {
     table: usize,
+    preserve_rows: bool,
     column_mapping: [u16; MAX_COLUMNS],
 }
 
@@ -11050,6 +11051,22 @@ impl Storage {
                     })?;
                     def.columns[i].ctype = ColType::Array(element);
                 }
+                _ if col.user_type.is_some_and(|identity| {
+                    self.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                        .is_some()
+                }) =>
+                {
+                    let identity = col.user_type.expect("domain identity checked above");
+                    let slot = self
+                        .domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                        .expect("domain identity checked above");
+                    // Scalar domains execute as their base representation, but
+                    // their durable identity is the domain.  Resolve it before
+                    // the `Composite`/`Enum` cases below so a domain named
+                    // independently from its composite base cannot be
+                    // mistaken for that base during replay.
+                    def.columns[i].ctype = self.domain(slot).base;
+                }
                 ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => {
                     let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
                         sql_err!(
@@ -11106,6 +11123,7 @@ impl Storage {
         &mut self,
         previous_schema: &str,
         previous_name: &str,
+        preserve_rows: bool,
         column_mapping: [u16; MAX_COLUMNS],
     ) -> Result<(), SqlError> {
         if self.replay_table_rewrite.is_some() {
@@ -11123,6 +11141,7 @@ impl Storage {
         };
         self.replay_table_rewrite = Some(ReplayTableRewrite {
             table: index,
+            preserve_rows,
             column_mapping,
         });
         Ok(())
@@ -11151,10 +11170,12 @@ impl Storage {
         }
         let index = rewrite.table;
         self.set_table_def(index, def, &column_mapping);
-        self.tables[index].rows.clear();
-        self.tables[index].statistics = TableStatistics::EMPTY;
-        self.tables[index].statistics_wal_dirty = false;
-        self.set_spill_list(index, &[]);
+        if !rewrite.preserve_rows {
+            self.tables[index].rows.clear();
+            self.tables[index].statistics = TableStatistics::EMPTY;
+            self.tables[index].statistics_wal_dirty = false;
+            self.set_spill_list(index, &[]);
+        }
         Ok(true)
     }
 
@@ -12988,6 +13009,21 @@ impl Storage {
                     oid: oid::domain_array_oid(slot),
                 });
             }
+            _ if column.user_type.is_some_and(|identity| {
+                self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .is_some()
+            }) =>
+            {
+                let UserTypeName { schema, name } = column.user_type.expect("domain checked above");
+                let slot = self
+                    .domain_identity_slot(schema.as_str(), name.as_str(), txid)
+                    .expect("domain checked above");
+                return Ok(DeclaredColumnType::UserDefined {
+                    oid: oid::domain_oid(slot as u16),
+                    schema,
+                    name,
+                });
+            }
             ColType::Enum(slot) => {
                 let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
                     sql_err!(
@@ -13361,45 +13397,155 @@ impl Storage {
     /// Finishes manifest-time user-type binding once every catalog definition
     /// has been installed. Startup never exposes the interim unresolved slot.
     pub(crate) fn rebind_domain_base_types(&mut self) -> Result<(), SqlError> {
+        fn bind(
+            storage: &mut Storage,
+            slot: usize,
+            state: &mut [u8; MAX_DOMAINS],
+        ) -> Result<(), SqlError> {
+            match state[slot] {
+                2 => return Ok(()),
+                1 => {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "recovered domain base chain contains a cycle"
+                    ));
+                }
+                _ => state[slot] = 1,
+            }
+            let domain = storage.domains[slot];
+            if let Some(parent) = domain.base_domain {
+                let parent_slot = storage
+                    .domain_slot(parent.schema.as_str(), parent.name.as_str(), 0)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "domain base \"{}.{}\" does not exist",
+                            parent.schema.as_str(),
+                            parent.name.as_str()
+                        )
+                    })?;
+                bind(storage, parent_slot, state)?;
+                storage.domains[slot].base = storage.domains[parent_slot].base;
+            } else if let Some(identity) = domain.base_user_type {
+                storage.domains[slot].base = match domain.base {
+                    ColType::Enum(_) => ColType::Enum(
+                        storage
+                            .enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "domain base enum \"{}.{}\" does not exist",
+                                    identity.schema.as_str(),
+                                    identity.name.as_str()
+                                )
+                            })? as u16,
+                    ),
+                    ColType::Composite(_) => ColType::Composite(
+                        storage
+                            .composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "domain base composite \"{}.{}\" does not exist",
+                                    identity.schema.as_str(),
+                                    identity.name.as_str()
+                                )
+                            })? as u16,
+                    ),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "domain base identity names a non-user-defined type"
+                        ));
+                    }
+                };
+            }
+            state[slot] = 2;
+            Ok(())
+        }
+
+        let mut state = [0u8; MAX_DOMAINS];
         for slot in 0..self.domains.len() {
             let domain = self.domains[slot];
             if domain.ddl_state != CatalogDdlState::Present {
                 continue;
             }
-            let Some(identity) = domain.base_user_type else {
+            bind(self, slot, &mut state)?;
+        }
+        Ok(())
+    }
+
+    /// Rebind persisted declarations after their complete catalog exists.
+    /// Checkpoint type codes deliberately omit runtime slots; a user-type name
+    /// is the durable witness that selects the current enum, composite, or
+    /// domain representation.
+    fn rebind_declared_user_type(
+        &self,
+        ctype: ColType,
+        identity: UserTypeName,
+    ) -> Result<ColType, SqlError> {
+        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0) {
+            let domain = self.domain(slot);
+            return match ctype {
+                ColType::Array(ArrElem::Domain { .. }) => ArrElem::domain(slot as u16, domain.base)
+                    .map(ColType::Array)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "arrays of domain {} require a scalar base type",
+                            identity.name.as_str()
+                        )
+                    }),
+                _ => Ok(domain.base),
+            };
+        }
+        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0) {
+            return Ok(if matches!(ctype, ColType::Array(_)) {
+                ColType::Array(ArrElem::Enum(slot as u16))
+            } else {
+                ColType::Enum(slot as u16)
+            });
+        }
+        if let Some(slot) = self.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+        {
+            return Ok(if matches!(ctype, ColType::Array(_)) {
+                ColType::Array(ArrElem::Composite(slot as u16))
+            } else {
+                ColType::Composite(slot as u16)
+            });
+        }
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "declared type \"{}.{}\" does not exist",
+            identity.schema.as_str(),
+            identity.name.as_str()
+        ))
+    }
+
+    /// Completes checkpoint-time binding for every table and composite field.
+    /// No recovered declaration is exposed with an unresolved user-type slot.
+    pub(crate) fn rebind_user_type_declarations(&mut self) -> Result<(), SqlError> {
+        for table in 0..self.tables.len() {
+            if !self.tables[table].live {
                 continue;
-            };
-            let base = match domain.base {
-                ColType::Enum(_) => ColType::Enum(
-                    self.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "domain base enum \"{}.{}\" does not exist",
-                                identity.schema.as_str(),
-                                identity.name.as_str()
-                            )
-                        })? as u16,
-                ),
-                ColType::Composite(_) => ColType::Composite(
-                    self.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "domain base composite \"{}.{}\" does not exist",
-                                identity.schema.as_str(),
-                                identity.name.as_str()
-                            )
-                        })? as u16,
-                ),
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "domain base identity names a non-user-defined type"
-                    ));
-                }
-            };
-            self.domains[slot].base = base;
+            }
+            let mut definition = self.tables[table].def;
+            self.bind_user_type_columns(&mut definition)?;
+            self.tables[table].def = definition;
+        }
+        for composite in 0..self.composites.len() {
+            if self.composites[composite].ddl_state != CatalogDdlState::Present {
+                continue;
+            }
+            let n_fields = self.composites[composite].n_fields;
+            for field in 0..n_fields {
+                let definition = self.composites[composite].fields[field];
+                let Some(identity) = definition.user_type else {
+                    continue;
+                };
+                let rebound = self.rebind_declared_user_type(definition.ctype, identity)?;
+                self.composites[composite].fields[field].ctype = rebound;
+            }
         }
         Ok(())
     }
@@ -14369,11 +14515,16 @@ impl Storage {
                     ColType::Composite(candidate)
                         | ColType::Array(ArrElem::Composite(candidate))
                         if candidate as usize == slot
-                ) {
-                    if let Some(identity) = &mut column.user_type {
-                        identity.schema = new_schema;
-                        identity.name = new_name;
-                    }
+                ) && column.user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
+                {
+                    column.user_type = Some(UserTypeName {
+                        schema: new_schema,
+                        name: new_name,
+                    });
                     changed = true;
                 }
             }
@@ -14392,10 +14543,16 @@ impl Storage {
                     ColType::Composite(candidate)
                         | ColType::Array(ArrElem::Composite(candidate))
                         if candidate as usize == slot
-                ) && let Some(identity) = &mut field.user_type
+                ) && field.user_type
+                    == Some(UserTypeName {
+                        schema: old_schema,
+                        name: old_name,
+                    })
                 {
-                    identity.schema = new_schema;
-                    identity.name = new_name;
+                    field.user_type = Some(UserTypeName {
+                        schema: new_schema,
+                        name: new_name,
+                    });
                 }
             }
             if let Some(pending) = &mut composite.pending_definition {
@@ -14405,10 +14562,16 @@ impl Storage {
                         ColType::Composite(candidate)
                             | ColType::Array(ArrElem::Composite(candidate))
                             if candidate as usize == slot
-                    ) && let Some(identity) = &mut field.user_type
+                    ) && field.user_type
+                        == Some(UserTypeName {
+                            schema: old_schema,
+                            name: old_name,
+                        })
                     {
-                        identity.schema = new_schema;
-                        identity.name = new_name;
+                        field.user_type = Some(UserTypeName {
+                            schema: new_schema,
+                            name: new_name,
+                        });
                     }
                 }
             }
@@ -16152,6 +16315,17 @@ impl Storage {
             .filter(|(_, index)| index.ddl_state == CatalogDdlState::Present)
     }
 
+    pub(crate) fn index_count(&self) -> usize {
+        self.indexes.len()
+    }
+
+    pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {
+        self.indexes
+            .get(slot)
+            .copied()
+            .filter(|index| index.visible_to(txid))
+    }
+
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
@@ -16931,11 +17105,11 @@ mod tests {
         column_mapping[0] = 0;
 
         storage
-            .begin_replay_table_rewrite("public", "t", column_mapping)
+            .begin_replay_table_rewrite("public", "t", false, column_mapping)
             .unwrap();
         assert_eq!(
             storage
-                .begin_replay_table_rewrite("public", "t", column_mapping)
+                .begin_replay_table_rewrite("public", "t", false, column_mapping)
                 .unwrap_err()
                 .sqlstate,
             sqlstate::INTERNAL_ERROR

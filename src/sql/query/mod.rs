@@ -70,6 +70,223 @@ pub fn stored_query_dependencies(
     dependencies::collect(sql, storage, txid, path, arena)
 }
 
+pub(crate) struct StoredQueryCompositeFieldRename<'a> {
+    pub storage: &'a Storage,
+    pub txid: u32,
+    pub composite_slot: u16,
+    pub from: &'a str,
+    pub arena: &'a Arena,
+}
+
+impl<'a> StoredQueryCompositeFieldRename<'a> {
+    fn collect_expression(
+        &self,
+        expression: &'a Expr<'a>,
+        columns: &dyn super::exec::ColTypeResolver,
+        outer_scope: Option<&QueryScope<'a>>,
+        sites: &mut [bool],
+        count: &mut usize,
+    ) -> Result<(), SqlError> {
+        match expression {
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+                return collect_stored_query_composite_field_rename_select(
+                    select,
+                    self,
+                    outer_scope,
+                    sites,
+                    count,
+                );
+            }
+            Expr::InSubquery {
+                operand, select, ..
+            } => {
+                self.collect_expression(operand, columns, outer_scope, sites, count)?;
+                return collect_stored_query_composite_field_rename_select(
+                    select,
+                    self,
+                    outer_scope,
+                    sites,
+                    count,
+                );
+            }
+            _ => {}
+        }
+        super::query::walk_children(expression, &mut |child| {
+            self.collect_expression(child, columns, outer_scope, sites, count)
+        })?;
+        super::exec::collect_composite_field_rename_site(
+            expression,
+            columns,
+            self.composite_slot,
+            self.from,
+            sites,
+            count,
+        )
+    }
+}
+
+fn collect_stored_query_composite_field_rename_set_tree<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    rename: &StoredQueryCompositeFieldRename<'a>,
+    outer_scope: Option<&QueryScope<'a>>,
+    sites: &mut [bool],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            collect_stored_query_composite_field_rename_select(
+                select,
+                rename,
+                outer_scope,
+                sites,
+                count,
+            )
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            collect_stored_query_composite_field_rename_set_tree(
+                left,
+                rename,
+                outer_scope,
+                sites,
+                count,
+            )?;
+            collect_stored_query_composite_field_rename_set_tree(
+                right,
+                rename,
+                outer_scope,
+                sites,
+                count,
+            )
+        }
+    }
+}
+
+fn collect_stored_query_composite_field_rename_select<'a>(
+    select: &'a Select<'a>,
+    rename: &StoredQueryCompositeFieldRename<'a>,
+    outer_scope: Option<&QueryScope<'a>>,
+    sites: &mut [bool],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    if let Some(tree) = select.set_body {
+        collect_stored_query_composite_field_rename_set_tree(
+            tree,
+            rename,
+            outer_scope,
+            sites,
+            count,
+        )?;
+        let columns: &dyn super::exec::ColTypeResolver = match outer_scope {
+            Some(scope) => &ScopeCols(scope),
+            None => &super::exec::NoCols,
+        };
+        for expression in select
+            .order_by
+            .iter()
+            .map(|order| order.expression)
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            rename.collect_expression(expression, columns, outer_scope, sites, count)?;
+        }
+        return Ok(());
+    }
+
+    let scope = match &select.from {
+        Some(from_clause) => Some(QueryScope::resolve_schema(
+            rename.storage,
+            from_clause,
+            rename.txid,
+            rename.arena,
+        )?),
+        None => None,
+    };
+    let catalog_columns = scope.as_ref().map(|scope| CatalogScopeCols {
+        scope,
+        outer_scope,
+        storage: rename.storage,
+        txid: rename.txid,
+    });
+    let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
+        (Some(columns), _) => columns,
+        (None, Some(scope)) => &ScopeCols(scope),
+        (None, None) => &super::exec::NoCols,
+    };
+    let nested_outer = scope.as_ref().or(outer_scope);
+
+    // Follow source order: selector flags are paired with lexer positions in
+    // the unchanged stored SQL, including nested queries and set-op leaves.
+    for expression in select.distinct_on {
+        rename.collect_expression(expression, columns, nested_outer, sites, count)?;
+    }
+    for item in select.items {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                rename.collect_expression(expression, columns, nested_outer, sites, count)?;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+        }
+    }
+    if let Some(from_clause) = &select.from {
+        for table in core::iter::once(&from_clause.base)
+            .chain(from_clause.joins.iter().map(|join| &join.table))
+        {
+            if let Some(arguments) = table.func_args {
+                for argument in arguments {
+                    rename.collect_expression(argument, columns, nested_outer, sites, count)?;
+                }
+            }
+            if let Some(subquery) = table.subquery {
+                collect_stored_query_composite_field_rename_select(
+                    subquery,
+                    rename,
+                    nested_outer,
+                    sites,
+                    count,
+                )?;
+            }
+        }
+        for join in from_clause.joins {
+            if let Some(on) = join.on {
+                rename.collect_expression(on, columns, nested_outer, sites, count)?;
+            }
+        }
+    }
+    for expression in select
+        .where_clause
+        .into_iter()
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        rename.collect_expression(expression, columns, nested_outer, sites, count)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn stored_query_composite_field_rename_sites<'a>(
+    sql: &'a str,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    rename: &StoredQueryCompositeFieldRename<'a>,
+    sites: &mut [bool],
+) -> Result<usize, SqlError> {
+    let parsed = super::parser::parse_query(sql, rename.arena)?;
+    let expanded = cte::expand_stored_query(
+        parsed,
+        rename.storage,
+        rename.txid,
+        path,
+        dependencies,
+        rename.arena,
+    )?;
+    let mut count = 0usize;
+    collect_stored_query_composite_field_rename_select(expanded, rename, None, sites, &mut count)?;
+    Ok(count)
+}
+
 mod aggregate;
 use aggregate::{AggState, fold_aggregates};
 
@@ -1452,13 +1669,26 @@ pub(crate) fn emit_data_row(
     values: &[Datum],
 ) -> Outcome {
     let formats = responder.result_formats();
+    let catalog = storage_catalog(storage, arena, txid);
+    let mut prepared = [Datum::Null; MAX_PROJ];
+    for (index, output) in prepared.iter_mut().enumerate().take(values.len()) {
+        *output = if formats.is_binary(index) {
+            values[index]
+        } else {
+            match super::eval::materialize_composite_text_output(values[index], &catalog, arena) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            }
+        };
+    }
+    let prepared = &prepared[..values.len()];
     if !(0..values.len()).any(|index| formats.is_binary(index)) {
-        return responder.data_row(values).map(|()| Ok(()));
+        return responder.data_row(prepared).map(|()| Ok(()));
     }
     let mut plans = [super::exec::BinaryFieldPlan::Direct; MAX_PROJ];
     for (index, plan) in plans.iter_mut().enumerate().take(values.len()) {
         if formats.is_binary(index) {
-            *plan = match super::exec::binary_field_plan(&values[index], storage, txid, arena) {
+            *plan = match super::exec::binary_field_plan(&prepared[index], storage, txid, arena) {
                 Ok(plan) => plan,
                 Err(error) => return sql_fail(error),
             };
@@ -1466,8 +1696,8 @@ pub(crate) fn emit_data_row(
     }
     let render = responder.render_context();
     responder
-        .data_row_prepared(values, &|m| {
-            for (index, value) in values.iter().enumerate() {
+        .data_row_prepared(prepared, &|m| {
+            for (index, value) in prepared.iter().enumerate() {
                 if formats.is_binary(index) {
                     super::exec::encode_binary_field_plan(m, value, plans[index]);
                 } else {
@@ -1994,7 +2224,8 @@ pub fn resolve_view_for_dml<'a>(
         storage.view_dependencies(view_slot),
         arena,
     )?;
-    if sel.distinct
+    if sel.set_body.is_some()
+        || sel.distinct
         || !sel.group_by.is_empty()
         || sel.having.is_some()
         || sel.limit.is_some()

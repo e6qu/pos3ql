@@ -349,14 +349,15 @@ else
              ((outbound_dump.echo_locations(ARRAY[ROW(13,14,NULL)::outbound_type_target.location]))[1]).y,
              ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16,NULL)::outbound_dump.location_domain]))[1]).east;
       SELECT item,label,generated,ordinality FROM outbound_dump.row_view ORDER BY ordinality;
-      SELECT a.atttypmod,a.attcollation
+      SELECT a.atttypmod,c.collname
         FROM pg_attribute AS a
+        JOIN pg_collation AS c ON c.oid = a.attcollation
        WHERE a.attrelid = (SELECT typrelid FROM pg_type
                             WHERE typnamespace = 'outbound_dump'::regnamespace
                               AND typname = 'metadata')
          AND a.attname = 'code';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n7|950'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n7|C'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

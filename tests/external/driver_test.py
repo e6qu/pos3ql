@@ -182,6 +182,51 @@ assert bcur.fetchone() == ("abc", "label")
 bcur.close()
 print("record field metadata ok")
 
+# Catalog overload identity stays semantic while PostgreSQL exposes a domain's
+# base representation in RowDescription. A one-column RETURNS TABLE call is a
+# scalar set outside FROM, not an expandable record.
+cur.execute("CREATE DOMAIN drv_srf_count AS integer CHECK (VALUE > 0)")
+cur.execute(
+    "CREATE FUNCTION drv_srf_scalar(value drv_srf_count) RETURNS drv_srf_count "
+    "LANGUAGE SQL AS 'SELECT $1'"
+)
+cur.execute(
+    "CREATE FUNCTION drv_srf_record(value integer) "
+    "RETURNS TABLE(number integer, source text) LANGUAGE SQL AS 'SELECT 1, ''integer'''"
+)
+cur.execute(
+    "CREATE FUNCTION drv_srf_record(value drv_srf_count) "
+    "RETURNS TABLE(label text, accepted boolean) LANGUAGE SQL AS 'SELECT ''domain'', true'"
+)
+cur.execute(
+    "CREATE FUNCTION drv_srf_one(value drv_srf_count) "
+    "RETURNS TABLE(label text) LANGUAGE SQL AS 'SELECT ''domain'''"
+)
+cur.execute("CREATE TABLE drv_srf_input(value drv_srf_count)")
+cur.execute("INSERT INTO drv_srf_input VALUES (1)")
+catalog_srf_query = (
+    "SELECT drv_srf_scalar(input.value), (drv_srf_record(input.value)).* "
+    "FROM drv_srf_input AS input"
+)
+cur.execute(catalog_srf_query)
+assert [(d.type_code, d.display_size) for d in cur.description] == [
+    (23, None),
+    (25, None),
+    (16, None),
+]
+assert cur.fetchone() == (1, "domain", True)
+bcur = conn.cursor(binary=True)
+bcur.execute(catalog_srf_query)
+assert [d.type_code for d in bcur.description] == [23, 25, 16]
+assert bcur.fetchone() == (1, "domain", True)
+bcur.close()
+try:
+    cur.execute("SELECT (drv_srf_one(1::drv_srf_count)).*")
+    raise AssertionError("single-column RETURNS TABLE expanded as a record")
+except psycopg.errors.WrongObjectType as error:
+    assert error.sqlstate == "42809"
+print("catalog SRF typed boundary ok")
+
 # char(n): the blank padding is part of the value on the wire — in both text
 # and binary result formats (PostgreSQL's bpchar binary send is the padded
 # text bytes) — while length() and equality ignore it.

@@ -525,6 +525,75 @@ def test_rows_from_binary_portal_retains_lockstep_shape_and_format():
     s.close()
 
 
+def test_catalog_srf_identity_and_domain_wire_boundary():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE DOMAIN wire_srf_count AS integer CHECK (VALUE > 0); "
+        "CREATE FUNCTION wire_srf_scalar(value wire_srf_count) RETURNS wire_srf_count "
+        "LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_srf_record(value integer) "
+        "RETURNS TABLE(number integer, source text) LANGUAGE SQL AS 'SELECT 1, ''integer'''; "
+        "CREATE FUNCTION wire_srf_record(value wire_srf_count) "
+        "RETURNS TABLE(label text, accepted boolean) LANGUAGE SQL AS 'SELECT ''domain'', true'; "
+        "CREATE FUNCTION wire_srf_one(value wire_srf_count) "
+        "RETURNS TABLE(label text) LANGUAGE SQL AS 'SELECT ''domain'''; "
+        "CREATE TABLE wire_srf_input(value wire_srf_count); "
+        "INSERT INTO wire_srf_input VALUES (1)",
+    )
+    check("catalog SRF raw-wire setup", not any(kind == b"E" for kind, _ in setup), setup)
+
+    query = (
+        "SELECT wire_srf_scalar(input.value), (wire_srf_record(input.value)).* "
+        "FROM wire_srf_input AS input"
+    )
+    parse = frontend_message(
+        b"P", b"wire_srf_statement\x00" + query.encode() + b"\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_srf_portal\x00wire_srf_statement\x00"
+        + struct.pack("!hhhhhh", 0, 0, 3, 1, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_srf_portal\x00")
+    execute = frontend_message(b"E", b"wire_srf_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    expected = (
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01"
+        b"\x00\x00\x00\x06domain\x00\x00\x00\x01\x01"
+    )
+    check(
+        "catalog SRF Describe separates domain identity from wire representation",
+        description is not None
+        and row_description_type_oids(description) == [23, 25, 16]
+        and row_description_formats(description) == [1, 1, 1],
+        output,
+    )
+    check(
+        "catalog SRF binary Result uses the domain overload and record shape",
+        row == expected,
+        row,
+    )
+
+    scalar_star = simple_query(s, "SELECT (wire_srf_one(1::wire_srf_count)).*")
+    check(
+        "single-column RETURNS TABLE is not a record expression",
+        any(kind == b"E" for kind, _ in scalar_star) and has_sqlstate(scalar_star, "42809"),
+        scalar_star,
+    )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))
@@ -2025,7 +2094,7 @@ def test_catalog_aware_binary_bind_parameters():
         )
     routine_results = [
         ("enum", "SELECT wire_binary_state_echo('ready'::wire_binary_state)", enum_oid, b"ready"),
-        ("domain", "SELECT wire_binary_positive_echo(7::wire_binary_positive)", domain_oid, struct.pack("!i", 7)),
+        ("domain base", "SELECT wire_binary_positive_echo(7::wire_binary_positive)", 23, struct.pack("!i", 7)),
         ("composite", "SELECT wire_binary_coordinate_echo(ROW(4,8)::wire_binary_coordinate)", coordinate_oid, coordinate),
         (
             "enum array",
@@ -2051,7 +2120,7 @@ def test_catalog_aware_binary_bind_parameters():
         description = next((payload for kind, payload in messages if kind == b"T"), None)
         row = next((payload for kind, payload in messages if kind == b"D"), None)
         check(
-            f"binary Result preserves routine {name} identity",
+            f"binary Result describes routine {name}",
             description is not None
             and row_description_type_oids(description) == [oid]
             and row_description_formats(description) == [1]

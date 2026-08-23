@@ -7607,6 +7607,22 @@ fn collatable_builtin_types_expose_the_default_collation() {
 }
 
 #[test]
+fn pg_collation_rows_have_catalog_relation_identity_and_types() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tableoid, 'pg_collation'::regclass, pg_typeof(tableoid), \
+                    pg_typeof(oid), pg_typeof(collname), pg_typeof(collnamespace), \
+                    pg_typeof(collowner) \
+               FROM pg_collation WHERE oid = 950",
+        )),
+        ["3456|pg_collation|oid|oid|name|oid|oid"],
+    );
+}
+
+#[test]
 fn column_collation_survives_wal_and_checkpoint_recovery() {
     let config = test_config("collation-restart");
     {

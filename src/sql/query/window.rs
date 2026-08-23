@@ -214,6 +214,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             alias: Some("?grouped"),
             subquery: Some(inner),
             func_args: None,
+            rows_from: None,
             col_alias: None,
             cte: None,
             with_ordinality: false,
@@ -1481,6 +1482,7 @@ pub(crate) fn project_window_rows<'a>(
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
             catalog: hooks.catalog,
             srf_index: hooks.srf_index,
+            project_sets: hooks.project_sets,
             sequences: hooks.sequences,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
@@ -2022,6 +2024,7 @@ pub(crate) fn external_window_into<'a>(
                 windows: Some((win_ptrs, &wv[..win_count])),
                 catalog: hooks.catalog,
                 srf_index: hooks.srf_index,
+                project_sets: hooks.project_sets,
                 sequences: hooks.sequences,
             };
             let mut projected = [Datum::Null; MAX_PROJ];

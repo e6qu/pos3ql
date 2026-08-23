@@ -60,6 +60,15 @@ RESULT_CASES = [
     "SELECT 'empty'::int4range",
     "SELECT '{[1,3),[5,7)}'::int4multirange",
     "SELECT ROW(42::int4, NULL::text)",
+    "SELECT ROW(state, positive, pair) FROM binary_result_rows",
+    "SELECT ROW(binary_result_state_echo(state), binary_result_positive_echo(positive), "
+    "binary_result_pair_echo(pair)) FROM binary_result_rows",
+    "SELECT pg_options_to_table(ARRAY['fillfactor=80','flag'])",
+    "SELECT pg_get_sequence_data(oid) FROM pg_class WHERE relname = 'binary_result_sequence'",
+    "SELECT * FROM unnest(ARRAY[1::int4,2], ARRAY['a'::varchar(3)]) AS u(id,label) ORDER BY id",
+    "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'::varchar(2)])) "
+    "WITH ORDINALITY AS r(series,label,ordinality) ORDER BY ordinality",
+    "SELECT binary_result_values(4), generate_series(10,12)",
 ]
 
 
@@ -72,7 +81,7 @@ def run_case(conn, sql, param):
 def run_result_case(conn, sql):
     cur = conn.cursor()
     cur.execute(sql, binary=True)
-    return cur.fetchone()[0]
+    return cur.fetchall()
 
 
 def main():
@@ -84,6 +93,26 @@ def main():
 
     pg = connect(args.host, args.pg)
     p3 = connect(args.host, args.p3)
+
+    setup = (
+        "CREATE TYPE binary_result_state AS ENUM ('ready', 'blocked'); "
+        "CREATE DOMAIN binary_result_positive AS integer CHECK (VALUE > 0); "
+        "CREATE TYPE binary_result_pair AS (id integer, label text); "
+        "CREATE TABLE binary_result_rows (state binary_result_state, positive binary_result_positive, "
+        "pair binary_result_pair); "
+        "INSERT INTO binary_result_rows VALUES ('ready', 7, ROW(1,'a')::binary_result_pair); "
+        "CREATE FUNCTION binary_result_state_echo(binary_result_state) RETURNS binary_result_state "
+        "LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION binary_result_positive_echo(binary_result_positive) RETURNS binary_result_positive "
+        "LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION binary_result_pair_echo(binary_result_pair) RETURNS binary_result_pair "
+        "LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION binary_result_values(integer) RETURNS SETOF integer "
+        "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'; "
+        "CREATE SEQUENCE binary_result_sequence START WITH 7"
+    )
+    pg.execute(setup)
+    p3.execute(setup)
 
     fails = 0
     for sql, param in CASES:

@@ -668,7 +668,21 @@ fn tref_references(t: &TableRef, name: &str) -> usize {
     if let Some(sub) = t.subquery {
         return select_references(sub, name);
     }
-    usize::from(t.schema.is_none() && t.func_args.is_none() && t.table == name)
+    let argument_references = t.func_args.map_or(0, |arguments| {
+        arguments
+            .iter()
+            .map(|argument| expr_references(argument, name))
+            .sum()
+    });
+    let grouped_references = t.rows_from.map_or(0, |functions| {
+        functions
+            .iter()
+            .map(|function| tref_references(function, name))
+            .sum()
+    });
+    argument_references
+        + grouped_references
+        + usize::from(t.schema.is_none() && !t.is_function_source() && t.table == name)
 }
 
 fn set_tree_references(tree: &SetTree, name: &str) -> usize {
@@ -685,6 +699,9 @@ fn expr_references(e: &Expr, name: &str) -> usize {
     match e {
         Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
         Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
             operand, select, ..
         } => expr_references(operand, name) + select_references(select, name),
         Expr::Unary { operand, .. }
@@ -743,7 +760,10 @@ fn expr_references(e: &Expr, name: &str) -> usize {
 fn direct_references(tree: &SetTree, name: &str) -> usize {
     let direct = |t: &TableRef| -> usize {
         usize::from(
-            t.schema.is_none() && t.subquery.is_none() && t.func_args.is_none() && t.table == name,
+            t.schema.is_none()
+                && t.subquery.is_none()
+                && !t.is_function_source()
+                && t.table == name,
         )
     };
     match tree {
@@ -1602,6 +1622,44 @@ fn subst_tableref<'a>(
     context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
+    if let Some(functions) = t.rows_from {
+        let mut rewritten = [*t; crate::sql::parser::MAX_LIST];
+        for (slot, function) in rewritten.iter_mut().zip(functions) {
+            *slot = subst_tableref(function, context, arena)?;
+        }
+        return Ok(TableRef {
+            rows_from: Some(
+                arena
+                    .alloc_slice_copy(&rewritten[..functions.len()])
+                    .map_err(|_| arena_full())?,
+            ),
+            ..*t
+        });
+    }
+    if let Some(arguments) = t.func_args {
+        let Some(dependency) = stored_routine_dependency(t.schema.unwrap_or(""), t.table, context)
+        else {
+            return Ok(TableRef {
+                func_args: Some(subst_expr_slice(arguments, context, arena)?),
+                ..*t
+            });
+        };
+        let routine = context
+            .storage
+            .routine_for(dependency.slot as usize, context.txid);
+        return Ok(TableRef {
+            schema: Some(
+                arena
+                    .alloc_str(routine.schema_for(context.txid).as_str())
+                    .map_err(|_| arena_full())?,
+            ),
+            table: arena
+                .alloc_str(routine.name_for(context.txid).as_str())
+                .map_err(|_| arena_full())?,
+            func_args: Some(subst_expr_slice(arguments, context, arena)?),
+            ..*t
+        });
+    }
     if let Some(sub) = t.subquery {
         return Ok(TableRef {
             subquery: Some(subst_select(sub, context, arena)?),
@@ -1611,7 +1669,7 @@ fn subst_tableref<'a>(
     // An unqualified name matching a materialized (recursive) CTE resolves to
     // its precomputed row set.
     if t.schema.is_none()
-        && t.func_args.is_none()
+        && !t.is_function_source()
         && let Some((_, m)) = context
             .materialized
             .iter()
@@ -1623,6 +1681,7 @@ fn subst_tableref<'a>(
             alias: Some(t.alias.unwrap_or(t.table)),
             subquery: None,
             func_args: None,
+            rows_from: None,
             col_alias: t.col_alias,
             cte: Some(m),
             with_ordinality: false,
@@ -1648,6 +1707,7 @@ fn subst_tableref<'a>(
             alias: Some(t.alias.unwrap_or(t.table)),
             subquery: Some(q),
             func_args: None,
+            rows_from: None,
             col_alias: renames,
             cte: None,
             with_ordinality: false,
@@ -1755,6 +1815,7 @@ fn subst_tableref<'a>(
             alias: Some(t.alias.unwrap_or(t.table)),
             subquery: Some(expanded),
             func_args: None,
+            rows_from: None,
             col_alias: None,
             cte: None,
             with_ordinality: false,
@@ -1823,9 +1884,11 @@ fn subst_expr_slice<'a>(
 /// are substituted). Leaves and subquery-free trees are returned unchanged.
 fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
-            true
-        }
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => true,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::Collate { operand, .. }
@@ -1979,6 +2042,46 @@ fn rewrite_stored_type_name<'a>(
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }
 
+fn stored_routine_dependency<'a>(
+    schema: &str,
+    name: &str,
+    context: Subst<'_, 'a, '_>,
+) -> Option<crate::storage::StoredQueryDependency> {
+    context
+        .dependencies?
+        .entries()
+        .iter()
+        .copied()
+        .find(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.referenced_schema.as_str() == schema
+                && dependency.referenced_name.as_str() == name
+        })
+}
+
+fn rewrite_stored_routine_name<'a>(
+    name: &'a str,
+    context: Subst<'_, 'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let (schema, bare) = name.split_once('.').map_or(("", name), |parts| parts);
+    let Some(dependency) = stored_routine_dependency(schema, bare, context) else {
+        return Ok(name);
+    };
+    let routine = context
+        .storage
+        .routine_for(dependency.slot as usize, context.txid);
+    let qualified = crate::stack_format!(
+        192,
+        "{}.{}",
+        routine.schema_for(context.txid).as_str(),
+        routine.name_for(context.txid).as_str()
+    );
+    arena
+        .alloc_str(qualified.as_str())
+        .map_err(|_| arena_full())
+}
+
 fn subst_expr<'a>(
     e: &'a Expr<'a>,
     context: Subst<'_, 'a, '_>,
@@ -1999,6 +2102,17 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, context, arena)?,
             select: subst_select(select, context, arena)?,
             negated: *negated,
+        },
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            select,
+            all,
+        } => Expr::QuantifiedSubquery {
+            operand: subst_expr(operand, context, arena)?,
+            operator: *operator,
+            select: subst_select(select, context, arena)?,
+            all: *all,
         },
         Expr::Unary { operator, operand } => Expr::Unary {
             operator: *operator,
@@ -2035,6 +2149,7 @@ fn subst_expr<'a>(
             over,
             filter,
         } => {
+            let name = rewrite_stored_routine_name(name, context, arena)?;
             let mut ob = [OrderBy {
                 expression: &Expr::Null,
                 descending: false,

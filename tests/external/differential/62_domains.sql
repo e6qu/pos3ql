@@ -27,6 +27,8 @@ INSERT INTO dom_t VALUES (5, 'a@b.com', 7);
 -- Column omitted → domain default applies.
 INSERT INTO dom_t (id, e) VALUES (9, 'x@y.com');
 SELECT id, e, d FROM dom_t ORDER BY id;
+SELECT (dom_t).* FROM dom_t ORDER BY id;
+SELECT (ROW(id, e, d)).* FROM dom_t ORDER BY id;
 
 -- pg_typeof: the domain on a bare column, the base type through an expression.
 SELECT pg_typeof(id), pg_typeof(e), pg_typeof(d) FROM dom_t WHERE id = 5;

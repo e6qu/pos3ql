@@ -4967,10 +4967,21 @@ impl Engine {
                 )));
             }
         };
+        let routine_name = match arena.alloc_str(routine.name.as_str()) {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement arena exhausted while invoking SQL function"
+                )));
+            }
+        };
         let program = match query::parse_routine_function_program(
             body,
             arena,
             result_type == ColType::Void,
+            routine_name,
+            routine.arguments(),
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
@@ -5034,11 +5045,22 @@ impl Engine {
                 )));
             }
         };
+        let routine_name = match arena.alloc_str(routine.name.as_str()) {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement arena exhausted while invoking SQL table function"
+                )));
+            }
+        };
         let result_type = routine.kind.function_result().expect("set routine result");
         let program = match query::parse_routine_function_program(
             body,
             arena,
             result_type == ColType::Void,
+            routine_name,
+            routine.arguments(),
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
@@ -5638,11 +5660,15 @@ impl Engine {
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
         for (slot, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
-            exec::register_named_composite_shape(
+            if let Err(error) = exec::register_named_composite_shape(
                 slot as u16,
                 composite.name.as_str(),
                 composite.fields(),
-            );
+                &self.storage,
+                txn.txid,
+            ) {
+                return Ok(Err(error));
+            }
         }
         let session_user = guc.session_user();
         eval::funcs::system::set_session_user(session_user.as_str());

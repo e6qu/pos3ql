@@ -12,8 +12,9 @@ use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, format_append_ident,
-    format_append_literal, format_append_str, sqlstate, text_arg, type_mismatch,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, expression_type_identity,
+    format_append_ident, format_append_literal, format_append_str, sqlstate, text_arg,
+    type_mismatch,
 };
 
 /// Handles the miscellaneous scalar family. Returns `None` if `name` is not one
@@ -61,10 +62,11 @@ pub(crate) fn dispatch<'a>(
                 }; parser::MAX_LIST];
                 for (i, arg) in args.iter().enumerate() {
                     let v = eval_full(arg, arena, params, row, hooks)?;
+                    let type_oid = expression_type_identity(arg, row, hooks)?.record_field_oid();
                     let name = stack_format!(12, "f{}", i + 1);
                     fields[i] = RecordField {
                         name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
-                        type_oid: v.type_oid(),
+                        type_oid,
                         value: v,
                     };
                 }

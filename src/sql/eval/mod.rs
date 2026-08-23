@@ -29,12 +29,12 @@ pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring}
 
 pub(crate) use operators::arithmetic;
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
-pub(crate) use operators::membership_eq;
-use operators::{binary, coerce_unknown, compare_text_collated, logic, range_mismatch, unary};
+pub(crate) use operators::{binary, coerce_unknown, membership_eq};
 pub use operators::{
     compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,
     hash_key_collated,
 };
+use operators::{compare_text_collated, logic, range_mismatch, unary};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry
@@ -204,6 +204,7 @@ pub mod sqlstate {
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
     pub const COLLATION_MISMATCH: &str = "42P21";
+    pub const INDETERMINATE_COLLATION: &str = "42P22";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const WINDOWING_ERROR: &str = "42P20";
     pub const OUT_OF_MEMORY: &str = "53200";
@@ -332,14 +333,16 @@ pub trait ColumnLookup<'a> {
         crate::sql::ast::Collation::None
     }
 
-    /// The domain type name a bare column was declared with, if any — so
-    /// `pg_typeof(domain_col)` reports the domain rather than its base type.
-    /// Defaults to none (an ordinary base-typed column).
-    fn column_domain(
+    fn record_field_collation(&self, _base: &Expr<'a>, _field: &str) -> crate::sql::ast::Collation {
+        crate::sql::ast::Collation::None
+    }
+
+    /// The stable user-defined type identity of a bare column, if any.
+    fn column_user_type(
         &self,
         _qualifier: Option<&str>,
         _name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         None
     }
 
@@ -348,6 +351,150 @@ pub trait ColumnLookup<'a> {
     /// Defaults to false.
     fn whole_row_is_scalar(&self, _table: &str) -> bool {
         false
+    }
+}
+
+/// Static type identity retained until a context decides how PostgreSQL
+/// resolves an unconstrained expression.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpressionTypeIdentity {
+    Known(i32),
+    Unresolved,
+}
+
+impl ExpressionTypeIdentity {
+    pub(crate) const fn record_field_oid(self) -> i32 {
+        match self {
+            Self::Known(oid) => oid,
+            Self::Unresolved => super::types::oid::UNKNOWN,
+        }
+    }
+
+    pub(crate) fn routine_argument_oid(self, value: &Datum<'_>) -> i32 {
+        match self {
+            Self::Known(oid) => oid,
+            // An unconstrained literal or parameter acquires its call-site
+            // type from the value produced for overload resolution.
+            Self::Unresolved => value.type_oid(),
+        }
+    }
+}
+
+fn catalog_user_type_oid<'a>(
+    identity: crate::storage::UserTypeName,
+    is_array: bool,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<i32, SqlError> {
+    hooks
+        .catalog
+        .and_then(|catalog| catalog.user_type_identity_oid(identity, is_array))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "evaluated user-defined type has no catalog identity"
+            )
+        })
+}
+
+pub(crate) fn expression_type_identity<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<ExpressionTypeIdentity, SqlError> {
+    if let Expr::Collate { operand, .. } = expression {
+        return expression_type_identity(operand, row, hooks);
+    }
+    if let Expr::Column { qualifier, name } = expression
+        && let Some(identity) = row.column_user_type(*qualifier, name)
+    {
+        return catalog_user_type_oid(
+            identity,
+            matches!(
+                row.col_type(*qualifier, name),
+                Some(super::types::ColType::Array(_))
+            ),
+            hooks,
+        )
+        .map(ExpressionTypeIdentity::Known);
+    }
+    if let Expr::Cast { type_name, .. } = expression {
+        if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
+            return Ok(ExpressionTypeIdentity::Known(ctype.oid()));
+        }
+        return hooks
+            .catalog
+            .and_then(|catalog| catalog.user_type_oid(type_name))
+            .map(ExpressionTypeIdentity::Known)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "evaluated user-type cast has no catalog identity"
+                )
+            });
+    }
+    if let Expr::Array(elements) = expression
+        && let Some(first) = elements.first()
+    {
+        if let Expr::Cast { type_name, .. } = first
+            && super::types::ColType::from_sql_name(type_name).is_none()
+        {
+            let array_name = stack_format!(128, "{}[]", type_name);
+            return hooks
+                .catalog
+                .and_then(|catalog| catalog.user_type_oid(array_name.as_str()))
+                .map(ExpressionTypeIdentity::Known)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "evaluated user-type array has no catalog identity"
+                    )
+                });
+        }
+        if let Expr::Column { qualifier, name } = first
+            && let Some(identity) = row.column_user_type(*qualifier, name)
+        {
+            return catalog_user_type_oid(identity, true, hooks).map(ExpressionTypeIdentity::Known);
+        }
+    }
+    if let Expr::Call { name, args, .. } = expression
+        && args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+        && let Some(catalog) = hooks.catalog
+    {
+        let mut argument_oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut resolved = true;
+        for (index, argument) in args.iter().enumerate() {
+            match expression_type_identity(argument, row, hooks)? {
+                ExpressionTypeIdentity::Known(oid) => argument_oids[index] = oid,
+                ExpressionTypeIdentity::Unresolved => resolved = false,
+            }
+        }
+        if resolved
+            && let Some(result_oid) = catalog.routine_result_oid(name, &argument_oids[..args.len()])
+        {
+            return Ok(ExpressionTypeIdentity::Known(result_oid));
+        }
+    }
+    match crate::sql::exec::infer_type_res(expression, &RuntimeColumnTypes(row))?.0 {
+        super::types::oid::UNKNOWN => Ok(ExpressionTypeIdentity::Unresolved),
+        oid => Ok(ExpressionTypeIdentity::Known(oid)),
+    }
+}
+
+struct RuntimeColumnTypes<'row, 'datum>(&'row dyn ColumnLookup<'datum>);
+
+impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn resolve(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<super::types::ColType, SqlError> {
+        self.0.col_type(qualifier, name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )
+        })
     }
 }
 
@@ -386,12 +533,12 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).column_identity(qualifier, name)
     }
 
-    fn column_domain(
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
-        (**self).column_domain(qualifier, name)
+    ) -> Option<crate::storage::UserTypeName> {
+        (**self).column_user_type(qualifier, name)
     }
 }
 
@@ -455,12 +602,24 @@ pub struct EvalHooks<'h, 'a> {
     /// The current 1-based expansion index of a set-returning function
     /// (`_pg_expandarray`) in the projection; `None` outside such expansion.
     pub srf_index: Option<usize>,
+    /// Materialized catalog SRFs keyed by their expression node. Built-in SRFs
+    /// compute by index; SQL routines retain their one execution here.
+    pub project_sets: Option<&'h [ProjectSetValue<'a>]>,
     /// Sequence side-effects for `nextval`/`currval`/`lastval`/`setval`. `None`
     /// in contexts where a sequence function cannot appear (catalog synthesis,
     /// constraint checks); the volatile functions error `0A000`-style if called
     /// without it. A trait object with interior mutability so evaluation stays
     /// `&`-only while advancing the generator.
     pub sequences: Option<&'h dyn SequenceAccess>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ProjectSetValue<'a> {
+    pub node: *const (),
+    pub values: &'a [Datum<'a>],
+    /// Nested project-set levels select their input independently of the
+    /// outer level currently being expanded.
+    pub fixed_index: Option<usize>,
 }
 
 /// The side-effecting sequence functions, abstracted so `eval` need not depend
@@ -475,9 +634,12 @@ pub trait SequenceAccess {
     fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
     fn dry_lastval(&self) -> Result<i64, SqlError>;
     fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    /// Restarts replay of volatile sequence calls when a physical executor
-    /// pass repeats the same logical expression stream.
-    fn rewind_statement_cursor(&self) {}
+    /// Captures and restores the logical position when a bounded physical
+    /// executor pass repeats the same expression stream.
+    fn statement_cursor(&self) -> Option<usize> {
+        None
+    }
+    fn restore_statement_cursor(&self, _cursor: usize) {}
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -530,7 +692,13 @@ pub trait CatalogAccess {
     fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
         None
     }
-    fn rewind_routine_invocation_cursor(&self) {}
+    fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
+        None
+    }
+    fn routine_invocation_cursor(&self) -> Option<usize> {
+        None
+    }
+    fn restore_routine_invocation_cursor(&self, _cursor: usize) {}
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
@@ -753,6 +921,15 @@ pub trait CatalogAccess {
     fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
         None
     }
+    /// Resolves a durable schema-qualified identity without reparsing it as
+    /// SQL text.
+    fn user_type_identity_oid(
+        &self,
+        _identity: crate::storage::UserTypeName,
+        _array: bool,
+    ) -> Option<i32> {
+        None
+    }
 }
 
 /// A bounded membership source for an `IN (subquery)` result.
@@ -767,7 +944,23 @@ pub trait SubqueryListProbe: 'static {
 
     /// Returns `(matched, saw_unknown)`. `value` has already been coerced to
     /// the subquery column's type.
-    fn probe<'a>(&self, value: Datum<'a>, arena: &'a Arena) -> Result<(bool, bool), SqlError>;
+    fn probe<'a>(
+        &self,
+        value: Datum<'a>,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(bool, bool), SqlError>;
+
+    fn quantify<'a>(
+        &self,
+        value: Datum<'a>,
+        operator: BinaryOp,
+        all: bool,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError>;
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -780,6 +973,7 @@ pub struct SubqueryList<'a> {
     pub probe: Option<core::ptr::NonNull<dyn SubqueryListProbe>>,
     pub saw_null: bool,
     pub witness: Datum<'a>,
+    pub collations: &'a [Collation],
 }
 
 /// Pre-evaluated (uncorrelated) subquery results.
@@ -802,6 +996,7 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     windows: None,
     catalog: None,
     srf_index: None,
+    project_sets: None,
     sequences: None,
 };
 
@@ -860,6 +1055,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::Str(_)
         | Expr::BitLit(_)
         | Expr::Column { .. }
+        | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
         | Expr::SchemaColumn { .. }
         | Expr::Param(_)
@@ -995,9 +1191,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
-            Ok(None)
-        }
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => Ok(None),
         Expr::Array(items) => {
             for e in *items {
                 fold_check(e, arena)?;
@@ -1061,6 +1259,13 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if let Some(set) = hooks.project_sets.and_then(|sets| {
+        sets.iter()
+            .find(|set| set.node == expression as *const Expr<'a> as *const ())
+    }) && let Some(index) = set.fixed_index.or(hooks.srf_index)
+    {
+        return Ok(set.values.get(index - 1).copied().unwrap_or(Datum::Null));
+    }
     // GROUPING(arg, ...): each argument contributes one bit (1 if that column
     // is NOT part of the current grouping set), most significant first.
     if let Expr::Call { name, args, .. } = expression
@@ -1098,7 +1303,7 @@ pub fn eval_full<'a>(
     match *expression {
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
-        // marker — consumable only by count() (type analysis rejects the rest).
+        // Preserve the table field layout for composite evaluation and output.
         Expr::WholeRow(table) => match row.whole_row_fields(table, arena)? {
             // A function scan's whole row is its single scalar column.
             Some(fields) if row.whole_row_is_scalar(table) => {
@@ -1135,6 +1340,26 @@ pub fn eval_full<'a>(
                 }
             }
             Err(e) => Err(e),
+        },
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+        } => match row.lookup(qualifier, name) {
+            Ok(value) => materialize_named_composite(value, hooks, arena),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                params.get(index as usize - 1).copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "there is no parameter ${}",
+                        index
+                    )
+                })
+            }
+            Err(error) => Err(error),
         },
         Expr::SchemaColumn {
             schema,
@@ -1630,6 +1855,7 @@ pub fn eval_full<'a>(
                 ));
             };
             let witness = list.witness;
+            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
             // Coerce the operand to the subquery's column type first: PostgreSQL
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
@@ -1670,15 +1896,17 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                match membership_eq(&l, &r)? {
-                    Some(true) => return Ok(Datum::Bool(!negated)),
-                    Some(false) => {}
-                    None => saw_null = true,
+                match quantified_comparison(BinaryOp::Eq, l, r, collations, hooks.catalog, arena)? {
+                    Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                    Datum::Bool(false) => {}
+                    Datum::Null => saw_null = true,
+                    _ => unreachable!("equality returns boolean or NULL"),
                 }
             }
             if let Some(probe) = list.probe {
                 // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) = unsafe { probe.as_ref() }.probe(v, arena)?;
+                let (matched, unknown) =
+                    unsafe { probe.as_ref() }.probe(v, collations, hooks.catalog, arena)?;
                 if matched {
                     return Ok(Datum::Bool(!negated));
                 }
@@ -1688,6 +1916,89 @@ pub fn eval_full<'a>(
                 Datum::Null
             } else {
                 Datum::Bool(negated)
+            })
+        }
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            all,
+            ..
+        } => {
+            let Some(subs) = hooks.subs else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "subqueries are not allowed in this context"
+                ));
+            };
+            let list = subs
+                .lists
+                .iter()
+                .find(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
+                .copied()
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "subqueries are not allowed in this context (or are correlated)"
+                    )
+                })?;
+            let value = materialize_named_composite(
+                eval_full(operand, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
+            let value = coerce_unknown(value, &list.witness)?;
+            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
+            // Resolve the operator against the subquery's declared output
+            // type even when it is empty or yields only NULLs.
+            let _ = quantified_comparison(
+                operator,
+                value,
+                list.witness,
+                collations,
+                hooks.catalog,
+                arena,
+            )?;
+            let mut saw_unknown = false;
+            for member in list.values {
+                let left = coerce_unknown(value, member)?;
+                let right = coerce_unknown(*member, &left)?;
+                match quantified_comparison(
+                    operator,
+                    left,
+                    right,
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
+                    Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    other => return Err(type_mismatch("quantified comparison", &other)),
+                }
+            }
+            if let Some(probe) = list.probe {
+                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                let result = unsafe { probe.as_ref() }.quantify(
+                    value,
+                    operator,
+                    all,
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )?;
+                match result {
+                    Datum::Bool(true) if !all => return Ok(result),
+                    Datum::Bool(false) if all => return Ok(result),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    _ => unreachable!("subquery quantifier returns boolean or NULL"),
+                }
+            }
+            Ok(if saw_unknown {
+                Datum::Null
+            } else {
+                Datum::Bool(all)
             })
         }
         Expr::Exists(_) => {
@@ -2128,6 +2439,205 @@ pub fn eval_full<'a>(
     }
 }
 
+fn effective_quantified_collations<'a>(
+    operand: &Expr<'a>,
+    right: &[Collation],
+    row: &impl ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [Collation], SqlError> {
+    let mut output = [Collation::None; super::parser::MAX_LIST];
+    if right.len() > output.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many fields in row comparison"
+        ));
+    }
+    let row_args = match operand {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(*args),
+        _ => None,
+    };
+    let whole_fields = match operand {
+        Expr::WholeRow(table) => row.whole_row_fields(table, arena)?,
+        _ => None,
+    };
+    for (index, right) in right.iter().copied().enumerate() {
+        let left = if let Some(args) = row_args {
+            args.get(index)
+                .map(|expression| expression_collation(expression, row))
+                .transpose()?
+                .flatten()
+        } else if let Expr::WholeRow(table) = operand {
+            whole_fields
+                .and_then(|fields| fields.get(index))
+                .map(|field| DerivedCollation {
+                    value: row.collation(Some(table), field.name),
+                    explicit: false,
+                    indeterminate: false,
+                })
+        } else if index == 0 {
+            expression_collation(operand, row)?
+        } else {
+            None
+        };
+        let right = (right != Collation::None).then_some(DerivedCollation {
+            value: right,
+            explicit: false,
+            indeterminate: false,
+        });
+        output[index] = required_comparison_collation(merge_derived_collations(left, right)?)?;
+    }
+    arena
+        .alloc_slice_copy(&output[..right.len()])
+        .map(|slice| &*slice)
+        .map_err(|_| arena_full())
+}
+
+fn typed_field_value<'a>(field: &super::types::RecordField<'a>) -> Datum<'a> {
+    if field.value.is_null() {
+        ColType::from_oid(field.type_oid)
+            .map(super::query::type_witness)
+            .unwrap_or(Datum::Null)
+    } else {
+        field.value
+    }
+}
+
+fn quantified_scalar<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collation: Collation,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(
+        (&left, &right),
+        (
+            Datum::Text(_) | Datum::Bpchar(_),
+            Datum::Text(_) | Datum::Bpchar(_)
+        )
+    ) {
+        compare_text_collated(operator, left, right, false, false, collation, catalog)
+    } else {
+        binary(operator, left, right, false, false, arena)
+    }
+}
+
+pub(crate) fn quantified_comparison<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collations: &[Collation],
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let materialize = |value| match value {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?
+            .materialize_composite(slot, physical_fields, text, arena),
+        value => Ok(value),
+    };
+    let left = materialize(left)?;
+    let right = materialize(right)?;
+    match (left, right) {
+        (
+            Datum::Record(left) | Datum::Composite { fields: left, .. },
+            Datum::Record(right) | Datum::Composite { fields: right, .. },
+        ) => {
+            if left.len() != right.len() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "unequal number of entries in row expressions"
+                ));
+            }
+            if collations.len() != left.len() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "unequal number of entries in row expressions"
+                ));
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                let _ = quantified_scalar(
+                    operator,
+                    typed_field_value(left),
+                    typed_field_value(right),
+                    collations[index],
+                    catalog,
+                    arena,
+                )?;
+            }
+            if matches!(operator, BinaryOp::Eq | BinaryOp::NotEq) {
+                let mut saw_null = false;
+                for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                    match quantified_scalar(
+                        BinaryOp::Eq,
+                        left.value,
+                        right.value,
+                        collations[index],
+                        catalog,
+                        arena,
+                    )? {
+                        Datum::Bool(false) => return Ok(Datum::Bool(operator == BinaryOp::NotEq)),
+                        Datum::Null => saw_null = true,
+                        Datum::Bool(true) => {}
+                        _ => unreachable!("equality returns boolean or NULL"),
+                    }
+                }
+                return Ok(if saw_null {
+                    Datum::Null
+                } else {
+                    Datum::Bool(operator == BinaryOp::Eq)
+                });
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                match quantified_scalar(
+                    BinaryOp::Eq,
+                    left.value,
+                    right.value,
+                    collations[index],
+                    catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) => continue,
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Bool(false) => {
+                        return quantified_scalar(
+                            operator,
+                            left.value,
+                            right.value,
+                            collations[index],
+                            catalog,
+                            arena,
+                        );
+                    }
+                    _ => unreachable!("equality returns boolean or NULL"),
+                }
+            }
+            Ok(Datum::Bool(matches!(
+                operator,
+                BinaryOp::LtEq | BinaryOp::GtEq
+            )))
+        }
+        (left, right) => quantified_scalar(
+            operator,
+            left,
+            right,
+            collations.first().copied().unwrap_or(Collation::None),
+            catalog,
+            arena,
+        ),
+    }
+}
+
 pub(crate) fn resolve_comparison_collation<'a>(
     left: &Expr<'a>,
     right: &Expr<'a>,
@@ -2135,9 +2645,20 @@ pub(crate) fn resolve_comparison_collation<'a>(
 ) -> Result<crate::sql::ast::Collation, SqlError> {
     let left = expression_collation(left, row)?;
     let right = expression_collation(right, row)?;
-    Ok(merge_derived_collations(left, right)?
-        .map(|collation| collation.value)
-        .unwrap_or(crate::sql::ast::Collation::None))
+    required_comparison_collation(merge_derived_collations(left, right)?)
+}
+
+fn required_comparison_collation(
+    collation: Option<DerivedCollation>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    match collation {
+        Some(collation) if collation.indeterminate => Err(sql_err!(
+            sqlstate::INDETERMINATE_COLLATION,
+            "could not determine which collation to use for string comparison"
+        )),
+        Some(collation) => Ok(collation.value),
+        None => Ok(crate::sql::ast::Collation::None),
+    }
 }
 
 /// PostgreSQL's collation-combination rule, shared by every expression that
@@ -2159,17 +2680,25 @@ fn merge_derived_collations(
         }
         (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
         (Some(_left), Some(right)) if right.explicit => Ok(Some(right)),
+        (Some(left), Some(right)) if left.indeterminate && right.indeterminate => {
+            Ok(Some(DerivedCollation {
+                value: crate::sql::ast::Collation::None,
+                explicit: false,
+                indeterminate: true,
+            }))
+        }
+        (Some(left), Some(right)) if left.indeterminate => Ok(Some(right)),
+        (Some(left), Some(right)) if right.indeterminate => Ok(Some(left)),
         (Some(left), Some(right))
             if left.value != crate::sql::ast::Collation::Default
                 && right.value != crate::sql::ast::Collation::Default
                 && left.value != right.value =>
         {
-            Err(sql_err!(
-                sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
-                left.value.name(),
-                right.value.name()
-            ))
+            Ok(Some(DerivedCollation {
+                value: crate::sql::ast::Collation::None,
+                explicit: false,
+                indeterminate: true,
+            }))
         }
         (Some(left), Some(right)) => {
             Ok(Some(if left.value == crate::sql::ast::Collation::Default {
@@ -2187,6 +2716,7 @@ fn merge_derived_collations(
 struct DerivedCollation {
     value: crate::sql::ast::Collation,
     explicit: bool,
+    indeterminate: bool,
 }
 
 fn expression_collation<'a>(
@@ -2208,6 +2738,7 @@ fn expression_collation<'a>(
             Ok(Some(DerivedCollation {
                 value: *collation,
                 explicit: true,
+                indeterminate: false,
             }))
         }
         Expr::Cast {
@@ -2217,14 +2748,57 @@ fn expression_collation<'a>(
             Some(_) => Ok(None),
             None => expression_collation(operand, row),
         },
-        Expr::Column { qualifier, name } => Ok(Some(DerivedCollation {
-            value: row.collation(*qualifier, name),
-            explicit: false,
-        })),
-        Expr::SchemaColumn { table, name, .. } => Ok(Some(DerivedCollation {
-            value: row.collation(Some(table), name),
-            explicit: false,
-        })),
+        Expr::Column { qualifier, name } => {
+            let value = row.collation(*qualifier, name);
+            Ok(Some(DerivedCollation {
+                value,
+                explicit: false,
+                indeterminate: value == crate::sql::ast::Collation::None
+                    && row
+                        .col_type(*qualifier, name)
+                        .is_some_and(ColType::is_collatable),
+            }))
+        }
+        Expr::SchemaColumn { table, name, .. } => {
+            let value = row.collation(Some(table), name);
+            Ok(Some(DerivedCollation {
+                value,
+                explicit: false,
+                indeterminate: value == crate::sql::ast::Collation::None
+                    && row
+                        .col_type(Some(table), name)
+                        .is_some_and(ColType::is_collatable),
+            }))
+        }
+        Expr::Field { base, field } => match &**base {
+            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+                let position = crate::sql::exec::RECORD_FIELD_NAMES
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(field));
+                match position.and_then(|position| args.get(position)) {
+                    Some(argument) => expression_collation(argument, row),
+                    None => Ok(None),
+                }
+            }
+            Expr::WholeRow(table) => {
+                let value = row.collation(Some(table), field);
+                Ok(Some(DerivedCollation {
+                    value,
+                    explicit: false,
+                    indeterminate: value == crate::sql::ast::Collation::None
+                        && static_type(expression, row).is_some_and(ColType::is_collatable),
+                }))
+            }
+            _ => {
+                let value = row.record_field_collation(base, field);
+                Ok(Some(DerivedCollation {
+                    value,
+                    explicit: false,
+                    indeterminate: value == crate::sql::ast::Collation::None
+                        && static_type(expression, row).is_some_and(ColType::is_collatable),
+                }))
+            }
+        },
         Expr::Binary {
             operator: BinaryOp::Concat,
             left,
@@ -2261,33 +2835,39 @@ fn expression_collation<'a>(
     }
 }
 
-/// Returns the resolved collation identity of a collatable expression.  This
-/// is the one derivation used by comparison validation and catalog projection,
-/// so expression indexes cannot report a different identity from execution.
+/// Returns the collation required by an operation that compares or orders an
+/// expression. An indeterminate collatable expression is rejected here rather
+/// than being mistaken for a non-collatable value.
 pub(crate) fn resolved_expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
-    Ok(expression_collation(expression, row)?
-        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+    required_comparison_collation(expression_collation(expression, row)?)
 }
 
-/// Combines implicit collation identities for a result column.  Set-operation
-/// and CTE description use this exact rule instead of choosing one leaf.
-pub(crate) fn unify_implicit_collations(
-    left: crate::sql::ast::Collation,
-    right: crate::sql::ast::Collation,
-) -> Result<crate::sql::ast::Collation, SqlError> {
-    let left = (left != crate::sql::ast::Collation::None).then_some(DerivedCollation {
-        value: left,
-        explicit: false,
-    });
-    let right = (right != crate::sql::ast::Collation::None).then_some(DerivedCollation {
-        value: right,
-        explicit: false,
-    });
-    Ok(merge_derived_collations(left, right)?
-        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+/// Returns result metadata without requiring a usable comparison collation.
+/// PostgreSQL permits this state through `UNION ALL` and diagnoses it only
+/// when a later operation needs collation semantics.
+pub(crate) fn described_expression_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<
+    (
+        crate::sql::ast::Collation,
+        crate::sql::types::CollationDerivation,
+    ),
+    SqlError,
+> {
+    use crate::sql::types::CollationDerivation;
+    Ok(match expression_collation(expression, row)? {
+        Some(value) if value.indeterminate => (
+            crate::sql::ast::Collation::None,
+            CollationDerivation::Indeterminate,
+        ),
+        Some(value) if value.explicit => (value.value, CollationDerivation::Explicit),
+        Some(value) => (value.value, CollationDerivation::Implicit),
+        None => (crate::sql::ast::Collation::None, CollationDerivation::None),
+    })
 }
 
 /// Text functions whose result retains the input collation.  Non-text calls
@@ -2432,24 +3012,8 @@ fn call<'a>(
         if args.len() <= arguments.len() {
             for (slot, argument) in args.iter().enumerate() {
                 arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
-                argument_type_oids[slot] = match argument {
-                    Expr::Cast { type_name, .. } => catalog
-                        .user_type_oid(type_name)
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    Expr::Array(elements) => elements
-                        .first()
-                        .and_then(|element| match element {
-                            Expr::Cast { type_name, .. } => {
-                                let array_name = stack_format!(128, "{}[]", type_name);
-                                catalog.user_type_oid(array_name.as_str())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    Expr::Param(index) => crate::sql::exec::bound_parameter_type_oid(*index)
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    _ => arguments[slot].type_oid(),
-                };
+                argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
+                    .routine_argument_oid(&arguments[slot]);
             }
             if let Some(result) = catalog.call_routine(
                 name,
@@ -2568,7 +3132,9 @@ fn call<'a>(
                     return Ok(Datum::Null);
                 }
                 // int4 unless an argument is int8 or the value overflows int4.
-                let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
+                let wide = matches!(start, Datum::Int8(_))
+                    || matches!(stop, Datum::Int8(_))
+                    || matches!(step, Datum::Int8(_));
                 return Ok(if !wide && i32::try_from(v).is_ok() {
                     Datum::Int4(v as i32)
                 } else {
@@ -2771,10 +3337,11 @@ fn call<'a>(
                 None => Datum::Null,
             })
         }
-        // Set-returning `generate_subscripts(array, dim)`: the k-th 1-based index
-        // of the array along `dim` (only dimension 1 exists here).
+        // Set-returning `generate_subscripts(array, dim [, reverse])`.
         "generate_subscripts" => {
-            arity(2)?;
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
             let raw = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Array { raw, .. } => raw,
                 Datum::Null => return Ok(Datum::Null),
@@ -2803,11 +3370,38 @@ fn call<'a>(
                     "set-returning function called where not allowed"
                 )
             })?;
-            if dim == 1 && k <= super::array::len(raw) {
-                Ok(Datum::Int4(k as i32))
+            let reverse = if args.len() == 3 {
+                match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Bool(reverse) => reverse,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(type_mismatch(
+                            "generate_subscripts reverse must be boolean",
+                            &other,
+                        ));
+                    }
+                }
             } else {
-                Ok(Datum::Null)
+                false
+            };
+            let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            let Some(dimension) = dimension else {
+                return Ok(Datum::Null);
+            };
+            let Some(length) = shape.dimension(dimension) else {
+                return Ok(Datum::Null);
+            };
+            if k > length {
+                return Ok(Datum::Null);
             }
+            let offset = i32::try_from(k - 1).expect("array dimension fits i32");
+            let subscript = if reverse {
+                shape.upper_bound(dimension).expect("known dimension") - offset
+            } else {
+                shape.lower_bound(dimension).expect("known dimension") + offset
+            };
+            Ok(Datum::Int4(subscript))
         }
         "jsonb_object_keys" | "json_object_keys" => {
             arity(1)?;
@@ -2959,6 +3553,89 @@ fn call<'a>(
                         name: "value",
                         type_oid: value_oid,
                         value: *value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
+        "pg_options_to_table" => {
+            arity(1)?;
+            let raw = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Array {
+                    element: super::types::ArrElem::Text,
+                    raw,
+                } => raw,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("pg_options_to_table", &other)),
+            };
+            let index = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
+            let option = match super::array::get(raw, super::types::ArrElem::Text, index - 1) {
+                Some(Datum::Text(option)) => option,
+                Some(Datum::Null) => {
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "null value not allowed"
+                    ));
+                }
+                None => return Ok(Datum::Null),
+                Some(other) => return Err(type_mismatch("pg_options_to_table", &other)),
+            };
+            let (option_name, option_value) = match option.split_once('=') {
+                Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
+                None => (Datum::Text(option), Datum::Null),
+            };
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "option_name",
+                        type_oid: super::types::oid::TEXT,
+                        value: option_name,
+                    },
+                    super::types::RecordField {
+                        name: "option_value",
+                        type_oid: super::types::oid::TEXT,
+                        value: option_value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
+        "pg_get_sequence_data" => {
+            arity(1)?;
+            let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Int4(oid) => oid,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("pg_get_sequence_data", &other)),
+            };
+            let (last_value, is_called) = hooks
+                .catalog
+                .and_then(|catalog| catalog.sequence_state_by_oid(oid))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "sequence with OID {} does not exist",
+                        oid
+                    )
+                })?;
+            if hooks.srf_index != Some(1) {
+                return Ok(Datum::Null);
+            }
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "last_value",
+                        type_oid: super::types::oid::INT8,
+                        value: Datum::Int8(last_value),
+                    },
+                    super::types::RecordField {
+                        name: "is_called",
+                        type_oid: super::types::oid::BOOL,
+                        value: Datum::Bool(is_called),
                     },
                 ])
                 .map_err(|_| arena_full())?;
@@ -3127,15 +3804,21 @@ pub enum SeriesKind {
 /// overload family. Keep the type decision in one place so select-list,
 /// FROM, Describe, and Result encoding cannot disagree about a temporal
 /// series' wire type.
-pub(crate) fn generate_series_result_type(start: Option<ColType>, has_numeric: bool) -> ColType {
+pub(crate) fn generate_series_result_type(
+    start: Option<ColType>,
+    has_numeric: bool,
+    has_int8: bool,
+) -> ColType {
     if has_numeric {
         return ColType::Numeric;
+    }
+    if has_int8 {
+        return ColType::Int8;
     }
     match start {
         Some(ColType::Timestamp) => ColType::Timestamp,
         Some(ColType::Timestamptz | ColType::Date) => ColType::Timestamptz,
         Some(ColType::Numeric) => ColType::Numeric,
-        Some(ColType::Int8) => ColType::Int8,
         _ => ColType::Int4,
     }
 }

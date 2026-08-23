@@ -115,6 +115,14 @@ start_pos3ql() { # <config> <log> <port>
   fi
 }
 
+stop_pos3ql() { # <pid>
+  local pid=$1
+  kill "$pid" 2>/dev/null
+  for _ in {1..50}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+}
+
 cleanup() {
   # Stop the base-port server gracefully and wait for it to exit before
   # returning. Under coverage the server flushes its profile on a clean
@@ -122,9 +130,7 @@ cleanup() {
   # this script exits — so a fire-and-forget SIGTERM races the flush. Give it
   # up to five seconds to go, then force it.
   if [[ -n "${SERVER_PID:-}" ]]; then
-    kill "$SERVER_PID" 2>/dev/null
-    for _ in {1..50}; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
-    kill -9 "$SERVER_PID" 2>/dev/null
+    stop_pos3ql "$SERVER_PID"
   fi
   if [[ -n "${GATEWAY_PID:-}" ]]; then
     kill "$GATEWAY_PID" 2>/dev/null
@@ -154,8 +160,9 @@ for i in {1..50}; do
 done
 ok "gateway (pid $GATEWAY_PID)"
 
-step "write config and start pos3ql"
-cat > "$WORK/server.conf" <<EOF
+write_main_config() { # <object prefix>
+  local object_prefix=$1
+  cat > "$WORK/server.conf" <<EOF
 listen_addr = 127.0.0.1:${PG_PORT}
 data_dir = ${WORK}/data
 max_connections = 8
@@ -164,7 +171,7 @@ wal_bytes = 16MiB
 object_store = on
 object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
 object_store_namespace = pos3ql-external
-object_store_prefix = run-$$/
+object_store_prefix = ${object_prefix}
 wal_upload = on
 wal_upload_sync = on
 sql_arena_bytes = 4MiB
@@ -185,6 +192,10 @@ work_arena_bytes = 192MiB
 # stream back in ranged windows.
 object_store_response_bytes = 256KiB
 EOF
+}
+
+step "write config and start pos3ql"
+write_main_config "run-$$/"
 start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
 SERVER_PID=$START_PID
 ok "server up (pid $SERVER_PID)"
@@ -262,6 +273,15 @@ out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
 fi # proto
 
 if want dur; then
+
+if want proto; then
+  step "isolate durability fixtures"
+  stop_pos3ql "$SERVER_PID"
+  rm -rf "$WORK/data"
+  write_main_config "dur-$$/"
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  SERVER_PID=$START_PID
+fi
 
 step "durability: kill -9, restart, data intact"
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
@@ -386,14 +406,22 @@ cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
 step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
 # Commit without any CHECKPOINT, then destroy the local disk: recovery must
 # come entirely from WAL segments synchronously acknowledged by MinIO.
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  -v ON_ERROR_STOP=1 \
   -c "CREATE TABLE waltest (id int, v text)" \
-  -c "INSERT INTO waltest VALUES (10,'durable-a'),(20,'durable-b'),(30,'durable-c')"
+  -c "INSERT INTO waltest VALUES (10,'durable-a'),(20,'durable-b'),(30,'durable-c')"; then
+  bad "durable WAL fixture setup"
+  exit 1
+fi
 # One commit whose WAL batch (~600 KiB of row images, within the statement
 # arena) exceeds the 256 KiB response buffer: its uploaded segment must
 # still replay, in ranged windows, after the wipe.
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
-  -c "INSERT INTO waltest SELECT 1000 + g, repeat('w', 1024) FROM generate_series(1, 600) g"
+if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  -v ON_ERROR_STOP=1 \
+  -c "INSERT INTO waltest SELECT 1000 + g, repeat('w', 1024) FROM generate_series(1, 600) g"; then
+  bad "durable WAL ranged-replay fixture setup"
+  exit 1
+fi
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null

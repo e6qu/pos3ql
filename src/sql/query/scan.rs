@@ -228,6 +228,13 @@ fn pax_column_demand_bounded(
         {
             return false;
         }
+        if let Some(functions) = table.rows_from {
+            for function in functions {
+                if !collect_table(function, scope, columns) {
+                    return false;
+                }
+            }
+        }
         table
             .subquery
             .is_none_or(|select| collect_select(select, scope, columns))
@@ -315,6 +322,9 @@ fn pax_column_demand_bounded(
                 return collect_select(select, scope, columns);
             }
             Expr::InSubquery {
+                operand, select, ..
+            }
+            | Expr::QuantifiedSubquery {
                 operand, select, ..
             } => return collect(operand, scope, columns) && collect_select(select, scope, columns),
             _ => {}
@@ -594,17 +604,19 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
-    fn column_domain(
+    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+    }
+
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(t, c) => self.scope.defs[t].and_then(|def| {
-                def.columns()
-                    .get(c)
-                    .and_then(|col| col.user_type.map(|identity| identity.name))
-            }),
+            ResolvedColumn::Table(t, c) => self.scope.defs[t]
+                .and_then(|def| def.columns().get(c).and_then(|col| col.user_type)),
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
         }
@@ -714,10 +726,14 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .col_type(q, name)
             .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
     }
-    fn column_domain(&self, q: Option<&str>, name: &str) -> Option<crate::storage::SqlName> {
+    fn column_user_type(
+        &self,
+        q: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         self.inner
-            .column_domain(q, name)
-            .or_else(|| self.outer.and_then(|o| o.column_domain(q, name)))
+            .column_user_type(q, name)
+            .or_else(|| self.outer.and_then(|o| o.column_user_type(q, name)))
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
@@ -728,6 +744,18 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             self.outer
                 .map(|outer| outer.collation(q, name))
                 .unwrap_or(crate::sql::ast::Collation::None)
+        }
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        let inner = self.inner.record_field_collation(base, field);
+        if inner != crate::sql::ast::Collation::None {
+            inner
+        } else {
+            self.outer
+                .map_or(crate::sql::ast::Collation::None, |outer| {
+                    outer.record_field_collation(base, field)
+                })
         }
     }
 
@@ -791,10 +819,12 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             unsafe { core::slice::from_raw_parts(store, len) }
         });
     }
-    if tref.func_args.is_some() {
+    if tref.is_function_source() {
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
         // arguments against the outer row.
-        return super::table_func_rows_outer(tref, storage, txid, arena, params, outer, None, None);
+        return super::table_func_rows_outer(
+            tref, storage, txid, arena, params, outer, None, None, None,
+        );
     }
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,

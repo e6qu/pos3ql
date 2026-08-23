@@ -19,10 +19,10 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, find_srf,
-    merge_correlated, pax_column_demand, postpone_cost, project_row_skipping, record_star_width,
-    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok, srf_max_count,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, has_project_set,
+    merge_correlated, pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping,
+    record_star_width, resolve_order_target, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -70,6 +70,43 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.scope
+            .find_column(qualifier, name)
+            .ok()
+            .map(|entry| self.scope.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
+            .map_or(Collation::None, |meta| meta.collation)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        match self.scope.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(table, column) => {
+                self.scope.defs[table]?.columns().get(column)?.user_type
+            }
+            ResolvedColumn::Merged(_) => None,
+        }
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.scope.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(table, column) => Some((table as u32, column as u32)),
+            ResolvedColumn::Merged(merged) => Some((u32::MAX, merged as u32)),
+        }
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.scope.func_scalar_type(table).is_some()
     }
 }
 
@@ -137,16 +174,26 @@ fn for_each_materialized_projection<'a>(
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,
+            project_sets: None,
             sequences: hooks.sequences,
         };
         &owned_hooks
     };
-    let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
-    for expansion in 1..=expansions {
+    let project_set = prepare_project_set(
+        statement.items,
+        storage,
+        txid,
+        arena,
+        params,
+        row,
+        row_hooks,
+    )?;
+    for expansion in 1..=project_set.count {
         let srf_hooks;
-        let use_hooks: &EvalHooks = if has_srf {
+        let use_hooks: &EvalHooks = if project_set.any || has_srf {
             srf_hooks = EvalHooks {
                 srf_index: Some(expansion),
+                project_sets: Some(project_set.values),
                 ..*row_hooks
             };
             &srf_hooks
@@ -200,17 +247,26 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         let entry = self.0.find_column(qualifier, name).ok()?;
         Some(self.0.output_type(entry))
     }
-    fn column_domain(
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.0
+            .find_column(qualifier, name)
+            .ok()
+            .map(|entry| self.0.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+            .map_or(Collation::None, |meta| meta.collation)
+    }
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
-            super::scope::ResolvedColumn::Table(table, column) => self.0.defs[table]?
-                .columns()
-                .get(column)?
-                .user_type
-                .map(|identity| identity.name),
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.user_type
+            }
             super::scope::ResolvedColumn::Merged(_) => None,
         }
     }
@@ -219,6 +275,9 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
         }
+    }
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.func_scalar_type(table).is_some()
     }
 }
 
@@ -392,6 +451,8 @@ fn sort_dedup_collated(
 }
 
 fn prepare_materialization<'a>(
+    storage: &Storage,
+    txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     correlated: &'a [&'a Expr<'a>],
@@ -457,7 +518,7 @@ fn prepare_materialization<'a>(
         };
     }
 
-    let has_srf = find_srf(statement.items).is_some();
+    let has_srf = has_project_set(statement.items, storage, txid);
     let defer_allowed = n_order > 0
         && statement.limit.is_some()
         && !statement.distinct
@@ -566,7 +627,7 @@ pub(crate) fn materialized_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
-    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let visible_collations = projected_collations(statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
@@ -587,6 +648,12 @@ pub(crate) fn materialized_rows<'a>(
         has_srf,
     } = plan;
 
+    let routine_cursor = hooks
+        .catalog
+        .and_then(crate::sql::eval::CatalogAccess::routine_invocation_cursor);
+    let sequence_cursor = hooks
+        .sequences
+        .and_then(crate::sql::eval::SequenceAccess::statement_cursor);
     // Pass 1: count — and evaluate the projection and ORDER BY keys per row
     // (discarding the values). PostgreSQL scans, filters, and projects in a
     // single per-row pass below the Sort, so an early row's projection error
@@ -641,11 +708,11 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
-    if let Some(catalog) = hooks.catalog {
-        catalog.rewind_routine_invocation_cursor();
+    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
+        catalog.restore_routine_invocation_cursor(cursor);
     }
-    if let Some(sequences) = hooks.sequences {
-        sequences.rewind_statement_cursor();
+    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
+        sequences.restore_statement_cursor(cursor);
     }
     // Pass 2: project + keys, encode.
     {
@@ -1120,7 +1187,7 @@ pub(crate) fn external_materialized_into<'a>(
     offset: u64,
     emit: &mut ExternalRowEmitter<'_>,
 ) -> Result<u64, SqlError> {
-    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let mut sorter = storage.external_sorter()?;
     sorter.reset();

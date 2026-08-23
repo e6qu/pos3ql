@@ -13,7 +13,7 @@ use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, Materialize
 use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTypeName};
 
 use super::{
     Chained, MAX_JOIN_TABLES, arena_full, common_using_type, select_into_rows, synth_derived_def,
@@ -117,13 +117,16 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+    }
+
+    fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(table, column) => self.0.defs[table]?
-                .columns()
-                .get(column)?
-                .user_type
-                .map(|identity| identity.name),
+            ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.user_type
+            }
             ResolvedColumn::Merged(_) => None,
         }
     }
@@ -261,7 +264,7 @@ impl<'d> QueryScope<'d> {
         'a: 'd,
     {
         let exposed = tref.alias.unwrap_or(tref.table);
-        if self.names[..self.n].contains(&exposed) {
+        if !exposed.is_empty() && self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
@@ -340,7 +343,7 @@ impl<'d> QueryScope<'d> {
         if let Some(m) = tref.cte {
             return self.add_materialized(storage, tref, m, txid, arena, true);
         }
-        if tref.func_args.is_some() {
+        if tref.is_function_source() {
             return self.add_table_func(storage, tref, txid, arena, params, true, outer);
         }
         let Some(sub) = tref.subquery else {
@@ -505,7 +508,7 @@ impl<'d> QueryScope<'d> {
         if let Some(m) = tref.cte {
             return self.add_materialized(storage, tref, m, txid, arena, false);
         }
-        if tref.func_args.is_some() {
+        if tref.is_function_source() {
             return self.add_table_func(storage, tref, txid, arena, &[], false, None);
         }
         let Some(sub) = tref.subquery else {
@@ -632,7 +635,7 @@ impl<'d> QueryScope<'d> {
             table_func_def_outer(tref, storage, txid, arena, params, &columns)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
-        if self.names[..self.n].contains(&exposed) {
+        if !exposed.is_empty() && self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "table name \"{}\" specified more than once",
@@ -655,7 +658,9 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
-            table_func_rows_outer(tref, storage, txid, arena, params, &columns, None, None)?
+            table_func_rows_outer(
+                tref, storage, txid, arena, params, &columns, None, None, None,
+            )?
         } else {
             table_func_rows_outer(
                 tref,
@@ -664,6 +669,7 @@ impl<'d> QueryScope<'d> {
                 arena,
                 params,
                 &crate::sql::eval::NoColumns,
+                None,
                 None,
                 None,
             )?
@@ -965,6 +971,19 @@ impl<'d> QueryScope<'d> {
         expression: &Expr<'d>,
     ) -> Result<crate::sql::ast::Collation, SqlError> {
         crate::sql::eval::resolved_expression_collation(expression, &ScopeTypes(self))
+    }
+
+    pub(crate) fn described_expression_collation(
+        &self,
+        expression: &Expr<'d>,
+    ) -> Result<
+        (
+            crate::sql::ast::Collation,
+            crate::sql::types::CollationDerivation,
+        ),
+        SqlError,
+    > {
+        crate::sql::eval::described_expression_collation(expression, &ScopeTypes(self))
     }
 
     /// An expression reading a join-tree output column: a qualified column

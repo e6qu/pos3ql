@@ -544,6 +544,11 @@ SELECT regexp_split_to_table('the quick brown', '\s+');
 SELECT generate_subscripts(ARRAY[10,20,30], 1);
 SELECT sub FROM generate_subscripts(ARRAY['a','b'], 1) AS g(sub) ORDER BY sub;
 SELECT generate_subscripts(ARRAY[10,20], 2);
+SELECT generate_subscripts('[0:1][5:7]={{1,2,3},{4,5,6}}'::integer[], 1);
+SELECT generate_subscripts('[0:1][5:7]={{1,2,3},{4,5,6}}'::integer[], 2, true);
+SELECT sub FROM generate_subscripts(
+  '[0:1][5:7]={{1,2,3},{4,5,6}}'::integer[], 2, true
+) AS g(sub);
 SELECT * FROM unnest(ARRAY['x','y','z']) WITH ORDINALITY;
 SELECT elem, idx FROM unnest(ARRAY['x','y']) WITH ORDINALITY AS t(elem, idx) ORDER BY idx DESC;
 SELECT * FROM generate_series(5,7) WITH ORDINALITY;

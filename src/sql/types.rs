@@ -2138,6 +2138,14 @@ pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Re
 }
 
 /// Description of one result column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollationDerivation {
+    None,
+    Implicit,
+    Explicit,
+    Indeterminate,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ColDesc<'a> {
     pub name: &'a str,
@@ -2150,6 +2158,10 @@ pub struct ColDesc<'a> {
     /// The resolved collation identity of a collatable result.  It is internal
     /// planning metadata, not a RowDescription wire field.
     pub collation: crate::sql::ast::Collation,
+    /// How the result acquired its collation. An indeterminate collatable
+    /// result carries no identity but must remain distinct from a
+    /// non-collatable result until a consumer requires comparison semantics.
+    pub collation_derivation: CollationDerivation,
 }
 
 impl<'a> ColDesc<'a> {
@@ -2160,6 +2172,7 @@ impl<'a> ColDesc<'a> {
             typlen,
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
+            collation_derivation: CollationDerivation::None,
         }
     }
 
@@ -2169,6 +2182,11 @@ impl<'a> ColDesc<'a> {
                 crate::sql::ast::Collation::Default
             } else {
                 crate::sql::ast::Collation::None
+            },
+            collation_derivation: if t.is_collatable() {
+                CollationDerivation::Implicit
+            } else {
+                CollationDerivation::None
             },
             ..Self::new(name, t.oid(), t.typlen())
         }
@@ -2183,6 +2201,16 @@ impl<'a> ColDesc<'a> {
     /// The collation selected by the source expression or stored column.
     pub fn with_collation(mut self, collation: crate::sql::ast::Collation) -> Self {
         self.collation = collation;
+        self.collation_derivation = if collation == crate::sql::ast::Collation::None {
+            CollationDerivation::None
+        } else {
+            CollationDerivation::Implicit
+        };
+        self
+    }
+
+    pub fn with_collation_derivation(mut self, derivation: CollationDerivation) -> Self {
+        self.collation_derivation = derivation;
         self
     }
 }

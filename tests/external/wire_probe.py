@@ -302,6 +302,40 @@ def test_binary_cursor_preserves_type_modifier():
     s.close()
 
 
+def test_record_fields_preserve_type_modifiers():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    query = (
+        "WITH source AS (SELECT ROW('abc'::varchar(5), 'label'::text COLLATE \"C\") AS q) "
+        "SELECT (q).f1, (q).f2 FROM source"
+    )
+    parse = frontend_message(b"P", b"wire_record_meta_statement\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"wire_record_meta_portal\x00wire_record_meta_statement\x00"
+        + struct.pack("!hhhhh", 0, 0, 2, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_record_meta_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "record fields retain OIDs, typmods, and binary formats",
+        description is not None
+        and row_description_type_oids(description) == [1043, 25]
+        and row_description_type_modifiers(description) == [9, -1]
+        and row_description_formats(description) == [1, 1],
+        out,
+    )
+    s.close()
+
+
 def test_binary_cursor_preserves_catalog_identity():
     s = connect()
     s.sendall(startup_payload(0))
@@ -429,6 +463,134 @@ def test_binary_portal_paging_retains_result_shape_and_format():
             row == expected and [kind for kind, _ in out] == [b"D", terminal, b"Z"],
             out,
         )
+    s.close()
+
+
+def test_rows_from_binary_portal_retains_lockstep_shape_and_format():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    query = (
+        "SELECT * FROM ROWS FROM (generate_series(1,2), "
+        "unnest(ARRAY['x']::varchar(2)[])) WITH ORDINALITY "
+        "AS r(series,label,ordinality) ORDER BY ordinality"
+    )
+    parse = frontend_message(
+        b"P", b"rows_from_statement\x00" + query.encode() + b"\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B",
+        b"rows_from_portal\x00rows_from_statement\x00"
+        + struct.pack("!hhhhhh", 0, 0, 3, 1, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Prows_from_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    described = []
+    while True:
+        item = read_message(s)
+        described.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in described if kind == b"T"), None)
+    check(
+        "ROWS FROM portal Describe retains OIDs, typmod, and binary formats",
+        description is not None
+        and row_description_type_oids(description) == [23, 1043, 20]
+        and row_description_type_modifiers(description) == [-1, 6, -1]
+        and row_description_formats(description) == [1, 1, 1],
+        described,
+    )
+    expected_rows = [
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x01x"
+        b"\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x01",
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x02\xff\xff\xff\xff"
+        b"\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x02",
+    ]
+    for index, expected in enumerate(expected_rows):
+        execute = frontend_message(b"E", b"rows_from_portal\x00\x00\x00\x00\x01")
+        s.sendall(execute + frontend_message(b"S"))
+        output = []
+        while True:
+            item = read_message(s)
+            output.append(item)
+            if item[0] == b"Z":
+                break
+        row = next((payload for kind, payload in output if kind == b"D"), None)
+        terminal = b"C" if index == len(expected_rows) - 1 else b"s"
+        check(
+            f"ROWS FROM binary portal page {index + 1} preserves NULL padding",
+            row == expected and [kind for kind, _ in output] == [b"D", terminal, b"Z"],
+            output,
+        )
+    s.close()
+
+
+def test_catalog_srf_identity_and_domain_wire_boundary():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE DOMAIN wire_srf_count AS integer CHECK (VALUE > 0); "
+        "CREATE FUNCTION wire_srf_scalar(value wire_srf_count) RETURNS wire_srf_count "
+        "LANGUAGE SQL AS 'SELECT $1'; "
+        "CREATE FUNCTION wire_srf_record(value integer) "
+        "RETURNS TABLE(number integer, source text) LANGUAGE SQL AS 'SELECT 1, ''integer'''; "
+        "CREATE FUNCTION wire_srf_record(value wire_srf_count) "
+        "RETURNS TABLE(label text, accepted boolean) LANGUAGE SQL AS 'SELECT ''domain'', true'; "
+        "CREATE FUNCTION wire_srf_one(value wire_srf_count) "
+        "RETURNS TABLE(label text) LANGUAGE SQL AS 'SELECT ''domain'''; "
+        "CREATE TABLE wire_srf_input(value wire_srf_count); "
+        "INSERT INTO wire_srf_input VALUES (1)",
+    )
+    check("catalog SRF raw-wire setup", not any(kind == b"E" for kind, _ in setup), setup)
+
+    query = (
+        "SELECT wire_srf_scalar(input.value), (wire_srf_record(input.value)).* "
+        "FROM wire_srf_input AS input"
+    )
+    parse = frontend_message(
+        b"P", b"wire_srf_statement\x00" + query.encode() + b"\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_srf_portal\x00wire_srf_statement\x00"
+        + struct.pack("!hhhhhh", 0, 0, 3, 1, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_srf_portal\x00")
+    execute = frontend_message(b"E", b"wire_srf_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    expected = (
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01"
+        b"\x00\x00\x00\x06domain\x00\x00\x00\x01\x01"
+    )
+    check(
+        "catalog SRF Describe separates domain identity from wire representation",
+        description is not None
+        and row_description_type_oids(description) == [23, 25, 16]
+        and row_description_formats(description) == [1, 1, 1],
+        output,
+    )
+    check(
+        "catalog SRF binary Result uses the domain overload and record shape",
+        row == expected,
+        row,
+    )
+
+    scalar_star = simple_query(s, "SELECT (wire_srf_one(1::wire_srf_count)).*")
+    check(
+        "single-column RETURNS TABLE is not a record expression",
+        any(kind == b"E" for kind, _ in scalar_star) and has_sqlstate(scalar_star, "42809"),
+        scalar_star,
+    )
     s.close()
 
 
@@ -695,7 +857,7 @@ def test_generate_series_result_types_and_binary_format():
     s.sendall(startup_payload(0))
     drain_startup(s)
 
-    def run(text, expected_oid):
+    def run(text, expected_oid, expected_width=None):
         parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
         bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1))
         describe = frontend_message(b"D", b"P\x00")
@@ -714,13 +876,24 @@ def test_generate_series_result_types_and_binary_format():
             description is not None
             and row_description_type_oids(description) == [expected_oid]
             and row_description_formats(description) == [1]
-            and len(rows) == 3,
+            and len(rows) == 3
+            and (
+                expected_width is None
+                or all(
+                    len(row) == 6 + expected_width
+                    and struct.unpack("!i", row[2:6])[0] == expected_width
+                    for row in rows
+                )
+            ),
             out,
         )
 
+    run("SELECT generate_series(1, 3)", 23, 4)
+    run("SELECT generate_series(1, 3::bigint)", 20, 8)
     run(
         "SELECT generate_series('2000-01-01'::timestamp, '2000-01-03'::timestamp, '1 day'::interval)",
         1114,
+        8,
     )
     run("SELECT generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric)", 1700)
     s.close()
@@ -1459,7 +1632,8 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
         "CREATE TYPE wire_binary_coordinate AS (x integer, y integer); "
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
-        "CREATE TABLE wire_binary_regclass (id integer); "
+        "CREATE TABLE wire_binary_regclass (id integer, state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
+        "INSERT INTO wire_binary_regclass VALUES (1, 'ready', 7, ROW(4,8)::wire_binary_coordinate); "
         "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
         "AS 'SELECT value'; "
         "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL AS 'SELECT $1'; "
@@ -1491,6 +1665,38 @@ def test_catalog_aware_binary_bind_parameters():
     coordinate_array_oid = 240000 + coordinate_oid - 230000
     coordinate_domain_array_oid = 150000 + coordinate_domain_oid - 110000
     coordinate = binary_record([(23, struct.pack("!i", 4)), (23, struct.pack("!i", 8))])
+    typed_record = binary_record(
+        [
+            (enum_oid, b"ready"),
+            (domain_oid, struct.pack("!i", 7)),
+            (coordinate_oid, coordinate),
+        ]
+    )
+    for name, query in [
+        (
+            "cast fields",
+            "SELECT ROW('ready'::wire_binary_state, 7::wire_binary_positive, "
+            "ROW(4,8)::wire_binary_coordinate)",
+        ),
+        ("declared column fields", "SELECT ROW(state, positive, coordinate) FROM wire_binary_regclass"),
+        (
+            "routine result fields",
+            "SELECT ROW(wire_binary_state_echo('ready'::wire_binary_state), "
+            "wire_binary_positive_echo(7::wire_binary_positive), "
+            "wire_binary_coordinate_echo(ROW(4,8)::wire_binary_coordinate))",
+        ),
+    ]:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        check(
+            f"binary Result ROW preserves {name} identities",
+            description is not None
+            and row_description_type_oids(description) == [2249]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(typed_record)) + typed_record,
+            messages,
+        )
     regclass_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
     )
@@ -1888,7 +2094,7 @@ def test_catalog_aware_binary_bind_parameters():
         )
     routine_results = [
         ("enum", "SELECT wire_binary_state_echo('ready'::wire_binary_state)", enum_oid, b"ready"),
-        ("domain", "SELECT wire_binary_positive_echo(7::wire_binary_positive)", domain_oid, struct.pack("!i", 7)),
+        ("domain base", "SELECT wire_binary_positive_echo(7::wire_binary_positive)", 23, struct.pack("!i", 7)),
         ("composite", "SELECT wire_binary_coordinate_echo(ROW(4,8)::wire_binary_coordinate)", coordinate_oid, coordinate),
         (
             "enum array",
@@ -1914,7 +2120,7 @@ def test_catalog_aware_binary_bind_parameters():
         description = next((payload for kind, payload in messages if kind == b"T"), None)
         row = next((payload for kind, payload in messages if kind == b"D"), None)
         check(
-            f"binary Result preserves routine {name} identity",
+            f"binary Result describes routine {name}",
             description is not None
             and row_description_type_oids(description) == [oid]
             and row_description_formats(description) == [1]
@@ -2013,6 +2219,27 @@ def test_catalog_aware_binary_bind_parameters():
     check(
         "binary Bind resolves a set-returning SQL function parameter",
         [first_text_row([message]) for message in messages if message[0] == b"D"] == ["40", "41"],
+        messages,
+    )
+    messages = extended_binary_result(
+        s,
+        "SELECT wire_values_from(1), generate_series(10,12)",
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    rows = [payload for kind, payload in messages if kind == b"D"]
+    expected_rows = [
+        b"\x00\x02\x00\x00\x00\x04" + struct.pack("!i", value)
+        + b"\x00\x00\x00\x04" + struct.pack("!i", generated)
+        for value, generated in [(40, 10), (41, 11)]
+    ] + [
+        b"\x00\x02\xff\xff\xff\xff\x00\x00\x00\x04" + struct.pack("!i", 12)
+    ]
+    check(
+        "binary Result locksteps a catalog SRF without losing its integer type",
+        description is not None
+        and row_description_type_oids(description) == [23, 23]
+        and row_description_formats(description) == [1, 1]
+        and rows == expected_rows,
         messages,
     )
     s.close()

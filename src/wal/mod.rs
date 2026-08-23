@@ -17,7 +17,8 @@ use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
     ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics,
     OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy,
-    RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
+    RoleAttributes, SerializedStoredQueryDependency, SqlName, StoredDependencyIdentity,
+    StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -158,7 +159,8 @@ impl WalStoredQueryDependencies<'_> {
                     .entries()
                     .iter()
                     .map(|dependency| {
-                        1 + 8
+                        1 + 4
+                            + 8
                             + 1
                             + dependency.schema.as_str().len()
                             + 1
@@ -181,6 +183,7 @@ impl WalStoredQueryDependencies<'_> {
                 let mut ok = buffer.append(&[0xff, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
+                        && buffer.append(&dependency.identity.encoded().to_le_bytes())
                         && buffer.append(&dependency.referenced_columns.to_le_bytes())
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
@@ -1842,7 +1845,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
             for field in def.fields() {
-                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1;
+                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1 + 1;
                 if let Some(identity) = field.user_type {
                     n += 1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len();
                 }
@@ -2654,7 +2657,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&[u8::from(field.dropped)])
                     && buffer.append(&[u8::from(field.not_null)])
                     && buffer.append(&[field.ctype.code()])
-                    && buffer.append(&field.type_mod.to_le_bytes());
+                    && buffer.append(&field.type_mod.to_le_bytes())
+                    && buffer.append(&[field.collation.code()]);
                 match field.user_type {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
@@ -2989,6 +2993,19 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
             return false;
         }
         at += 1;
+        if payload.get(at..at + 4).is_none() {
+            return false;
+        }
+        let identity = i32::from_le_bytes(payload[at..at + 4].try_into().expect("length checked"));
+        if StoredDependencyIdentity::decode(
+            DependencyClass::from_code(class).expect("validated class"),
+            identity,
+        )
+        .is_none()
+        {
+            return false;
+        }
+        at += 4;
         if has_columns {
             if payload.get(at..at + 8).is_none() {
                 return false;
@@ -3016,6 +3033,11 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     for _ in 0..count {
         let class = DependencyClass::from_code(payload[at])?;
         at += 1;
+        let identity = StoredDependencyIdentity::decode(
+            class,
+            i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+        )?;
+        at += 4;
         let referenced_columns = if has_columns {
             let columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -3028,14 +3050,15 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
         let referenced_schema = stored_dependency_name(payload, &mut at)?;
         let referenced_name = stored_dependency_name(payload, &mut at)?;
         dependencies
-            .serialized_push_with_columns(
+            .serialized_push(SerializedStoredQueryDependency {
                 class,
-                SqlName::parse(schema).ok()?,
-                SqlName::parse(name).ok()?,
-                SqlName::parse(referenced_schema).ok()?,
-                SqlName::parse(referenced_name).ok()?,
+                identity,
+                schema: SqlName::parse(schema).ok()?,
+                name: SqlName::parse(name).ok()?,
+                referenced_schema: SqlName::parse(referenced_schema).ok()?,
+                referenced_name: SqlName::parse(referenced_name).ok()?,
                 referenced_columns,
-            )
+            })
             .ok()?;
     }
     Some(dependencies)
@@ -4389,6 +4412,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
+                let collation = crate::sql::ast::Collation::from_code(*payload.get(at)?)?;
+                at += 1;
                 let has_user_type = *payload.get(at)?;
                 at += 1;
                 let user_type = match has_user_type {
@@ -4404,6 +4429,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     name: SqlName::parse(field_name).ok()?,
                     ctype: crate::sql::types::ColType::from_code(code)?,
                     type_mod,
+                    collation,
                     user_type,
                     dropped,
                     not_null,
@@ -5509,14 +5535,28 @@ mod tests {
     fn stored_query_dependency_columns_round_trip_in_wal() {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies
-            .serialized_push_with_columns(
-                DependencyClass::Table,
-                SqlName::parse("public").unwrap(),
-                SqlName::parse("items").unwrap(),
-                SqlName::parse("").unwrap(),
-                SqlName::parse("items").unwrap(),
-                0b101,
-            )
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Table,
+                identity: StoredDependencyIdentity::Name,
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("items").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("items").unwrap(),
+                referenced_columns: 0b101,
+            })
+            .unwrap();
+        dependencies
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Routine,
+                identity: StoredDependencyIdentity::RoutineOid(
+                    crate::storage::ROUTINE_OID_BASE + 7,
+                ),
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("expanded").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("original_function").unwrap(),
+                referenced_columns: 0,
+            })
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
         let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 256).unwrap();
@@ -5950,6 +5990,7 @@ mod tests {
             name: crate::storage::SqlName::parse("retained").unwrap(),
             ctype: ColType::Composite(3),
             type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             user_type: Some(crate::storage::UserTypeName {
                 schema: crate::storage::SqlName::parse("public").unwrap(),
                 name: crate::storage::SqlName::parse("root").unwrap(),
@@ -5962,6 +6003,7 @@ mod tests {
             name: crate::storage::SqlName::parse("........pg.dropped.2........").unwrap(),
             ctype: ColType::Text,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
             user_type: None,
             dropped: true,
             not_null: false,
@@ -6000,6 +6042,10 @@ mod tests {
         );
         assert_eq!(definition.fields()[1].attribute_number, 2);
         assert!(definition.fields()[1].dropped);
+        assert_eq!(
+            definition.fields()[1].collation,
+            crate::sql::ast::Collation::Default
+        );
 
         payload.clear();
         let drop = WalOp::DropComposite {

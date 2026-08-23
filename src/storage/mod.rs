@@ -1884,6 +1884,7 @@ pub enum DependencyClass {
     Enum = 4,
     Sequence = 5,
     Composite = 6,
+    Routine = 7,
 }
 
 impl DependencyClass {
@@ -1895,6 +1896,35 @@ impl DependencyClass {
             4 => Some(Self::Enum),
             5 => Some(Self::Sequence),
             6 => Some(Self::Composite),
+            7 => Some(Self::Routine),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredDependencyIdentity {
+    Name,
+    RoutineOid(i32),
+}
+
+impl StoredDependencyIdentity {
+    pub(crate) const fn encoded(self) -> i32 {
+        match self {
+            Self::Name => 0,
+            Self::RoutineOid(oid) => oid,
+        }
+    }
+
+    pub(crate) fn decode(class: DependencyClass, encoded: i32) -> Option<Self> {
+        match (class, encoded) {
+            (DependencyClass::Routine, oid)
+                if (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid) =>
+            {
+                Some(Self::RoutineOid(oid))
+            }
+            (DependencyClass::Routine, _) => None,
+            (_, 0) => Some(Self::Name),
             _ => None,
         }
     }
@@ -1904,6 +1934,7 @@ impl DependencyClass {
 pub struct StoredQueryDependency {
     pub class: DependencyClass,
     pub slot: u16,
+    pub identity: StoredDependencyIdentity,
     /// One bit per referenced attribute (PostgreSQL attribute numbers start
     /// at one, so bit zero represents attnum 1). Relation-only dependencies
     /// retain zero; this avoids treating an unknown column set as every
@@ -1915,10 +1946,22 @@ pub struct StoredQueryDependency {
     pub referenced_name: SqlName,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SerializedStoredQueryDependency {
+    pub class: DependencyClass,
+    pub identity: StoredDependencyIdentity,
+    pub referenced_columns: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub referenced_schema: SqlName,
+    pub referenced_name: SqlName,
+}
+
 impl StoredQueryDependency {
     pub(crate) const EMPTY: Self = Self {
         class: DependencyClass::Table,
         slot: 0,
+        identity: StoredDependencyIdentity::Name,
         referenced_columns: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -1944,6 +1987,14 @@ impl StoredQueryDependencies {
     }
 
     pub fn push(&mut self, dependency: StoredQueryDependency) -> Result<(), SqlError> {
+        if StoredDependencyIdentity::decode(dependency.class, dependency.identity.encoded())
+            != Some(dependency.identity)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored-query dependency has an invalid catalog identity"
+            ));
+        }
         if self.entries().iter().any(|entry| {
             entry.class == dependency.class
                 && entry.slot == dependency.slot
@@ -1997,14 +2048,18 @@ impl StoredQueryDependencies {
         Ok(())
     }
 
-    pub fn serialized_push(
+    pub(crate) fn serialized_push(
         &mut self,
-        class: DependencyClass,
-        schema: SqlName,
-        name: SqlName,
-        referenced_schema: SqlName,
-        referenced_name: SqlName,
+        dependency: SerializedStoredQueryDependency,
     ) -> Result<(), SqlError> {
+        if StoredDependencyIdentity::decode(dependency.class, dependency.identity.encoded())
+            != Some(dependency.identity)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored-query dependency has an invalid catalog identity"
+            ));
+        }
         if self.len as usize == MAX_STORED_QUERY_DEPENDENCIES {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2013,29 +2068,16 @@ impl StoredQueryDependencies {
             ));
         }
         self.entries[self.len as usize] = StoredQueryDependency {
-            class,
+            class: dependency.class,
             slot: u16::MAX,
-            referenced_columns: 0,
-            schema,
-            name,
-            referenced_schema,
-            referenced_name,
+            identity: dependency.identity,
+            referenced_columns: dependency.referenced_columns,
+            schema: dependency.schema,
+            name: dependency.name,
+            referenced_schema: dependency.referenced_schema,
+            referenced_name: dependency.referenced_name,
         };
         self.len += 1;
-        Ok(())
-    }
-
-    pub fn serialized_push_with_columns(
-        &mut self,
-        class: DependencyClass,
-        schema: SqlName,
-        name: SqlName,
-        referenced_schema: SqlName,
-        referenced_name: SqlName,
-        referenced_columns: u64,
-    ) -> Result<(), SqlError> {
-        self.serialized_push(class, schema, name, referenced_schema, referenced_name)?;
-        self.entries[self.len as usize - 1].referenced_columns = referenced_columns;
         Ok(())
     }
 
@@ -2712,6 +2754,13 @@ impl RoutineDef {
             .then_some(&self.result_columns[..self.result_column_count])
     }
 
+    /// PostgreSQL exposes a single OUT column as the set element itself, not
+    /// as a record that can be expanded with field selection or `.*`.
+    pub(crate) fn record_result_columns(&self) -> Option<&[RoutineArgumentDef]> {
+        let columns = self.table_columns()?;
+        (columns.len() > 1).then_some(columns)
+    }
+
     pub(crate) fn schema_for(&self, txid: u32) -> SqlName {
         self.pending_identity
             .filter(|pending| pending.txid == txid)
@@ -3169,6 +3218,7 @@ pub struct CompositeFieldDef {
     pub name: SqlName,
     pub ctype: ColType,
     pub type_mod: i32,
+    pub collation: Collation,
     pub user_type: Option<UserTypeName>,
     pub dropped: bool,
     pub not_null: bool,
@@ -3180,6 +3230,7 @@ impl CompositeFieldDef {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: Collation::None,
         user_type: None,
         dropped: true,
         not_null: false,
@@ -4797,6 +4848,12 @@ impl Storage {
                 DependencyClass::Enum => self.enum_slot(schema, name, txid),
                 DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
                 DependencyClass::Composite => self.composite_slot(schema, name, txid),
+                DependencyClass::Routine => match dependency.identity {
+                    StoredDependencyIdentity::RoutineOid(oid) => {
+                        self.routine_slot_by_oid(oid, txid)
+                    }
+                    StoredDependencyIdentity::Name => None,
+                },
             }
             .ok_or_else(|| {
                 sql_err!(
@@ -4809,6 +4866,7 @@ impl Storage {
             rebound.push(StoredQueryDependency {
                 class: dependency.class,
                 slot: slot as u16,
+                identity: dependency.identity,
                 referenced_columns: dependency.referenced_columns,
                 schema: dependency.schema,
                 name: dependency.name,
@@ -15143,6 +15201,79 @@ impl Storage {
             .map(|slot| self.routine_for(slot, txid))
     }
 
+    pub(crate) fn function_for_call_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
+            .or_else(|| {
+                self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
+            })
+            .map(|slot| self.routine_for(slot, txid))
+    }
+
+    pub(crate) fn routine_slot_for_function_call_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<usize> {
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
+            .or_else(|| {
+                self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
+            })
+    }
+
+    pub(crate) fn has_set_routine_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind| kind.is_set_returning())
+    }
+
+    pub(crate) fn has_function_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind| {
+            matches!(
+                kind,
+                RoutineKind::Function { .. }
+                    | RoutineKind::SetFunction { .. }
+                    | RoutineKind::TableFunction
+            )
+        })
+    }
+
+    fn has_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+        accepts: impl Fn(RoutineKind) -> bool,
+    ) -> bool {
+        let matches = |schema: &str, routine_name: &str| {
+            self.routines.iter().any(|routine| {
+                let definition = routine.definition_for(txid);
+                routine.visible_to(txid)
+                    && accepts(definition.kind)
+                    && definition.argument_count == arity
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == routine_name
+            })
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return matches(schema, routine_name);
+        }
+        self.path.entries().iter().any(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return false;
+            };
+            matches(self.schemas[*slot as usize].name.as_str(), name)
+        })
+    }
+
     /// Resolves a set-returning call from declared argument identities.  This
     /// is distinct from the datum representation because a domain's runtime
     /// representation is its base type.
@@ -15289,11 +15420,35 @@ impl Storage {
         user_type: Option<UserTypeName>,
         txid: u32,
     ) -> Option<i32> {
-        use crate::sql::types::oid;
+        use crate::sql::types::{ArrElem, oid};
+
+        match ctype {
+            ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
+            ColType::Composite(slot) => return Some(oid::composite_oid(slot)),
+            ColType::Array(ArrElem::Enum(slot)) => return Some(oid::enum_array_oid(slot)),
+            ColType::Array(ArrElem::Composite(slot)) => {
+                return Some(oid::composite_array_oid(slot));
+            }
+            ColType::Array(ArrElem::Domain { slot, .. }) => {
+                return Some(oid::domain_array_oid(slot));
+            }
+            _ => {}
+        }
         let Some(identity) = user_type else {
             return Some(ctype.oid());
         };
         let array = matches!(ctype, ColType::Array(_));
+        self.user_type_identity_oid(identity, array, txid)
+    }
+
+    pub(crate) fn user_type_identity_oid(
+        &self,
+        identity: UserTypeName,
+        array: bool,
+        txid: u32,
+    ) -> Option<i32> {
+        use crate::sql::types::oid;
+
         if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             return Some(if array {
@@ -15449,13 +15604,21 @@ impl Storage {
     }
 
     pub(crate) fn commit_routine_identity(&mut self, slot: usize, txid: u32) {
-        let routine = &mut self.routines[slot];
-        if let Some(pending) = routine.pending_identity
-            && pending.txid == txid
-        {
-            routine.schema = pending.schema;
-            routine.name = pending.name;
-            routine.pending_identity = None;
+        let changed = {
+            let routine = &mut self.routines[slot];
+            if let Some(pending) = routine.pending_identity
+                && pending.txid == txid
+            {
+                routine.schema = pending.schema;
+                routine.name = pending.name;
+                routine.pending_identity = None;
+                Some((pending.schema, pending.name))
+            } else {
+                None
+            }
+        };
+        if let Some((schema, name)) = changed {
+            self.rename_stored_query_dependency(DependencyClass::Routine, slot, schema, name);
         }
     }
 

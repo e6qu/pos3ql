@@ -12,7 +12,7 @@ use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQu
 use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
-use crate::sql::types::{ColDesc, ColType, Datum};
+use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum};
 use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
@@ -22,6 +22,7 @@ use super::{
 };
 
 const MAX_SET_LEAVES: usize = 32;
+const MAX_SET_NODES: usize = MAX_SET_LEAVES * 2 - 1;
 
 struct DrySequence<'a>(&'a dyn SequenceAccess);
 
@@ -325,6 +326,12 @@ fn resolve_set_order(
                 ));
             }
         };
+        if columns[index].collation_derivation == CollationDerivation::Indeterminate {
+            return Err(sql_err!(
+                sqlstate::INDETERMINATE_COLLATION,
+                "could not determine which collation to use for string comparison"
+            ));
+        }
         keys[count] = (index, order.descending, order.nulls_first);
         count += 1;
     }
@@ -931,6 +938,13 @@ fn leaf_col_unknown<'a>(
         match item {
             SelectItem::Expr { expression, .. } => {
                 if idx == c {
+                    // A cast is a typed boundary even when catalog-free
+                    // inference cannot name its user-defined target. Treating
+                    // such a cast as UNKNOWN makes identical composite
+                    // branches collapse to text.
+                    if matches!(expression, Expr::Cast { .. }) {
+                        return false;
+                    }
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
                         Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
@@ -965,6 +979,130 @@ fn describe_leaf<'a>(
             describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct SetColumnCollation {
+    value: Collation,
+    derivation: CollationDerivation,
+}
+
+impl SetColumnCollation {
+    const NONE: Self = Self {
+        value: Collation::None,
+        derivation: CollationDerivation::None,
+    };
+}
+
+fn merge_set_collations(
+    left: SetColumnCollation,
+    right: SetColumnCollation,
+    allow_indeterminate: bool,
+) -> Result<SetColumnCollation, SqlError> {
+    use CollationDerivation::{Explicit, Implicit, Indeterminate, None};
+
+    let merged = match (left.derivation, right.derivation) {
+        (None, _) => right,
+        (_, None) => left,
+        (Explicit, Explicit) if left.value != right.value => {
+            return Err(sql_err!(
+                sqlstate::COLLATION_MISMATCH,
+                "collation mismatch between \"{}\" and \"{}\"",
+                left.value.name(),
+                right.value.name()
+            ));
+        }
+        (Explicit, _) => left,
+        (_, Explicit) => right,
+        (Indeterminate, Indeterminate) => SetColumnCollation {
+            value: Collation::None,
+            derivation: Indeterminate,
+        },
+        (Indeterminate, _) => right,
+        (_, Indeterminate) => left,
+        (Implicit, Implicit)
+            if left.value != Collation::Default
+                && right.value != Collation::Default
+                && left.value != right.value =>
+        {
+            SetColumnCollation {
+                value: Collation::None,
+                derivation: Indeterminate,
+            }
+        }
+        (Implicit, Implicit) if left.value == Collation::Default => right,
+        (Implicit, Implicit) => left,
+    };
+    if merged.derivation == Indeterminate && !allow_indeterminate {
+        return Err(sql_err!(
+            sqlstate::COLLATION_MISMATCH,
+            "collation mismatch between implicit collations \"{}\" and \"{}\"",
+            left.value.name(),
+            right.value.name()
+        ));
+    }
+    Ok(merged)
+}
+
+fn describe_set_collations(
+    tree: &SetTree<'_>,
+    column_count: usize,
+    leaves: &[[SetColumnCollation; MAX_PROJ]; MAX_SET_LEAVES],
+    next_leaf: &mut usize,
+    workspace: &mut [[SetColumnCollation; MAX_PROJ]; MAX_SET_NODES],
+    next_node: &mut usize,
+) -> Result<usize, SqlError> {
+    let output = *next_node;
+    *next_node += 1;
+    if output == workspace.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many set-operation branches"
+        ));
+    }
+    match tree {
+        SetTree::Select(_) => {
+            workspace[output][..column_count].copy_from_slice(&leaves[*next_leaf][..column_count]);
+            *next_leaf += 1;
+        }
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => {
+            let left = describe_set_collations(
+                left,
+                column_count,
+                leaves,
+                next_leaf,
+                workspace,
+                next_node,
+            )?;
+            let right = describe_set_collations(
+                right,
+                column_count,
+                leaves,
+                next_leaf,
+                workspace,
+                next_node,
+            )?;
+            let allow_indeterminate = *operator == SetOp::Union && *all;
+            let left = workspace[left];
+            let right = workspace[right];
+            for ((result, left), right) in workspace[output][..column_count]
+                .iter_mut()
+                .zip(left)
+                .zip(right)
+            {
+                *result = merge_set_collations(left, right, allow_indeterminate)?;
+                if result.derivation == CollationDerivation::Explicit {
+                    result.derivation = CollationDerivation::Implicit;
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 /// A set operation keeps the first leaf's output identity. Record output is
@@ -1003,12 +1141,27 @@ fn register_first_leaf_record_shapes(
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < count && columns[slot].type_oid == crate::sql::types::oid::RECORD {
-                    let resolver: &dyn crate::sql::exec::ColTypeResolver = match scope {
-                        Some(scope) => &super::ScopeCols(scope),
-                        None => &crate::sql::exec::NoCols,
+                    let handle = match scope {
+                        Some(scope) => crate::sql::exec::register_shape_for(
+                            expression,
+                            &super::CatalogScopeCols {
+                                scope,
+                                outer_scope: None,
+                                storage,
+                                txid,
+                            },
+                        ),
+                        None => crate::sql::exec::register_shape_for(
+                            expression,
+                            &crate::sql::exec::CatalogCols {
+                                definition: None,
+                                alias: None,
+                                storage,
+                                txid,
+                            },
+                        ),
                     };
-                    if let Some(handle) = crate::sql::exec::register_shape_for(expression, resolver)
-                    {
+                    if let Some(handle) = handle {
                         columns[slot].type_mod = handle;
                     }
                 }
@@ -1123,11 +1276,19 @@ pub(crate) fn describe_set_body<'a>(
     let leaf0 = leaves[0].expect(">=1 leaf");
     let n_cols = describe_leaf(storage, leaf0, txid, columns, arena)?;
     register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
+    let mut leaf_collations = [[SetColumnCollation::NONE; MAX_PROJ]; MAX_SET_LEAVES];
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
-        target[c] = if leaf_col_unknown(storage, leaf0, c, txid, arena) {
+        let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
+        if !unknown {
+            leaf_collations[0][c] = SetColumnCollation {
+                value: col.collation,
+                derivation: col.collation_derivation,
+            };
+        }
+        target[c] = if unknown {
             None
         } else {
             Some(
@@ -1144,7 +1305,7 @@ pub(crate) fn describe_set_body<'a>(
             )
         };
     }
-    for leaf in leaves[1..n_leaves].iter() {
+    for (leaf_index, leaf) in leaves[1..n_leaves].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
         let ln = describe_leaf(storage, leaf.expect("leaf"), txid, &mut lc, arena)?;
         if ln != n_cols {
@@ -1158,6 +1319,10 @@ pub(crate) fn describe_set_body<'a>(
             if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
                 continue; // an untyped NULL column adopts the running type
             }
+            leaf_collations[leaf_index + 1][c] = SetColumnCollation {
+                value: lc[c].collation,
+                derivation: lc[c].collation_derivation,
+            };
             let lt = exec::catalog_column_type(storage, txid, lc[c].type_oid)
                 .map(|(ctype, _)| ctype)
                 .ok_or_else(|| {
@@ -1182,8 +1347,6 @@ pub(crate) fn describe_set_body<'a>(
                     }
                 },
             }
-            columns[c].collation =
-                crate::sql::eval::unify_implicit_collations(columns[c].collation, lc[c].collation)?;
         }
     }
     // A column that stayed unknown across every branch (all NULL) is text.
@@ -1191,6 +1354,24 @@ pub(crate) fn describe_set_body<'a>(
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
+    }
+    let mut collation_workspace = [[SetColumnCollation::NONE; MAX_PROJ]; MAX_SET_NODES];
+    let mut next_collation_leaf = 0;
+    let mut next_collation_node = 0;
+    let collation_root = describe_set_collations(
+        tree,
+        n_cols,
+        &leaf_collations,
+        &mut next_collation_leaf,
+        &mut collation_workspace,
+        &mut next_collation_node,
+    )?;
+    for (column, collation) in columns[..n_cols]
+        .iter_mut()
+        .zip(&collation_workspace[collation_root])
+    {
+        column.collation = collation.value;
+        column.collation_derivation = collation.derivation;
     }
     Ok(n_cols)
 }
@@ -1539,6 +1720,12 @@ pub(crate) fn sort_set_rows(
                 ));
             }
         };
+        if columns[index].collation_derivation == CollationDerivation::Indeterminate {
+            return Err(sql_err!(
+                sqlstate::INDETERMINATE_COLLATION,
+                "could not determine which collation to use for string comparison"
+            ));
+        }
         keys[nk] = (index, ob.descending, ob.nulls_first);
         nk += 1;
     }

@@ -34,6 +34,8 @@ const PG_CATALOG_NS_OID: i32 = 11;
 const PG_CLASS_OID: i32 = 1259;
 const PG_NAMESPACE_OID: i32 = 2615;
 const PG_TYPE_OID: i32 = 1247;
+const PG_PROC_OID: i32 = 1255;
+const PG_COLLATION_OID: i32 = 3456;
 
 #[derive(Clone, Copy)]
 struct IntrinsicRoutine {
@@ -337,27 +339,37 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
     },
 ];
 
+const CATALOG_RELATIONS: &[(&str, i32)] = &[
+    ("pg_type", PG_TYPE_OID),
+    ("pg_proc", PG_PROC_OID),
+    ("pg_class", PG_CLASS_OID),
+    ("pg_attribute", 1249),
+    ("pg_amop", 2602),
+    ("pg_amproc", 2603),
+    ("pg_cast", 2605),
+    ("pg_constraint", 2606),
+    ("pg_collation", PG_COLLATION_OID),
+    ("pg_depend", 2608),
+    ("pg_rewrite", 2618),
+    ("pg_namespace", PG_NAMESPACE_OID),
+    ("pg_opfamily", 2753),
+    ("pg_extension", 3079),
+    ("pg_default_acl", 826),
+    ("pg_replication_slots", 121),
+    ("pg_subscription", 6107),
+    ("pg_transform", 3576),
+];
+
 fn catalog_relation_oid(name: &str) -> Option<i32> {
-    Some(match name {
-        "pg_type" => PG_TYPE_OID,
-        "pg_proc" => 1255,
-        "pg_class" => PG_CLASS_OID,
-        "pg_attribute" => 1249,
-        "pg_amop" => 2602,
-        "pg_amproc" => 2603,
-        "pg_cast" => 2605,
-        "pg_constraint" => 2606,
-        "pg_depend" => 2608,
-        "pg_rewrite" => 2618,
-        "pg_namespace" => PG_NAMESPACE_OID,
-        "pg_opfamily" => 2753,
-        "pg_extension" => 3079,
-        "pg_default_acl" => 826,
-        "pg_replication_slots" => 121,
-        "pg_subscription" => 6107,
-        "pg_transform" => 3576,
-        _ => return None,
-    })
+    CATALOG_RELATIONS
+        .iter()
+        .find_map(|(candidate, oid)| (*candidate == name).then_some(*oid))
+}
+
+fn catalog_relation_name(oid: i32) -> Option<&'static str> {
+    CATALOG_RELATIONS
+        .iter()
+        .find_map(|(name, candidate)| (*candidate == oid).then_some(*name))
 }
 
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
@@ -1865,25 +1877,8 @@ pub fn relname_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    for name in [
-        "pg_type",
-        "pg_proc",
-        "pg_class",
-        "pg_attribute",
-        "pg_amop",
-        "pg_amproc",
-        "pg_cast",
-        "pg_constraint",
-        "pg_depend",
-        "pg_rewrite",
-        "pg_namespace",
-        "pg_opfamily",
-        "pg_extension",
-        "pg_transform",
-    ] {
-        if catalog_relation_oid(name) == Some(oid) {
-            return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
-        }
+    if let Some(name) = catalog_relation_name(oid) {
+        return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
     }
     for slot in 0..storage.table_count() {
         if !storage.table(slot).visible_to(txid) {
@@ -1990,26 +1985,7 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 }
 
 fn catalog_relation_oid_by_oid(oid: i32) -> bool {
-    [
-        "pg_type",
-        "pg_proc",
-        "pg_class",
-        "pg_attribute",
-        "pg_amop",
-        "pg_amproc",
-        "pg_cast",
-        "pg_constraint",
-        "pg_depend",
-        "pg_rewrite",
-        "pg_namespace",
-        "pg_opfamily",
-        "pg_extension",
-        "pg_default_acl",
-        "pg_replication_slots",
-        "pg_transform",
-    ]
-    .into_iter()
-    .any(|name| catalog_relation_oid(name) == Some(oid))
+    catalog_relation_name(oid).is_some()
 }
 
 pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
@@ -2577,7 +2553,29 @@ pub fn function_result_text<'a>(
             .map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::TableFunction => {
-            write!(output, "record").map_err(|_| super::eval::arena_full())?;
+            write!(output, "TABLE(").map_err(|_| super::eval::arena_full())?;
+            for (index, column) in routine
+                .table_columns()
+                .expect("table routine columns")
+                .iter()
+                .enumerate()
+            {
+                if index != 0 {
+                    write!(output, ", ").map_err(|_| super::eval::arena_full())?;
+                }
+                write!(output, "{} ", column.name.as_str())
+                    .map_err(|_| super::eval::arena_full())?;
+                write_routine_type_name(
+                    &mut output,
+                    column.ctype,
+                    column.user_type,
+                    column
+                        .user_type
+                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                )
+                .map_err(|_| super::eval::arena_full())?;
+            }
+            write!(output, ")").map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::Trigger => {
             write!(output, "trigger").map_err(|_| super::eval::arena_full())?;
@@ -3355,6 +3353,11 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     for (index, (name, column_type)) in specification.columns.iter().enumerate() {
         definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
         definition.columns[index].ctype = *column_type;
+        definition.columns[index].collation = if column_type.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        };
     }
     definition
 }
@@ -4794,6 +4797,13 @@ fn pg_depend<'a>(
             PG_TYPE_OID,
             crate::sql::types::oid::composite_oid(dependency.slot),
         )),
+        crate::storage::DependencyClass::Routine => Some((
+            PG_PROC_OID,
+            match dependency.identity {
+                crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
+                crate::storage::StoredDependencyIdentity::Name => return None,
+            },
+        )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
         push(
@@ -5162,7 +5172,7 @@ fn pg_attribute<'a>(
                 name: field.name,
                 ctype: field.ctype,
                 type_mod: field.type_mod,
-                collation: crate::sql::ast::Collation::None,
+                collation: field.collation,
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -5195,7 +5205,11 @@ fn pg_attribute<'a>(
                         Datum::Int4(field.type_mod)
                     },
                     Datum::Bool(false),
-                    Datum::Int4(0),
+                    if field.dropped {
+                        Datum::Int4(0)
+                    } else {
+                        Datum::Int4(field.collation.oid())
+                    },
                     text("", arena)?,
                     text("", arena)?,
                     text(
@@ -5668,11 +5682,11 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_collation",
         &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("collname", ColType::Text),
-            ("collnamespace", ColType::Int4),
-            ("collowner", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("collname", ColType::Name),
+            ("collnamespace", ColType::Oid),
+            ("collowner", ColType::Oid),
             ("collcollate", ColType::Text),
             ("collctype", ColType::Text),
             ("colliculocale", ColType::Text),
@@ -5685,7 +5699,7 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
-                Datum::Int4(collation.oid()),
+                Datum::Int4(PG_COLLATION_OID),
                 Datum::Int4(collation.oid()),
                 text(collation.name(), arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),

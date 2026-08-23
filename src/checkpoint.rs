@@ -14,7 +14,8 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
     ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, PartitionBound, PartitionBoundValue,
-    PartitionDef, PartitionStrategy, RowHome, SqlName, Storage, TableDef,
+    PartitionDef, PartitionStrategy, RowHome, SerializedStoredQueryDependency, SqlName, Storage,
+    TableDef,
 };
 use crate::store::{
     BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
@@ -2390,6 +2391,12 @@ impl Checkpointer {
                         };
                         let code: u8 = parse_field(words.next(), "cmp field type missing")?;
                         let type_mod: i32 = parse_field(words.next(), "cmp field typmod missing")?;
+                        let collation_code: u8 =
+                            parse_field(words.next(), "cmp field collation missing")?;
+                        let collation = crate::sql::ast::Collation::from_code(collation_code)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "bad composite field collation",
+                            ))?;
                         let user_schema = hexstr(words.next(), "cmp field user schema missing")?;
                         let user_name = hexstr(words.next(), "cmp field user name missing")?;
                         let user_type = match (user_schema.is_empty(), user_name.is_empty()) {
@@ -2410,6 +2417,7 @@ impl Checkpointer {
                             ctype: crate::sql::types::ColType::from_code(code)
                                 .ok_or(CheckpointSetupError::Corrupt("bad composite field type"))?,
                             type_mod,
+                            collation,
                             user_type,
                             dropped,
                             not_null,
@@ -3312,12 +3320,13 @@ impl Checkpointer {
                 hex(&mut line, field.name.as_str());
                 let _ = write!(
                     line,
-                    " {} {} {} {} {} ",
+                    " {} {} {} {} {} {} ",
                     field.attribute_number,
                     u8::from(field.dropped),
                     u8::from(field.not_null),
                     field.ctype.code(),
                     field.type_mod,
+                    field.collation.code(),
                 );
                 hex(
                     &mut line,
@@ -5923,6 +5932,7 @@ impl core::fmt::Display for ManifestDependencies<'_> {
         write!(output, "{}", self.0.entries().len())?;
         for dependency in self.0.entries() {
             write!(output, " {} ", dependency.class as u8)?;
+            write!(output, "{} ", dependency.identity.encoded())?;
             for byte in dependency.schema.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
@@ -5961,6 +5971,13 @@ fn parse_stored_query_dependencies(
         let class = crate::storage::DependencyClass::from_code(code).ok_or(
             CheckpointSetupError::Corrupt("unknown stored-query dependency class"),
         )?;
+        let identity = crate::storage::StoredDependencyIdentity::decode(
+            class,
+            parse_field(words.next(), "stored-query dependency identity")?,
+        )
+        .ok_or(CheckpointSetupError::Corrupt(
+            "invalid stored-query dependency identity",
+        ))?;
         let schema = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
             "stored-query dependency schema missing",
         ))?)?;
@@ -5985,14 +6002,15 @@ fn parse_stored_query_dependencies(
             0
         };
         dependencies
-            .serialized_push_with_columns(
+            .serialized_push(SerializedStoredQueryDependency {
                 class,
-                sql_name(&schema)?,
-                sql_name(&name)?,
-                sql_name(&referenced_schema)?,
-                sql_name(&referenced_name)?,
+                identity,
+                schema: sql_name(&schema)?,
+                name: sql_name(&name)?,
+                referenced_schema: sql_name(&referenced_schema)?,
+                referenced_name: sql_name(&referenced_name)?,
                 referenced_columns,
-            )
+            })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
     Ok(dependencies)
@@ -6214,20 +6232,34 @@ mod stored_dependency_tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
-    use crate::storage::{DependencyClass, StoredQueryDependencies};
+    use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
 
     #[test]
     fn manifest_round_trip_preserves_reference_names() {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies
-            .serialized_push_with_columns(
-                DependencyClass::Table,
-                SqlName::parse("moved").unwrap(),
-                SqlName::parse("current_name").unwrap(),
-                SqlName::parse("").unwrap(),
-                SqlName::parse("original_name").unwrap(),
-                0b101,
-            )
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Table,
+                identity: StoredDependencyIdentity::Name,
+                schema: SqlName::parse("moved").unwrap(),
+                name: SqlName::parse("current_name").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("original_name").unwrap(),
+                referenced_columns: 0b101,
+            })
+            .unwrap();
+        dependencies
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Routine,
+                identity: StoredDependencyIdentity::RoutineOid(
+                    crate::storage::ROUTINE_OID_BASE + 7,
+                ),
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("expanded").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("original_function").unwrap(),
+                referenced_columns: 0,
+            })
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(&dependencies));
         let mut words = encoded.split(' ');

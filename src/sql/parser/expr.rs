@@ -391,11 +391,10 @@ impl<'a> Parser<'a> {
                             negated: true,
                         })?
                     } else {
-                        let array = self.arena_expr(Expr::ArraySubquery(boxed))?;
-                        self.arena_expr(Expr::AnyAll {
+                        self.arena_expr(Expr::QuantifiedSubquery {
                             operand: left,
                             operator,
-                            array,
+                            select: boxed,
                             all,
                         })?
                     };
@@ -812,6 +811,10 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    if self.peeked == Tok::Op("(") {
+                        let routine = self.composed_qualifier(name, column)?;
+                        return self.call(routine);
+                    }
                     // A third part makes it `schema.table.column` — as does a
                     // transparently stripped `pg_catalog.`/`information_schema.`
                     // prefix, which must still validate as the schema part.
@@ -838,6 +841,14 @@ impl<'a> Parser<'a> {
                             schema,
                             table: name,
                             name: column,
+                        });
+                    }
+                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                        self.max_param = self.max_param.max(index);
+                        return self.arena_expr(Expr::RoutineParam {
+                            qualifier: Some(name),
+                            name: column,
+                            index,
                         });
                     }
                     return self.arena_expr(Expr::Column {
@@ -883,6 +894,14 @@ impl<'a> Parser<'a> {
                         filter: None,
                     });
                 }
+                if let Some(parameter) = self.routine_parameter(name) {
+                    self.max_param = self.max_param.max(parameter);
+                    return self.arena_expr(Expr::RoutineParam {
+                        qualifier: None,
+                        name,
+                        index: parameter,
+                    });
+                }
                 // Only now, every construct this arm knows having had its
                 // chance: a still-unconsumed reserved word cannot begin an
                 // expression. It cannot come earlier — `ARRAY` is reserved and
@@ -910,6 +929,10 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    if self.peeked == Tok::Op("(") {
+                        let routine = self.composed_qualifier(name, column)?;
+                        return self.call(routine);
+                    }
                     if self.peeked == Tok::Op(".") {
                         self.advance()?;
                         if self.peeked == Tok::Op("*") {
@@ -925,9 +948,25 @@ impl<'a> Parser<'a> {
                             name: third,
                         });
                     }
+                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                        self.max_param = self.max_param.max(index);
+                        return self.arena_expr(Expr::RoutineParam {
+                            qualifier: Some(name),
+                            name: column,
+                            index,
+                        });
+                    }
                     return self.arena_expr(Expr::Column {
                         qualifier: Some(name),
                         name: column,
+                    });
+                }
+                if let Some(parameter) = self.routine_parameter(name) {
+                    self.max_param = self.max_param.max(parameter);
+                    return self.arena_expr(Expr::RoutineParam {
+                        qualifier: None,
+                        name,
+                        index: parameter,
                     });
                 }
                 self.arena_expr(Expr::Column {

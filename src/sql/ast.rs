@@ -84,6 +84,27 @@ impl Collation {
             Self::None | Self::Default | Self::UcsBasic => "",
         }
     }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::C => 1,
+            Self::Posix => 2,
+            Self::UcsBasic => 3,
+            Self::None => 4,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Default),
+            1 => Some(Self::C),
+            2 => Some(Self::Posix),
+            3 => Some(Self::UcsBasic),
+            4 => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
@@ -627,6 +648,7 @@ pub struct CompositeField<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
     pub type_mod: i32,
+    pub collation: Collation,
 }
 
 /// A parsed ALTER INDEX operation. Keeping the supported operation typed
@@ -1253,6 +1275,11 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
+    /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
+    /// reference. The outer source owns the shared alias and ordinality, so a
+    /// parsed table source is either one function or one non-empty function
+    /// group, never both.
+    pub rows_from: Option<&'a [TableRef<'a>]>,
     /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
     /// derived table or a table function. A table function has a single output
     /// column, so it accepts exactly one name.
@@ -1270,6 +1297,12 @@ pub struct TableRef<'a> {
     /// Set only by stored-view expansion; ordinary parsed references use the
     /// current effective role.
     pub authorization_role: Option<u16>,
+}
+
+impl TableRef<'_> {
+    pub const fn is_function_source(&self) -> bool {
+        self.func_args.is_some() || self.rows_from.is_some()
+    }
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged
@@ -1646,6 +1679,7 @@ pub enum AlterTypeAction<'a> {
         name: &'a str,
         type_name: &'a str,
         type_mod: i32,
+        collation: Collation,
     },
     /// ALTER ATTRIBUTE name SET NOT NULL.
     SetAttributeNotNull(&'a str),
@@ -2034,6 +2068,7 @@ pub enum AlterAction<'a> {
         column: &'a str,
         type_name: &'a str,
         type_mod: i32,
+        collation: Option<Collation>,
         using: Option<&'a Expr<'a>>,
     },
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows
@@ -2091,6 +2126,13 @@ pub enum Expr<'a> {
         /// Optional table/alias qualifier.
         qualifier: Option<&'a str>,
         name: &'a str,
+    },
+    /// A named SQL-routine argument. Column lookup has precedence; `index`
+    /// supplies the positional value only when this spelling binds no column.
+    RoutineParam {
+        qualifier: Option<&'a str>,
+        name: &'a str,
+        index: u32,
     },
     Param(u32),
     Unary {
@@ -2185,6 +2227,14 @@ pub enum Expr<'a> {
         select: &'a Select<'a>,
         negated: bool,
     },
+    /// `operand operator ANY/ALL (SELECT ...)` for operators other than the
+    /// `IN`/`NOT IN` spellings represented above.
+    QuantifiedSubquery {
+        operand: &'a Expr<'a>,
+        operator: BinaryOp,
+        select: &'a Select<'a>,
+        all: bool,
+    },
     /// `EXISTS (SELECT ...)`: true when the subquery yields at least one row.
     /// `NOT EXISTS` parses as `NOT` wrapping this.
     Exists(&'a Select<'a>),
@@ -2212,9 +2262,7 @@ pub enum Expr<'a> {
         base: &'a Expr<'a>,
         field: &'a str,
     },
-    /// `t.*` in an expression position (a whole-row reference). Supported
-    /// only as a `count()` argument; anywhere else it is rejected at type
-    /// analysis (record values are not first-class here).
+    /// `t.*` in an expression position: the table's typed composite row.
     WholeRow(&'a str),
     /// A three-part column reference `schema.table.column`: the qualifier
     /// pair must match an unaliased FROM entry that really is that schema's
@@ -2268,23 +2316,7 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("set_config")
         }
         fn is_set_returning(name: &str) -> bool {
-            name.eq_ignore_ascii_case("unnest")
-                || name.eq_ignore_ascii_case("generate_series")
-                || name.eq_ignore_ascii_case("_pg_expandarray")
-                || name.eq_ignore_ascii_case("regexp_matches")
-                || name.eq_ignore_ascii_case("jsonb_object_keys")
-                || name.eq_ignore_ascii_case("json_object_keys")
-                || name.eq_ignore_ascii_case("jsonb_array_elements")
-                || name.eq_ignore_ascii_case("json_array_elements")
-                || name.eq_ignore_ascii_case("jsonb_array_elements_text")
-                || name.eq_ignore_ascii_case("json_array_elements_text")
-                || name.eq_ignore_ascii_case("json_each")
-                || name.eq_ignore_ascii_case("jsonb_each")
-                || name.eq_ignore_ascii_case("json_each_text")
-                || name.eq_ignore_ascii_case("jsonb_each_text")
-                || name.eq_ignore_ascii_case("regexp_split_to_table")
-                || name.eq_ignore_ascii_case("string_to_table")
-                || name.eq_ignore_ascii_case("generate_subscripts")
+            super::query::is_builtin_set_routine(name)
         }
         match self {
             Expr::Null
@@ -2296,9 +2328,11 @@ impl Expr<'_> {
             | Expr::BitLit(_) => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::Param(_)
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
@@ -2380,6 +2414,7 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
@@ -2433,6 +2468,7 @@ impl Expr<'_> {
             // non-foldable to be safe.
             Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
         }
@@ -2444,6 +2480,7 @@ impl Expr<'_> {
         match self {
             Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
             Expr::Null
@@ -2454,6 +2491,7 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
@@ -2565,12 +2603,14 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => None,
             Expr::Unary { operand, .. }
@@ -2635,7 +2675,7 @@ impl Expr<'_> {
     /// validating a generation expression's dependencies.
     pub fn for_each_column(&self, f: &mut dyn FnMut(&str)) {
         match self {
-            Expr::Column { name, .. } => f(name),
+            Expr::Column { name, .. } | Expr::RoutineParam { name, .. } => f(name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -2649,6 +2689,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
@@ -2724,7 +2765,10 @@ impl Expr<'_> {
     /// Subqueries own their bindings and are visited by their enclosing query.
     pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
         match self {
-            Expr::Column { qualifier, name } => f(*qualifier, name),
+            Expr::Column { qualifier, name }
+            | Expr::RoutineParam {
+                qualifier, name, ..
+            } => f(*qualifier, name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -2738,6 +2782,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }

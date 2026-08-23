@@ -1,7 +1,30 @@
 -- Durable named composite types: catalog identity, nested values, query
 -- propagation, and transactional DDL all match PostgreSQL's SQL boundary.
 CREATE TYPE composite_coordinate AS (x integer, y integer);
-CREATE TYPE composite_place AS (name text, coordinate composite_coordinate);
+CREATE TYPE composite_place AS (
+  name varchar(6) COLLATE "C",
+  coordinate composite_coordinate
+);
+CREATE TYPE composite_metadata AS (value varchar(3) COLLATE "C");
+CREATE DOMAIN composite_field_count AS integer CHECK (VALUE > 0);
+CREATE TYPE composite_domain_fields AS (value composite_field_count, label text);
+CREATE FUNCTION composite_domain_scalar(value composite_field_count)
+RETURNS composite_field_count
+LANGUAGE SQL
+AS $$ SELECT value $$;
+CREATE TABLE composite_field_inputs(value composite_field_count);
+INSERT INTO composite_field_inputs VALUES (1);
+SELECT composite_domain_scalar(1::composite_field_count);
+SELECT composite_domain_scalar(input.value)
+  FROM composite_field_inputs AS input;
+SELECT (ROW(1::composite_field_count, 'domain')::composite_domain_fields).value;
+SELECT (ROW(1::composite_field_count, 'domain')::composite_domain_fields).*;
+ALTER TYPE composite_metadata ADD ATTRIBUTE label text COLLATE "POSIX";
+ALTER TYPE composite_metadata ALTER ATTRIBUTE value TYPE varchar(5) COLLATE "POSIX";
+SELECT attname, atttypmod, attcollation
+  FROM pg_attribute
+ WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_metadata')
+ ORDER BY attnum;
 
 CREATE TABLE composite_places (id integer, place composite_place, places composite_place[]);
 INSERT INTO composite_places VALUES
@@ -15,7 +38,8 @@ SELECT typname, typtype, typcategory, typelem <> 0
  WHERE typname IN ('composite_coordinate', '_composite_coordinate',
                    'composite_place', '_composite_place')
  ORDER BY typname;
-SELECT attname, atttypid = (SELECT oid FROM pg_type WHERE typname = 'composite_coordinate')
+SELECT attname, atttypid = (SELECT oid FROM pg_type WHERE typname = 'composite_coordinate'),
+       atttypmod, attcollation
   FROM pg_attribute
  WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'composite_place')
  ORDER BY attnum;
@@ -24,6 +48,15 @@ SELECT (place).name, ((place).coordinate).x, pg_typeof(place), pg_typeof(places[
  ORDER BY id;
 WITH copied AS (SELECT place FROM composite_places)
 SELECT (place).name FROM copied ORDER BY 1;
+SELECT (q).f1, (q).f2
+  FROM (SELECT ROW((place).name, ((place).coordinate).x) AS q
+          FROM composite_places) AS shaped
+ ORDER BY 1;
+WITH shaped AS (
+  SELECT ROW((place).name, ((place).coordinate).x) AS q
+    FROM composite_places
+)
+SELECT (q).* FROM shaped ORDER BY 1;
 SELECT place, count(*) FROM composite_places GROUP BY place ORDER BY place;
 SELECT (place).name, row_number() OVER (ORDER BY id) FROM composite_places ORDER BY id;
 SELECT place FROM composite_places WHERE id = 1
@@ -157,3 +190,33 @@ DROP DOMAIN composite_domain_coordinate_child;
 DROP DOMAIN composite_domain_coordinate_value;
 DROP TYPE composite_domain_schema.composite_domain_point;
 DROP SCHEMA composite_domain_schema;
+
+-- UNION ALL may carry an indeterminate result collation until an operation
+-- needs comparison semantics; an explicit collation resolves the conflict.
+CREATE TABLE composite_c_collation (value text COLLATE "C");
+CREATE TABLE composite_posix_collation (value text COLLATE "POSIX");
+INSERT INTO composite_c_collation VALUES ('c');
+INSERT INTO composite_posix_collation VALUES ('p');
+SELECT value FROM composite_c_collation
+UNION ALL
+SELECT value FROM composite_posix_collation;
+WITH combined AS (
+  SELECT value FROM composite_c_collation
+  UNION ALL
+  SELECT value FROM composite_posix_collation
+)
+SELECT combined.value = composite_c_collation.value
+  FROM combined CROSS JOIN composite_c_collation;
+SELECT value FROM composite_c_collation
+UNION ALL
+SELECT value FROM composite_posix_collation
+ORDER BY 1;
+SELECT value COLLATE "C" FROM composite_c_collation
+UNION
+SELECT value FROM composite_posix_collation
+ORDER BY 1;
+
+DROP FUNCTION composite_domain_scalar(composite_field_count);
+DROP TABLE composite_field_inputs;
+DROP TYPE composite_domain_fields;
+DROP DOMAIN composite_field_count;

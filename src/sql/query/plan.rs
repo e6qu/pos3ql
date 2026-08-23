@@ -1003,6 +1003,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | Str(_)
         | BitLit(_)
         | Param(_)
+        | RoutineParam { .. }
         | DefaultMarker
         | Column { .. }
         | WholeRow(_)
@@ -1154,6 +1155,10 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             postpone_cost(operand, scope, arena) + postpone_cost(array, scope, arena) + elements
         }
         // Subqueries carry a subplan's cost in PostgreSQL and are postponed.
-        Subquery(_) | Exists(_) | ArraySubquery(_) | InSubquery { .. } => 1000,
+        Subquery(_)
+        | Exists(_)
+        | ArraySubquery(_)
+        | InSubquery { .. }
+        | QuantifiedSubquery { .. } => 1000,
     }
 }

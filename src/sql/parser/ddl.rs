@@ -790,6 +790,7 @@ impl<'a> Parser<'a> {
             name: "",
             type_name: "",
             type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
         }; MAX_LIST];
         let mut n = 0;
         if self.peeked != Tok::Op(")") {
@@ -799,10 +800,16 @@ impl<'a> Parser<'a> {
                 }
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation = if self.eat_ident("collate")? {
+                    self.collation_name()?
+                } else {
+                    crate::sql::ast::Collation::Default
+                };
                 fields[n] = crate::sql::ast::CompositeField {
                     name: field_name,
                     type_name,
                     type_mod,
+                    collation,
                 };
                 n += 1;
                 if !self.eat_op(",")? {
@@ -827,10 +834,16 @@ impl<'a> Parser<'a> {
             if self.eat_ident("attribute")? {
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation = if self.eat_ident("collate")? {
+                    self.collation_name()?
+                } else {
+                    crate::sql::ast::Collation::Default
+                };
                 AlterTypeAction::AddAttribute(crate::sql::ast::CompositeField {
                     name: field_name,
                     type_name,
                     type_mod,
+                    collation,
                 })
             } else {
                 self.expect_ident("value")?;
@@ -895,10 +908,16 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("data")? {
                     self.expect_ident("type")?;
                     let (type_name, type_mod) = self.type_name_mod()?;
+                    let collation = if self.eat_ident("collate")? {
+                        self.collation_name()?
+                    } else {
+                        crate::sql::ast::Collation::Default
+                    };
                     AlterTypeAction::AlterAttributeType {
                         name: field,
                         type_name,
                         type_mod,
+                        collation,
                     }
                 } else {
                     self.expect_ident("not")?;
@@ -907,10 +926,16 @@ impl<'a> Parser<'a> {
                 }
             } else if self.eat_ident("type")? {
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation = if self.eat_ident("collate")? {
+                    self.collation_name()?
+                } else {
+                    crate::sql::ast::Collation::Default
+                };
                 AlterTypeAction::AlterAttributeType {
                     name: field,
                     type_name,
                     type_mod,
+                    collation,
                 }
             } else if self.eat_ident("drop")? {
                 self.expect_ident("not")?;

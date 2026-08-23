@@ -13324,8 +13324,12 @@ fn table_routines_accept_and_return_catalog_types() {
         "CREATE TYPE routine_table_state AS ENUM ('ready', 'done'); \
          CREATE FUNCTION routine_table_rows(value routine_table_state) RETURNS TABLE (state routine_table_state) LANGUAGE SQL AS 'SELECT $1'; \
          CREATE DOMAIN routine_table_count AS integer CHECK (VALUE > 0); \
-         CREATE FUNCTION routine_table_overload(value integer) RETURNS TABLE (label text) LANGUAGE SQL AS 'SELECT ''integer'''; \
-         CREATE FUNCTION routine_table_overload(value routine_table_count) RETURNS TABLE (label text) LANGUAGE SQL AS 'SELECT ''domain'''",
+         CREATE FUNCTION routine_table_overload(value integer) RETURNS TABLE (number integer) LANGUAGE SQL AS 'SELECT 1'; \
+         CREATE FUNCTION routine_table_overload(value routine_table_count) RETURNS TABLE (label text) LANGUAGE SQL AS 'SELECT ''domain'''; \
+         CREATE FUNCTION routine_table_record_overload(value integer) RETURNS TABLE (number integer, source text) LANGUAGE SQL AS 'SELECT 1, ''integer'''; \
+         CREATE FUNCTION routine_table_record_overload(value routine_table_count) RETURNS TABLE (label text, accepted boolean) LANGUAGE SQL AS 'SELECT ''domain'', true'; \
+         CREATE TABLE routine_table_inputs(value routine_table_count); \
+         INSERT INTO routine_table_inputs VALUES (1)",
     );
     assert!(
         !String::from_utf8_lossy(&setup).contains("ERROR"),
@@ -13336,13 +13340,54 @@ fn table_routines_accept_and_return_catalog_types() {
         &mut engine,
         &mut budget,
         "SELECT state::text FROM routine_table_rows('done'::routine_table_state); \
-         SELECT label FROM routine_table_overload(1::routine_table_count)",
+         SELECT label FROM routine_table_overload(1::routine_table_count); \
+         SELECT (routine_table_record_overload(input.value)).* \
+           FROM routine_table_inputs AS input; \
+         SELECT label, label < 'z' \
+           FROM routine_table_inputs AS input \
+           CROSS JOIN LATERAL routine_table_overload(input.value)",
     );
     assert_eq!(
         data_rows(&rows),
-        ["done", "domain"],
+        ["done", "domain", "domain|t", "domain|t"],
         "{}",
         String::from_utf8_lossy(&rows)
+    );
+    let scalar_star = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (routine_table_overload(1::routine_table_count)).*",
+    );
+    assert!(
+        String::from_utf8_lossy(&scalar_star).contains("42809"),
+        "{}",
+        String::from_utf8_lossy(&scalar_star)
+    );
+    let correlated_scalar_star = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (routine_table_overload(input.value)).* \
+           FROM routine_table_inputs AS input",
+    );
+    assert!(
+        String::from_utf8_lossy(&correlated_scalar_star).contains("42809"),
+        "{}",
+        String::from_utf8_lossy(&correlated_scalar_star)
+    );
+    let stored = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW routine_table_record_view AS \
+           SELECT (routine_table_record_overload(input.value)).* \
+             FROM routine_table_inputs AS input; \
+         DROP FUNCTION routine_table_record_overload(integer); \
+         SELECT * FROM routine_table_record_view",
+    );
+    assert_eq!(
+        data_rows(&stored),
+        ["domain|t"],
+        "{}",
+        String::from_utf8_lossy(&stored)
     );
 }
 

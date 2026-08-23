@@ -2754,6 +2754,13 @@ impl RoutineDef {
             .then_some(&self.result_columns[..self.result_column_count])
     }
 
+    /// PostgreSQL exposes a single OUT column as the set element itself, not
+    /// as a record that can be expanded with field selection or `.*`.
+    pub(crate) fn record_result_columns(&self) -> Option<&[RoutineArgumentDef]> {
+        let columns = self.table_columns()?;
+        (columns.len() > 1).then_some(columns)
+    }
+
     pub(crate) fn schema_for(&self, txid: u32) -> SqlName {
         self.pending_identity
             .filter(|pending| pending.txid == txid)

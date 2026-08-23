@@ -188,7 +188,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
-pub(crate) use describe::{AliasedDefCols, CatalogCols};
+pub(crate) use describe::CatalogCols;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -199,7 +199,8 @@ pub use describe::{
     visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
 pub(crate) use describe::{
-    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, unify_numeric_tower,
+    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
+    routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 

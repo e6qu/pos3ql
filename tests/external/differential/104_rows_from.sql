@@ -52,6 +52,43 @@ RETURNS SETOF integer
 LANGUAGE SQL
 AS $$ SELECT start_value UNION ALL SELECT start_value + 1 $$;
 
+CREATE DOMAIN rows_from_count AS integer CHECK (VALUE > 0);
+CREATE FUNCTION rows_from_overload(value integer)
+RETURNS TABLE(number integer)
+LANGUAGE SQL
+AS $$ SELECT 1 $$;
+CREATE FUNCTION rows_from_overload(value rows_from_count)
+RETURNS TABLE(label text)
+LANGUAGE SQL
+AS $$ SELECT 'domain' $$;
+CREATE FUNCTION rows_from_record_overload(value integer)
+RETURNS TABLE(number integer, source text)
+LANGUAGE SQL
+AS $$ SELECT 1, 'integer' $$;
+CREATE FUNCTION rows_from_record_overload(value rows_from_count)
+RETURNS TABLE(label text, accepted boolean)
+LANGUAGE SQL
+AS $$ SELECT 'domain', true $$;
+CREATE FUNCTION rows_from_domain_record()
+RETURNS TABLE(value rows_from_count, label text)
+LANGUAGE SQL
+AS $$ SELECT 1::rows_from_count, 'domain' $$;
+CREATE TABLE rows_from_typed_input(value rows_from_count);
+INSERT INTO rows_from_typed_input VALUES (1);
+SELECT (rows_from_domain_record()).*;
+SELECT (rows_from_overload(input.value)).*
+  FROM rows_from_typed_input AS input;
+SELECT (rows_from_record_overload(input.value)).*
+  FROM rows_from_typed_input AS input;
+CREATE VIEW rows_from_record_view AS
+SELECT (rows_from_record_overload(input.value)).*
+  FROM rows_from_typed_input AS input;
+DROP FUNCTION rows_from_record_overload(integer);
+SELECT * FROM rows_from_record_view;
+SELECT label
+  FROM rows_from_typed_input AS input
+ CROSS JOIN LATERAL rows_from_overload(input.value) AS result;
+
 SELECT rows_from_values(4), generate_series(10,12);
 SELECT rows_from_pair(4), generate_series(10,12);
 SELECT (rows_from_pair(4)).*;
@@ -230,6 +267,13 @@ DROP FUNCTION rows_from_schema.rows_from_values_moved(integer);
 DROP SCHEMA rows_from_schema;
 DROP FUNCTION rows_from_insert(integer);
 DROP FUNCTION rows_from_empty();
+DROP VIEW rows_from_record_view;
+DROP TABLE rows_from_typed_input;
+DROP FUNCTION rows_from_overload(integer);
+DROP FUNCTION rows_from_overload(rows_from_count);
+DROP FUNCTION rows_from_record_overload(rows_from_count);
+DROP FUNCTION rows_from_domain_record();
+DROP DOMAIN rows_from_count;
 DROP TABLE rows_from_effects;
 DROP TABLE rows_from_target;
 DROP TABLE rows_from_input;

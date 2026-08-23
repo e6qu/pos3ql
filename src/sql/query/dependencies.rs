@@ -245,15 +245,42 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         }
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        let scope = self.scope?;
+        ColTypeResolver::column_meta(
+            &super::CatalogScopeCols {
+                scope,
+                outer_scope: None,
+                storage: self.storage,
+                txid: self.txid,
+            },
+            qualifier,
+            name,
+        )
+    }
+
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<StaticTypeMeta> {
         let routine = self
             .storage
             .function_for_call_oids(name, arguments, self.txid)?;
-        Some((
-            self.storage
+        let ctype = routine.kind.function_result()?;
+        Some(StaticTypeMeta {
+            type_oid: self
+                .storage
                 .routine_function_result_oid(&routine, self.txid)?,
-            routine.kind.function_result()?.typlen(),
-        ))
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        })
     }
 
     fn routine_record_field(
@@ -266,7 +293,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
         let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.table_columns()?.get(index)?;
+        let column = routine.record_result_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
             StaticTypeMeta {
@@ -413,13 +440,11 @@ fn collect_routine_dependencies_with_resolver(
             let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut known = true;
             for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
-                match crate::sql::exec::infer_type_res(argument, resolver) {
-                    Ok((crate::sql::types::oid::UNKNOWN, _))
-                        if matches!(argument, Expr::Str(_)) =>
-                    {
+                match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
+                    Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
                         *slot = ColType::Text.oid();
                     }
-                    Ok((oid, _)) => *slot = oid,
+                    Ok(oid) => *slot = oid,
                     Err(_) => {
                         *needs_scope = true;
                         known = false;

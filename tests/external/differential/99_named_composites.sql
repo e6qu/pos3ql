@@ -6,6 +6,19 @@ CREATE TYPE composite_place AS (
   coordinate composite_coordinate
 );
 CREATE TYPE composite_metadata AS (value varchar(3) COLLATE "C");
+CREATE DOMAIN composite_field_count AS integer CHECK (VALUE > 0);
+CREATE TYPE composite_domain_fields AS (value composite_field_count, label text);
+CREATE FUNCTION composite_domain_scalar(value composite_field_count)
+RETURNS composite_field_count
+LANGUAGE SQL
+AS $$ SELECT value $$;
+CREATE TABLE composite_field_inputs(value composite_field_count);
+INSERT INTO composite_field_inputs VALUES (1);
+SELECT composite_domain_scalar(1::composite_field_count);
+SELECT composite_domain_scalar(input.value)
+  FROM composite_field_inputs AS input;
+SELECT (ROW(1::composite_field_count, 'domain')::composite_domain_fields).value;
+SELECT (ROW(1::composite_field_count, 'domain')::composite_domain_fields).*;
 ALTER TYPE composite_metadata ADD ATTRIBUTE label text COLLATE "POSIX";
 ALTER TYPE composite_metadata ALTER ATTRIBUTE value TYPE varchar(5) COLLATE "POSIX";
 SELECT attname, atttypmod, attcollation
@@ -202,3 +215,8 @@ SELECT value COLLATE "C" FROM composite_c_collation
 UNION
 SELECT value FROM composite_posix_collation
 ORDER BY 1;
+
+DROP FUNCTION composite_domain_scalar(composite_field_count);
+DROP TABLE composite_field_inputs;
+DROP TYPE composite_domain_fields;
+DROP DOMAIN composite_field_count;

@@ -1485,15 +1485,11 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     };
     let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in args.iter().enumerate() {
-        let statically_known = match argument {
-            // Do not erase a domain, enum, or composite to its storage type
-            // before overload resolution.
-            Expr::Cast { type_name, .. } => {
-                crate::sql::catalog::user_type_oid(storage, txid, type_name)
-                    .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
-            }
-            _ => crate::sql::eval::static_type_pub(argument, columns).map(ColType::oid),
-        };
+        let statically_known =
+            match crate::sql::eval::expression_type_identity(argument, columns, &hooks)? {
+                crate::sql::eval::ExpressionTypeIdentity::Known(oid) => Some(oid),
+                crate::sql::eval::ExpressionTypeIdentity::Unresolved => None,
+            };
         argument_type_oids[slot] = match statically_known {
             Some(oid) => oid,
             None => {

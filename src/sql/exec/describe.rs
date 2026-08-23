@@ -124,6 +124,13 @@ pub fn describe_items<'q>(
                     }
                     _ => None,
                 };
+                if let Some(meta) = field_meta {
+                    type_oid = meta.ctype.oid();
+                    typlen = meta.ctype.typlen();
+                } else if let Some(meta) = routine_result_metadata(expression, resolver) {
+                    type_oid = meta.ctype.oid();
+                    typlen = meta.ctype.typlen();
+                }
                 let type_mod = field_meta.map_or_else(
                     || {
                         output_type_mod(expression, |column| {
@@ -205,14 +212,28 @@ impl ColTypeResolver for CatalogCols<'_> {
         static_meta_for_column(self.storage, column, self.txid)
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<StaticTypeMeta> {
         let routine = self
             .storage
             .function_for_call_oids(name, arguments, self.txid)?;
-        let oid = self
-            .storage
-            .routine_function_result_oid(&routine, self.txid)?;
-        Some((oid, routine.kind.function_result()?.typlen()))
+        let ctype = routine.kind.function_result()?;
+        Some(StaticTypeMeta {
+            type_oid: self
+                .storage
+                .routine_function_result_oid(&routine, self.txid)?,
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        })
     }
 
     fn routine_record_field(
@@ -225,7 +246,7 @@ impl ColTypeResolver for CatalogCols<'_> {
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
         let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.table_columns()?.get(index)?;
+        let column = routine.record_result_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
             StaticTypeMeta {
@@ -300,12 +321,26 @@ fn describe_record_star<'q>(
 ) -> Result<(), SqlError> {
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
-            let resolver: &dyn ColTypeResolver = match def {
-                Some(definition) => &AliasedDefCols {
-                    definition,
-                    alias: table_alias,
-                },
-                None => &NoCols,
+            let catalog_resolver;
+            let aliased_resolver;
+            let resolver: &dyn ColTypeResolver = match (def, storage) {
+                (definition, Some(storage)) => {
+                    catalog_resolver = CatalogCols {
+                        definition,
+                        alias: table_alias,
+                        storage,
+                        txid,
+                    };
+                    &catalog_resolver
+                }
+                (Some(definition), None) => {
+                    aliased_resolver = AliasedDefCols {
+                        definition,
+                        alias: table_alias,
+                    };
+                    &aliased_resolver
+                }
+                (None, None) => &NoCols,
             };
             check_row_field_types(base, resolver)?;
             for (i, arg) in args.iter().take(RECORD_FIELD_NAMES.len()).enumerate() {
@@ -323,12 +358,12 @@ fn describe_record_star<'q>(
             Ok(())
         }
         Expr::Call { name, args, .. } if storage.is_some() => {
-            let resolver: &dyn ColTypeResolver = match def {
-                Some(definition) => &AliasedDefCols {
-                    definition,
-                    alias: table_alias,
-                },
-                None => &NoCols,
+            let storage = storage.expect("matched");
+            let resolver = CatalogCols {
+                definition: def,
+                alias: table_alias,
+                storage,
+                txid,
             };
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if args.len() > argument_oids.len() {
@@ -338,9 +373,8 @@ fn describe_record_star<'q>(
                 ));
             }
             for (index, argument) in args.iter().enumerate() {
-                argument_oids[index] = infer_type_res(argument, resolver)?.0;
+                argument_oids[index] = infer_routine_argument_oid(argument, &resolver)?;
             }
-            let storage = storage.expect("matched");
             let Some(slot) =
                 storage.routine_slot_for_table_call_oids(name, &argument_oids[..args.len()], txid)
             else {
@@ -350,26 +384,18 @@ fn describe_record_star<'q>(
                 ));
             };
             let routine = storage.routine(slot);
-            let Some(columns) = routine.table_columns() else {
+            let Some(columns) = routine.record_result_columns() else {
                 return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "row expansion is not supported on this expression"
                 ));
             };
             for column in columns {
-                let type_oid = storage
-                    .routine_type_oid(column.ctype, column.user_type, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine result type is absent from the catalog"
-                        )
-                    })?;
-                push(ColDesc::new(
-                    column.name.as_str(),
-                    type_oid,
-                    column.ctype.typlen(),
-                ))?;
+                let mut description = ColDesc::of_type(column.name.as_str(), column.ctype);
+                if column.ctype.is_collatable() {
+                    description = description.with_collation(crate::sql::ast::Collation::Default);
+                }
+                push(description)?;
             }
             Ok(())
         }
@@ -419,21 +445,9 @@ fn describe_record_star<'q>(
                     .active_fields_for(txid)
                 {
                     push(
-                        ColDesc::new(
-                            field.name.as_str(),
-                            storage
-                                .expect("checked")
-                                .routine_type_oid(field.ctype, field.user_type, txid)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::INTERNAL_ERROR,
-                                        "composite field type is absent from the catalog"
-                                    )
-                                })?,
-                            field.ctype.typlen(),
-                        )
-                        .with_type_mod(field.type_mod)
-                        .with_collation(field.collation),
+                        ColDesc::of_type(field.name.as_str(), field.ctype)
+                            .with_type_mod(field.type_mod)
+                            .with_collation(field.collation),
                     )?;
                 }
                 return Ok(());
@@ -457,7 +471,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(error) = push(
-                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                            ColDesc::of_type(name, meta.ctype)
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {
@@ -504,7 +518,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(e) = push(
-                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                            ColDesc::of_type(name, meta.ctype)
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {
@@ -723,11 +737,15 @@ pub trait ColTypeResolver {
         self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
     }
 
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        ColType::from_sql_name(type_name).map(ColType::oid)
+    }
+
     /// SQL-routine result type resolved from already-inferred argument type
     /// identities. OIDs retain a domain identity that its runtime value does
     /// not carry.
     /// Plain column resolvers have no catalog and therefore expose none.
-    fn routine_result(&self, _name: &str, _arguments: &[i32]) -> Option<(i32, i16)> {
+    fn routine_result(&self, _name: &str, _arguments: &[i32]) -> Option<StaticTypeMeta> {
         None
     }
 
@@ -1410,7 +1428,7 @@ pub fn record_shape(
                 return None;
             }
             for (index, argument) in args.iter().enumerate() {
-                argument_oids[index] = infer_type_res(argument, columns).ok()?.0;
+                argument_oids[index] = infer_routine_argument_oid(argument, columns).ok()?;
             }
             let mut count = 0usize;
             while let Some((field_name, meta)) =
@@ -1575,7 +1593,7 @@ pub fn record_field_metadata(
                 None
             } else {
                 for (index, argument) in args.iter().enumerate() {
-                    argument_oids[index] = infer_type_res(argument, columns)?.0;
+                    argument_oids[index] = infer_routine_argument_oid(argument, columns)?;
                 }
                 let mut index = 0usize;
                 let mut found = None;
@@ -2012,35 +2030,69 @@ pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32,
 /// PostgreSQL's plan-time analysis: comparisons and arithmetic over
 /// incompatible types raise 42883 here, before any row is scanned. String
 /// literals and parameters are UNKNOWN and coerce to the other operand.
-pub fn infer_type_res(
+pub(crate) fn infer_routine_argument_oid(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
-) -> Result<(i32, i16), SqlError> {
-    let of = |t: ColType| (t.oid(), t.typlen());
-    if let Expr::Call {
+) -> Result<i32, SqlError> {
+    match expression {
+        Expr::Collate { operand, .. } => infer_routine_argument_oid(operand, columns),
+        Expr::Column { qualifier, name }
+        | Expr::RoutineParam {
+            qualifier, name, ..
+        } => match columns.column_meta(*qualifier, name) {
+            Some(meta) => Ok(meta.type_oid),
+            None => Ok(infer_type_res(expression, columns)?.0),
+        },
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
+            let mut composed = crate::util::StackStr::<130>::new();
+            let _ = core::fmt::Write::write_fmt(&mut composed, format_args!("{schema}.{table}"));
+            match columns.column_meta(Some(composed.as_str()), name) {
+                Some(meta) => Ok(meta.type_oid),
+                None => Ok(infer_type_res(expression, columns)?.0),
+            }
+        }
+        Expr::Cast { type_name, .. } => match columns.named_type_oid(type_name) {
+            Some(type_oid) => Ok(type_oid),
+            None => Ok(infer_type_res(expression, columns)?.0),
+        },
+        _ => Ok(infer_type_res(expression, columns)?.0),
+    }
+}
+
+pub(crate) fn routine_result_metadata(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Option<StaticTypeMeta> {
+    let Expr::Call {
         name,
         args,
         star: false,
         ..
     } = expression
-    {
-        let mut argument_type_oids = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-        if args.len() <= argument_type_oids.len() {
-            let mut known = true;
-            for (index, argument) in args.iter().enumerate() {
-                let Ok((type_oid, _)) = infer_type_res(argument, columns) else {
-                    known = false;
-                    break;
-                };
-                argument_type_oids[index] = type_oid;
-            }
-            if known
-                && let Some(result) =
-                    columns.routine_result(name, &argument_type_oids[..args.len()])
-            {
-                return Ok(result);
-            }
-        }
+    else {
+        return None;
+    };
+    let mut argument_type_oids = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    if args.len() > argument_type_oids.len() {
+        return None;
+    }
+    for (index, argument) in args.iter().enumerate() {
+        argument_type_oids[index] = infer_routine_argument_oid(argument, columns).ok()?;
+    }
+    columns.routine_result(name, &argument_type_oids[..args.len()])
+}
+
+pub fn infer_type_res(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
+    let of = |t: ColType| (t.oid(), t.typlen());
+    if let Some(result) = routine_result_metadata(expression, columns) {
+        return Ok((result.type_oid, result.ctype.typlen()));
     }
     Ok(match expression {
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),

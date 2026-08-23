@@ -988,7 +988,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn routine_result_oid(&self, name: &str, argument_type_oids: &[i32]) -> Option<i32> {
         let routine = self
             .storage
-            .routine_for_call_oids(name, argument_type_oids, self.txid)?;
+            .function_for_call_oids(name, argument_type_oids, self.txid)?;
         self.storage
             .routine_function_result_oid(&routine, self.txid)
     }
@@ -5193,7 +5193,7 @@ pub fn describe_scope_items<'q>(
                     txid,
                 };
                 let user_type = user_type_expression_description(expression, name, storage, txid);
-                let (oid, typlen) = match user_type {
+                let (mut oid, mut typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
                     None => {
                         let (oid, typlen) = super::exec::infer_type_res(expression, &resolver)?;
@@ -5213,6 +5213,15 @@ pub fn describe_scope_items<'q>(
                     }
                     _ => None,
                 };
+                if let Some(meta) = field_meta {
+                    oid = meta.ctype.oid();
+                    typlen = meta.ctype.typlen();
+                } else if let Some(meta) =
+                    super::exec::routine_result_metadata(expression, &resolver)
+                {
+                    oid = meta.ctype.oid();
+                    typlen = meta.ctype.typlen();
+                }
                 let type_mod = match expression {
                     Expr::Column { qualifier, name } => {
                         scope_column_type_mod(scope, outer_scope, *qualifier, name)
@@ -5317,54 +5326,6 @@ pub fn describe_catalog_items_as<'q>(
                     txid,
                 ) {
                     out[column] = description;
-                }
-                if let Expr::Call {
-                    name,
-                    args,
-                    star: false,
-                    ..
-                } = expression
-                {
-                    let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                        Some(definition) => &super::exec::AliasedDefCols {
-                            definition,
-                            alias: *alias,
-                        },
-                        None => &super::exec::NoCols,
-                    };
-                    let mut argument_type_oids =
-                        [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    if args.len() <= argument_type_oids.len() {
-                        let mut known = true;
-                        for (argument_index, argument) in args.iter().enumerate() {
-                            let Ok((oid, _)) = super::exec::infer_type_res(argument, resolver)
-                            else {
-                                known = false;
-                                break;
-                            };
-                            argument_type_oids[argument_index] = oid;
-                        }
-                        if known
-                            && let Some(routine) = storage.routine_for_call_oids(
-                                name,
-                                &argument_type_oids[..args.len()],
-                                txid,
-                            )
-                        {
-                            let result_oid = storage
-                                .routine_function_result_oid(&routine, txid)
-                                .expect("scalar routine used as an expression has a result");
-                            let result = routine
-                                .kind
-                                .function_result()
-                                .expect("scalar routine used as an expression has a result");
-                            out[column] = ColDesc::new(
-                                alias.unwrap_or(super::exec::derived_name(expression)),
-                                result_oid,
-                                result.typlen(),
-                            );
-                        }
-                    }
                 }
                 column += 1;
             }
@@ -5664,10 +5625,8 @@ fn user_type_cast_description<'q>(
     })
 }
 
-/// Catalog-defined casts retain their type boundary even when they are nested
-/// in an anonymous record field. Static expression inference intentionally has
-/// no catalog dependency, so resolving this shape here prevents a valid domain
-/// or enum field from being mistaken for an unknown literal.
+/// Catalog-backed expression description preserves user-type shape while
+/// exposing a domain's base representation on the wire.
 fn user_type_expression_description<'q>(
     expression: &Expr<'q>,
     name: &'q str,
@@ -5708,11 +5667,7 @@ fn user_type_expression_description<'q>(
                 storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)
             {
                 let result = routine.kind.function_result()?;
-                return Some(ColDesc::new(
-                    name,
-                    storage.routine_function_result_oid(&routine, txid)?,
-                    result.typlen(),
-                ));
+                return Some(ColDesc::new(name, result.oid(), result.typlen()));
             }
         }
     }
@@ -5831,13 +5786,9 @@ fn user_type_expression_description<'q>(
                     .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
             {
                 return Some(
-                    ColDesc::new(
-                        name,
-                        catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
-                        field.ctype.typlen(),
-                    )
-                    .with_type_mod(field.type_mod)
-                    .with_collation(field.collation),
+                    ColDesc::of_type(name, field.ctype)
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
                 );
             }
         }
@@ -5859,45 +5810,6 @@ fn user_type_expression_description<'q>(
         .iter()
         .position(|candidate| candidate.eq_ignore_ascii_case(field))?;
     user_type_cast_description(args.get(position)?, name, storage, txid)
-}
-
-/// Maps stored user-type identity back to its PostgreSQL OID.  A field's
-/// runtime `ColType` is its executable representation; its identity controls
-/// the descriptor exposed through a composite boundary.
-fn catalog_declared_type_oid(
-    storage: &Storage,
-    ctype: super::types::ColType,
-    user_type: Option<crate::storage::UserTypeName>,
-    txid: u32,
-) -> Option<i32> {
-    let Some(identity) = user_type else {
-        return Some(ctype.oid());
-    };
-    if let Some(slot) =
-        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-    {
-        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
-            super::types::oid::domain_array_oid(slot as u16)
-        } else {
-            super::types::oid::domain_oid(slot as u16)
-        });
-    }
-    if let Some(slot) = storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
-        return Some(if matches!(ctype, super::types::ColType::Array(_)) {
-            super::types::oid::enum_array_oid(slot as u16)
-        } else {
-            super::types::oid::enum_oid(slot as u16)
-        });
-    }
-    storage
-        .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        .map(|slot| {
-            if matches!(ctype, super::types::ColType::Array(_)) {
-                super::types::oid::composite_array_oid(slot as u16)
-            } else {
-                super::types::oid::composite_oid(slot as u16)
-            }
-        })
 }
 
 fn catalog_array_element_description<'q>(
@@ -6056,15 +5968,21 @@ fn describe_scope_record_star<'q>(
         *n += 1;
         Ok(())
     };
+    let resolver = CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+    };
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
-            super::exec::check_row_field_types(base, &ScopeCols(scope))?;
+            super::exec::check_row_field_types(base, &resolver)?;
             for (i, arg) in args
                 .iter()
                 .take(super::exec::RECORD_FIELD_NAMES.len())
                 .enumerate()
             {
-                let (oid, typlen) = infer_scope_type(arg, scope)?;
+                let (oid, typlen) = super::exec::infer_type_res(arg, &resolver)?;
                 push(
                     ColDesc::new(super::exec::RECORD_FIELD_NAMES[i], oid, typlen),
                     &mut n,
@@ -6096,13 +6014,45 @@ fn describe_scope_record_star<'q>(
                 index += 1;
             }
         }
+        Expr::Call { name, args, .. } => {
+            if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many function arguments"
+                ));
+            }
+            let mut argument_oids =
+                [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (index, argument) in args.iter().enumerate() {
+                argument_oids[index] =
+                    super::exec::infer_routine_argument_oid(argument, &resolver)?;
+            }
+            let mut index = 0usize;
+            while let Some((field_name, meta)) = super::exec::ColTypeResolver::routine_record_field(
+                &resolver,
+                name,
+                &argument_oids[..args.len()],
+                index,
+            ) {
+                let field_name = arena
+                    .alloc_str(field_name.as_str())
+                    .map_err(|_| arena_full())?;
+                push(
+                    ColDesc::of_type(field_name, meta.ctype)
+                        .with_type_mod(meta.type_mod)
+                        .with_collation(meta.collation),
+                    &mut n,
+                )?;
+                index += 1;
+            }
+            if index == 0 {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            }
+        }
         _ => {
-            let resolver = CatalogScopeCols {
-                scope,
-                outer_scope: None,
-                storage,
-                txid,
-            };
             let slot = match base {
                 Expr::Column { qualifier, name } => {
                     match super::exec::ColTypeResolver::resolve(&resolver, *qualifier, name)? {
@@ -6127,26 +6077,15 @@ fn describe_scope_record_star<'q>(
                         .alloc_str(field.name.as_str())
                         .map_err(|_| arena_full())?;
                     push(
-                        ColDesc::new(
-                            name,
-                            storage
-                                .routine_type_oid(field.ctype, field.user_type, txid)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::INTERNAL_ERROR,
-                                        "composite field type is absent from the catalog"
-                                    )
-                                })?,
-                            field.ctype.typlen(),
-                        )
-                        .with_type_mod(field.type_mod)
-                        .with_collation(field.collation),
+                        ColDesc::of_type(name, field.ctype)
+                            .with_type_mod(field.type_mod)
+                            .with_collation(field.collation),
                         &mut n,
                     )?;
                 }
                 return Ok(n);
             }
-            let Some(handle) = super::exec::expr_record_handle_pub(base, &ScopeCols(scope)) else {
+            let Some(handle) = super::exec::expr_record_handle_pub(base, &resolver) else {
                 return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "row expansion is not supported on this expression"
@@ -6160,7 +6099,7 @@ fn describe_scope_record_star<'q>(
                 match arena.alloc_str(field_name) {
                     Ok(name) => {
                         if let Err(error) = push(
-                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                            ColDesc::of_type(name, meta.ctype)
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                             &mut n,
@@ -6292,15 +6231,28 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         })
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        super::catalog::user_type_oid(self.storage, self.txid, type_name)
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<super::exec::StaticTypeMeta> {
         let routine = self
             .storage
             .function_for_call_oids(name, arguments, self.txid)?;
-        Some((
-            self.storage
+        let ctype = routine.kind.function_result()?;
+        Some(super::exec::StaticTypeMeta {
+            type_oid: self
+                .storage
                 .routine_function_result_oid(&routine, self.txid)?,
-            routine.kind.function_result()?.typlen(),
-        ))
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                super::ast::Collation::Default
+            } else {
+                super::ast::Collation::None
+            },
+        })
     }
 
     fn routine_record_field(
@@ -6313,7 +6265,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
         let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.table_columns()?.get(index)?;
+        let column = routine.record_result_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
             super::exec::StaticTypeMeta {

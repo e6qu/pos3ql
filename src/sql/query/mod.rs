@@ -310,7 +310,10 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
-pub(crate) use srf::{synth_derived_def, synth_derived_def_outer, table_func_rows_outer};
+pub(crate) use srf::{
+    is_srf_name as is_builtin_set_routine, synth_derived_def, synth_derived_def_outer,
+    table_func_rows_outer,
+};
 
 mod group;
 use group::{grouped_rows, grouped_select};
@@ -1612,6 +1615,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     super::types::oid::composite_oid(slot as u16)
                 }
             })
+    }
+
+    fn user_type_identity_oid(
+        &self,
+        identity: crate::storage::UserTypeName,
+        array: bool,
+    ) -> Option<i32> {
+        self.storage
+            .user_type_identity_oid(identity, array, self.txid)
     }
 }
 

@@ -604,17 +604,14 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
-    fn column_domain(
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(t, c) => self.scope.defs[t].and_then(|def| {
-                def.columns()
-                    .get(c)
-                    .and_then(|col| col.user_type.map(|identity| identity.name))
-            }),
+            ResolvedColumn::Table(t, c) => self.scope.defs[t]
+                .and_then(|def| def.columns().get(c).and_then(|col| col.user_type)),
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
         }
@@ -724,10 +721,14 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .col_type(q, name)
             .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
     }
-    fn column_domain(&self, q: Option<&str>, name: &str) -> Option<crate::storage::SqlName> {
+    fn column_user_type(
+        &self,
+        q: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         self.inner
-            .column_domain(q, name)
-            .or_else(|| self.outer.and_then(|o| o.column_domain(q, name)))
+            .column_user_type(q, name)
+            .or_else(|| self.outer.and_then(|o| o.column_user_type(q, name)))
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {

@@ -161,17 +161,19 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         if let Some(q) = qualifier
             && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
         }
-        self.def.column_index(name).and_then(|i| {
-            self.def.columns()[i]
-                .user_type
-                .map(|identity| identity.name)
-        })
+        self.def
+            .column_index(name)
+            .and_then(|i| self.def.columns()[i].user_type)
     }
 }
 
@@ -195,10 +197,8 @@ pub use describe::{
     typeof_static, typeof_static_coltype, typeof_static_oid,
     visit_record_shape as visit_record_shape_pub,
 };
-pub(crate) use describe::{
-    bound_parameter_type_oid, enter_bound_parameter_types, enter_routine_parameter_types,
-};
 pub(crate) use describe::{builtin_record_srf_field_pub, coltype_of_oid, unify_numeric_tower};
+pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
 mod projected;
 pub(crate) use projected::{
@@ -1679,22 +1679,24 @@ where
         }
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
             self.outer
-                .and_then(|outer| outer.column_domain(qualifier, name))
+                .and_then(|outer| outer.column_user_type(qualifier, name))
         } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded"))
             || self.def.column_index(name).is_some()
         {
-            self.def.column_index(name).and_then(|i| {
-                self.def.columns()[i]
-                    .user_type
-                    .map(|identity| identity.name)
-            })
+            self.def
+                .column_index(name)
+                .and_then(|i| self.def.columns()[i].user_type)
         } else {
             self.outer
-                .and_then(|outer| outer.column_domain(qualifier, name))
+                .and_then(|outer| outer.column_user_type(qualifier, name))
         }
     }
 }
@@ -7746,11 +7748,15 @@ where
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
             .then(|| self.definition.column_index(name))
             .flatten()
-            .and_then(|column| self.definition.columns()[column].user_type.map(|identity| identity.name))
+            .and_then(|column| self.definition.columns()[column].user_type)
     }
 }
 
@@ -7793,14 +7799,18 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
         }
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.outer.column_domain(qualifier, name)
+            self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
-            self.outer.column_domain(None, name)
+            self.outer.column_user_type(None, name)
         } else {
-            self.row.column_domain(qualifier, name)
+            self.row.column_user_type(qualifier, name)
         }
     }
 }
@@ -7853,14 +7863,18 @@ where
         }
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            self.outer.column_domain(qualifier, name)
+            self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
-            self.outer.column_domain(None, name)
+            self.outer.column_user_type(None, name)
         } else {
-            self.row.column_domain(qualifier, name)
+            self.row.column_user_type(qualifier, name)
         }
     }
 }
@@ -9962,10 +9976,14 @@ where
         }
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
         {
-            return self.transition.column_domain(qualifier, name);
+            return self.transition.column_user_type(qualifier, name);
         }
         if qualifier.is_none()
             && (self.local_index(name).is_some()
@@ -9976,7 +9994,7 @@ where
         {
             None
         } else {
-            self.transition.column_domain(qualifier, name)
+            self.transition.column_user_type(qualifier, name)
         }
     }
 }
@@ -10142,11 +10160,15 @@ where
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
         self.definition
             .column_index(name)
             .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
-            .and_then(|column| self.definition.columns()[column].user_type.map(|identity| identity.name))
+            .and_then(|column| self.definition.columns()[column].user_type)
     }
 }
 

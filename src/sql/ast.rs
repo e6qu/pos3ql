@@ -2292,25 +2292,7 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("set_config")
         }
         fn is_set_returning(name: &str) -> bool {
-            name.eq_ignore_ascii_case("unnest")
-                || name.eq_ignore_ascii_case("generate_series")
-                || name.eq_ignore_ascii_case("_pg_expandarray")
-                || name.eq_ignore_ascii_case("regexp_matches")
-                || name.eq_ignore_ascii_case("jsonb_object_keys")
-                || name.eq_ignore_ascii_case("json_object_keys")
-                || name.eq_ignore_ascii_case("jsonb_array_elements")
-                || name.eq_ignore_ascii_case("json_array_elements")
-                || name.eq_ignore_ascii_case("jsonb_array_elements_text")
-                || name.eq_ignore_ascii_case("json_array_elements_text")
-                || name.eq_ignore_ascii_case("json_each")
-                || name.eq_ignore_ascii_case("jsonb_each")
-                || name.eq_ignore_ascii_case("json_each_text")
-                || name.eq_ignore_ascii_case("jsonb_each_text")
-                || name.eq_ignore_ascii_case("regexp_split_to_table")
-                || name.eq_ignore_ascii_case("string_to_table")
-                || name.eq_ignore_ascii_case("generate_subscripts")
-                || name.eq_ignore_ascii_case("pg_options_to_table")
-                || name.eq_ignore_ascii_case("pg_get_sequence_data")
+            super::query::is_builtin_set_routine(name)
         }
         match self {
             Expr::Null

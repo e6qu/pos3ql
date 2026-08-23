@@ -1529,6 +1529,8 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
         "CREATE TYPE wire_binary_coordinate AS (x integer, y integer); "
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
+        "CREATE TABLE wire_binary_values (state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
+        "INSERT INTO wire_binary_values VALUES ('ready', 7, ROW(4,8)::wire_binary_coordinate); "
         "CREATE TABLE wire_binary_regclass (id integer); "
         "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
         "AS 'SELECT value'; "
@@ -1561,6 +1563,38 @@ def test_catalog_aware_binary_bind_parameters():
     coordinate_array_oid = 240000 + coordinate_oid - 230000
     coordinate_domain_array_oid = 150000 + coordinate_domain_oid - 110000
     coordinate = binary_record([(23, struct.pack("!i", 4)), (23, struct.pack("!i", 8))])
+    typed_record = binary_record(
+        [
+            (enum_oid, b"ready"),
+            (domain_oid, struct.pack("!i", 7)),
+            (coordinate_oid, coordinate),
+        ]
+    )
+    for name, query in [
+        (
+            "cast fields",
+            "SELECT ROW('ready'::wire_binary_state, 7::wire_binary_positive, "
+            "ROW(4,8)::wire_binary_coordinate)",
+        ),
+        ("declared column fields", "SELECT ROW(state, positive, coordinate) FROM wire_binary_values"),
+        (
+            "routine result fields",
+            "SELECT ROW(wire_binary_state_echo('ready'::wire_binary_state), "
+            "wire_binary_positive_echo(7::wire_binary_positive), "
+            "wire_binary_coordinate_echo(ROW(4,8)::wire_binary_coordinate))",
+        ),
+    ]:
+        messages = extended_binary_result(s, query)
+        description = next((payload for kind, payload in messages if kind == b"T"), None)
+        row = next((payload for kind, payload in messages if kind == b"D"), None)
+        check(
+            f"binary Result ROW preserves {name} identities",
+            description is not None
+            and row_description_type_oids(description) == [2249]
+            and row_description_formats(description) == [1]
+            and row == b"\x00\x01" + struct.pack("!i", len(typed_record)) + typed_record,
+            messages,
+        )
     regclass_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_class WHERE relname = 'wire_binary_regclass'"))
     )

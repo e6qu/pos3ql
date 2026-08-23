@@ -25,7 +25,7 @@ use super::subquery::subquery_witness;
 use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 
 /// Whether `name` is one of the supported set-returning functions.
-pub(super) fn is_srf_name(name: &str) -> bool {
+pub(crate) fn is_srf_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
@@ -751,8 +751,7 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         Ok(dimension
             .and_then(|dimension| crate::sql::array::shape(raw)?.dimension(dimension))
             .unwrap_or(0))
-    } else {
-        // unnest / _pg_expandarray over an array.
+    } else if name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("_pg_expandarray") {
         if args.len() != 1 {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -766,6 +765,8 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             Datum::Null => Ok(0),
             _ => Err(srf_signature_error(name)),
         }
+    } else {
+        unreachable!("accepted set-returning routine has an explicit cardinality branch")
     }
 }
 

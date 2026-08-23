@@ -12984,7 +12984,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
          CREATE FUNCTION echo_pair(value routine_pair) RETURNS routine_pair LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION routine_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
          CREATE FUNCTION routine_overload(value routine_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \
-         CREATE PROCEDURE accept_state(value routine_state) LANGUAGE SQL AS 'SELECT $1'",
+         CREATE PROCEDURE accept_state(value routine_state) LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE TABLE routine_values (state routine_state, count routine_count, pair routine_pair); \
+         INSERT INTO routine_values VALUES ('ready', 5, ROW(9, 'nine')::routine_pair)",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -13003,7 +13005,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
          SELECT pg_typeof(echo_state('done'::routine_state)), \
                 pg_typeof(echo_count(1::routine_count)), \
                 pg_typeof(echo_counts(ARRAY[1::routine_count]::routine_count[])), \
-                pg_typeof(echo_pair(ROW(1, 'one')::routine_pair))",
+                pg_typeof(echo_pair(ROW(1, 'one')::routine_pair)); \
+         SELECT echo_state(state), echo_count(count), echo_pair(pair) FROM routine_values; \
+         SELECT ROW(echo_state(state), echo_count(count), echo_pair(pair)) FROM routine_values",
     );
     assert!(
         !String::from_utf8_lossy(&invoked).contains("ERROR"),
@@ -13015,6 +13019,8 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         [
             "ready|3|{1,2}|{4}|(7,seven)|integer|domain",
             "routine_state|routine_count|routine_count[]|routine_pair",
+            "ready|5|(9,nine)",
+            "(ready,5,\"(9,nine)\")",
         ]
     );
     let called = run_with(

@@ -953,10 +953,10 @@ pub(crate) fn dispatch<'a>(
                         return Ok(regtype(referenced_oid, type_name));
                     }
                 }
-                // A bare column of a domain type reports the domain name (an
-                // expression over it un-domains to the base, handled below).
+                // A bare user-typed column retains its declared identity; an
+                // expression over it uses the representation type below.
                 if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
-                    && let Some(dname) = row.column_domain(*qualifier, name)
+                    && let Some(identity) = row.column_user_type(*qualifier, name)
                 {
                     if let Some(ColType::Array(element)) = row.col_type(*qualifier, name)
                         && element.user_type_slot().is_some()
@@ -966,12 +966,10 @@ pub(crate) fn dispatch<'a>(
                         return Ok(regtype(element.array_oid(), name));
                     }
                     if let Some(cat) = hooks.catalog
-                        && let Some(referenced_oid) = cat.user_type_oid(dname.as_str())
+                        && let Some(referenced_oid) = cat.user_type_identity_oid(identity, false)
+                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
                     {
-                        return Ok(regtype(
-                            referenced_oid,
-                            arena.alloc_str(dname.as_str()).map_err(|_| arena_full())?,
-                        ));
+                        return Ok(regtype(referenced_oid, type_name));
                     }
                 }
                 if let crate::sql::ast::Expr::Subscript { base, .. } = args[0]

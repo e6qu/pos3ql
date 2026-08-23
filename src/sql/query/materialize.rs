@@ -210,17 +210,15 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         let entry = self.0.find_column(qualifier, name).ok()?;
         Some(self.0.output_type(entry))
     }
-    fn column_domain(
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
-            super::scope::ResolvedColumn::Table(table, column) => self.0.defs[table]?
-                .columns()
-                .get(column)?
-                .user_type
-                .map(|identity| identity.name),
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.user_type
+            }
             super::scope::ResolvedColumn::Merged(_) => None,
         }
     }

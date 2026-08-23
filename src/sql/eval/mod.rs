@@ -332,14 +332,12 @@ pub trait ColumnLookup<'a> {
         crate::sql::ast::Collation::None
     }
 
-    /// The domain type name a bare column was declared with, if any — so
-    /// `pg_typeof(domain_col)` reports the domain rather than its base type.
-    /// Defaults to none (an ordinary base-typed column).
-    fn column_domain(
+    /// The stable user-defined type identity of a bare column, if any.
+    fn column_user_type(
         &self,
         _qualifier: Option<&str>,
         _name: &str,
-    ) -> Option<crate::storage::SqlName> {
+    ) -> Option<crate::storage::UserTypeName> {
         None
     }
 
@@ -348,6 +346,150 @@ pub trait ColumnLookup<'a> {
     /// Defaults to false.
     fn whole_row_is_scalar(&self, _table: &str) -> bool {
         false
+    }
+}
+
+/// Static type identity retained until a context decides how PostgreSQL
+/// resolves an unconstrained expression.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpressionTypeIdentity {
+    Known(i32),
+    Unresolved,
+}
+
+impl ExpressionTypeIdentity {
+    pub(crate) const fn record_field_oid(self) -> i32 {
+        match self {
+            Self::Known(oid) => oid,
+            Self::Unresolved => super::types::oid::UNKNOWN,
+        }
+    }
+
+    pub(crate) fn routine_argument_oid(self, value: &Datum<'_>) -> i32 {
+        match self {
+            Self::Known(oid) => oid,
+            // An unconstrained literal or parameter acquires its call-site
+            // type from the value produced for overload resolution.
+            Self::Unresolved => value.type_oid(),
+        }
+    }
+}
+
+fn catalog_user_type_oid<'a>(
+    identity: crate::storage::UserTypeName,
+    is_array: bool,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<i32, SqlError> {
+    hooks
+        .catalog
+        .and_then(|catalog| catalog.user_type_identity_oid(identity, is_array))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "evaluated user-defined type has no catalog identity"
+            )
+        })
+}
+
+pub(crate) fn expression_type_identity<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<ExpressionTypeIdentity, SqlError> {
+    if let Expr::Collate { operand, .. } = expression {
+        return expression_type_identity(operand, row, hooks);
+    }
+    if let Expr::Column { qualifier, name } = expression
+        && let Some(identity) = row.column_user_type(*qualifier, name)
+    {
+        return catalog_user_type_oid(
+            identity,
+            matches!(
+                row.col_type(*qualifier, name),
+                Some(super::types::ColType::Array(_))
+            ),
+            hooks,
+        )
+        .map(ExpressionTypeIdentity::Known);
+    }
+    if let Expr::Cast { type_name, .. } = expression {
+        if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
+            return Ok(ExpressionTypeIdentity::Known(ctype.oid()));
+        }
+        return hooks
+            .catalog
+            .and_then(|catalog| catalog.user_type_oid(type_name))
+            .map(ExpressionTypeIdentity::Known)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "evaluated user-type cast has no catalog identity"
+                )
+            });
+    }
+    if let Expr::Array(elements) = expression
+        && let Some(first) = elements.first()
+    {
+        if let Expr::Cast { type_name, .. } = first
+            && super::types::ColType::from_sql_name(type_name).is_none()
+        {
+            let array_name = stack_format!(128, "{}[]", type_name);
+            return hooks
+                .catalog
+                .and_then(|catalog| catalog.user_type_oid(array_name.as_str()))
+                .map(ExpressionTypeIdentity::Known)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "evaluated user-type array has no catalog identity"
+                    )
+                });
+        }
+        if let Expr::Column { qualifier, name } = first
+            && let Some(identity) = row.column_user_type(*qualifier, name)
+        {
+            return catalog_user_type_oid(identity, true, hooks).map(ExpressionTypeIdentity::Known);
+        }
+    }
+    if let Expr::Call { name, args, .. } = expression
+        && args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+        && let Some(catalog) = hooks.catalog
+    {
+        let mut argument_oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut resolved = true;
+        for (index, argument) in args.iter().enumerate() {
+            match expression_type_identity(argument, row, hooks)? {
+                ExpressionTypeIdentity::Known(oid) => argument_oids[index] = oid,
+                ExpressionTypeIdentity::Unresolved => resolved = false,
+            }
+        }
+        if resolved
+            && let Some(result_oid) = catalog.routine_result_oid(name, &argument_oids[..args.len()])
+        {
+            return Ok(ExpressionTypeIdentity::Known(result_oid));
+        }
+    }
+    match crate::sql::exec::infer_type_res(expression, &RuntimeColumnTypes(row))?.0 {
+        super::types::oid::UNKNOWN => Ok(ExpressionTypeIdentity::Unresolved),
+        oid => Ok(ExpressionTypeIdentity::Known(oid)),
+    }
+}
+
+struct RuntimeColumnTypes<'row, 'datum>(&'row dyn ColumnLookup<'datum>);
+
+impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn resolve(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<super::types::ColType, SqlError> {
+        self.0.col_type(qualifier, name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )
+        })
     }
 }
 
@@ -386,12 +528,12 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).column_identity(qualifier, name)
     }
 
-    fn column_domain(
+    fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::storage::SqlName> {
-        (**self).column_domain(qualifier, name)
+    ) -> Option<crate::storage::UserTypeName> {
+        (**self).column_user_type(qualifier, name)
     }
 }
 
@@ -772,6 +914,15 @@ pub trait CatalogAccess {
     }
     /// Resolves the exact OID of a visible user-defined scalar or array type.
     fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
+        None
+    }
+    /// Resolves a durable schema-qualified identity without reparsing it as
+    /// SQL text.
+    fn user_type_identity_oid(
+        &self,
+        _identity: crate::storage::UserTypeName,
+        _array: bool,
+    ) -> Option<i32> {
         None
     }
 }
@@ -2786,24 +2937,8 @@ fn call<'a>(
         if args.len() <= arguments.len() {
             for (slot, argument) in args.iter().enumerate() {
                 arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
-                argument_type_oids[slot] = match argument {
-                    Expr::Cast { type_name, .. } => catalog
-                        .user_type_oid(type_name)
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    Expr::Array(elements) => elements
-                        .first()
-                        .and_then(|element| match element {
-                            Expr::Cast { type_name, .. } => {
-                                let array_name = stack_format!(128, "{}[]", type_name);
-                                catalog.user_type_oid(array_name.as_str())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    Expr::Param(index) => crate::sql::exec::bound_parameter_type_oid(*index)
-                        .unwrap_or_else(|| arguments[slot].type_oid()),
-                    _ => arguments[slot].type_oid(),
-                };
+                argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
+                    .routine_argument_oid(&arguments[slot]);
             }
             if let Some(result) = catalog.call_routine(
                 name,

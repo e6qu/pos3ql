@@ -15411,11 +15411,21 @@ impl Storage {
         user_type: Option<UserTypeName>,
         txid: u32,
     ) -> Option<i32> {
-        use crate::sql::types::oid;
         let Some(identity) = user_type else {
             return Some(ctype.oid());
         };
         let array = matches!(ctype, ColType::Array(_));
+        self.user_type_identity_oid(identity, array, txid)
+    }
+
+    pub(crate) fn user_type_identity_oid(
+        &self,
+        identity: UserTypeName,
+        array: bool,
+        txid: u32,
+    ) -> Option<i32> {
+        use crate::sql::types::oid;
+
         if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             return Some(if array {

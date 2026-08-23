@@ -13,7 +13,7 @@ use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, Materialize
 use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTypeName};
 
 use super::{
     Chained, MAX_JOIN_TABLES, arena_full, common_using_type, select_into_rows, synth_derived_def,
@@ -117,13 +117,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
-    fn column_domain(&self, qualifier: Option<&str>, name: &str) -> Option<SqlName> {
+    fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(table, column) => self.0.defs[table]?
-                .columns()
-                .get(column)?
-                .user_type
-                .map(|identity| identity.name),
+            ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.user_type
+            }
             ResolvedColumn::Merged(_) => None,
         }
     }

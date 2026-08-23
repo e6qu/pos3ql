@@ -20,6 +20,43 @@ fn result_description_decodes_the_complete_builtin_array_inventory() {
 }
 
 #[test]
+fn quantified_row_subqueries_keep_set_types_and_null_semantics() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ROW(1,2) < ANY (SELECT 1,NULL UNION ALL SELECT 2,0); \
+         SELECT ROW(1,2) < ALL (SELECT 1,NULL UNION ALL SELECT 2,0); \
+         SELECT ROW(1,2) > ANY (SELECT 9,9 WHERE false)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "NULL", "f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE quantified_rows(a int, b int); \
+         INSERT INTO quantified_rows VALUES (1,10), (1,20), (2,30)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT r.a, r.b FROM quantified_rows AS r \
+          WHERE r.* = ANY (SELECT x FROM quantified_rows AS x WHERE x.a = 1) \
+          ORDER BY 1, 2",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|10", "1|20"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn rows_from_zips_scalar_and_record_table_functions() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -9205,6 +9242,14 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                 "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE sql AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'"
             ]
         );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT pg_get_function_arguments(oid), pg_get_function_identity_arguments(oid), pg_get_function_result(oid) FROM pg_proc WHERE proname = 'routine_pairs_from'"
+            )),
+            ["integer|integer|TABLE(routine_id integer, routine_value integer)"]
+        );
         let changed_table_contract = run_with(
             &mut engine,
             &mut budget,
@@ -13206,7 +13251,9 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
             "CREATE VIEW durable_rows_view AS \
                SELECT item, label, generated, ordinality \
                  FROM ROWS FROM (durable_rows(7), generate_series(20,20)) \
-                WITH ORDINALITY AS r(item,label,generated,ordinality)",
+                WITH ORDINALITY AS r(item,label,generated,ordinality); \
+             CREATE VIEW durable_row_quantified_view AS \
+               SELECT ROW(1,2) <= ANY (SELECT item, item + 1 FROM durable_rows(1)) AS matches",
         );
         let target_view = run_with(
             &mut engine,
@@ -13234,6 +13281,14 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
             ["7|one|20|1", "8|two|NULL|2"],
             "{}",
             String::from_utf8_lossy(&visible)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT matches FROM durable_row_quantified_view"
+            )),
+            ["t"]
         );
         let copied = run_with_arena_bytes(
             &mut engine,
@@ -13276,6 +13331,14 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
         ["(9,one)|30", "(10,two)|31", "NULL|32"],
         "{}",
         String::from_utf8_lossy(&target_rows)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT matches FROM durable_row_quantified_view"
+        )),
+        ["t"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);

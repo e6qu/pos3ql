@@ -20192,12 +20192,14 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
             }
             column(None, name)
         }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
-            Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot use subquery in COPY WHERE"
-            ))
-        }
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use subquery in COPY WHERE"
+        )),
         Expr::Call { over: Some(_), .. } => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot use window function in COPY WHERE"
@@ -23063,7 +23065,8 @@ fn merge_source_demand(
         | Expr::Subquery(_)
         | Expr::Exists(_)
         | Expr::ArraySubquery(_)
-        | Expr::InSubquery { .. } => false,
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => false,
         _ => {
             let mut complete = true;
             let _ = super::query::walk_children(expression, &mut |child| {

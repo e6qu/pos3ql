@@ -268,6 +268,15 @@ CREATE FUNCTION outbound_dump.echo_marked_location(value outbound_dump.location_
 CREATE FUNCTION outbound_dump.echo_moods(value outbound_type_target.mood[]) RETURNS outbound_type_target.mood[] LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_locations(value outbound_type_target.location[]) RETURNS outbound_type_target.location[] LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_marked_locations(value outbound_dump.location_domain[]) RETURNS outbound_dump.location_domain[] LANGUAGE sql AS 'SELECT $1';
+CREATE FUNCTION outbound_dump.dump_rows(start_value integer)
+RETURNS TABLE(item integer, label text)
+LANGUAGE sql AS 'SELECT start_value, ''one'' UNION ALL SELECT start_value + 1, ''two''';
+CREATE VIEW outbound_dump.row_view AS
+  SELECT item,label,generated,ordinality
+    FROM ROWS FROM (
+      outbound_dump.dump_rows(1),
+      generate_series(10,30,10)
+    ) WITH ORDINALITY AS rows(item,label,generated,ordinality);
 GRANT USAGE ON SCHEMA outbound_dump TO outbound_reader;
 GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
 GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
@@ -338,8 +347,9 @@ else
              outbound_dump.echo_moods(ARRAY['great'::outbound_type_target.mood])::text,
              ((outbound_dump.echo_locations(ARRAY[ROW(13,14,NULL)::outbound_type_target.location]))[1]).y,
              ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16,NULL)::outbound_dump.location_domain]))[1]).east;
+      SELECT item,label,generated,ordinality FROM outbound_dump.row_view ORDER BY ordinality;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

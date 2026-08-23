@@ -981,6 +981,9 @@ fn collect_expression<'a>(
         }
         Expr::InSubquery {
             operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
         } => {
             child(operand)?;
             collect_select(select, storage, txid, path, ctes, dependencies, arena)

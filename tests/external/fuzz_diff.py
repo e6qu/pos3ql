@@ -321,6 +321,19 @@ class Gen:
             "SELECT id, (ROW(a,b)).f1, ROW(a,b) = ROW(b,a) FROM fz ORDER BY id",
         ])
 
+    def quantified_row_statement(self):
+        return self.choice([
+            "SELECT ROW(1,2) < ANY (SELECT id,weight FROM fz_right)",
+            "SELECT ROW(1,2) <= ALL (SELECT id,weight FROM fz_right WHERE id < 5)",
+            "SELECT ROW(1,NULL) = ANY (SELECT id,weight FROM fz_right)",
+            "SELECT ROW(1,2) > ANY (SELECT id,weight FROM fz_right WHERE false)",
+            "SELECT outer_table.id, ROW(outer_table.id,outer_table.a) < ANY "
+            "(SELECT inner_table.id,inner_table.weight FROM fz_right AS inner_table "
+            "WHERE inner_table.id <= outer_table.id) FROM fz AS outer_table ORDER BY 1",
+            "SELECT id FROM fz WHERE ROW(id,a) <> ALL "
+            "(SELECT id,weight FROM fz_right UNION ALL SELECT 9,9) ORDER BY id",
+        ])
+
     def order_by(self, tiebreak=True):
         # Always end with the unique `id` so ordering is total; LIMIT without
         # a total order is unspecified in SQL and its row set would differ by
@@ -349,8 +362,10 @@ class Gen:
             return self.window_statement()
         if r < 0.28:
             return self.array_scalar_statement()
-        if r < 0.36:
+        if r < 0.34:
             return self.row_srf_statement()
+        if r < 0.40:
+            return self.quantified_row_statement()
         if self.maybe(0.3):
             # Aggregate / GROUP BY form.
             grp = self.choice(ALL_COLS)

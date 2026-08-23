@@ -39,6 +39,14 @@ impl SequenceReplayState {
         self.next.set(0);
     }
 
+    fn cursor(&self) -> usize {
+        self.next.get()
+    }
+
+    fn restore_cursor(&self, cursor: usize) {
+        self.next.set(cursor);
+    }
+
     fn invoke(&self, action: impl FnOnce() -> Result<i64, SqlError>) -> Result<i64, SqlError> {
         let ordinal = self.next.get();
         if ordinal == MAX_REPLAYED_SEQUENCE_CALLS {
@@ -272,7 +280,10 @@ impl SequenceAccess for ReplaySeqEval<'_, '_> {
     fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         self.base.dry_setval(name, value, is_called)
     }
-    fn rewind_statement_cursor(&self) {
-        self.state.begin_attempt();
+    fn statement_cursor(&self) -> Option<usize> {
+        Some(self.state.cursor())
+    }
+    fn restore_statement_cursor(&self, cursor: usize) {
+        self.state.restore_cursor(cursor);
     }
 }

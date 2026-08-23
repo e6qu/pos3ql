@@ -2039,7 +2039,9 @@ pub fn infer_type_res(
         // pre-evaluated datum.
         Expr::Subquery(_) | Expr::ArraySubquery(_) => (oid::UNKNOWN, -2),
         // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
-        Expr::InSubquery { .. } | Expr::Exists(_) => of(ColType::Bool),
+        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
+            of(ColType::Bool)
+        }
         Expr::AnyAll { .. } => of(ColType::Bool),
         Expr::Array(items) => {
             // An unknown-typed element (a bare string literal) makes the array

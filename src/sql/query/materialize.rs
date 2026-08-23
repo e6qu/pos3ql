@@ -599,6 +599,12 @@ pub(crate) fn materialized_rows<'a>(
         has_srf,
     } = plan;
 
+    let routine_cursor = hooks
+        .catalog
+        .and_then(crate::sql::eval::CatalogAccess::routine_invocation_cursor);
+    let sequence_cursor = hooks
+        .sequences
+        .and_then(crate::sql::eval::SequenceAccess::statement_cursor);
     // Pass 1: count — and evaluate the projection and ORDER BY keys per row
     // (discarding the values). PostgreSQL scans, filters, and projects in a
     // single per-row pass below the Sort, so an early row's projection error
@@ -653,11 +659,11 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
-    if let Some(catalog) = hooks.catalog {
-        catalog.rewind_routine_invocation_cursor();
+    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
+        catalog.restore_routine_invocation_cursor(cursor);
     }
-    if let Some(sequences) = hooks.sequences {
-        sequences.rewind_statement_cursor();
+    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
+        sequences.restore_statement_cursor(cursor);
     }
     // Pass 2: project + keys, encode.
     {

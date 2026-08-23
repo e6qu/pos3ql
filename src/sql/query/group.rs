@@ -1124,7 +1124,8 @@ fn ungrouped_column<'e, 'a>(
         | Expr::Cast { operand, .. }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::InSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
+        | Expr::InSubquery { operand, .. }
+        | Expr::QuantifiedSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
         Expr::Binary { left, right, .. } => first(&[left, right]),
         Expr::Call { args, .. } => args
             .iter()

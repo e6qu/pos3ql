@@ -4808,6 +4808,36 @@ mod tests {
     }
 
     #[test]
+    fn quantified_subqueries_are_typed_at_the_parse_boundary() {
+        with_parser(
+            "SELECT ROW(1, 2) < ANY (SELECT 1, 3), 1 = ANY (SELECT 1)",
+            |p| {
+                let Stmt::Select(select) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                let SelectItem::Expr { expression, .. } = select.items[0] else {
+                    panic!()
+                };
+                assert!(matches!(
+                    expression,
+                    Expr::QuantifiedSubquery {
+                        operator: BinaryOp::Lt,
+                        all: false,
+                        ..
+                    }
+                ));
+                let SelectItem::Expr { expression, .. } = select.items[1] else {
+                    panic!()
+                };
+                assert!(matches!(
+                    expression,
+                    Expr::InSubquery { negated: false, .. }
+                ));
+            },
+        );
+    }
+
+    #[test]
     fn partition_declarations_are_typed_at_the_parse_boundary() {
         with_parser(
             "CREATE TABLE sales (sold_on date, amount int) PARTITION BY RANGE (sold_on); \

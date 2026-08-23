@@ -323,6 +323,9 @@ fn pax_column_demand_bounded(
             }
             Expr::InSubquery {
                 operand, select, ..
+            }
+            | Expr::QuantifiedSubquery {
+                operand, select, ..
             } => return collect(operand, scope, columns) && collect_select(select, scope, columns),
             _ => {}
         }

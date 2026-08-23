@@ -2578,7 +2578,29 @@ pub fn function_result_text<'a>(
             .map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::TableFunction => {
-            write!(output, "record").map_err(|_| super::eval::arena_full())?;
+            write!(output, "TABLE(").map_err(|_| super::eval::arena_full())?;
+            for (index, column) in routine
+                .table_columns()
+                .expect("table routine columns")
+                .iter()
+                .enumerate()
+            {
+                if index != 0 {
+                    write!(output, ", ").map_err(|_| super::eval::arena_full())?;
+                }
+                write!(output, "{} ", column.name.as_str())
+                    .map_err(|_| super::eval::arena_full())?;
+                write_routine_type_name(
+                    &mut output,
+                    column.ctype,
+                    column.user_type,
+                    column
+                        .user_type
+                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                )
+                .map_err(|_| super::eval::arena_full())?;
+            }
+            write!(output, ")").map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::Trigger => {
             write!(output, "trigger").map_err(|_| super::eval::arena_full())?;

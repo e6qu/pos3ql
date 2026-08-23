@@ -29,12 +29,12 @@ pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring}
 
 pub(crate) use operators::arithmetic;
 pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
-pub(crate) use operators::membership_eq;
-use operators::{binary, coerce_unknown, compare_text_collated, logic, range_mismatch, unary};
+pub(crate) use operators::{binary, coerce_unknown, membership_eq};
 pub use operators::{
     compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,
     hash_key_collated,
 };
+use operators::{compare_text_collated, logic, range_mismatch, unary};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry
@@ -487,9 +487,12 @@ pub trait SequenceAccess {
     fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
     fn dry_lastval(&self) -> Result<i64, SqlError>;
     fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    /// Restarts replay of volatile sequence calls when a physical executor
-    /// pass repeats the same logical expression stream.
-    fn rewind_statement_cursor(&self) {}
+    /// Captures and restores the logical position when a bounded physical
+    /// executor pass repeats the same expression stream.
+    fn statement_cursor(&self) -> Option<usize> {
+        None
+    }
+    fn restore_statement_cursor(&self, _cursor: usize) {}
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -542,7 +545,10 @@ pub trait CatalogAccess {
     fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
         None
     }
-    fn rewind_routine_invocation_cursor(&self) {}
+    fn routine_invocation_cursor(&self) -> Option<usize> {
+        None
+    }
+    fn restore_routine_invocation_cursor(&self, _cursor: usize) {}
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
@@ -779,7 +785,23 @@ pub trait SubqueryListProbe: 'static {
 
     /// Returns `(matched, saw_unknown)`. `value` has already been coerced to
     /// the subquery column's type.
-    fn probe<'a>(&self, value: Datum<'a>, arena: &'a Arena) -> Result<(bool, bool), SqlError>;
+    fn probe<'a>(
+        &self,
+        value: Datum<'a>,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(bool, bool), SqlError>;
+
+    fn quantify<'a>(
+        &self,
+        value: Datum<'a>,
+        operator: BinaryOp,
+        all: bool,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError>;
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -792,6 +814,7 @@ pub struct SubqueryList<'a> {
     pub probe: Option<core::ptr::NonNull<dyn SubqueryListProbe>>,
     pub saw_null: bool,
     pub witness: Datum<'a>,
+    pub collations: &'a [Collation],
 }
 
 /// Pre-evaluated (uncorrelated) subquery results.
@@ -1009,9 +1032,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
-            Ok(None)
-        }
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => Ok(None),
         Expr::Array(items) => {
             for e in *items {
                 fold_check(e, arena)?;
@@ -1671,6 +1696,7 @@ pub fn eval_full<'a>(
                 ));
             };
             let witness = list.witness;
+            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
             // Coerce the operand to the subquery's column type first: PostgreSQL
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
@@ -1711,15 +1737,17 @@ pub fn eval_full<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                match membership_eq(&l, &r)? {
-                    Some(true) => return Ok(Datum::Bool(!negated)),
-                    Some(false) => {}
-                    None => saw_null = true,
+                match quantified_comparison(BinaryOp::Eq, l, r, collations, hooks.catalog, arena)? {
+                    Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                    Datum::Bool(false) => {}
+                    Datum::Null => saw_null = true,
+                    _ => unreachable!("equality returns boolean or NULL"),
                 }
             }
             if let Some(probe) = list.probe {
                 // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) = unsafe { probe.as_ref() }.probe(v, arena)?;
+                let (matched, unknown) =
+                    unsafe { probe.as_ref() }.probe(v, collations, hooks.catalog, arena)?;
                 if matched {
                     return Ok(Datum::Bool(!negated));
                 }
@@ -1729,6 +1757,89 @@ pub fn eval_full<'a>(
                 Datum::Null
             } else {
                 Datum::Bool(negated)
+            })
+        }
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            all,
+            ..
+        } => {
+            let Some(subs) = hooks.subs else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "subqueries are not allowed in this context"
+                ));
+            };
+            let list = subs
+                .lists
+                .iter()
+                .find(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
+                .copied()
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "subqueries are not allowed in this context (or are correlated)"
+                    )
+                })?;
+            let value = materialize_named_composite(
+                eval_full(operand, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
+            let value = coerce_unknown(value, &list.witness)?;
+            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
+            // Resolve the operator against the subquery's declared output
+            // type even when it is empty or yields only NULLs.
+            let _ = quantified_comparison(
+                operator,
+                value,
+                list.witness,
+                collations,
+                hooks.catalog,
+                arena,
+            )?;
+            let mut saw_unknown = false;
+            for member in list.values {
+                let left = coerce_unknown(value, member)?;
+                let right = coerce_unknown(*member, &left)?;
+                match quantified_comparison(
+                    operator,
+                    left,
+                    right,
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
+                    Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    other => return Err(type_mismatch("quantified comparison", &other)),
+                }
+            }
+            if let Some(probe) = list.probe {
+                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                let result = unsafe { probe.as_ref() }.quantify(
+                    value,
+                    operator,
+                    all,
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )?;
+                match result {
+                    Datum::Bool(true) if !all => return Ok(result),
+                    Datum::Bool(false) if all => return Ok(result),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    _ => unreachable!("subquery quantifier returns boolean or NULL"),
+                }
+            }
+            Ok(if saw_unknown {
+                Datum::Null
+            } else {
+                Datum::Bool(all)
             })
         }
         Expr::Exists(_) => {
@@ -2166,6 +2277,188 @@ pub fn eval_full<'a>(
                 Ok(Datum::Bool(all))
             }
         }
+    }
+}
+
+fn effective_quantified_collations<'a>(
+    operand: &Expr<'a>,
+    right: &[Collation],
+    row: &impl ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [Collation], SqlError> {
+    let mut output = [Collation::None; super::parser::MAX_LIST];
+    if right.len() > output.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many fields in row comparison"
+        ));
+    }
+    let row_args = match operand {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(*args),
+        _ => None,
+    };
+    let whole_fields = match operand {
+        Expr::WholeRow(table) => row.whole_row_fields(table, arena)?,
+        _ => None,
+    };
+    for (index, right) in right.iter().copied().enumerate() {
+        let left = if let Some(args) = row_args {
+            args.get(index)
+                .map(|expression| expression_collation(expression, row))
+                .transpose()?
+                .flatten()
+        } else if let Expr::WholeRow(table) = operand {
+            whole_fields
+                .and_then(|fields| fields.get(index))
+                .map(|field| DerivedCollation {
+                    value: row.collation(Some(table), field.name),
+                    explicit: false,
+                })
+        } else if index == 0 {
+            expression_collation(operand, row)?
+        } else {
+            None
+        };
+        let right = (right != Collation::None).then_some(DerivedCollation {
+            value: right,
+            explicit: false,
+        });
+        output[index] = merge_derived_collations(left, right)?
+            .map(|collation| collation.value)
+            .unwrap_or(Collation::None);
+    }
+    arena
+        .alloc_slice_copy(&output[..right.len()])
+        .map(|slice| &*slice)
+        .map_err(|_| arena_full())
+}
+
+fn typed_field_value<'a>(field: &super::types::RecordField<'a>) -> Datum<'a> {
+    if field.value.is_null() {
+        ColType::from_oid(field.type_oid)
+            .map(super::query::type_witness)
+            .unwrap_or(Datum::Null)
+    } else {
+        field.value
+    }
+}
+
+fn quantified_scalar<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collation: Collation,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(
+        (&left, &right),
+        (
+            Datum::Text(_) | Datum::Bpchar(_),
+            Datum::Text(_) | Datum::Bpchar(_)
+        )
+    ) {
+        compare_text_collated(operator, left, right, false, false, collation, catalog)
+    } else {
+        binary(operator, left, right, false, false, arena)
+    }
+}
+
+pub(crate) fn quantified_comparison<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collations: &[Collation],
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match (left, right) {
+        (
+            Datum::Record(left) | Datum::Composite { fields: left, .. },
+            Datum::Record(right) | Datum::Composite { fields: right, .. },
+        ) => {
+            if left.len() != right.len() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "unequal number of entries in row expressions"
+                ));
+            }
+            if collations.len() != left.len() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "unequal number of entries in row expressions"
+                ));
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                let _ = quantified_scalar(
+                    operator,
+                    typed_field_value(left),
+                    typed_field_value(right),
+                    collations[index],
+                    catalog,
+                    arena,
+                )?;
+            }
+            if matches!(operator, BinaryOp::Eq | BinaryOp::NotEq) {
+                let mut saw_null = false;
+                for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                    match quantified_scalar(
+                        BinaryOp::Eq,
+                        left.value,
+                        right.value,
+                        collations[index],
+                        catalog,
+                        arena,
+                    )? {
+                        Datum::Bool(false) => return Ok(Datum::Bool(operator == BinaryOp::NotEq)),
+                        Datum::Null => saw_null = true,
+                        Datum::Bool(true) => {}
+                        _ => unreachable!("equality returns boolean or NULL"),
+                    }
+                }
+                return Ok(if saw_null {
+                    Datum::Null
+                } else {
+                    Datum::Bool(operator == BinaryOp::Eq)
+                });
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                match quantified_scalar(
+                    BinaryOp::Eq,
+                    left.value,
+                    right.value,
+                    collations[index],
+                    catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) => continue,
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Bool(false) => {
+                        return quantified_scalar(
+                            operator,
+                            left.value,
+                            right.value,
+                            collations[index],
+                            catalog,
+                            arena,
+                        );
+                    }
+                    _ => unreachable!("equality returns boolean or NULL"),
+                }
+            }
+            Ok(Datum::Bool(matches!(
+                operator,
+                BinaryOp::LtEq | BinaryOp::GtEq
+            )))
+        }
+        (left, right) => quantified_scalar(
+            operator,
+            left,
+            right,
+            collations.first().copied().unwrap_or(Collation::None),
+            catalog,
+            arena,
+        ),
     }
 }
 

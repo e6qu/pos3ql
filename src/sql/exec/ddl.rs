@@ -502,7 +502,11 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
             *cols |= 1u64 << index;
         }
         Expr::RoutineParam { .. } => {}
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot use subquery in check constraint"

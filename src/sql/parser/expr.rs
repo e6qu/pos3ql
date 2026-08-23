@@ -391,11 +391,10 @@ impl<'a> Parser<'a> {
                             negated: true,
                         })?
                     } else {
-                        let array = self.arena_expr(Expr::ArraySubquery(boxed))?;
-                        self.arena_expr(Expr::AnyAll {
+                        self.arena_expr(Expr::QuantifiedSubquery {
                             operand: left,
                             operator,
-                            array,
+                            select: boxed,
                             all,
                         })?
                     };

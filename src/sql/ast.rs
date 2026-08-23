@@ -2203,6 +2203,14 @@ pub enum Expr<'a> {
         select: &'a Select<'a>,
         negated: bool,
     },
+    /// `operand operator ANY/ALL (SELECT ...)` for operators other than the
+    /// `IN`/`NOT IN` spellings represented above.
+    QuantifiedSubquery {
+        operand: &'a Expr<'a>,
+        operator: BinaryOp,
+        select: &'a Select<'a>,
+        all: bool,
+    },
     /// `EXISTS (SELECT ...)`: true when the subquery yields at least one row.
     /// `NOT EXISTS` parses as `NOT` wrapping this.
     Exists(&'a Select<'a>),
@@ -2316,6 +2324,7 @@ impl Expr<'_> {
             | Expr::Param(_)
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
@@ -2451,6 +2460,7 @@ impl Expr<'_> {
             // non-foldable to be safe.
             Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
         }
@@ -2462,6 +2472,7 @@ impl Expr<'_> {
         match self {
             Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => true,
             Expr::Null
@@ -2591,6 +2602,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => None,
             Expr::Unary { operand, .. }
@@ -2669,6 +2681,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
@@ -2761,6 +2774,7 @@ impl Expr<'_> {
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }

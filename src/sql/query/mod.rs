@@ -99,6 +99,9 @@ impl<'a> StoredQueryCompositeFieldRename<'a> {
             }
             Expr::InSubquery {
                 operand, select, ..
+            }
+            | Expr::QuantifiedSubquery {
+                operand, select, ..
             } => {
                 self.collect_expression(operand, columns, outer_scope, sites, count)?;
                 return collect_stored_query_composite_field_rename_select(
@@ -317,12 +320,12 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::walk_children;
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
+pub(crate) use subquery::{type_witness, walk_children};
 
 mod window;
 use window::{
@@ -483,8 +486,12 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(None);
     }
 
-    pub(crate) fn rewind_cursor(&self) {
-        self.next.set(0);
+    fn cursor(&self) -> usize {
+        self.next.get()
+    }
+
+    fn restore_cursor(&self, cursor: usize) {
+        self.next.set(cursor);
     }
 
     pub(crate) fn resolve<'query>(
@@ -983,11 +990,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .routine_function_result_oid(&routine, self.txid)
     }
 
-    fn rewind_routine_invocation_cursor(&self) {
+    fn routine_invocation_cursor(&self) -> Option<usize> {
+        self.invocations
+            .map(RoutineInvocationState::cursor)
+            .or_else(|| active_routine_invocations().map(|(state, _)| state.cursor()))
+    }
+
+    fn restore_routine_invocation_cursor(&self, cursor: usize) {
         if let Some(invocations) = self.invocations {
-            invocations.rewind_cursor();
+            invocations.restore_cursor(cursor);
         } else if let Some((invocations, _)) = active_routine_invocations() {
-            invocations.rewind_cursor();
+            invocations.restore_cursor(cursor);
         }
     }
 
@@ -2856,6 +2869,17 @@ fn rewrite_grouped_expr<'a>(
             operand: rewrite(operand)?,
             select,
             negated: *negated,
+        }),
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            select,
+            all,
+        } => alloc(Expr::QuantifiedSubquery {
+            operand: rewrite(operand)?,
+            operator: *operator,
+            select,
+            all: *all,
         }),
         Expr::Array(items) => {
             let mut rewritten = [&Expr::Null as &'a Expr<'a>; super::parser::MAX_LIST];

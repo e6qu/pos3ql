@@ -700,6 +700,9 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
         Expr::InSubquery {
             operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
         } => expr_references(operand, name) + select_references(select, name),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
@@ -1881,9 +1884,11 @@ fn subst_expr_slice<'a>(
 /// are substituted). Leaves and subquery-free trees are returned unchanged.
 fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
-            true
-        }
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => true,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::Collate { operand, .. }
@@ -2097,6 +2102,17 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, context, arena)?,
             select: subst_select(select, context, arena)?,
             negated: *negated,
+        },
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            select,
+            all,
+        } => Expr::QuantifiedSubquery {
+            operand: subst_expr(operand, context, arena)?,
+            operator: *operator,
+            select: subst_select(select, context, arena)?,
+            all: *all,
         },
         Expr::Unary { operator, operand } => Expr::Unary {
             operator: *operator,

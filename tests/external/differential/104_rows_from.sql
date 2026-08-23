@@ -36,6 +36,11 @@ SELECT input.id, expanded.value, expanded.ordinality
        LATERAL ROWS FROM (unnest(input.values))
          WITH ORDINALITY AS expanded(value, ordinality)
  ORDER BY input.id, expanded.ordinality;
+SELECT input.id, expanded.value
+  FROM rows_from_input AS input
+  JOIN LATERAL unnest(input.values) AS expanded(value)
+    ON expanded.value > input.id
+ ORDER BY input.id, expanded.value;
 
 CREATE FUNCTION rows_from_pair(start_value integer)
 RETURNS TABLE(item integer, label text)
@@ -109,6 +114,15 @@ UPDATE rows_from_target AS target
    SET label = source.label
   FROM unnest(ARRAY[10], ARRAY['TEN']) AS source(id, label)
  WHERE target.id = source.id;
+DELETE FROM rows_from_target AS target
+ USING unnest(ARRAY[11], ARRAY['eleven']) AS source(id, label)
+ WHERE target.id = source.id AND target.label = source.label
+ RETURNING target.id;
+MERGE INTO rows_from_target AS target
+USING unnest(ARRAY[10,30], ARRAY['merged','thirty']) AS source(id, label)
+   ON target.id = source.id
+ WHEN MATCHED THEN UPDATE SET label = source.label
+ WHEN NOT MATCHED THEN INSERT (id, label) VALUES (source.id, source.label);
 SELECT * FROM rows_from_target ORDER BY id;
 
 CREATE TABLE rows_from_effects(value integer);

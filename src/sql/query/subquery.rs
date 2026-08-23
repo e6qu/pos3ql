@@ -161,6 +161,12 @@ fn spooled_column_witness<'a>(
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
         super::setops::describe_set_body(storage, tree, txid, &mut columns, arena)?;
+        if let Some((ColType::Composite(slot), _)) =
+            crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
+        {
+            return composite_slot_witness(storage, txid, slot as usize, arena)
+                .map(|(witness, _)| witness);
+        }
         return catalog_type_witness(storage, txid, columns[0].type_oid);
     }
     match select.items.first() {
@@ -206,6 +212,57 @@ fn spooled_column_witness<'a>(
     }
 }
 
+fn composite_slot_witness<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    slot: usize,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, &'a [Collation]), SqlError> {
+    let definition = storage.composite_for(slot, txid);
+    let mut fields = [RecordField {
+        name: "",
+        type_oid: 0,
+        value: Datum::Null,
+    }; MAX_PROJ];
+    let mut collations = [Collation::None; MAX_PROJ];
+    let mut count = 0;
+    for field in definition.active_fields() {
+        fields[count] = RecordField {
+            name: arena
+                .alloc_str(field.name.as_str())
+                .map_err(|_| arena_full())?,
+            type_oid: storage
+                .routine_type_oid(field.ctype, field.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "composite field type is absent from the catalog"
+                    )
+                })?,
+            value: type_witness(field.ctype),
+        };
+        collations[count] = if field.ctype.is_collatable() {
+            Collation::Default
+        } else {
+            Collation::None
+        };
+        count += 1;
+    }
+    let fields = arena
+        .alloc_slice_copy(&fields[..count])
+        .map_err(|_| arena_full())?;
+    let collations = arena
+        .alloc_slice_copy(&collations[..count])
+        .map_err(|_| arena_full())?;
+    Ok((
+        Datum::Composite {
+            slot: slot as u16,
+            fields: &*fields,
+        },
+        &*collations,
+    ))
+}
+
 fn scope_record_witness<'a>(
     expression: &'a Expr<'a>,
     scope: Option<&QueryScope<'a>>,
@@ -213,6 +270,11 @@ fn scope_record_witness<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(Datum<'a>, &'a [Collation])>, SqlError> {
+    if let Expr::Cast { type_name, .. } = expression
+        && let Some(slot) = storage.resolve_composite_slot(type_name, txid)
+    {
+        return composite_slot_witness(storage, txid, slot, arena).map(Some);
+    }
     let Some(scope) = scope else {
         return Ok(None);
     };
@@ -320,6 +382,20 @@ fn external_list_subquery<'a>(
         Some(Datum::Record(fields)) => Some(fields),
         _ => None,
     };
+    if let Some(fields) = row_witness_fields {
+        if fields.len() < row_arity {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "subquery has too few columns"
+            ));
+        }
+        if fields.len() > row_arity {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "subquery has too many columns"
+            ));
+        }
+    }
     let projected_columns = if assemble_record { row_arity } else { 1 };
     select_into_rows_recycling(
         storage,
@@ -889,6 +965,13 @@ fn subquery_collations<'a>(
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
         let count = super::setops::describe_set_body(storage, tree, txid, &mut columns, arena)?;
+        if count == 1
+            && let Some((ColType::Composite(slot), _)) =
+                crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
+        {
+            return composite_slot_witness(storage, txid, slot as usize, arena)
+                .map(|(_, collations)| collations);
+        }
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
             *slot = column.collation;
         }
@@ -1051,10 +1134,17 @@ fn row_projected<'a>(
     select: &'a Select<'a>,
     _arena: &'a Arena,
 ) -> Result<(&'a Select<'a>, usize), SqlError> {
-    let arity = match operand {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => args.len(),
-        _ => 1,
-    };
+    fn arity(operand: &Expr) -> usize {
+        match operand {
+            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => args.len(),
+            // PostgreSQL retains RowExpr arity through an explicit cast when
+            // checking the sublink's projected column count. A scalar cast
+            // from text to a composite remains one value.
+            Expr::Cast { operand, .. } => arity(operand),
+            _ => 1,
+        }
+    }
+    let arity = arity(operand);
     if arity > 1 {
         return Ok((select, arity));
     }
@@ -2614,7 +2704,11 @@ fn run_set_subquery<'a>(
         }
         *slot = v;
     }
-    Ok((&*out, saw_null, type_witness(target[0])))
+    let witness = match target[0] {
+        ColType::Composite(slot) => composite_slot_witness(storage, txid, slot as usize, arena)?.0,
+        ctype => type_witness(ctype),
+    };
+    Ok((&*out, saw_null, witness))
 }
 
 /// The row-comparison form of the above: each materialized row becomes a

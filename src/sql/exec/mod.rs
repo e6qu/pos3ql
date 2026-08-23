@@ -198,7 +198,7 @@ pub use describe::{
 pub(crate) use describe::{
     bound_parameter_type_oid, enter_bound_parameter_types, enter_routine_parameter_types,
 };
-pub(crate) use describe::{coltype_of_oid, json_each_value_type_pub, unify_numeric_tower};
+pub(crate) use describe::{builtin_record_srf_field_pub, coltype_of_oid, unify_numeric_tower};
 
 mod projected;
 pub(crate) use projected::{

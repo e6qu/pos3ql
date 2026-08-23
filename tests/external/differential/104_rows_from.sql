@@ -177,6 +177,51 @@ BEGIN;
 DROP FUNCTION rows_from_schema.rows_from_values_moved(integer);
 ROLLBACK;
 
+-- Catalog SRFs follow the same project-set and record-expansion rules as
+-- ordinary record-returning functions.
+SELECT pg_options_to_table(ARRAY['fillfactor=80','flag']);
+SELECT (pg_options_to_table(ARRAY['fillfactor=80','flag'])).*;
+SELECT (pg_options_to_table(ARRAY[NULL,'empty='])).*;
+SELECT unnest();
+SELECT unnest(ARRAY[1], ARRAY[2]);
+SELECT json_each();
+SELECT json_array_elements();
+SELECT regexp_split_to_table('a');
+SELECT string_to_table('a');
+SELECT generate_subscripts(ARRAY[1], 1, false, false);
+SELECT pg_options_to_table();
+SELECT pg_get_sequence_data();
+SELECT unnest(1);
+SELECT regexp_matches(1, 'x');
+SELECT regexp_matches('x', 'x', 1);
+SELECT regexp_split_to_table(1, 'x');
+SELECT regexp_split_to_table('x', 'x', 1);
+SELECT string_to_table(1, ',');
+SELECT string_to_table('x', 1);
+SELECT generate_subscripts(1, 1);
+SELECT generate_subscripts(ARRAY[1], true);
+SELECT generate_subscripts(ARRAY[1], 1, 1);
+SELECT pg_options_to_table(ARRAY[1]);
+SELECT pg_get_sequence_data(true);
+SELECT * FROM regexp_split_to_table(1, 'x');
+SELECT * FROM string_to_table(1, ',');
+SELECT * FROM generate_subscripts(1, 1);
+SELECT * FROM pg_options_to_table(ARRAY[1]);
+SELECT * FROM pg_get_sequence_data(true);
+SELECT option_name, option_value
+  FROM (VALUES (ARRAY['a=1','b=2'])) AS source(options)
+ CROSS JOIN LATERAL pg_options_to_table(source.options)
+ ORDER BY option_name;
+CREATE SEQUENCE rows_from_sequence START WITH 7;
+SELECT pg_get_sequence_data(oid)
+  FROM pg_class WHERE relname = 'rows_from_sequence';
+SELECT (pg_get_sequence_data(oid)).*
+  FROM pg_class WHERE relname = 'rows_from_sequence';
+SELECT nextval('rows_from_sequence');
+SELECT (pg_get_sequence_data(oid)).*
+  FROM pg_class WHERE relname = 'rows_from_sequence';
+DROP SEQUENCE rows_from_sequence;
+
 DROP VIEW rows_from_view;
 DROP VIEW rows_from_target_view;
 DROP MATERIALIZED VIEW rows_from_target_mat;

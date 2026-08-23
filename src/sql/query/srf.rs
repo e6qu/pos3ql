@@ -44,6 +44,14 @@ pub(super) fn is_srf_name(name: &str) -> bool {
         || is_json_each_name(name)
 }
 
+fn srf_signature_error(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "function {}(...) does not exist",
+        name
+    )
+}
+
 /// The set-returning function call (if any) driving a single expression's
 /// expansion — the outermost SRF reachable through wrapping expressions.
 pub(super) fn srf_in_expr<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
@@ -498,6 +506,39 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             };
             crate::sql::eval::numeric_series_count(start, stop, step, arena)
         }
+    } else if name.eq_ignore_ascii_case("pg_options_to_table") {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "pg_options_to_table(...) argument count"
+            ));
+        }
+        match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Text,
+                raw,
+            } => Ok(crate::sql::array::len(raw)),
+            Datum::Null => Ok(0),
+            _ => Err(srf_signature_error(name)),
+        }
+    } else if name.eq_ignore_ascii_case("pg_get_sequence_data") {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "pg_get_sequence_data(...) argument count"
+            ));
+        }
+        let oid = match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Int4(oid) => oid,
+            Datum::Null => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
+        };
+        Ok(usize::from(
+            hooks
+                .catalog
+                .and_then(|catalog| catalog.sequence_state_by_oid(oid))
+                .is_some(),
+        ))
     } else if name.eq_ignore_ascii_case("regexp_matches") {
         // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
         if !(2..=3).contains(&args.len()) {
@@ -508,14 +549,16 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         }
         let string = crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?);
         let pattern = crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?);
-        let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
-            return Ok(0);
+        let (string, pattern) = match (string, pattern) {
+            (Datum::Text(string), Datum::Text(pattern)) => (string, pattern),
+            (Datum::Null, _) | (_, Datum::Null) => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
         };
         let flags = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_full(args[2], arena, params, row, hooks)?) {
                 Datum::Text(f) => f,
                 Datum::Null => return Ok(0),
-                _ => "",
+                _ => return Err(srf_signature_error(name)),
             }
         } else {
             ""
@@ -540,6 +583,13 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     } else if name.eq_ignore_ascii_case("jsonb_object_keys")
         || name.eq_ignore_ascii_case("json_object_keys")
     {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{}(...) argument count",
+                name
+            ));
+        }
         let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
         {
             Datum::Json { text, .. } => text,
@@ -568,6 +618,13 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         || name.eq_ignore_ascii_case("jsonb_array_elements_text")
         || name.eq_ignore_ascii_case("json_array_elements_text")
     {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{}(...) argument count",
+                name
+            ));
+        }
         let jsonb = name.eq_ignore_ascii_case("jsonb_array_elements")
             || name.eq_ignore_ascii_case("jsonb_array_elements_text");
         let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
@@ -595,6 +652,13 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         }
         Ok(crate::sql::json::array_elements_source(text, arena)?.len())
     } else if is_json_each_name(name) {
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{}(...) argument count",
+                name
+            ));
+        }
         let jsonb =
             name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = name.eq_ignore_ascii_case("json_each_text")
@@ -613,23 +677,37 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         };
         Ok(crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
     } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "regexp_split_to_table(...) argument count"
+            ));
+        }
         let (src, pat) = match (
             crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?),
             crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?),
         ) {
             (Datum::Text(s), Datum::Text(p)) => (s, p),
-            _ => return Ok(0),
+            (Datum::Null, _) | (_, Datum::Null) => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
         };
         let ci = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_full(args[2], arena, params, row, hooks)?) {
                 Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
-                _ => return Ok(0),
+                Datum::Null => return Ok(0),
+                _ => return Err(srf_signature_error(name)),
             }
         } else {
             false
         };
         Ok(crate::sql::eval::regex_split_pub(src, pat, ci, arena)?.len())
     } else if name.eq_ignore_ascii_case("string_to_table") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "string_to_table(...) argument count"
+            ));
+        }
         let (src, delimiter) = match (
             crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?),
             crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?),
@@ -637,34 +715,56 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             (Datum::Text(s), Datum::Text(d)) => (s, Some(d)),
             // A NULL delimiter splits into characters; a NULL input yields nothing.
             (Datum::Text(s), Datum::Null) => (s, None),
-            _ => return Ok(0),
+            (Datum::Null, _) => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
         };
         let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
         Ok(crate::sql::eval::split_pieces(src, delimiter, &mut pieces)?)
     } else if name.eq_ignore_ascii_case("generate_subscripts") {
+        if !(2..=3).contains(&args.len()) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_subscripts(...) argument count"
+            ));
+        }
         let raw = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
         {
             Datum::Array { raw, .. } => raw,
-            _ => return Ok(0),
+            Datum::Null => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
         };
         let dim = match crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?)
         {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
-            _ => return Ok(0),
+            Datum::Null => return Ok(0),
+            _ => return Err(srf_signature_error(name)),
         };
-        Ok(if dim == 1 {
-            crate::sql::array::len(raw)
-        } else {
-            0
-        })
+        if args.len() == 3 {
+            match eval_full(args[2], arena, params, row, hooks)? {
+                Datum::Bool(_) => {}
+                Datum::Null => return Ok(0),
+                _ => return Err(srf_signature_error(name)),
+            }
+        }
+        let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
+        Ok(dimension
+            .and_then(|dimension| crate::sql::array::shape(raw)?.dimension(dimension))
+            .unwrap_or(0))
     } else {
         // unnest / _pg_expandarray over an array.
+        if args.len() != 1 {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{}(...) argument count",
+                name
+            ));
+        }
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
             Datum::Int2Vector(raw) => Ok(raw.len() / 2),
             Datum::Null => Ok(0),
-            _ => Ok(1),
+            _ => Err(srf_signature_error(name)),
         }
     }
 }
@@ -1490,12 +1590,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let oid = match eval_argument(args[0])? {
             Datum::Int4(oid) => oid,
             Datum::Null => return Ok(&[]),
-            other => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "pg_get_sequence_data",
-                    &other,
-                ));
-            }
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let Some((last_value, is_called)) =
             crate::sql::catalog::sequence_state_by_oid(storage, oid)
@@ -1526,12 +1621,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 raw,
             } => raw,
             Datum::Null => return Ok(&[]),
-            other => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "pg_options_to_table",
-                    &other,
-                ));
-            }
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let count = crate::sql::array::len(raw);
         const EMPTY: &[u8] = &[];
@@ -1542,19 +1632,20 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let option = match crate::sql::array::get(raw, crate::sql::types::ArrElem::Text, index)
             {
                 Some(Datum::Text(option)) => option,
-                Some(Datum::Null) | None => "",
-                Some(other) => {
-                    return Err(crate::sql::eval::type_mismatch_pub(
-                        "pg_options_to_table",
-                        &other,
+                Some(Datum::Null) => {
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "null value not allowed"
                     ));
                 }
+                None => unreachable!("array length fixes every option index"),
+                Some(_) => return Err(srf_signature_error(tref.table)),
             };
-            let (name, value) = option.split_once('=').unwrap_or((option, ""));
-            *slot = crate::sql::exec::encode_projected_pub(
-                &[Datum::Text(name), Datum::Text(value)],
-                arena,
-            )?;
+            let (name, value) = match option.split_once('=') {
+                Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
+                None => (Datum::Text(option), Datum::Null),
+            };
+            *slot = crate::sql::exec::encode_projected_pub(&[name, value], arena)?;
         }
         return Ok(&*rows);
     }
@@ -1601,18 +1692,18 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let source = match evaluate(0)? {
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
-            a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let delimiter = match evaluate(1)? {
             Datum::Text(d) => Some(d),
             Datum::Null => None,
-            a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let null_string = if args.len() == 3 {
             match evaluate(2)? {
                 Datum::Text(t) => Some(t),
                 Datum::Null => None,
-                a => return Err(crate::sql::eval::type_mismatch_pub("string_to_table", &a)),
+                _ => return Err(srf_signature_error(tref.table)),
             }
         } else {
             None
@@ -1647,18 +1738,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         ) {
             (Datum::Text(s), Datum::Text(p)) => (s, p),
             (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
-            (a, _) => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "regexp_split_to_table",
-                    &a,
-                ));
-            }
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let case_insensitive = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_argument(args[2])?) {
                 Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
                 Datum::Null => return Ok(&[]),
-                _ => false,
+                _ => return Err(srf_signature_error(tref.table)),
             }
         } else {
             false
@@ -1673,10 +1759,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         return Ok(&*rows);
     }
-    // generate_subscripts(array, dim): the 1-based indices of `array` along
-    // `dim`; empty for a dim other than 1 (arrays are one-dimensional here).
+    // generate_subscripts(array, dim [, reverse]): declared indices along one
+    // dimension, including non-default lower bounds.
     if tref.table.eq_ignore_ascii_case("generate_subscripts") {
-        if args.len() != 2 {
+        if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "generate_subscripts(...) argument count"
@@ -1685,35 +1771,42 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let raw = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Array { raw, .. } => raw,
             Datum::Null => return Ok(&[]),
-            a => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "generate_subscripts",
-                    &a,
-                ));
-            }
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let dim = match crate::sql::eval::text_view(eval_argument(args[1])?) {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
             Datum::Null => return Ok(&[]),
-            a => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "generate_subscripts",
-                    &a,
-                ));
+            _ => return Err(srf_signature_error(tref.table)),
+        };
+        let reverse = if args.len() == 3 {
+            match eval_argument(args[2])? {
+                Datum::Bool(reverse) => reverse,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
             }
-        };
-        let count = if dim == 1 {
-            crate::sql::array::len(raw)
         } else {
-            0
+            false
         };
+        let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
+        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+        let count = dimension
+            .and_then(|dimension| shape.dimension(dimension))
+            .unwrap_or(0);
+        let lower = dimension.and_then(|dimension| shape.lower_bound(dimension));
+        let upper = dimension.and_then(|dimension| shape.upper_bound(dimension));
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
         for (i, slot) in rows.iter_mut().enumerate() {
-            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4((i + 1) as i32)], arena)?;
+            let offset = i32::try_from(i).expect("array dimension fits i32");
+            let subscript = if reverse {
+                upper.expect("nonempty dimension") - offset
+            } else {
+                lower.expect("nonempty dimension") + offset
+            };
+            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4(subscript)], arena)?;
         }
         return Ok(&*rows);
     }
@@ -1728,14 +1821,16 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         let string = crate::sql::eval::text_view(eval_argument(args[0])?);
         let pattern = crate::sql::eval::text_view(eval_argument(args[1])?);
-        let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
-            return Ok(&[]);
+        let (string, pattern) = match (string, pattern) {
+            (Datum::Text(string), Datum::Text(pattern)) => (string, pattern),
+            (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
+            _ => return Err(srf_signature_error(tref.table)),
         };
         let flags = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_argument(args[2])?) {
                 Datum::Text(f) => f,
                 Datum::Null => return Ok(&[]),
-                _ => "",
+                _ => return Err(srf_signature_error(tref.table)),
             }
         } else {
             ""

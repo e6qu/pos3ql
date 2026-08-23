@@ -990,6 +990,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .routine_function_result_oid(&routine, self.txid)
     }
 
+    fn sequence_state_by_oid(&self, oid: i32) -> Option<(i64, bool)> {
+        super::catalog::sequence_state_by_oid(self.storage, oid)
+    }
+
     fn routine_invocation_cursor(&self) -> Option<usize> {
         self.invocations
             .map(RoutineInvocationState::cursor)
@@ -5277,8 +5281,7 @@ pub fn describe_catalog_items_as<'q>(
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |table| table.n_columns);
             }
-            SelectItem::RecordStar(base) => {
-                let _ = base;
+            SelectItem::RecordStar(_) => {
                 column += item_width[item_index];
             }
             SelectItem::Expr { expression, alias } => {
@@ -6059,11 +6062,13 @@ fn describe_scope_record_star<'q>(
                 )?;
             }
         }
-        // json_each family: `(key, value)` with statically-known names/types.
-        Expr::Call { name, .. } if super::exec::json_each_value_type_pub(name).is_some() => {
-            push(ColDesc::of_type("key", ColType::Text), &mut n)?;
-            let value_type = super::exec::json_each_value_type_pub(name).expect("checked");
-            push(ColDesc::of_type("value", value_type), &mut n)?;
+        Expr::Call { name, .. } if super::exec::builtin_record_srf_field_pub(name, 0).is_some() => {
+            let mut index = 0;
+            while let Some((field, ctype)) = super::exec::builtin_record_srf_field_pub(name, index)
+            {
+                push(ColDesc::of_type(field, ctype), &mut n)?;
+                index += 1;
+            }
         }
         _ => {
             let resolver = CatalogScopeCols {

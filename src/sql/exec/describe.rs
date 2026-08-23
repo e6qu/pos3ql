@@ -257,12 +257,12 @@ fn describe_record_star<'q>(
             }
             Ok(())
         }
-        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
-            push(ColDesc::of_type("key", ColType::Text))?;
-            push(ColDesc::of_type(
-                "value",
-                json_each_value_type(name).expect("checked"),
-            ))?;
+        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+            let mut index = 0;
+            while let Some((field, ctype)) = builtin_record_srf_field(name, index) {
+                push(ColDesc::of_type(field, ctype))?;
+                index += 1;
+            }
             Ok(())
         }
         Expr::Call { name, args, .. } if storage.is_some() => {
@@ -464,19 +464,19 @@ pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
 /// float8); non-numeric or equal types keep the first.
 /// The result type (oid, typlen) of an array function that promotes an array's
 /// element type to also hold a new scalar element (`array_append`/`prepend`/
-/// `replace`). Falls back to the array's own type when either is unknown.
+/// `replace`). An unknown element adopts the array argument's contextual type.
 fn array_promoted(array_oid: Option<i32>, elem_oid: Option<i32>) -> (i32, i16) {
-    let fallback = (array_oid.unwrap_or(oid::TEXT), -1i16);
+    let contextual = (array_oid.unwrap_or(oid::TEXT), -1i16);
     let (Some(ao), Some(eo)) = (array_oid, elem_oid) else {
-        return fallback;
+        return contextual;
     };
     let (Some(ColType::Array(ae)), Some(et)) = (coltype_of_oid(ao), coltype_of_oid(eo)) else {
-        return fallback;
+        return contextual;
     };
     let unified = unify_numeric_tower(ae.to_coltype(), et);
     match crate::sql::types::ArrElem::from_coltype(unified) {
         Some(e) => (ColType::Array(e).oid(), -1),
-        None => fallback,
+        None => contextual,
     }
 }
 
@@ -1030,22 +1030,17 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 n += 1;
             }
         }
-        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
-            let mut key = crate::util::StackStr::new();
-            let _ = core::fmt::Write::write_str(&mut key, "key");
-            let mut value = crate::util::StackStr::new();
-            let _ = core::fmt::Write::write_str(&mut value, "value");
-            fields[0] = RecordShapeField {
-                name: key,
-                ctype: ColType::Text,
-                nested: -1,
-            };
-            fields[1] = RecordShapeField {
-                name: value,
-                ctype: json_each_value_type(name)?,
-                nested: -1,
-            };
-            n = 2;
+        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+            while let Some((field, ctype)) = builtin_record_srf_field(name, n) {
+                let mut field_name = crate::util::StackStr::new();
+                let _ = core::fmt::Write::write_str(&mut field_name, field);
+                fields[n] = RecordShapeField {
+                    name: field_name,
+                    ctype,
+                    nested: -1,
+                };
+                n += 1;
+            }
         }
         Expr::WholeRow(table) => {
             let cols = columns.table_columns(table)?;
@@ -1097,12 +1092,6 @@ pub const RECORD_FIELD_NAMES: [&str; 64] = [
     "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64",
 ];
 
-/// The value type of `json_each`-family output's `value` column, for callers
-/// outside this module (scope-based record-star expansion).
-pub(crate) fn json_each_value_type_pub(name: &str) -> Option<ColType> {
-    json_each_value_type(name)
-}
-
 /// The value type of `json_each`-family output's `value` column.
 fn json_each_value_type(name: &str) -> Option<ColType> {
     if name.eq_ignore_ascii_case("json_each") {
@@ -1116,6 +1105,38 @@ fn json_each_value_type(name: &str) -> Option<ColType> {
     } else {
         None
     }
+}
+
+fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, ColType)> {
+    if let Some(value_type) = json_each_value_type(name) {
+        return match index {
+            0 => Some(("key", ColType::Text)),
+            1 => Some(("value", value_type)),
+            _ => None,
+        };
+    }
+    if name.eq_ignore_ascii_case("pg_options_to_table") {
+        return match index {
+            0 => Some(("option_name", ColType::Text)),
+            1 => Some(("option_value", ColType::Text)),
+            _ => None,
+        };
+    }
+    if name.eq_ignore_ascii_case("pg_get_sequence_data") {
+        return match index {
+            0 => Some(("last_value", ColType::Int8)),
+            1 => Some(("is_called", ColType::Bool)),
+            _ => None,
+        };
+    }
+    None
+}
+
+pub(crate) fn builtin_record_srf_field_pub(
+    name: &str,
+    index: usize,
+) -> Option<(&'static str, ColType)> {
+    builtin_record_srf_field(name, index)
 }
 
 /// Visits each `(field_name, type)` of a record-valued expression's shape,
@@ -1140,10 +1161,13 @@ pub fn record_shape(
             }
             Some(n)
         }
-        Expr::Call { name, .. } if json_each_value_type(name).is_some() => {
-            visit("key", ColType::Text);
-            visit("value", json_each_value_type(name)?);
-            Some(2)
+        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+            let mut count = 0;
+            while let Some((field, ctype)) = builtin_record_srf_field(name, count) {
+                visit(field, ctype);
+                count += 1;
+            }
+            Some(count)
         }
         Expr::Call { name, args, .. } => {
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -2594,7 +2618,12 @@ pub fn infer_type_res(
             "jsonb_array_elements" => of(ColType::Jsonb),
             "json_array_elements" => of(ColType::Json),
             // The `each` family yields a `(key, value)` composite per member.
-            "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => (oid::RECORD, -1),
+            "json_each"
+            | "jsonb_each"
+            | "json_each_text"
+            | "jsonb_each_text"
+            | "pg_options_to_table"
+            | "pg_get_sequence_data" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),

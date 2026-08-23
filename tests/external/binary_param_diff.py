@@ -60,6 +60,8 @@ RESULT_CASES = [
     "SELECT 'empty'::int4range",
     "SELECT '{[1,3),[5,7)}'::int4multirange",
     "SELECT ROW(42::int4, NULL::text)",
+    "SELECT pg_options_to_table(ARRAY['fillfactor=80','flag'])",
+    "SELECT pg_get_sequence_data(oid) FROM pg_class WHERE relname = 'binary_result_sequence'",
     "SELECT * FROM unnest(ARRAY[1::int4,2], ARRAY['a'::varchar(3)]) AS u(id,label) ORDER BY id",
     "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'::varchar(2)])) "
     "WITH ORDINALITY AS r(series,label,ordinality) ORDER BY ordinality",
@@ -91,7 +93,8 @@ def main():
 
     setup = (
         "CREATE FUNCTION binary_result_values(integer) RETURNS SETOF integer "
-        "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'"
+        "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'; "
+        "CREATE SEQUENCE binary_result_sequence START WITH 7"
     )
     pg.execute(setup)
     p3.execute(setup)

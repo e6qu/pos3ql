@@ -545,6 +545,9 @@ pub trait CatalogAccess {
     fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
         None
     }
+    fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
+        None
+    }
     fn routine_invocation_cursor(&self) -> Option<usize> {
         None
     }
@@ -2372,6 +2375,23 @@ pub(crate) fn quantified_comparison<'a>(
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let materialize = |value| match value {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?
+            .materialize_composite(slot, physical_fields, text, arena),
+        value => Ok(value),
+    };
+    let left = materialize(left)?;
+    let right = materialize(right)?;
     match (left, right) {
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
@@ -3107,10 +3127,11 @@ fn call<'a>(
                 None => Datum::Null,
             })
         }
-        // Set-returning `generate_subscripts(array, dim)`: the k-th 1-based index
-        // of the array along `dim` (only dimension 1 exists here).
+        // Set-returning `generate_subscripts(array, dim [, reverse])`.
         "generate_subscripts" => {
-            arity(2)?;
+            if !(2..=3).contains(&args.len()) {
+                return Err(arity_err(name, args.len()));
+            }
             let raw = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Array { raw, .. } => raw,
                 Datum::Null => return Ok(Datum::Null),
@@ -3139,11 +3160,38 @@ fn call<'a>(
                     "set-returning function called where not allowed"
                 )
             })?;
-            if dim == 1 && k <= super::array::len(raw) {
-                Ok(Datum::Int4(k as i32))
+            let reverse = if args.len() == 3 {
+                match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Bool(reverse) => reverse,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(type_mismatch(
+                            "generate_subscripts reverse must be boolean",
+                            &other,
+                        ));
+                    }
+                }
             } else {
-                Ok(Datum::Null)
+                false
+            };
+            let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            let Some(dimension) = dimension else {
+                return Ok(Datum::Null);
+            };
+            let Some(length) = shape.dimension(dimension) else {
+                return Ok(Datum::Null);
+            };
+            if k > length {
+                return Ok(Datum::Null);
             }
+            let offset = i32::try_from(k - 1).expect("array dimension fits i32");
+            let subscript = if reverse {
+                shape.upper_bound(dimension).expect("known dimension") - offset
+            } else {
+                shape.lower_bound(dimension).expect("known dimension") + offset
+            };
+            Ok(Datum::Int4(subscript))
         }
         "jsonb_object_keys" | "json_object_keys" => {
             arity(1)?;
@@ -3295,6 +3343,89 @@ fn call<'a>(
                         name: "value",
                         type_oid: value_oid,
                         value: *value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
+        "pg_options_to_table" => {
+            arity(1)?;
+            let raw = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Array {
+                    element: super::types::ArrElem::Text,
+                    raw,
+                } => raw,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("pg_options_to_table", &other)),
+            };
+            let index = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
+            let option = match super::array::get(raw, super::types::ArrElem::Text, index - 1) {
+                Some(Datum::Text(option)) => option,
+                Some(Datum::Null) => {
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "null value not allowed"
+                    ));
+                }
+                None => return Ok(Datum::Null),
+                Some(other) => return Err(type_mismatch("pg_options_to_table", &other)),
+            };
+            let (option_name, option_value) = match option.split_once('=') {
+                Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
+                None => (Datum::Text(option), Datum::Null),
+            };
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "option_name",
+                        type_oid: super::types::oid::TEXT,
+                        value: option_name,
+                    },
+                    super::types::RecordField {
+                        name: "option_value",
+                        type_oid: super::types::oid::TEXT,
+                        value: option_value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
+        "pg_get_sequence_data" => {
+            arity(1)?;
+            let oid = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Int4(oid) => oid,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("pg_get_sequence_data", &other)),
+            };
+            let (last_value, is_called) = hooks
+                .catalog
+                .and_then(|catalog| catalog.sequence_state_by_oid(oid))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "sequence with OID {} does not exist",
+                        oid
+                    )
+                })?;
+            if hooks.srf_index != Some(1) {
+                return Ok(Datum::Null);
+            }
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "last_value",
+                        type_oid: super::types::oid::INT8,
+                        value: Datum::Int8(last_value),
+                    },
+                    super::types::RecordField {
+                        name: "is_called",
+                        type_oid: super::types::oid::BOOL,
+                        value: Datum::Bool(is_called),
                     },
                 ])
                 .map_err(|_| arena_full())?;

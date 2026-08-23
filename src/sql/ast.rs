@@ -2309,6 +2309,8 @@ impl Expr<'_> {
                 || name.eq_ignore_ascii_case("regexp_split_to_table")
                 || name.eq_ignore_ascii_case("string_to_table")
                 || name.eq_ignore_ascii_case("generate_subscripts")
+                || name.eq_ignore_ascii_case("pg_options_to_table")
+                || name.eq_ignore_ascii_case("pg_get_sequence_data")
         }
         match self {
             Expr::Null

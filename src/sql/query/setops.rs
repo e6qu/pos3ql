@@ -931,6 +931,13 @@ fn leaf_col_unknown<'a>(
         match item {
             SelectItem::Expr { expression, .. } => {
                 if idx == c {
+                    // A cast is a typed boundary even when catalog-free
+                    // inference cannot name its user-defined target. Treating
+                    // such a cast as UNKNOWN makes identical composite
+                    // branches collapse to text.
+                    if matches!(expression, Expr::Cast { .. }) {
+                        return false;
+                    }
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
                         Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)

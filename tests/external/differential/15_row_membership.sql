@@ -64,6 +64,20 @@ SELECT ROW(1,2) < ALL (SELECT 1,NULL UNION ALL SELECT 2,0);
 SELECT 'a' COLLATE "C" = ANY (SELECT 'a' COLLATE "POSIX");
 SELECT ROW('a' COLLATE "C",1) = ANY (SELECT 'a' COLLATE "POSIX",1);
 
+CREATE TYPE rowmem_pair AS (a integer, b integer);
+SELECT '(1,2)'::rowmem_pair = ANY (SELECT ROW(1,2)::rowmem_pair);
+SELECT '(1,2)'::rowmem_pair < ALL (
+  SELECT ROW(1,3)::rowmem_pair UNION ALL SELECT ROW(2,0)::rowmem_pair
+);
+SELECT ROW(1,2)::rowmem_pair = ANY (SELECT ROW(1,2)::rowmem_pair);
+SELECT ROW(1,2)::rowmem_pair < ALL (
+  SELECT ROW(1,3)::rowmem_pair UNION ALL SELECT ROW(2,0)::rowmem_pair
+);
+SELECT ROW(1,2)::rowmem_pair = ANY (
+  SELECT ROW(9,9)::rowmem_pair WHERE false
+);
+DROP TYPE rowmem_pair;
+
 -- A bounded two-pass query must not invoke a volatile table routine twice.
 CREATE TABLE rowmem_effects (a int, b int);
 CREATE FUNCTION rowmem_write(v int) RETURNS TABLE(a int, b int) LANGUAGE SQL AS

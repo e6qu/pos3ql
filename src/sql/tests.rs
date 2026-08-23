@@ -54,6 +54,37 @@ fn quantified_row_subqueries_keep_set_types_and_null_semantics() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE quantified_pair AS (a integer, b integer)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '(1,2)'::quantified_pair = ANY (\
+           SELECT ROW(1,2)::quantified_pair); \
+         SELECT '(1,2)'::quantified_pair < ALL (\
+           SELECT ROW(1,3)::quantified_pair \
+           UNION ALL SELECT ROW(2,0)::quantified_pair)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ROW(1,2)::quantified_pair = ANY (\
+           SELECT ROW(1,2)::quantified_pair)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]
@@ -81,6 +112,60 @@ fn rows_from_zips_scalar_and_record_table_functions() {
         "{}",
         String::from_utf8_lossy(&rows)
     );
+}
+
+#[test]
+fn catalog_set_routines_expand_typed_records_in_select_lists() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE catalog_srf_sequence START WITH 7",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (pg_options_to_table(ARRAY['fillfactor=80','flag'])).*; \
+         SELECT (pg_get_sequence_data(oid)).* \
+           FROM pg_class WHERE relname = 'catalog_srf_sequence'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["fillfactor|80", "flag|NULL", "7|f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn generate_subscripts_preserves_shape_direction_and_arity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT generate_subscripts(\
+           '[0:1][5:7]={{1,2,3},{4,5,6}}'::integer[], 2, true)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["7", "6", "5"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for query in [
+        "SELECT unnest()",
+        "SELECT json_each()",
+        "SELECT string_to_table('value')",
+        "SELECT generate_subscripts(ARRAY[1], 1, false, false)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42883"),
+            "{}: {}",
+            query,
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]

@@ -319,6 +319,8 @@ class Gen:
             "LATERAL ROWS FROM (unnest(source.ai)) WITH ORDINALITY "
             "AS expanded(value,ordinality) ORDER BY source.id, expanded.ordinality",
             "SELECT id, (ROW(a,b)).f1, ROW(a,b) = ROW(b,a) FROM fz ORDER BY id",
+            "SELECT generate_subscripts('[0:1][5:7]={{1,2,3},{4,5,6}}'::integer[], 2, true)",
+            "SELECT (pg_options_to_table(ARRAY['fillfactor=80','flag'])).*",
         ])
 
     def quantified_row_statement(self):

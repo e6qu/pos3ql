@@ -71,6 +71,43 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
     }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.scope
+            .find_column(qualifier, name)
+            .ok()
+            .map(|entry| self.scope.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
+            .map_or(Collation::None, |meta| meta.collation)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        match self.scope.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(table, column) => {
+                self.scope.defs[table]?.columns().get(column)?.user_type
+            }
+            ResolvedColumn::Merged(_) => None,
+        }
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.scope.find_column(qualifier, name).ok()? {
+            ResolvedColumn::Table(table, column) => Some((table as u32, column as u32)),
+            ResolvedColumn::Merged(merged) => Some((u32::MAX, merged as u32)),
+        }
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.scope.func_scalar_type(table).is_some()
+    }
 }
 
 /// Runs the per-source-row part shared by materialization's sizing and
@@ -210,6 +247,17 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         let entry = self.0.find_column(qualifier, name).ok()?;
         Some(self.0.output_type(entry))
     }
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.0
+            .find_column(qualifier, name)
+            .ok()
+            .map(|entry| self.0.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+            .map_or(Collation::None, |meta| meta.collation)
+    }
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -227,6 +275,9 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
         }
+    }
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.func_scalar_type(table).is_some()
     }
 }
 

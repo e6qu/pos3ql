@@ -7907,6 +7907,69 @@ fn comparison_rejects_conflicting_implicit_column_collations() {
 }
 
 #[test]
+fn default_collation_column_comparisons_remain_resolved() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE default_collation_values (value text); \
+         INSERT INTO default_collation_values VALUES \
+           ('apple'), ('banana'), (''), ('Apple'), (NULL); \
+         SELECT value <> value, value > 'a_b' \
+           FROM default_collation_values ORDER BY value NULLS LAST",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["f|f", "f|f", "f|t", "f|t", "NULL|NULL"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT CASE WHEN NOT value <> value THEN 3.14 ELSE 0 END \
+           FROM default_collation_values \
+          WHERE NOT value > 'a_b' ORDER BY value NULLS LAST",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3.14", "3.14"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE generated_collation_values ( \
+           id int NOT NULL, a int, r float8, s text, d date); \
+         INSERT INTO generated_collation_values VALUES \
+           (1, 10, 1.5, 'apple', DATE '2020-01-01'), \
+           (2, -7, -2.25, 'banana', DATE '2021-06-15'), \
+           (3, NULL, NULL, NULL, NULL), \
+           (4, 2147483647, 3.0, 'pear', DATE '1999-12-31'), \
+           (5, 0, 0.0, '', DATE '2000-01-01'), \
+           (6, 42, 2.5, 'Apple', DATE '2020-01-01'); \
+         SELECT CASE \
+                  WHEN NOT s <> s THEN 3.14 \
+                  WHEN id IN (5, 1, 0) AND a BETWEEN 5 AND 2 \
+                    THEN (((-2.25 * -1) / 3.14) + ((1 - 3.14) + (a % a))) \
+                  WHEN id NOT IN (2147483647, -2147483648, 999999, 1) THEN 0.0 \
+                  ELSE 999999 \
+                END \
+           FROM generated_collation_values \
+          WHERE NOT s > 'a_b' \
+          ORDER BY r ASC NULLS LAST, d DESC NULLS LAST, id \
+          LIMIT 3 OFFSET 0",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3.14", "3.14"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn window_functions() {
     // All outputs verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();

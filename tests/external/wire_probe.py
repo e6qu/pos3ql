@@ -432,6 +432,65 @@ def test_binary_portal_paging_retains_result_shape_and_format():
     s.close()
 
 
+def test_rows_from_binary_portal_retains_lockstep_shape_and_format():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    query = (
+        "SELECT * FROM ROWS FROM (generate_series(1,2), "
+        "unnest(ARRAY['x']::varchar(2)[])) WITH ORDINALITY "
+        "AS r(series,label,ordinality) ORDER BY ordinality"
+    )
+    parse = frontend_message(
+        b"P", b"rows_from_statement\x00" + query.encode() + b"\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B",
+        b"rows_from_portal\x00rows_from_statement\x00"
+        + struct.pack("!hhhhhh", 0, 0, 3, 1, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Prows_from_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    described = []
+    while True:
+        item = read_message(s)
+        described.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in described if kind == b"T"), None)
+    check(
+        "ROWS FROM portal Describe retains OIDs, typmod, and binary formats",
+        description is not None
+        and row_description_type_oids(description) == [23, 1043, 20]
+        and row_description_type_modifiers(description) == [-1, 6, -1]
+        and row_description_formats(description) == [1, 1, 1],
+        described,
+    )
+    expected_rows = [
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x01x"
+        b"\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x01",
+        b"\x00\x03\x00\x00\x00\x04\x00\x00\x00\x02\xff\xff\xff\xff"
+        b"\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x02",
+    ]
+    for index, expected in enumerate(expected_rows):
+        execute = frontend_message(b"E", b"rows_from_portal\x00\x00\x00\x00\x01")
+        s.sendall(execute + frontend_message(b"S"))
+        output = []
+        while True:
+            item = read_message(s)
+            output.append(item)
+            if item[0] == b"Z":
+                break
+        row = next((payload for kind, payload in output if kind == b"D"), None)
+        terminal = b"C" if index == len(expected_rows) - 1 else b"s"
+        check(
+            f"ROWS FROM binary portal page {index + 1} preserves NULL padding",
+            row == expected and [kind for kind, _ in output] == [b"D", terminal, b"Z"],
+            output,
+        )
+    s.close()
+
+
 def test_bind_rejects_invalid_format_codes_and_lengths():
     s = connect()
     s.sendall(startup_payload(0))
@@ -695,7 +754,7 @@ def test_generate_series_result_types_and_binary_format():
     s.sendall(startup_payload(0))
     drain_startup(s)
 
-    def run(text, expected_oid):
+    def run(text, expected_oid, expected_width=None):
         parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
         bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 1) + struct.pack("!h", 1))
         describe = frontend_message(b"D", b"P\x00")
@@ -714,13 +773,24 @@ def test_generate_series_result_types_and_binary_format():
             description is not None
             and row_description_type_oids(description) == [expected_oid]
             and row_description_formats(description) == [1]
-            and len(rows) == 3,
+            and len(rows) == 3
+            and (
+                expected_width is None
+                or all(
+                    len(row) == 6 + expected_width
+                    and struct.unpack("!i", row[2:6])[0] == expected_width
+                    for row in rows
+                )
+            ),
             out,
         )
 
+    run("SELECT generate_series(1, 3)", 23, 4)
+    run("SELECT generate_series(1, 3::bigint)", 20, 8)
     run(
         "SELECT generate_series('2000-01-01'::timestamp, '2000-01-03'::timestamp, '1 day'::interval)",
         1114,
+        8,
     )
     run("SELECT generate_series(1.5::numeric, 2.5::numeric, 0.5::numeric)", 1700)
     s.close()
@@ -2013,6 +2083,27 @@ def test_catalog_aware_binary_bind_parameters():
     check(
         "binary Bind resolves a set-returning SQL function parameter",
         [first_text_row([message]) for message in messages if message[0] == b"D"] == ["40", "41"],
+        messages,
+    )
+    messages = extended_binary_result(
+        s,
+        "SELECT wire_values_from(1), generate_series(10,12)",
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    rows = [payload for kind, payload in messages if kind == b"D"]
+    expected_rows = [
+        b"\x00\x02\x00\x00\x00\x04" + struct.pack("!i", value)
+        + b"\x00\x00\x00\x04" + struct.pack("!i", generated)
+        for value, generated in [(40, 10), (41, 11)]
+    ] + [
+        b"\x00\x02\xff\xff\xff\xff\x00\x00\x00\x04" + struct.pack("!i", 12)
+    ]
+    check(
+        "binary Result locksteps a catalog SRF without losing its integer type",
+        description is not None
+        and row_description_type_oids(description) == [23, 23]
+        and row_description_formats(description) == [1, 1]
+        and rows == expected_rows,
         messages,
     )
     s.close()

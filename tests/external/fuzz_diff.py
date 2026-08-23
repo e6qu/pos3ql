@@ -305,6 +305,22 @@ class Gen:
             "FROM fz ORDER BY id"
         )
 
+    def row_srf_statement(self):
+        """Generate deterministic row and project-set shapes rather than
+        leaving their lockstep and NULL-padding rules to a single corpus."""
+        return self.choice([
+            "SELECT generate_series(1,2) + generate_series(10,12) ORDER BY 1 NULLS LAST",
+            "SELECT ROW(generate_series(1,3), unnest(ARRAY['a','b']))",
+            "SELECT * FROM unnest(ARRAY[1,2,3], ARRAY['a','b']) "
+            "AS u(value,label) ORDER BY value",
+            "SELECT * FROM ROWS FROM (generate_series(1,3), unnest(ARRAY['x','y'])) "
+            "WITH ORDINALITY AS r(value,label,ordinality) ORDER BY ordinality",
+            "SELECT source.id, expanded.value, expanded.ordinality FROM fz AS source, "
+            "LATERAL ROWS FROM (unnest(source.ai)) WITH ORDINALITY "
+            "AS expanded(value,ordinality) ORDER BY source.id, expanded.ordinality",
+            "SELECT id, (ROW(a,b)).f1, ROW(a,b) = ROW(b,a) FROM fz ORDER BY id",
+        ])
+
     def order_by(self, tiebreak=True):
         # Always end with the unique `id` so ordering is total; LIMIT without
         # a total order is unspecified in SQL and its row set would differ by
@@ -333,6 +349,8 @@ class Gen:
             return self.window_statement()
         if r < 0.28:
             return self.array_scalar_statement()
+        if r < 0.36:
+            return self.row_srf_statement()
         if self.maybe(0.3):
             # Aggregate / GROUP BY form.
             grp = self.choice(ALL_COLS)

@@ -538,6 +538,7 @@ pub(super) fn groups_for_mask<'a>(
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,
+            project_sets: None,
             sequences: hooks.sequences,
         };
         let schema = ScopeSchema(scope);
@@ -1104,6 +1105,9 @@ fn ungrouped_column<'e, 'a>(
     };
     match expression {
         Expr::Column { .. } | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => Some(expression),
+        Expr::RoutineParam {
+            qualifier, name, ..
+        } => scope.find_column(*qualifier, name).ok().map(|_| expression),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)

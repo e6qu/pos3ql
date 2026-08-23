@@ -242,6 +242,12 @@ pub struct Parser<'a> {
     /// expression parser needs this narrow bit of grammar context to leave the
     /// column constraint for its caller.
     stop_default_at_not_null: bool,
+    /// SQL-language routine formals. Their names are resolved to the same
+    /// positional parameter nodes as `$n` while the body is parsed, so a
+    /// runtime value cannot lose its declared type or be mistaken for a table
+    /// column merely because the caller used the named spelling.
+    routine_parameters: [Option<&'a str>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    routine_name: Option<&'a str>,
 }
 
 /// Parses a stored view definition across PostgreSQL's complete query body,
@@ -339,7 +345,40 @@ impl<'a> Parser<'a> {
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
+            routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            routine_name: None,
         })
+    }
+
+    pub(crate) fn with_routine_parameters(
+        mut self,
+        routine_name: &'a str,
+        parameters: &[crate::storage::RoutineArgumentDef],
+    ) -> Result<Self, ParseError> {
+        self.routine_name = Some(routine_name);
+        for (index, parameter) in parameters.iter().enumerate() {
+            if !parameter.name.as_str().is_empty() {
+                let allocated = self.arena.alloc_str(parameter.name.as_str()).map_err(|_| {
+                    ParseError::new(self.peek_at, "statement too large for SQL arena")
+                })?;
+                self.routine_parameters[index] = Some(allocated);
+            }
+        }
+        Ok(self)
+    }
+
+    pub(super) fn routine_parameter(&self, name: &str) -> Option<u32> {
+        self.routine_parameters
+            .iter()
+            .position(|parameter| parameter.is_some_and(|parameter| parameter == name))
+            .map(|index| index as u32 + 1)
+    }
+
+    pub(super) fn qualified_routine_parameter(&self, qualifier: &str, name: &str) -> Option<u32> {
+        self.routine_name
+            .is_some_and(|routine| routine == qualifier)
+            .then(|| self.routine_parameter(name))
+            .flatten()
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -1811,6 +1850,87 @@ impl<'a> Parser<'a> {
         // reference the FROM items to its left. It applies to whichever kind of
         // item follows, so it is captured here and stamped on the result.
         let lateral = self.eat_ident("lateral")?;
+        // ROWS FROM composes function scans in lockstep. Keep the member calls
+        // typed as function-only TableRefs so ordinary relations, subqueries,
+        // and nested groups cannot enter this state.
+        if self.peeked == Tok::Ident("rows") {
+            let mark = self.lexer.mark();
+            let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+            self.advance()?;
+            if self.eat_ident("from")? {
+                self.expect_op("(")?;
+                let mut functions = [TableRef {
+                    schema: None,
+                    table: "",
+                    alias: None,
+                    subquery: None,
+                    func_args: None,
+                    rows_from: None,
+                    col_alias: None,
+                    cte: None,
+                    with_ordinality: false,
+                    lateral: false,
+                    authorization_role: None,
+                }; MAX_LIST];
+                let mut count = 0usize;
+                loop {
+                    if count == functions.len() {
+                        return Err(self.limit("ROWS FROM functions", functions.len()));
+                    }
+                    let function = self.table_ref()?;
+                    if function.func_args.is_none()
+                        || function.rows_from.is_some()
+                        || function.subquery.is_some()
+                        || function.cte.is_some()
+                        || function.with_ordinality
+                        || function.lateral
+                    {
+                        return Err(self.err_here("ROWS FROM requires function calls"));
+                    }
+                    functions[count] = function;
+                    count += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                let with_ordinality = if self.eat_ident("with")? {
+                    self.expect_ident("ordinality")?;
+                    true
+                } else {
+                    false
+                };
+                let alias = if self.eat_ident("as")? {
+                    Some(self.col_ident("alias")?)
+                } else if let Tok::Ident(word) = self.peeked {
+                    if is_column_name_keyword(word) {
+                        None
+                    } else {
+                        self.advance()?;
+                        Some(word)
+                    }
+                } else {
+                    None
+                };
+                let col_alias = self.column_alias_list()?;
+                return Ok(TableRef {
+                    schema: None,
+                    table: "",
+                    alias,
+                    subquery: None,
+                    func_args: None,
+                    rows_from: Some(self.arena_slice(&functions[..count])?),
+                    col_alias,
+                    cte: None,
+                    with_ordinality,
+                    lateral,
+                    authorization_role: None,
+                });
+            }
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+        }
         // Derived table: `(SELECT ...) [AS] alias`. PostgreSQL requires the
         // alias, so a missing one is a syntax error.
         if self.peeked == Tok::Op("(") {
@@ -1838,6 +1958,7 @@ impl<'a> Parser<'a> {
                 alias: Some(word),
                 subquery: Some(boxed),
                 func_args: None,
+                rows_from: None,
                 col_alias,
                 cte: None,
                 with_ordinality: false,
@@ -1907,6 +2028,7 @@ impl<'a> Parser<'a> {
             alias,
             subquery: None,
             func_args,
+            rows_from: None,
             col_alias,
             cte: None,
             with_ordinality,
@@ -1951,6 +2073,7 @@ impl<'a> Parser<'a> {
                 alias: None,
                 subquery: None,
                 func_args: None,
+                rows_from: None,
                 col_alias: None,
                 cte: None,
                 with_ordinality: false,
@@ -5192,6 +5315,39 @@ mod tests {
             assert_eq!(base.col_alias, Some(&["x"][..]));
             assert!(base.func_args.is_some());
         });
+    }
+
+    #[test]
+    fn rows_from_is_a_nonempty_typed_function_group() {
+        with_parser(
+            "SELECT * FROM LATERAL ROWS FROM (generate_series(1,3), unnest(ARRAY[4,5])) \
+             WITH ORDINALITY AS expanded(series, value, ordinality)",
+            |p| {
+                let Stmt::Select(select) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                let source = &select.from.unwrap().base;
+                assert!(source.lateral);
+                assert!(source.with_ordinality);
+                assert_eq!(source.alias, Some("expanded"));
+                assert_eq!(
+                    source.col_alias,
+                    Some(&["series", "value", "ordinality"][..])
+                );
+                let functions = source.rows_from.expect("typed ROWS FROM group");
+                assert_eq!(functions.len(), 2);
+                assert_eq!(functions[0].table, "generate_series");
+                assert_eq!(functions[1].table, "unnest");
+                assert!(functions.iter().all(TableRef::is_function_source));
+            },
+        );
+        for sql in [
+            "SELECT * FROM ROWS FROM ()",
+            "SELECT * FROM ROWS FROM (ordinary_table)",
+            "SELECT * FROM ROWS FROM (ROWS FROM (generate_series(1,2)))",
+        ] {
+            with_parser(sql, |p| assert!(p.next_stmt().is_err(), "{sql}"));
+        }
     }
 
     #[test]

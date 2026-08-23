@@ -1253,6 +1253,11 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
+    /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
+    /// reference. The outer source owns the shared alias and ordinality, so a
+    /// parsed table source is either one function or one non-empty function
+    /// group, never both.
+    pub rows_from: Option<&'a [TableRef<'a>]>,
     /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
     /// derived table or a table function. A table function has a single output
     /// column, so it accepts exactly one name.
@@ -1270,6 +1275,12 @@ pub struct TableRef<'a> {
     /// Set only by stored-view expansion; ordinary parsed references use the
     /// current effective role.
     pub authorization_role: Option<u16>,
+}
+
+impl TableRef<'_> {
+    pub const fn is_function_source(&self) -> bool {
+        self.func_args.is_some() || self.rows_from.is_some()
+    }
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged
@@ -2092,6 +2103,13 @@ pub enum Expr<'a> {
         qualifier: Option<&'a str>,
         name: &'a str,
     },
+    /// A named SQL-routine argument. Column lookup has precedence; `index`
+    /// supplies the positional value only when this spelling binds no column.
+    RoutineParam {
+        qualifier: Option<&'a str>,
+        name: &'a str,
+        index: u32,
+    },
     Param(u32),
     Unary {
         operator: UnaryOp,
@@ -2212,9 +2230,7 @@ pub enum Expr<'a> {
         base: &'a Expr<'a>,
         field: &'a str,
     },
-    /// `t.*` in an expression position (a whole-row reference). Supported
-    /// only as a `count()` argument; anywhere else it is rejected at type
-    /// analysis (record values are not first-class here).
+    /// `t.*` in an expression position: the table's typed composite row.
     WholeRow(&'a str),
     /// A three-part column reference `schema.table.column`: the qualifier
     /// pair must match an unaliased FROM entry that really is that schema's
@@ -2296,6 +2312,7 @@ impl Expr<'_> {
             | Expr::BitLit(_) => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::Param(_)
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }
@@ -2380,6 +2397,7 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
@@ -2454,6 +2472,7 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
@@ -2565,6 +2584,7 @@ impl Expr<'_> {
             | Expr::Str(_)
             | Expr::BitLit(_)
             | Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::Param(_)
@@ -2635,7 +2655,7 @@ impl Expr<'_> {
     /// validating a generation expression's dependencies.
     pub fn for_each_column(&self, f: &mut dyn FnMut(&str)) {
         match self {
-            Expr::Column { name, .. } => f(name),
+            Expr::Column { name, .. } | Expr::RoutineParam { name, .. } => f(name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -2724,7 +2744,10 @@ impl Expr<'_> {
     /// Subqueries own their bindings and are visited by their enclosing query.
     pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
         match self {
-            Expr::Column { qualifier, name } => f(*qualifier, name),
+            Expr::Column { qualifier, name }
+            | Expr::RoutineParam {
+                qualifier, name, ..
+            } => f(*qualifier, name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)

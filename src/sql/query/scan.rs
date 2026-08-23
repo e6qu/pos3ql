@@ -228,6 +228,13 @@ fn pax_column_demand_bounded(
         {
             return false;
         }
+        if let Some(functions) = table.rows_from {
+            for function in functions {
+                if !collect_table(function, scope, columns) {
+                    return false;
+                }
+            }
+        }
         table
             .subquery
             .is_none_or(|select| collect_select(select, scope, columns))
@@ -791,10 +798,12 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             unsafe { core::slice::from_raw_parts(store, len) }
         });
     }
-    if tref.func_args.is_some() {
+    if tref.is_function_source() {
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
         // arguments against the outer row.
-        return super::table_func_rows_outer(tref, storage, txid, arena, params, outer, None, None);
+        return super::table_func_rows_outer(
+            tref, storage, txid, arena, params, outer, None, None, None,
+        );
     }
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,

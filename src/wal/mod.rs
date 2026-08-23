@@ -17,7 +17,8 @@ use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
     ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics,
     OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy,
-    RoleAttributes, SqlName, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
+    RoleAttributes, SerializedStoredQueryDependency, SqlName, StoredDependencyIdentity,
+    StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -158,7 +159,8 @@ impl WalStoredQueryDependencies<'_> {
                     .entries()
                     .iter()
                     .map(|dependency| {
-                        1 + 8
+                        1 + 4
+                            + 8
                             + 1
                             + dependency.schema.as_str().len()
                             + 1
@@ -181,6 +183,7 @@ impl WalStoredQueryDependencies<'_> {
                 let mut ok = buffer.append(&[0xff, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
+                        && buffer.append(&dependency.identity.encoded().to_le_bytes())
                         && buffer.append(&dependency.referenced_columns.to_le_bytes())
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
@@ -2989,6 +2992,19 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
             return false;
         }
         at += 1;
+        if payload.get(at..at + 4).is_none() {
+            return false;
+        }
+        let identity = i32::from_le_bytes(payload[at..at + 4].try_into().expect("length checked"));
+        if StoredDependencyIdentity::decode(
+            DependencyClass::from_code(class).expect("validated class"),
+            identity,
+        )
+        .is_none()
+        {
+            return false;
+        }
+        at += 4;
         if has_columns {
             if payload.get(at..at + 8).is_none() {
                 return false;
@@ -3016,6 +3032,11 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     for _ in 0..count {
         let class = DependencyClass::from_code(payload[at])?;
         at += 1;
+        let identity = StoredDependencyIdentity::decode(
+            class,
+            i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+        )?;
+        at += 4;
         let referenced_columns = if has_columns {
             let columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -3028,14 +3049,15 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
         let referenced_schema = stored_dependency_name(payload, &mut at)?;
         let referenced_name = stored_dependency_name(payload, &mut at)?;
         dependencies
-            .serialized_push_with_columns(
+            .serialized_push(SerializedStoredQueryDependency {
                 class,
-                SqlName::parse(schema).ok()?,
-                SqlName::parse(name).ok()?,
-                SqlName::parse(referenced_schema).ok()?,
-                SqlName::parse(referenced_name).ok()?,
+                identity,
+                schema: SqlName::parse(schema).ok()?,
+                name: SqlName::parse(name).ok()?,
+                referenced_schema: SqlName::parse(referenced_schema).ok()?,
+                referenced_name: SqlName::parse(referenced_name).ok()?,
                 referenced_columns,
-            )
+            })
             .ok()?;
     }
     Some(dependencies)
@@ -5509,14 +5531,28 @@ mod tests {
     fn stored_query_dependency_columns_round_trip_in_wal() {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies
-            .serialized_push_with_columns(
-                DependencyClass::Table,
-                SqlName::parse("public").unwrap(),
-                SqlName::parse("items").unwrap(),
-                SqlName::parse("").unwrap(),
-                SqlName::parse("items").unwrap(),
-                0b101,
-            )
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Table,
+                identity: StoredDependencyIdentity::Name,
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("items").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("items").unwrap(),
+                referenced_columns: 0b101,
+            })
+            .unwrap();
+        dependencies
+            .serialized_push(SerializedStoredQueryDependency {
+                class: DependencyClass::Routine,
+                identity: StoredDependencyIdentity::RoutineOid(
+                    crate::storage::ROUTINE_OID_BASE + 7,
+                ),
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("expanded").unwrap(),
+                referenced_schema: SqlName::parse("").unwrap(),
+                referenced_name: SqlName::parse("original_function").unwrap(),
+                referenced_columns: 0,
+            })
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
         let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 256).unwrap();

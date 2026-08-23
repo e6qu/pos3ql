@@ -2065,6 +2065,7 @@ pub fn drop_table(
                             kind: "table",
                             schema: def.schema,
                             name: def.name,
+                            suffix: crate::util::StackStr::new(),
                         },
                         StoredQuerySelection {
                             views: &dependent_views,
@@ -2091,6 +2092,7 @@ pub fn drop_table(
                             kind: "table",
                             schema: def.schema,
                             name: def.name,
+                            suffix: crate::util::StackStr::new(),
                         },
                         StoredQuerySelection {
                             views: &dependent_views,
@@ -4243,6 +4245,7 @@ pub fn drop_owned(
     let mut domains = [false; MAX_DOMAINS];
     let mut enums = [false; MAX_ENUMS];
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
+    let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut schemas = [false; MAX_SCHEMAS];
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
@@ -4252,6 +4255,7 @@ pub fn drop_owned(
         (AccessClass::Domain, &mut domains[..]),
         (AccessClass::Enum, &mut enums[..]),
         (AccessClass::Composite, &mut composites[..]),
+        (AccessClass::Routine, &mut routines[..]),
         (AccessClass::Schema, &mut schemas[..]),
     ] {
         for (slot, selected) in selected
@@ -4290,6 +4294,10 @@ pub fn drop_owned(
             .copied()
             .unwrap_or(false),
         DependencyClass::Sequence => sequences
+            .get(dependency.slot as usize)
+            .copied()
+            .unwrap_or(false),
+        DependencyClass::Routine => routines
             .get(dependency.slot as usize)
             .copied()
             .unwrap_or(false),
@@ -13064,9 +13072,13 @@ pub fn create_routine(
                 crate::storage::RoutineKind::Function { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) =
-                super::query::parse_routine_function_program(routine.body, arena, returns_void)
-            {
+            if let Err(error) = super::query::parse_routine_function_program(
+                routine.body,
+                arena,
+                returns_void,
+                routine.name.name,
+                &arguments[..routine.arguments.len()],
+            ) {
                 return sql_fail(error);
             }
         }
@@ -13077,9 +13089,13 @@ pub fn create_routine(
                 crate::storage::RoutineKind::SetFunction { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) =
-                super::query::parse_routine_function_program(routine.body, arena, returns_void)
-            {
+            if let Err(error) = super::query::parse_routine_function_program(
+                routine.body,
+                arena,
+                returns_void,
+                routine.name.name,
+                &arguments[..routine.arguments.len()],
+            ) {
                 return sql_fail(error);
             }
         }
@@ -13448,6 +13464,80 @@ pub fn drop_routine(
             return sql_fail(error);
         }
         let routine = *storage.routine(slot);
+        let (dependent_views, dependent_matviews) =
+            match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+                dependency.class == crate::storage::DependencyClass::Routine
+                    && dependency.slot as usize == slot
+            }) {
+                Ok(dependents) => dependents,
+                Err(error) => return sql_fail(error),
+            };
+        let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
+            || dependent_matviews.iter().any(|selected| *selected);
+        let dependency_suffix = match routine_dependency_suffix(storage, &routine) {
+            Ok(suffix) => suffix,
+            Err(error) => return sql_fail(error),
+        };
+        if has_stored_dependents && !cascade {
+            if let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Routine,
+                    slot,
+                    kind: "function",
+                    schema: routine.schema_for(txn.txid),
+                    name: routine.name_for(txn.txid),
+                    suffix: dependency_suffix,
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                },
+                false,
+                responder,
+            ) {
+                return sql_fail(error);
+            }
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop function {} because other objects depend on it",
+                routine.name_for(txn.txid).as_str()
+            ));
+        }
+        if has_stored_dependents
+            && let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Routine,
+                    slot,
+                    kind: "function",
+                    schema: routine.schema_for(txn.txid),
+                    name: routine.name_for(txn.txid),
+                    suffix: dependency_suffix,
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                },
+                true,
+                responder,
+            )
+        {
+            return sql_fail(error);
+        }
+        if has_stored_dependents
+            && let Err(error) = drop_selected_stored_queries(
+                storage,
+                wal,
+                txn,
+                &dependent_views,
+                &dependent_matviews,
+            )
+        {
+            return sql_fail(error);
+        }
         if storage
             .triggers_with_slots_visible_to(txn.txid)
             .any(|(_, trigger)| usize::from(trigger.function) == slot)
@@ -14071,6 +14161,10 @@ pub fn create_table_as(
         let sel = match crate::sql::parser::parse_query(sql, arena) {
             Ok(s) => s,
             Err(e) => return sql_fail(e),
+        };
+        let sel = match super::query::expand_ctes_exec(sel, storage, txn.txid, arena, params, &[]) {
+            Ok(select) => select,
+            Err(error) => return sql_fail(error),
         };
         let mut rows = 0usize;
         if let Err(e) = super::query::select_into_rows(
@@ -15022,6 +15116,7 @@ pub fn drop_sequence(
                     kind: "sequence",
                     schema,
                     name: sname,
+                    suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
                     views: &dependent_views,
@@ -15048,6 +15143,7 @@ pub fn drop_sequence(
                     kind: "sequence",
                     schema,
                     name: sname,
+                    suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
                     views: &dependent_views,
@@ -17084,6 +17180,64 @@ struct StoredQueryRoot {
     kind: &'static str,
     schema: SqlName,
     name: SqlName,
+    suffix: crate::util::StackStr<192>,
+}
+
+fn routine_dependency_suffix(
+    storage: &Storage,
+    routine: &crate::storage::RoutineDef,
+) -> Result<crate::util::StackStr<192>, SqlError> {
+    use core::fmt::Write as _;
+    let mut suffix = crate::util::StackStr::<192>::new();
+    suffix.write_char('(').map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine signature too long"
+        )
+    })?;
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        if index != 0 {
+            suffix.write_char(',').map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine signature too long"
+                )
+            })?;
+        }
+        let write_result = match argument.user_type {
+            Some(identity) if storage.schema_is_on_path(identity.schema) => {
+                suffix.write_str(identity.name.as_str())
+            }
+            Some(identity) => write!(
+                suffix,
+                "{}.{}",
+                identity.schema.as_str(),
+                identity.name.as_str()
+            ),
+            None => suffix.write_str(argument.ctype.name()),
+        };
+        write_result.map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine signature too long"
+            )
+        })?;
+        if argument.user_type.is_some() && matches!(argument.ctype, ColType::Array(_)) {
+            suffix.write_str("[]").map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine signature too long"
+                )
+            })?;
+        }
+    }
+    suffix.write_char(')').map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine signature too long"
+        )
+    })?;
+    Ok(suffix)
 }
 
 #[derive(Clone, Copy)]
@@ -17234,6 +17388,7 @@ fn report_stored_query_dependents(
                     if depth == 1 {
                         let _ = write!(parent, "{} ", root.kind);
                         write_name(&mut parent, &root.schema, &root.name);
+                        let _ = write!(parent, "{}", root.suffix.as_str());
                     } else {
                         for dependency in storage.view_dependencies(slot).entries() {
                             if dependency.class == DependencyClass::View
@@ -17287,6 +17442,7 @@ fn report_stored_query_dependents(
                     if depth == 1 {
                         let _ = write!(parent, "{} ", root.kind);
                         write_name(&mut parent, &root.schema, &root.name);
+                        let _ = write!(parent, "{}", root.suffix.as_str());
                     } else if let Some(dependency) = storage
                         .matview_dependencies(slot)
                         .entries()
@@ -20019,6 +20175,7 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
     };
     match expression {
         Expr::Column { qualifier, name } => column(*qualifier, name),
+        Expr::RoutineParam { .. } => Ok(()),
         Expr::SchemaColumn {
             schema,
             table,
@@ -22423,6 +22580,7 @@ pub fn copy_out_query(
             .map_err(wire_to_sql)?;
     }
     let sel = crate::sql::parser::parse_query(sql, arena)?;
+    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
     let render = responder.render_context();
     let fmt = &fmt;
     let mut count = 0u64;
@@ -25774,6 +25932,7 @@ pub(crate) fn update<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: None,
     };
     let collect = if let Some(from) = statement.from {
@@ -26429,6 +26588,7 @@ pub(crate) fn delete<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: None,
     };
     let collect = if let Some(using) = statement.using {

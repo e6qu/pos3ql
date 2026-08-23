@@ -455,12 +455,24 @@ pub struct EvalHooks<'h, 'a> {
     /// The current 1-based expansion index of a set-returning function
     /// (`_pg_expandarray`) in the projection; `None` outside such expansion.
     pub srf_index: Option<usize>,
+    /// Materialized catalog SRFs keyed by their expression node. Built-in SRFs
+    /// compute by index; SQL routines retain their one execution here.
+    pub project_sets: Option<&'h [ProjectSetValue<'a>]>,
     /// Sequence side-effects for `nextval`/`currval`/`lastval`/`setval`. `None`
     /// in contexts where a sequence function cannot appear (catalog synthesis,
     /// constraint checks); the volatile functions error `0A000`-style if called
     /// without it. A trait object with interior mutability so evaluation stays
     /// `&`-only while advancing the generator.
     pub sequences: Option<&'h dyn SequenceAccess>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ProjectSetValue<'a> {
+    pub node: *const (),
+    pub values: &'a [Datum<'a>],
+    /// Nested project-set levels select their input independently of the
+    /// outer level currently being expanded.
+    pub fixed_index: Option<usize>,
 }
 
 /// The side-effecting sequence functions, abstracted so `eval` need not depend
@@ -802,6 +814,7 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     windows: None,
     catalog: None,
     srf_index: None,
+    project_sets: None,
     sequences: None,
 };
 
@@ -860,6 +873,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::Str(_)
         | Expr::BitLit(_)
         | Expr::Column { .. }
+        | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
         | Expr::SchemaColumn { .. }
         | Expr::Param(_)
@@ -1061,6 +1075,13 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if let Some(set) = hooks.project_sets.and_then(|sets| {
+        sets.iter()
+            .find(|set| set.node == expression as *const Expr<'a> as *const ())
+    }) && let Some(index) = set.fixed_index.or(hooks.srf_index)
+    {
+        return Ok(set.values.get(index - 1).copied().unwrap_or(Datum::Null));
+    }
     // GROUPING(arg, ...): each argument contributes one bit (1 if that column
     // is NOT part of the current grouping set), most significant first.
     if let Expr::Call { name, args, .. } = expression
@@ -1098,7 +1119,7 @@ pub fn eval_full<'a>(
     match *expression {
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
-        // marker — consumable only by count() (type analysis rejects the rest).
+        // Preserve the table field layout for composite evaluation and output.
         Expr::WholeRow(table) => match row.whole_row_fields(table, arena)? {
             // A function scan's whole row is its single scalar column.
             Some(fields) if row.whole_row_is_scalar(table) => {
@@ -1135,6 +1156,26 @@ pub fn eval_full<'a>(
                 }
             }
             Err(e) => Err(e),
+        },
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+        } => match row.lookup(qualifier, name) {
+            Ok(value) => materialize_named_composite(value, hooks, arena),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                params.get(index as usize - 1).copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "there is no parameter ${}",
+                        index
+                    )
+                })
+            }
+            Err(error) => Err(error),
         },
         Expr::SchemaColumn {
             schema,
@@ -2568,7 +2609,9 @@ fn call<'a>(
                     return Ok(Datum::Null);
                 }
                 // int4 unless an argument is int8 or the value overflows int4.
-                let wide = matches!(start, Datum::Int8(_)) || matches!(step, Datum::Int8(_));
+                let wide = matches!(start, Datum::Int8(_))
+                    || matches!(stop, Datum::Int8(_))
+                    || matches!(step, Datum::Int8(_));
                 return Ok(if !wide && i32::try_from(v).is_ok() {
                     Datum::Int4(v as i32)
                 } else {
@@ -3127,15 +3170,21 @@ pub enum SeriesKind {
 /// overload family. Keep the type decision in one place so select-list,
 /// FROM, Describe, and Result encoding cannot disagree about a temporal
 /// series' wire type.
-pub(crate) fn generate_series_result_type(start: Option<ColType>, has_numeric: bool) -> ColType {
+pub(crate) fn generate_series_result_type(
+    start: Option<ColType>,
+    has_numeric: bool,
+    has_int8: bool,
+) -> ColType {
     if has_numeric {
         return ColType::Numeric;
+    }
+    if has_int8 {
+        return ColType::Int8;
     }
     match start {
         Some(ColType::Timestamp) => ColType::Timestamp,
         Some(ColType::Timestamptz | ColType::Date) => ColType::Timestamptz,
         Some(ColType::Numeric) => ColType::Numeric,
-        Some(ColType::Int8) => ColType::Int8,
         _ => ColType::Int4,
     }
 }

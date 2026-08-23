@@ -8,11 +8,13 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, FrameBound, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::exec::ColTypeResolver;
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
     DependencyClass, MAX_COLUMNS, MAX_STORED_QUERY_DEPENDENCIES, PathContext, PathEntry,
-    ResolvedRelation, SqlName, Storage, StoredQueryDependencies, StoredQueryDependency,
+    ResolvedRelation, SqlName, Storage, StoredDependencyIdentity, StoredQueryDependencies,
+    StoredQueryDependency,
 };
 
 #[derive(Clone, Copy)]
@@ -173,7 +175,7 @@ fn collect_select<'a>(
         let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
         if sources.clone().all(|source| {
             source.subquery.is_none()
-                && source.func_args.is_none()
+                && !source.is_function_source()
                 && matches!(
                     storage.resolve_relation_under(path, source.schema, source.table, txid),
                     Some(ResolvedRelation::Table(_))
@@ -225,7 +227,360 @@ fn collect_select<'a>(
         }
         record_relation_column_references(storage, txid, path, &from, select, dependencies, arena)?;
     }
+    collect_routine_dependencies(select, storage, txid, dependencies, arena)?;
     Ok(())
+}
+
+struct DependencyTypes<'scope, 'definition, 'storage> {
+    scope: Option<&'scope super::QueryScope<'definition>>,
+    storage: &'storage Storage,
+    txid: u32,
+}
+
+impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        match self.scope {
+            Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),
+            None => crate::sql::exec::NoCols.resolve(qualifier, name),
+        }
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+        let routine = self
+            .storage
+            .function_for_call_oids(name, arguments, self.txid)?;
+        Some((
+            self.storage
+                .routine_function_result_oid(&routine, self.txid)?,
+            routine.kind.function_result()?.typlen(),
+        ))
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self
+            .storage
+            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let routine = self.storage.routine_for(slot, self.txid);
+        let column = routine.table_columns()?.get(index)?;
+        Some((
+            crate::util::StackStr::from_str(column.name.as_str()),
+            column.ctype,
+        ))
+    }
+
+    fn named_composite_field(
+        &self,
+        type_name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
+        let definition = self.storage.composite_for(slot, self.txid);
+        let field = definition.active_field(index)?;
+        Some((
+            crate::util::StackStr::from_str(field.name.as_str()),
+            field.ctype,
+        ))
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.scope
+            .is_some_and(|scope| scope.table_index(name).is_ok())
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.scope.and_then(|scope| scope.func_scalar_type(name))
+    }
+
+    fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
+        let scope = self.scope?;
+        let table = scope.table_index(name).ok()?;
+        Some(scope.defs[table]?.columns())
+    }
+
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let scope = self.scope?;
+        let entry = scope.find_column(qualifier, name).ok()?;
+        if scope.output_type(entry) != ColType::Record {
+            return None;
+        }
+        match entry {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                Some(scope.defs[table]?.columns()[column].type_mod)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn collect_routine_dependencies(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let resolver = DependencyTypes {
+        scope: None,
+        storage,
+        txid,
+    };
+    let needs_scope =
+        collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
+    if needs_scope {
+        let from = select.from.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored routine dependency did not resolve at its typed boundary"
+            )
+        })?;
+        let mark = arena.mark();
+        let result = (|| {
+            let scope = super::QueryScope::resolve_schema(storage, from, txid, arena)?;
+            let resolver = DependencyTypes {
+                scope: Some(&scope),
+                storage,
+                txid,
+            };
+            if collect_routine_dependencies_with_resolver(
+                select,
+                storage,
+                txid,
+                dependencies,
+                &resolver,
+            )? {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored routine dependency remained unresolved after scope binding"
+                ));
+            }
+            Ok(())
+        })();
+        // The dependency set owns catalog identities; the temporary scope does
+        // not cross this typed boundary.
+        unsafe { arena.rewind_to(mark) };
+        result?;
+    }
+    Ok(())
+}
+
+fn collect_routine_dependencies_with_resolver(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    resolver: &DependencyTypes<'_, '_, '_>,
+) -> Result<bool, SqlError> {
+    let mut needs_scope = false;
+
+    fn record_call(
+        name: &str,
+        args: &[&Expr<'_>],
+        storage: &Storage,
+        txid: u32,
+        resolver: &DependencyTypes<'_, '_, '_>,
+        dependencies: &mut StoredQueryDependencies,
+        needs_scope: &mut bool,
+    ) -> Result<(), SqlError> {
+        if !storage.has_function_routine_candidate(name, args.len(), txid) {
+            return Ok(());
+        }
+        if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS {
+            let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut known = true;
+            for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+                match crate::sql::exec::infer_type_res(argument, resolver) {
+                    Ok((crate::sql::types::oid::UNKNOWN, _))
+                        if matches!(argument, Expr::Str(_)) =>
+                    {
+                        *slot = ColType::Text.oid();
+                    }
+                    Ok((oid, _)) => *slot = oid,
+                    Err(_) => {
+                        *needs_scope = true;
+                        known = false;
+                        break;
+                    }
+                }
+            }
+            if known
+                && let Some(slot) = storage.routine_slot_for_function_call_oids(
+                    name,
+                    &argument_oids[..args.len()],
+                    txid,
+                )
+            {
+                let routine = storage.routine_for(slot, txid);
+                let (referenced_schema, referenced_name) = name
+                    .split_once('.')
+                    .map_or(("", name), |(schema, name)| (schema, name));
+                dependencies.push(StoredQueryDependency {
+                    class: DependencyClass::Routine,
+                    slot: slot as u16,
+                    identity: StoredDependencyIdentity::RoutineOid(crate::storage::routine_oid(
+                        &routine,
+                    )),
+                    referenced_columns: 0,
+                    schema: routine.schema_for(txid),
+                    name: routine.name_for(txid),
+                    referenced_schema: SqlName::parse(referenced_schema)?,
+                    referenced_name: SqlName::parse(referenced_name)?,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_expr(
+        expression: &Expr<'_>,
+        storage: &Storage,
+        txid: u32,
+        resolver: &DependencyTypes<'_, '_, '_>,
+        dependencies: &mut StoredQueryDependencies,
+        needs_scope: &mut bool,
+    ) -> Result<(), SqlError> {
+        if let Expr::Call { name, args, .. } = expression {
+            record_call(
+                name,
+                args,
+                storage,
+                txid,
+                resolver,
+                dependencies,
+                needs_scope,
+            )?;
+        }
+        super::walk_children(expression, &mut |child| {
+            visit_expr(child, storage, txid, resolver, dependencies, needs_scope)
+        })
+    }
+
+    fn record_table_call(
+        table: &TableRef<'_>,
+        args: &[&Expr<'_>],
+        storage: &Storage,
+        txid: u32,
+        resolver: &DependencyTypes<'_, '_, '_>,
+        dependencies: &mut StoredQueryDependencies,
+        needs_scope: &mut bool,
+    ) -> Result<(), SqlError> {
+        use core::fmt::Write as _;
+        let mut qualified = crate::util::StackStr::<128>::new();
+        let name = if let Some(schema) = table.schema {
+            write!(qualified, "{schema}.{}", table.table).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine dependency name is too long"
+                )
+            })?;
+            qualified.as_str()
+        } else {
+            table.table
+        };
+        record_call(
+            name,
+            args,
+            storage,
+            txid,
+            resolver,
+            dependencies,
+            needs_scope,
+        )
+    }
+
+    for item in select.items {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => visit_expr(
+                expression,
+                storage,
+                txid,
+                resolver,
+                dependencies,
+                &mut needs_scope,
+            )?,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+        }
+    }
+    for expression_node in select
+        .distinct_on
+        .iter()
+        .copied()
+        .chain(select.where_clause)
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        visit_expr(
+            expression_node,
+            storage,
+            txid,
+            resolver,
+            dependencies,
+            &mut needs_scope,
+        )?;
+    }
+    if let Some(from) = select.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(args) = table.func_args {
+                record_table_call(
+                    table,
+                    args,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    &mut needs_scope,
+                )?;
+                for argument in args {
+                    visit_expr(
+                        argument,
+                        storage,
+                        txid,
+                        resolver,
+                        dependencies,
+                        &mut needs_scope,
+                    )?;
+                }
+            }
+            if let Some(functions) = table.rows_from {
+                for function in functions {
+                    if let Some(args) = function.func_args {
+                        record_table_call(
+                            function,
+                            args,
+                            storage,
+                            txid,
+                            resolver,
+                            dependencies,
+                            &mut needs_scope,
+                        )?;
+                        for argument in args {
+                            visit_expr(
+                                argument,
+                                storage,
+                                txid,
+                                resolver,
+                                dependencies,
+                                &mut needs_scope,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        for join in from.joins {
+            if let Some(on) = join.on {
+                visit_expr(on, storage, txid, resolver, dependencies, &mut needs_scope)?;
+            }
+        }
+    }
+    Ok(needs_scope)
 }
 
 #[derive(Clone, Copy)]
@@ -255,7 +610,7 @@ fn record_relation_column_references<'a>(
     }; super::MAX_JOIN_TABLES];
     let mut n_sources = 0;
     for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
-        if table.subquery.is_some() || table.func_args.is_some() {
+        if table.subquery.is_some() || table.is_function_source() {
             continue;
         }
         let Some(relation) = storage.resolve_relation_under(path, table.schema, table.table, txid)
@@ -448,7 +803,7 @@ fn collect_table_ref<'a>(
 ) -> Result<(), SqlError> {
     if let Some(select) = table.subquery {
         collect_select(select, storage, txid, path, ctes, dependencies, arena)?;
-    } else if table.func_args.is_none()
+    } else if !table.is_function_source()
         && table.cte.is_none()
         && !(table.schema.is_none() && ctes.contains(table.table))
     {
@@ -458,6 +813,7 @@ fn collect_table_ref<'a>(
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::Table,
                     slot: slot as u16,
+                    identity: StoredDependencyIdentity::Name,
                     referenced_columns: 0,
                     schema: definition.schema,
                     name: definition.name,
@@ -470,6 +826,7 @@ fn collect_table_ref<'a>(
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::View,
                     slot: slot as u16,
+                    identity: StoredDependencyIdentity::Name,
                     referenced_columns: 0,
                     schema: view.schema,
                     name: view.name,
@@ -483,6 +840,11 @@ fn collect_table_ref<'a>(
     if let Some(arguments) = table.func_args {
         for argument in arguments {
             collect_expression(argument, storage, txid, path, ctes, dependencies, arena)?;
+        }
+    }
+    if let Some(functions) = table.rows_from {
+        for function in functions {
+            collect_table_ref(function, storage, txid, path, ctes, dependencies, arena)?;
         }
     }
     Ok(())
@@ -660,6 +1022,7 @@ fn collect_type(
         dependencies.push(StoredQueryDependency {
             class,
             slot: slot as u16,
+            identity: StoredDependencyIdentity::Name,
             referenced_columns: 0,
             schema,
             name,
@@ -776,6 +1139,7 @@ fn collect_sequence(
         dependencies.push(StoredQueryDependency {
             class: DependencyClass::Sequence,
             slot: slot as u16,
+            identity: StoredDependencyIdentity::Name,
             referenced_columns: 0,
             schema: sequence.schema,
             name: sequence.name,

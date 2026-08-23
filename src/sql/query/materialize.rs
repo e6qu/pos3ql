@@ -19,10 +19,10 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, find_srf,
-    merge_correlated, pax_column_demand, postpone_cost, project_row_skipping, record_star_width,
-    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok, srf_max_count,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, has_project_set,
+    merge_correlated, pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping,
+    record_star_width, resolve_order_target, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -137,16 +137,26 @@ fn for_each_materialized_projection<'a>(
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,
+            project_sets: None,
             sequences: hooks.sequences,
         };
         &owned_hooks
     };
-    let expansions = srf_max_count(statement.items, arena, params, row, row_hooks)?;
-    for expansion in 1..=expansions {
+    let project_set = prepare_project_set(
+        statement.items,
+        storage,
+        txid,
+        arena,
+        params,
+        row,
+        row_hooks,
+    )?;
+    for expansion in 1..=project_set.count {
         let srf_hooks;
-        let use_hooks: &EvalHooks = if has_srf {
+        let use_hooks: &EvalHooks = if project_set.any || has_srf {
             srf_hooks = EvalHooks {
                 srf_index: Some(expansion),
+                project_sets: Some(project_set.values),
                 ..*row_hooks
             };
             &srf_hooks
@@ -392,6 +402,8 @@ fn sort_dedup_collated(
 }
 
 fn prepare_materialization<'a>(
+    storage: &Storage,
+    txid: u32,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     correlated: &'a [&'a Expr<'a>],
@@ -457,7 +469,7 @@ fn prepare_materialization<'a>(
         };
     }
 
-    let has_srf = find_srf(statement.items).is_some();
+    let has_srf = has_project_set(statement.items, storage, txid);
     let defer_allowed = n_order > 0
         && statement.limit.is_some()
         && !statement.distinct
@@ -566,7 +578,7 @@ pub(crate) fn materialized_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
-    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let visible_collations = projected_collations(statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
@@ -1120,7 +1132,7 @@ pub(crate) fn external_materialized_into<'a>(
     offset: u64,
     emit: &mut ExternalRowEmitter<'_>,
 ) -> Result<u64, SqlError> {
-    let plan = prepare_materialization(statement, scope, correlated, arena)?;
+    let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let mut sorter = storage.external_sorter()?;
     sorter.reset();

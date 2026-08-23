@@ -91,12 +91,24 @@ pub fn describe_items<'q>(
                 describe_record_star(base, def, table_alias, storage, txid, &mut push)?;
             }
             SelectItem::Expr { expression, alias } => {
-                let resolver: &dyn ColTypeResolver = match def {
-                    Some(definition) => &AliasedDefCols {
-                        definition,
-                        alias: table_alias,
+                let catalog_resolver;
+                let resolver: &dyn ColTypeResolver = match storage {
+                    Some(storage) => {
+                        catalog_resolver = CatalogCols {
+                            definition: def,
+                            alias: table_alias,
+                            storage,
+                            txid,
+                        };
+                        &catalog_resolver
+                    }
+                    None => match def {
+                        Some(definition) => &AliasedDefCols {
+                            definition,
+                            alias: table_alias,
+                        },
+                        None => &NoCols,
                     },
-                    None => &NoCols,
                 };
                 let (mut type_oid, mut typlen) = infer_type_res(expression, resolver)?;
                 // A bare unknown (string literal / param) resolves to text
@@ -137,6 +149,88 @@ pub fn describe_items<'q>(
     Ok(n)
 }
 
+struct CatalogCols<'a> {
+    definition: Option<&'a TableDef>,
+    alias: Option<&'a str>,
+    storage: &'a crate::storage::Storage,
+    txid: u32,
+}
+
+impl ColTypeResolver for CatalogCols<'_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        match self.definition {
+            Some(definition) => AliasedDefCols {
+                definition,
+                alias: self.alias,
+            }
+            .resolve(qualifier, name),
+            None => NoCols.resolve(qualifier, name),
+        }
+    }
+
+    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
+        let routine = self
+            .storage
+            .function_for_call_oids(name, arguments, self.txid)?;
+        let oid = self
+            .storage
+            .routine_function_result_oid(&routine, self.txid)?;
+        Some((oid, routine.kind.function_result()?.typlen()))
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self
+            .storage
+            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let routine = self.storage.routine_for(slot, self.txid);
+        let column = routine.table_columns()?.get(index)?;
+        Some((
+            crate::util::StackStr::from_str(column.name.as_str()),
+            column.ctype,
+        ))
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.definition.is_some_and(|definition| {
+            crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
+        })
+    }
+
+    fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
+        let definition = self.definition?;
+        crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
+            .then(|| definition.columns())
+    }
+
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let definition = self.definition?;
+        AliasedDefCols {
+            definition,
+            alias: self.alias,
+        }
+        .record_column_handle(qualifier, name)
+    }
+
+    fn named_composite_field(
+        &self,
+        type_name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
+        let definition = self.storage.composite_for(slot, self.txid);
+        let field = definition.active_field(index)?;
+        Some((
+            crate::util::StackStr::from_str(field.name.as_str()),
+            field.ctype,
+        ))
+    }
+}
+
 /// Emits one `ColDesc` per field of a `(record).*` expansion, resolving field
 /// names and types at the caller's `'q` lifetime (single-table describe path).
 fn describe_record_star<'q>(
@@ -169,6 +263,57 @@ fn describe_record_star<'q>(
                 "value",
                 json_each_value_type(name).expect("checked"),
             ))?;
+            Ok(())
+        }
+        Expr::Call { name, args, .. } if storage.is_some() => {
+            let resolver: &dyn ColTypeResolver = match def {
+                Some(definition) => &AliasedDefCols {
+                    definition,
+                    alias: table_alias,
+                },
+                None => &NoCols,
+            };
+            let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > argument_oids.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many function arguments"
+                ));
+            }
+            for (index, argument) in args.iter().enumerate() {
+                argument_oids[index] = infer_type_res(argument, resolver)?.0;
+            }
+            let storage = storage.expect("matched");
+            let Some(slot) =
+                storage.routine_slot_for_table_call_oids(name, &argument_oids[..args.len()], txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            };
+            let routine = storage.routine(slot);
+            let Some(columns) = routine.table_columns() else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                ));
+            };
+            for column in columns {
+                let type_oid = storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine result type is absent from the catalog"
+                        )
+                    })?;
+                push(ColDesc::new(
+                    column.name.as_str(),
+                    type_oid,
+                    column.ctype.typlen(),
+                ))?;
+            }
             Ok(())
         }
         Expr::WholeRow(table)
@@ -482,6 +627,15 @@ pub trait ColTypeResolver {
     /// not carry.
     /// Plain column resolvers have no catalog and therefore expose none.
     fn routine_result(&self, _name: &str, _arguments: &[i32]) -> Option<(i32, i16)> {
+        None
+    }
+
+    fn routine_record_field(
+        &self,
+        _name: &str,
+        _arguments: &[i32],
+        _index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
         None
     }
 
@@ -991,6 +1145,23 @@ pub fn record_shape(
             visit("value", json_each_value_type(name)?);
             Some(2)
         }
+        Expr::Call { name, args, .. } => {
+            let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > argument_oids.len() {
+                return None;
+            }
+            for (index, argument) in args.iter().enumerate() {
+                argument_oids[index] = infer_type_res(argument, columns).ok()?.0;
+            }
+            let mut count = 0usize;
+            while let Some((field_name, ctype)) =
+                columns.routine_record_field(name, &argument_oids[..args.len()], count)
+            {
+                visit(field_name.as_str(), ctype);
+                count += 1;
+            }
+            (count != 0).then_some(count)
+        }
         Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
         Expr::Cast { type_name, .. } => {
             if let Some(count) = visit_named_composite_shape(type_name, &mut visit) {
@@ -1496,6 +1667,22 @@ pub fn infer_type_res(
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index).map(of))
             .unwrap_or((oid::UNKNOWN, -2)),
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+        } => match columns.resolve(*qualifier, name) {
+            Ok(column) => of(column),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                routine_parameter_type(*index)
+                    .map(of)
+                    .unwrap_or((oid::UNKNOWN, -2))
+            }
+            Err(error) => return Err(error),
+        },
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.
         Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {
@@ -2367,9 +2554,16 @@ pub fn infer_type_res(
                         .and_then(|(type_oid, _)| coltype_of_oid(type_oid))
                         == Some(ColType::Numeric)
                 });
+                let has_int8 = args.iter().any(|argument| {
+                    infer_type_res(argument, columns)
+                        .ok()
+                        .and_then(|(type_oid, _)| coltype_of_oid(type_oid))
+                        == Some(ColType::Int8)
+                });
                 of(crate::sql::eval::generate_series_result_type(
                     start,
                     has_numeric,
+                    has_int8,
                 ))
             }
             "unnest" => {

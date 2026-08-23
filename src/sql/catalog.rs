@@ -34,6 +34,7 @@ const PG_CATALOG_NS_OID: i32 = 11;
 const PG_CLASS_OID: i32 = 1259;
 const PG_NAMESPACE_OID: i32 = 2615;
 const PG_TYPE_OID: i32 = 1247;
+const PG_PROC_OID: i32 = 1255;
 
 #[derive(Clone, Copy)]
 struct IntrinsicRoutine {
@@ -4793,6 +4794,13 @@ fn pg_depend<'a>(
         crate::storage::DependencyClass::Composite => Some((
             PG_TYPE_OID,
             crate::sql::types::oid::composite_oid(dependency.slot),
+        )),
+        crate::storage::DependencyClass::Routine => Some((
+            PG_PROC_OID,
+            match dependency.identity {
+                crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
+                crate::storage::StoredDependencyIdentity::Name => return None,
+            },
         )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {

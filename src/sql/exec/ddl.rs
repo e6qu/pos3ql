@@ -370,6 +370,7 @@ pub(super) fn resolve_default(
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
+            project_sets: None,
             sequences: None,
         };
         let v = eval_full(
@@ -500,6 +501,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
             // MAX_COLUMNS is 64, so a column index always fits the u64 mask.
             *cols |= 1u64 << index;
         }
+        Expr::RoutineParam { .. } => {}
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,

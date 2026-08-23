@@ -236,6 +236,21 @@ fn collect_stored_query_composite_field_rename_select<'a>(
                     rename.collect_expression(argument, columns, nested_outer, sites, count)?;
                 }
             }
+            if let Some(functions) = table.rows_from {
+                for function in functions {
+                    if let Some(arguments) = function.func_args {
+                        for argument in arguments {
+                            rename.collect_expression(
+                                argument,
+                                columns,
+                                nested_outer,
+                                sites,
+                                count,
+                            )?;
+                        }
+                    }
+                }
+            }
             if let Some(subquery) = table.subquery {
                 collect_stored_query_composite_field_rename_select(
                     subquery,
@@ -291,7 +306,7 @@ mod aggregate;
 use aggregate::{AggState, fold_aggregates};
 
 mod srf;
-use srf::{find_srf, srf_count, srf_max_count, table_func_def, table_func_def_outer};
+use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 pub(crate) use srf::{synth_derived_def, synth_derived_def_outer, table_func_rows_outer};
 
 mod group;
@@ -588,8 +603,8 @@ type Outcome = Result<Result<(), SqlError>, WireFull>;
 /// queries; no DML statement can cross this boundary.
 #[derive(Clone, Copy)]
 pub(crate) enum RoutineQuery<'a> {
-    Select(Select<'a>),
-    Set(SetQuery<'a>),
+    Select(&'a Select<'a>),
+    Set(&'a SetQuery<'a>),
 }
 
 /// A non-final SQL-function statement. It cannot be used as the result, so a
@@ -622,9 +637,12 @@ pub(crate) fn parse_routine_function_program<'a>(
     body: &'a str,
     arena: &'a Arena,
     returns_void: bool,
+    routine_name: &'a str,
+    parameters: &[crate::storage::RoutineArgumentDef],
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
     const MAX_ROUTINE_STATEMENTS: usize = 64;
     let mut parser = super::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(routine_name, parameters))
         .map_err(|error| super::parse_error_to_sql(&error))?;
     let mut parsed = [None; MAX_ROUTINE_STATEMENTS];
     let mut count = 0usize;
@@ -660,12 +678,12 @@ pub(crate) fn parse_routine_function_program<'a>(
         match last {
             RoutinePrelude::Statement(Stmt::Select(query)) => RoutineFunctionResult::Query(
                 arena
-                    .alloc(RoutineQuery::Select(*query))
+                    .alloc(RoutineQuery::Select(query))
                     .map_err(|_| arena_full())?,
             ),
             RoutinePrelude::Statement(Stmt::SetQuery(query)) => RoutineFunctionResult::Query(
                 arena
-                    .alloc(RoutineQuery::Set(*query))
+                    .alloc(RoutineQuery::Set(query))
                     .map_err(|_| arena_full())?,
             ),
             RoutinePrelude::Statement(statement) if statement_returns_rows(statement) => {
@@ -845,6 +863,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             routine.body.as_str(),
             self.routine_workspace,
             result_type == ColType::Void,
+            routine.name.as_str(),
+            routine.arguments(),
         )?;
         if routine_program_requires_mutable_execution(&function_program) {
             if let Some(invocations) = self.invocations {
@@ -879,8 +899,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 return Err(routine_forbidden_statement_error(statement));
             };
             let query = match statement {
-                Stmt::Select(query) => RoutineQuery::Select(*query),
-                Stmt::SetQuery(query) => RoutineQuery::Set(*query),
+                Stmt::Select(query) => RoutineQuery::Select(query),
+                Stmt::SetQuery(query) => RoutineQuery::Set(query),
                 _ => unreachable!("mutable routine prelude was rejected above"),
             };
             execute_routine_query(
@@ -904,8 +924,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             RoutineFunctionResult::Void(statement) => {
                 let query = match statement {
-                    Stmt::Select(query) => RoutineQuery::Select(*query),
-                    Stmt::SetQuery(query) => RoutineQuery::Set(*query),
+                    Stmt::Select(query) => RoutineQuery::Select(query),
+                    Stmt::SetQuery(query) => RoutineQuery::Set(query),
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1914,6 +1934,7 @@ fn correlated_row_hooks<'scratch, 'a>(
         windows: None,
         catalog: base.catalog,
         srf_index: None,
+        project_sets: None,
         sequences: base.sequences,
     }
 }
@@ -2665,6 +2686,23 @@ fn rewrite_grouped_expr<'a>(
         | Expr::Subquery(_)
         | Expr::Exists(_)
         | Expr::ArraySubquery(_) => Ok(e),
+        Expr::RoutineParam {
+            qualifier, name, ..
+        } => {
+            if context
+                .scope
+                .is_some_and(|scope| scope.find_column(*qualifier, name).is_ok())
+            {
+                return Err(sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier.unwrap_or(""),
+                    if qualifier.is_some() { "." } else { "" },
+                    name
+                ));
+            }
+            Ok(e)
+        }
         Expr::Column { qualifier, name } => {
             // An unknown column errors as such; a known one is ungrouped.
             if let Some(scope) = context.scope
@@ -3094,7 +3132,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
                 }
             }
         }
-        let has_srf = find_srf(statement.items).is_some();
+        let has_srf = has_project_set(statement.items, storage, txid);
         if (n_win_probe > 0 || has_srf)
             && (!statement.group_by.is_empty() || statement.having.is_some() || n_grouped_aggs > 0)
         {
@@ -3191,6 +3229,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: seq,
     };
 
@@ -3466,8 +3505,16 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
                 };
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
-                let count = srf_max_count(statement.items, arena, params, row, row_hooks)?;
-                for k in 1..=count {
+                let project_set = prepare_project_set(
+                    statement.items,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    row,
+                    row_hooks,
+                )?;
+                for k in 1..=project_set.count {
                     if emitted >= limit {
                         break;
                     }
@@ -3479,9 +3526,10 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
                         continue;
                     }
                     let srf_hooks;
-                    let use_hooks: &EvalHooks = if srf_call.is_some() {
+                    let use_hooks: &EvalHooks = if srf_call.is_some() || project_set.any {
                         srf_hooks = EvalHooks {
                             srf_index: Some(k),
+                            project_sets: Some(project_set.values),
                             ..*row_hooks
                         };
                         &srf_hooks
@@ -3586,6 +3634,7 @@ fn over_one_row<'a>(
             alias: Some("?onerow"),
             subquery: Some(inner),
             func_args: None,
+            rows_from: None,
             col_alias: None,
             cte: None,
             with_ordinality: false,
@@ -3730,6 +3779,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: seq,
     };
 
@@ -3757,7 +3807,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         }
     }
     if n_aggs > 0 || statement.having.is_some() || !statement.group_by.is_empty() {
-        if find_srf(statement.items).is_some() {
+        if has_project_set(statement.items, storage, txid) {
             // The set-returning function expands after aggregation: rewrite
             // to the two-level form (aggregates in a derived table) and run
             // through the FROM executor.
@@ -3832,14 +3882,16 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // A set-returning function in the select list expands the single virtual
     // row into one output row per element/value.
     let srf_call = find_srf(statement.items);
-    let count = match srf_max_count(
+    let project_set = match prepare_project_set(
         statement.items,
+        storage,
+        txid,
         arena,
         params,
         &super::eval::NoColumns,
         &hooks,
     ) {
-        Ok(n) => n,
+        Ok(project_set) => project_set,
         Err(e) => return sql_fail(e),
     };
     responder.row_description(&columns[..n])?;
@@ -3856,8 +3908,19 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         for (i, item) in statement.items.iter().enumerate() {
             col_start[i] = col;
             col += match item {
-                SelectItem::RecordStar(base) => {
-                    super::exec::record_shape(base, &super::exec::NoCols, |_, _| {}).unwrap_or(0)
+                SelectItem::RecordStar(_) => {
+                    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    match super::exec::describe_items(
+                        core::slice::from_ref(item),
+                        None,
+                        None,
+                        Some(storage),
+                        txid,
+                        &mut described,
+                    ) {
+                        Ok(width) => width,
+                        Err(error) => return sql_fail(error),
+                    }
                 }
                 _ => 1,
             };
@@ -3901,16 +3964,17 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
 
     // Materialize every output row (visible values + hidden sort keys).
     let mut n_rows = 0usize;
-    let max_rows = count;
+    let max_rows = project_set.count;
     let empty: &[u8] = &[];
     let encoded = match arena.alloc_slice_with(max_rows, |_| empty) {
         Ok(e) => e,
         Err(_) => return sql_fail(arena_full()),
     };
-    for k in 1..=count {
-        let khooks = if srf_call.is_some() {
+    for k in 1..=project_set.count {
+        let khooks = if srf_call.is_some() || project_set.any {
             EvalHooks {
                 srf_index: Some(k),
+                project_sets: Some(project_set.values),
                 ..hooks
             }
         } else {
@@ -4233,7 +4297,9 @@ fn select_into_rows_mode<'a>(
     // ORDER BY and dedups DISTINCT) and emit each output row, honoring
     // LIMIT/OFFSET. A set-returning function expands after aggregation —
     // rewrite to the two-level form first.
-    if (!statement.group_by.is_empty() || n_aggs > 0) && find_srf(statement.items).is_some() {
+    if (!statement.group_by.is_empty() || n_aggs > 0)
+        && has_project_set(statement.items, storage, txid)
+    {
         let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
         return select_into_rows_mode(
             storage,
@@ -4275,6 +4341,7 @@ fn select_into_rows_mode<'a>(
                 windows: None,
                 catalog: Some(&catalog),
                 srf_index: None,
+                project_sets: None,
             };
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
@@ -4352,6 +4419,7 @@ fn select_into_rows_mode<'a>(
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
+            project_sets: None,
             sequences: seq,
         };
         let (rows, width) = grouped_rows(
@@ -4439,15 +4507,18 @@ fn select_into_rows_mode<'a>(
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
+            project_sets: None,
             sequences: seq,
         };
         let srf_call = find_srf(statement.items);
-        let count = srf_max_count(statement.items, arena, params, &cols, &hooks)?;
+        let project_set =
+            prepare_project_set(statement.items, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
-        for k in 1..=count {
-            let khooks = if srf_call.is_some() {
+        for k in 1..=project_set.count {
+            let khooks = if srf_call.is_some() || project_set.any {
                 EvalHooks {
                     srf_index: Some(k),
+                    project_sets: Some(project_set.values),
                     ..hooks
                 }
             } else {
@@ -4506,6 +4577,7 @@ fn select_into_rows_mode<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: seq,
     };
 
@@ -4749,15 +4821,44 @@ fn select_into_rows_mode<'a>(
             None => &hooks,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
-        match srf_call {
-            None => {
+        let project_set = prepare_project_set(
+            statement.items,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            row_hooks,
+        )?;
+        if !project_set.any && srf_call.is_none() {
+            let n = project_row(
+                statement.items,
+                &scope,
+                row,
+                arena,
+                params,
+                row_hooks,
+                &mut projected,
+                outer,
+            )?;
+            if produced >= offset {
+                emit(&projected[..n])?;
+            }
+            produced = produced.saturating_add(1);
+        } else {
+            for k in 1..=project_set.count {
+                let srf_hooks = EvalHooks {
+                    srf_index: Some(k),
+                    project_sets: Some(project_set.values),
+                    ..*row_hooks
+                };
                 let n = project_row(
                     statement.items,
                     &scope,
                     row,
                     arena,
                     params,
-                    row_hooks,
+                    &srf_hooks,
                     &mut projected,
                     outer,
                 )?;
@@ -4765,31 +4866,8 @@ fn select_into_rows_mode<'a>(
                     emit(&projected[..n])?;
                 }
                 produced = produced.saturating_add(1);
-            }
-            Some(c) => {
-                let count = srf_count(c, arena, params, row, row_hooks)?;
-                for k in 1..=count {
-                    let srf_hooks = EvalHooks {
-                        srf_index: Some(k),
-                        ..*row_hooks
-                    };
-                    let n = project_row(
-                        statement.items,
-                        &scope,
-                        row,
-                        arena,
-                        params,
-                        &srf_hooks,
-                        &mut projected,
-                        outer,
-                    )?;
-                    if produced >= offset {
-                        emit(&projected[..n])?;
-                    }
-                    produced = produced.saturating_add(1);
-                    if produced >= stop_after {
-                        break;
-                    }
+                if produced >= stop_after {
+                    break;
                 }
             }
         }
@@ -5137,7 +5215,8 @@ pub fn describe_catalog_items_as<'q>(
     // descriptor pass: static inference deliberately cannot reconstruct that
     // information from an expression such as `(composite_array[1]).field`.
     let mut count = 0;
-    for item in items {
+    let mut item_width = [0usize; MAX_PROJ];
+    for (item_index, item) in items.iter().enumerate() {
         if let SelectItem::Expr { expression, alias } = item
             && let Some(description) = user_type_expression_description(
                 expression,
@@ -5154,9 +5233,10 @@ pub fn describe_catalog_items_as<'q>(
             }
             out[count] = description;
             count += 1;
+            item_width[item_index] = 1;
             continue;
         }
-        count += describe_items(
+        let width = describe_items(
             core::slice::from_ref(item),
             definition,
             alias,
@@ -5164,20 +5244,18 @@ pub fn describe_catalog_items_as<'q>(
             txid,
             &mut out[count..],
         )?;
+        count += width;
+        item_width[item_index] = width;
     }
     let mut column = 0;
-    for item in items {
+    for (item_index, item) in items.iter().enumerate() {
         match item {
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |table| table.n_columns);
             }
             SelectItem::RecordStar(base) => {
-                let resolver: &dyn super::exec::ColTypeResolver = match definition {
-                    Some(definition) => &super::exec::AliasedDefCols { definition, alias },
-                    None => &super::exec::NoCols,
-                };
-                column += super::exec::record_shape(base, resolver, |_, _| {})
-                    .expect("described record star has a static shape");
+                let _ = base;
+                column += item_width[item_index];
             }
             SelectItem::Expr { expression, alias } => {
                 if let Some(description) = user_type_expression_description(
@@ -6091,11 +6169,28 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
         let routine = self
             .storage
-            .routine_for_call_oids(name, arguments, self.txid)?;
+            .function_for_call_oids(name, arguments, self.txid)?;
         Some((
             self.storage
                 .routine_function_result_oid(&routine, self.txid)?,
             routine.kind.function_result()?.typlen(),
+        ))
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+        let slot = self
+            .storage
+            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let routine = self.storage.routine_for(slot, self.txid);
+        let column = routine.table_columns()?.get(index)?;
+        Some((
+            crate::util::StackStr::from_str(column.name.as_str()),
+            column.ctype,
         ))
     }
 
@@ -6256,6 +6351,7 @@ pub fn first_from_match<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: None,
     };
     let mut found = false;

@@ -985,6 +985,7 @@ fn subquery_exists<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: None,
     };
 
@@ -1114,7 +1115,7 @@ fn correlation_schema<'a>(
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
     let references_outer =
-        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.func_args.is_some();
+        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.is_function_source();
     if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
         return Ok(None);
     }
@@ -1193,6 +1194,13 @@ fn table_ref_has_outer_ref<'a>(
     if let Some(arguments) = table.func_args {
         for argument in arguments {
             if expr_has_outer_ref(argument, chain, storage, txid, arena)? {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(functions) = table.rows_from {
+        for function in functions {
+            if table_ref_has_outer_ref(function, chain, storage, txid, arena)? {
                 return Ok(true);
             }
         }
@@ -1769,7 +1777,7 @@ fn run_subquery<'a>(
     // A set-returning function in the subquery's select list expands to many
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
-    let has_srf = super::srf::find_srf(select.items).is_some();
+    let has_srf = super::srf::has_project_set(select.items, storage, txid);
     if !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
@@ -1854,6 +1862,7 @@ fn run_subquery<'a>(
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
+        project_sets: None,
         sequences: None,
     };
 
@@ -1992,6 +2001,7 @@ fn run_subquery<'a>(
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,
+            project_sets: None,
             sequences: hooks.sequences,
         };
         let schema = ScopeSchema(&scope);

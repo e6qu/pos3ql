@@ -9,7 +9,7 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
+use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
 /// Pieces one `string_to_table` call may split into.
@@ -47,15 +47,26 @@ pub(super) fn is_srf_name(name: &str) -> bool {
 /// The set-returning function call (if any) driving a single expression's
 /// expansion — the outermost SRF reachable through wrapping expressions.
 pub(super) fn srf_in_expr<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
-    match e {
-        Expr::Call { name, .. } if is_srf_name(name) => Some(e),
-        Expr::Field { base, .. } => srf_in_expr(base),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => srf_in_expr(operand),
-        Expr::Unary { operand, .. } => srf_in_expr(operand),
-        Expr::Binary { left, right, .. } => srf_in_expr(left).or_else(|| srf_in_expr(right)),
-        Expr::Call { args, .. } => args.iter().find_map(|a| srf_in_expr(a)),
-        _ => None,
+    let mut found = None;
+    let _ = for_each_srf(e, &mut |call| {
+        if found.is_none() {
+            found = Some(call);
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Visits the independently lockstepped outer SRFs in one target expression.
+/// Nested calls belong to the lower project-set level owned by their parent.
+fn for_each_srf<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if matches!(expression, Expr::Call { name, .. } if is_srf_name(name)) {
+        return visit(expression);
     }
+    super::walk_children(expression, &mut |child| for_each_srf(child, visit))
 }
 
 /// The SRF (if any) driving a single select item's expansion.
@@ -73,25 +84,339 @@ pub(super) fn find_srf<'a>(items: &'a [SelectItem<'a>]) -> Option<&'a Expr<'a>> 
     items.iter().find_map(srf_in_item)
 }
 
-/// The number of output rows a select list's set-returning functions expand to:
-/// the maximum length over all of them (each shorter one NULL-pads), matching
-/// PostgreSQL's lockstep evaluation. Returns 1 when there is no SRF.
-pub(super) fn srf_max_count<'a, R: ColumnLookup<'a>>(
+/// Whether a SELECT list contains a built-in or catalog set-returning call.
+/// This is a planning predicate: overload selection still happens at the
+/// typed execution boundary once the input row is available.
+fn expression_has_project_set(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call { name, args, .. } = expression
+        && (is_srf_name(name) || storage.has_set_routine_candidate(name, args.len(), txid))
+    {
+        return true;
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found |= expression_has_project_set(child, storage, txid);
+        Ok(())
+    });
+    found
+}
+
+pub(super) fn has_project_set(items: &[SelectItem<'_>], storage: &Storage, txid: u32) -> bool {
+    items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expression_has_project_set(expression, storage, txid)
+        }
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+    })
+}
+
+pub(super) struct ProjectSet<'a> {
+    pub count: usize,
+    pub values: &'a [ProjectSetValue<'a>],
+    pub any: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     items: &'a [SelectItem<'a>],
+    storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &R,
     hooks: &EvalHooks<'_, 'a>,
-) -> Result<usize, SqlError> {
-    let mut any = false;
+) -> Result<ProjectSet<'a>, SqlError> {
+    let empty = ProjectSetValue {
+        node: core::ptr::null(),
+        values: &[],
+        fixed_index: None,
+    };
+    let mut materialized = [empty; MAX_PROJ];
+    let mut materialized_count = 0usize;
     let mut max = 0usize;
-    for item in items {
-        if let Some(call) = srf_in_item(item) {
-            max = max.max(srf_count(call, arena, params, row, hooks)?);
-            any = true;
+    let mut any = false;
+
+    fn visit<'a, R: ColumnLookup<'a>>(
+        expression: &'a Expr<'a>,
+        storage: &'a Storage,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &R,
+        hooks: &EvalHooks<'_, 'a>,
+        materialized: &mut [ProjectSetValue<'a>; MAX_PROJ],
+        materialized_count: &mut usize,
+        max: &mut usize,
+        any: &mut bool,
+    ) -> Result<(), SqlError> {
+        let Expr::Call { name, args, .. } = expression else {
+            return super::walk_children(expression, &mut |child| {
+                visit(
+                    child,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                    materialized,
+                    materialized_count,
+                    max,
+                    any,
+                )
+            });
+        };
+        let built_in = is_srf_name(name);
+        let catalog = storage.has_set_routine_candidate(name, args.len(), txid);
+        if !built_in && !catalog {
+            return super::walk_children(expression, &mut |child| {
+                visit(
+                    child,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                    materialized,
+                    materialized_count,
+                    max,
+                    any,
+                )
+            });
         }
+        if *materialized_count == materialized.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "select list has too many set-returning functions"
+            ));
+        }
+        let values = materialize_call(expression, storage, txid, arena, params, row, hooks)?;
+        materialized[*materialized_count] = ProjectSetValue {
+            node: expression as *const Expr<'a> as *const (),
+            values,
+            fixed_index: None,
+        };
+        *materialized_count += 1;
+        *max = (*max).max(values.len());
+        *any = true;
+        Ok(())
     }
-    Ok(if any { max } else { 1 })
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_call<'a, R: ColumnLookup<'a>>(
+        expression: &'a Expr<'a>,
+        storage: &'a Storage,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &R,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        let Expr::Call { args, .. } = expression else {
+            unreachable!("project-set materialization requires a call")
+        };
+        let empty = ProjectSetValue {
+            node: core::ptr::null(),
+            values: &[],
+            fixed_index: None,
+        };
+        let mut nested = [empty; MAX_PROJ];
+        let mut nested_count = 0usize;
+        let mut nested_max = 0usize;
+        let mut nested_any = false;
+        for argument in *args {
+            visit(
+                argument,
+                storage,
+                txid,
+                arena,
+                params,
+                row,
+                hooks,
+                &mut nested,
+                &mut nested_count,
+                &mut nested_max,
+                &mut nested_any,
+            )?;
+        }
+        if !nested_any {
+            return materialize_direct(expression, storage, txid, arena, params, row, hooks);
+        }
+
+        const EMPTY_VALUES: &[Datum<'_>] = &[];
+        let chunks = arena
+            .alloc_slice_with(nested_max, |_| EMPTY_VALUES)
+            .map_err(|_| arena_full())?;
+        let mut total = 0usize;
+        for (offset, chunk) in chunks.iter_mut().enumerate() {
+            let mut selected = nested;
+            for value in &mut selected[..nested_count] {
+                value.fixed_index = Some(offset + 1);
+            }
+            let selected_hooks = EvalHooks {
+                project_sets: Some(&selected[..nested_count]),
+                ..*hooks
+            };
+            *chunk = materialize_direct(
+                expression,
+                storage,
+                txid,
+                arena,
+                params,
+                row,
+                &selected_hooks,
+            )?;
+            total = total.checked_add(chunk.len()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested set-returning function result is too large"
+                )
+            })?;
+        }
+        let values = arena
+            .alloc_slice_with(total, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let mut at = 0usize;
+        for chunk in chunks {
+            values[at..at + chunk.len()].copy_from_slice(chunk);
+            at += chunk.len();
+        }
+        Ok(values)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_direct<'a, R: ColumnLookup<'a>>(
+        expression: &'a Expr<'a>,
+        storage: &'a Storage,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &R,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        let Expr::Call { name, args, .. } = expression else {
+            unreachable!("project-set materialization requires a call")
+        };
+        if is_srf_name(name) {
+            let count = srf_count(expression, arena, params, row, hooks)?;
+            let values = arena
+                .alloc_slice_with(count, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (offset, value) in values.iter_mut().enumerate() {
+                let indexed_hooks = EvalHooks {
+                    srf_index: Some(offset + 1),
+                    ..*hooks
+                };
+                *value = eval_full(expression, arena, params, row, &indexed_hooks)?;
+            }
+            return Ok(values);
+        }
+
+        let (schema, table) = name
+            .split_once('.')
+            .map_or((None, *name), |(schema, table)| (Some(schema), table));
+        let source = arena
+            .alloc(TableRef {
+                schema,
+                table,
+                alias: None,
+                subquery: None,
+                func_args: Some(args),
+                rows_from: None,
+                col_alias: None,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+                authorization_role: None,
+            })
+            .map_err(|_| arena_full())?;
+        let Some((_, routine)) =
+            table_func_routine(source, storage, txid, arena, params, row, Some(hooks))?
+        else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {}(...) does not exist",
+                name
+            ));
+        };
+        let rows = table_func_rows_outer(
+            source,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            Some(hooks),
+            None,
+            None,
+        )?;
+        let values = arena
+            .alloc_slice_with(rows.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        if let Some(columns) = routine.table_columns() {
+            for (value, encoded) in values.iter_mut().zip(rows) {
+                let mut decoded = [crate::sql::types::RecordField {
+                    name: "",
+                    type_oid: 0,
+                    value: Datum::Null,
+                }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (index, column) in columns.iter().enumerate() {
+                    decoded[index] = crate::sql::types::RecordField {
+                        name: column.name.as_str(),
+                        type_oid: storage
+                            .routine_type_oid(column.ctype, column.user_type, txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "routine result type is absent from the catalog"
+                                )
+                            })?,
+                        value: crate::sql::exec::decode_projected_col_record(
+                            encoded, index, arena,
+                        )?,
+                    };
+                }
+                let fields = arena
+                    .alloc_slice_copy(&decoded[..columns.len()])
+                    .map_err(|_| arena_full())?;
+                *value = Datum::Record(fields);
+            }
+        } else {
+            for (value, encoded) in values.iter_mut().zip(rows) {
+                *value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            }
+        }
+        Ok(values)
+    }
+
+    for item in items {
+        let expression = match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => continue,
+        };
+        visit(
+            expression,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            hooks,
+            &mut materialized,
+            &mut materialized_count,
+            &mut max,
+            &mut any,
+        )?;
+    }
+    let values = arena
+        .alloc_slice_copy(&materialized[..materialized_count])
+        .map_err(|_| arena_full())?;
+    Ok(ProjectSet {
+        count: if any { max } else { 1 },
+        values,
+        any,
+    })
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -602,6 +927,63 @@ pub(super) fn table_func_def<'a>(
     )
 }
 
+fn table_function_column(
+    name: SqlName,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+    type_mod: i32,
+    collation: crate::sql::ast::Collation,
+) -> ColumnMeta {
+    ColumnMeta {
+        name,
+        ctype,
+        user_type,
+        type_mod,
+        collation: if ctype.is_collatable() {
+            match collation {
+                crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
+                resolved => resolved,
+            }
+        } else {
+            crate::sql::ast::Collation::None
+        },
+        ..ColumnMeta::EMPTY
+    }
+}
+
+fn table_function_array_element_type(
+    storage: &Storage,
+    txid: u32,
+    element: crate::sql::types::ArrElem,
+) -> (ColType, Option<crate::storage::UserTypeName>) {
+    use crate::sql::types::ArrElem;
+    let user_type = match element {
+        ArrElem::Domain { slot, .. } => {
+            let domain = storage.domain(slot as usize).definition_for(txid);
+            Some(crate::storage::UserTypeName {
+                schema: domain.schema,
+                name: domain.name,
+            })
+        }
+        ArrElem::Enum(slot) => {
+            let definition = storage.enum_for(slot as usize, txid);
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            })
+        }
+        ArrElem::Composite(slot) => {
+            let definition = storage.composite_for(slot as usize, txid);
+            Some(crate::storage::UserTypeName {
+                schema: definition.schema,
+                name: definition.name,
+            })
+        }
+        _ => None,
+    };
+    (element.to_coltype(), user_type)
+}
+
 /// [`table_func_def`] with column types supplied by an enclosing row or the
 /// preceding FROM items. PostgreSQL table-function arguments are implicitly
 /// lateral, so their result type must be resolvable before a value exists for
@@ -614,6 +996,9 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
 ) -> Result<&'a TableDef, SqlError> {
+    if let Some(functions) = tref.rows_from {
+        return rows_from_def_outer(tref, functions, storage, txid, arena, params, columns);
+    }
     let is_gs = tref.table.eq_ignore_ascii_case("generate_series");
     let is_unnest = tref.table.eq_ignore_ascii_case("unnest");
     let is_re = tref.table.eq_ignore_ascii_case("regexp_matches");
@@ -643,7 +1028,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let routine = if built_in {
         None
     } else {
-        table_func_routine(tref, storage, txid, arena, params, columns)?
+        table_func_routine(tref, storage, txid, arena, params, columns, None)?
     };
     if !built_in && routine.is_none() {
         return Err(sql_err!(
@@ -653,48 +1038,68 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         ));
     }
     let name = tref.alias.unwrap_or(tref.table);
-    let blank = ColumnMeta {
-        name: SqlName::parse("").expect("empty name is valid"),
-        ctype: ColType::Bool,
-        type_mod: -1,
-        collation: crate::sql::ast::Collation::None,
-        not_null: false,
-        unique: false,
-        primary: false,
-        auto_increment: false,
-        default: crate::storage::ColumnDefault::NONE,
-        is_identity: false,
-        identity_always: false,
-        auto_increment_step: 1,
-        user_type: None,
-    };
     // Each supported function's output columns: `key`/`value` for the `each`
     // family (two columns), a single column named per the function otherwise.
     // generate_series yields its resolved overload type; regexp_matches yields
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
-    let mut default_cols: [(SqlName, ColType); MAX_COLUMNS] =
-        [(SqlName::EMPTY, ColType::Bool); MAX_COLUMNS];
+    let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
     let n_default = if let Some((_, routine)) = routine {
         if let Some(output) = routine.table_columns() {
             for (slot, column) in output.iter().enumerate() {
-                default_cols[slot] = (column.name, column.ctype);
+                default_cols[slot] = table_function_column(
+                    column.name,
+                    column.ctype,
+                    column.user_type,
+                    -1,
+                    crate::sql::ast::Collation::None,
+                );
             }
             output.len()
         } else {
-            default_cols[0] = (
+            default_cols[0] = table_function_column(
                 SqlName::parse(name)?,
                 routine.kind.function_result().expect("set routine result"),
+                routine.kind.function_result().and(match routine.kind {
+                    crate::storage::RoutineKind::SetFunction { result } => result.user_type,
+                    _ => None,
+                }),
+                -1,
+                crate::sql::ast::Collation::None,
             );
             1
         }
     } else if is_sequence_data {
-        default_cols[0] = (SqlName::parse("last_value")?, ColType::Int8);
-        default_cols[1] = (SqlName::parse("is_called")?, ColType::Bool);
+        default_cols[0] = table_function_column(
+            SqlName::parse("last_value")?,
+            ColType::Int8,
+            None,
+            -1,
+            crate::sql::ast::Collation::None,
+        );
+        default_cols[1] = table_function_column(
+            SqlName::parse("is_called")?,
+            ColType::Bool,
+            None,
+            -1,
+            crate::sql::ast::Collation::None,
+        );
         2
     } else if is_options {
-        default_cols[0] = (SqlName::parse("option_name")?, ColType::Text);
-        default_cols[1] = (SqlName::parse("option_value")?, ColType::Text);
+        default_cols[0] = table_function_column(
+            SqlName::parse("option_name")?,
+            ColType::Text,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
+        default_cols[1] = table_function_column(
+            SqlName::parse("option_value")?,
+            ColType::Text,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
         2
     } else if is_each {
         let value_type = if tref.table.eq_ignore_ascii_case("json_each") {
@@ -704,9 +1109,62 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         } else {
             ColType::Text // json_each_text / jsonb_each_text
         };
-        default_cols[0] = (SqlName::parse("key")?, ColType::Text);
-        default_cols[1] = (SqlName::parse("value")?, value_type);
+        default_cols[0] = table_function_column(
+            SqlName::parse("key")?,
+            ColType::Text,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
+        default_cols[1] = table_function_column(
+            SqlName::parse("value")?,
+            value_type,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
         2
+    } else if is_unnest {
+        let args = tref.func_args.unwrap_or(&[]);
+        if args.is_empty() {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function unnest() does not exist"
+            ));
+        }
+        if args.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "UNNEST output exceeds configured column capacity"
+            ));
+        }
+        for (index, argument) in args.iter().enumerate() {
+            let element = match crate::sql::eval::static_type_pub(argument, columns) {
+                Some(ColType::Array(element)) => element,
+                Some(_) => crate::sql::types::ArrElem::Text,
+                None => match crate::sql::eval::eval(argument, arena, params, columns)? {
+                    Datum::Array { element, .. } => element,
+                    _ => crate::sql::types::ArrElem::Text,
+                },
+            };
+            let (ctype, user_type) = table_function_array_element_type(storage, txid, element);
+            let type_mod = match argument {
+                Expr::Cast { type_mod, .. } => *type_mod,
+                _ => -1,
+            };
+            default_cols[index] = table_function_column(
+                SqlName::parse("unnest")?,
+                ctype,
+                user_type,
+                type_mod,
+                if ctype.is_collatable() {
+                    crate::sql::eval::resolved_expression_collation(argument, columns)?
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            );
+        }
+        args.len()
     } else {
         let single_type = if is_gs {
             let arguments = tref.func_args.unwrap_or(&[]);
@@ -716,7 +1174,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             let has_numeric = arguments.iter().any(|argument| {
                 crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Numeric)
             });
-            crate::sql::eval::generate_series_result_type(start, has_numeric)
+            let has_int8 = arguments.iter().any(|argument| {
+                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Int8)
+            });
+            crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
         } else if is_re {
@@ -747,9 +1208,16 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         };
         // A single-column function's default column name is `value` for
         // array_elements, else the (aliased) function name.
-        default_cols[0] = (
+        default_cols[0] = table_function_column(
             SqlName::parse(if is_elems { "value" } else { name })?,
             single_type,
+            None,
+            -1,
+            if single_type.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
         );
         1
     };
@@ -771,23 +1239,17 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             aliases.len()
         ));
     }
-    let mut columns = [blank; MAX_COLUMNS];
-    for (i, (default_name, ctype)) in default_cols[..n_default].iter().enumerate() {
+    let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+    for (i, default) in default_cols[..n_default].iter().enumerate() {
         let col_name = tref
             .col_alias
             .and_then(|a| a.get(i).copied())
             .map(SqlName::parse)
             .transpose()?
-            .unwrap_or(*default_name);
+            .unwrap_or(default.name);
         columns[i] = ColumnMeta {
             name: col_name,
-            ctype: *ctype,
-            collation: if ctype.is_collatable() {
-                crate::sql::ast::Collation::Default
-            } else {
-                crate::sql::ast::Collation::None
-            },
-            ..blank
+            ..*default
         };
     }
     if tref.with_ordinality {
@@ -800,7 +1262,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         columns[n_default] = ColumnMeta {
             name: col_name,
             ctype: ColType::Int8,
-            ..blank
+            ..ColumnMeta::EMPTY
         };
     }
     let def = TableDef {
@@ -810,6 +1272,70 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         ..TableDef::empty()
     };
     Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+}
+
+fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    functions: &'a [TableRef<'a>],
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<&'a TableDef, SqlError> {
+    if functions.is_empty() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "ROWS FROM must contain at least one function"
+        ));
+    }
+    let mut output = [ColumnMeta::EMPTY; MAX_COLUMNS];
+    let mut count = 0usize;
+    for function in functions {
+        let definition = table_func_def_outer(function, storage, txid, arena, params, columns)?;
+        if count + definition.n_columns > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "ROWS FROM output exceeds configured column capacity"
+            ));
+        }
+        output[count..count + definition.n_columns].copy_from_slice(definition.columns());
+        count += definition.n_columns;
+    }
+    if tref.with_ordinality {
+        if count == MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "ROWS FROM output exceeds configured column capacity"
+            ));
+        }
+        output[count] = ColumnMeta {
+            name: SqlName::parse("ordinality")?,
+            ctype: ColType::Int8,
+            ..ColumnMeta::EMPTY
+        };
+        count += 1;
+    }
+    if let Some(aliases) = tref.col_alias {
+        if aliases.len() > count {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "table has {} columns available but {} columns specified",
+                count,
+                aliases.len()
+            ));
+        }
+        for (column, alias) in output.iter_mut().zip(aliases) {
+            column.name = SqlName::parse(alias)?;
+        }
+    }
+    let definition = TableDef {
+        name: SqlName::parse(tref.alias.unwrap_or(""))?,
+        columns: output,
+        n_columns: count,
+        ..TableDef::empty()
+    };
+    Ok(&*arena.alloc(definition).map_err(|_| arena_full())?)
 }
 
 /// Whether `name` is one of the two-column `json_each` set-returning functions.
@@ -827,6 +1353,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
+    eval_hooks: Option<&EvalHooks<'_, 'a>>,
 ) -> Result<Option<(usize, &'a RoutineDef)>, SqlError> {
     use core::fmt::Write as _;
 
@@ -837,7 +1364,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&catalog),
-        ..crate::sql::eval::NO_HOOKS
+        ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
     };
     let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in args.iter().enumerate() {
@@ -887,6 +1414,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
+    eval_hooks: Option<&EvalHooks<'_, 'a>>,
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
@@ -897,6 +1425,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         arena,
         params,
         columns,
+        eval_hooks,
         invocations,
         statement_arena,
     )?;
@@ -929,10 +1458,28 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
+    eval_hooks: Option<&EvalHooks<'_, 'a>>,
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    if let Some(functions) = tref.rows_from {
+        return rows_from_base_rows_outer(
+            functions,
+            storage,
+            txid,
+            arena,
+            params,
+            columns,
+            eval_hooks,
+            invocations,
+            statement_arena,
+        );
+    }
     let args = tref.func_args.expect("table function carries arguments");
+    let eval_argument = |argument| match eval_hooks {
+        Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
+        None => crate::sql::eval::eval(argument, arena, params, columns),
+    };
     if tref.table.eq_ignore_ascii_case("pg_get_sequence_data") {
         if args.len() != 1 {
             return Err(sql_err!(
@@ -940,7 +1487,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "pg_get_sequence_data(...) argument count"
             ));
         }
-        let oid = match crate::sql::eval::eval(args[0], arena, params, columns)? {
+        let oid = match eval_argument(args[0])? {
             Datum::Int4(oid) => oid,
             Datum::Null => return Ok(&[]),
             other => {
@@ -973,7 +1520,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "pg_options_to_table(...) argument count"
             ));
         }
-        let raw = match crate::sql::eval::eval(args[0], arena, params, columns)? {
+        let raw = match eval_argument(args[0])? {
             Datum::Array {
                 element: crate::sql::types::ArrElem::Text,
                 raw,
@@ -1017,9 +1564,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[0], arena, params, columns,
-        )?) {
+        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -1052,9 +1597,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 args.len()
             ));
         }
-        let evaluate = |i: usize| {
-            crate::sql::eval::eval(args[i], arena, params, columns).map(crate::sql::eval::text_view)
-        };
+        let evaluate = |i: usize| eval_argument(args[i]).map(crate::sql::eval::text_view);
         let source = match evaluate(0)? {
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -1099,8 +1642,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             ));
         }
         let (src, pat) = match (
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?),
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?),
+            crate::sql::eval::text_view(eval_argument(args[0])?),
+            crate::sql::eval::text_view(eval_argument(args[1])?),
         ) {
             (Datum::Text(s), Datum::Text(p)) => (s, p),
             (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
@@ -1112,9 +1655,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
         };
         let case_insensitive = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(
-                args[2], arena, params, columns,
-            )?) {
+            match crate::sql::eval::text_view(eval_argument(args[2])?) {
                 Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
                 Datum::Null => return Ok(&[]),
                 _ => false,
@@ -1141,9 +1682,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "generate_subscripts(...) argument count"
             ));
         }
-        let raw = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[0], arena, params, columns,
-        )?) {
+        let raw = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Array { raw, .. } => raw,
             Datum::Null => return Ok(&[]),
             a => {
@@ -1153,9 +1692,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 ));
             }
         };
-        let dim = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[1], arena, params, columns,
-        )?) {
+        let dim = match crate::sql::eval::text_view(eval_argument(args[1])?) {
             Datum::Int4(v) => v as i64,
             Datum::Int8(v) => v,
             Datum::Null => return Ok(&[]),
@@ -1189,17 +1726,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "regexp_matches(...) argument count"
             ));
         }
-        let string =
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
-        let pattern =
-            crate::sql::eval::text_view(crate::sql::eval::eval(args[1], arena, params, columns)?);
+        let string = crate::sql::eval::text_view(eval_argument(args[0])?);
+        let pattern = crate::sql::eval::text_view(eval_argument(args[1])?);
         let (Datum::Text(string), Datum::Text(pattern)) = (string, pattern) else {
             return Ok(&[]);
         };
         let flags = if args.len() == 3 {
-            match crate::sql::eval::text_view(crate::sql::eval::eval(
-                args[2], arena, params, columns,
-            )?) {
+            match crate::sql::eval::text_view(eval_argument(args[2])?) {
                 Datum::Text(f) => f,
                 Datum::Null => return Ok(&[]),
                 _ => "",
@@ -1261,9 +1794,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         || tref.table.eq_ignore_ascii_case("json_object_keys")
     {
         let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[0], arena, params, columns,
-        )?) {
+        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -1312,9 +1843,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
         let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
             || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-        let text = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[0], arena, params, columns,
-        )?) {
+        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -1385,34 +1914,64 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         return Ok(&*rows);
     }
-    // unnest(array): one row per element.
+    // PostgreSQL's FROM-only multi-argument UNNEST advances all arrays in
+    // lockstep and NULL-pads the shorter inputs. A NULL array is empty; it
+    // does not suppress rows produced by another argument.
     if tref.table.eq_ignore_ascii_case("unnest") {
-        let (element, raw) = match crate::sql::eval::text_view(crate::sql::eval::eval(
-            args[0], arena, params, columns,
-        )?) {
-            Datum::Array { element, raw } => (element, raw),
-            Datum::Null => return Ok(&[]),
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "unnest requires an array argument"
-                ));
+        if args.is_empty() {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function unnest() does not exist"
+            ));
+        }
+        if args.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "UNNEST output exceeds configured column capacity"
+            ));
+        }
+        let mut arrays = [Datum::Null; MAX_COLUMNS];
+        let mut count = 0usize;
+        for (slot, argument) in arrays.iter_mut().zip(args) {
+            *slot = crate::sql::eval::text_view(eval_argument(argument)?);
+            match *slot {
+                Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
+                Datum::Null => {}
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "unnest requires an array argument"
+                    ));
+                }
             }
-        };
-        let count = crate::sql::array::len(raw);
+        }
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (i, slot) in rows.iter_mut().enumerate() {
-            let v = crate::sql::array::get(raw, element, i).unwrap_or(Datum::Null);
-            *slot = crate::sql::exec::encode_projected_pub(&[v], arena)?;
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            for (column, array) in arrays[..args.len()].iter().enumerate() {
+                values[column] = match *array {
+                    Datum::Array { element, raw } => {
+                        crate::sql::array::get(raw, element, row_index).unwrap_or(Datum::Null)
+                    }
+                    Datum::Null => Datum::Null,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "validated UNNEST input changed type"
+                        ));
+                    }
+                };
+            }
+            *row = crate::sql::exec::encode_projected_pub(&values[..args.len()], arena)?;
         }
         return Ok(&*rows);
     }
     if !tref.table.eq_ignore_ascii_case("generate_series") {
         let Some((routine_slot, routine)) =
-            table_func_routine(tref, storage, txid, arena, params, columns)?
+            table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
         else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1426,7 +1985,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let catalog = super::storage_catalog(storage, arena, txid);
         let hooks = crate::sql::eval::EvalHooks {
             catalog: Some(&catalog),
-            ..crate::sql::eval::NO_HOOKS
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
         };
         let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in args.iter().enumerate() {
@@ -1439,6 +1998,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             routine.body.as_str(),
             arena,
             scalar_result == Some(ColType::Void),
+            routine.name.as_str(),
+            routine.arguments(),
         )?;
         if super::routine_program_requires_mutable_execution(&program) {
             let (invocations, statement_arena) = match (invocations, statement_arena) {
@@ -1473,8 +2034,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Err(super::routine_forbidden_statement_error(statement));
             };
             let query = match statement {
-                crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(*query),
-                crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(*query),
+                crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(query),
+                crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
                 _ => unreachable!("mutable table routine was classified before execution"),
             };
             super::execute_routine_query(
@@ -1491,10 +2052,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             super::RoutineFunctionResult::Query(query) => query,
             super::RoutineFunctionResult::Void(statement) => match statement {
                 crate::sql::ast::Stmt::Select(query) => arena
-                    .alloc(super::RoutineQuery::Select(*query))
+                    .alloc(super::RoutineQuery::Select(query))
                     .map_err(|_| arena_full())?,
                 crate::sql::ast::Stmt::SetQuery(query) => arena
-                    .alloc(super::RoutineQuery::Set(*query))
+                    .alloc(super::RoutineQuery::Set(query))
                     .map_err(|_| arena_full())?,
                 _ => unreachable!("mutable table routine was classified before execution"),
             },
@@ -1585,11 +2146,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         ));
     }
     // Temporal series: a date/timestamp start with an interval step.
-    let start_val =
-        crate::sql::eval::text_view(crate::sql::eval::eval(args[0], arena, params, columns)?);
-    let stop_raw = crate::sql::eval::eval(args[1], arena, params, columns)?;
+    let start_val = crate::sql::eval::text_view(eval_argument(args[0])?);
+    let stop_raw = eval_argument(args[1])?;
     let step_raw = if args.len() == 3 {
-        crate::sql::eval::eval(args[2], arena, params, columns)?
+        eval_argument(args[2])?
     } else {
         Datum::Int4(1)
     };
@@ -1702,10 +2262,88 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     let rows = arena
         .alloc_slice_with(count, |_| EMPTY)
         .map_err(|_| arena_full())?;
+    let wide = matches!(start_val, Datum::Int8(_))
+        || matches!(stop_raw, Datum::Int8(_))
+        || matches!(step_raw, Datum::Int8(_));
     let mut v = start;
     for slot in rows.iter_mut() {
-        *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int8(v)], arena)?;
+        let value = if wide {
+            Datum::Int8(v)
+        } else {
+            Datum::Int4(v as i32)
+        };
+        *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
         v += step;
+    }
+    Ok(&*rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
+    functions: &'a [TableRef<'a>],
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    eval_hooks: Option<&EvalHooks<'_, 'a>>,
+    invocations: Option<&super::RoutineInvocationState<'a>>,
+    statement_arena: Option<&'a Arena>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    const EMPTY_ROWS: &[&[u8]] = &[];
+    let mut rows_by_function: [&[&[u8]]; crate::sql::parser::MAX_LIST] =
+        [EMPTY_ROWS; crate::sql::parser::MAX_LIST];
+    let mut widths = [0usize; crate::sql::parser::MAX_LIST];
+    let mut row_count = 0usize;
+    let mut total_width = 0usize;
+    for (index, function) in functions.iter().enumerate() {
+        let definition = table_func_def_outer(function, storage, txid, arena, params, columns)?;
+        widths[index] = definition.n_columns;
+        total_width = total_width
+            .checked_add(definition.n_columns)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "ROWS FROM output exceeds configured column capacity"
+                )
+            })?;
+        if total_width > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "ROWS FROM output exceeds configured column capacity"
+            ));
+        }
+        rows_by_function[index] = table_func_base_rows_outer(
+            function,
+            storage,
+            txid,
+            arena,
+            params,
+            columns,
+            eval_hooks,
+            invocations,
+            statement_arena,
+        )?;
+        row_count = row_count.max(rows_by_function[index].len());
+    }
+    const EMPTY: &[u8] = &[];
+    let rows = arena
+        .alloc_slice_with(row_count, |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (row_index, encoded) in rows.iter_mut().enumerate() {
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        let mut output_column = 0usize;
+        for function_index in 0..functions.len() {
+            let width = widths[function_index];
+            if let Some(row) = rows_by_function[function_index].get(row_index) {
+                for column in 0..width {
+                    values[output_column + column] =
+                        crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+                }
+            }
+            output_column += width;
+        }
+        *encoded = crate::sql::exec::encode_projected_pub(&values[..total_width], arena)?;
     }
     Ok(&*rows)
 }

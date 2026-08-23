@@ -4967,10 +4967,21 @@ impl Engine {
                 )));
             }
         };
+        let routine_name = match arena.alloc_str(routine.name.as_str()) {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement arena exhausted while invoking SQL function"
+                )));
+            }
+        };
         let program = match query::parse_routine_function_program(
             body,
             arena,
             result_type == ColType::Void,
+            routine_name,
+            routine.arguments(),
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
@@ -5034,11 +5045,22 @@ impl Engine {
                 )));
             }
         };
+        let routine_name = match arena.alloc_str(routine.name.as_str()) {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement arena exhausted while invoking SQL table function"
+                )));
+            }
+        };
         let result_type = routine.kind.function_result().expect("set routine result");
         let program = match query::parse_routine_function_program(
             body,
             arena,
             result_type == ColType::Void,
+            routine_name,
+            routine.arguments(),
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),

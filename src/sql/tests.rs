@@ -19,6 +19,123 @@ fn result_description_decodes_the_complete_builtin_array_inventory() {
     }
 }
 
+#[test]
+fn rows_from_zips_scalar_and_record_table_functions() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION rows_from_pair(start_value integer) \
+         RETURNS TABLE(item integer, label text) LANGUAGE SQL AS \
+         $$ SELECT start_value, 'first' UNION ALL \
+            SELECT start_value + 1, 'second' $$",
+    );
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT item, label, generated \
+           FROM ROWS FROM (rows_from_pair(4), generate_series(9,9)) \
+             AS rf(item, label, generated) \
+          ORDER BY item",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["4|first|9", "5|second|NULL"],
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+}
+
+#[test]
+fn project_set_counts_every_srf_inside_one_expression() {
+    let (mut engine, mut budget) = test_engine();
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT generate_series(1,2) + generate_series(10,12)",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["11", "13", "NULL"],
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+}
+
+#[test]
+fn nested_project_sets_form_distinct_execution_levels() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION nested_values(start_value integer) \
+         RETURNS SETOF integer LANGUAGE SQL AS \
+         $$ SELECT start_value UNION ALL SELECT start_value + 1 $$",
+    );
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT nested_values(nested_values(1))",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["1", "2", "2", "3"],
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT generate_series(generate_series(1,2), generate_series(2,3))",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["1", "2", "2", "3"],
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+}
+
+#[test]
+fn qualified_routine_dependencies_bind_string_arguments() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE SCHEMA qualified_srf");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION qualified_srf.text_values(start_value text) \
+         RETURNS SETOF text LANGUAGE SQL AS $$ SELECT start_value $$",
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW qualified_srf_view AS \
+         SELECT qualified_srf.text_values('kept') AS value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM qualified_srf_view"
+        )),
+        ["kept"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP FUNCTION qualified_srf.text_values(text)"
+        ))
+        .contains("2BP01")
+    );
+}
+
 fn test_config(name: &str) -> Config {
     let dir = std::env::temp_dir().join(format!("pos3ql-engine-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&dir);
@@ -12524,11 +12641,17 @@ fn sql_write_function_survives_wal_recovery() {
                AS 'INSERT INTO write_function_log VALUES ($1, $1 + 1) RETURNING value'; \
              CREATE FUNCTION recovered_set_void() RETURNS SETOF void LANGUAGE SQL \
                AS 'SELECT NULL UNION ALL SELECT NULL'; \
-             SELECT write_function_value(40)",
+             CREATE FUNCTION resolved_routine_arg(value integer) RETURNS integer LANGUAGE SQL \
+               AS 'SELECT resolved_routine_arg.value + value FROM (VALUES (2)) AS source(value)'; \
+             CREATE FUNCTION shadowed_routine_arg(value integer) RETURNS integer LANGUAGE SQL \
+               AS 'SELECT shadowed_routine_arg.value + value FROM (VALUES (2)) AS shadowed_routine_arg(value)'; \
+             SELECT write_function_value(40); \
+             SELECT resolved_routine_arg(40); \
+             SELECT shadowed_routine_arg(40)",
         );
         assert_eq!(
             data_rows(&setup),
-            ["42"],
+            ["42", "42", "4"],
             "{}",
             String::from_utf8_lossy(&setup)
         );
@@ -12540,13 +12663,14 @@ fn sql_write_function_survives_wal_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT write_function_value(41); \
+         SELECT resolved_routine_arg(41); \
          SELECT value FROM write_function_rows(42) AS result(value); \
          SELECT id, value FROM write_function_log ORDER BY id; \
          SELECT count(*) FROM recovered_set_void() AS result(value)",
     );
     assert_eq!(
         data_rows(&output),
-        ["43", "43", "40|41", "41|42", "42|43", "0"],
+        ["43", "43", "43", "40|41", "41|42", "42|43", "0"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -13029,6 +13153,133 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
     );
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
+    let mut config = test_config("rows-from-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.work_arena_bytes = 16 << 20;
+    config.object_store_namespace = format!("rows-from-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION durable_rows(start_value integer) \
+               RETURNS TABLE(item integer, label varchar(4)) LANGUAGE SQL AS \
+               $$ SELECT start_value, 'one'::varchar(4) UNION ALL \
+                  SELECT start_value + 1, 'two'::varchar(4) $$",
+        );
+        let target_set = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT durable_rows(7), generate_series(20,22); \
+             SELECT * FROM durable_rows(7); \
+             SELECT (durable_rows(7)).*",
+        );
+        assert_eq!(
+            data_rows(&target_set),
+            [
+                "(7,one)|20",
+                "(8,two)|21",
+                "NULL|22",
+                "7|one",
+                "8|two",
+                "7|one",
+                "8|two",
+            ],
+            "{}",
+            String::from_utf8_lossy(&target_set)
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let viewed = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE VIEW durable_rows_view AS \
+               SELECT item, label, generated, ordinality \
+                 FROM ROWS FROM (durable_rows(7), generate_series(20,20)) \
+                WITH ORDINALITY AS r(item,label,generated,ordinality)",
+        );
+        let target_view = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE VIEW durable_target_set_view AS \
+               SELECT durable_rows(9) AS value, generate_series(30,32) AS generated",
+        );
+        assert!(
+            String::from_utf8_lossy(&target_view).contains("CREATE VIEW"),
+            "{}",
+            String::from_utf8_lossy(&target_view)
+        );
+        assert!(
+            String::from_utf8_lossy(&viewed).contains("CREATE VIEW"),
+            "{}",
+            String::from_utf8_lossy(&viewed)
+        );
+        let visible = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM durable_rows_view ORDER BY ordinality",
+        );
+        assert_eq!(
+            data_rows(&visible),
+            ["7|one|20|1", "8|two|NULL|2"],
+            "{}",
+            String::from_utf8_lossy(&visible)
+        );
+        let copied = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_rows_copy AS SELECT * FROM durable_rows_view",
+            16 << 20,
+        );
+        assert!(
+            !String::from_utf8_lossy(&copied).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&copied)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    for relation in ["durable_rows_view", "durable_rows_copy"] {
+        let rows = run_with(
+            &mut recovered,
+            &mut budget,
+            &format!(
+                "SELECT item, label, generated, ordinality FROM {relation} ORDER BY ordinality"
+            ),
+        );
+        assert_eq!(
+            data_rows(&rows),
+            ["7|one|20|1", "8|two|NULL|2"],
+            "{}",
+            String::from_utf8_lossy(&rows)
+        );
+    }
+    let target_rows = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT value, generated FROM durable_target_set_view ORDER BY generated",
+    );
+    assert_eq!(
+        data_rows(&target_rows),
+        ["(9,one)|30", "(10,two)|31", "NULL|32"],
+        "{}",
+        String::from_utf8_lossy(&target_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -28604,6 +28855,28 @@ fn copy_query_to_stdout() {
         "text rows: {text}"
     );
     assert!(text.contains("COPY 2"), "command tag: {text}");
+
+    // Query COPY executes the same expanded stored definition it describes.
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW cq_rows AS \
+         SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'])) \
+         WITH ORDINALITY AS r(series,label,ordinality)",
+    );
+    let out = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT * FROM cq_rows ORDER BY ordinality) TO STDOUT",
+        16 << 20,
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !message_types(&out).contains(&b'E')
+            && text.contains("1\tx\t1")
+            && text.contains("2\t\\N\t2"),
+        "expanded view COPY: {text}"
+    );
 
     // Catalog aliases must render their catalog text in query COPY, rather
     // than leaking their backing OID or degrading to an ordinary integer.

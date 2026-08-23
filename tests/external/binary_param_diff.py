@@ -60,6 +60,10 @@ RESULT_CASES = [
     "SELECT 'empty'::int4range",
     "SELECT '{[1,3),[5,7)}'::int4multirange",
     "SELECT ROW(42::int4, NULL::text)",
+    "SELECT * FROM unnest(ARRAY[1::int4,2], ARRAY['a'::varchar(3)]) AS u(id,label) ORDER BY id",
+    "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'::varchar(2)])) "
+    "WITH ORDINALITY AS r(series,label,ordinality) ORDER BY ordinality",
+    "SELECT binary_result_values(4), generate_series(10,12)",
 ]
 
 
@@ -72,7 +76,7 @@ def run_case(conn, sql, param):
 def run_result_case(conn, sql):
     cur = conn.cursor()
     cur.execute(sql, binary=True)
-    return cur.fetchone()[0]
+    return cur.fetchall()
 
 
 def main():
@@ -84,6 +88,13 @@ def main():
 
     pg = connect(args.host, args.pg)
     p3 = connect(args.host, args.p3)
+
+    setup = (
+        "CREATE FUNCTION binary_result_values(integer) RETURNS SETOF integer "
+        "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'"
+    )
+    pg.execute(setup)
+    p3.execute(setup)
 
     fails = 0
     for sql, param in CASES:

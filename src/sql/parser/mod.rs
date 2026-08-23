@@ -2611,6 +2611,11 @@ impl<'a> Parser<'a> {
     /// after the `TYPE` keyword.
     fn alter_column_type(&mut self, column: &'a str) -> Result<AlterAction<'a>, ParseError> {
         let (type_name, type_mod) = self.type_name_mod()?;
+        let collation = if self.eat_ident("collate")? {
+            Some(self.collation_name()?)
+        } else {
+            None
+        };
         let using = if self.eat_ident("using")? {
             Some(self.expression(0)?)
         } else {
@@ -2620,6 +2625,7 @@ impl<'a> Parser<'a> {
             column,
             type_name,
             type_mod,
+            collation,
             using,
         })
     }

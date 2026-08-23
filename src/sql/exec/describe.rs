@@ -9,8 +9,8 @@
 //! here rather than part-way through a scan.
 
 use crate::sql::ast::{Expr, SelectItem};
-use crate::sql::eval::{ColumnLookup, SqlError, resolved_expression_collation, sqlstate};
-use crate::sql::types::{ColDesc, ColType, Datum, oid};
+use crate::sql::eval::{ColumnLookup, SqlError, described_expression_collation, sqlstate};
+use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum, oid};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
@@ -118,29 +118,42 @@ pub fn describe_items<'q>(
                     typlen = -1;
                 }
                 let name = alias.unwrap_or(derived_name(expression));
-                let type_mod = output_type_mod(expression, |column| {
-                    def.and_then(|d| d.columns().iter().find(|c| c.name.as_str() == column))
-                        .map_or(-1, |c| c.type_mod)
-                });
+                let field_meta = match expression {
+                    Expr::Field { base, field } => {
+                        record_field_metadata(base, field, resolver).ok()
+                    }
+                    _ => None,
+                };
+                let type_mod = field_meta.map_or_else(
+                    || {
+                        output_type_mod(expression, |column| {
+                            def.and_then(|d| d.columns().iter().find(|c| c.name.as_str() == column))
+                                .map_or(-1, |c| c.type_mod)
+                        })
+                    },
+                    |meta| meta.type_mod,
+                );
                 let mut description = ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod);
-                if let (Some(definition), Some(ctype)) = (def, coltype_of_oid(type_oid))
-                    && ctype.is_collatable()
-                {
-                    description.collation = resolved_expression_collation(
-                        expression,
-                        &AliasedDefCols {
-                            definition,
-                            alias: table_alias,
-                        },
-                    )?;
-                } else if matches!(expression, Expr::Collate { .. }) {
-                    description.collation =
-                        resolved_expression_collation(expression, &NoColumnLookup)?;
+                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable) {
+                    let metadata = match def {
+                        Some(definition) => described_expression_collation(
+                            expression,
+                            &AliasedDefCols {
+                                definition,
+                                alias: table_alias,
+                            },
+                        )?,
+                        None => described_expression_collation(expression, &NoColumnLookup)?,
+                    };
+                    (description.collation, description.collation_derivation) = metadata;
+                } else if let Some(meta) = field_meta {
+                    description.collation = meta.collation;
                 }
                 if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable)
-                    && description.collation == crate::sql::ast::Collation::None
+                    && description.collation_derivation == CollationDerivation::None
                 {
                     description.collation = crate::sql::ast::Collation::Default;
+                    description.collation_derivation = CollationDerivation::Implicit;
                 }
                 push(description)?;
             }
@@ -149,11 +162,24 @@ pub fn describe_items<'q>(
     Ok(n)
 }
 
-struct CatalogCols<'a> {
-    definition: Option<&'a TableDef>,
-    alias: Option<&'a str>,
-    storage: &'a crate::storage::Storage,
+pub(crate) struct CatalogCols<'a> {
+    pub(crate) definition: Option<&'a TableDef>,
+    pub(crate) alias: Option<&'a str>,
+    pub(crate) storage: &'a crate::storage::Storage,
+    pub(crate) txid: u32,
+}
+
+pub(crate) fn static_meta_for_column(
+    storage: &crate::storage::Storage,
+    column: &ColumnMeta,
     txid: u32,
+) -> Option<StaticTypeMeta> {
+    Some(StaticTypeMeta {
+        ctype: column.ctype,
+        type_oid: storage.routine_type_oid(column.ctype, column.user_type, txid)?,
+        type_mod: column.type_mod,
+        collation: column.collation,
+    })
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
@@ -166,6 +192,17 @@ impl ColTypeResolver for CatalogCols<'_> {
             .resolve(qualifier, name),
             None => NoCols.resolve(qualifier, name),
         }
+    }
+
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        let definition = self.definition?;
+        if let Some(qualifier) = qualifier
+            && !crate::sql::eval::qualifier_answers_target(definition, self.alias, qualifier)
+        {
+            return None;
+        }
+        let column = definition.columns().get(definition.column_index(name)?)?;
+        static_meta_for_column(self.storage, column, self.txid)
     }
 
     fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
@@ -183,7 +220,7 @@ impl ColTypeResolver for CatalogCols<'_> {
         name: &str,
         arguments: &[i32],
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         let slot = self
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
@@ -191,7 +228,20 @@ impl ColTypeResolver for CatalogCols<'_> {
         let column = routine.table_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
-            column.ctype,
+            StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: self.storage.routine_type_oid(
+                    column.ctype,
+                    column.user_type,
+                    self.txid,
+                )?,
+                type_mod: -1,
+                collation: if column.ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            },
         ))
     }
 
@@ -220,13 +270,20 @@ impl ColTypeResolver for CatalogCols<'_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
         let definition = self.storage.composite_for(slot, self.txid);
         let field = definition.active_field(index)?;
         Some((
             crate::util::StackStr::from_str(field.name.as_str()),
-            field.ctype,
+            StaticTypeMeta {
+                ctype: field.ctype,
+                type_oid: self
+                    .storage
+                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
+                type_mod: field.type_mod,
+                collation: field.collation,
+            },
         ))
     }
 }
@@ -362,8 +419,21 @@ fn describe_record_star<'q>(
                     .active_fields_for(txid)
                 {
                     push(
-                        ColDesc::of_type(field.name.as_str(), field.ctype)
-                            .with_type_mod(field.type_mod),
+                        ColDesc::new(
+                            field.name.as_str(),
+                            storage
+                                .expect("checked")
+                                .routine_type_oid(field.ctype, field.user_type, txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "composite field type is absent from the catalog"
+                                    )
+                                })?,
+                            field.ctype.typlen(),
+                        )
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
                     )?;
                 }
                 return Ok(());
@@ -375,7 +445,7 @@ fn describe_record_star<'q>(
                 ));
             };
             let mut push_err = None;
-            visit_record_shape(handle, |field_name, ctype| {
+            visit_record_shape_metadata(handle, |field_name, meta| {
                 if push_err.is_some() {
                     return;
                 }
@@ -386,7 +456,11 @@ fn describe_record_star<'q>(
                     .copied();
                 match leased {
                     Some(name) => {
-                        if let Err(error) = push(ColDesc::of_type(name, ctype)) {
+                        if let Err(error) = push(
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                                .with_type_mod(meta.type_mod)
+                                .with_collation(meta.collation),
+                        ) {
                             push_err = Some(error);
                         }
                     }
@@ -418,7 +492,7 @@ fn describe_record_star<'q>(
                 ));
             };
             let mut push_err = None;
-            visit_record_shape(handle, |field_name, ctype| {
+            visit_record_shape_metadata(handle, |field_name, meta| {
                 if push_err.is_some() {
                     return;
                 }
@@ -429,7 +503,11 @@ fn describe_record_star<'q>(
                     .copied();
                 match leased {
                     Some(name) => {
-                        if let Err(e) = push(ColDesc::of_type(name, ctype)) {
+                        if let Err(e) = push(
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                                .with_type_mod(meta.type_mod)
+                                .with_collation(meta.collation),
+                        ) {
                             push_err = Some(e);
                         }
                     }
@@ -617,10 +695,33 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct StaticTypeMeta {
+    pub ctype: ColType,
+    pub type_oid: i32,
+    pub type_mod: i32,
+    pub collation: crate::sql::ast::Collation,
+}
+
+impl StaticTypeMeta {
+    fn of(ctype: ColType) -> Self {
+        Self {
+            ctype,
+            type_oid: ctype.oid(),
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
+        }
+    }
+}
+
 /// Resolves a column reference's type during static analysis. Returns an
 /// error for an unknown column (or absent FROM clause).
 pub trait ColTypeResolver {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError>;
+
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
+    }
 
     /// SQL-routine result type resolved from already-inferred argument type
     /// identities. OIDs retain a domain identity that its runtime value does
@@ -635,7 +736,7 @@ pub trait ColTypeResolver {
         _name: &str,
         _arguments: &[i32],
         _index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         None
     }
 
@@ -670,7 +771,7 @@ pub trait ColTypeResolver {
         &self,
         _type_name: &str,
         _index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         None
     }
 }
@@ -764,8 +865,22 @@ fn routine_parameter_type(index: u32) -> Option<ColType> {
 pub(crate) struct RecordShapeField {
     pub name: crate::util::StackStr<64>,
     pub ctype: ColType,
+    pub type_oid: i32,
+    pub type_mod: i32,
+    pub collation: crate::sql::ast::Collation,
     /// Registry handle of a record-typed field's own shape, or -1.
     pub nested: i32,
+}
+
+impl RecordShapeField {
+    fn metadata(self) -> StaticTypeMeta {
+        StaticTypeMeta {
+            ctype: self.ctype,
+            type_oid: self.type_oid,
+            type_mod: self.type_mod,
+            collation: self.collation,
+        }
+    }
 }
 
 const MAX_SHAPE_FIELDS: usize = 16;
@@ -800,6 +915,9 @@ fn empty_shape_pool() -> Box<ShapePool> {
         fields: [[RecordShapeField {
             name: crate::util::StackStr::new(),
             ctype: ColType::Record,
+            type_oid: oid::RECORD,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             nested: -1,
         }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
         lens: [0; MAX_SHAPES],
@@ -807,6 +925,9 @@ fn empty_shape_pool() -> Box<ShapePool> {
         named: [[RecordShapeField {
             name: crate::util::StackStr::new(),
             ctype: ColType::Record,
+            type_oid: oid::RECORD,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             nested: -1,
         }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
         named_names: [crate::util::StackStr::new(); MAX_SHAPES],
@@ -845,12 +966,17 @@ pub fn register_named_composite_shape(
     slot: u16,
     name: &str,
     fields: &[crate::storage::CompositeFieldDef],
-) {
-    RECORD_SHAPES.with(|p| {
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    RECORD_SHAPES.with(|p| -> Result<(), SqlError> {
         let mut p = p.borrow_mut();
         let pool = p.get_or_insert_with(empty_shape_pool);
         if pool.named_n == MAX_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
-            return;
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "record shape capacity exceeded"
+            ));
         }
         let at = pool.named_n;
         pool.named_names[at] = crate::util::StackStr::from_str(name);
@@ -859,10 +985,21 @@ pub fn register_named_composite_shape(
         for (out, field) in pool.named[at].iter_mut().zip(fields) {
             out.name = crate::util::StackStr::from_str(field.name.as_str());
             out.ctype = field.ctype;
+            out.type_oid = storage
+                .routine_type_oid(field.ctype, field.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "composite field type is absent from the catalog"
+                    )
+                })?;
+            out.type_mod = field.type_mod;
+            out.collation = field.collation;
             out.nested = -1;
         }
         pool.named_n += 1;
-    });
+        Ok(())
+    })
 }
 
 fn visit_named_composite_shape(name: &str, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
@@ -895,6 +1032,20 @@ fn visit_composite_slot_shape(slot: u16, mut visit: impl FnMut(&str, ColType)) -
     })
 }
 
+fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMeta> {
+    RECORD_SHAPES.with(|p| {
+        let p = p.borrow();
+        let pool = p.as_ref()?;
+        let at = pool.named_slots[..pool.named_n]
+            .iter()
+            .position(|candidate| *candidate == slot)?;
+        pool.named[at][..pool.named_lens[at] as usize]
+            .iter()
+            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
+            .map(|candidate| candidate.metadata())
+    })
+}
+
 /// Registers a record shape, returning its handle, or None when the
 /// statement's pool is exhausted (the caller then leaves the column without
 /// a shape and field access fails loudly, never wrongly).
@@ -915,6 +1066,13 @@ pub(crate) fn register_record_shape(fields: &[RecordShapeField]) -> Option<i32> 
 
 /// Looks up one field of a registered shape by (case-insensitive) name.
 pub(crate) fn record_shape_field(handle: i32, field: &str) -> Option<(ColType, i32)> {
+    record_shape_field_metadata(handle, field).map(|(meta, nested)| (meta.ctype, nested))
+}
+
+pub(crate) fn record_shape_field_metadata(
+    handle: i32,
+    field: &str,
+) -> Option<(StaticTypeMeta, i32)> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
@@ -925,12 +1083,19 @@ pub(crate) fn record_shape_field(handle: i32, field: &str) -> Option<(ColType, i
         pool.fields[at][..pool.lens[at] as usize]
             .iter()
             .find(|f| f.name.as_str().eq_ignore_ascii_case(field))
-            .map(|f| (f.ctype, f.nested))
+            .map(|f| (f.metadata(), f.nested))
     })
 }
 
 /// Visits every (name, type) of a registered shape.
 pub fn visit_record_shape(handle: i32, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+    visit_record_shape_metadata(handle, |name, meta| visit(name, meta.ctype))
+}
+
+pub fn visit_record_shape_metadata(
+    handle: i32,
+    mut visit: impl FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
@@ -939,7 +1104,7 @@ pub fn visit_record_shape(handle: i32, mut visit: impl FnMut(&str, ColType)) -> 
             return None;
         }
         for f in &pool.fields[at][..pool.lens[at] as usize] {
-            visit(f.name.as_str(), f.ctype);
+            visit(f.name.as_str(), f.metadata());
         }
         Some(pool.lens[at] as usize)
     })
@@ -982,6 +1147,61 @@ pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<
     }
 }
 
+fn expression_static_metadata(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Option<StaticTypeMeta> {
+    match expression {
+        Expr::Column { qualifier, name } if !columns.is_whole_row(name) => {
+            columns.column_meta(*qualifier, name)
+        }
+        Expr::Field { base, field } => record_field_metadata(base, field, columns).ok(),
+        Expr::Cast {
+            operand, type_mod, ..
+        } => {
+            let (type_oid, _) = infer_type_res(expression, columns).ok()?;
+            let ctype = coltype_of_oid(type_oid)?;
+            let collation = if ctype.is_collatable() {
+                expression_static_metadata(operand, columns)
+                    .map(|meta| meta.collation)
+                    .filter(|collation| *collation != crate::sql::ast::Collation::None)
+                    .unwrap_or(crate::sql::ast::Collation::Default)
+            } else {
+                crate::sql::ast::Collation::None
+            };
+            Some(StaticTypeMeta {
+                ctype,
+                type_oid,
+                type_mod: *type_mod,
+                collation,
+            })
+        }
+        Expr::Collate { operand, collation } => {
+            let mut meta = expression_static_metadata(operand, columns)?;
+            meta.collation = *collation;
+            Some(meta)
+        }
+        _ => {
+            let (type_oid, _) = infer_type_res(expression, columns).ok()?;
+            let ctype = if type_oid == oid::UNKNOWN {
+                ColType::Text
+            } else {
+                coltype_of_oid(type_oid)?
+            };
+            Some(StaticTypeMeta {
+                ctype,
+                type_oid,
+                type_mod: -1,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            })
+        }
+    }
+}
+
 /// Registers the shape of a record-valued select item, so a derived table's
 /// record column can carry it (in `type_mod`) for later field access. A
 /// record column propagates its existing handle; a `ROW(...)` derives one
@@ -995,6 +1215,9 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
     let mut fields = [RecordShapeField {
         name: crate::util::StackStr::new(),
         ctype: ColType::Record,
+        type_oid: oid::RECORD,
+        type_mod: -1,
+        collation: crate::sql::ast::Collation::None,
         nested: -1,
     }; MAX_SHAPE_FIELDS];
     let mut n = 0usize;
@@ -1004,12 +1227,8 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 return None;
             }
             for (i, arg) in args.iter().enumerate() {
-                let type_oid = infer_type_res(arg, columns).ok()?.0;
-                let ctype = if type_oid == oid::UNKNOWN {
-                    ColType::Text
-                } else {
-                    coltype_of_oid(type_oid)?
-                };
+                let meta = expression_static_metadata(arg, columns)?;
+                let ctype = meta.ctype;
                 // A nested ROW(...) is an *anonymous* record even inside a
                 // named shape — PostgreSQL refuses its fields — while a
                 // nested whole-row or record column keeps its named type.
@@ -1025,6 +1244,9 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 fields[i] = RecordShapeField {
                     name: field_name,
                     ctype,
+                    type_oid: meta.type_oid,
+                    type_mod: meta.type_mod,
+                    collation: meta.collation,
                     nested,
                 };
                 n += 1;
@@ -1037,6 +1259,13 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 fields[n] = RecordShapeField {
                     name: field_name,
                     ctype,
+                    type_oid: ctype.oid(),
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    },
                     nested: -1,
                 };
                 n += 1;
@@ -1053,6 +1282,9 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 fields[i] = RecordShapeField {
                     name: field_name,
                     ctype: c.ctype,
+                    type_oid: columns.column_meta(Some(table), c.name.as_str())?.type_oid,
+                    type_mod: c.type_mod,
+                    collation: c.collation,
                     nested: -1,
                 };
                 n += 1;
@@ -1072,6 +1304,9 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 fields[i] = RecordShapeField {
                     name: field_name,
                     ctype: c.ctype,
+                    type_oid: columns.column_meta(Some(name), c.name.as_str())?.type_oid,
+                    type_mod: c.type_mod,
+                    collation: c.collation,
                     nested: -1,
                 };
                 n += 1;
@@ -1178,10 +1413,10 @@ pub fn record_shape(
                 argument_oids[index] = infer_type_res(argument, columns).ok()?.0;
             }
             let mut count = 0usize;
-            while let Some((field_name, ctype)) =
+            while let Some((field_name, meta)) =
                 columns.routine_record_field(name, &argument_oids[..args.len()], count)
             {
-                visit(field_name.as_str(), ctype);
+                visit(field_name.as_str(), meta.ctype);
                 count += 1;
             }
             (count != 0).then_some(count)
@@ -1192,8 +1427,8 @@ pub fn record_shape(
                 return Some(count);
             }
             let mut n = 0;
-            while let Some((name, ctype)) = columns.named_composite_field(type_name, n) {
-                visit(name.as_str(), ctype);
+            while let Some((name, meta)) = columns.named_composite_field(type_name, n) {
+                visit(name.as_str(), meta.ctype);
                 n += 1;
             }
             (n != 0).then_some(n)
@@ -1288,11 +1523,11 @@ pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Resu
 
 /// The type of a record's field `field` (for `(base).field`), or an error if
 /// `base` is not a record whose shape is known or the field does not exist.
-pub fn record_field_type(
+pub fn record_field_metadata(
     base: &Expr,
     field: &str,
     columns: &dyn ColTypeResolver,
-) -> Result<ColType, SqlError> {
+) -> Result<StaticTypeMeta, SqlError> {
     if field == "*" {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1316,10 +1551,90 @@ pub fn record_field_type(
             "failed to find conversion function from unknown to text"
         ));
     }
+    let precise = match base {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => RECORD_FIELD_NAMES
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(field))
+            .and_then(|position| args.get(position))
+            .and_then(|argument| expression_static_metadata(argument, columns)),
+        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+            let mut index = 0usize;
+            let mut found = None;
+            while let Some((name, ctype)) = builtin_record_srf_field(name, index) {
+                if name.eq_ignore_ascii_case(field) {
+                    found = Some(StaticTypeMeta::of(ctype));
+                    break;
+                }
+                index += 1;
+            }
+            found
+        }
+        Expr::Call { name, args, .. } => {
+            let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > argument_oids.len() {
+                None
+            } else {
+                for (index, argument) in args.iter().enumerate() {
+                    argument_oids[index] = infer_type_res(argument, columns)?.0;
+                }
+                let mut index = 0usize;
+                let mut found = None;
+                while let Some((name, meta)) =
+                    columns.routine_record_field(name, &argument_oids[..args.len()], index)
+                {
+                    if name.as_str().eq_ignore_ascii_case(field) {
+                        found = Some(meta);
+                        break;
+                    }
+                    index += 1;
+                }
+                found
+            }
+        }
+        Expr::WholeRow(table) => columns.column_meta(Some(table), field),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if columns.is_whole_row(name) => columns.column_meta(Some(name), field),
+        Expr::Column { qualifier, name } => columns
+            .record_column_handle(*qualifier, name)
+            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
+            .or_else(|| match columns.resolve(*qualifier, name).ok()? {
+                ColType::Composite(slot) => composite_slot_field_metadata(slot, field),
+                _ => None,
+            }),
+        Expr::Field {
+            base: inner,
+            field: inner_field,
+        } => expr_record_handle(base, columns)
+            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
+            .or_else(
+                || match record_field_type(inner, inner_field, columns).ok()? {
+                    ColType::Composite(slot) => composite_slot_field_metadata(slot, field),
+                    _ => None,
+                },
+            ),
+        Expr::Cast { type_name, .. } => {
+            let mut index = 0usize;
+            let mut found = None;
+            while let Some((name, meta)) = columns.named_composite_field(type_name, index) {
+                if name.as_str().eq_ignore_ascii_case(field) {
+                    found = Some(meta);
+                    break;
+                }
+                index += 1;
+            }
+            found
+        }
+        _ => None,
+    };
+    if let Some(meta) = precise {
+        return Ok(meta);
+    }
     let mut found = None;
     let shape = record_shape(base, columns, |name, ctype| {
         if found.is_none() && name.eq_ignore_ascii_case(field) {
-            found = Some(ctype);
+            found = Some(StaticTypeMeta::of(ctype));
         }
     });
     if shape.is_none() {
@@ -1356,6 +1671,14 @@ pub fn record_field_type(
         }
         _ => could_not_identify(field),
     })
+}
+
+pub fn record_field_type(
+    base: &Expr,
+    field: &str,
+    columns: &dyn ColTypeResolver,
+) -> Result<ColType, SqlError> {
+    record_field_metadata(base, field, columns).map(|meta| meta.ctype)
 }
 
 /// PostgreSQL's 42703 for a field of an anonymous record.
@@ -1430,6 +1753,17 @@ impl ColTypeResolver for DefCols<'_> {
         (column.ctype == ColType::Record).then_some(column.type_mod)
     }
 
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        self.resolve(qualifier, name).ok()?;
+        let column = self.0.columns().get(self.0.column_index(name)?)?;
+        Some(StaticTypeMeta {
+            ctype: column.ctype,
+            type_oid: column.ctype.oid(),
+            type_mod: column.type_mod,
+            collation: column.collation,
+        })
+    }
+
     fn is_whole_row(&self, name: &str) -> bool {
         name == self.0.name.as_str()
     }
@@ -1455,6 +1789,11 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
             .and_then(|_| self.0.column_index(name))
             .map(|index| self.0.columns()[index].collation)
             .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        record_field_metadata(base, field, self)
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
     }
 }
 
@@ -1491,6 +1830,19 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
         let column = &self.definition.columns()[index];
         (column.ctype == ColType::Record).then_some(column.type_mod)
     }
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        self.resolve(qualifier, name).ok()?;
+        let column = self
+            .definition
+            .columns()
+            .get(self.definition.column_index(name)?)?;
+        Some(StaticTypeMeta {
+            ctype: column.ctype,
+            type_oid: column.ctype.oid(),
+            type_mod: column.type_mod,
+            collation: column.collation,
+        })
+    }
     fn is_whole_row(&self, name: &str) -> bool {
         crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
     }
@@ -1516,6 +1868,11 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
             .and_then(|_| self.definition.column_index(name))
             .map(|index| self.definition.columns()[index].collation)
             .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        record_field_metadata(base, field, self)
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
     }
 }
 
@@ -2122,8 +2479,8 @@ pub fn infer_type_res(
         // reached directly or through a derived-table column — the shape driver
         // introspection relies on), fall back to int4, matching its `.x`/`.n`
         // ordinal fields; a *known* record with a missing field still errors.
-        Expr::Field { base, field } => match record_field_type(base, field, columns) {
-            Ok(t) => of(t),
+        Expr::Field { base, field } => match record_field_metadata(base, field, columns) {
+            Ok(meta) => (meta.type_oid, meta.ctype.typlen()),
             Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
             // The subquery executor preserves the element's named-composite
             // identity, but this catalog-free inference boundary cannot

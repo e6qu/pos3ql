@@ -5186,16 +5186,16 @@ pub fn describe_scope_items<'q>(
                 }
                 // Multi-table type inference: columns resolve via scope.
                 let name = alias.unwrap_or(super::exec::derived_name(expression));
+                let resolver = CatalogScopeCols {
+                    scope,
+                    outer_scope,
+                    storage,
+                    txid,
+                };
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (oid, typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
                     None => {
-                        let resolver = CatalogScopeCols {
-                            scope,
-                            outer_scope,
-                            storage,
-                            txid,
-                        };
                         let (oid, typlen) = super::exec::infer_type_res(expression, &resolver)?;
                         if oid == super::types::oid::UNKNOWN {
                             (super::types::oid::TEXT, -1)
@@ -5207,19 +5207,32 @@ pub fn describe_scope_items<'q>(
                 // A bare column carries its declared modifier and a cast its
                 // target's, as RowDescription reports them; anything computed
                 // is -1 — the rule PostgreSQL follows.
+                let field_meta = match expression {
+                    Expr::Field { base, field } if user_type.is_none() => {
+                        super::exec::record_field_metadata(base, field, &resolver).ok()
+                    }
+                    _ => None,
+                };
                 let type_mod = match expression {
                     Expr::Column { qualifier, name } => {
                         scope_column_type_mod(scope, outer_scope, *qualifier, name)
                     }
                     Expr::Cast { type_mod, .. } => *type_mod,
-                    _ => -1,
+                    _ => field_meta.map_or(-1, |meta| meta.type_mod),
                 };
                 out[n] = ColDesc::new(name, oid, typlen)
                     .with_type_mod(user_type.map_or(type_mod, |description| description.type_mod));
                 if let Some(ctype) = super::exec::coltype_of_oid(oid)
                     && ctype.is_collatable()
                 {
-                    out[n].collation = scope.expression_collation(expression)?;
+                    (out[n].collation, out[n].collation_derivation) =
+                        scope.described_expression_collation(expression)?;
+                    if out[n].collation_derivation == super::types::CollationDerivation::None {
+                        out[n].collation = super::ast::Collation::Default;
+                        out[n].collation_derivation = super::types::CollationDerivation::Implicit;
+                    }
+                } else if let Some(meta) = field_meta {
+                    out[n].collation = meta.collation;
                 }
                 n += 1;
             }
@@ -5823,7 +5836,8 @@ fn user_type_expression_description<'q>(
                         catalog_declared_type_oid(storage, field.ctype, field.user_type, txid)?,
                         field.ctype.typlen(),
                     )
-                    .with_type_mod(field.type_mod),
+                    .with_type_mod(field.type_mod)
+                    .with_collation(field.collation),
                 );
             }
         }
@@ -6113,7 +6127,20 @@ fn describe_scope_record_star<'q>(
                         .alloc_str(field.name.as_str())
                         .map_err(|_| arena_full())?;
                     push(
-                        ColDesc::of_type(name, field.ctype).with_type_mod(field.type_mod),
+                        ColDesc::new(
+                            name,
+                            storage
+                                .routine_type_oid(field.ctype, field.user_type, txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "composite field type is absent from the catalog"
+                                    )
+                                })?,
+                            field.ctype.typlen(),
+                        )
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
                         &mut n,
                     )?;
                 }
@@ -6126,13 +6153,18 @@ fn describe_scope_record_star<'q>(
                 ));
             };
             let mut push_err = None;
-            super::exec::visit_record_shape_pub(handle, |field_name, ctype| {
+            super::exec::visit_record_shape_metadata_pub(handle, |field_name, meta| {
                 if push_err.is_some() {
                     return;
                 }
                 match arena.alloc_str(field_name) {
                     Ok(name) => {
-                        if let Err(error) = push(ColDesc::of_type(name, ctype), &mut n) {
+                        if let Err(error) = push(
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
+                                .with_type_mod(meta.type_mod)
+                                .with_collation(meta.collation),
+                            &mut n,
+                        ) {
                             push_err = Some(error);
                         }
                     }
@@ -6154,6 +6186,27 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
+    }
+
+    fn column_meta(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<super::exec::StaticTypeMeta> {
+        let entry = self.0.find_column(qualifier, name).ok()?;
+        let ctype = self.0.output_type(entry);
+        let type_mod = match entry {
+            scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs[table]?.columns().get(column)?.type_mod
+            }
+            scope::ResolvedColumn::Merged(_) => -1,
+        };
+        Some(super::exec::StaticTypeMeta {
+            ctype,
+            type_oid: ctype.oid(),
+            type_mod,
+            collation: self.0.output_collation(entry),
+        })
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -6207,6 +6260,38 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         }
     }
 
+    fn column_meta(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<super::exec::StaticTypeMeta> {
+        let (scope, entry) = match self.scope.find_column(qualifier, name) {
+            Ok(entry) => (self.scope, entry),
+            Err(_) => {
+                let outer = self.outer_scope?;
+                (outer, outer.find_column(qualifier, name).ok()?)
+            }
+        };
+        let ctype = scope.output_type(entry);
+        let (type_oid, type_mod) = match entry {
+            scope::ResolvedColumn::Table(table, column) => {
+                let column = scope.defs[table]?.columns().get(column)?;
+                (
+                    self.storage
+                        .routine_type_oid(column.ctype, column.user_type, self.txid)?,
+                    column.type_mod,
+                )
+            }
+            scope::ResolvedColumn::Merged(_) => (ctype.oid(), -1),
+        };
+        Some(super::exec::StaticTypeMeta {
+            ctype,
+            type_oid,
+            type_mod,
+            collation: scope.output_collation(entry),
+        })
+    }
+
     fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<(i32, i16)> {
         let routine = self
             .storage
@@ -6223,7 +6308,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         name: &str,
         arguments: &[i32],
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
         let slot = self
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
@@ -6231,7 +6316,20 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let column = routine.table_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
-            column.ctype,
+            super::exec::StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: self.storage.routine_type_oid(
+                    column.ctype,
+                    column.user_type,
+                    self.txid,
+                )?,
+                type_mod: -1,
+                collation: if column.ctype.is_collatable() {
+                    super::ast::Collation::Default
+                } else {
+                    super::ast::Collation::None
+                },
+            },
         ))
     }
 
@@ -6239,13 +6337,20 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
         let definition = self.storage.composite_for(slot, self.txid);
         let field = definition.active_field(index)?;
         Some((
             crate::util::StackStr::from_str(field.name.as_str()),
-            field.ctype,
+            super::exec::StaticTypeMeta {
+                ctype: field.ctype,
+                type_oid: self
+                    .storage
+                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
+                type_mod: field.type_mod,
+                collation: field.collation,
+            },
         ))
     }
 

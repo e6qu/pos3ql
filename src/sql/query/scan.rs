@@ -604,6 +604,11 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
+    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+    }
+
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -739,6 +744,18 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             self.outer
                 .map(|outer| outer.collation(q, name))
                 .unwrap_or(crate::sql::ast::Collation::None)
+        }
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        let inner = self.inner.record_field_collation(base, field);
+        if inner != crate::sql::ast::Collation::None {
+            inner
+        } else {
+            self.outer
+                .map_or(crate::sql::ast::Collation::None, |outer| {
+                    outer.record_field_collation(base, field)
+                })
         }
     }
 

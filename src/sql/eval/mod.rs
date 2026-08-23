@@ -204,6 +204,7 @@ pub mod sqlstate {
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
     pub const COLLATION_MISMATCH: &str = "42P21";
+    pub const INDETERMINATE_COLLATION: &str = "42P22";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const WINDOWING_ERROR: &str = "42P20";
     pub const OUT_OF_MEMORY: &str = "53200";
@@ -329,6 +330,10 @@ pub trait ColumnLookup<'a> {
     /// scalar contexts explicitly non-collatable instead of guessing from the
     /// datum after expression identity has already been erased.
     fn collation(&self, _qualifier: Option<&str>, _name: &str) -> crate::sql::ast::Collation {
+        crate::sql::ast::Collation::None
+    }
+
+    fn record_field_collation(&self, _base: &Expr<'a>, _field: &str) -> crate::sql::ast::Collation {
         crate::sql::ast::Collation::None
     }
 
@@ -2467,6 +2472,7 @@ fn effective_quantified_collations<'a>(
                 .map(|field| DerivedCollation {
                     value: row.collation(Some(table), field.name),
                     explicit: false,
+                    indeterminate: false,
                 })
         } else if index == 0 {
             expression_collation(operand, row)?
@@ -2476,10 +2482,9 @@ fn effective_quantified_collations<'a>(
         let right = (right != Collation::None).then_some(DerivedCollation {
             value: right,
             explicit: false,
+            indeterminate: false,
         });
-        output[index] = merge_derived_collations(left, right)?
-            .map(|collation| collation.value)
-            .unwrap_or(Collation::None);
+        output[index] = required_comparison_collation(merge_derived_collations(left, right)?)?;
     }
     arena
         .alloc_slice_copy(&output[..right.len()])
@@ -2640,9 +2645,20 @@ pub(crate) fn resolve_comparison_collation<'a>(
 ) -> Result<crate::sql::ast::Collation, SqlError> {
     let left = expression_collation(left, row)?;
     let right = expression_collation(right, row)?;
-    Ok(merge_derived_collations(left, right)?
-        .map(|collation| collation.value)
-        .unwrap_or(crate::sql::ast::Collation::None))
+    required_comparison_collation(merge_derived_collations(left, right)?)
+}
+
+fn required_comparison_collation(
+    collation: Option<DerivedCollation>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    match collation {
+        Some(collation) if collation.indeterminate => Err(sql_err!(
+            sqlstate::INDETERMINATE_COLLATION,
+            "could not determine which collation to use for string comparison"
+        )),
+        Some(collation) => Ok(collation.value),
+        None => Ok(crate::sql::ast::Collation::None),
+    }
 }
 
 /// PostgreSQL's collation-combination rule, shared by every expression that
@@ -2664,17 +2680,25 @@ fn merge_derived_collations(
         }
         (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
         (Some(_left), Some(right)) if right.explicit => Ok(Some(right)),
+        (Some(left), Some(right)) if left.indeterminate && right.indeterminate => {
+            Ok(Some(DerivedCollation {
+                value: crate::sql::ast::Collation::None,
+                explicit: false,
+                indeterminate: true,
+            }))
+        }
+        (Some(left), Some(right)) if left.indeterminate => Ok(Some(right)),
+        (Some(left), Some(right)) if right.indeterminate => Ok(Some(left)),
         (Some(left), Some(right))
             if left.value != crate::sql::ast::Collation::Default
                 && right.value != crate::sql::ast::Collation::Default
                 && left.value != right.value =>
         {
-            Err(sql_err!(
-                sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
-                left.value.name(),
-                right.value.name()
-            ))
+            Ok(Some(DerivedCollation {
+                value: crate::sql::ast::Collation::None,
+                explicit: false,
+                indeterminate: true,
+            }))
         }
         (Some(left), Some(right)) => {
             Ok(Some(if left.value == crate::sql::ast::Collation::Default {
@@ -2692,6 +2716,7 @@ fn merge_derived_collations(
 struct DerivedCollation {
     value: crate::sql::ast::Collation,
     explicit: bool,
+    indeterminate: bool,
 }
 
 fn expression_collation<'a>(
@@ -2713,6 +2738,7 @@ fn expression_collation<'a>(
             Ok(Some(DerivedCollation {
                 value: *collation,
                 explicit: true,
+                indeterminate: false,
             }))
         }
         Expr::Cast {
@@ -2722,14 +2748,57 @@ fn expression_collation<'a>(
             Some(_) => Ok(None),
             None => expression_collation(operand, row),
         },
-        Expr::Column { qualifier, name } => Ok(Some(DerivedCollation {
-            value: row.collation(*qualifier, name),
-            explicit: false,
-        })),
-        Expr::SchemaColumn { table, name, .. } => Ok(Some(DerivedCollation {
-            value: row.collation(Some(table), name),
-            explicit: false,
-        })),
+        Expr::Column { qualifier, name } => {
+            let value = row.collation(*qualifier, name);
+            Ok(Some(DerivedCollation {
+                value,
+                explicit: false,
+                indeterminate: value == crate::sql::ast::Collation::None
+                    && row
+                        .col_type(*qualifier, name)
+                        .is_some_and(ColType::is_collatable),
+            }))
+        }
+        Expr::SchemaColumn { table, name, .. } => {
+            let value = row.collation(Some(table), name);
+            Ok(Some(DerivedCollation {
+                value,
+                explicit: false,
+                indeterminate: value == crate::sql::ast::Collation::None
+                    && row
+                        .col_type(Some(table), name)
+                        .is_some_and(ColType::is_collatable),
+            }))
+        }
+        Expr::Field { base, field } => match &**base {
+            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+                let position = crate::sql::exec::RECORD_FIELD_NAMES
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(field));
+                match position.and_then(|position| args.get(position)) {
+                    Some(argument) => expression_collation(argument, row),
+                    None => Ok(None),
+                }
+            }
+            Expr::WholeRow(table) => {
+                let value = row.collation(Some(table), field);
+                Ok(Some(DerivedCollation {
+                    value,
+                    explicit: false,
+                    indeterminate: value == crate::sql::ast::Collation::None
+                        && static_type(expression, row).is_some_and(ColType::is_collatable),
+                }))
+            }
+            _ => {
+                let value = row.record_field_collation(base, field);
+                Ok(Some(DerivedCollation {
+                    value,
+                    explicit: false,
+                    indeterminate: value == crate::sql::ast::Collation::None
+                        && static_type(expression, row).is_some_and(ColType::is_collatable),
+                }))
+            }
+        },
         Expr::Binary {
             operator: BinaryOp::Concat,
             left,
@@ -2766,33 +2835,39 @@ fn expression_collation<'a>(
     }
 }
 
-/// Returns the resolved collation identity of a collatable expression.  This
-/// is the one derivation used by comparison validation and catalog projection,
-/// so expression indexes cannot report a different identity from execution.
+/// Returns the collation required by an operation that compares or orders an
+/// expression. An indeterminate collatable expression is rejected here rather
+/// than being mistaken for a non-collatable value.
 pub(crate) fn resolved_expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
-    Ok(expression_collation(expression, row)?
-        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+    required_comparison_collation(expression_collation(expression, row)?)
 }
 
-/// Combines implicit collation identities for a result column.  Set-operation
-/// and CTE description use this exact rule instead of choosing one leaf.
-pub(crate) fn unify_implicit_collations(
-    left: crate::sql::ast::Collation,
-    right: crate::sql::ast::Collation,
-) -> Result<crate::sql::ast::Collation, SqlError> {
-    let left = (left != crate::sql::ast::Collation::None).then_some(DerivedCollation {
-        value: left,
-        explicit: false,
-    });
-    let right = (right != crate::sql::ast::Collation::None).then_some(DerivedCollation {
-        value: right,
-        explicit: false,
-    });
-    Ok(merge_derived_collations(left, right)?
-        .map_or(crate::sql::ast::Collation::None, |value| value.value))
+/// Returns result metadata without requiring a usable comparison collation.
+/// PostgreSQL permits this state through `UNION ALL` and diagnoses it only
+/// when a later operation needs collation semantics.
+pub(crate) fn described_expression_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<
+    (
+        crate::sql::ast::Collation,
+        crate::sql::types::CollationDerivation,
+    ),
+    SqlError,
+> {
+    use crate::sql::types::CollationDerivation;
+    Ok(match expression_collation(expression, row)? {
+        Some(value) if value.indeterminate => (
+            crate::sql::ast::Collation::None,
+            CollationDerivation::Indeterminate,
+        ),
+        Some(value) if value.explicit => (value.value, CollationDerivation::Explicit),
+        Some(value) => (value.value, CollationDerivation::Implicit),
+        None => (crate::sql::ast::Collation::None, CollationDerivation::None),
+    })
 }
 
 /// Text functions whose result retains the input collation.  Non-text calls

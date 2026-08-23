@@ -84,6 +84,27 @@ impl Collation {
             Self::None | Self::Default | Self::UcsBasic => "",
         }
     }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::C => 1,
+            Self::Posix => 2,
+            Self::UcsBasic => 3,
+            Self::None => 4,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Default),
+            1 => Some(Self::C),
+            2 => Some(Self::Posix),
+            3 => Some(Self::UcsBasic),
+            4 => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
@@ -627,6 +648,7 @@ pub struct CompositeField<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
     pub type_mod: i32,
+    pub collation: Collation,
 }
 
 /// A parsed ALTER INDEX operation. Keeping the supported operation typed
@@ -1657,6 +1679,7 @@ pub enum AlterTypeAction<'a> {
         name: &'a str,
         type_name: &'a str,
         type_mod: i32,
+        collation: Collation,
     },
     /// ALTER ATTRIBUTE name SET NOT NULL.
     SetAttributeNotNull(&'a str),
@@ -2045,6 +2068,7 @@ pub enum AlterAction<'a> {
         column: &'a str,
         type_name: &'a str,
         type_mod: i32,
+        collation: Option<Collation>,
         using: Option<&'a Expr<'a>>,
     },
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows

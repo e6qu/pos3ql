@@ -319,7 +319,12 @@ fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
          UPDATE view_trigger_target SET value = value + 1 WHERE id = 2 RETURNING id, value; \
          DELETE FROM view_trigger_target WHERE id = 1 RETURNING id;",
     );
-    assert_eq!(data_rows(&output), ["3|30", "2|21", "1"]);
+    assert_eq!(
+        data_rows(&output),
+        ["3|30", "2|21", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -434,20 +439,23 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
         "INSERT INTO recovered_view VALUES (7, 70)",
     );
     assert!(String::from_utf8_lossy(&disabled).contains("55000"));
-    assert_eq!(
-        data_rows(&run_with(
-            &mut restarted,
-            &mut restarted_budget,
-            "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
+    let recovered = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
              INSERT INTO recovered_view VALUES (7, 70); \
              UPDATE recovered_view AS target SET value = source.value \
                FROM recovered_view_source AS source WHERE target.id = source.id \
                RETURNING target.id, target.value; \
              DELETE FROM recovered_view AS target USING recovered_view_source AS source \
                WHERE target.id = source.id RETURNING target.id; \
-             SELECT count(*) FROM recovered_view_base"
-        )),
-        ["7|77", "7", "0"]
+             SELECT count(*) FROM recovered_view_base",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["7|77", "7", "0"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -6782,6 +6790,74 @@ fn describe_whole_row_expansion_preserves_column_type_modifiers() {
 }
 
 #[test]
+fn record_fields_preserve_type_modifiers_and_collations() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE described_record AS (value varchar(3), label text COLLATE \"C\"); \
+         CREATE TABLE described_record_source ( \
+           value varchar(3), c_value text COLLATE \"C\", \
+           posix_value text COLLATE \"POSIX\"); \
+         INSERT INTO described_record_source VALUES ('abc', 'a', 'b')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    for query in [
+        "SELECT (ROW(value, c_value)).f1, (ROW(value, c_value)).f2 \
+         FROM described_record_source",
+        "SELECT (q).f1, (q).f2 FROM ( \
+           SELECT ROW(value, c_value) AS q FROM described_record_source \
+         ) AS source",
+        "WITH source AS ( \
+           SELECT ROW(value, c_value) AS q FROM described_record_source \
+         ) SELECT (q).f1, (q).f2 FROM source",
+        "SELECT (q).* FROM ( \
+           SELECT ROW(value, c_value) AS q FROM described_record_source \
+         ) AS source",
+        "SELECT (ROW(value, c_value)::described_record).value, \
+                (ROW(value, c_value)::described_record).label \
+         FROM described_record_source",
+    ] {
+        let description = describe_with(&mut engine, &mut budget, query);
+        assert_eq!(
+            row_description_type_oids(&description),
+            [
+                crate::sql::types::oid::VARCHAR,
+                crate::sql::types::oid::TEXT
+            ],
+            "{query}: {}",
+            String::from_utf8_lossy(&description)
+        );
+        assert_eq!(
+            row_description_type_modifiers(&description),
+            [7, -1],
+            "{query}: {}",
+            String::from_utf8_lossy(&description)
+        );
+    }
+
+    for query in [
+        "SELECT (ROW(c_value)).f1 < (ROW(posix_value)).f1 \
+         FROM described_record_source",
+        "SELECT (q).f1 < posix_value FROM ( \
+           SELECT ROW(c_value) AS q, posix_value FROM described_record_source \
+         ) AS source",
+    ] {
+        let response = run_with(&mut engine, &mut budget, query);
+        assert!(
+            response.windows(7).any(|window| window == b"C42P22\0"),
+            "{query}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+}
+
+#[test]
 fn cursor_fetch_preserves_row_description_type_modifier() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -7682,6 +7758,53 @@ fn set_operation_rejects_incompatible_collation_identities() {
 }
 
 #[test]
+fn union_all_preserves_indeterminate_and_explicit_collations() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE c_values (value text COLLATE \"C\"); \
+             CREATE TABLE posix_values (value text COLLATE \"POSIX\"); \
+             INSERT INTO c_values VALUES ('c'); \
+             INSERT INTO posix_values VALUES ('p'); \
+             SELECT value FROM c_values UNION ALL SELECT value FROM posix_values",
+        )),
+        ["c", "p"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "WITH combined AS ( \
+                 SELECT value FROM c_values UNION ALL SELECT value FROM posix_values \
+             ) \
+             SELECT combined.value = c_values.value FROM combined CROSS JOIN c_values",
+        )),
+        ["t", "f"]
+    );
+    let ordered = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM c_values UNION ALL SELECT value FROM posix_values ORDER BY 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&ordered).contains("42P22"),
+        "{}",
+        String::from_utf8_lossy(&ordered)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value COLLATE \"C\" FROM c_values \
+             UNION SELECT value FROM posix_values ORDER BY 1",
+        )),
+        ["c", "p"]
+    );
+}
+
+#[test]
 fn noncollatable_column_rejects_explicit_collation() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -7777,7 +7900,7 @@ fn comparison_rejects_conflicting_implicit_column_collations() {
          SELECT left_value = right_value FROM collation_values",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -14954,6 +15077,20 @@ fn alter_column_type_rewrites_and_persists() {
         );
         // Assignment cast (int -> text) needs no USING.
         run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN a TYPE text");
+        assert_eq!(
+            data_rows(&run_with(
+                &mut e,
+                &mut b,
+                "SELECT attcollation FROM pg_attribute \
+                 WHERE attrelid = 'ct'::regclass AND attname = 'a'",
+            )),
+            ["100"]
+        );
+        run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE ct ALTER COLUMN a TYPE varchar(5) COLLATE \"POSIX\"",
+        );
         // Explicit-only cast without USING is refused (42804).
         let bytes = run_with(&mut e, &mut b, "ALTER TABLE ct ALTER COLUMN b TYPE int");
         assert!(
@@ -14971,7 +15108,10 @@ fn alter_column_type_rewrites_and_persists() {
             &mut b,
             "SELECT a, pg_typeof(a), b FROM ct ORDER BY id",
         );
-        assert_eq!(data_rows(&bytes), ["42|text|5", "100|text|2"]);
+        assert_eq!(
+            data_rows(&bytes),
+            ["42|character varying|5", "100|character varying|2"]
+        );
     }
     // The rewritten shape and values survive a restart.
     let mut b = Budget::new(1 << 26);
@@ -14979,9 +15119,12 @@ fn alter_column_type_rewrites_and_persists() {
     let bytes = run_with(
         &mut e,
         &mut b,
-        "SELECT a, pg_typeof(b), b FROM ct ORDER BY id",
+        "SELECT ct.a, pg_typeof(b), b, attribute.attcollation \
+         FROM ct JOIN pg_attribute attribute \
+           ON attribute.attrelid = 'ct'::regclass AND attribute.attname = 'a' \
+         ORDER BY id",
     );
-    assert_eq!(data_rows(&bytes), ["42|integer|5", "100|integer|2"]);
+    assert_eq!(data_rows(&bytes), ["42|integer|5|951", "100|integer|2|951"]);
 }
 
 #[test]
@@ -18341,10 +18484,11 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         for statement in [
             "CREATE SCHEMA durable_types",
             "CREATE TYPE coordinate AS (x integer, y integer)",
-            "CREATE TYPE place AS (name text, point coordinate)",
+            "CREATE TYPE place AS (name varchar(7) COLLATE \"C\", point coordinate)",
             "CREATE TABLE durable_places (value place)",
             "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
             "ALTER TYPE coordinate ADD ATTRIBUTE z integer",
+            "ALTER TYPE coordinate ADD ATTRIBUTE label varchar(3) COLLATE \"POSIX\"",
             "ALTER TYPE coordinate RENAME ATTRIBUTE x TO east",
             "ALTER TYPE coordinate RENAME TO coordinate_renamed",
             "ALTER TYPE coordinate_renamed SET SCHEMA durable_types",
@@ -18364,13 +18508,41 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
     let bytes = run_with(
         &mut engine,
         &mut budget,
-        "SELECT (value).name, ((value).point).east, ((value).point).y, ((value).point).z IS NULL FROM durable_places",
+        "SELECT (value).name, ((value).point).east, ((value).point).y, \
+                ((value).point).z IS NULL, ((value).point).label IS NULL \
+         FROM durable_places",
     );
     assert_eq!(
         data_rows(&bytes),
-        ["Station|4|8|t"],
+        ["Station|4|8|t|t"],
         "{}",
         String::from_utf8_lossy(&bytes)
+    );
+    let description = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).name, ((value).point).label FROM durable_places",
+    );
+    assert_eq!(
+        row_description_type_modifiers(&description),
+        [11, 7],
+        "{}",
+        String::from_utf8_lossy(&description)
+    );
+    let metadata = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT t.typname, a.attname, a.atttypmod, a.attcollation \
+         FROM pg_type t JOIN pg_attribute a ON a.attrelid = t.typrelid \
+         WHERE (t.typname = 'place' AND a.attname = 'name') \
+            OR (t.typname = 'coordinate_renamed' AND a.attname = 'label') \
+         ORDER BY t.typname",
+    );
+    assert_eq!(
+        data_rows(&metadata),
+        ["coordinate_renamed|label|7|951", "place|name|11|950"],
+        "{}",
+        String::from_utf8_lossy(&metadata)
     );
     let bytes = run_with(
         &mut engine,
@@ -18455,7 +18627,7 @@ fn dropped_composite_attribute_recovers_without_retired_identity() {
 #[test]
 fn named_types_move_schema_without_changing_typed_identity() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let setup = run_with(
         &mut engine,
         &mut budget,
         "CREATE SCHEMA moved_types; \
@@ -18470,13 +18642,21 @@ fn named_types_move_schema_without_changing_typed_identity() {
          ALTER TYPE moved_point SET SCHEMA moved_types; \
          ALTER TYPE moved_container SET SCHEMA moved_types",
     );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT state::text, (point).x, (points[1]).y, ((item).point).x, (item).state::text FROM moved_values",
+    );
     assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT state::text, (point).x, (points[1]).y, ((item).point).x, (item).state::text FROM moved_values",
-        )),
-        ["ready|3|6|7|blocked"]
+        data_rows(&response),
+        ["ready|3|6|7|blocked"],
+        "{}",
+        String::from_utf8_lossy(&response)
     );
     assert_eq!(
         data_rows(&run_with(
@@ -21943,7 +22123,12 @@ fn recursive_cte_feeds_data_modifying_main_statement() {
              VALUES (1) UNION ALL SELECT n+1 FROM numbers WHERE n < 4\
          ) INSERT INTO generated_rows SELECT n FROM numbers RETURNING id",
     );
-    assert_eq!(data_rows(&response), ["1", "2", "3", "4"]);
+    assert_eq!(
+        data_rows(&response),
+        ["1", "2", "3", "4"],
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
 }
 
 #[test]
@@ -27464,14 +27649,17 @@ fn common_table_expressions() {
         ["1"]
     );
     // A self-referencing CTE iterates to its fixpoint.
+    let recursive = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
+         SELECT * FROM c ORDER BY n",
+    );
     assert_eq!(
-        data_rows(&run_with(
-            &mut e,
-            &mut b,
-            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) \
-             SELECT * FROM c ORDER BY n"
-        )),
-        ["1", "2", "3", "4"]
+        data_rows(&recursive),
+        ["1", "2", "3", "4"],
+        "{}",
+        String::from_utf8_lossy(&recursive)
     );
     // UNION (deduplicating) terminates a cyclic recursion.
     assert_eq!(

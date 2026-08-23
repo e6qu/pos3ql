@@ -952,6 +952,20 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
             .or_else(|| self.outer.map(|outer| outer.collation(qualifier, name)))
             .unwrap_or(Collation::None)
     }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        if let Some(scope) = self.scope {
+            let collation =
+                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(scope))
+                    .map_or(Collation::None, |meta| meta.collation);
+            if collation != Collation::None {
+                return collation;
+            }
+        }
+        self.outer.map_or(Collation::None, |outer| {
+            outer.record_field_collation(base, field)
+        })
+    }
 }
 
 fn subquery_collations<'a>(
@@ -1015,7 +1029,7 @@ fn subquery_collations<'a>(
         match item {
             SelectItem::Expr { expression, .. } => {
                 output[count] =
-                    crate::sql::eval::resolved_expression_collation(expression, &lookup)?;
+                    crate::sql::eval::described_expression_collation(expression, &lookup)?.0;
                 count += 1;
             }
             SelectItem::Wildcard => {

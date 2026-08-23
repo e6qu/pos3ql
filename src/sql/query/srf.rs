@@ -834,7 +834,12 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                 && descriptors[slot].type_oid == crate::sql::types::oid::RECORD
                                 && let Some(handle) = crate::sql::exec::register_shape_for(
                                     expression,
-                                    &super::ScopeCols(&ss),
+                                    &super::CatalogScopeCols {
+                                        scope: &ss,
+                                        outer_scope: outer,
+                                        storage,
+                                        txid,
+                                    },
                                 )
                             {
                                 descriptors[slot].type_mod = handle;
@@ -921,7 +926,12 @@ pub(crate) fn synth_derived_def_outer<'a>(
                             && descriptors[slot].type_oid == crate::sql::types::oid::RECORD
                             && let Some(handle) = crate::sql::exec::register_shape_for(
                                 expression,
-                                &crate::sql::exec::NoCols,
+                                &crate::sql::exec::CatalogCols {
+                                    definition: None,
+                                    alias: None,
+                                    storage,
+                                    txid,
+                                },
                             )
                         {
                             descriptors[slot].type_mod = handle;
@@ -933,6 +943,12 @@ pub(crate) fn synth_derived_def_outer<'a>(
             }
         },
     };
+    for (output, description) in output_collations[..n_cols]
+        .iter_mut()
+        .zip(&descriptors[..n_cols])
+    {
+        *output = description.collation;
+    }
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -1259,7 +1275,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 user_type,
                 type_mod,
                 if ctype.is_collatable() {
-                    crate::sql::eval::resolved_expression_collation(argument, columns)?
+                    crate::sql::eval::described_expression_collation(argument, columns)?.0
                 } else {
                     crate::sql::ast::Collation::None
                 },

@@ -12,6 +12,10 @@ ALTER TABLE ct ALTER COLUMN a TYPE bigint;
 SELECT a, pg_typeof(a) FROM ct ORDER BY id;
 ALTER TABLE ct ALTER COLUMN a SET DATA TYPE text;
 SELECT a, pg_typeof(a) FROM ct ORDER BY id;
+SELECT attcollation FROM pg_attribute
+ WHERE attrelid = 'ct'::regclass AND attname = 'a';
+ALTER TABLE ct ALTER COLUMN a TYPE varchar(8) COLLATE "POSIX";
+SELECT a, pg_typeof(a) FROM ct ORDER BY id;
 
 -- text -> numeric is explicit-only, so it needs USING.
 ALTER TABLE ct ALTER COLUMN b TYPE numeric;
@@ -40,6 +44,7 @@ CREATE TABLE et (i int, d date, u uuid);
 ALTER TABLE et ALTER COLUMN i TYPE date;
 ALTER TABLE et ALTER COLUMN d TYPE int;
 ALTER TABLE et ALTER COLUMN u TYPE text;
+ALTER TABLE et ALTER COLUMN i TYPE int COLLATE "C";
 ALTER TABLE et ALTER COLUMN nope TYPE int;
 ALTER TABLE et ALTER COLUMN i TYPE nosuchtype;
 SELECT pg_typeof(u) FROM et LIMIT 1;

@@ -117,6 +117,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             .unwrap_or(crate::sql::ast::Collation::None)
     }
 
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+    }
+
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => {
@@ -966,6 +971,19 @@ impl<'d> QueryScope<'d> {
         expression: &Expr<'d>,
     ) -> Result<crate::sql::ast::Collation, SqlError> {
         crate::sql::eval::resolved_expression_collation(expression, &ScopeTypes(self))
+    }
+
+    pub(crate) fn described_expression_collation(
+        &self,
+        expression: &Expr<'d>,
+    ) -> Result<
+        (
+            crate::sql::ast::Collation,
+            crate::sql::types::CollationDerivation,
+        ),
+        SqlError,
+    > {
+        crate::sql::eval::described_expression_collation(expression, &ScopeTypes(self))
     }
 
     /// An expression reading a join-tree output column: a qualified column

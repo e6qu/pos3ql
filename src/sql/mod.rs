@@ -5660,11 +5660,15 @@ impl Engine {
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
         for (slot, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
-            exec::register_named_composite_shape(
+            if let Err(error) = exec::register_named_composite_shape(
                 slot as u16,
                 composite.name.as_str(),
                 composite.fields(),
-            );
+                &self.storage,
+                txn.txid,
+            ) {
+                return Ok(Err(error));
+            }
         }
         let session_user = guc.session_user();
         eval::funcs::system::set_session_user(session_user.as_str());

@@ -2391,6 +2391,12 @@ impl Checkpointer {
                         };
                         let code: u8 = parse_field(words.next(), "cmp field type missing")?;
                         let type_mod: i32 = parse_field(words.next(), "cmp field typmod missing")?;
+                        let collation_code: u8 =
+                            parse_field(words.next(), "cmp field collation missing")?;
+                        let collation = crate::sql::ast::Collation::from_code(collation_code)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "bad composite field collation",
+                            ))?;
                         let user_schema = hexstr(words.next(), "cmp field user schema missing")?;
                         let user_name = hexstr(words.next(), "cmp field user name missing")?;
                         let user_type = match (user_schema.is_empty(), user_name.is_empty()) {
@@ -2411,6 +2417,7 @@ impl Checkpointer {
                             ctype: crate::sql::types::ColType::from_code(code)
                                 .ok_or(CheckpointSetupError::Corrupt("bad composite field type"))?,
                             type_mod,
+                            collation,
                             user_type,
                             dropped,
                             not_null,
@@ -3313,12 +3320,13 @@ impl Checkpointer {
                 hex(&mut line, field.name.as_str());
                 let _ = write!(
                     line,
-                    " {} {} {} {} {} ",
+                    " {} {} {} {} {} {} ",
                     field.attribute_number,
                     u8::from(field.dropped),
                     u8::from(field.not_null),
                     field.ctype.code(),
                     field.type_mod,
+                    field.collation.code(),
                 );
                 hex(
                     &mut line,

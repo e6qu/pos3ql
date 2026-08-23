@@ -33,8 +33,8 @@ use super::ast::{
     TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums, datum_to_text,
-    eval, eval_full, sqlstate,
+    ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, cast_to, compare_datums,
+    compare_datums_collated, datum_to_text, eval, eval_full, sqlstate,
 };
 use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 
@@ -188,16 +188,19 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod describe;
-pub(crate) use describe::AliasedDefCols;
+pub(crate) use describe::{AliasedDefCols, CatalogCols};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
-    infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_type,
-    record_shape, register_named_composite_shape, register_shape_for, reset_record_shapes,
-    typeof_static, typeof_static_coltype, typeof_static_oid,
+    infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_metadata,
+    record_field_type, record_shape, register_named_composite_shape, register_shape_for,
+    reset_record_shapes, typeof_static, typeof_static_coltype, typeof_static_oid,
     visit_record_shape as visit_record_shape_pub,
+    visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
-pub(crate) use describe::{builtin_record_srf_field_pub, coltype_of_oid, unify_numeric_tower};
+pub(crate) use describe::{
+    StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, unify_numeric_tower,
+};
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
 mod projected;
@@ -9963,17 +9966,51 @@ where
         {
             return self.transition.collation(qualifier, name);
         }
-        if qualifier.is_none()
-            && (self.local_index(name).is_some()
-                || TriggerContextField::parse(name).is_some()
-                || TriggerStatusVariable::parse(name).is_some())
-            || (TriggerExceptionVariable::parse(name).is_some()
-                && self.invocation.exception.is_some())
-        {
-            crate::sql::ast::Collation::None
-        } else {
-            self.transition.collation(qualifier, name)
+        if qualifier.is_none() {
+            let local_type = self.local_index(name).map(|index| self.locals[index].ctype);
+            let runtime_type = TriggerContextField::parse(name)
+                .map(TriggerContextField::ctype)
+                .or_else(|| TriggerStatusVariable::parse(name).map(|_| ColType::Bool))
+                .or_else(|| {
+                    (TriggerExceptionVariable::parse(name).is_some()
+                        && self.invocation.exception.is_some())
+                    .then_some(ColType::Text)
+                });
+            if let Some(ctype) = local_type.or(runtime_type) {
+                return if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                };
+            }
         }
+        self.transition.collation(qualifier, name)
+    }
+
+    fn record_field_collation(
+        &self,
+        base: &Expr<'value>,
+        field: &str,
+    ) -> crate::sql::ast::Collation {
+        let Expr::Column {
+            qualifier: None,
+            name,
+        } = base
+        else {
+            return crate::sql::ast::Collation::None;
+        };
+        self.local_index(name)
+            .and_then(|index| match self.values[index] {
+                Datum::Record(fields) => fields
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(field))
+                    .and_then(|candidate| ColType::from_oid(candidate.type_oid)),
+                _ => None,
+            })
+            .filter(|ctype| ctype.is_collatable())
+            .map_or(crate::sql::ast::Collation::None, |_| {
+                crate::sql::ast::Collation::Default
+            })
     }
 
     fn column_user_type(
@@ -10153,6 +10190,24 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if qualifier.is_none() {
+            let ctype = self
+                .local_index(name)
+                .map(|index| self.locals[index].ctype)
+                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype))
+                .or_else(|| {
+                    (TriggerExceptionVariable::parse(name).is_some()
+                        && self.invocation.exception.is_some())
+                    .then_some(ColType::Text)
+                });
+            if let Some(ctype) = ctype {
+                return if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                };
+            }
+        }
         self.definition
             .column_index(name)
             .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
@@ -10232,6 +10287,31 @@ struct TriggerExecContext<'s, 'a, 'b> {
     scratch: *mut DmlScratch,
 }
 
+fn eval_trigger_expression<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    expression: &'a Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let catalog = super::query::storage_catalog(&*context.storage, context.arena, context.txn.txid);
+    let sequence = crate::sql::sequence::SeqEval::new(
+        &*context.storage,
+        context.seq_session,
+        context.txn.txid,
+    );
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequence),
+        ..NO_HOOKS
+    };
+    eval_full(
+        expression,
+        context.arena,
+        crate::sql::eval::NO_PARAMS,
+        row,
+        &hooks,
+    )
+}
+
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
     let savepoint = context.txn.savepoint_at(index);
     for at in (savepoint.touched_mark..context.txn.touched().len()).rev() {
@@ -10298,13 +10378,7 @@ fn initialize_trigger_locals<'a>(
             invocation,
             transition: &transition,
         };
-        let value = eval_full(
-            initial,
-            context.arena,
-            crate::sql::eval::NO_PARAMS,
-            &scope,
-            &NO_HOOKS,
-        )?;
+        let value = eval_trigger_expression(context, initial, &scope)?;
         values[index] = apply_typmod(
             cast_to(value, local.ctype, context.arena)?,
             local.ctype,
@@ -10349,7 +10423,7 @@ fn assign_trigger_local<'a>(
 fn trigger_format_message<'a>(
     format: &str,
     arguments: &[&'a Expr<'a>],
-    arena: &'a Arena,
+    context: &TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<192>, SqlError> {
     use core::fmt::Write as _;
@@ -10366,18 +10440,12 @@ fn trigger_format_message<'a>(
             let _ = message.write_char('%');
             continue;
         }
-        let value = eval_full(
-            arguments[argument],
-            arena,
-            crate::sql::eval::NO_PARAMS,
-            scope,
-            &NO_HOOKS,
-        )?;
+        let value = eval_trigger_expression(context, arguments[argument], scope)?;
         argument += 1;
         if value.is_null() {
             let _ = message.write_str("<NULL>");
         } else {
-            let _ = message.write_str(datum_to_text(value, arena)?);
+            let _ = message.write_str(datum_to_text(value, context.arena)?);
         }
     }
     if message.is_truncated() {
@@ -10391,23 +10459,17 @@ fn trigger_format_message<'a>(
 
 fn trigger_diagnostic_text<const N: usize>(
     expression: &Expr<'_>,
-    arena: &Arena,
+    context: &TriggerExecContext<'_, '_, '_>,
     scope: &TriggerLocalScope<'_, '_>,
 ) -> Result<StackStr<N>, SqlError> {
-    let value = eval_full(
-        expression,
-        arena,
-        crate::sql::eval::NO_PARAMS,
-        scope,
-        &NO_HOOKS,
-    )?;
+    let value = eval_trigger_expression(context, expression, scope)?;
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
             "RAISE diagnostic option cannot be null"
         ));
     }
-    let value = StackStr::from_str(datum_to_text(value, arena)?);
+    let value = StackStr::from_str(datum_to_text(value, context.arena)?);
     if value.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -10419,13 +10481,13 @@ fn trigger_diagnostic_text<const N: usize>(
 
 fn trigger_raise_sqlstate(
     state: TriggerRaiseSqlState<'_>,
-    arena: &Arena,
+    context: &TriggerExecContext<'_, '_, '_>,
     scope: &TriggerLocalScope<'_, '_>,
 ) -> Result<crate::sql::eval::SqlState, SqlError> {
     match state {
         TriggerRaiseSqlState::Parsed(state) => Ok(state),
         TriggerRaiseSqlState::Expression(expression) => {
-            let code = trigger_diagnostic_text::<6>(expression, arena, scope)?;
+            let code = trigger_diagnostic_text::<6>(expression, context, scope)?;
             parse_trigger_raised_sqlstate(code.as_str())
                 .ok_or_else(|| invalid_trigger_sqlstate(code.as_str()))
         }
@@ -10444,6 +10506,7 @@ fn trigger_notice_to_sql(_: WireFull) -> SqlError {
     reason = "a trigger condition evaluates against the complete typed firing context"
 )]
 fn trigger_condition<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
     definition: &TableDef,
     invocation: TriggerInvocation<'a>,
@@ -10452,12 +10515,10 @@ fn trigger_condition<'a>(
     locals: &[TriggerLocalDecl<'a>],
     values: &[Datum<'a>],
     found: Option<bool>,
-    arena: &'a Arena,
 ) -> Result<bool, SqlError> {
-    match eval_full(
+    match eval_trigger_expression(
+        context,
         expression,
-        arena,
-        crate::sql::eval::NO_PARAMS,
         &TriggerLocalScope {
             locals,
             values,
@@ -10469,7 +10530,6 @@ fn trigger_condition<'a>(
                 new,
             },
         },
-        &NO_HOOKS,
     )? {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
@@ -10680,13 +10740,7 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let value = eval_full(
-                    assignment.expression,
-                    context.arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &scope,
-                    &NO_HOOKS,
-                )?;
+                let value = eval_trigger_expression(context, assignment.expression, &scope)?;
                 let value = coerce(
                     value,
                     &definition.columns()[column],
@@ -10709,13 +10763,7 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let value = eval_full(
-                    assignment.expression,
-                    context.arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &scope,
-                    &NO_HOOKS,
-                )?;
+                let value = eval_trigger_expression(context, assignment.expression, &scope)?;
                 if locals.iter().any(|local| local.name == assignment.name) {
                     assign_trigger_local(
                         locals,
@@ -10747,6 +10795,7 @@ fn execute_trigger_block<'a>(
                 };
                 let selected = match condition {
                     Some(condition) => trigger_condition(
+                        context,
                         condition,
                         definition,
                         invocation,
@@ -10755,7 +10804,6 @@ fn execute_trigger_block<'a>(
                         locals,
                         &local_values[..locals.len()],
                         status.found,
-                        context.arena,
                     )?,
                     None => true,
                 };
@@ -10909,6 +10957,7 @@ fn execute_trigger_block<'a>(
             }
             TriggerStatement::Assert(assertion) => {
                 if trigger_condition(
+                    context,
                     assertion.condition,
                     definition,
                     invocation,
@@ -10917,7 +10966,6 @@ fn execute_trigger_block<'a>(
                     locals,
                     &local_values[..locals.len()],
                     status.found,
-                    context.arena,
                 )? {
                     continue;
                 }
@@ -10935,13 +10983,7 @@ fn execute_trigger_block<'a>(
                 };
                 let message = match assertion.message {
                     Some(message) => {
-                        let value = eval_full(
-                            message,
-                            context.arena,
-                            crate::sql::eval::NO_PARAMS,
-                            &scope,
-                            &NO_HOOKS,
-                        )?;
+                        let value = eval_trigger_expression(context, message, &scope)?;
                         if value.is_null() {
                             stack_format!(192, "assertion failed")
                         } else {
@@ -10979,17 +11021,15 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context.arena, &scope)?;
+                let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context, &scope)?;
                 let message = match raise.message {
-                    Some(message) => {
-                        trigger_diagnostic_text::<192>(message, context.arena, &scope)?
-                    }
+                    Some(message) => trigger_diagnostic_text::<192>(message, context, &scope)?,
                     None if raise.default_message.is_some() => {
                         stack_format!(192, "{}", raise.default_message.expect("default message"))
                     }
                     None => match raise.format {
                         Some(format) => {
-                            trigger_format_message(format, raise.arguments, context.arena, &scope)?
+                            trigger_format_message(format, raise.arguments, context, &scope)?
                         }
                         None => stack_format!(192, "{}", sqlstate.as_str()),
                     },
@@ -11000,12 +11040,12 @@ fn execute_trigger_block<'a>(
                         .map(|detail| {
                             trigger_diagnostic_text::<
                                 { crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES },
-                            >(detail, context.arena, &scope)
+                            >(detail, context, &scope)
                         })
                         .transpose()?;
                 let hint = raise
                     .hint
-                    .map(|hint| trigger_diagnostic_text::<128>(hint, context.arena, &scope))
+                    .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
                     .transpose()?;
                 if detail.is_some() || hint.is_some() {
                     crate::sql::eval::stash_diagnostic(detail.unwrap_or_default(), hint);
@@ -11488,33 +11528,15 @@ fn execute_trigger_block<'a>(
                             transition: &transition,
                         };
                         let lower = trigger_loop_integer(
-                            eval_full(
-                                lower,
-                                context.arena,
-                                crate::sql::eval::NO_PARAMS,
-                                &scope,
-                                &NO_HOOKS,
-                            )?,
+                            eval_trigger_expression(context, lower, &scope)?,
                             context.arena,
                         )?;
                         let upper = trigger_loop_integer(
-                            eval_full(
-                                upper,
-                                context.arena,
-                                crate::sql::eval::NO_PARAMS,
-                                &scope,
-                                &NO_HOOKS,
-                            )?,
+                            eval_trigger_expression(context, upper, &scope)?,
                             context.arena,
                         )?;
                         let step = trigger_loop_integer(
-                            eval_full(
-                                step,
-                                context.arena,
-                                crate::sql::eval::NO_PARAMS,
-                                &scope,
-                                &NO_HOOKS,
-                            )?,
+                            eval_trigger_expression(context, step, &scope)?,
                             context.arena,
                         )?;
                         if step <= 0 {
@@ -11676,13 +11698,7 @@ fn execute_trigger_block<'a>(
                                 invocation,
                                 transition: &transition,
                             };
-                            let array = eval_full(
-                                expression,
-                                context.arena,
-                                crate::sql::eval::NO_PARAMS,
-                                &scope,
-                                &NO_HOOKS,
-                            )?;
+                            let array = eval_trigger_expression(context, expression, &scope)?;
                             let Datum::Array { element, raw } = array else {
                                 if array.is_null() {
                                     continue;
@@ -11798,6 +11814,7 @@ fn execute_trigger_block<'a>(
             }
             TriggerStatement::While(program) => loop {
                 if !trigger_condition(
+                    context,
                     program.condition,
                     definition,
                     invocation,
@@ -11806,7 +11823,6 @@ fn execute_trigger_block<'a>(
                     locals,
                     &local_values[..locals.len()],
                     status.found,
-                    context.arena,
                 )? {
                     break;
                 }
@@ -11869,10 +11885,9 @@ fn execute_trigger_block<'a>(
                 for branch in program.branches {
                     let selected = match branch.condition {
                         None => true,
-                        Some(condition) => match eval_full(
+                        Some(condition) => match eval_trigger_expression(
+                            context,
                             condition,
-                            context.arena,
-                            crate::sql::eval::NO_PARAMS,
                             &TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
@@ -11884,7 +11899,6 @@ fn execute_trigger_block<'a>(
                                     new: new.as_deref(),
                                 },
                             },
-                            &NO_HOOKS,
                         )? {
                             Datum::Bool(value) => value,
                             Datum::Null => false,
@@ -11932,30 +11946,26 @@ fn execute_trigger_block<'a>(
                 };
                 let operand = program
                     .operand
-                    .map(|expression| {
-                        eval_full(
-                            expression,
-                            context.arena,
-                            crate::sql::eval::NO_PARAMS,
-                            &scope,
-                            &NO_HOOKS,
-                        )
-                    })
+                    .map(|expression| eval_trigger_expression(context, expression, &scope))
                     .transpose()?;
                 let mut selected = None;
                 for branch in program.branches {
-                    let value = eval_full(
-                        branch.when,
-                        context.arena,
-                        crate::sql::eval::NO_PARAMS,
-                        &scope,
-                        &NO_HOOKS,
-                    )?;
+                    let value = eval_trigger_expression(context, branch.when, &scope)?;
                     let matches = match operand {
                         Some(operand) => {
+                            let collation = crate::sql::eval::resolve_comparison_collation(
+                                program.operand.expect("simple CASE operand"),
+                                branch.when,
+                                &scope,
+                            )?;
                             !operand.is_null()
                                 && !value.is_null()
-                                && compare_datums(&operand, &value)? == core::cmp::Ordering::Equal
+                                && compare_datums_collated(
+                                    &*context.storage,
+                                    collation,
+                                    &operand,
+                                    &value,
+                                )? == core::cmp::Ordering::Equal
                         }
                         None => match value {
                             Datum::Bool(value) => value,
@@ -12051,16 +12061,14 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
                 )
             })?;
             let condition = super::parser::parse_expr(source, context.arena)?;
-            match eval_full(
+            match eval_trigger_expression(
+                &context,
                 condition,
-                context.arena,
-                crate::sql::eval::NO_PARAMS,
                 &TriggerTransition {
                     definition,
                     old,
                     new: new.as_deref(),
                 },
-                &NO_HOOKS,
             )? {
                 Datum::Bool(true) => {}
                 Datum::Bool(false) | Datum::Null => continue,
@@ -16345,11 +16353,24 @@ fn build_composite_spec(
                 field.type_name
             ));
         }
+        let collatable = ctype.is_collatable();
+        if !collatable && field.collation != crate::sql::ast::Collation::Default {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "collations are not supported by type {}",
+                ctype.name()
+            ));
+        }
         out[index] = crate::storage::CompositeFieldDef {
             attribute_number: (index + 1) as u16,
             name: SqlName::parse(field.name)?,
             ctype,
             type_mod: field.type_mod,
+            collation: if collatable {
+                field.collation
+            } else {
+                crate::sql::ast::Collation::None
+            },
             user_type,
             dropped: false,
             not_null: false,
@@ -18148,6 +18169,7 @@ fn alter_composite_type(
             name,
             type_name,
             type_mod,
+            collation,
         } => {
             let Some(index) = altered.active_field_index(name) else {
                 return sql_fail(sql_err!(
@@ -18161,6 +18183,7 @@ fn alter_composite_type(
                 name,
                 type_name,
                 type_mod: *type_mod,
+                collation: *collation,
             };
             let spec =
                 match build_composite_spec(storage, txn.txid, core::slice::from_ref(&synthetic)) {
@@ -28028,6 +28051,7 @@ fn alter_table_inner(
                 column,
                 type_name,
                 type_mod,
+                collation,
                 using,
             } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -28051,6 +28075,21 @@ fn alter_table_inner(
                         target.name()
                     ));
                 }
+                let source_type = new_def.columns[i].ctype;
+                let source_collation = new_def.columns[i].collation;
+                let target_collation = match (*collation, target.is_collatable()) {
+                    (Some(collation), true) => collation,
+                    (Some(_), false) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "collations are not supported by type {}",
+                            target.name()
+                        ));
+                    }
+                    (None, true) if source_type.is_collatable() => source_collation,
+                    (None, true) => crate::sql::ast::Collation::Default,
+                    (None, false) => crate::sql::ast::Collation::None,
+                };
                 // Compose with whatever already produces this column: a kept or
                 // cast original column becomes a (re)cast of its original index;
                 // a column added in this same statement re-casts its default.
@@ -28089,6 +28128,7 @@ fn alter_table_inner(
                 }
                 new_def.columns[i].ctype = target;
                 new_def.columns[i].type_mod = *type_mod;
+                new_def.columns[i].collation = target_collation;
             }
             AlterAction::AddConstraint(constraint) => {
                 // Build the constraint into the new definition. CHECK/NOT NULL/FK

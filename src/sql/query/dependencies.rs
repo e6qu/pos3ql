@@ -8,7 +8,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Expr, FrameBound, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql::exec::ColTypeResolver;
+use crate::sql::exec::{ColTypeResolver, StaticTypeMeta};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
@@ -261,7 +261,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         name: &str,
         arguments: &[i32],
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         let slot = self
             .storage
             .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
@@ -269,7 +269,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         let column = routine.table_columns()?.get(index)?;
         Some((
             crate::util::StackStr::from_str(column.name.as_str()),
-            column.ctype,
+            StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: self.storage.routine_type_oid(
+                    column.ctype,
+                    column.user_type,
+                    self.txid,
+                )?,
+                type_mod: -1,
+                collation: if column.ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            },
         ))
     }
 
@@ -277,13 +290,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, ColType)> {
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
         let definition = self.storage.composite_for(slot, self.txid);
         let field = definition.active_field(index)?;
         Some((
             crate::util::StackStr::from_str(field.name.as_str()),
-            field.ctype,
+            StaticTypeMeta {
+                ctype: field.ctype,
+                type_oid: self
+                    .storage
+                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
+                type_mod: field.type_mod,
+                collation: field.collation,
+            },
         ))
     }
 

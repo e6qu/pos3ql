@@ -3378,6 +3378,11 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     for (index, (name, column_type)) in specification.columns.iter().enumerate() {
         definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
         definition.columns[index].ctype = *column_type;
+        definition.columns[index].collation = if column_type.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        };
     }
     definition
 }
@@ -5192,7 +5197,7 @@ fn pg_attribute<'a>(
                 name: field.name,
                 ctype: field.ctype,
                 type_mod: field.type_mod,
-                collation: crate::sql::ast::Collation::None,
+                collation: field.collation,
                 not_null: false,
                 unique: false,
                 primary: false,
@@ -5225,7 +5230,11 @@ fn pg_attribute<'a>(
                         Datum::Int4(field.type_mod)
                     },
                     Datum::Bool(false),
-                    Datum::Int4(0),
+                    if field.dropped {
+                        Datum::Int4(0)
+                    } else {
+                        Datum::Int4(field.collation.oid())
+                    },
                     text("", arena)?,
                     text("", arena)?,
                     text(

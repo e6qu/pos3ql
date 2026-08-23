@@ -1845,7 +1845,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
             for field in def.fields() {
-                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1;
+                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1 + 1;
                 if let Some(identity) = field.user_type {
                     n += 1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len();
                 }
@@ -2657,7 +2657,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&[u8::from(field.dropped)])
                     && buffer.append(&[u8::from(field.not_null)])
                     && buffer.append(&[field.ctype.code()])
-                    && buffer.append(&field.type_mod.to_le_bytes());
+                    && buffer.append(&field.type_mod.to_le_bytes())
+                    && buffer.append(&[field.collation.code()]);
                 match field.user_type {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
@@ -4411,6 +4412,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
+                let collation = crate::sql::ast::Collation::from_code(*payload.get(at)?)?;
+                at += 1;
                 let has_user_type = *payload.get(at)?;
                 at += 1;
                 let user_type = match has_user_type {
@@ -4426,6 +4429,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     name: SqlName::parse(field_name).ok()?,
                     ctype: crate::sql::types::ColType::from_code(code)?,
                     type_mod,
+                    collation,
                     user_type,
                     dropped,
                     not_null,
@@ -5986,6 +5990,7 @@ mod tests {
             name: crate::storage::SqlName::parse("retained").unwrap(),
             ctype: ColType::Composite(3),
             type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
             user_type: Some(crate::storage::UserTypeName {
                 schema: crate::storage::SqlName::parse("public").unwrap(),
                 name: crate::storage::SqlName::parse("root").unwrap(),
@@ -5998,6 +6003,7 @@ mod tests {
             name: crate::storage::SqlName::parse("........pg.dropped.2........").unwrap(),
             ctype: ColType::Text,
             type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
             user_type: None,
             dropped: true,
             not_null: false,
@@ -6036,6 +6042,10 @@ mod tests {
         );
         assert_eq!(definition.fields()[1].attribute_number, 2);
         assert!(definition.fields()[1].dropped);
+        assert_eq!(
+            definition.fields()[1].collation,
+            crate::sql::ast::Collation::Default
+        );
 
         payload.clear();
         let drop = WalOp::DropComposite {

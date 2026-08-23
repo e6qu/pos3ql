@@ -3211,6 +3211,7 @@ pub struct CompositeFieldDef {
     pub name: SqlName,
     pub ctype: ColType,
     pub type_mod: i32,
+    pub collation: Collation,
     pub user_type: Option<UserTypeName>,
     pub dropped: bool,
     pub not_null: bool,
@@ -3222,6 +3223,7 @@ impl CompositeFieldDef {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         type_mod: -1,
+        collation: Collation::None,
         user_type: None,
         dropped: true,
         not_null: false,
@@ -15411,6 +15413,20 @@ impl Storage {
         user_type: Option<UserTypeName>,
         txid: u32,
     ) -> Option<i32> {
+        use crate::sql::types::{ArrElem, oid};
+
+        match ctype {
+            ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
+            ColType::Composite(slot) => return Some(oid::composite_oid(slot)),
+            ColType::Array(ArrElem::Enum(slot)) => return Some(oid::enum_array_oid(slot)),
+            ColType::Array(ArrElem::Composite(slot)) => {
+                return Some(oid::composite_array_oid(slot));
+            }
+            ColType::Array(ArrElem::Domain { slot, .. }) => {
+                return Some(oid::domain_array_oid(slot));
+            }
+            _ => {}
+        }
         let Some(identity) = user_type else {
             return Some(ctype.oid());
         };

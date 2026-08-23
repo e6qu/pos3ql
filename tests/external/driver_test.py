@@ -71,6 +71,8 @@ cur.execute("ALTER TYPE drv_state SET SCHEMA drv_moved_types")
 cur.execute("ALTER TYPE drv_point SET SCHEMA drv_moved_types")
 cur.execute("SELECT state::text, (point).x, (point).y FROM drv_moved_values")
 assert cur.fetchone() == ("ready", 3, 4)
+cur.execute("ALTER TYPE drv_moved_types.drv_point ADD ATTRIBUTE code varchar(5) COLLATE \"C\"")
+cur.execute("ALTER TYPE drv_moved_types.drv_point ADD ATTRIBUTE label text COLLATE \"C\"")
 print("type schema moves extended protocol ok")
 
 # PostgreSQL views become writable through row-level INSTEAD OF triggers. This
@@ -148,7 +150,7 @@ print("with dml extended protocol ok")
 # cast its target's, while a computed expression carries none — psycopg derives
 # display_size/precision/scale from it, so a client sees varchar(5) as 5.
 cur.execute("DROP TABLE IF EXISTS drv_typmod")
-cur.execute("CREATE TABLE drv_typmod(v varchar(5), n numeric(6,2), t timestamp(3))")
+cur.execute("CREATE TABLE drv_typmod(v varchar(5), n numeric(6,2), t timestamp(3), label text COLLATE \"C\")")
 cur.execute("SELECT v, n, t, v::varchar(9), upper(v) FROM drv_typmod")
 got = [(d.precision, d.scale, d.display_size) for d in cur.description]
 assert got == [
@@ -159,6 +161,26 @@ assert got == [
     (None, None, None),
 ], f"typmod on the wire: {got}"
 print("row description typmod ok")
+
+cur.execute("INSERT INTO drv_typmod VALUES ('abc', 1.25, timestamp '2000-01-01', 'label')")
+record_queries = [
+    "SELECT (ROW(v,label)).f1, (ROW(v,label)).f2 FROM drv_typmod",
+    "SELECT (q).f1, (q).f2 FROM (SELECT ROW(v,label) q FROM drv_typmod) s",
+    "WITH s AS (SELECT ROW(v,label) q FROM drv_typmod) SELECT (q).* FROM s",
+    "SELECT (ROW(1,2,v,label)::drv_moved_types.drv_point).code, "
+    "(ROW(1,2,v,label)::drv_moved_types.drv_point).label FROM drv_typmod",
+]
+for query in record_queries:
+    cur.execute(query)
+    got = [(d.type_code, d.display_size) for d in cur.description]
+    assert got == [(1043, 5), (25, None)], f"record field metadata: {query}: {got}"
+    assert cur.fetchone() == ("abc", "label")
+bcur = conn.cursor(binary=True)
+bcur.execute(record_queries[1])
+assert [(d.type_code, d.display_size) for d in bcur.description] == [(1043, 5), (25, None)]
+assert bcur.fetchone() == ("abc", "label")
+bcur.close()
+print("record field metadata ok")
 
 # char(n): the blank padding is part of the value on the wire — in both text
 # and binary result formats (PostgreSQL's bpchar binary send is the padded

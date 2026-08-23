@@ -302,6 +302,40 @@ def test_binary_cursor_preserves_type_modifier():
     s.close()
 
 
+def test_record_fields_preserve_type_modifiers():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    query = (
+        "WITH source AS (SELECT ROW('abc'::varchar(5), 'label'::text COLLATE \"C\") AS q) "
+        "SELECT (q).f1, (q).f2 FROM source"
+    )
+    parse = frontend_message(b"P", b"wire_record_meta_statement\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"wire_record_meta_portal\x00wire_record_meta_statement\x00"
+        + struct.pack("!hhhhh", 0, 0, 2, 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_record_meta_portal\x00")
+    s.sendall(parse + bind + describe + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "record fields retain OIDs, typmods, and binary formats",
+        description is not None
+        and row_description_type_oids(description) == [1043, 25]
+        and row_description_type_modifiers(description) == [9, -1]
+        and row_description_formats(description) == [1, 1],
+        out,
+    )
+    s.close()
+
+
 def test_binary_cursor_preserves_catalog_identity():
     s = connect()
     s.sendall(startup_payload(0))
@@ -1529,9 +1563,8 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_required AS integer NOT NULL; "
         "CREATE TYPE wire_binary_coordinate AS (x integer, y integer); "
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
-        "CREATE TABLE wire_binary_values (state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
-        "INSERT INTO wire_binary_values VALUES ('ready', 7, ROW(4,8)::wire_binary_coordinate); "
-        "CREATE TABLE wire_binary_regclass (id integer); "
+        "CREATE TABLE wire_binary_regclass (id integer, state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
+        "INSERT INTO wire_binary_regclass VALUES (1, 'ready', 7, ROW(4,8)::wire_binary_coordinate); "
         "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
         "AS 'SELECT value'; "
         "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL AS 'SELECT $1'; "
@@ -1576,7 +1609,7 @@ def test_catalog_aware_binary_bind_parameters():
             "SELECT ROW('ready'::wire_binary_state, 7::wire_binary_positive, "
             "ROW(4,8)::wire_binary_coordinate)",
         ),
-        ("declared column fields", "SELECT ROW(state, positive, coordinate) FROM wire_binary_values"),
+        ("declared column fields", "SELECT ROW(state, positive, coordinate) FROM wire_binary_regclass"),
         (
             "routine result fields",
             "SELECT ROW(wire_binary_state_echo('ready'::wire_binary_state), "

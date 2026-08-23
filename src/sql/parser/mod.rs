@@ -4789,8 +4789,10 @@ mod tests {
     fn with_parser<R>(text: &str, f: impl FnOnce(&mut Parser) -> R) -> R {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "test", 1 << 18).unwrap();
-        let mut p = Parser::new(text, &arena).unwrap();
-        f(&mut p)
+        crate::mem::guard::forbid_alloc(|| {
+            let mut p = Parser::new(text, &arena).unwrap();
+            f(&mut p)
+        })
     }
 
     #[test]
@@ -5295,9 +5297,10 @@ mod tests {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
                 panic!()
             };
-            let mut got = s.grouping_sets.to_vec();
-            got.sort_unstable();
-            assert_eq!(got, vec![0b00, 0b01, 0b10, 0b11]);
+            assert_eq!(s.grouping_sets.len(), 4);
+            for expected in [0b00, 0b01, 0b10, 0b11] {
+                assert!(s.grouping_sets.contains(&expected));
+            }
         });
         // Explicit GROUPING SETS, including the empty grand-total set.
         with_parser(

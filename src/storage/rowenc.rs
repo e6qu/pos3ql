@@ -337,7 +337,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
-        ColType::Void | ColType::Int2Vector | ColType::Record => {
+        ColType::Void | ColType::Int2Vector | ColType::PgNodeTree | ColType::Record => {
             return Err(corrupt());
         }
         ColType::Composite(_) => {
@@ -386,6 +386,12 @@ pub(crate) fn decode<'a>(
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "int2vector cannot be decoded as a stored column"
+                ));
+            }
+            ColType::PgNodeTree => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "pg_node_tree cannot be decoded as a stored column"
                 ));
             }
             ColType::Bool => {

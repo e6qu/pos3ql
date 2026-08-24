@@ -78,6 +78,84 @@ else
   exit 1
 fi
 
+# This suite owns its PostgreSQL service. Clear cluster-wide roles and user
+# objects so a root-cause rerun observes the same oracle as the first run.
+# Keep the bootstrap public schema: catalog-reference binary values contain
+# its OID, so replacing the schema would manufacture a cross-cluster mismatch.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+SET client_min_messages = warning;
+DO $$
+DECLARE object record;
+BEGIN
+  FOR object IN
+    SELECT c.relkind, c.relname
+      FROM pg_class c
+     WHERE c.relnamespace = 'public'::regnamespace
+       AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+  LOOP
+    EXECUTE format(
+      'DROP %s IF EXISTS public.%I CASCADE',
+      CASE object.relkind
+        WHEN 'v' THEN 'VIEW'
+        WHEN 'm' THEN 'MATERIALIZED VIEW'
+        WHEN 'S' THEN 'SEQUENCE'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        ELSE 'TABLE'
+      END,
+      object.relname
+    );
+  END LOOP;
+  FOR object IN
+    SELECT p.oid::regprocedure AS identity
+      FROM pg_proc p
+     WHERE p.pronamespace = 'public'::regnamespace
+  LOOP
+    EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', object.identity);
+  END LOOP;
+  FOR object IN
+    SELECT t.typname, t.typtype
+      FROM pg_type t
+      LEFT JOIN pg_class c ON c.oid = t.typrelid
+     WHERE t.typnamespace = 'public'::regnamespace
+       AND t.typelem = 0
+       AND (t.typrelid = 0 OR c.relkind = 'c')
+  LOOP
+    EXECUTE format(
+      'DROP %s IF EXISTS public.%I CASCADE',
+      CASE object.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+      object.typname
+    );
+  END LOOP;
+END
+$$;
+DO $$
+DECLARE schema_name text;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+     WHERE nspname <> 'public'
+       AND nspname <> 'information_schema'
+       AND nspname !~ '^pg_'
+  LOOP
+    EXECUTE format('DROP SCHEMA %I CASCADE', schema_name);
+  END LOOP;
+END
+$$;
+DO $$
+DECLARE role_name text;
+BEGIN
+  FOR role_name IN
+    SELECT rolname FROM pg_roles
+     WHERE rolname <> current_user AND rolname !~ '^pg_'
+  LOOP
+    EXECUTE format('DROP OWNED BY %I CASCADE', role_name);
+    EXECUTE format('DROP ROLE %I', role_name);
+  END LOOP;
+END
+$$;
+SQL
+
 # --- start pos3ql (object storage off: this suite is pure SQL semantics) ----
 cargo build --release -q || { echo "build failed"; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
@@ -190,6 +268,10 @@ else
 fi
 
 # --- outbound pg_dump, restored by vanilla PostgreSQL 18 -------------------
+# The inbound and outbound fixtures are independent durability boundaries.
+# Reclaim the first fixture before constructing the second so the configured
+# table bound measures each supported workload rather than test accumulation.
+restart_p3_fresh || exit 1
 echo "=== pos3ql outbound pg_dump round trip ==="
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/outbound_setup.out" 2>&1 <<'SQL'
@@ -278,6 +360,14 @@ CREATE VIEW outbound_dump.row_view AS
       outbound_dump.dump_rows(1),
       generate_series(10,30,10)
     ) WITH ORDINALITY AS rows(item,label,generated,ordinality);
+CREATE TABLE outbound_dump.partition_root (id integer, region integer, PRIMARY KEY (id, region))
+  PARTITION BY RANGE (id, region);
+CREATE TABLE outbound_dump.partition_mid PARTITION OF outbound_dump.partition_root
+  FOR VALUES FROM (0, 0) TO (100, 100) PARTITION BY LIST (region);
+CREATE TABLE outbound_dump.partition_leaf PARTITION OF outbound_dump.partition_mid
+  FOR VALUES IN (1);
+CREATE TABLE outbound_dump.partition_other PARTITION OF outbound_dump.partition_mid DEFAULT;
+INSERT INTO outbound_dump.partition_root VALUES (10, 1), (20, 2);
 GRANT USAGE ON SCHEMA outbound_dump TO outbound_reader;
 GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
 GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
@@ -349,6 +439,7 @@ else
              ((outbound_dump.echo_locations(ARRAY[ROW(13,14,NULL)::outbound_type_target.location]))[1]).y,
              ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16,NULL)::outbound_dump.location_domain]))[1]).east;
       SELECT item,label,generated,ordinality FROM outbound_dump.row_view ORDER BY ordinality;
+      SELECT id,region FROM outbound_dump.partition_root ORDER BY id;
       SELECT a.atttypmod,c.collname
         FROM pg_attribute AS a
         JOIN pg_collation AS c ON c.oid = a.attcollation
@@ -357,7 +448,7 @@ else
                               AND typname = 'metadata')
          AND a.attname = 'code';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n7|C'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n10|1\n20|2\n7|C'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

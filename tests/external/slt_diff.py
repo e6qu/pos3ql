@@ -317,15 +317,10 @@ def main():
     for c in (pg, p3):
         c.execute("SET TimeZone='UTC'")
     # Cap any single statement so a pathological query cannot wedge the run.
-    # An engine that does not enforce statement_timeout says so loudly; we report
-    # which one and fall back to the job-level timeout for that engine.
+    # Both engines must enforce the same session boundary.
     if args.stmt_timeout_ms > 0:
-        for name, c in (("pg", pg), ("p3", p3)):
-            try:
-                c.execute("SET statement_timeout = %d" % args.stmt_timeout_ms)
-            except psycopg.Error as e:
-                print(f"note: {name} does not enforce statement_timeout "
-                      f"({e}); relying on job-level timeout for it")
+        for c in (pg, p3):
+            c.execute("SET statement_timeout = %d" % args.stmt_timeout_ms)
 
     total = {"match": 0, "unsupported": 0, "divergence": 0, "blocks": 0}
     divergences = []

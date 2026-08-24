@@ -740,6 +740,12 @@ pub trait CatalogAccess {
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
+    /// The executable `RANGE|LIST|HASH (...)` clause for a partitioned table.
+    fn partition_key_def<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError>;
     /// The relation name for an OID, for rendering `oid::regclass`.
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.

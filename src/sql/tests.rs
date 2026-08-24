@@ -507,6 +507,45 @@ fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8>
     run_with_guc(engine, budget, sql_text, 1 << 18, &mut guc)
 }
 
+fn copy_line(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    setup: &crate::sql::exec::CopySetup,
+    txn: &mut TxnState,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
+    line: &[u8],
+) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
+    let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
+    let mut responder = Responder::new(&mut send);
+    engine.copy_row_line(setup, txn, seq_session, arena, &mut responder, line)
+}
+
+fn copy_binary_row(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    setup: &crate::sql::exec::CopySetup,
+    txn: &mut TxnState,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
+    row: &[u8],
+) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
+    let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
+    let mut responder = Responder::new(&mut send);
+    engine.copy_row_binary(setup, txn, seq_session, arena, &mut responder, row)
+}
+
+fn finish_copy(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    setup: &crate::sql::exec::CopySetup,
+    txn: &mut TxnState,
+    guc: &GucState,
+) -> Result<(), SqlError> {
+    let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send))
+}
+
 fn run_with_arena_bytes(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -3532,6 +3571,133 @@ fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
 }
 
 #[test]
+fn publication_via_partition_root_emits_root_relation_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE publication_root (id int PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE publication_root_leaf PARTITION OF publication_root FOR VALUES FROM (0) TO (10); \
+         CREATE PUBLICATION root_changes FOR TABLE publication_root \
+           WITH (publish_via_partition_root = true)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = 'root_changes'"
+        )),
+        ["t"]
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_root VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "root replication scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "root replication send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("root_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("root publication transaction is retained");
+    assert!(emitted);
+    assert!(
+        send.readable()
+            .windows(b"publication_root".len())
+            .any(|window| window == b"publication_root")
+    );
+    assert!(
+        !send
+            .readable()
+            .windows(b"publication_root_leaf".len())
+            .any(|window| window == b"publication_root_leaf")
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION root_changes SET (publish_via_partition_root = false)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = 'root_changes'"
+        )),
+        ["f"]
+    );
+}
+
+#[test]
+fn publication_via_partition_root_covers_update_delete_and_truncate() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE publication_root_ops (id int PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE publication_root_ops_leaf PARTITION OF publication_root_ops \
+           FOR VALUES FROM (0) TO (10); \
+         CREATE PUBLICATION root_ops FOR TABLE publication_root_ops \
+           WITH (publish_via_partition_root = true); \
+         INSERT INTO publication_root_ops VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "root ops replication scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "root ops replication send", 1 << 16).unwrap();
+    let publication = [crate::storage::SqlName::parse("root_ops").unwrap()];
+
+    for (statement, operation) in [
+        ("UPDATE publication_root_ops SET id = 2 WHERE id = 1", b'U'),
+        ("DELETE FROM publication_root_ops WHERE id = 2", b'D'),
+        ("TRUNCATE publication_root_ops", b'T'),
+    ] {
+        let floor = engine.storage.lsn();
+        run_txn(&mut engine, &mut budget, &mut transaction, statement);
+        scratch.clear();
+        send.clear();
+        let (_, emitted) = engine
+            .emit_replication_transaction(
+                floor,
+                &publication,
+                false,
+                crate::pg::pgoutput::ProtocolVersion::V2,
+                &mut scratch,
+                &mut Responder::new(&mut send),
+            )
+            .unwrap()
+            .expect("partition operation is retained");
+        assert!(emitted);
+        assert!(send.readable().contains(&operation));
+        assert!(
+            send.readable()
+                .windows(b"publication_root_ops".len())
+                .any(|window| window == b"publication_root_ops")
+        );
+        assert!(
+            !send
+                .readable()
+                .windows(b"publication_root_ops_leaf".len())
+                .any(|window| window == b"publication_root_ops_leaf")
+        );
+    }
+}
+
+#[test]
 fn logical_replication_row_filter_suppresses_unmatched_rows() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -4082,25 +4248,539 @@ fn list_hash_and_default_partitions_route_typed_integer_keys() {
 }
 
 #[test]
-fn multi_column_partition_keys_fail_before_a_partial_catalog_definition_exists() {
+fn multi_column_range_partition_keys_route_lexicographically() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE unsupported_partition_key (a int, b int) PARTITION BY RANGE (a, b)",
+        "CREATE TABLE multi_partition_key (a int, b int) PARTITION BY RANGE (a, b); \
+         CREATE TABLE multi_partition_middle PARTITION OF multi_partition_key \
+           FOR VALUES FROM (0, 0) TO (10, 10); \
+         CREATE TABLE multi_partition_other PARTITION OF multi_partition_key DEFAULT; \
+         INSERT INTO multi_partition_key VALUES (0, 0), (10, 9), (10, 10), (-1, 9); \
+         SELECT count(*) FROM multi_partition_middle; \
+         SELECT count(*) FROM multi_partition_other",
     );
-    assert!(
-        String::from_utf8_lossy(&output).contains("multi-column partition keys are not supported"),
+    assert_eq!(data_rows(&output), ["2", "2"]);
+}
+
+#[test]
+fn multi_column_hash_partition_keys_match_postgresql_integer_hashing() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE multi_hash_key (a int, b int) PARTITION BY HASH (a, b); \
+         CREATE TABLE multi_hash_zero PARTITION OF multi_hash_key \
+           FOR VALUES WITH (MODULUS 4, REMAINDER 0); \
+         CREATE TABLE multi_hash_one PARTITION OF multi_hash_key \
+           FOR VALUES WITH (MODULUS 4, REMAINDER 1); \
+         CREATE TABLE multi_hash_two PARTITION OF multi_hash_key \
+           FOR VALUES WITH (MODULUS 4, REMAINDER 2); \
+         CREATE TABLE multi_hash_three PARTITION OF multi_hash_key \
+           FOR VALUES WITH (MODULUS 4, REMAINDER 3); \
+         INSERT INTO multi_hash_key VALUES \
+           (0, 1), (1, 2), (4, 5), (8, 9), (9, 10), (11, 12); \
+         SELECT a FROM multi_hash_zero ORDER BY a; \
+         SELECT a FROM multi_hash_one ORDER BY a; \
+         SELECT a FROM multi_hash_two ORDER BY a; \
+         SELECT a FROM multi_hash_three ORDER BY a",
+    );
+    assert_eq!(data_rows(&output), ["4", "1", "11", "8", "0", "9"]);
+}
+
+#[test]
+fn subpartitioned_tables_route_through_every_typed_level() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routed_root (id int, region int) PARTITION BY RANGE (id); \
+         CREATE TABLE routed_mid PARTITION OF routed_root FOR VALUES FROM (0) TO (100) \
+           PARTITION BY LIST (region); \
+         CREATE TABLE routed_east PARTITION OF routed_mid FOR VALUES IN (1); \
+         CREATE TABLE routed_other PARTITION OF routed_mid DEFAULT; \
+         INSERT INTO routed_root VALUES (10, 1), (20, 2); \
+         SELECT count(*) FROM routed_east; SELECT count(*) FROM routed_other; \
+         SELECT count(*) FROM routed_root",
+    );
+    assert_eq!(data_rows(&output), ["1", "1", "2"]);
+}
+
+#[test]
+fn root_row_triggers_are_inherited_through_subpartition_attachments() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE inherited_trigger_audit (id int); \
+         CREATE TABLE inherited_trigger_root (id int, region int) PARTITION BY RANGE (id); \
+         CREATE TABLE inherited_trigger_mid PARTITION OF inherited_trigger_root \
+           FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region); \
+         CREATE TABLE inherited_trigger_leaf PARTITION OF inherited_trigger_mid FOR VALUES IN (1); \
+         CREATE FUNCTION inherited_partition_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO inherited_trigger_audit VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TRIGGER inherited_root_after AFTER INSERT ON inherited_trigger_root \
+           FOR EACH ROW EXECUTE FUNCTION inherited_partition_trigger(); \
+         INSERT INTO inherited_trigger_leaf VALUES (10, 1); \
+         SELECT id FROM inherited_trigger_audit",
+    );
+    assert_eq!(data_rows(&output), ["10"]);
+}
+
+#[test]
+fn update_and_delete_triggers_walk_the_complete_partition_chain() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE partition_trigger_log (event text, level int); \
+         CREATE TABLE partition_trigger_root (id int, region int) PARTITION BY RANGE (id); \
+         CREATE TABLE partition_trigger_mid PARTITION OF partition_trigger_root \
+           FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region); \
+         CREATE TABLE partition_trigger_leaf PARTITION OF partition_trigger_mid FOR VALUES IN (1); \
+         CREATE FUNCTION partition_root_change() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO partition_trigger_log VALUES (TG_OP, 1); IF TG_OP = ''DELETE'' THEN RETURN OLD; END IF; RETURN NEW; END'; \
+         CREATE FUNCTION partition_mid_change() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO partition_trigger_log VALUES (TG_OP, 2); IF TG_OP = ''DELETE'' THEN RETURN OLD; END IF; RETURN NEW; END'; \
+         CREATE TRIGGER partition_root_change AFTER UPDATE OR DELETE ON partition_trigger_root \
+           FOR EACH ROW EXECUTE FUNCTION partition_root_change(); \
+         CREATE TRIGGER partition_mid_change AFTER UPDATE OR DELETE ON partition_trigger_mid \
+           FOR EACH ROW EXECUTE FUNCTION partition_mid_change(); \
+         INSERT INTO partition_trigger_root VALUES (10, 1); \
+         UPDATE partition_trigger_root SET id = 11 WHERE id = 10; \
+         DELETE FROM partition_trigger_root WHERE id = 11; \
+         SELECT event, level FROM partition_trigger_log",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["UPDATE|2", "UPDATE|1", "DELETE|2", "DELETE|1"],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn on_conflict_update_uses_the_complete_partition_trigger_chain() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE conflict_partition_log (level int, value int); \
+         CREATE TABLE conflict_partition_root (id int PRIMARY KEY, value int) PARTITION BY RANGE (id); \
+         CREATE TABLE conflict_partition_mid PARTITION OF conflict_partition_root \
+           FOR VALUES FROM (0) TO (100) PARTITION BY HASH (id); \
+         CREATE TABLE conflict_partition_leaf PARTITION OF conflict_partition_mid \
+           FOR VALUES WITH (MODULUS 1, REMAINDER 0); \
+         CREATE TABLE conflict_partition_high PARTITION OF conflict_partition_root \
+           FOR VALUES FROM (100) TO (200); \
+         CREATE FUNCTION conflict_partition_root_audit() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO conflict_partition_log VALUES (1, NEW.value); RETURN NEW; END'; \
+         CREATE FUNCTION conflict_partition_mid_audit() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO conflict_partition_log VALUES (2, NEW.value); RETURN NEW; END'; \
+         CREATE TRIGGER conflict_partition_root_audit AFTER UPDATE ON conflict_partition_root \
+           FOR EACH ROW EXECUTE FUNCTION conflict_partition_root_audit(); \
+         CREATE TRIGGER conflict_partition_mid_audit AFTER UPDATE ON conflict_partition_mid \
+           FOR EACH ROW EXECUTE FUNCTION conflict_partition_mid_audit(); \
+         INSERT INTO conflict_partition_root VALUES (1, 10); \
+         INSERT INTO conflict_partition_root VALUES (1, 20) \
+           ON CONFLICT (id) DO UPDATE SET value = excluded.value; \
+         SELECT level, value FROM conflict_partition_log ORDER BY level",
+    );
+    assert_eq!(data_rows(&output), ["1|20", "2|20"]);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO conflict_partition_root VALUES (1, 30) \
+         ON CONFLICT (id) DO UPDATE SET id = 101",
+    );
+    assert!(output.windows(5).any(|window| window == b"0A000"));
+}
+
+#[test]
+fn partition_constraints_apply_to_parent_and_direct_leaf_writes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE constrained_partition_root (id int PRIMARY KEY, amount int CHECK (amount > 0)) \
+           PARTITION BY RANGE (id); \
+         CREATE TABLE constrained_partition_leaf PARTITION OF constrained_partition_root \
+           FOR VALUES FROM (0) TO (10)",
+    );
+    for statement in [
+        "INSERT INTO constrained_partition_root VALUES (1, 0)",
+        "INSERT INTO constrained_partition_leaf VALUES (2, 0)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("violates check constraint"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn parent_constraint_alters_are_durable_on_existing_partition_leaves() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE altered_constraint_root (id int, amount int) PARTITION BY RANGE (id); \
+         CREATE TABLE altered_constraint_leaf PARTITION OF altered_constraint_root \
+           FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE altered_constraint_root ADD CONSTRAINT positive_amount CHECK (amount > 0); \
+         ALTER TABLE altered_constraint_root RENAME CONSTRAINT positive_amount TO amount_is_positive",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO altered_constraint_leaf VALUES (1, 0)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("amount_is_positive"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE altered_constraint_root DROP CONSTRAINT amount_is_positive; \
+         INSERT INTO altered_constraint_leaf VALUES (1, 0); \
+         SELECT amount FROM altered_constraint_leaf",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn partition_constraint_identity_and_not_null_provenance_follow_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE provenance_ref (id int PRIMARY KEY); \
+         CREATE TABLE provenance_root (id int, region int, \
+             CONSTRAINT root_key UNIQUE (id, region), \
+             CONSTRAINT positive_id CHECK (id > 0), \
+             CONSTRAINT provenance_fk FOREIGN KEY (id) REFERENCES provenance_ref(id)) \
+           PARTITION BY RANGE (region); \
+         CREATE TABLE provenance_mid (id int NOT NULL, region int, \
+           CONSTRAINT positive_id CHECK (id > 0)) PARTITION BY HASH (id); \
+         ALTER TABLE provenance_root ATTACH PARTITION provenance_mid \
+           FOR VALUES FROM (0) TO (100); \
+         CREATE TABLE provenance_leaf PARTITION OF provenance_mid \
+           FOR VALUES WITH (MODULUS 1, REMAINDER 0); \
+         ALTER TABLE provenance_root ALTER COLUMN id SET NOT NULL; \
+         ALTER TABLE provenance_root ALTER COLUMN id DROP NOT NULL",
     );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM pg_class WHERE relname = 'unsupported_partition_key'",
+            "SELECT relation.relname, constraint_catalog.conislocal, \
+                    constraint_catalog.coninhcount \
+               FROM pg_constraint constraint_catalog \
+               JOIN pg_class relation ON relation.oid = constraint_catalog.conrelid \
+              WHERE relation.relname IN ('provenance_mid', 'provenance_leaf') \
+                AND constraint_catalog.contype = 'n' ORDER BY relation.relname",
+        )),
+        ["provenance_leaf|f|1", "provenance_mid|t|0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT child.relname, child_constraint.conname, parent.relname \
+               FROM pg_constraint child_constraint \
+               JOIN pg_class child ON child.oid = child_constraint.conrelid \
+               JOIN pg_constraint parent_constraint \
+                 ON parent_constraint.oid = child_constraint.conparentid \
+               JOIN pg_class parent ON parent.oid = parent_constraint.conrelid \
+              WHERE child.relname IN ('provenance_mid', 'provenance_leaf') \
+                AND child_constraint.contype = 'u' ORDER BY child.relname",
+        )),
+        [
+            "provenance_leaf|provenance_leaf_id_region_key|provenance_mid",
+            "provenance_mid|provenance_mid_id_region_key|provenance_root",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation.relname, constraint_catalog.contype, \
+                    constraint_catalog.conislocal, constraint_catalog.coninhcount, \
+                    constraint_catalog.conparentid <> 0 \
+               FROM pg_constraint constraint_catalog \
+               JOIN pg_class relation ON relation.oid = constraint_catalog.conrelid \
+              WHERE relation.relname IN \
+                    ('provenance_root', 'provenance_mid', 'provenance_leaf') \
+                AND constraint_catalog.contype IN ('c', 'f') \
+              ORDER BY relation.relname, constraint_catalog.contype",
+        )),
+        [
+            "provenance_leaf|c|f|1|f",
+            "provenance_leaf|f|f|1|t",
+            "provenance_mid|c|f|1|f",
+            "provenance_mid|f|f|1|t",
+            "provenance_root|c|t|0|f",
+            "provenance_root|f|t|0|f",
+        ]
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE provenance_root RENAME CONSTRAINT positive_id TO id_is_positive; \
+         ALTER TABLE provenance_root DROP CONSTRAINT root_key",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation.relname, constraint_catalog.conname \
+               FROM pg_constraint constraint_catalog \
+               JOIN pg_class relation ON relation.oid = constraint_catalog.conrelid \
+              WHERE relation.relname LIKE 'provenance_%' \
+                AND constraint_catalog.contype IN ('c', 'u') \
+              ORDER BY relation.relname, constraint_catalog.conname",
+        )),
+        [
+            "provenance_leaf|id_is_positive",
+            "provenance_mid|id_is_positive",
+            "provenance_root|id_is_positive",
+        ]
+    );
+}
+
+#[test]
+fn attach_partition_validates_every_inherited_constraint() {
+    let (mut engine, mut budget) = test_engine();
+    let setup_output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE attach_constraint_root (id int, region int, \
+             PRIMARY KEY (id, region), CHECK (id > 0)) PARTITION BY RANGE (region); \
+         CREATE TABLE attach_duplicate (id int NOT NULL, region int NOT NULL, \
+           CONSTRAINT attach_constraint_root_id_check CHECK (id > 0)); \
+         INSERT INTO attach_duplicate VALUES (1, 10), (1, 10); \
+         CREATE TABLE attach_bad_check (id int NOT NULL, region int NOT NULL); \
+         INSERT INTO attach_bad_check VALUES (-1, 20)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup_output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup_output)
+    );
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE attach_constraint_root ATTACH PARTITION attach_duplicate \
+           FOR VALUES FROM (10) TO (20)",
+    );
+    assert!(
+        duplicate.windows(5).any(|window| window == b"23505"),
+        "{}",
+        String::from_utf8_lossy(&duplicate)
+    );
+    let check = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE attach_constraint_root ATTACH PARTITION attach_bad_check \
+           FOR VALUES FROM (20) TO (30)",
+    );
+    assert!(check.windows(5).any(|window| window == b"42804"));
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE attach_subroot (id int NOT NULL, region int NOT NULL, \
+           CONSTRAINT attach_constraint_root_id_check CHECK (id > 0)) PARTITION BY HASH (id); \
+         CREATE TABLE attach_subleaf PARTITION OF attach_subroot \
+           FOR VALUES WITH (MODULUS 1, REMAINDER 0); \
+         ALTER TABLE attach_constraint_root ATTACH PARTITION attach_subroot \
+           FOR VALUES FROM (30) TO (40)",
+    );
+    let inherited_check = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO attach_subleaf VALUES (-1, 35)",
+    );
+    assert!(inherited_check.windows(5).any(|window| window == b"23514"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO attach_subleaf VALUES (1, 35)",
+    );
+    let inherited_unique = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO attach_subleaf VALUES (1, 35)",
+    );
+    assert!(inherited_unique.windows(5).any(|window| window == b"23505"));
+}
+
+#[test]
+fn attach_and_detach_partition_validate_rows_and_change_visibility_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE attach_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE attach_leaf (id int); INSERT INTO attach_leaf VALUES (5); \
+         ALTER TABLE attach_parent ATTACH PARTITION attach_leaf FOR VALUES FROM (0) TO (10); \
+         SELECT count(*) FROM attach_parent; \
+         ALTER TABLE attach_parent DETACH PARTITION attach_leaf; \
+         SELECT count(*) FROM attach_parent; SELECT count(*) FROM attach_leaf",
+    );
+    assert_eq!(data_rows(&output), ["1", "0", "1"]);
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE invalid_attach (id int); INSERT INTO invalid_attach VALUES (20)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE attach_parent ATTACH PARTITION invalid_attach FOR VALUES FROM (0) TO (10)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("is violated by some row"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn attach_and_detach_partition_catalog_versions_are_transaction_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE attach_visibility_parent (id int) PARTITION BY RANGE (id); \
+         CREATE TABLE attach_visibility_leaf (id int)",
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE attach_visibility_parent ATTACH PARTITION attach_visibility_leaf \
+           FOR VALUES FROM (0) TO (10)",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
         )),
         ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
+        )),
+        ["0"]
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE attach_visibility_parent ATTACH PARTITION attach_visibility_leaf \
+           FOR VALUES FROM (0) TO (10)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
+        )),
+        ["1"]
+    );
+
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "ALTER TABLE attach_visibility_parent DETACH PARTITION attach_visibility_leaf",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
+        )),
+        ["0"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE c.relname = 'attach_visibility_leaf'",
+        )),
+        ["0"]
+    );
+}
+
+#[test]
+fn dropping_partitioned_root_drops_the_complete_internal_tree() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE drop_partition_root (id int, region int) PARTITION BY RANGE (id); \
+         CREATE TABLE drop_partition_mid PARTITION OF drop_partition_root \
+           FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region); \
+         CREATE TABLE drop_partition_leaf PARTITION OF drop_partition_mid FOR VALUES IN (1); \
+         DROP TABLE drop_partition_root; \
+         SELECT count(*) FROM pg_class WHERE relname IN \
+           ('drop_partition_root', 'drop_partition_mid', 'drop_partition_leaf')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -4166,12 +4846,31 @@ fn partitioned_unique_keys_must_include_the_partition_key() {
 }
 
 #[test]
+fn inherited_unique_constraint_must_include_each_subpartition_key() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE global_partition_key (id int UNIQUE, region int) PARTITION BY RANGE (id); \
+         CREATE TABLE global_partition_mid PARTITION OF global_partition_key \
+           FOR VALUES FROM (0) TO (10) PARTITION BY LIST (region)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains(
+            "unique constraint on partitioned table must include all partitioning columns"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE catalog_partition_parent (id int) PARTITION BY RANGE (id); \
+        "CREATE TABLE catalog_partition_parent (id int PRIMARY KEY) PARTITION BY RANGE (id); \
          CREATE TABLE catalog_partition_leaf PARTITION OF catalog_partition_parent \
            FOR VALUES FROM (0) TO (10)",
     );
@@ -4199,6 +4898,41 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
+            "SELECT pg_get_partkeydef(oid), pg_get_expr(relpartbound, oid) FROM pg_class \
+             WHERE relname = 'catalog_partition_parent'"
+        )),
+        ["RANGE (id)|NULL"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_partkeydef('16384')",
+        )),
+        ["RANGE (id)"],
+        "pg_dump passes relation OIDs as unknown string literals"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(relpartbound, oid) FROM pg_class \
+             WHERE relname = 'catalog_partition_leaf'"
+        )),
+        ["FOR VALUES FROM (0) TO (10)"]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relpartbound FROM pg_class WHERE relname = 'catalog_partition_leaf'",
+        )),
+        [crate::sql::types::oid::PG_NODE_TREE]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
             "SELECT partrelid FROM pg_partitioned_table WHERE 0 = ANY(partclass)",
         )),
         Vec::<String>::new(),
@@ -4214,6 +4948,68 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
              WHERE child.relname = 'catalog_partition_leaf'"
         )),
         ["catalog_partition_parent"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT parent_index.relname FROM pg_inherits inheritance \
+               JOIN pg_class child_index ON child_index.oid = inheritance.inhrelid \
+               JOIN pg_class parent_index ON parent_index.oid = inheritance.inhparent \
+              WHERE child_index.relname = 'catalog_partition_leaf_pkey'"
+        )),
+        ["catalog_partition_parent_pkey"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT child_constraint.conparentid = parent_constraint.oid, \
+                    child_constraint.conislocal, child_constraint.coninhcount \
+               FROM pg_constraint child_constraint \
+               JOIN pg_class child ON child.oid = child_constraint.conrelid \
+               JOIN pg_constraint parent_constraint \
+                 ON parent_constraint.oid = child_constraint.conparentid \
+               JOIN pg_class parent ON parent.oid = parent_constraint.conrelid \
+              WHERE child.relname = 'catalog_partition_leaf' \
+                AND parent.relname = 'catalog_partition_parent'"
+        )),
+        ["t|f|1"]
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_partition_tree (id int, region int, PRIMARY KEY (id, region)) \
+           PARTITION BY RANGE (id, region); \
+         CREATE TABLE catalog_partition_mid PARTITION OF catalog_partition_tree \
+           FOR VALUES FROM (0, 0) TO (100, 100) PARTITION BY LIST (region); \
+         CREATE TABLE catalog_partition_tree_leaf PARTITION OF catalog_partition_mid \
+           FOR VALUES IN (1)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation.relname, parent_relation.relname, \
+                    constraint_catalog.conislocal, constraint_catalog.coninhcount \
+               FROM pg_constraint constraint_catalog \
+               JOIN pg_class relation ON relation.oid = constraint_catalog.conrelid \
+               LEFT JOIN pg_constraint parent_constraint \
+                 ON parent_constraint.oid = constraint_catalog.conparentid \
+               LEFT JOIN pg_class parent_relation \
+                 ON parent_relation.oid = parent_constraint.conrelid \
+              WHERE relation.relname IN \
+                    ('catalog_partition_tree', 'catalog_partition_mid', \
+                     'catalog_partition_tree_leaf') \
+                AND constraint_catalog.contype = 'p' \
+              ORDER BY relation.relname"
+        )),
+        [
+            "catalog_partition_mid|catalog_partition_tree|f|1",
+            "catalog_partition_tree|NULL|t|0",
+            "catalog_partition_tree_leaf|catalog_partition_mid|f|1",
+        ]
     );
 }
 
@@ -4239,9 +5035,32 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE copy_from_parent (id int) PARTITION BY RANGE (id); \
+        "CREATE TABLE copy_from_audit (id int, level int); \
+         CREATE TABLE copy_from_statement_audit (phase text, rows int); \
+         CREATE TABLE copy_from_parent (id int) PARTITION BY RANGE (id); \
          CREATE TABLE copy_from_low PARTITION OF copy_from_parent FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE copy_from_other PARTITION OF copy_from_parent DEFAULT",
+         CREATE TABLE copy_from_other PARTITION OF copy_from_parent DEFAULT; \
+         CREATE FUNCTION copy_from_root_audit() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_from_audit VALUES (NEW.id, 1); RETURN NEW; END'; \
+         CREATE FUNCTION copy_from_leaf_audit() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_from_audit VALUES (NEW.id, 2); RETURN NEW; END'; \
+         CREATE FUNCTION copy_from_before_statement() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_from_statement_audit \
+              SELECT ''before'', count(*) FROM copy_from_parent; RETURN NULL; END'; \
+         CREATE FUNCTION copy_from_after_statement() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_from_statement_audit \
+              SELECT ''after'', count(*) FROM copied_rows; RETURN NULL; END'; \
+         CREATE TRIGGER copy_from_before_statement BEFORE INSERT ON copy_from_parent \
+           FOR EACH STATEMENT EXECUTE FUNCTION copy_from_before_statement(); \
+         CREATE TRIGGER copy_from_after_statement AFTER INSERT ON copy_from_parent \
+           REFERENCING NEW TABLE AS copied_rows FOR EACH STATEMENT \
+           EXECUTE FUNCTION copy_from_after_statement(); \
+         CREATE TRIGGER copy_from_root_audit AFTER INSERT ON copy_from_parent \
+           FOR EACH ROW EXECUTE FUNCTION copy_from_root_audit(); \
+         CREATE TRIGGER copy_from_low_audit AFTER INSERT ON copy_from_low \
+           FOR EACH ROW EXECUTE FUNCTION copy_from_leaf_audit(); \
+         CREATE TRIGGER copy_from_other_audit AFTER INSERT ON copy_from_other \
+           FOR EACH ROW EXECUTE FUNCTION copy_from_leaf_audit()",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -4276,20 +5095,38 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         })
     };
     arena.reset();
-    engine
-        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"1")
-        .unwrap();
-    engine
-        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"20")
-        .unwrap();
-    engine.copy_finish(&mut txn, &guc).unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"1",
+    )
+    .unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"20",
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM copy_from_low; SELECT count(*) FROM copy_from_other"
+            "SELECT count(*) FROM copy_from_low; SELECT count(*) FROM copy_from_other; \
+             SELECT id, level FROM copy_from_audit ORDER BY id, level; \
+             SELECT phase, rows FROM copy_from_statement_audit ORDER BY phase"
         )),
-        ["1", "1"]
+        [
+            "1", "1", "1|1", "1|2", "20|1", "20|2", "after|2", "before|0"
+        ]
     );
 }
 
@@ -8808,6 +9645,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
     let mut config = test_config("partition-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
+    config.max_tables = 32;
     config.object_store_namespace = format!("partition-restart-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     {
@@ -8819,7 +9657,24 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
             "CREATE TABLE restart_parent (id int) PARTITION BY RANGE (id); \
              CREATE TABLE restart_low PARTITION OF restart_parent FOR VALUES FROM (MINVALUE) TO (10); \
              CREATE TABLE restart_default PARTITION OF restart_parent DEFAULT; \
+             CREATE TABLE restart_subroot (id int, region int) PARTITION BY RANGE (id); \
+             CREATE TABLE restart_submid PARTITION OF restart_subroot FOR VALUES FROM (0) TO (100) \
+               PARTITION BY LIST (region); \
+             CREATE TABLE restart_subleaf PARTITION OF restart_submid FOR VALUES IN (1); \
+             CREATE TABLE restart_attached (id int, region int); \
+             ALTER TABLE restart_submid ATTACH PARTITION restart_attached DEFAULT; \
+             CREATE TABLE restart_null_root (id int) PARTITION BY RANGE (id); \
+             CREATE TABLE restart_null_mid (id int NOT NULL) PARTITION BY HASH (id); \
+             ALTER TABLE restart_null_root ATTACH PARTITION restart_null_mid \
+               FOR VALUES FROM (0) TO (100); \
+             CREATE TABLE restart_null_leaf PARTITION OF restart_null_mid \
+               FOR VALUES WITH (MODULUS 1, REMAINDER 0); \
+             ALTER TABLE restart_null_root ALTER COLUMN id SET NOT NULL; \
+             ALTER TABLE restart_null_root ALTER COLUMN id DROP NOT NULL; \
+             CREATE PUBLICATION restart_publication FOR TABLE restart_subroot \
+               WITH (publish_via_partition_root = true); \
              INSERT INTO restart_parent VALUES (1), (20); \
+             INSERT INTO restart_subroot VALUES (10, 1), (20, 2); \
              UPDATE restart_parent SET id = 12 WHERE id = 1",
         );
         assert!(engine.checkpoint().unwrap());
@@ -8837,7 +9692,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
     run_with(
         &mut engine,
         &mut budget,
-        "INSERT INTO restart_parent VALUES (2)",
+        "INSERT INTO restart_parent VALUES (2); INSERT INTO restart_subroot VALUES (30, 1), (40, 2)",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -8846,6 +9701,28 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
             "SELECT id FROM restart_low ORDER BY id"
         )),
         ["2"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM restart_subleaf; SELECT count(*) FROM restart_attached; \
+             SELECT pubviaroot FROM pg_publication WHERE pubname = 'restart_publication'"
+        )),
+        ["2", "2", "t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation.relname, constraint_catalog.conislocal, \
+                    constraint_catalog.coninhcount \
+               FROM pg_constraint constraint_catalog \
+               JOIN pg_class relation ON relation.oid = constraint_catalog.conrelid \
+              WHERE relation.relname IN ('restart_null_mid', 'restart_null_leaf') \
+                AND constraint_catalog.contype = 'n' ORDER BY relation.relname"
+        )),
+        ["restart_null_leaf|f|1", "restart_null_mid|t|0"]
     );
 }
 
@@ -19600,16 +20477,17 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
     input_row.extend_from_slice(&1_i16.to_be_bytes());
     input_row.extend_from_slice(&(input_array.len() as i32).to_be_bytes());
     input_row.extend_from_slice(&input_array);
-    engine
-        .copy_row_binary(
-            &setup,
-            &mut transaction,
-            guc.seq_session(),
-            &arena,
-            &input_row,
-        )
-        .unwrap();
-    engine.copy_finish(&mut transaction, &guc).unwrap();
+    copy_binary_row(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        guc.seq_session(),
+        &arena,
+        &input_row,
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
     engine.commit_txn(&mut transaction, &guc).unwrap();
     let selected = run_with(
         &mut engine,
@@ -24736,6 +25614,165 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
 }
 
 #[test]
+fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
+    use crate::pg::pginput::copy_data;
+    use crate::pg::subscription_apply::{ApplyResult, SubscriptionApply};
+
+    fn receive(
+        apply: &mut SubscriptionApply,
+        engine: &mut Engine,
+        end_lsn: u64,
+        plugin: &[u8],
+    ) -> ApplyResult {
+        let mut frame = [0_u8; 256];
+        frame[0] = b'w';
+        frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
+        frame[25..25 + plugin.len()].copy_from_slice(plugin);
+        let parsed = copy_data(&frame[..25 + plugin.len()]).expect("valid pgoutput frame");
+        apply.receive(engine, parsed).unwrap()
+    }
+
+    fn relation() -> Vec<u8> {
+        let mut message = vec![b'R'];
+        message.extend_from_slice(&7_u32.to_be_bytes());
+        message.extend_from_slice(b"public\0replicated_partition\0");
+        message.push(b'd');
+        message.extend_from_slice(&2_u16.to_be_bytes());
+        for (key, name, oid) in [(1_u8, b"id".as_slice(), 23_u32), (0, b"body", 25)] {
+            message.push(key);
+            message.extend_from_slice(name);
+            message.push(0);
+            message.extend_from_slice(&oid.to_be_bytes());
+            message.extend_from_slice(&(-1_i32).to_be_bytes());
+        }
+        message
+    }
+
+    fn tuple(columns: &[&[u8]]) -> Vec<u8> {
+        let mut tuple = Vec::new();
+        tuple.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+        for column in columns {
+            tuple.push(b't');
+            tuple.extend_from_slice(&(column.len() as u32).to_be_bytes());
+            tuple.extend_from_slice(column);
+        }
+        tuple
+    }
+
+    fn begin(final_lsn: u64, xid: u32) -> [u8; 21] {
+        let mut message = [0_u8; 21];
+        message[0] = b'B';
+        message[1..9].copy_from_slice(&final_lsn.to_be_bytes());
+        message[17..21].copy_from_slice(&xid.to_be_bytes());
+        message
+    }
+
+    fn commit(commit_lsn: u64, end_lsn: u64) -> [u8; 26] {
+        let mut message = [0_u8; 26];
+        message[0] = b'C';
+        message[2..10].copy_from_slice(&commit_lsn.to_be_bytes());
+        message[10..18].copy_from_slice(&end_lsn.to_be_bytes());
+        message
+    }
+
+    let config = test_config("pgoutput-partition-root-apply");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text) PARTITION BY RANGE (id); \
+         CREATE TABLE replicated_partition_low PARTITION OF replicated_partition \
+           FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE replicated_partition_high PARTITION OF replicated_partition \
+           FOR VALUES FROM (10) TO (20); \
+         CREATE SUBSCRIPTION partition_apply CONNECTION \
+           'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+           PUBLICATION partition_changes WITH (connect = false, slot_name = NONE)",
+    );
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        engine.subscription_stream("partition_apply").unwrap(),
+        8,
+        config.txn_rows,
+        1 << 16,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        receive(&mut apply, &mut engine, 1, &relation()),
+        ApplyResult::None
+    );
+
+    receive(&mut apply, &mut engine, 40, &begin(40, 1));
+    let mut insert = vec![b'I'];
+    insert.extend_from_slice(&7_u32.to_be_bytes());
+    insert.push(b'N');
+    insert.extend_from_slice(&tuple(&[b"1", b"first"]));
+    receive(&mut apply, &mut engine, 40, &insert);
+    assert_eq!(
+        receive(&mut apply, &mut engine, 41, &commit(40, 41)),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 41,
+            reply_requested: false,
+        }
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, body FROM replicated_partition_low",
+        )),
+        ["1|first"]
+    );
+
+    receive(&mut apply, &mut engine, 80, &begin(80, 2));
+    let mut update = vec![b'U'];
+    update.extend_from_slice(&7_u32.to_be_bytes());
+    update.push(b'K');
+    update.push(b'N');
+    update.extend_from_slice(&tuple(&[b"1"]));
+    update.push(b'N');
+    update.extend_from_slice(&tuple(&[b"11", b"moved"]));
+    receive(&mut apply, &mut engine, 80, &update);
+    receive(&mut apply, &mut engine, 81, &commit(80, 81));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, body FROM replicated_partition_high",
+        )),
+        ["11|moved"]
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition_low",
+        ))
+        .is_empty()
+    );
+
+    receive(&mut apply, &mut engine, 100, &begin(100, 3));
+    let mut delete = vec![b'D'];
+    delete.extend_from_slice(&7_u32.to_be_bytes());
+    delete.push(b'K');
+    delete.push(b'N');
+    delete.extend_from_slice(&tuple(&[b"11"]));
+    receive(&mut apply, &mut engine, 100, &delete);
+    receive(&mut apply, &mut engine, 101, &commit(100, 101));
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition",
+        ))
+        .is_empty()
+    );
+    assert_eq!(apply.confirmed_lsn(), 101);
+}
+
+#[test]
 fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
     let config = test_config("publication-alter-replay");
     let mut budget = Budget::new(1 << 27);
@@ -28956,10 +29993,17 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     arena.reset();
-    engine
-        .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"5")
-        .unwrap();
-    engine.copy_finish(&mut txn, &guc).unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"5",
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
 
     let rows = data_rows(&run_with(
         &mut engine,
@@ -29029,28 +30073,30 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         .expect_err("reordered header must fail");
     assert_eq!(bad_header.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
     arena.reset();
-    engine
-        .copy_row_line(
-            &setup,
-            &mut txn,
-            guc.seq_session(),
-            &arena,
-            b"DEFAULT,loaded",
-        )
-        .expect("DEFAULT marker uses the column default");
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"DEFAULT,loaded",
+    )
+    .expect("DEFAULT marker uses the column default");
     arena.reset();
-    let conversion = engine
-        .copy_row_line(
-            &setup,
-            &mut txn,
-            guc.seq_session(),
-            &arena,
-            b"not-an-integer,rejected",
-        )
-        .expect_err("bad integer must remain a typed conversion error");
+    let conversion = copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"not-an-integer,rejected",
+    )
+    .expect_err("bad integer must remain a typed conversion error");
     assert!(crate::sql::exec::copy_ignorable_error(&conversion));
     assert!(conversion.message.as_str().contains("COPY column \"id\""));
-    engine.copy_finish(&mut txn, &guc).unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
 
     assert_eq!(
         data_rows(&run_with(
@@ -29110,27 +30156,48 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
         .expect("COPY enters streaming mode");
     arena.reset();
     assert_eq!(
-        engine
-            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"skip")
-            .unwrap(),
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            b"skip",
+        )
+        .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered
     );
     arena.reset();
     assert_eq!(
-        engine
-            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"\\N")
-            .unwrap(),
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            b"\\N",
+        )
+        .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered,
         "a NULL predicate filters before the row's NOT NULL constraint"
     );
     arena.reset();
     assert_eq!(
-        engine
-            .copy_row_line(&setup, &mut txn, guc.seq_session(), &arena, b"keep")
-            .unwrap(),
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            b"keep",
+        )
+        .unwrap(),
         crate::sql::exec::CopyRowOutcome::Stored
     );
-    engine.copy_finish(&mut txn, &guc).unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
 
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "copy where binary send", 1 << 18).unwrap();
@@ -29160,12 +30227,19 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
     ];
     arena.reset();
     assert_eq!(
-        engine
-            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, &binary_row)
-            .unwrap(),
+        copy_binary_row(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            &binary_row,
+        )
+        .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered
     );
-    engine.copy_finish(&mut txn, &guc).unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
 
     assert_eq!(
         data_rows(&run_with(
@@ -29228,9 +30302,16 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
         &[0, 1, 255, 255, 255, 254][..], // field length below -1
         &[0, 1, 0, 0, 0, 0, 0][..],      // trailing byte after an empty field
     ] {
-        let error = engine
-            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, frame)
-            .unwrap_err();
+        let error = copy_binary_row(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            frame,
+        )
+        .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
     }
 }
@@ -29285,10 +30366,17 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
     row.extend_from_slice(&(array.len() as i32).to_be_bytes());
     row.extend_from_slice(&array);
     assert_eq!(
-        engine
-            .copy_row_binary(&setup, &mut txn, guc.seq_session(), &arena, &row)
-            .unwrap_err()
-            .sqlstate,
+        copy_binary_row(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut txn,
+            guc.seq_session(),
+            &arena,
+            &row,
+        )
+        .unwrap_err()
+        .sqlstate,
         sqlstate::NOT_NULL_VIOLATION
     );
 }

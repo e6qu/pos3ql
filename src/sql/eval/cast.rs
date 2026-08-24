@@ -48,6 +48,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Int2Vector(_) => v,
             _ => return Err(cast_unsupported(&v, "int2vector")),
         },
+        ColType::PgNodeTree => match v {
+            Datum::Text(_) => v,
+            _ => return Err(cast_unsupported(&v, "pg_node_tree")),
+        },
         ColType::Regtype => match v {
             Datum::Regtype { .. } => v,
             Datum::Text(name) => super::regtype_of_name(name)?,

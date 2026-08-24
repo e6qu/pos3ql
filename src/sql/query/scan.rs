@@ -1391,10 +1391,10 @@ pub(crate) fn select_hash_join_plan<'a>(
     // asking storage for partition metadata.
     let is_partition_parent = |source: usize| {
         scope.derived[source].is_none()
-            && matches!(
-                storage.table_def(scope.slots[source], txid).partition,
-                crate::storage::PartitionDef::Parent { .. }
-            )
+            && storage
+                .table_def(scope.slots[source], txid)
+                .partition
+                .is_partitioned()
     };
     if is_partition_parent(probe_table) || is_partition_parent(build_table) {
         return Ok(None);
@@ -1526,6 +1526,134 @@ fn scan_source_mode<'a>(
         }
         None => None,
     };
+
+    fn exact_partition_leaf<'a>(
+        storage: &Storage,
+        scope: &QueryScope<'a>,
+        source: usize,
+        predicate: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        hooks: &EvalHooks<'_, 'a>,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        let root = scope.slots[source];
+        if !storage.table_def(root, txid).partition.is_partitioned() {
+            return Ok(None);
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        let mut known = [false; MAX_COLUMNS];
+        fn collect<'a>(
+            expression: &'a Expr<'a>,
+            storage: &Storage,
+            scope: &QueryScope<'a>,
+            source: usize,
+            arena: &'a Arena,
+            params: &[Datum<'a>],
+            hooks: &EvalHooks<'_, 'a>,
+            txid: u32,
+            values: &mut [Datum<'a>; MAX_COLUMNS],
+            known: &mut [bool; MAX_COLUMNS],
+        ) -> Result<(), SqlError> {
+            if let Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+            } = expression
+            {
+                collect(
+                    left, storage, scope, source, arena, params, hooks, txid, values, known,
+                )?;
+                return collect(
+                    right, storage, scope, source, arena, params, hooks, txid, values, known,
+                );
+            }
+            let Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+            } = expression
+            else {
+                return Ok(());
+            };
+            let mut bind = |column: &'a Expr<'a>,
+                            constant: &'a Expr<'a>|
+             -> Result<bool, SqlError> {
+                let Expr::Column { qualifier, name } = column else {
+                    return Ok(false);
+                };
+                if !constant.is_constant() || constant.contains_call() {
+                    return Ok(false);
+                }
+                let Ok(ResolvedColumn::Table(table, index)) = scope.find_column(*qualifier, name)
+                else {
+                    return Ok(false);
+                };
+                if table != source {
+                    return Ok(false);
+                }
+                let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
+                values[index] = crate::sql::exec::coerce(
+                    raw,
+                    &storage.table_def(scope.slots[source], txid).columns[index],
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                known[index] = true;
+                Ok(true)
+            };
+            if !bind(left, right)? {
+                let _ = bind(right, left)?;
+            }
+            Ok(())
+        }
+        if let Some(predicate) = predicate {
+            collect(
+                predicate,
+                storage,
+                scope,
+                source,
+                arena,
+                params,
+                hooks,
+                txid,
+                &mut values,
+                &mut known,
+            )?;
+        }
+        let mut current = root;
+        loop {
+            let Some(scheme) = storage.table_def(current, txid).partition.scheme else {
+                return (current != root)
+                    .then_some(current)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "partition pruning lost its root scheme"
+                        )
+                    })
+                    .map(Some);
+            };
+            if scheme.keys[..usize::from(scheme.n_keys)]
+                .iter()
+                .any(|key| !known[usize::from(*key)])
+            {
+                return Ok(None);
+            }
+            current = match storage.partition_child_target(
+                current,
+                scheme.strategy,
+                scheme.keys,
+                scheme.n_keys,
+                &values,
+                txid,
+            ) {
+                Ok(child) => child,
+                Err(_) => return Ok(None),
+            };
+        }
+    }
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
@@ -2197,7 +2325,7 @@ fn scan_source_mode<'a>(
         scope: &QueryScope<'a>,
         from: &'a FromClause<'a>,
         txid: u32,
-        where_clause: Option<&Expr<'a>>,
+        where_clause: Option<&'a Expr<'a>>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
@@ -2443,10 +2571,10 @@ fn scan_source_mode<'a>(
             }
         } else if depth == 0
             || (scope.derived[order[depth]].is_none()
-                && matches!(
-                    storage.table_def(scope.slots[order[depth]], txid).partition,
-                    crate::storage::PartitionDef::Parent { .. }
-                ))
+                && storage
+                    .table_def(scope.slots[order[depth]], txid)
+                    .partition
+                    .is_partitioned())
         {
             // Outermost scan: iterate in heap-offset (insertion) order so a
             // per-row error surfaces on the same row as PostgreSQL, whose heap
@@ -2456,14 +2584,25 @@ fn scan_source_mode<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
-            if matches!(
-                storage.table_def(slot, txid).partition,
-                crate::storage::PartitionDef::Parent { .. }
-            ) {
+            if storage.table_def(slot, txid).partition.is_partitioned() {
                 let leaves = arena
                     .alloc_slice_with(storage.table_count(), |_| usize::MAX)
                     .map_err(|_| arena_full())?;
-                let n_leaves = storage.partition_leaf_slots(slot, txid, leaves)?;
+                let n_leaves = if let Some(leaf) = exact_partition_leaf(
+                    storage,
+                    scope,
+                    order[depth],
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    txid,
+                )? {
+                    leaves[0] = leaf;
+                    1
+                } else {
+                    storage.partition_leaf_slots(slot, txid, leaves)?
+                };
                 let mut index = 0usize;
                 let mut aborted = false;
                 for &leaf in &leaves[..n_leaves] {

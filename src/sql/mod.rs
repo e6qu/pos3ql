@@ -155,6 +155,10 @@ pub struct Engine {
     /// checkpoint sort entries because a logical partitioned relation needs
     /// its leaf owner alongside the row identifier.
     dml_scratch: exec::DmlScratch,
+    /// Physical images inserted by the active streamed COPY statement. This
+    /// stays separate from trigger DML scratch so nested trigger statements
+    /// cannot erase the AFTER STATEMENT transition relation.
+    copy_transition_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, u8, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
@@ -554,8 +558,17 @@ fn emit_pending_truncates(
             )? {
                 continue;
             }
-            let definition = storage.table_def(table_slot, 0);
-            let relation_id = table_slot as u32 + 1;
+            let output_slot = publication_output_relation(
+                storage,
+                publication_names,
+                table_slot,
+                PublicationOperation::Truncate,
+            )?;
+            let definition = storage.table_def(output_slot, 0);
+            let relation_id = output_slot as u32 + 1;
+            if relation_ids[..relation_count].contains(&relation_id) {
+                continue;
+            }
             emit_replication_relation(
                 storage,
                 definition,
@@ -621,11 +634,8 @@ fn publication_partition_member(
         {
             return Some(index);
         }
-        let crate::storage::PartitionDef::Child { parent, .. } =
-            storage.table_def(current, 0).partition
-        else {
-            return None;
-        };
+        let crate::storage::PartitionAttachment { parent, .. } =
+            storage.table_def(current, 0).partition.attachment?;
         current = usize::from(parent);
     }
 }
@@ -647,8 +657,8 @@ fn publication_partition_schema_member(
         if schema_selected {
             return true;
         }
-        let crate::storage::PartitionDef::Child { parent, .. } =
-            storage.table_def(current, 0).partition
+        let Some(crate::storage::PartitionAttachment { parent, .. }) =
+            storage.table_def(current, 0).partition.attachment
         else {
             return false;
         };
@@ -663,6 +673,46 @@ fn publication_selects(
     operation: PublicationOperation,
 ) -> Result<bool, SqlError> {
     Ok(publication_column_mask(storage, publication_names, table_slot, operation)?.is_some())
+}
+
+fn partition_root(storage: &Storage, table_slot: usize) -> usize {
+    let mut current = table_slot;
+    while let Some(attachment) = storage.table_def(current, 0).partition.attachment {
+        current = usize::from(attachment.parent);
+    }
+    current
+}
+
+fn publication_output_relation(
+    storage: &Storage,
+    publication_names: &[SqlName],
+    table_slot: usize,
+    operation: PublicationOperation,
+) -> Result<usize, SqlError> {
+    for name in publication_names {
+        let publication = storage.publication(name.as_str()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "publication \"{}\" does not exist",
+                name.as_str()
+            )
+        })?;
+        let publishes = match operation {
+            PublicationOperation::Insert => publication.publish_insert,
+            PublicationOperation::Update => publication.publish_update,
+            PublicationOperation::Delete => publication.publish_delete,
+            PublicationOperation::Truncate => publication.publish_truncate,
+        };
+        if publishes
+            && publication.publish_via_partition_root
+            && (publication.all_tables
+                || publication_partition_schema_member(storage, publication, table_slot)
+                || publication_partition_member(storage, publication, table_slot).is_some())
+        {
+            return Ok(partition_root(storage, table_slot));
+        }
+    }
+    Ok(table_slot)
 }
 
 /// Computes the pgoutput projection selected by every subscribed publication.
@@ -698,7 +748,9 @@ fn publication_column_mask(
             return Ok(Some(u64::MAX));
         }
         if let Some(index) = explicit {
-            if usize::from(publication.tables[index]) != table_slot {
+            if usize::from(publication.tables[index]) != table_slot
+                && !publication.publish_via_partition_root
+            {
                 // Default pgoutput identity is the physical leaf, whose
                 // implicit membership has no ancestor column projection.
                 return Ok(Some(u64::MAX));
@@ -754,7 +806,9 @@ fn publication_row_matches(
         // With PostgreSQL's default leaf identity, an ancestor's row filter
         // does not become the leaf's filter.  Only an explicitly named leaf
         // has a filter in this representation.
-        if usize::from(publication.tables[index]) != table_slot {
+        if usize::from(publication.tables[index]) != table_slot
+            && !publication.publish_via_partition_root
+        {
             return Ok(true);
         }
         let filter = publication.table_filters.get(index);
@@ -1043,7 +1097,7 @@ impl Engine {
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
-            + config.table_rows * size_of::<(u64, RowHome)>()
+            + 2 * config.table_rows * size_of::<exec::PhysicalRow>()
             + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
                 + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
                 * config.max_tables
@@ -1173,6 +1227,11 @@ impl Engine {
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: FixedVec::new(budget, "dml_scratch", config.table_rows)?,
+            copy_transition_scratch: FixedVec::new(
+                budget,
+                "copy_transition_scratch",
+                config.table_rows,
+            )?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -1706,10 +1765,16 @@ impl Engine {
                                     filter_arena,
                                 )?;
                                 if old_matches || new_matches {
-                                    let relation_id = table_slot as u32 + 1;
+                                    let output_slot = publication_output_relation(
+                                        storage,
+                                        publication_names,
+                                        table_slot,
+                                        PublicationOperation::Update,
+                                    )?;
+                                    let relation_id = output_slot as u32 + 1;
                                     emit_replication_relation(
                                         storage,
-                                        definition,
+                                        storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -1763,10 +1828,16 @@ impl Engine {
                                     &values[..column_count],
                                     filter_arena,
                                 )? {
-                                    let relation_id = table_slot as u32 + 1;
+                                    let output_slot = publication_output_relation(
+                                        storage,
+                                        publication_names,
+                                        table_slot,
+                                        PublicationOperation::Insert,
+                                    )?;
+                                    let relation_id = output_slot as u32 + 1;
                                     emit_replication_relation(
                                         storage,
-                                        definition,
+                                        storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -1852,10 +1923,16 @@ impl Engine {
                                 &values[..column_count],
                                 filter_arena,
                             )? {
-                                let relation_id = table_slot as u32 + 1;
+                                let output_slot = publication_output_relation(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Delete,
+                                )?;
+                                let relation_id = output_slot as u32 + 1;
                                 emit_replication_relation(
                                     storage,
-                                    definition,
+                                    storage.table_def(output_slot, 0),
                                     relation_id,
                                     column_mask,
                                     responder,
@@ -3334,9 +3411,20 @@ impl Engine {
         txn: &mut TxnState,
         seq_session: &guc::SeqSession,
         arena: &Arena,
+        responder: &mut Responder,
         line: &[u8],
     ) -> Result<exec::CopyRowOutcome, SqlError> {
-        exec::copy_row(&mut self.storage, txn, seq_session, setup, line, arena)
+        exec::copy_row(
+            &mut self.storage,
+            txn,
+            seq_session,
+            setup,
+            line,
+            arena,
+            responder,
+            &mut self.dml_scratch,
+            &mut self.copy_transition_scratch,
+        )
     }
 
     /// Checks a `COPY ... HEADER MATCH` line through the same decoded field
@@ -3357,15 +3445,63 @@ impl Engine {
         txn: &mut TxnState,
         seq_session: &guc::SeqSession,
         arena: &Arena,
+        responder: &mut Responder,
         row: &[u8],
     ) -> Result<exec::CopyRowOutcome, SqlError> {
-        exec::copy_row_binary(&mut self.storage, txn, seq_session, setup, row, arena)
+        exec::copy_row_binary(
+            &mut self.storage,
+            txn,
+            seq_session,
+            setup,
+            row,
+            arena,
+            responder,
+            &mut self.dml_scratch,
+            &mut self.copy_transition_scratch,
+        )
+    }
+
+    pub fn copy_start(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        seq_session: &guc::SeqSession,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        self.copy_transition_scratch.clear();
+        exec::copy_statement_begin(
+            &mut self.storage,
+            txn,
+            setup,
+            seq_session,
+            arena,
+            responder,
+            &mut self.dml_scratch,
+        )
     }
 
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
-    pub fn copy_finish(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
+    pub fn copy_finish(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        self.work.reset();
+        exec::copy_statement_end(
+            &mut self.storage,
+            txn,
+            setup,
+            guc.seq_session(),
+            &self.work,
+            responder,
+            &mut self.dml_scratch,
+            &self.copy_transition_scratch,
+        )?;
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -6056,6 +6192,7 @@ impl Engine {
                 tables,
                 schemas,
                 publish,
+                publish_via_partition_root,
             } => exec::create_publication(
                 &mut self.storage,
                 &mut self.wal,
@@ -6065,6 +6202,7 @@ impl Engine {
                 tables,
                 schemas,
                 *publish,
+                *publish_via_partition_root,
                 responder,
             ),
             Stmt::AlterPublication { name, action } => exec::alter_publication(
@@ -7065,6 +7203,11 @@ impl Engine {
                     // copy_row_line under this same (implicit or explicit)
                     // transaction, and the command tag waits for CopyDone.
                     self.ensure_txn(txn, txn.mode, guc);
+                    if let Err(error) =
+                        self.copy_start(&setup, txn, guc.seq_session(), arena, responder)
+                    {
+                        return Ok(Err(error));
+                    }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
                     self.pending_copy = Some(setup);
                     Ok(Ok(()))
@@ -7953,6 +8096,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_update,
             publish_delete,
             publish_truncate,
+            publish_via_partition_root,
         } => {
             let slot = storage.create_publication(
                 crate::storage::PublicationSpec {
@@ -7966,6 +8110,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     publish_update,
                     publish_delete,
                     publish_truncate,
+                    publish_via_partition_root,
                 },
                 0,
             )?;
@@ -7990,6 +8135,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_update,
             publish_delete,
             publish_truncate,
+            publish_via_partition_root,
         } => {
             let definition = crate::storage::PublicationDefinition {
                 all_tables,
@@ -8005,6 +8151,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 publish_update,
                 publish_delete,
                 publish_truncate,
+                publish_via_partition_root,
             };
             let (slot, _) = storage.alter_publication(name, definition, 0)?;
             storage.commit_publication_alter(slot, 0);

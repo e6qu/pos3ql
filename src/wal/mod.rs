@@ -415,6 +415,7 @@ pub(crate) enum WalOp<'a> {
         publish_update: bool,
         publish_delete: bool,
         publish_truncate: bool,
+        publish_via_partition_root: bool,
     },
     DropPublication {
         name: &'a str,
@@ -435,6 +436,7 @@ pub(crate) enum WalOp<'a> {
         publish_update: bool,
         publish_delete: bool,
         publish_truncate: bool,
+        publish_via_partition_root: bool,
     },
     SetPublicationOwner {
         name: &'a str,
@@ -1447,7 +1449,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             let mut n = 1 + def.name.as_str().len() + 2;
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
-                n += 1 + c.name.as_str().len() + 2 + 4 + encoded_default_len(&default_value);
+                n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -2001,33 +2003,31 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
 }
 
 fn encoded_partition_len(partition: PartitionDef) -> usize {
-    match partition {
-        PartitionDef::None => 1,
-        PartitionDef::Parent { n_keys, .. } => 3 + usize::from(n_keys) * 2,
-        PartitionDef::Child { bound, .. } => {
-            3 + match bound {
-                PartitionBound::Default => 1,
-                PartitionBound::Hash { .. } => 1 + 8,
-                PartitionBound::List { n_values, values } => {
-                    2 + values[..usize::from(n_values)]
-                        .iter()
-                        .map(|value| encoded_default_len(&Some(*value)))
-                        .sum::<usize>()
-                }
-                PartitionBound::Range {
-                    n_keys,
-                    lower,
-                    upper,
-                } => {
-                    2 + (0..usize::from(n_keys))
-                        .map(|i| {
-                            encoded_bound_value_len(lower[i]) + encoded_bound_value_len(upper[i])
-                        })
-                        .sum::<usize>()
-                }
+    let scheme = partition
+        .scheme
+        .map_or(0, |scheme| 2 + usize::from(scheme.n_keys) * 2);
+    let attachment = partition.attachment.map_or(0, |attachment| {
+        2 + match attachment.bound {
+            PartitionBound::Default => 1,
+            PartitionBound::Hash { .. } => 1 + 8,
+            PartitionBound::List { n_values, values } => {
+                2 + values[..usize::from(n_values)]
+                    .iter()
+                    .map(|value| encoded_default_len(&Some(*value)))
+                    .sum::<usize>()
+            }
+            PartitionBound::Range {
+                n_keys,
+                lower,
+                upper,
+            } => {
+                2 + (0..usize::from(n_keys))
+                    .map(|i| encoded_bound_value_len(lower[i]) + encoded_bound_value_len(upper[i]))
+                    .sum::<usize>()
             }
         }
-    }
+    });
+    1 + scheme + attachment
 }
 
 fn encoded_bound_value_len(value: PartitionBoundValue) -> usize {
@@ -2038,54 +2038,49 @@ fn encoded_bound_value_len(value: PartitionBoundValue) -> usize {
 }
 
 fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
-    match partition {
-        PartitionDef::None => buffer.append(&[0]),
-        PartitionDef::Parent {
-            strategy,
-            keys,
-            n_keys,
-        } => {
-            let strategy = match strategy {
-                PartitionStrategy::Range => 0,
-                PartitionStrategy::List => 1,
-                PartitionStrategy::Hash => 2,
-            };
-            let mut ok = buffer.append(&[1, strategy, n_keys]);
-            for key in &keys[..usize::from(n_keys)] {
-                ok &= buffer.append(&key.to_le_bytes());
-            }
-            ok
-        }
-        PartitionDef::Child { parent, bound } => {
-            let mut ok = buffer.append(&[2]) && buffer.append(&parent.to_le_bytes());
-            match bound {
-                PartitionBound::Default => ok &= buffer.append(&[0]),
-                PartitionBound::Range {
-                    lower,
-                    upper,
-                    n_keys,
-                } => {
-                    ok &= buffer.append(&[1, n_keys]);
-                    for i in 0..usize::from(n_keys) {
-                        ok &= append_bound_value(buffer, lower[i])
-                            && append_bound_value(buffer, upper[i]);
-                    }
-                }
-                PartitionBound::List { values, n_values } => {
-                    ok &= buffer.append(&[2, n_values]);
-                    for value in &values[..usize::from(n_values)] {
-                        ok &= append_default(buffer, &Some(*value));
-                    }
-                }
-                PartitionBound::Hash { modulus, remainder } => {
-                    ok &= buffer.append(&[3])
-                        && buffer.append(&modulus.to_le_bytes())
-                        && buffer.append(&remainder.to_le_bytes())
-                }
-            }
-            ok
+    let flags =
+        u8::from(partition.scheme.is_some()) | (u8::from(partition.attachment.is_some()) << 1);
+    let mut ok = buffer.append(&[flags]);
+    if let Some(scheme) = partition.scheme {
+        let strategy = match scheme.strategy {
+            PartitionStrategy::Range => 0,
+            PartitionStrategy::List => 1,
+            PartitionStrategy::Hash => 2,
+        };
+        ok &= buffer.append(&[strategy, scheme.n_keys]);
+        for key in &scheme.keys[..usize::from(scheme.n_keys)] {
+            ok &= buffer.append(&key.to_le_bytes());
         }
     }
+    if let Some(attachment) = partition.attachment {
+        ok &= buffer.append(&attachment.parent.to_le_bytes());
+        match attachment.bound {
+            PartitionBound::Default => ok &= buffer.append(&[0]),
+            PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            } => {
+                ok &= buffer.append(&[1, n_keys]);
+                for i in 0..usize::from(n_keys) {
+                    ok &= append_bound_value(buffer, lower[i])
+                        && append_bound_value(buffer, upper[i]);
+                }
+            }
+            PartitionBound::List { values, n_values } => {
+                ok &= buffer.append(&[2, n_values]);
+                for value in &values[..usize::from(n_values)] {
+                    ok &= append_default(buffer, &Some(*value));
+                }
+            }
+            PartitionBound::Hash { modulus, remainder } => {
+                ok &= buffer.append(&[3])
+                    && buffer.append(&modulus.to_le_bytes())
+                    && buffer.append(&remainder.to_le_bytes())
+            }
+        }
+    }
+    ok
 }
 
 fn append_bound_value(buffer: &mut FixedBuf, value: PartitionBoundValue) -> bool {
@@ -2117,7 +2112,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
                 // column, whose domain name is appended after the fixed fields.
-                let flags = u8::from(c.not_null)
+                let flags = u8::from(c.not_null.is_required())
                     | (u8::from(c.unique) << 1)
                     | (u8::from(c.primary) << 2)
                     | (u8::from(c.auto_increment) << 3)
@@ -2126,6 +2121,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.identity_always) << 6)
                     | (u8::from(c.user_type.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
+                ok &= buffer.append(&[c.not_null.code()]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
                 ok &= append_default(buffer, &default_value);
@@ -2280,6 +2276,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publish_update,
             publish_delete,
             publish_truncate,
+            publish_via_partition_root,
             schemas,
             schema_count,
         } => {
@@ -2287,7 +2284,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u8::from(*publish_insert) << 1)
                 | (u8::from(*publish_update) << 2)
                 | (u8::from(*publish_delete) << 3)
-                | (u8::from(*publish_truncate) << 4);
+                | (u8::from(*publish_truncate) << 4)
+                | (u8::from(*publish_via_partition_root) << 5);
             let mut ok = name_bytes(buffer, name)
                 && buffer.append(&owner.to_le_bytes())
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
@@ -2319,12 +2317,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publish_update,
             publish_delete,
             publish_truncate,
+            publish_via_partition_root,
         } => {
             let flags = u8::from(*all_tables)
                 | (u8::from(*publish_insert) << 1)
                 | (u8::from(*publish_update) << 2)
                 | (u8::from(*publish_delete) << 3)
-                | (u8::from(*publish_truncate) << 4);
+                | (u8::from(*publish_truncate) << 4)
+                | (u8::from(*publish_via_partition_root) << 5);
             let mut ok = name_bytes(buffer, name)
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
@@ -3200,7 +3200,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     ctype: ColType::Bool,
                     type_mod: -1,
                     collation: crate::sql::ast::Collation::None,
-                    not_null: false,
+                    not_null: crate::storage::NotNullOrigin::Nullable,
                     unique: false,
                     primary: false,
                     auto_increment: false,
@@ -3217,6 +3217,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let col_name = take_name(&mut at)?;
                 let meta = payload.get(at..at + 2)?;
                 at += 2;
+                let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
+                at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
                 at += 4;
                 let default_value = decode_default(payload, &mut at)?;
@@ -3253,7 +3255,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     ctype: ColType::from_code(meta[0])?,
                     type_mod,
                     collation: legacy_collation(ColType::from_code(meta[0])?),
-                    not_null: meta[1] & 1 != 0,
+                    not_null,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -3629,6 +3631,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
+                publish_via_partition_root: flags & 32 != 0,
             })
         }
         KIND_DROP_PUBLICATION => {
@@ -3689,6 +3692,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
+                publish_via_partition_root: flags & 32 != 0,
             })
         }
         KIND_SET_PUBLICATION_OWNER => {
@@ -5353,85 +5357,88 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
 }
 
 fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
-    let tag = *payload.get(*at)?;
+    let flags = *payload.get(*at)?;
     *at += 1;
-    match tag {
-        0 => Some(PartitionDef::None),
-        1 => {
-            let strategy = match *payload.get(*at)? {
-                0 => PartitionStrategy::Range,
-                1 => PartitionStrategy::List,
-                2 => PartitionStrategy::Hash,
-                _ => return None,
-            };
-            *at += 1;
-            let n_keys = *payload.get(*at)?;
-            *at += 1;
-            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
-                return None;
-            }
-            let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
-            for key in &mut keys[..usize::from(n_keys)] {
-                *key = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
-                *at += 2;
-            }
-            Some(PartitionDef::Parent {
-                strategy,
-                keys,
-                n_keys,
-            })
-        }
-        2 => {
-            let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
-            *at += 2;
-            let tag = *payload.get(*at)?;
-            *at += 1;
-            let bound = match tag {
-                0 => PartitionBound::Default,
-                1 => {
-                    let n_keys = *payload.get(*at)?;
-                    *at += 1;
-                    if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
-                        return None;
-                    }
-                    let mut lower =
-                        [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
-                    let mut upper = lower;
-                    for i in 0..usize::from(n_keys) {
-                        lower[i] = decode_bound_value(payload, at)?;
-                        upper[i] = decode_bound_value(payload, at)?;
-                    }
-                    PartitionBound::Range {
-                        lower,
-                        upper,
-                        n_keys,
-                    }
-                }
-                2 => {
-                    let n_values = *payload.get(*at)?;
-                    *at += 1;
-                    if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
-                        return None;
-                    }
-                    let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
-                    for value in &mut values[..usize::from(n_values)] {
-                        *value = decode_default(payload, at)??;
-                    }
-                    PartitionBound::List { values, n_values }
-                }
-                3 => {
-                    let modulus = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
-                    *at += 4;
-                    let remainder = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
-                    *at += 4;
-                    PartitionBound::Hash { modulus, remainder }
-                }
-                _ => return None,
-            };
-            Some(PartitionDef::Child { parent, bound })
-        }
-        _ => None,
+    if flags & !3 != 0 {
+        return None;
     }
+    let scheme = if flags & 1 != 0 {
+        let strategy = match *payload.get(*at)? {
+            0 => PartitionStrategy::Range,
+            1 => PartitionStrategy::List,
+            2 => PartitionStrategy::Hash,
+            _ => return None,
+        };
+        *at += 1;
+        let n_keys = *payload.get(*at)?;
+        *at += 1;
+        if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+            return None;
+        }
+        let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+        for key in &mut keys[..usize::from(n_keys)] {
+            *key = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+            *at += 2;
+        }
+        Some(crate::storage::PartitionScheme {
+            strategy,
+            keys,
+            n_keys,
+        })
+    } else {
+        None
+    };
+    let attachment = if flags & 2 != 0 {
+        let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+        *at += 2;
+        let tag = *payload.get(*at)?;
+        *at += 1;
+        let bound = match tag {
+            0 => PartitionBound::Default,
+            1 => {
+                let n_keys = *payload.get(*at)?;
+                *at += 1;
+                if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                    return None;
+                }
+                let mut lower = [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
+                let mut upper = lower;
+                for i in 0..usize::from(n_keys) {
+                    lower[i] = decode_bound_value(payload, at)?;
+                    upper[i] = decode_bound_value(payload, at)?;
+                }
+                PartitionBound::Range {
+                    lower,
+                    upper,
+                    n_keys,
+                }
+            }
+            2 => {
+                let n_values = *payload.get(*at)?;
+                *at += 1;
+                if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
+                    return None;
+                }
+                let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+                for value in &mut values[..usize::from(n_values)] {
+                    *value = decode_default(payload, at)??;
+                }
+                PartitionBound::List { values, n_values }
+            }
+            3 => {
+                let modulus = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                *at += 4;
+                let remainder = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                *at += 4;
+                PartitionBound::Hash { modulus, remainder }
+            }
+            _ => return None,
+        };
+        Some(crate::storage::PartitionAttachment { parent, bound })
+    } else {
+        None
+    };
+    Some(PartitionDef { scheme, attachment })
 }
 
 fn decode_bound_value(payload: &[u8], at: &mut usize) -> Option<PartitionBoundValue> {
@@ -5700,7 +5707,7 @@ mod tests {
                 ctype: ColType::Bool,
                 type_mod: -1,
                 collation: crate::sql::ast::Collation::None,
-                not_null: false,
+                not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -5718,7 +5725,7 @@ mod tests {
             ctype: ColType::Int4,
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
-            not_null: true,
+            not_null: crate::storage::NotNullOrigin::Local,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -5733,7 +5740,7 @@ mod tests {
             ctype: ColType::Text,
             type_mod: -1,
             collation: crate::sql::ast::Collation::C,
-            not_null: false,
+            not_null: crate::storage::NotNullOrigin::Nullable,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -5803,16 +5810,17 @@ mod tests {
     #[test]
     fn table_payload_round_trip_preserves_typed_partition_bounds() {
         let mut definition = sample_def();
-        definition.partition = PartitionDef::Child {
-            parent: 4,
-            bound: PartitionBound::Range {
+        definition.columns[0].not_null = crate::storage::NotNullOrigin::LocalAndInherited;
+        definition.partition = PartitionDef::child(
+            4,
+            PartitionBound::Range {
                 lower: [PartitionBoundValue::Value(OwnedDatum::Int4(10));
                     crate::storage::MAX_PARTITION_KEYS],
                 upper: [PartitionBoundValue::Value(OwnedDatum::Int4(20));
                     crate::storage::MAX_PARTITION_KEYS],
                 n_keys: 1,
             },
-        };
+        );
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
         assert!(append_payload(
@@ -5822,7 +5830,7 @@ mod tests {
         let Some(WalOp::CreateTable(restored)) = decode_op(KIND_CREATE, payload.readable()) else {
             panic!("partition table definition did not decode")
         };
-        let PartitionDef::Child {
+        let Some(crate::storage::PartitionAttachment {
             parent,
             bound:
                 PartitionBound::Range {
@@ -5830,11 +5838,15 @@ mod tests {
                     upper,
                     n_keys,
                 },
-        } = restored.partition
+        }) = restored.partition.attachment
         else {
             panic!("partition metadata lost")
         };
         assert_eq!((parent, n_keys), (4, 1));
+        assert_eq!(
+            restored.columns[0].not_null,
+            crate::storage::NotNullOrigin::LocalAndInherited
+        );
         assert!(matches!(
             lower[0],
             PartitionBoundValue::Value(OwnedDatum::Int4(10))
@@ -6202,6 +6214,7 @@ mod tests {
                     publish_update: true,
                     publish_delete: true,
                     publish_truncate: true,
+                    publish_via_partition_root: false,
                 },
             )
             .unwrap();
@@ -6220,6 +6233,7 @@ mod tests {
                     publish_update: false,
                     publish_delete: true,
                     publish_truncate: false,
+                    publish_via_partition_root: true,
                 },
             )
             .unwrap();

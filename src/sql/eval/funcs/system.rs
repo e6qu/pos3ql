@@ -39,6 +39,18 @@ impl CatalogOid {
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid))),
+            // PostgreSQL resolves an untyped string literal against the OID
+            // argument in the intrinsic signature before the function runs.
+            // String literals are represented as text in the AST, so perform
+            // that parse at this identity boundary and carry only CatalogOid
+            // afterward.
+            Datum::Text(raw) => raw.parse::<i32>().map(Self).map(Some).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input syntax for type oid: \"{}\"",
+                    raw
+                )
+            }),
             _ => Ok(None),
         }
     }
@@ -292,6 +304,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
+            | "pg_get_partkeydef"
             | "pg_get_functiondef"
             | "pg_get_function_arguments"
             | "pg_get_function_identity_arguments"
@@ -660,6 +673,20 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(cat
                     .constraint_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_get_partkeydef" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .partition_key_def(oid, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

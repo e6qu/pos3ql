@@ -756,7 +756,7 @@ pub struct ColumnMeta {
     /// numeric(p,s) encodes `((p<<16)|s) + 4`. Enforced during coercion.
     pub type_mod: i32,
     pub collation: Collation,
-    pub not_null: bool,
+    pub not_null: NotNullOrigin,
     pub unique: bool,
     pub primary: bool,
     /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
@@ -777,6 +777,94 @@ pub struct ColumnMeta {
     /// schema-qualified identity. Runtime enum/domain slots are rebound from
     /// this identity after restart.
     pub user_type: Option<UserTypeName>,
+}
+
+/// Durable provenance of a table column's effective `NOT NULL` constraint.
+/// Partitions can retain a local constraint while also inheriting one, so a
+/// boolean cannot represent parent ALTER and DETACH semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NotNullOrigin {
+    Nullable = 0,
+    Local = 1,
+    Inherited = 2,
+    LocalAndInherited = 3,
+}
+
+impl NotNullOrigin {
+    pub const fn local(required: bool) -> Self {
+        if required {
+            Self::Local
+        } else {
+            Self::Nullable
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Nullable,
+            1 => Self::Local,
+            2 => Self::Inherited,
+            3 => Self::LocalAndInherited,
+            _ => return None,
+        })
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn is_required(self) -> bool {
+        !matches!(self, Self::Nullable)
+    }
+
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Local | Self::LocalAndInherited)
+    }
+
+    pub const fn is_inherited(self) -> bool {
+        matches!(self, Self::Inherited | Self::LocalAndInherited)
+    }
+
+    pub const fn attach_inherited(self) -> Self {
+        Self::Inherited
+    }
+
+    pub const fn add_inherited(self) -> Self {
+        if self.is_local() {
+            Self::LocalAndInherited
+        } else {
+            Self::Inherited
+        }
+    }
+
+    pub const fn drop_inherited(self) -> Self {
+        if self.is_local() {
+            Self::Local
+        } else {
+            Self::Nullable
+        }
+    }
+
+    pub const fn add_local(self) -> Self {
+        if self.is_inherited() {
+            Self::LocalAndInherited
+        } else {
+            Self::Local
+        }
+    }
+
+    pub const fn drop_local(self) -> Self {
+        if self.is_inherited() {
+            Self::Inherited
+        } else {
+            Self::Nullable
+        }
+    }
+
+    pub const fn localize(self) -> Self {
+        Self::local(self.is_required())
+    }
 }
 
 /// A durable schema-qualified user-type identity.
@@ -853,7 +941,7 @@ impl ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: Collation::None,
-        not_null: false,
+        not_null: NotNullOrigin::Nullable,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -1001,24 +1089,27 @@ pub struct TableDef {
     pub partition: PartitionDef,
 }
 
-/// A resolved partitioning role.  Parent links are storage slots, never names:
-/// renaming a relation cannot leave routing metadata stale.
+/// A table's independent partitioning and attachment roles. Parent links are
+/// storage slots, so renames cannot stale routing metadata. Keeping the roles
+/// orthogonal permits a partition to be partitioned without an ambiguous enum
+/// state.
 #[derive(Debug, Clone, Copy)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "bounds stay inline in fixed startup catalog storage; boxing would add post-startup allocation"
-)]
-pub enum PartitionDef {
-    None,
-    Parent {
-        strategy: PartitionStrategy,
-        keys: [u16; MAX_PARTITION_KEYS],
-        n_keys: u8,
-    },
-    Child {
-        parent: u16,
-        bound: PartitionBound,
-    },
+pub struct PartitionDef {
+    pub scheme: Option<PartitionScheme>,
+    pub attachment: Option<PartitionAttachment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionScheme {
+    pub strategy: PartitionStrategy,
+    pub keys: [u16; MAX_PARTITION_KEYS],
+    pub n_keys: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionAttachment {
+    pub parent: u16,
+    pub bound: PartitionBound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1056,7 +1147,40 @@ pub enum PartitionBound {
 }
 
 impl PartitionDef {
-    pub const NONE: Self = Self::None;
+    pub const NONE: Self = Self {
+        scheme: None,
+        attachment: None,
+    };
+
+    pub const fn parent(
+        strategy: PartitionStrategy,
+        keys: [u16; MAX_PARTITION_KEYS],
+        n_keys: u8,
+    ) -> Self {
+        Self {
+            scheme: Some(PartitionScheme {
+                strategy,
+                keys,
+                n_keys,
+            }),
+            attachment: None,
+        }
+    }
+
+    pub const fn child(parent: u16, bound: PartitionBound) -> Self {
+        Self {
+            scheme: None,
+            attachment: Some(PartitionAttachment { parent, bound }),
+        }
+    }
+
+    pub const fn is_partitioned(self) -> bool {
+        self.scheme.is_some()
+    }
+
+    pub const fn is_attached(self) -> bool {
+        self.attachment.is_some()
+    }
 }
 
 /// Inline catalog bounds have an explicit, startup-bounded capacity.
@@ -1078,7 +1202,7 @@ impl TableDef {
             n_checks: 0,
             fkeys: [ForeignKey::EMPTY; MAX_FKEYS],
             n_fkeys: 0,
-            partition: PartitionDef::None,
+            partition: PartitionDef::NONE,
         }
     }
 
@@ -1111,7 +1235,7 @@ impl TableDef {
     }
 }
 
-fn partition_bound_matches(
+pub(crate) fn partition_bound_matches(
     strategy: PartitionStrategy,
     keys: [u16; MAX_PARTITION_KEYS],
     n_keys: u8,
@@ -1130,44 +1254,32 @@ fn partition_bound_matches(
     };
     match (strategy, bound) {
         (PartitionStrategy::Range, PartitionBound::Range { lower, upper, .. }) => {
-            let mut lower_ok = true;
-            let mut upper_ok = true;
-            for (i, bound_value) in lower.iter().copied().enumerate().take(usize::from(n_keys)) {
-                let value = key(i)?;
-                if value.is_null() {
-                    return Ok(false);
-                }
-                match bound_value {
-                    PartitionBoundValue::MinValue => {}
-                    PartitionBoundValue::MaxValue => lower_ok = false,
-                    PartitionBoundValue::Value(bound) => {
-                        let ord = compare_datums(&value, &bound.as_datum())?;
-                        if ord.is_lt() {
-                            lower_ok = false;
+            let compare = |tuple: &[PartitionBoundValue; MAX_PARTITION_KEYS]| {
+                for (index, bound) in tuple.iter().copied().enumerate().take(usize::from(n_keys)) {
+                    let value = key(index)?;
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    let ordering = match bound {
+                        PartitionBoundValue::MinValue => Ordering::Greater,
+                        PartitionBoundValue::MaxValue => Ordering::Less,
+                        PartitionBoundValue::Value(bound) => {
+                            compare_datums(&value, &bound.as_datum())?
                         }
-                        if !ord.is_eq() {
-                            break;
-                        }
+                    };
+                    if !ordering.is_eq() {
+                        return Ok(Some(ordering));
                     }
                 }
-            }
-            for (i, bound_value) in upper.iter().copied().enumerate().take(usize::from(n_keys)) {
-                let value = key(i)?;
-                match bound_value {
-                    PartitionBoundValue::MaxValue => {}
-                    PartitionBoundValue::MinValue => upper_ok = false,
-                    PartitionBoundValue::Value(bound) => {
-                        let ord = compare_datums(&value, &bound.as_datum())?;
-                        if ord.is_gt() || ord.is_eq() {
-                            upper_ok = false;
-                        }
-                        if !ord.is_eq() {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(lower_ok && upper_ok)
+                Ok(Some(Ordering::Equal))
+            };
+            let Some(lower_ordering) = compare(&lower)? else {
+                return Ok(false);
+            };
+            let Some(upper_ordering) = compare(&upper)? else {
+                return Ok(false);
+            };
+            Ok(lower_ordering != Ordering::Less && upper_ordering == Ordering::Less)
         }
         (
             PartitionStrategy::List,
@@ -1181,28 +1293,85 @@ fn partition_bound_matches(
                 .any(|i| compare_datums(&value, &list[i].as_datum()).is_ok_and(Ordering::is_eq)))
         }
         (PartitionStrategy::Hash, PartitionBound::Hash { modulus, remainder }) => {
-            let value = key(0)?;
-            if value.is_null() {
-                return Ok(false);
+            let mut hash = 0u64;
+            for index in 0..usize::from(n_keys) {
+                let value = key(index)?;
+                let part = match value {
+                    crate::sql::types::Datum::Null => 0,
+                    crate::sql::types::Datum::Int2(value) => {
+                        postgres_hash_uint32_extended(value as i32 as u32)
+                    }
+                    crate::sql::types::Datum::Int4(value) => {
+                        postgres_hash_uint32_extended(value as u32)
+                    }
+                    crate::sql::types::Datum::Int8(value) => {
+                        let low = value as u32;
+                        let high = (value >> 32) as u32;
+                        postgres_hash_uint32_extended(low ^ if value >= 0 { high } else { !high })
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                            "non-integer HASH partition key reached routing"
+                        ));
+                    }
+                };
+                hash ^= part
+                    .wrapping_add(0x49a0_f4dd_15e5_a8e3)
+                    .wrapping_add(hash << 54)
+                    .wrapping_add(hash >> 7);
             }
-            // PostgreSQL's integer hash is stable for integer datums.  Other
-            // key types are rejected at definition time until their exact hash
-            // support is available rather than routed by an approximation.
-            let hash = match value {
-                crate::sql::types::Datum::Int2(v) => v as i64 as u64,
-                crate::sql::types::Datum::Int4(v) => v as i64 as u64,
-                crate::sql::types::Datum::Int8(v) => v as u64,
-                _ => {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                        "HASH partitioning is supported for integer partition keys only"
-                    ));
-                }
-            };
             Ok(hash % u64::from(modulus) == u64::from(remainder))
         }
         _ => Ok(false),
     }
+}
+
+fn postgres_hash_uint32_extended(value: u32) -> u64 {
+    fn mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
+        a = a.wrapping_sub(c);
+        a ^= c.rotate_left(4);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a);
+        b ^= a.rotate_left(6);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b);
+        c ^= b.rotate_left(8);
+        b = b.wrapping_add(a);
+        a = a.wrapping_sub(c);
+        a ^= c.rotate_left(16);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a);
+        b ^= a.rotate_left(19);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b);
+        c ^= b.rotate_left(4);
+        b = b.wrapping_add(a);
+        (a, b, c)
+    }
+    let initial = 0x9e37_79b9u32.wrapping_add(4).wrapping_add(3_923_095);
+    let seed = 0x7a5b_2236_7996_dcfd_u64;
+    let (mut a, mut b, mut c) = mix(
+        initial.wrapping_add((seed >> 32) as u32),
+        initial.wrapping_add(seed as u32),
+        initial,
+    );
+    a = a.wrapping_add(value);
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(24));
+    (u64::from(b) << 32) | u64::from(c)
 }
 
 /// Where a row's bytes live in the heap.
@@ -2162,6 +2331,7 @@ pub struct PublicationDef {
     pub publish_update: bool,
     pub publish_delete: bool,
     pub publish_truncate: bool,
+    pub publish_via_partition_root: bool,
     pending_definition: Option<PendingPublicationDefinition>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -2183,6 +2353,7 @@ pub(crate) struct PublicationDefinition {
     pub publish_update: bool,
     pub publish_delete: bool,
     pub publish_truncate: bool,
+    pub publish_via_partition_root: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2220,6 +2391,7 @@ pub struct PublicationSpec<'a> {
     pub publish_update: bool,
     pub publish_delete: bool,
     pub publish_truncate: bool,
+    pub publish_via_partition_root: bool,
 }
 
 /// Durable state required to resume a logical replication consumer. A slot is
@@ -2448,6 +2620,7 @@ impl PublicationDef {
             publish_update: self.publish_update,
             publish_delete: self.publish_delete,
             publish_truncate: self.publish_truncate,
+            publish_via_partition_root: self.publish_via_partition_root,
         }
     }
 
@@ -2469,6 +2642,7 @@ impl PublicationDef {
         self.publish_update = definition.publish_update;
         self.publish_delete = definition.publish_delete;
         self.publish_truncate = definition.publish_truncate;
+        self.publish_via_partition_root = definition.publish_via_partition_root;
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> PublicationDefinition {
@@ -4999,7 +5173,7 @@ impl Storage {
                             ctype: ColType::Bool,
                             type_mod: -1,
                             collation: Collation::None,
-                            not_null: false,
+                            not_null: NotNullOrigin::Nullable,
                             unique: false,
                             primary: false,
                             auto_increment: false,
@@ -5086,6 +5260,7 @@ impl Storage {
                     publish_update: true,
                     publish_delete: true,
                     publish_truncate: true,
+                    publish_via_partition_root: false,
                     pending_definition: None,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
@@ -9555,96 +9730,118 @@ impl Storage {
         let mut current = table;
         loop {
             let definition = self.table_def(current, txid);
-            let PartitionDef::Parent {
+            let Some(PartitionScheme {
                 strategy,
                 keys,
                 n_keys,
-            } = definition.partition
+            }) = definition.partition.scheme
             else {
-                if let PartitionDef::Child { parent, bound } = definition.partition {
-                    let parent_def = self.table_def(usize::from(parent), txid);
-                    let PartitionDef::Parent {
-                        strategy,
-                        keys,
-                        n_keys,
-                    } = parent_def.partition
-                    else {
-                        return Err(sql_err!(
-                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                            "partition parent is not partitioned"
-                        ));
-                    };
-                    let violates = if matches!(bound, PartitionBound::Default) {
-                        let mut matches_sibling = false;
-                        for sibling in 0..self.table_count() {
-                            if sibling == current || !self.table(sibling).visible_to(txid) {
-                                continue;
-                            }
-                            let PartitionDef::Child {
-                                parent: sibling_parent,
-                                bound,
-                            } = self.table_def(sibling, txid).partition
-                            else {
-                                continue;
-                            };
-                            if usize::from(sibling_parent) == usize::from(parent)
-                                && !matches!(bound, PartitionBound::Default)
-                                && partition_bound_matches(strategy, keys, n_keys, bound, values)?
-                            {
-                                matches_sibling = true;
-                                break;
-                            }
-                        }
-                        matches_sibling
-                    } else {
-                        !partition_bound_matches(strategy, keys, n_keys, bound, values)?
-                    };
-                    if violates {
-                        return Err(sql_err!(
-                            crate::sql::eval::sqlstate::CHECK_VIOLATION,
-                            "new row for relation \"{}\" violates partition constraint",
-                            definition.name.as_str()
-                        ));
-                    }
+                if let Some(PartitionAttachment { parent, bound }) = definition.partition.attachment
+                    && !self.partition_attachment_accepts(
+                        usize::from(parent),
+                        current,
+                        bound,
+                        values,
+                        txid,
+                    )?
+                {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                        "new row for relation \"{}\" violates partition constraint",
+                        definition.name.as_str()
+                    ));
                 }
                 return Ok(current);
             };
-            let mut default = None;
-            let mut match_slot = None;
-            for child in 0..self.table_count() {
-                let candidate = self.table(child);
-                if !candidate.visible_to(txid) {
-                    continue;
-                }
-                let PartitionDef::Child { parent, bound } = self.table_def(child, txid).partition
-                else {
-                    continue;
-                };
-                if usize::from(parent) != current {
-                    continue;
-                }
-                if matches!(bound, PartitionBound::Default) {
-                    default = Some(child);
-                    continue;
-                }
-                if partition_bound_matches(strategy, keys, n_keys, bound, values)?
-                    && match_slot.replace(child).is_some()
-                {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                        "overlapping partition bounds in relation \"{}\"",
-                        self.table_def(current, txid).name.as_str()
-                    ));
-                }
-            }
-            current = match_slot.or(default).ok_or_else(|| {
-                sql_err!(
-                    crate::sql::eval::sqlstate::CHECK_VIOLATION,
-                    "no partition of relation \"{}\" found for row",
-                    self.table_def(current, txid).name.as_str()
-                )
-            })?;
+            current = self.partition_child_target(current, strategy, keys, n_keys, values, txid)?;
         }
+    }
+
+    pub(crate) fn partition_child_target(
+        &self,
+        parent_slot: usize,
+        strategy: PartitionStrategy,
+        keys: [u16; MAX_PARTITION_KEYS],
+        n_keys: u8,
+        values: &[crate::sql::types::Datum],
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let mut default = None;
+        let mut match_slot = None;
+        for child in 0..self.table_count() {
+            if !self.table(child).visible_to(txid) {
+                continue;
+            }
+            let Some(PartitionAttachment { parent, bound }) =
+                self.table_def(child, txid).partition.attachment
+            else {
+                continue;
+            };
+            if usize::from(parent) != parent_slot {
+                continue;
+            }
+            if matches!(bound, PartitionBound::Default) {
+                default = Some(child);
+            } else if partition_bound_matches(strategy, keys, n_keys, bound, values)?
+                && match_slot.replace(child).is_some()
+            {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                    "overlapping partition bounds in relation \"{}\"",
+                    self.table_def(parent_slot, txid).name.as_str()
+                ));
+            }
+        }
+        match_slot.or(default).ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                "no partition of relation \"{}\" found for row",
+                self.table_def(parent_slot, txid).name.as_str()
+            )
+        })
+    }
+
+    pub(crate) fn partition_attachment_accepts(
+        &self,
+        parent: usize,
+        child: usize,
+        bound: PartitionBound,
+        values: &[crate::sql::types::Datum],
+        txid: u32,
+    ) -> Result<bool, SqlError> {
+        let Some(PartitionScheme {
+            strategy,
+            keys,
+            n_keys,
+        }) = self.table_def(parent, txid).partition.scheme
+        else {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "partition parent is not partitioned"
+            ));
+        };
+        if !matches!(bound, PartitionBound::Default) {
+            return partition_bound_matches(strategy, keys, n_keys, bound, values);
+        }
+        for sibling in 0..self.table_count() {
+            if sibling == child || !self.table(sibling).visible_to(txid) {
+                continue;
+            }
+            let Some(PartitionAttachment {
+                parent: sibling_parent,
+                bound,
+            }) = self.table_def(sibling, txid).partition.attachment
+            else {
+                continue;
+            };
+            if usize::from(sibling_parent) == parent
+                && !matches!(bound, PartitionBound::Default)
+                && partition_bound_matches(strategy, keys, n_keys, bound, values)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Expands a logical relation to physical scan leaves without allocating.
@@ -9668,7 +9865,8 @@ impl Storage {
                 if !storage.table(child).visible_to(txid) {
                     continue;
                 }
-                let PartitionDef::Child { parent, .. } = storage.table_def(child, txid).partition
+                let Some(PartitionAttachment { parent, .. }) =
+                    storage.table_def(child, txid).partition.attachment
                 else {
                     continue;
                 };
@@ -9678,12 +9876,7 @@ impl Storage {
                 found = true;
                 visit(storage, child, txid, out, n)?;
             }
-            if !found
-                && !matches!(
-                    storage.table_def(root, txid).partition,
-                    PartitionDef::Parent { .. }
-                )
-            {
+            if !found && !storage.table_def(root, txid).partition.is_partitioned() {
                 if *n == out.len() {
                     return Err(sql_err!(
                         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -9700,6 +9893,24 @@ impl Storage {
         Ok(n)
     }
 
+    /// Whether `table` is a physical descendant of `ancestor` in the catalog
+    /// snapshot. Attachment slots are typed and acyclic at DDL time, so this
+    /// walk cannot reinterpret an unrelated table as part of the hierarchy.
+    pub(crate) fn partition_descends_from(
+        &self,
+        mut table: usize,
+        ancestor: usize,
+        txid: u32,
+    ) -> bool {
+        while let Some(attachment) = self.table_def(table, txid).partition.attachment {
+            table = usize::from(attachment.parent);
+            if table == ancestor {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Finds the physical owner of a row identity emitted while scanning a
     /// logical partitioned relation. Row identifiers are cluster-wide, so the
     /// search cannot confuse identically numbered rows from two leaves.
@@ -9711,10 +9922,7 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         for candidate in 0..self.table_count() {
             if !self.table(candidate).visible_to(txid)
-                || matches!(
-                    self.table_def(candidate, txid).partition,
-                    PartitionDef::Parent { .. }
-                )
+                || self.table_def(candidate, txid).partition.is_partitioned()
                 || self.row_state(candidate, rowid)?.is_none()
             {
                 continue;
@@ -9724,7 +9932,8 @@ impl Storage {
                 if current == root {
                     return Ok(Some(candidate));
                 }
-                let PartitionDef::Child { parent, .. } = self.table_def(current, txid).partition
+                let Some(PartitionAttachment { parent, .. }) =
+                    self.table_def(current, txid).partition.attachment
                 else {
                     break;
                 };
@@ -12223,6 +12432,7 @@ impl Storage {
             publish_update: spec.publish_update,
             publish_delete: spec.publish_delete,
             publish_truncate: spec.publish_truncate,
+            publish_via_partition_root: spec.publish_via_partition_root,
             pending_definition: None,
             ownership: self.initial_ownership(txid),
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -17143,7 +17353,7 @@ mod tests {
                 ctype: ColType::Bool,
                 type_mod: -1,
                 collation: Collation::None,
-                not_null: false,
+                not_null: NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -17166,7 +17376,7 @@ mod tests {
                 } else {
                     Collation::None
                 },
-                not_null: *nn,
+                not_null: NotNullOrigin::local(*nn),
                 unique: false,
                 primary: false,
                 auto_increment: false,

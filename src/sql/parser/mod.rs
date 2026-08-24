@@ -80,6 +80,8 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
+        | AlterAction::AttachPartition { .. }
+        | AlterAction::DetachPartition { .. }
         | AlterAction::SetSchema(_) => 5,
     }
 }
@@ -3401,7 +3403,19 @@ impl<'a> Parser<'a> {
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
     fn alter_table_cmd(&mut self) -> Result<AlterAction<'a>, ParseError> {
-        if self.eat_ident("add")? {
+        if self.eat_ident("attach")? {
+            self.expect_ident("partition")?;
+            let child = self.qual_name("partition name")?;
+            let bound = self.partition_bound()?;
+            Ok(AlterAction::AttachPartition { child, bound })
+        } else if self.eat_ident("detach")? {
+            self.expect_ident("partition")?;
+            let child = self.qual_name("partition name")?;
+            if self.eat_ident("concurrently")? || self.eat_ident("finalize")? {
+                return Err(self.err_here("concurrent partition detach is not supported"));
+            }
+            Ok(AlterAction::DetachPartition { child })
+        } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
@@ -4908,6 +4922,24 @@ mod tests {
             assert!(publish.insert && publish.update && publish.delete);
             assert!(!publish.truncate);
         });
+    }
+
+    #[test]
+    fn duplicate_publication_options_fail_at_the_parse_boundary() {
+        for sql in [
+            "CREATE PUBLICATION changes WITH (publish = 'insert', publish = 'update')",
+            "CREATE PUBLICATION changes WITH (publish_via_partition_root = true, publish_via_partition_root = false)",
+            "ALTER PUBLICATION changes SET (publish = 'insert', publish = 'delete')",
+            "ALTER PUBLICATION changes SET (publish_via_partition_root = true, publish_via_partition_root = false)",
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();
+            let mut parser = Parser::new(sql, &arena).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.message.as_str(), "conflicting or redundant options");
+            });
+        }
     }
 
     #[test]

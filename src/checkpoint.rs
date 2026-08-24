@@ -1382,6 +1382,26 @@ impl Checkpointer {
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
+                Some("rls") => {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("rls outside table"));
+                    };
+                    def.row_level_security = crate::storage::RowLevelSecurityState {
+                        enabled: match parse_field::<u8>(words.next(), "rls enabled")? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(CheckpointSetupError::Corrupt("rls enabled")),
+                        },
+                        forced: match parse_field::<u8>(words.next(), "rls forced")? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(CheckpointSetupError::Corrupt("rls forced")),
+                        },
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing rls fields"));
+                    }
+                }
                 Some("nsp") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let hex = words
@@ -1892,7 +1912,7 @@ impl Checkpointer {
                         },
                     ));
                 }
-                Some("vw5") => {
+                Some("vw6") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(storage, line)?;
                 }
@@ -2093,6 +2113,10 @@ impl Checkpointer {
                 Some("trg") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_trigger(storage, line)?;
+                }
+                Some("pol") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_policy(storage, line)?;
                 }
                 tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
                     let has_owner = tag == Some("sq3");
@@ -3237,6 +3261,14 @@ impl Checkpointer {
                 )?;
             }
             write_partition_manifest(&mut self.manifest_buf, table.def.partition)?;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rls {} {}",
+                    u8::from(table.def.row_level_security.enabled),
+                    u8::from(table.def.row_level_security.forced),
+                ),
+            )?;
             for c in table.def.columns() {
                 use core::fmt::Write as _;
                 let default_value = c.default.constant().copied();
@@ -3617,9 +3649,7 @@ impl Checkpointer {
                 )?;
             }
         }
-        // Views: `vw2 <hex-SELECT> <hex-schema> <hex-creation-path> <hex-name>`
-        // (all hex, so every field survives the space-separated format; the
-        // loader still reads the older `view` line for old manifests).
+        // View SQL and names are hex because the manifest is space-separated.
         for (view_slot, view) in storage.views_with_slots() {
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
@@ -3641,11 +3671,15 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw5 {} {} {} {} {}",
+                    "vw6 {} {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
+                    u8::from(matches!(
+                        view.security,
+                        crate::storage::ViewSecurity::Invoker
+                    )),
                     ManifestDependencies(storage.view_dependencies(view_slot))
                 ),
             )?;
@@ -4195,6 +4229,72 @@ impl Checkpointer {
                     },
                     harguments.as_str(),
                     trigger.enabled.code(),
+                ),
+            )?;
+        }
+        for (_, policy) in storage.policies_with_slots_visible_to(0) {
+            use core::fmt::Write;
+            let table = storage.table_def(usize::from(policy.table), 0);
+            let definition = policy.definition_for(0);
+            let mut schema = StackStr::<130>::new();
+            let mut table_name = StackStr::<130>::new();
+            let mut name = StackStr::<130>::new();
+            let mut roles = StackStr::<1048>::new();
+            let mut using = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
+            let mut with_check = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
+            for byte in table.schema.as_str().as_bytes() {
+                let _ = write!(schema, "{byte:02x}");
+            }
+            for byte in table.name.as_str().as_bytes() {
+                let _ = write!(table_name, "{byte:02x}");
+            }
+            for byte in policy.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            for role in definition.roles.entries() {
+                let role_name = if *role == crate::storage::PUBLIC_ROLE {
+                    crate::storage::SqlName::parse("public").expect("valid role name")
+                } else {
+                    storage.role_name(usize::from(*role), 0)
+                };
+                for byte in role_name.as_str().as_bytes() {
+                    let _ = write!(roles, "{byte:02x}");
+                }
+                let _ = roles.write_char(' ');
+            }
+            if let Some(source) = definition.using {
+                for byte in source.as_str().as_bytes() {
+                    let _ = write!(using, "{byte:02x}");
+                }
+            }
+            if let Some(source) = definition.with_check {
+                for byte in source.as_str().as_bytes() {
+                    let _ = write!(with_check, "{byte:02x}");
+                }
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "pol {} {} {} {} {} {} {} {}{} {} {}",
+                    policy.created_at,
+                    policy.command.code(),
+                    u8::from(policy.permissive),
+                    schema.as_str(),
+                    table_name.as_str(),
+                    name.as_str(),
+                    definition.roles.entries().len(),
+                    roles.as_str(),
+                    if definition.using.is_some() {
+                        using.as_str()
+                    } else {
+                        "-"
+                    },
+                    if definition.with_check.is_some() {
+                        with_check.as_str()
+                    } else {
+                        "-"
+                    },
+                    ManifestDependencies(&definition.dependencies),
                 ),
             )?;
         }
@@ -5433,6 +5533,100 @@ fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), Checkp
         })
 }
 
+fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    if words.next() != Some("pol") {
+        return Err(CheckpointSetupError::Corrupt("policy record"));
+    }
+    let created_at = parse_field(words.next(), "policy created_at")?;
+    let command =
+        crate::storage::PolicyCommandKind::from_code(parse_field(words.next(), "policy command")?)
+            .ok_or(CheckpointSetupError::Corrupt("policy command"))?;
+    let permissive = match parse_field::<u8>(words.next(), "policy permissiveness")? {
+        0 => false,
+        1 => true,
+        _ => return Err(CheckpointSetupError::Corrupt("policy permissiveness")),
+    };
+    let schema = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("policy schema"))?,
+    )?;
+    let table_name = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("policy table"))?,
+    )?;
+    let name = sql_name(&decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("policy name"))?,
+    )?)?;
+    let role_count: usize = parse_field(words.next(), "policy role count")?;
+    if role_count == 0 || role_count > crate::storage::MAX_POLICY_ROLES {
+        return Err(CheckpointSetupError::Corrupt("policy role count"));
+    }
+    let mut role_slots = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
+    for role in &mut role_slots[..role_count] {
+        let role_name = decode_hex_name(
+            words
+                .next()
+                .ok_or(CheckpointSetupError::Corrupt("policy role"))?,
+        )?;
+        *role = if role_name.eq_ignore_ascii_case("public") {
+            crate::storage::PUBLIC_ROLE
+        } else {
+            storage
+                .find_role(&role_name)
+                .ok_or(CheckpointSetupError::Corrupt("policy role does not exist"))?
+                as u16
+        };
+    }
+    let expression = |value: Option<&str>| {
+        let value = value.ok_or(CheckpointSetupError::Corrupt("policy expression"))?;
+        if value == "-" {
+            Ok(None)
+        } else {
+            crate::storage::policy_expression(&decode_hex_name(value)?)
+                .map(Some)
+                .map_err(|_| CheckpointSetupError::Corrupt("policy expression"))
+        }
+    };
+    let using = expression(words.next())?;
+    let with_check = expression(words.next())?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("trailing policy fields"));
+    }
+    let table = match storage.resolve_relation(Some(&schema), &table_name, 0) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
+        _ => return Err(CheckpointSetupError::Corrupt("policy table does not exist")),
+    };
+    storage
+        .restore_policy(
+            created_at,
+            crate::storage::PolicySpec {
+                name,
+                table,
+                command,
+                permissive,
+                definition: crate::storage::PolicyDefinition {
+                    roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])
+                        .map_err(|_| CheckpointSetupError::Corrupt("policy roles"))?,
+                    using,
+                    with_check,
+                    dependencies,
+                },
+            },
+        )
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest policy rejected: {}",
+                error.message.as_str()
+            ))
+        })
+}
+
 fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
     let mut words = line.split_ascii_whitespace();
     if words.next() != Some("trg") {
@@ -5961,6 +6155,11 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
     let schema = read_hex(words.next(), "vw2 schema missing")?;
     let path = read_hex(words.next(), "vw2 path missing")?;
     let name = read_hex(words.next(), "vw2 name missing")?;
+    let security = match parse_field::<u8>(words.next(), "view security missing")? {
+        0 => crate::storage::ViewSecurity::Definer,
+        1 => crate::storage::ViewSecurity::Invoker,
+        _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
+    };
     let dependencies = parse_stored_query_dependencies(&mut words)?;
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
@@ -5976,6 +6175,7 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
                 creation_path: path_buffer,
                 dependencies,
             },
+            security,
             true,
             0,
         )

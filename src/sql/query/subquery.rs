@@ -1522,6 +1522,23 @@ fn subquery_node_correlated<'a>(
     select_has_outer_ref(select, &chain, storage, txid, arena)
 }
 
+pub(crate) fn expression_has_correlated_subquery<'a>(
+    expression: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
+    let mut count = 0usize;
+    collect_subqueries(expression, &mut nodes, &mut count)?;
+    for node in nodes[..count].iter().flatten() {
+        if subquery_node_correlated(node, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A scope that needs an enclosing row cannot be described as a stand-alone
 /// schema. Preserve that state explicitly so correlation analysis can inspect
 /// its outer references in the statement's catalog snapshot.
@@ -2865,7 +2882,43 @@ pub fn subquery_hooks<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    let borrowed = prepare_subqueries(exprs, storage, txid, arena, params, SUBQUERY_DEPTH, None)?;
+    subquery_hooks_with_outer(exprs, storage, txid, arena, params, None)
+}
+
+pub(crate) fn subquery_hooks_outer<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    subquery_hooks_with_outer(exprs, storage, txid, arena, params, Some(outer))
+}
+
+fn subquery_hooks_with_outer<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    // `prepare_subqueries` may return values borrowing relation bytes. This
+    // adapter immediately round-trips every value through the arena codec, so
+    // no storage borrow escapes. The engine keeps Storage live for the call.
+    // SAFETY: Storage outlives this call, remains immutable during evaluation,
+    // and every possibly borrowed datum is detached before this function returns.
+    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let borrowed = prepare_subqueries(
+        exprs,
+        storage_for_eval,
+        txid,
+        arena,
+        params,
+        SUBQUERY_DEPTH,
+        outer,
+    )?;
     let scalars = arena
         .alloc_slice_with(borrowed.scalars.len(), |_| {
             (core::ptr::null(), Datum::Null, Datum::Null)

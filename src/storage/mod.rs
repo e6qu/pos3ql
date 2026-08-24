@@ -1260,7 +1260,23 @@ pub struct TableDef {
     pub n_fkeys: usize,
     pub exclusions: [ExclusionConstraint; MAX_EXCLUSIONS],
     pub n_exclusions: usize,
+    pub row_level_security: RowLevelSecurityState,
     pub partition: PartitionDef,
+}
+
+/// The two independent pg_class row-security flags. A policy may exist while
+/// enforcement is disabled, and FORCE affects only the ordinary owner bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowLevelSecurityState {
+    pub enabled: bool,
+    pub forced: bool,
+}
+
+impl RowLevelSecurityState {
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        forced: false,
+    };
 }
 
 /// A table's independent partitioning and attachment roles. Parent links are
@@ -1378,6 +1394,7 @@ impl TableDef {
             n_fkeys: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
+            row_level_security: RowLevelSecurityState::DISABLED,
             partition: PartitionDef::NONE,
         }
     }
@@ -2469,6 +2486,12 @@ pub struct StoredQueryDefinition {
 
 /// A named view: its output is its stored SELECT text, expanded as a derived
 /// table at query time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewSecurity {
+    Definer,
+    Invoker,
+}
+
 #[derive(Clone)]
 pub struct ViewDef {
     /// Monotonic creation stamp, shared with tables (see `Table::created_at`).
@@ -2480,6 +2503,7 @@ pub struct ViewDef {
     /// view body by OID at creation; this engine re-resolves the stored text,
     /// so it must re-resolve under the creator's path, not the reader's.
     pub creation_path: StackStr<128>,
+    pub security: ViewSecurity,
     pub ownership: Ownership,
     ddl_state: CatalogDdlState,
 }
@@ -3312,11 +3336,21 @@ pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 /// Trigger definitions share the table-sized catalog budget.  A trigger has no
 /// runtime allocation: its target and function are stable catalog slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
+pub(crate) const POLICY_OID_BASE: i32 = 180_000;
+pub(crate) const MAX_POLICIES_PER_TABLE: usize = 8;
+pub(crate) const MAX_POLICY_ROLES: usize = 8;
+pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
     TRIGGER_OID_BASE
         .checked_add(i32::try_from(trigger.created_at).expect("trigger OID range exhausted"))
         .expect("trigger OID range exhausted")
+}
+
+pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
+    POLICY_OID_BASE
+        .checked_add(i32::try_from(policy.created_at).expect("policy OID range exhausted"))
+        .expect("policy OID range exhausted")
 }
 
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
@@ -3744,6 +3778,162 @@ pub(crate) fn trigger_when_stackstr(source: &str) -> Result<StackStr<TRIGGER_WHE
         ));
     }
     Ok(value)
+}
+
+/// A policy command uses PostgreSQL's pg_policy codes directly at durable and
+/// catalog boundaries, while remaining a closed typed set in the executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyCommandKind {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCommandKind {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::All => b'*',
+            Self::Select => b'r',
+            Self::Insert => b'a',
+            Self::Update => b'w',
+            Self::Delete => b'd',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'*' => Some(Self::All),
+            b'r' => Some(Self::Select),
+            b'a' => Some(Self::Insert),
+            b'w' => Some(Self::Update),
+            b'd' => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn applies_to(self, command: Self) -> bool {
+        matches!(self, Self::All) || self as u8 == command as u8
+    }
+}
+
+/// Resolved policy roles. PUBLIC uses the catalog-wide sentinel; every other
+/// entry is a stable role slot, so role renames cannot stale policy behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolicyRoles {
+    entries: [u16; MAX_POLICY_ROLES],
+    count: u8,
+}
+
+impl PolicyRoles {
+    pub(crate) const PUBLIC: Self = Self {
+        entries: [PUBLIC_ROLE; MAX_POLICY_ROLES],
+        count: 1,
+    };
+
+    pub(crate) fn from_slice(roles: &[u16]) -> Result<Self, SqlError> {
+        if roles.is_empty() || roles.len() > MAX_POLICY_ROLES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a policy can target between 1 and {} roles",
+                MAX_POLICY_ROLES
+            ));
+        }
+        let mut value = Self {
+            entries: [PUBLIC_ROLE; MAX_POLICY_ROLES],
+            count: roles.len() as u8,
+        };
+        value.entries[..roles.len()].copy_from_slice(roles);
+        Ok(value)
+    }
+
+    pub(crate) fn entries(&self) -> &[u16] {
+        &self.entries[..usize::from(self.count)]
+    }
+
+    pub(crate) fn applies_to(&self, storage: &Storage, role: usize, txid: u32) -> bool {
+        self.entries().iter().any(|target| {
+            *target == PUBLIC_ROLE
+                || usize::from(*target) == role
+                || storage.role_is_member_of(role, usize::from(*target), txid)
+        })
+    }
+}
+
+pub(crate) fn policy_expression(source: &str) -> Result<StackStr<POLICY_EXPRESSION_MAX>, SqlError> {
+    let value = StackStr::from_str(source);
+    if value.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "policy expression exceeds {} bytes",
+            POLICY_EXPRESSION_MAX
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicyDefinition {
+    pub(crate) roles: PolicyRoles,
+    pub(crate) using: Option<StackStr<POLICY_EXPRESSION_MAX>>,
+    pub(crate) with_check: Option<StackStr<POLICY_EXPRESSION_MAX>>,
+    pub(crate) dependencies: StoredQueryDependencies,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingPolicyDefinition {
+    pub(crate) txid: u32,
+    pub(crate) definition: PolicyDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicyDef {
+    pub(crate) created_at: u64,
+    pub(crate) name: SqlName,
+    pub(crate) table: u16,
+    pub(crate) command: PolicyCommandKind,
+    pub(crate) permissive: bool,
+    pub(crate) definition: PolicyDefinition,
+    pub(crate) pending_definition: Option<PendingPolicyDefinition>,
+    pub(crate) ddl_state: CatalogDdlState,
+}
+
+impl PolicyDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        name: SqlName::EMPTY,
+        table: u16::MAX,
+        command: PolicyCommandKind::All,
+        permissive: true,
+        definition: PolicyDefinition {
+            roles: PolicyRoles::PUBLIC,
+            using: None,
+            with_check: None,
+            dependencies: StoredQueryDependencies::EMPTY,
+        },
+        pending_definition: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> PolicyDefinition {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicySpec {
+    pub(crate) name: SqlName,
+    pub(crate) table: usize,
+    pub(crate) command: PolicyCommandKind,
+    pub(crate) permissive: bool,
+    pub(crate) definition: PolicyDefinition,
 }
 
 impl TriggerDef {
@@ -5141,6 +5331,7 @@ pub struct Storage {
     views: FixedVec<ViewDef>,
     routines: FixedVec<RoutineDef>,
     triggers: FixedVec<TriggerDef>,
+    policies: FixedVec<PolicyDef>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
@@ -5683,6 +5874,13 @@ impl Storage {
                     self.rebind_stored_query_dependencies(serialized, 0)?;
             }
         }
+        for slot in 0..self.policies.len() {
+            if self.policies[slot].ddl_state == CatalogDdlState::Present {
+                let serialized = self.policies[slot].definition.dependencies;
+                self.policies[slot].definition.dependencies =
+                    self.rebind_stored_query_dependencies(serialized, 0)?;
+            }
+        }
         Ok(())
     }
 
@@ -5701,6 +5899,20 @@ impl Storage {
         for matview_slot in 0..self.matviews.len() {
             if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
                 self.matview_dependencies[matview_slot].rename(class, slot, schema, name);
+            }
+        }
+        for policy in self.policies.iter_mut() {
+            if policy.ddl_state != CatalogDdlState::Absent {
+                policy
+                    .definition
+                    .dependencies
+                    .rename(class, slot, schema, name);
+                if let Some(pending) = &mut policy.pending_definition {
+                    pending
+                        .definition
+                        .dependencies
+                        .rename(class, slot, schema, name);
+                }
             }
         }
     }
@@ -5725,6 +5937,20 @@ impl Storage {
                     .replace_slot(class, old_slot, new_slot, schema, name);
             }
         }
+        for policy in self.policies.iter_mut() {
+            if policy.ddl_state != CatalogDdlState::Absent {
+                policy
+                    .definition
+                    .dependencies
+                    .replace_slot(class, old_slot, new_slot, schema, name);
+                if let Some(pending) = &mut policy.pending_definition {
+                    pending
+                        .definition
+                        .dependencies
+                        .replace_slot(class, old_slot, new_slot, schema, name);
+                }
+            }
+        }
     }
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
@@ -5736,6 +5962,7 @@ impl Storage {
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
                     + size_of::<TriggerDef>()
+                    + MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
                     + size_of::<PublicationDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<MatviewDef>()
@@ -5843,6 +6070,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
+                    security: ViewSecurity::Definer,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -5859,6 +6087,13 @@ impl Storage {
             triggers
                 .push(TriggerDef::EMPTY)
                 .expect("sized to max_tables");
+        }
+        let policy_capacity = config.max_tables * MAX_POLICIES_PER_TABLE;
+        let mut policies = FixedVec::new(budget, "policies", policy_capacity)?;
+        for _ in 0..policy_capacity {
+            policies
+                .push(PolicyDef::EMPTY)
+                .expect("sized to policy capacity");
         }
         let view_dependencies =
             stored_query_dependency_slots(budget, "view_dependencies", config.max_tables)?;
@@ -6132,6 +6367,7 @@ impl Storage {
             views,
             routines,
             triggers,
+            policies,
             publications,
             replication_slots,
             subscriptions,
@@ -6549,6 +6785,15 @@ impl Storage {
                 let (defined, _, _) = Self::default_acl_visible(entry, txid);
                 defined && (entry.owner == role as u16 || entry.grantee == role as u16)
             })
+            || self
+                .policies_with_slots_visible_to(txid)
+                .any(|(_, policy)| {
+                    policy
+                        .definition_for(txid)
+                        .roles
+                        .entries()
+                        .contains(&(role as u16))
+                })
     }
 
     pub(crate) fn set_object_owner(
@@ -12167,6 +12412,7 @@ impl Storage {
         self.tables[index].pending_ddl = None;
         self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
+        self.commit_policies_for_table(index);
     }
 
     /// Transactional drop: the table stays visible to every other transaction
@@ -16356,6 +16602,7 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
         query: StoredQueryDefinition,
+        security: ViewSecurity,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
@@ -16412,6 +16659,7 @@ impl Storage {
             name,
             sql: query.sql,
             creation_path: query.creation_path,
+            security,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -17187,6 +17435,231 @@ impl Storage {
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn policy(&self, slot: usize) -> &PolicyDef {
+        &self.policies[slot]
+    }
+
+    pub(crate) fn policy_count(&self) -> usize {
+        self.policies.len()
+    }
+
+    pub(crate) fn policies_for_table(
+        &self,
+        table: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &PolicyDef)> {
+        self.policies.iter().enumerate().filter(move |(_, policy)| {
+            policy.visible_to(txid) && usize::from(policy.table) == table
+        })
+    }
+
+    pub(crate) fn policies_with_slots_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &PolicyDef)> {
+        self.policies
+            .iter()
+            .enumerate()
+            .filter(move |(_, policy)| policy.visible_to(txid))
+    }
+
+    /// Whether this role is subject to the table's row-security policies.
+    /// Superusers and BYPASSRLS roles always bypass; owners bypass unless the
+    /// table is forced. Disabled row security never consults policies.
+    pub(crate) fn row_security_applies(&self, table: usize, role: usize, txid: u32) -> bool {
+        let state = self.table_def(table, txid).row_level_security;
+        if !state.enabled {
+            return false;
+        }
+        let attributes = self.role(role).attributes_to(txid);
+        if attributes.superuser || attributes.bypass_row_level_security {
+            return false;
+        }
+        state.forced || self.object_owner(self.table_access_object(table, txid), txid) != role
+    }
+
+    pub(crate) fn policy_slot_on(&self, table: usize, name: &str, txid: u32) -> Option<usize> {
+        self.policies_for_table(table, txid)
+            .find_map(|(slot, policy)| (policy.name.as_str() == name).then_some(slot))
+    }
+
+    pub(crate) fn create_policy(&mut self, spec: PolicySpec, txid: u32) -> Result<usize, SqlError> {
+        if spec.table >= self.tables.len()
+            || spec.definition.roles.entries().is_empty()
+            || (matches!(spec.command, PolicyCommandKind::Insert)
+                && spec.definition.using.is_some())
+            || (matches!(
+                spec.command,
+                PolicyCommandKind::Select | PolicyCommandKind::Delete
+            ) && spec.definition.with_check.is_some())
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid row-security policy definition"
+            ));
+        }
+        if self
+            .policy_slot_on(spec.table, spec.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "policy \"{}\" for table already exists",
+                spec.name.as_str()
+            ));
+        }
+        if self.policies_for_table(spec.table, txid).count() == MAX_POLICIES_PER_TABLE {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table has too many policies (limit {})",
+                MAX_POLICIES_PER_TABLE
+            ));
+        }
+        let Some(slot) = self
+            .policies
+            .iter()
+            .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row-security policy catalog is full (limit {})",
+                self.policies.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.policies[slot] = PolicyDef {
+            created_at: self.catalog_seq,
+            name: spec.name,
+            table: u16::try_from(spec.table).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table slot exceeds policy catalog capacity"
+                )
+            })?,
+            command: spec.command,
+            permissive: spec.permissive,
+            definition: spec.definition,
+            pending_definition: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_policy(
+        &mut self,
+        slot: usize,
+        definition: PolicyDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingPolicyDefinition>, SqlError> {
+        if matches!(self.policies[slot].command, PolicyCommandKind::Insert)
+            && definition.using.is_some()
+            || matches!(
+                self.policies[slot].command,
+                PolicyCommandKind::Select | PolicyCommandKind::Delete
+            ) && definition.with_check.is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "policy expression is not valid for its command"
+            ));
+        }
+        if let Some(pending) = self.policies[slot].pending_definition
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.policies[slot].name.as_str(),
+            ));
+        }
+        let prior = self.policies[slot].pending_definition;
+        self.policies[slot].pending_definition = Some(PendingPolicyDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_policy(&mut self, slot: usize, txid: u32) {
+        self.policies[slot].ddl_state = self.policies[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_policy_create(&mut self, slot: usize) {
+        self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_policy_create(&mut self, slot: usize) {
+        self.policies[slot].ddl_state = self.policies[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_policy_alter(&mut self, slot: usize, txid: u32) {
+        let policy = &mut self.policies[slot];
+        if let Some(pending) = policy.pending_definition
+            && pending.txid == txid
+        {
+            policy.definition = pending.definition;
+            policy.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn rollback_policy_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingPolicyDefinition>,
+    ) {
+        self.policies[slot].pending_definition = prior;
+    }
+
+    pub(crate) fn commit_policy_drop(&mut self, slot: usize) {
+        self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_drop();
+        self.policies[slot].pending_definition = None;
+    }
+
+    pub(crate) fn rollback_policy_drop(&mut self, slot: usize, txid: u32) {
+        self.policies[slot].ddl_state = self.policies[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn commit_policies_for_table(&mut self, table: usize) {
+        for policy in self.policies.iter_mut() {
+            if policy.ddl_state != CatalogDdlState::Absent && usize::from(policy.table) == table {
+                policy.ddl_state = CatalogDdlState::Absent;
+                policy.pending_definition = None;
+            }
+        }
+    }
+
+    pub(crate) fn replay_set_policy(&mut self, spec: PolicySpec) -> Result<(), SqlError> {
+        if let Some(slot) = self.policy_slot_on(spec.table, spec.name.as_str(), 0) {
+            let policy = &mut self.policies[slot];
+            policy.command = spec.command;
+            policy.permissive = spec.permissive;
+            policy.definition = spec.definition;
+            policy.pending_definition = None;
+            return Ok(());
+        }
+        let slot = self.create_policy(spec, 0)?;
+        self.commit_policy_create(slot);
+        Ok(())
+    }
+
+    pub(crate) fn replay_drop_policy(&mut self, table: usize, name: &str) {
+        if let Some(slot) = self.policy_slot_on(table, name, 0) {
+            self.drop_policy(slot, 0);
+            self.commit_policy_drop(slot);
+        }
+    }
+
+    pub(crate) fn restore_policy(
+        &mut self,
+        created_at: u64,
+        spec: PolicySpec,
+    ) -> Result<(), SqlError> {
+        self.replay_set_policy(spec)?;
+        let slot = self
+            .policy_slot_on(spec.table, spec.name.as_str(), 0)
+            .expect("restored policy is installed");
+        self.policies[slot].created_at = created_at;
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        Ok(())
     }
 
     pub(crate) fn triggers_for_table(
@@ -18540,7 +19013,7 @@ mod tests {
     #[test]
     fn user_type_identity_is_atomic() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let storage = Storage::new(&config, &mut budget).unwrap();
         let mut column = ColumnMeta::EMPTY;
         column.ctype = ColType::Enum(0);
@@ -18567,7 +19040,7 @@ mod tests {
     #[test]
     fn create_find_drop_reuse() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
         let index = s.create_table(def).unwrap();
@@ -18613,7 +19086,7 @@ mod tests {
     #[test]
     fn replay_table_rewrite_marker_must_be_paired_exactly_once() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage
             .create_table(make_def("t", &[("id", ColType::Int4, true)]))
@@ -18697,7 +19170,7 @@ mod tests {
     fn heap_append_and_full() {
         let mut config = test_config();
         config.memtable_bytes = 64;
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let (loc, slice) = s.heap.append(10).unwrap();
         slice.copy_from_slice(b"0123456789");
@@ -18709,7 +19182,7 @@ mod tests {
     #[test]
     fn heap_compaction_preserves_rows_of_a_pending_create() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let slot = storage
             .create_table_in(make_def("pending", &[("id", ColType::Int4, true)]), 7)
@@ -18765,7 +19238,7 @@ mod tests {
     fn replication_slots_are_bounded_and_have_resume_positions() {
         let mut config = test_config();
         config.max_replication_slots = 1;
-        let mut budget = Budget::new(1 << 22);
+        let mut budget = Budget::new(1 << 23);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage
             .create_replication_slot(

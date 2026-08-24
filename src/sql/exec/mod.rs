@@ -19,8 +19,9 @@ use crate::storage::rowenc;
 use crate::storage::{
     CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
     PartitionBound as StoredPartitionBound, PartitionBoundValue, PartitionDef,
-    PartitionStrategy as StoredPartitionStrategy, ROUTINE_SQL_MAX, RoutineArgumentDef,
-    RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+    PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
+    RoutineArgumentDef, RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage,
+    TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -1852,6 +1853,8 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     on_conflict: &Option<super::ast::OnConflict<'a>>,
     arbiter: &Arbiter,
     checks: &ParsedChecks,
+    row_security_using: Option<super::query::RowSecurityPlan<'a>>,
+    row_security_check: Option<super::query::RowSecurityPlan<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -1902,6 +1905,35 @@ where
             )
         })?;
         rowenc::decode(bytes, schema, &mut existing)?;
+        if let Some(plan) = row_security_using {
+            let policy_row = RowCtx {
+                def,
+                values: &existing[..def.n_columns],
+                alias: None,
+            };
+            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+            let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+            let policy_hooks = EvalHooks {
+                catalog: Some(&catalog),
+                sequences: Some(&sequences),
+                ..NO_HOOKS
+            };
+            if !super::query::row_security_passes(
+                plan,
+                &policy_row,
+                storage,
+                txn.txid,
+                arena,
+                params,
+                &policy_hooks,
+            )? {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "new row violates row-level security policy for table \"{}\"",
+                    def.name.as_str()
+                ));
+            }
+        }
         let context = ExcludedCtx {
             def: *def,
             existing: &existing[..def.n_columns],
@@ -1976,6 +2008,35 @@ where
         return Ok(ConflictOutcome::Skip);
     }
     compute_generated(def, &generated, &mut new_values, storage, txn.txid, arena)?;
+    if let Some(plan) = row_security_check {
+        let policy_row = RowCtx {
+            def,
+            values: &new_values[..def.n_columns],
+            alias: None,
+        };
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let policy_hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        if !super::query::row_security_passes(
+            plan,
+            &policy_row,
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &policy_hooks,
+        )? {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "new row violates row-level security policy for table \"{}\"",
+                def.name.as_str()
+            ));
+        }
+    }
     let mut logical_table = table_index;
     while let Some(attachment) = storage
         .table_def(logical_table, txn.txid)
@@ -2235,8 +2296,19 @@ pub fn drop_table(
                     Ok(closure) => closure,
                     Err(error) => return sql_fail(error),
                 };
+                let policy_root = PolicyDependencySelection::Catalog {
+                    class: crate::storage::DependencyClass::Table,
+                    slot: index,
+                };
                 let has_dependents = dependent_views.iter().any(|selected| *selected)
-                    || dependent_matviews.iter().any(|selected| *selected);
+                    || dependent_matviews.iter().any(|selected| *selected)
+                    || policy_dependents_exist(
+                        storage,
+                        txn.txid,
+                        policy_root,
+                        &dependent_views,
+                        &dependent_matviews,
+                    );
                 if has_dependents && !statement.cascade {
                     if let Err(error) = report_stored_query_dependents(
                         storage,
@@ -2252,6 +2324,7 @@ pub fn drop_table(
                         StoredQuerySelection {
                             views: &dependent_views,
                             matviews: &dependent_matviews,
+                            policy_root: Some(policy_root),
                         },
                         false,
                         responder,
@@ -2279,9 +2352,20 @@ pub fn drop_table(
                         StoredQuerySelection {
                             views: &dependent_views,
                             matviews: &dependent_matviews,
+                            policy_root: Some(policy_root),
                         },
                         true,
                         responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = drop_policy_dependents(
+                        storage,
+                        wal,
+                        txn,
+                        policy_root,
+                        &dependent_views,
+                        &dependent_matviews,
                     ) {
                         return sql_fail(error);
                     }
@@ -4489,6 +4573,25 @@ pub fn drop_owned(
             Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
+    let has_policy_dependents =
+        storage
+            .policies_with_slots_visible_to(txn.txid)
+            .any(|(_, policy)| {
+                policy_depends_on_owned_selection(
+                    storage,
+                    txn.txid,
+                    policy,
+                    &tables,
+                    &views,
+                    &sequences,
+                    &domains,
+                    &enums,
+                    &composites,
+                    &routines,
+                    &dependent_views,
+                    &dependent_matviews,
+                )
+            });
     if !cascade
         && (dependent_views
             .iter()
@@ -4497,12 +4600,38 @@ pub fn drop_owned(
             || dependent_matviews
                 .iter()
                 .zip(matviews)
-                .any(|(dependent, owned)| *dependent && !owned))
+                .any(|(dependent, owned)| *dependent && !owned)
+            || has_policy_dependents)
     {
         return sql_fail(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop owned objects because other objects depend on them"
         ));
+    }
+    if cascade {
+        for slot in 0..storage.policy_count() {
+            let selected = {
+                let policy = storage.policy(slot);
+                policy.visible_to(txn.txid)
+                    && policy_depends_on_owned_selection(
+                        storage,
+                        txn.txid,
+                        policy,
+                        &tables,
+                        &views,
+                        &sequences,
+                        &domains,
+                        &enums,
+                        &composites,
+                        &routines,
+                        &dependent_views,
+                        &dependent_matviews,
+                    )
+            };
+            if selected && let Err(error) = drop_policy_slot(storage, wal, txn, slot) {
+                return sql_fail(error);
+            }
+        }
     }
     if cascade {
         for slot in 0..views.len() {
@@ -5340,6 +5469,12 @@ enum SchemaObject {
     Sequence(usize),
     Domain(usize),
     Enum(usize),
+    Policy {
+        slot: usize,
+        root_schema: SqlName,
+        root_class: Option<crate::storage::DependencyClass>,
+        root_slot: usize,
+    },
     /// An inbound foreign key on a table that itself survives.
     InboundFk {
         table: usize,
@@ -5675,6 +5810,101 @@ pub fn drop_schema(
                     return sql_fail(error);
                 }
             }
+            for policy_slot in 0..storage.policy_count() {
+                let policy = storage.policy(policy_slot);
+                if !policy.visible_to(txn.txid)
+                    || in_listed(
+                        storage,
+                        storage
+                            .table_def(usize::from(policy.table), txn.txid)
+                            .schema
+                            .as_str(),
+                    )
+                {
+                    continue;
+                }
+                let dependencies = &policy.definition_for(txn.txid).dependencies;
+                let direct_dependency = dependencies
+                    .entries()
+                    .iter()
+                    .find(|dependency| in_listed(storage, dependency.schema.as_str()))
+                    .copied();
+                if (direct_dependency.is_some()
+                    || policy_depends_on_selected_stored_query(
+                        storage,
+                        txn.txid,
+                        dependencies,
+                        &dependent_views,
+                        &dependent_matviews,
+                    ))
+                    && let Err(error) = push(
+                        SchemaObject::Policy {
+                            slot: policy_slot,
+                            root_schema: direct_dependency
+                                .map(|dependency| dependency.schema)
+                                .unwrap_or(storage.schema_def(slots[0]).name),
+                            root_class: direct_dependency.map(|dependency| dependency.class),
+                            root_slot: direct_dependency
+                                .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
+                        },
+                        &mut n_objects,
+                    )
+                {
+                    return sql_fail(error);
+                }
+            }
+        }
+    }
+    if !cascade && n_objects > 0 {
+        let (dependent_views, dependent_matviews) =
+            match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+                in_listed(storage, dependency.schema.as_str())
+            }) {
+                Ok(closure) => closure,
+                Err(error) => return sql_fail(error),
+            };
+        for policy_slot in 0..storage.policy_count() {
+            let policy = storage.policy(policy_slot);
+            if !policy.visible_to(txn.txid)
+                || in_listed(
+                    storage,
+                    storage
+                        .table_def(usize::from(policy.table), txn.txid)
+                        .schema
+                        .as_str(),
+                )
+            {
+                continue;
+            }
+            let dependencies = &policy.definition_for(txn.txid).dependencies;
+            let direct_dependency = dependencies
+                .entries()
+                .iter()
+                .find(|dependency| in_listed(storage, dependency.schema.as_str()))
+                .copied();
+            if (direct_dependency.is_some()
+                || policy_depends_on_selected_stored_query(
+                    storage,
+                    txn.txid,
+                    dependencies,
+                    &dependent_views,
+                    &dependent_matviews,
+                ))
+                && let Err(error) = push(
+                    SchemaObject::Policy {
+                        slot: policy_slot,
+                        root_schema: direct_dependency
+                            .map(|dependency| dependency.schema)
+                            .unwrap_or(storage.schema_def(slots[0]).name),
+                        root_class: direct_dependency.map(|dependency| dependency.class),
+                        root_slot: direct_dependency
+                            .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
+                    },
+                    &mut n_objects,
+                )
+            {
+                return sql_fail(error);
+            }
         }
     }
     // Inbound foreign keys: a surviving table referencing a dropped one loses
@@ -5760,6 +5990,16 @@ pub fn drop_schema(
                     0,
                 )
             }
+            SchemaObject::Policy {
+                slot, root_schema, ..
+            } => {
+                let policy = storage.policy(*slot);
+                (
+                    schema_rank(storage, root_schema.as_str()),
+                    policy.created_at,
+                    0,
+                )
+            }
             SchemaObject::InboundFk { table, fk_index } => {
                 let child = storage.table(*table);
                 let def = storage.table_def(*table, txn.txid);
@@ -5785,15 +6025,15 @@ pub fn drop_schema(
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
         })
     };
-    let describe = |storage: &Storage, o: &SchemaObject, out: &mut crate::util::StackStr<192>| {
-        let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
-            if in_path(storage, schema.as_str()) {
-                let _ = write!(out, "{}", name.as_str());
-            } else {
-                let _ = write!(out, "{}.{}", schema.as_str(), name.as_str());
-            }
-        };
-        match o {
+    let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
+        if in_path(storage, schema.as_str()) {
+            let _ = write!(out, "{}", name.as_str());
+        } else {
+            let _ = write!(out, "{}.{}", schema.as_str(), name.as_str());
+        }
+    };
+    let describe =
+        |storage: &Storage, o: &SchemaObject, out: &mut crate::util::StackStr<192>| match o {
             SchemaObject::Table(t) => {
                 let def = storage.table_def(*t, txn.txid);
                 let _ = write!(out, "table ");
@@ -5824,6 +6064,12 @@ pub fn drop_schema(
                 let _ = write!(out, "type ");
                 write_rel(out, &enumeration.schema, &enumeration.name);
             }
+            SchemaObject::Policy { slot, .. } => {
+                let policy = storage.policy(*slot);
+                let table = storage.table_def(usize::from(policy.table), txn.txid);
+                let _ = write!(out, "policy {} on table ", policy.name.as_str());
+                write_rel(out, &table.schema, &table.name);
+            }
             SchemaObject::InboundFk { table, fk_index } => {
                 let def = storage.table_def(*table, txn.txid);
                 let _ = write!(
@@ -5833,8 +6079,7 @@ pub fn drop_schema(
                 );
                 write_rel(out, &def.schema, &def.name);
             }
-        }
-    };
+        };
     if n_objects > 0 && !cascade {
         let first = slots[0];
         let mut detail =
@@ -5851,17 +6096,87 @@ pub fn drop_schema(
                 }
                 SchemaObject::Domain(domain) => storage.domain(*domain).schema,
                 SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
+                SchemaObject::Policy { root_schema, .. } => *root_schema,
                 SchemaObject::InboundFk { table, fk_index } => {
                     storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema
                 }
             };
-            let _ = write!(
-                detail,
-                "{}{} depends on schema {}",
-                if i > 0 { "\n" } else { "" },
-                line.as_str(),
-                schema.as_str(),
-            );
+            if let SchemaObject::Policy {
+                root_class: Some(root_class),
+                root_slot,
+                ..
+            } = o
+            {
+                let mut dependency = crate::util::StackStr::<192>::new();
+                match root_class {
+                    crate::storage::DependencyClass::Table => {
+                        let definition = storage.table_def(*root_slot, txn.txid);
+                        let kind = if storage
+                            .matview_slot(
+                                definition.schema.as_str(),
+                                definition.name.as_str(),
+                                txn.txid,
+                            )
+                            .is_some()
+                        {
+                            "materialized view"
+                        } else {
+                            "table"
+                        };
+                        let _ = write!(dependency, "{kind} ");
+                        write_rel(&mut dependency, &definition.schema, &definition.name);
+                    }
+                    crate::storage::DependencyClass::View => {
+                        let view = storage.view(*root_slot);
+                        let _ = write!(dependency, "view ");
+                        write_rel(&mut dependency, &view.schema, &view.name);
+                    }
+                    crate::storage::DependencyClass::Sequence => {
+                        let sequence = storage.sequence_for(*root_slot, txn.txid);
+                        let _ = write!(dependency, "sequence ");
+                        write_rel(&mut dependency, &sequence.schema, &sequence.name);
+                    }
+                    crate::storage::DependencyClass::Domain => {
+                        let domain = storage.domain(*root_slot);
+                        let _ = write!(dependency, "type ");
+                        write_rel(&mut dependency, &domain.schema, &domain.name);
+                    }
+                    crate::storage::DependencyClass::Enum => {
+                        let enumeration = storage.enum_for(*root_slot, txn.txid);
+                        let _ = write!(dependency, "type ");
+                        write_rel(&mut dependency, &enumeration.schema, &enumeration.name);
+                    }
+                    crate::storage::DependencyClass::Composite => {
+                        let composite = storage.composite(*root_slot);
+                        let _ = write!(dependency, "type ");
+                        write_rel(&mut dependency, &composite.schema, &composite.name);
+                    }
+                    crate::storage::DependencyClass::Routine => {
+                        let routine = storage.routine(*root_slot);
+                        let _ = write!(dependency, "function ");
+                        write_rel(
+                            &mut dependency,
+                            &routine.schema_for(txn.txid),
+                            &routine.name_for(txn.txid),
+                        );
+                    }
+                }
+                let _ = write!(
+                    detail,
+                    "{}{} depends on {}",
+                    if i > 0 { "\n" } else { "" },
+                    line.as_str(),
+                    dependency.as_str(),
+                );
+            } else {
+                let _ = write!(
+                    detail,
+                    "{}{} depends on schema {}",
+                    if i > 0 { "\n" } else { "" },
+                    line.as_str(),
+                    schema.as_str(),
+                );
+            }
         }
         let mut hint = crate::util::StackStr::<128>::new();
         let _ = write!(
@@ -6123,6 +6438,11 @@ pub fn drop_schema(
                     }
                     Ok(None) => {}
                     Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Policy { slot, .. } => {
+                if let Err(error) = drop_policy_slot(storage, wal, txn, *slot) {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Table(t) => {
@@ -7728,6 +8048,7 @@ fn replica_identity_columns(definition: &TableDef) -> u64 {
 pub struct CreateViewCommand<'a> {
     pub name: &'a QualName<'a>,
     pub or_replace: bool,
+    pub security: super::ast::ViewSecurity,
     pub sql: &'a str,
     pub raw_path: &'a str,
 }
@@ -13316,6 +13637,481 @@ pub fn create_trigger(
     sql_ok()
 }
 
+fn resolve_policy_roles(
+    storage: &Storage,
+    roles: &[crate::sql::ast::PolicyRole<'_>],
+    txid: u32,
+) -> Result<crate::storage::PolicyRoles, SqlError> {
+    let current = super::eval::funcs::system::current_user_owned();
+    let session = super::eval::funcs::system::session_user_owned();
+    let mut resolved = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
+    let mut count = 0usize;
+    for role in roles {
+        let slot = match role {
+            crate::sql::ast::PolicyRole::Public => crate::storage::PUBLIC_ROLE,
+            crate::sql::ast::PolicyRole::CurrentRole | crate::sql::ast::PolicyRole::CurrentUser => {
+                storage
+                    .find_role_visible(current.as_str(), txid)
+                    .map(|slot| slot as u16)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "role \"{}\" does not exist",
+                            current.as_str()
+                        )
+                    })?
+            }
+            crate::sql::ast::PolicyRole::SessionUser => storage
+                .find_role_visible(session.as_str(), txid)
+                .map(|slot| slot as u16)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        session.as_str()
+                    )
+                })?,
+            crate::sql::ast::PolicyRole::Named(name) => storage
+                .find_role_visible(name, txid)
+                .map(|slot| slot as u16)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        name
+                    )
+                })?,
+        };
+        if resolved[..count].contains(&slot) {
+            continue;
+        }
+        if count == resolved.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a policy can target at most {} roles",
+                resolved.len()
+            ));
+        }
+        resolved[count] = slot;
+        count += 1;
+    }
+    crate::storage::PolicyRoles::from_slice(&resolved[..count])
+}
+
+fn policy_wal_roles(
+    storage: &Storage,
+    roles: crate::storage::PolicyRoles,
+    txid: u32,
+) -> [SqlName; crate::storage::MAX_POLICY_ROLES] {
+    let mut names = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
+    for (index, role) in roles.entries().iter().copied().enumerate() {
+        names[index] = if role == crate::storage::PUBLIC_ROLE {
+            SqlName::parse("public").expect("PUBLIC is a valid role name")
+        } else {
+            storage.role_name(usize::from(role), txid)
+        };
+    }
+    names
+}
+
+fn policy_expression_source(
+    expression: Option<crate::sql::ast::PolicyExpression<'_>>,
+) -> Result<Option<crate::util::StackStr<{ crate::storage::POLICY_EXPRESSION_MAX }>>, SqlError> {
+    expression
+        .map(|expression| crate::storage::policy_expression(expression.source))
+        .transpose()
+}
+
+fn validate_policy_definition(
+    storage: &Storage,
+    table: usize,
+    definition: &mut crate::storage::PolicyDefinition,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let table_def = storage.table_def(table, txid);
+    let mut sql = crate::util::StackStr::<2304>::new();
+    sql.write_str("SELECT ").map_err(|_| arena_full())?;
+    let mut expressions = 0usize;
+    for source in [definition.using.as_ref(), definition.with_check.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let expression_source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+        let expression = crate::sql::parser::parse_expr(expression_source, arena)?;
+        if super::query::expr_has_aggregate(expression) {
+            return Err(sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in policy expressions"
+            ));
+        }
+        if super::query::expr_has_window(expression) {
+            return Err(sql_err!(
+                sqlstate::WINDOWING_ERROR,
+                "window functions are not allowed in policy expressions"
+            ));
+        }
+        if super::query::expression_has_project_set(expression, storage, txid) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-returning functions are not allowed in policy expressions"
+            ));
+        }
+        if expressions != 0 {
+            sql.write_str(", ").map_err(|_| arena_full())?;
+        }
+        write!(sql, "({})", source.as_str()).map_err(|_| arena_full())?;
+        expressions += 1;
+    }
+    if expressions == 0 {
+        sql.write_str("true").map_err(|_| arena_full())?;
+    }
+    sql.write_str(" FROM ").map_err(|_| arena_full())?;
+    write_identifier(&mut sql, table_def.schema.as_str());
+    sql.write_str(".").map_err(|_| arena_full())?;
+    write_identifier(&mut sql, table_def.name.as_str());
+    if sql.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "policy definition is too large to analyze"
+        ));
+    }
+    let sql = arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?;
+    let mut columns = [ColDesc::new("", 0, 0); 2];
+    let count = super::query::describe_query(sql, storage, txid, arena, &mut columns)?;
+    for column in &columns[..count] {
+        if column.type_oid != crate::sql::types::oid::BOOL {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "policy expression must return type boolean"
+            ));
+        }
+    }
+    definition.dependencies =
+        super::query::stored_query_dependencies(sql, storage, txid, *storage.path(), arena)?;
+    Ok(())
+}
+
+fn policy_table(
+    storage: &Storage,
+    table: &crate::sql::ast::QualName<'_>,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    match storage.resolve_relation(table.schema, table.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => Ok(slot),
+        _ => Err(undefined_qual(table)),
+    }
+}
+
+pub fn create_policy(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    policy: &crate::sql::ast::CreatePolicy<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match policy_table(storage, &policy.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::ShareRowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
+    let roles = match resolve_policy_roles(storage, policy.roles, txn.txid) {
+        Ok(roles) => roles,
+        Err(error) => return sql_fail(error),
+    };
+    let (command, using, with_check) = match policy.command {
+        crate::sql::ast::PolicyCommand::All { using, with_check } => {
+            (crate::storage::PolicyCommandKind::All, using, with_check)
+        }
+        crate::sql::ast::PolicyCommand::Select { using } => {
+            (crate::storage::PolicyCommandKind::Select, using, None)
+        }
+        crate::sql::ast::PolicyCommand::Insert { with_check } => {
+            (crate::storage::PolicyCommandKind::Insert, None, with_check)
+        }
+        crate::sql::ast::PolicyCommand::Update { using, with_check } => {
+            (crate::storage::PolicyCommandKind::Update, using, with_check)
+        }
+        crate::sql::ast::PolicyCommand::Delete { using } => {
+            (crate::storage::PolicyCommandKind::Delete, using, None)
+        }
+    };
+    let mut definition = crate::storage::PolicyDefinition {
+        roles,
+        using: match policy_expression_source(using) {
+            Ok(source) => source,
+            Err(error) => return sql_fail(error),
+        },
+        with_check: match policy_expression_source(with_check) {
+            Ok(source) => source,
+            Err(error) => return sql_fail(error),
+        },
+        dependencies: crate::storage::StoredQueryDependencies::EMPTY,
+    };
+    if let Err(error) = validate_policy_definition(storage, table, &mut definition, txn.txid, arena)
+    {
+        return sql_fail(error);
+    }
+    let name = match SqlName::parse(policy.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_policy(
+        crate::storage::PolicySpec {
+            name,
+            table,
+            command,
+            permissive: matches!(
+                policy.permissiveness,
+                crate::sql::ast::PolicyPermissiveness::Permissive
+            ),
+            definition,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let (table_schema, table_name) = {
+        let table_definition = storage.table_def(table, txn.txid);
+        (table_definition.schema, table_definition.name)
+    };
+    let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetPolicy {
+            schema: table_schema.as_str(),
+            table: table_name.as_str(),
+            name: policy.name,
+            command: command.code(),
+            permissive: matches!(
+                policy.permissiveness,
+                crate::sql::ast::PolicyPermissiveness::Permissive
+            ),
+            roles: wal_roles,
+            role_count: definition.roles.entries().len(),
+            using: definition.using.as_ref().map(|source| source.as_str()),
+            with_check: definition.with_check.as_ref().map(|source| source.as_str()),
+            dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                &definition.dependencies,
+            ),
+        },
+    ) {
+        storage.rollback_policy_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyCreated(slot as u32)) {
+        storage.rollback_policy_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE POLICY")?;
+    sql_ok()
+}
+
+pub fn alter_policy(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    alteration: &crate::sql::ast::AlterPolicy<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match policy_table(storage, &alteration.identity.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::ShareRowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.policy_slot_on(table, alteration.identity.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "policy \"{}\" for table \"{}\" does not exist",
+            alteration.identity.name,
+            alteration.identity.table.name
+        ));
+    };
+    let mut definition = storage.policy(slot).definition_for(txn.txid);
+    if let Some(roles) = alteration.roles {
+        definition.roles = match resolve_policy_roles(storage, roles, txn.txid) {
+            Ok(roles) => roles,
+            Err(error) => return sql_fail(error),
+        };
+    }
+    if let Some(expression) = alteration.using {
+        definition.using = match policy_expression_source(Some(expression)) {
+            Ok(source) => source,
+            Err(error) => return sql_fail(error),
+        };
+    }
+    if let Some(expression) = alteration.with_check {
+        definition.with_check = match policy_expression_source(Some(expression)) {
+            Ok(source) => source,
+            Err(error) => return sql_fail(error),
+        };
+    }
+    if let Err(error) = validate_policy_definition(storage, table, &mut definition, txn.txid, arena)
+    {
+        return sql_fail(error);
+    }
+    let prior = match storage.alter_policy(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let policy = *storage.policy(slot);
+    let (table_schema, table_name) = {
+        let table_definition = storage.table_def(table, txn.txid);
+        (table_definition.schema, table_definition.name)
+    };
+    let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetPolicy {
+            schema: table_schema.as_str(),
+            table: table_name.as_str(),
+            name: policy.name.as_str(),
+            command: policy.command.code(),
+            permissive: policy.permissive,
+            roles: wal_roles,
+            role_count: definition.roles.entries().len(),
+            using: definition.using.as_ref().map(|source| source.as_str()),
+            with_check: definition.with_check.as_ref().map(|source| source.as_str()),
+            dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                &definition.dependencies,
+            ),
+        },
+    ) {
+        storage.rollback_policy_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_policy_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER POLICY")?;
+    sql_ok()
+}
+
+pub fn drop_policy(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    identity: &crate::sql::ast::PolicyIdentity<'_>,
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match policy_table(storage, &identity.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) if if_exists => {
+            responder.notice(sqlstate::SUCCESSFUL_COMPLETION, error.message.as_str())?;
+            responder.command_complete("DROP POLICY")?;
+            return sql_ok();
+        }
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::ShareRowExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.policy_slot_on(table, identity.name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(96, "policy \"{}\" does not exist, skipping", identity.name).as_str(),
+            )?;
+            responder.command_complete("DROP POLICY")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "policy \"{}\" for table \"{}\" does not exist",
+            identity.name,
+            identity.table.name
+        ));
+    };
+    if let Err(error) = drop_policy_slot(storage, wal, txn, slot) {
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP POLICY")?;
+    sql_ok()
+}
+
+fn drop_policy_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let policy = *storage.policy(slot);
+    let (table_schema, table_name) = {
+        let table_definition = storage.table_def(usize::from(policy.table), txn.txid);
+        (table_definition.schema, table_definition.name)
+    };
+    let lsn = storage.bump_lsn();
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropPolicy {
+            schema: table_schema.as_str(),
+            table: table_name.as_str(),
+            name: policy.name.as_str(),
+        },
+    )?;
+    storage.drop_policy(slot, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyDropped(slot as u32)) {
+        storage.rollback_policy_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn drop_trigger(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -14189,8 +14985,19 @@ pub fn drop_routine(
                 Ok(dependents) => dependents,
                 Err(error) => return sql_fail(error),
             };
+        let policy_root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Routine,
+            slot,
+        };
         let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected);
+            || dependent_matviews.iter().any(|selected| *selected)
+            || policy_dependents_exist(
+                storage,
+                txn.txid,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+            );
         let dependency_suffix = match routine_dependency_suffix(storage, &routine) {
             Ok(suffix) => suffix,
             Err(error) => return sql_fail(error),
@@ -14210,6 +15017,7 @@ pub fn drop_routine(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    policy_root: Some(policy_root),
                 },
                 false,
                 responder,
@@ -14237,9 +15045,22 @@ pub fn drop_routine(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    policy_root: Some(policy_root),
                 },
                 true,
                 responder,
+            )
+        {
+            return sql_fail(error);
+        }
+        if has_stored_dependents
+            && let Err(error) = drop_policy_dependents(
+                storage,
+                wal,
+                txn,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
             )
         {
             return sql_fail(error);
@@ -14352,6 +15173,7 @@ pub fn create_view(
     let CreateViewCommand {
         name,
         or_replace,
+        security,
         sql,
         raw_path,
     } = command;
@@ -14406,6 +15228,10 @@ pub fn create_view(
             creation_path,
             dependencies,
         },
+        match security {
+            super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
+            super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+        },
         or_replace,
         txn.txid,
     ) {
@@ -14419,6 +15245,7 @@ pub fn create_view(
                     name: name.name,
                     sql,
                     path: raw_path,
+                    security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
                 },
             ) {
@@ -15332,8 +16159,19 @@ pub fn drop_materialized_view(
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
         };
+        let policy_root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Table,
+            slot: idx,
+        };
         let has_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected);
+            || dependent_matviews.iter().any(|selected| *selected)
+            || policy_dependents_exist(
+                storage,
+                txn.txid,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+            );
         if has_dependents && !cascade {
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -15341,16 +16179,26 @@ pub fn drop_materialized_view(
                 def.name.as_str()
             ));
         }
-        if cascade
-            && let Err(error) = drop_selected_stored_queries(
+        if cascade {
+            if let Err(error) = drop_policy_dependents(
+                storage,
+                wal,
+                txn,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = drop_selected_stored_queries(
                 storage,
                 wal,
                 txn,
                 &dependent_views,
                 &dependent_matviews,
-            )
-        {
-            return sql_fail(error);
+            ) {
+                return sql_fail(error);
+            }
         }
         // Drop the backing table.
         let lsn = storage.bump_lsn();
@@ -15821,8 +16669,19 @@ pub fn drop_sequence(
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
         };
+        let policy_root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Sequence,
+            slot,
+        };
         let has_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected);
+            || dependent_matviews.iter().any(|selected| *selected)
+            || policy_dependents_exist(
+                storage,
+                txn.txid,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+            );
         if has_dependents && !cascade {
             if let Err(error) = report_stored_query_dependents(
                 storage,
@@ -15838,6 +16697,7 @@ pub fn drop_sequence(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    policy_root: Some(policy_root),
                 },
                 false,
                 responder,
@@ -15865,9 +16725,20 @@ pub fn drop_sequence(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    policy_root: Some(policy_root),
                 },
                 true,
                 responder,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = drop_policy_dependents(
+                storage,
+                wal,
+                txn,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
             ) {
                 return sql_fail(error);
             }
@@ -16446,9 +17317,17 @@ fn cascade_drop_type_column(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
-    let mut actions = [AlterAction::DropColumn(""); MAX_COLUMNS];
+    let mut actions = [AlterAction::DropColumn {
+        name: "",
+        if_exists: false,
+        cascade: true,
+    }; MAX_COLUMNS];
     for (index, column) in column_names.iter().enumerate() {
-        actions[index] = AlterAction::DropColumn(column.as_str());
+        actions[index] = AlterAction::DropColumn {
+            name: column.as_str(),
+            if_exists: false,
+            cascade: true,
+        };
     }
     let statement = AlterTable {
         table: QualName {
@@ -17378,6 +18257,10 @@ fn drop_composite_type(
             dependency.class == crate::storage::DependencyClass::Composite
                 && dependency.slot as usize == slot
         })?;
+    let policy_root = PolicyDependencySelection::Catalog {
+        class: crate::storage::DependencyClass::Composite,
+        slot,
+    };
     // Report the complete direct dependency set in one PostgreSQL diagnostic.
     // Its DETAIL carries the individual objects, so clients never receive a
     // partial dependency explanation.
@@ -17394,7 +18277,13 @@ fn drop_composite_type(
         },
         cascade,
         responder,
-    )?;
+    )? || policy_dependents_exist(
+        storage,
+        txn.txid,
+        policy_root,
+        &dependent_views,
+        &dependent_matviews,
+    );
     if has_dependents && !cascade {
         return Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -17487,6 +18376,14 @@ fn drop_composite_type(
     }
 
     if cascade {
+        drop_policy_dependents(
+            storage,
+            wal,
+            txn,
+            policy_root,
+            &dependent_views,
+            &dependent_matviews,
+        )?;
         drop_selected_stored_queries(storage, wal, txn, &dependent_views, &dependent_matviews)?;
         drop_domain_selection(
             storage,
@@ -17802,7 +18699,24 @@ fn apply_type_drop_to_stored_queries(
         _ => false,
     };
     let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, root)?;
-    if !views.iter().any(|selected| *selected) && !matviews.iter().any(|selected| *selected) {
+    let has_policies = storage
+        .policies_with_slots_visible_to(txn.txid)
+        .any(|(_, policy)| {
+            policy_depends_on_type_selection(
+                storage,
+                txn.txid,
+                policy,
+                selected_domains,
+                selected_enum,
+                selected_composite,
+                &views,
+                &matviews,
+            )
+        });
+    if !views.iter().any(|selected| *selected)
+        && !matviews.iter().any(|selected| *selected)
+        && !has_policies
+    {
         return Ok(());
     }
     if !cascade {
@@ -17811,7 +18725,52 @@ fn apply_type_drop_to_stored_queries(
             "cannot drop type because a stored query depends on it"
         ));
     }
+    for slot in 0..storage.policy_count() {
+        let selected = {
+            let policy = storage.policy(slot);
+            policy.visible_to(txn.txid)
+                && policy_depends_on_type_selection(
+                    storage,
+                    txn.txid,
+                    policy,
+                    selected_domains,
+                    selected_enum,
+                    selected_composite,
+                    &views,
+                    &matviews,
+                )
+        };
+        if selected {
+            drop_policy_slot(storage, wal, txn, slot)?;
+        }
+    }
     drop_selected_stored_queries(storage, wal, txn, &views, &matviews)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn policy_depends_on_type_selection(
+    storage: &Storage,
+    txid: u32,
+    policy: &crate::storage::PolicyDef,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    selected_composite: Option<usize>,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> bool {
+    let dependencies = &policy.definition_for(txid).dependencies;
+    dependencies.entries().iter().any(|dependency| {
+        use crate::storage::DependencyClass;
+        match dependency.class {
+            DependencyClass::Domain => selected_domains
+                .get(usize::from(dependency.slot))
+                .copied()
+                .unwrap_or(false),
+            DependencyClass::Enum => selected_enum == Some(usize::from(dependency.slot)),
+            DependencyClass::Composite => selected_composite == Some(usize::from(dependency.slot)),
+            _ => false,
+        }
+    }) || policy_depends_on_selected_stored_query(storage, txid, dependencies, views, matviews)
 }
 
 const MAX_DEPENDENT_STORED_QUERIES: usize = 64;
@@ -17905,6 +18864,225 @@ fn stored_query_dependent_closure(
     Ok((views, matviews))
 }
 
+fn dependency_references_table_column(
+    dependency: &crate::storage::StoredQueryDependency,
+    table: usize,
+    column: usize,
+) -> bool {
+    dependency.class == crate::storage::DependencyClass::Table
+        && usize::from(dependency.slot) == table
+        && dependency.referenced_columns & (1u64 << column) != 0
+}
+
+fn policy_depends_on_selected_stored_query(
+    storage: &Storage,
+    txid: u32,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> bool {
+    dependencies
+        .entries()
+        .iter()
+        .any(|dependency| match dependency.class {
+            crate::storage::DependencyClass::View => views
+                .get(usize::from(dependency.slot))
+                .copied()
+                .unwrap_or(false),
+            crate::storage::DependencyClass::Table => matviews
+                .iter()
+                .enumerate()
+                .take(storage.matview_count())
+                .any(|(slot, selected)| {
+                    *selected
+                        && storage.matview(slot).visible_to(txid)
+                        && storage.find_visible(
+                            storage.matview(slot).schema.as_str(),
+                            storage.matview(slot).name.as_str(),
+                            txid,
+                        ) == Some(usize::from(dependency.slot))
+                }),
+            _ => false,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn policy_depends_on_owned_selection(
+    storage: &Storage,
+    txid: u32,
+    policy: &crate::storage::PolicyDef,
+    tables: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    sequences: &[bool; crate::storage::MAX_SEQUENCES],
+    domains: &[bool; crate::storage::MAX_DOMAINS],
+    enums: &[bool; crate::storage::MAX_ENUMS],
+    composites: &[bool; crate::storage::MAX_COMPOSITES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> bool {
+    if tables
+        .get(usize::from(policy.table))
+        .copied()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    policy
+        .definition_for(txid)
+        .dependencies
+        .entries()
+        .iter()
+        .any(|dependency| {
+            let slot = usize::from(dependency.slot);
+            match dependency.class {
+                crate::storage::DependencyClass::Table => tables.get(slot),
+                crate::storage::DependencyClass::View => views.get(slot),
+                crate::storage::DependencyClass::Sequence => sequences.get(slot),
+                crate::storage::DependencyClass::Domain => domains.get(slot),
+                crate::storage::DependencyClass::Enum => enums.get(slot),
+                crate::storage::DependencyClass::Composite => composites.get(slot),
+                crate::storage::DependencyClass::Routine => routines.get(slot),
+            }
+            .copied()
+            .unwrap_or(false)
+        })
+        || policy_depends_on_selected_stored_query(
+            storage,
+            txid,
+            &policy.definition_for(txid).dependencies,
+            dependent_views,
+            dependent_matviews,
+        )
+}
+
+fn policy_depends_on_dependency_drop(
+    storage: &Storage,
+    txid: u32,
+    policy: &crate::storage::PolicyDef,
+    root: PolicyDependencySelection,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> bool {
+    if matches!(
+        root,
+        PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Table,
+            slot
+        } if usize::from(policy.table) == slot
+    ) {
+        return false;
+    }
+    let dependencies = &policy.definition_for(txid).dependencies;
+    dependencies.entries().iter().any(|dependency| match root {
+        PolicyDependencySelection::Catalog { class, slot } => {
+            dependency.class == class && usize::from(dependency.slot) == slot
+        }
+        PolicyDependencySelection::TableColumn { table, column } => {
+            dependency_references_table_column(dependency, table, column)
+        }
+    }) || policy_depends_on_selected_stored_query(storage, txid, dependencies, views, matviews)
+}
+
+fn policy_dependents_exist(
+    storage: &Storage,
+    txid: u32,
+    root: PolicyDependencySelection,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> bool {
+    storage
+        .policies_with_slots_visible_to(txid)
+        .any(|(_, policy)| {
+            policy_depends_on_dependency_drop(storage, txid, policy, root, views, matviews)
+        })
+}
+
+fn drop_policy_dependents(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    root: PolicyDependencySelection,
+    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+) -> Result<(), SqlError> {
+    for slot in 0..storage.policy_count() {
+        let selected = {
+            let policy = storage.policy(slot);
+            policy.visible_to(txn.txid)
+                && policy_depends_on_dependency_drop(
+                    storage, txn.txid, policy, root, views, matviews,
+                )
+        };
+        if selected {
+            drop_policy_slot(storage, wal, txn, slot)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_column_drop_dependencies(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    column: usize,
+    column_name: SqlName,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        dependency_references_table_column(dependency, table, column)
+    })?;
+    let has_stored_dependents =
+        views.iter().any(|selected| *selected) || matviews.iter().any(|selected| *selected);
+    let policy_root = PolicyDependencySelection::TableColumn { table, column };
+    let has_policy_dependents =
+        policy_dependents_exist(storage, txn.txid, policy_root, &views, &matviews);
+    if !has_stored_dependents && !has_policy_dependents {
+        return Ok(());
+    }
+
+    let table_definition = *storage.table_def(table, txn.txid);
+    let mut suffix = crate::util::StackStr::<192>::new();
+    use core::fmt::Write as _;
+    let _ = write!(suffix, " column {}", column_name.as_str());
+    report_stored_query_dependents(
+        storage,
+        txn.txid,
+        StoredQueryRoot {
+            class: crate::storage::DependencyClass::Table,
+            slot: table,
+            kind: "table",
+            schema: table_definition.schema,
+            name: table_definition.name,
+            suffix,
+        },
+        StoredQuerySelection {
+            views: &views,
+            matviews: &matviews,
+            policy_root: Some(policy_root),
+        },
+        cascade,
+        responder,
+    )?;
+    if !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop column {} of table {} because other objects depend on it",
+            column_name.as_str(),
+            table_definition.name.as_str()
+        ));
+    }
+
+    // Policies have no dependents of their own. Drop them before the stored
+    // queries they reference so no transaction-visible definition can point
+    // at an object already marked for deletion.
+    drop_policy_dependents(storage, wal, txn, policy_root, &views, &matviews)?;
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)
+}
+
 #[derive(Clone, Copy)]
 struct StoredQueryRoot {
     class: crate::storage::DependencyClass,
@@ -17976,6 +19154,19 @@ fn routine_dependency_suffix(
 struct StoredQuerySelection<'a> {
     views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    policy_root: Option<PolicyDependencySelection>,
+}
+
+#[derive(Clone, Copy)]
+enum PolicyDependencySelection {
+    Catalog {
+        class: crate::storage::DependencyClass,
+        slot: usize,
+    },
+    TableColumn {
+        table: usize,
+        column: usize,
+    },
 }
 
 fn report_stored_query_dependents(
@@ -17991,8 +19182,17 @@ fn report_stored_query_dependents(
 
     let views = selection.views;
     let matviews = selection.matviews;
+    let policy_selected = |policy: &crate::storage::PolicyDef| {
+        selection.policy_root.is_some_and(|root| {
+            policy_depends_on_dependency_drop(storage, txid, policy, root, views, matviews)
+        })
+    };
     let count = views.iter().filter(|selected| **selected).count()
-        + matviews.iter().filter(|selected| **selected).count();
+        + matviews.iter().filter(|selected| **selected).count()
+        + storage
+            .policies_with_slots_visible_to(txid)
+            .filter(|(_, policy)| policy_selected(policy))
+            .count();
     if count == 0 {
         return Ok(());
     }
@@ -18103,6 +19303,46 @@ fn report_stored_query_dependents(
     let mut detail =
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut written = 0usize;
+    for (_, policy) in storage
+        .policies_with_slots_visible_to(txid)
+        .filter(|(_, policy)| policy_selected(policy))
+    {
+        let table = storage.table_def(usize::from(policy.table), txid);
+        let _ = write!(
+            detail,
+            "{}{}policy {} on table {}",
+            if written == 0 { "" } else { "\n" },
+            if cascade { "drop cascades to " } else { "" },
+            policy.name.as_str(),
+            table.name.as_str()
+        );
+        if !cascade {
+            if let Some(PolicyDependencySelection::TableColumn { table, column }) =
+                selection.policy_root
+            {
+                let column = storage.table_def(table, txid).columns()[column];
+                let _ = write!(
+                    detail,
+                    " depends on column {} of table ",
+                    column.name.as_str()
+                );
+            } else {
+                let _ = write!(detail, " depends on {} ", root.kind);
+            }
+            if in_path(root.schema.as_str()) {
+                let _ = write!(detail, "{}", root.name.as_str());
+            } else {
+                let _ = write!(detail, "{}.{}", root.schema.as_str(), root.name.as_str());
+            }
+            if !matches!(
+                selection.policy_root,
+                Some(PolicyDependencySelection::TableColumn { .. })
+            ) {
+                let _ = write!(detail, "{}", root.suffix.as_str());
+            }
+        }
+        written += 1;
+    }
     for depth in 1..=MAX_DEPENDENT_STORED_QUERIES as u8 {
         for slot in 0..storage.view_count() {
             if views[slot] && view_depth[slot] == depth {
@@ -18118,9 +19358,21 @@ fn report_stored_query_dependents(
                 if !cascade {
                     let mut parent = crate::util::StackStr::<192>::new();
                     if depth == 1 {
-                        let _ = write!(parent, "{} ", root.kind);
+                        if let Some(PolicyDependencySelection::TableColumn { table, column }) =
+                            selection.policy_root
+                        {
+                            let column = storage.table_def(table, txid).columns()[column];
+                            let _ = write!(parent, "column {} of table ", column.name.as_str());
+                        } else {
+                            let _ = write!(parent, "{} ", root.kind);
+                        }
                         write_name(&mut parent, &root.schema, &root.name);
-                        let _ = write!(parent, "{}", root.suffix.as_str());
+                        if !matches!(
+                            selection.policy_root,
+                            Some(PolicyDependencySelection::TableColumn { .. })
+                        ) {
+                            let _ = write!(parent, "{}", root.suffix.as_str());
+                        }
                     } else {
                         for dependency in storage.view_dependencies(slot).entries() {
                             if dependency.class == DependencyClass::View
@@ -18172,9 +19424,21 @@ fn report_stored_query_dependents(
                 if !cascade {
                     let mut parent = crate::util::StackStr::<192>::new();
                     if depth == 1 {
-                        let _ = write!(parent, "{} ", root.kind);
+                        if let Some(PolicyDependencySelection::TableColumn { table, column }) =
+                            selection.policy_root
+                        {
+                            let column = storage.table_def(table, txid).columns()[column];
+                            let _ = write!(parent, "column {} of table ", column.name.as_str());
+                        } else {
+                            let _ = write!(parent, "{} ", root.kind);
+                        }
                         write_name(&mut parent, &root.schema, &root.name);
-                        let _ = write!(parent, "{}", root.suffix.as_str());
+                        if !matches!(
+                            selection.policy_root,
+                            Some(PolicyDependencySelection::TableColumn { .. })
+                        ) {
+                            let _ = write!(parent, "{}", root.suffix.as_str());
+                        }
                     } else if let Some(dependency) = storage
                         .matview_dependencies(slot)
                         .entries()
@@ -19031,6 +20295,85 @@ fn rewrite_table_owned_column_references(
     Ok(())
 }
 
+fn rewrite_table_policy_column_references(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    original: &TableDef,
+    renames: &[(SqlName, SqlName)],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    for slot in 0..storage.policy_count() {
+        let policy = *storage.policy(slot);
+        if !policy.visible_to(txn.txid) || usize::from(policy.table) != table {
+            continue;
+        }
+        let mut definition = policy.definition_for(txn.txid);
+        let mut shape = *original;
+        for &(from, to) in renames {
+            let Some(column) = shape.column_index(from.as_str()) else {
+                continue;
+            };
+            let mut renamed = shape;
+            renamed.columns[column].name = to;
+            let rename = CompositeFieldRename { from, to };
+            definition.using = definition
+                .using
+                .map(|source| {
+                    rewrite_table_column_reference(source.as_str(), &shape, &renamed, rename, arena)
+                })
+                .transpose()?;
+            definition.with_check = definition
+                .with_check
+                .map(|source| {
+                    rewrite_table_column_reference(source.as_str(), &shape, &renamed, rename, arena)
+                })
+                .transpose()?;
+            shape = renamed;
+        }
+        validate_policy_definition(storage, table, &mut definition, txn.txid, arena)?;
+        let prior = storage.alter_policy(slot, definition, txn.txid)?;
+        let table_definition = storage.table_def(table, txn.txid);
+        let table_schema = table_definition.schema;
+        let table_name = table_definition.name;
+        let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetPolicy {
+                schema: table_schema.as_str(),
+                table: table_name.as_str(),
+                name: policy.name.as_str(),
+                command: policy.command.code(),
+                permissive: policy.permissive,
+                roles: wal_roles,
+                role_count: definition.roles.entries().len(),
+                using: definition.using.as_ref().map(|source| source.as_str()),
+                with_check: definition.with_check.as_ref().map(|source| source.as_str()),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    &definition.dependencies,
+                ),
+            },
+        ) {
+            storage.rollback_policy_alter(slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_policy_alter(slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_table_column_reference<const N: usize>(
     text: &str,
     current: &TableDef,
@@ -19356,6 +20699,7 @@ fn rewrite_composite_dependent_views(
                 creation_path: view.creation_path,
                 dependencies,
             },
+            view.security,
             true,
             txn.txid,
         )?;
@@ -19368,6 +20712,7 @@ fn rewrite_composite_dependent_views(
                 name: view.name.as_str(),
                 sql: rewritten.as_str(),
                 path: view.creation_path.as_str(),
+                security_invoker: matches!(view.security, crate::storage::ViewSecurity::Invoker),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
             },
         ) {
@@ -20289,8 +21634,19 @@ pub fn drop_view(
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
             };
+            let policy_root = PolicyDependencySelection::Catalog {
+                class: crate::storage::DependencyClass::View,
+                slot,
+            };
             let has_dependents = dependent_views.iter().any(|selected| *selected)
-                || dependent_matviews.iter().any(|selected| *selected);
+                || dependent_matviews.iter().any(|selected| *selected)
+                || policy_dependents_exist(
+                    storage,
+                    txn.txid,
+                    policy_root,
+                    &dependent_views,
+                    &dependent_matviews,
+                );
             let has_triggers = storage.triggers_for_view(slot, txn.txid).next().is_some();
             if (has_dependents || has_triggers) && !cascade {
                 return sql_fail(sql_err!(
@@ -20299,16 +21655,26 @@ pub fn drop_view(
                     view_name.as_str()
                 ));
             }
-            if cascade
-                && let Err(error) = drop_selected_stored_queries(
+            if cascade {
+                if let Err(error) = drop_policy_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    policy_root,
+                    &dependent_views,
+                    &dependent_matviews,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = drop_selected_stored_queries(
                     storage,
                     wal,
                     txn,
                     &dependent_views,
                     &dependent_matviews,
-                )
-            {
-                return sql_fail(error);
+                ) {
+                    return sql_fail(error);
+                }
             }
             if cascade && let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
                 return sql_fail(error);
@@ -20921,6 +22287,9 @@ pub struct CopySetup {
     pub reject_limit: Option<u64>,
     pub log_verbosity: crate::sql::ast::CopyLogVerbosity,
     filter: CopyFilter,
+    /// SQL COPY is authorized as the role fixed when the statement begins.
+    /// Subscription apply is a replication operation and has no SQL role.
+    security_role: Option<u16>,
 }
 
 /// COPY FROM either admits every decoded candidate or evaluates the one
@@ -21299,6 +22668,12 @@ pub fn copy_begin(
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
     let table_index = resolve_dml_table(storage, &statement.table, txid)?;
+    let security_role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
     require_table_privilege(
         storage,
         table_index,
@@ -21391,6 +22766,12 @@ pub fn copy_begin(
         reject_limit: opts.reject_limit,
         log_verbosity: opts.log_verbosity,
         filter,
+        security_role: Some(u16::try_from(security_role).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "role catalog exceeds COPY capacity"
+            )
+        })?),
     })
 }
 
@@ -21475,6 +22856,7 @@ pub(crate) fn subscription_copy_setup(
             mode: CopyFilterMode::All,
             source: StackStr::new(),
         },
+        security_role: None,
     })
 }
 
@@ -21488,6 +22870,17 @@ pub fn copy_statement_begin(
     scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
     let definition = *storage.table_def(setup.table_index, txn.txid);
+    if let Some(role) = setup.security_role {
+        let _ = super::query::plan_row_security(
+            storage,
+            setup.table_index,
+            usize::from(role),
+            PolicyCommandKind::Insert,
+            super::query::RowSecurityExpression::WithCheck,
+            txn.txid,
+            arena,
+        )?;
+    }
     fire_statement_triggers(
         TriggerExecContext {
             storage,
@@ -21749,6 +23142,7 @@ pub fn copy_row(
         scratch,
         inserted,
         setup.table_index,
+        setup.security_role,
         &def,
         &checks,
         &generated_exprs,
@@ -21858,6 +23252,7 @@ pub fn copy_row_binary(
         scratch,
         inserted,
         setup.table_index,
+        setup.security_role,
         &def,
         &checks,
         &generated_exprs,
@@ -21878,6 +23273,7 @@ fn finish_copy_row<'a>(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
     logical_table: usize,
+    security_role: Option<u16>,
     definition: &TableDef,
     checks: &ParsedChecks<'a>,
     generated: &constraints::ParsedDefaults<'a>,
@@ -21934,6 +23330,37 @@ fn finish_copy_row<'a>(
     compute_generated(definition, generated, values, storage, txn.txid, arena)?;
     let target =
         storage.partition_target(logical_table, &values[..definition.n_columns], txn.txid)?;
+    if let Some(role) = security_role
+        && let Some(plan) = super::query::plan_row_security(
+            storage,
+            logical_table,
+            usize::from(role),
+            PolicyCommandKind::Insert,
+            super::query::RowSecurityExpression::WithCheck,
+            txn.txid,
+            arena,
+        )?
+    {
+        let row = RowCtx {
+            def: definition,
+            values: &values[..definition.n_columns],
+            alias: None,
+        };
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        if !super::query::row_security_passes(plan, &row, storage, txn.txid, arena, &[], &hooks)? {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "new row violates row-level security policy for table \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+    }
     check_not_null(definition, values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -23539,6 +24966,21 @@ pub fn copy_out(
     responder: &mut Responder,
 ) -> Result<u64, SqlError> {
     let def = *storage.table_def(setup.table_index, txid);
+    let security = setup
+        .security_role
+        .map(|role| {
+            super::query::plan_row_security(
+                storage,
+                setup.table_index,
+                usize::from(role),
+                PolicyCommandKind::Select,
+                super::query::RowSecurityExpression::Using,
+                txid,
+                arena,
+            )
+        })
+        .transpose()?
+        .flatten();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let fmt = &setup.fmt;
@@ -23625,9 +25067,34 @@ pub fn copy_out(
     tokens.sort_unstable_by_key(|(_, rowid, _)| *rowid);
     let mut count = 0u64;
     for &(leaf, rowid, home) in tokens.iter() {
+        let mut emitted = false;
         storage.with_row_bytes(leaf, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
+            if let Some(plan) = security {
+                let row = RowCtx {
+                    def: &def,
+                    values: &values[..def.n_columns],
+                    alias: None,
+                };
+                let catalog = super::query::storage_catalog(storage, arena, txid);
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    ..NO_HOOKS
+                };
+                if !super::query::row_security_passes(
+                    plan,
+                    &row,
+                    storage,
+                    txid,
+                    arena,
+                    &[],
+                    &hooks,
+                )? {
+                    return Ok(());
+                }
+            }
+            emitted = true;
             if fmt.binary {
                 // Each field is its value's binary form (int32 length + bytes,
                 // or -1 for NULL). Ranges and multiranges are pre-parsed into
@@ -23707,7 +25174,7 @@ pub fn copy_out(
                 .map_err(wire_to_sql)?;
             Ok(())
         })?;
-        count += 1;
+        count += u64::from(emitted);
     }
     if fmt.binary {
         responder.copy_binary_trailer().map_err(wire_to_sql)?;
@@ -24428,7 +25895,16 @@ pub fn merge(
         Err(e) => return sql_fail(e),
     };
     let mut required = crate::storage::PrivilegeSet::NONE;
+    let mut has_insert = false;
+    let mut has_update = false;
+    let mut has_delete = false;
     for clause in statement.whens {
+        match clause.action {
+            MergeAction::Insert { .. } => has_insert = true,
+            MergeAction::Update(_) => has_update = true,
+            MergeAction::Delete => has_delete = true,
+            MergeAction::DoNothing => {}
+        }
         required = required.union(match clause.action {
             MergeAction::Insert { .. } => crate::storage::PrivilegeSet::INSERT,
             MergeAction::Update(_) => crate::storage::PrivilegeSet::UPDATE,
@@ -24448,6 +25924,161 @@ pub fn merge(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    let target_alias = statement.target_alias.or(Some(statement.target.name));
+    let reads_target = match (|| -> Result<bool, SqlError> {
+        if expression_reads_dml_target(statement.on, &def, target_alias, storage, txn.txid, arena)?
+        {
+            return Ok(true);
+        }
+        for when in statement.whens {
+            if let Some(expression) = when.cond
+                && expression_reads_dml_target(
+                    expression,
+                    &def,
+                    target_alias,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?
+            {
+                return Ok(true);
+            }
+            match when.action {
+                MergeAction::Update(assignments) => {
+                    for (_, expression) in assignments {
+                        if expression_reads_dml_target(
+                            expression,
+                            &def,
+                            target_alias,
+                            storage,
+                            txn.txid,
+                            arena,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                MergeAction::Insert { values, .. } => {
+                    for expression in values {
+                        if expression_reads_dml_target(
+                            expression,
+                            &def,
+                            target_alias,
+                            storage,
+                            txn.txid,
+                            arena,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                MergeAction::Delete | MergeAction::DoNothing => {}
+            }
+        }
+        Ok(false)
+    })() {
+        Ok(reads) => reads,
+        Err(error) => return sql_fail(error),
+    };
+    if reads_target
+        && let Err(error) = require_table_privilege(
+            storage,
+            table_index,
+            crate::storage::PrivilegeSet::SELECT,
+            txn.txid,
+        )
+    {
+        return sql_fail(error);
+    }
+    let current_role = match storage.current_role_slot(txn.txid) {
+        Some(role) => role,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
+    };
+    let select_security = if reads_target {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Select,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let update_security = if has_update {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Update,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let update_check = if has_update {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Update,
+            super::query::RowSecurityExpression::WithCheck,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let delete_security = if has_delete {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Delete,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let insert_check = if has_insert {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Insert,
+            super::query::RowSecurityExpression::WithCheck,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     let mut merge_update_columns = 0u64;
     for when in statement.whens {
         if let MergeAction::Update(assignments) = when.action {
@@ -24724,8 +26355,11 @@ pub fn merge(
                 return sql_fail(e);
             }
         }
+        let mut accepted = 0usize;
         for j in 0..k {
-            let fetched = match storage.row_bytes(tables[j], ids[j], hms[j], arena) {
+            let row_table = tables[j];
+            let row_id = ids[j];
+            let fetched = match storage.row_bytes(row_table, row_id, hms[j], arena) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -24739,12 +26373,37 @@ pub fn merge(
             if let Err(e) = rowenc::decode(bytes, target_schema, &mut vals) {
                 return sql_fail(e);
             }
+            if let Some(plan) = select_security {
+                let context = RowCtx {
+                    def: &def,
+                    values: &vals[..def.n_columns],
+                    alias: None,
+                };
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..NO_HOOKS
+                };
+                match super::query::row_security_passes(
+                    plan, &context, storage, txn.txid, arena, params, &hooks,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => return sql_fail(error),
+                }
+            }
             let owned = match arena.alloc_slice_copy(&vals[..def.n_columns]) {
                 Ok(v) => &*v,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
-            target_vals[j] = owned;
+            ids[accepted] = row_id;
+            tables[accepted] = row_table;
+            target_vals[accepted] = owned;
+            accepted += 1;
         }
+        n_target = accepted;
     }
     // A matched target row can be acted on at most once by MERGE's cardinality
     // rule, so target cardinality is the exact bounded capture capacity for
@@ -24817,6 +26476,39 @@ pub fn merge(
             matched = true;
             // First satisfied WHEN MATCHED clause.
             for when in statement.whens.iter().filter(|w| w.matched) {
+                let action_security = match when.action {
+                    MergeAction::Update(_) => update_security,
+                    MergeAction::Delete => delete_security,
+                    MergeAction::DoNothing | MergeAction::Insert { .. } => None,
+                };
+                if let Some(plan) = action_security {
+                    let policy_row = RowCtx {
+                        def: &def,
+                        values: target_vals[j],
+                        alias: None,
+                    };
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
+                    match super::query::row_security_passes(
+                        plan,
+                        &policy_row,
+                        storage,
+                        txn.txid,
+                        arena,
+                        params,
+                        &hooks,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 if let Some(cond) = when.cond {
                     match eval(cond, arena, params, &lookup) {
                         Ok(Datum::Bool(true)) => {}
@@ -24954,6 +26646,40 @@ pub fn merge(
                             arena,
                         ) {
                             return sql_fail(e);
+                        }
+                        if let Some(plan) = update_check {
+                            let policy_row = RowCtx {
+                                def: &def,
+                                values: &new_values[..def.n_columns],
+                                alias: None,
+                            };
+                            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                            let sequences =
+                                crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                            let hooks = EvalHooks {
+                                catalog: Some(&catalog),
+                                sequences: Some(&sequences),
+                                ..NO_HOOKS
+                            };
+                            match super::query::row_security_passes(
+                                plan,
+                                &policy_row,
+                                storage,
+                                txn.txid,
+                                arena,
+                                params,
+                                &hooks,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                                        "new row violates row-level security policy for table \"{}\"",
+                                        def.name.as_str()
+                                    ));
+                                }
+                                Err(error) => return sql_fail(error),
+                            }
                         }
                         if let Err(e) = check_not_null(&def, &new_values) {
                             return sql_fail(e);
@@ -25138,6 +26864,7 @@ pub fn merge(
                             arena,
                             params,
                             &checks,
+                            insert_check,
                             responder,
                             scratch,
                             insert_transitions.as_mut(),
@@ -25231,6 +26958,7 @@ fn merge_insert<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     checks: &ParsedChecks,
+    row_security_check: Option<super::query::RowSecurityPlan<'a>>,
     responder: &mut Responder,
     scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
@@ -25364,6 +27092,35 @@ fn merge_insert<'a>(
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     let target_table =
         storage.partition_target(table_index, &row_arr[..def.n_columns], txn.txid)?;
+    if let Some(plan) = row_security_check {
+        let policy_row = RowCtx {
+            def,
+            values: &row_arr[..def.n_columns],
+            alias: None,
+        };
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        if !super::query::row_security_passes(
+            plan,
+            &policy_row,
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &hooks,
+        )? {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "new row violates row-level security policy for table \"{}\"",
+                def.name.as_str()
+            ));
+        }
+    }
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -25414,6 +27171,9 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
     statement: &Insert<'a>,
     arbiter: &Arbiter,
     checks: &ParsedChecks<'a>,
+    insert_check: Option<super::query::RowSecurityPlan<'a>>,
+    conflict_using: Option<super::query::RowSecurityPlan<'a>>,
+    conflict_check: Option<super::query::RowSecurityPlan<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -25492,6 +27252,33 @@ where
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
         return Ok(Err(error));
     }
+    if let Some(plan) = insert_check {
+        let context = RowCtx {
+            def: definition,
+            values: &values[..definition.n_columns],
+            alias: None,
+        };
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        match super::query::row_security_passes(
+            plan, &context, storage, txn.txid, arena, params, &hooks,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "new row violates row-level security policy for table \"{}\"",
+                    definition.name.as_str()
+                )));
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+    }
     if let Err(error) = check_not_null(definition, values) {
         return Ok(Err(error));
     }
@@ -25507,6 +27294,8 @@ where
         &statement.on_conflict,
         arbiter,
         checks,
+        conflict_using,
+        conflict_check,
         arena,
         params,
         seq_session,
@@ -25983,13 +27772,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                 } else {
                     if let Some(predicate) = update.where_clause {
                         match row_matches_values(
+                            storage,
+                            txn.txid,
                             &def,
                             update.alias,
                             &old[..def.n_columns],
-                            predicate,
+                            Some(predicate),
                             arena,
                             params,
                             &NO_HOOKS,
+                            None,
                             None,
                         ) {
                             Ok(true) => {}
@@ -26098,13 +27890,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                     }
                 } else if let Some(predicate) = delete.where_clause {
                     match row_matches_values(
+                        storage,
+                        txn.txid,
                         &def,
                         delete.alias,
                         &old[..def.n_columns],
-                        predicate,
+                        Some(predicate),
                         arena,
                         params,
                         &NO_HOOKS,
+                        None,
                         None,
                     ) {
                         Ok(matched) => matched,
@@ -26394,6 +28189,79 @@ where
         }
         None => None,
     };
+    if conflict_update_columns.is_some() {
+        let privileges =
+            crate::storage::PrivilegeSet::UPDATE.union(crate::storage::PrivilegeSet::SELECT);
+        if let Err(error) = require_table_privilege(storage, table_index, privileges, txn.txid) {
+            return sql_fail(error);
+        }
+    }
+    let current_role = match storage.current_role_slot(txn.txid) {
+        Some(role) => role,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
+    };
+    let insert_check = match super::query::plan_row_security(
+        storage,
+        table_index,
+        current_role,
+        crate::storage::PolicyCommandKind::Insert,
+        super::query::RowSecurityExpression::WithCheck,
+        txn.txid,
+        arena,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let conflict_using = if conflict_update_columns.is_some() {
+        let update = match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Update,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
+        let select = match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Select,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
+        super::query::conjoin_row_security(update, select)
+    } else {
+        None
+    };
+    let conflict_check = if conflict_update_columns.is_some() {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Update,
+            super::query::RowSecurityExpression::WithCheck,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     if let Err(error) = fire_statement_triggers(
         TriggerExecContext {
             storage,
@@ -26664,6 +28532,9 @@ where
                 statement,
                 &arbiter,
                 &checks,
+                insert_check,
+                conflict_using,
+                conflict_check,
                 arena,
                 params,
                 seq_session,
@@ -26889,6 +28760,9 @@ where
             statement,
             &arbiter,
             &checks,
+            insert_check,
+            conflict_using,
+            conflict_check,
             arena,
             params,
             seq_session,
@@ -27114,6 +28988,75 @@ fn emit_projected(
     Ok(Ok(()))
 }
 
+fn expression_reads_dml_target(
+    expression: &Expr,
+    definition: &TableDef,
+    alias: Option<&str>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    let target_name = alias.unwrap_or(definition.name.as_str());
+    fn directly_reads(
+        expression: &Expr,
+        definition: &TableDef,
+        target_name: &str,
+    ) -> Result<bool, SqlError> {
+        let reads = match expression {
+            Expr::Column { qualifier, name }
+            | Expr::RoutineParam {
+                qualifier, name, ..
+            } => {
+                definition.column_index(name).is_some()
+                    && qualifier.is_none_or(|qualifier| qualifier == target_name)
+            }
+            Expr::WholeRow(qualifier) => *qualifier == target_name,
+            Expr::SchemaColumn { schema, table, .. } => {
+                *schema == definition.schema.as_str() && *table == definition.name.as_str()
+            }
+            _ => false,
+        };
+        if reads {
+            return Ok(true);
+        }
+        let mut child_reads = false;
+        super::query::walk_children(expression, &mut |child| {
+            child_reads |= directly_reads(child, definition, target_name)?;
+            Ok(())
+        })?;
+        Ok(child_reads)
+    }
+    if directly_reads(expression, definition, target_name)? {
+        return Ok(true);
+    }
+    super::query::expression_has_correlated_subquery(expression, storage, txid, arena)
+}
+
+fn returning_reads_dml_target(
+    returning: &[SelectItem],
+    definition: &TableDef,
+    alias: Option<&str>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    for item in returning {
+        let reads = match item {
+            SelectItem::Wildcard => true,
+            SelectItem::TableWildcard(qualifier) => {
+                crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+            }
+            SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
+                expression_reads_dml_target(expression, definition, alias, storage, txid, arena)?
+            }
+        };
+        if reads {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn update<'a>(
     storage: &mut Storage,
@@ -27150,6 +29093,53 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    let reads_target = match (|| -> Result<bool, SqlError> {
+        if let Some(expression) = statement.where_clause
+            && expression_reads_dml_target(
+                expression,
+                &def,
+                statement.alias,
+                storage,
+                txn.txid,
+                arena,
+            )?
+        {
+            return Ok(true);
+        }
+        for (_, expression) in statement.assignments {
+            if expression_reads_dml_target(
+                expression,
+                &def,
+                statement.alias,
+                storage,
+                txn.txid,
+                arena,
+            )? {
+                return Ok(true);
+            }
+        }
+        returning_reads_dml_target(
+            statement.returning,
+            &def,
+            statement.alias,
+            storage,
+            txn.txid,
+            arena,
+        )
+    })() {
+        Ok(reads) => reads,
+        Err(error) => return sql_fail(error),
+    };
+    if reads_target
+        && let Err(error) = require_table_privilege(
+            storage,
+            table_index,
+            crate::storage::PrivilegeSet::SELECT,
+            txn.txid,
+        )
+    {
+        return sql_fail(error);
+    }
     let checks = match parse_checks(&def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -27211,8 +29201,18 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
 
+    let mut subquery_expressions = [None; MAX_COLUMNS + 1];
+    let mut subquery_expression_count = 0usize;
+    if let Some(expression) = statement.where_clause {
+        subquery_expressions[subquery_expression_count] = Some(expression);
+        subquery_expression_count += 1;
+    }
+    for (_, expression) in statement.assignments {
+        subquery_expressions[subquery_expression_count] = Some(*expression);
+        subquery_expression_count += 1;
+    }
     let subs = match super::query::subquery_hooks(
-        &[statement.where_clause],
+        &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
         arena,
@@ -27232,6 +29232,56 @@ pub(crate) fn update<'a>(
         project_sets: None,
         sequences: None,
     };
+    let current_role = match storage.current_role_slot(txn.txid) {
+        Some(role) => role,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
+    };
+    let update_security = match super::query::plan_row_security(
+        storage,
+        table_index,
+        current_role,
+        crate::storage::PolicyCommandKind::Update,
+        super::query::RowSecurityExpression::Using,
+        txn.txid,
+        arena,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let select_security = if reads_target {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Select,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let row_security = super::query::conjoin_row_security(update_security, select_security);
+    let row_security_check = match super::query::plan_row_security(
+        storage,
+        table_index,
+        current_role,
+        crate::storage::PolicyCommandKind::Update,
+        super::query::RowSecurityExpression::WithCheck,
+        txn.txid,
+        arena,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
     let collect = if let Some(from) = statement.from {
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
@@ -27245,6 +29295,8 @@ pub(crate) fn update<'a>(
                 arena,
                 params,
                 txn.txid,
+                &hooks,
+                row_security,
                 scratch,
                 outer,
             )
@@ -27260,6 +29312,8 @@ pub(crate) fn update<'a>(
                 arena,
                 params,
                 txn.txid,
+                &hooks,
+                row_security,
                 scratch,
             )
         }
@@ -27274,6 +29328,7 @@ pub(crate) fn update<'a>(
             arena,
             params,
             &hooks,
+            row_security,
             scratch,
             outer_lookup,
         )
@@ -27402,6 +29457,7 @@ pub(crate) fn update<'a>(
                 let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                 let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let hooks = super::eval::EvalHooks {
+                    subs: Some(&subs),
                     catalog: Some(&catalog),
                     sequences: Some(&sequences),
                     ..super::eval::NO_HOOKS
@@ -27463,6 +29519,7 @@ pub(crate) fn update<'a>(
                 let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                 let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let hooks = super::eval::EvalHooks {
+                    subs: Some(&subs),
                     catalog: Some(&catalog),
                     sequences: Some(&seq),
                     ..super::eval::NO_HOOKS
@@ -27550,6 +29607,40 @@ pub(crate) fn update<'a>(
                 compute_generated(&def, &generated_exprs, new_values, storage, txn.txid, arena)
             {
                 return sql_fail(e);
+            }
+            if let Some(plan) = row_security_check {
+                let context = RowCtx {
+                    def: &def,
+                    values: &new_values[..def.n_columns],
+                    alias: None,
+                };
+                let policy_catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let policy_sequences =
+                    crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let policy_hooks = EvalHooks {
+                    catalog: Some(&policy_catalog),
+                    sequences: Some(&policy_sequences),
+                    ..NO_HOOKS
+                };
+                match super::query::row_security_passes(
+                    plan,
+                    &context,
+                    storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    &policy_hooks,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::INSUFFICIENT_PRIVILEGE,
+                            "new row violates row-level security policy for table \"{}\"",
+                            def.name.as_str()
+                        ));
+                    }
+                    Err(error) => return sql_fail(error),
+                }
             }
             if let Err(e) = check_not_null(&def, new_values) {
                 return sql_fail(e);
@@ -27800,6 +29891,41 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    let reads_target = match (|| -> Result<bool, SqlError> {
+        if let Some(expression) = statement.where_clause
+            && expression_reads_dml_target(
+                expression,
+                &def,
+                statement.alias,
+                storage,
+                txn.txid,
+                arena,
+            )?
+        {
+            return Ok(true);
+        }
+        returning_reads_dml_target(
+            statement.returning,
+            &def,
+            statement.alias,
+            storage,
+            txn.txid,
+            arena,
+        )
+    })() {
+        Ok(reads) => reads,
+        Err(error) => return sql_fail(error),
+    };
+    if reads_target
+        && let Err(error) = require_table_privilege(
+            storage,
+            table_index,
+            crate::storage::PrivilegeSet::SELECT,
+            txn.txid,
+        )
+    {
+        return sql_fail(error);
+    }
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -27842,6 +29968,44 @@ pub(crate) fn delete<'a>(
         project_sets: None,
         sequences: None,
     };
+    let current_role = match storage.current_role_slot(txn.txid) {
+        Some(role) => role,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
+    };
+    let delete_security = match super::query::plan_row_security(
+        storage,
+        table_index,
+        current_role,
+        crate::storage::PolicyCommandKind::Delete,
+        super::query::RowSecurityExpression::Using,
+        txn.txid,
+        arena,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let select_security = if reads_target {
+        match super::query::plan_row_security(
+            storage,
+            table_index,
+            current_role,
+            crate::storage::PolicyCommandKind::Select,
+            super::query::RowSecurityExpression::Using,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let row_security = super::query::conjoin_row_security(delete_security, select_security);
     let collect = if let Some(using) = statement.using {
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
@@ -27855,6 +30019,8 @@ pub(crate) fn delete<'a>(
                 arena,
                 params,
                 txn.txid,
+                &hooks,
+                row_security,
                 scratch,
                 outer,
             )
@@ -27870,6 +30036,8 @@ pub(crate) fn delete<'a>(
                 arena,
                 params,
                 txn.txid,
+                &hooks,
+                row_security,
                 scratch,
             )
         }
@@ -27884,6 +30052,7 @@ pub(crate) fn delete<'a>(
             arena,
             params,
             &hooks,
+            row_security,
             scratch,
             outer_lookup,
         )
@@ -29764,6 +31933,59 @@ fn alter_table_inner(
         );
     }
 
+    if let [AlterAction::SetRowLevelSecurity(alteration)] = statement.actions {
+        let mut new_def = def;
+        match alteration {
+            crate::sql::ast::RowLevelSecurityAlteration::Enable => {
+                new_def.row_level_security.enabled = true;
+            }
+            crate::sql::ast::RowLevelSecurityAlteration::Disable => {
+                new_def.row_level_security.enabled = false;
+            }
+            crate::sql::ast::RowLevelSecurityAlteration::Force => {
+                new_def.row_level_security.forced = true;
+            }
+            crate::sql::ast::RowLevelSecurityAlteration::NoForce => {
+                new_def.row_level_security.forced = false;
+            }
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for column in 0..def.n_columns {
+            mapping[column] = Some(def.columns()[column].name);
+            wal_mapping[column] = column as u16;
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: def.schema.as_str(),
+                previous_name: def.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+            storage.rollback_table_def(table_index, txn.txid);
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete("ALTER TABLE")?;
+        }
+        return sql_ok();
+    }
+
     if let [action @ (AlterAction::AttachPartition { .. } | AlterAction::DetachPartition { .. })] =
         statement.actions
     {
@@ -29840,12 +32062,17 @@ fn alter_table_inner(
     let mut n_identity_sequences = 0usize;
     let mut owned_sequences_to_drop = [usize::MAX; crate::storage::MAX_SEQUENCES];
     let mut n_owned_sequences_to_drop = 0usize;
+    let mut column_renames = [(SqlName::EMPTY, SqlName::EMPTY); MAX_COLUMNS];
+    let mut n_column_renames = 0usize;
 
     for action in statement.actions {
         match action {
             AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
             AlterAction::SetTriggerEnabled { .. } => {
                 unreachable!("trigger enablement is a standalone action")
+            }
+            AlterAction::SetRowLevelSecurity(_) => {
+                unreachable!("row-level security is a standalone action")
             }
             AlterAction::AttachPartition { .. } | AlterAction::DetachPartition { .. } => {
                 unreachable!("partition attachment is a standalone action")
@@ -29878,6 +32105,8 @@ fn alter_table_inner(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 };
+                column_renames[n_column_renames] = (new_def.columns[i].name, to);
+                n_column_renames += 1;
                 if let Err(error) =
                     rewrite_table_owned_column_references(&mut new_def, i, to, arena)
                 {
@@ -29922,16 +32151,47 @@ fn alter_table_inner(
                 source[index] = ColSource::FillDefault(index);
                 added_any = true;
             }
-            AlterAction::DropColumn(name) => {
+            AlterAction::DropColumn {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 let Some(i) = new_def.column_index(name) else {
+                    if *if_exists {
+                        responder.notice(
+                            sqlstate::SUCCESSFUL_COMPLETION,
+                            stack_format!(
+                                160,
+                                "column \"{}\" of relation \"{}\" does not exist, skipping",
+                                name,
+                                statement.table.name
+                            )
+                            .as_str(),
+                        )?;
+                        continue;
+                    }
                     return sql_fail(undefined_column(name));
                 };
-                let original_column = match source[i] {
+                let (original_column, original_index) = match source[i] {
                     ColSource::Keep(original) | ColSource::Cast { orig: original, .. } => {
-                        def.columns()[original].name
+                        (def.columns()[original].name, Some(original))
                     }
-                    ColSource::FillDefault(_) => new_def.columns()[i].name,
+                    ColSource::FillDefault(_) => (new_def.columns()[i].name, None),
                 };
+                if let Some(original_index) = original_index
+                    && let Err(error) = apply_column_drop_dependencies(
+                        storage,
+                        wal,
+                        txn,
+                        table_index,
+                        original_index,
+                        original_column,
+                        *cascade,
+                        responder,
+                    )
+                {
+                    return sql_fail(error);
+                }
                 for slot in 0..storage.sequence_count() {
                     if matches!(
                         storage.sequence_for(slot, txn.txid).owner,
@@ -30915,6 +33175,17 @@ fn alter_table_inner(
         storage.rollback_table_def(table_index, txn.txid);
         return sql_fail(error);
     }
+    if let Err(error) = rewrite_table_policy_column_references(
+        storage,
+        wal,
+        txn,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     if def.partition.is_partitioned()
         && statement.actions.iter().any(|action| {
             matches!(
@@ -31265,6 +33536,7 @@ fn row_matches<'a>(
     storage: &Storage,
     table_index: usize,
     rowid: u64,
+    txid: u32,
     def: &TableDef,
     alias: Option<&str>,
     schema: &[ColType],
@@ -31273,11 +33545,12 @@ fn row_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
-    let Some(w) = where_clause else {
+    if where_clause.is_none() && row_security.is_none() {
         return Ok(true);
-    };
+    }
     // Consume-in-place: the row's bytes live only for this predicate — a
     // WHERE over thousands of spilled rows must not fill the arena with
     // rows it rejects. (A WHERE subquery's own spilled reads take the
@@ -31293,38 +33566,64 @@ fn row_matches<'a>(
         let mut values = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut values)?;
         return row_matches_values(
+            storage,
+            txid,
             def,
             alias,
             &values,
-            w,
+            where_clause,
             arena,
             params,
             hooks,
+            row_security,
             Some(transition),
         );
     }
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut values = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, schema, &mut values)?;
-        row_matches_values(def, alias, &values, w, arena, params, hooks, None)
+        row_matches_values(
+            storage,
+            txid,
+            def,
+            alias,
+            &values,
+            where_clause,
+            arena,
+            params,
+            hooks,
+            row_security,
+            None,
+        )
     })
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 fn row_matches_values<'a>(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     alias: Option<&str>,
     values: &[Datum<'a>],
-    w: &Expr<'a>,
+    where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
     let context = RowCtx {
         def,
         values: &values[..def.n_columns],
         alias,
+    };
+    if let Some(plan) = row_security
+        && !super::query::row_security_passes(plan, &context, storage, txid, arena, params, hooks)?
+    {
+        return Ok(false);
+    }
+    let Some(w) = where_clause else {
+        return Ok(true);
     };
     let value = if let Some(transition) = transition {
         let scope = TriggerDmlScope {
@@ -31377,6 +33676,7 @@ fn collect_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
@@ -31393,6 +33693,7 @@ fn collect_matches<'a>(
                 storage,
                 leaf,
                 rowid,
+                txid,
                 def,
                 alias,
                 schema,
@@ -31401,6 +33702,7 @@ fn collect_matches<'a>(
                 arena,
                 params,
                 hooks,
+                row_security,
                 transition,
             )? {
                 scratch
@@ -31442,6 +33744,8 @@ fn collect_join_matches<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
     scratch.clear();
@@ -31462,6 +33766,13 @@ fn collect_join_matches<'a>(
                     values: &tv[..def.n_columns],
                     alias,
                 };
+                if let Some(plan) = row_security
+                    && !super::query::row_security_passes(
+                        plan, &context, storage, txid, arena, params, hooks,
+                    )?
+                {
+                    return Ok(false);
+                }
                 super::query::first_from_match(
                     storage,
                     from,
@@ -31510,6 +33821,8 @@ fn collect_join_matches_with_transition<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     outer: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
@@ -31529,6 +33842,13 @@ fn collect_join_matches_with_transition<'a>(
                     values: &values[..def.n_columns],
                     alias,
                 };
+                if let Some(plan) = row_security
+                    && !super::query::row_security_passes(
+                        plan, &context, storage, txid, arena, params, hooks,
+                    )?
+                {
+                    return Ok(false);
+                }
                 let scope = JoinedTriggerDmlScope {
                     row: &context,
                     outer,

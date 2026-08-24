@@ -52,6 +52,21 @@ pub fn active_render() -> Option<RenderContext> {
     ACTIVE_RENDER.with(|active| *active.borrow())
 }
 
+/// Whether the active session permits row-security filtering. PostgreSQL's
+/// `off` value is a safety check for dump tools: it raises instead of bypassing
+/// a policy that would affect the query.
+pub(crate) fn active_row_security() -> bool {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return true;
+        }
+        // SAFETY: the pointer has the same dynamic extent as `enter_eval_scope`.
+        let guc = unsafe { &*pointer };
+        guc.store.borrow().current.row_security.as_str() == "on"
+    })
+}
+
 pub fn set_active_config(
     name: &str,
     value: Option<&str>,
@@ -821,8 +836,6 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("row_security") {
-        // No row-level-security policies exist, so `on` and `offset` select
-        // the same rows; the value is validated and retained for SHOW.
         let on = if is_default {
             true
         } else {

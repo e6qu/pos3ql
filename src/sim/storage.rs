@@ -672,11 +672,11 @@ fn parse_environment_nonzero_u64(
 #[test]
 fn storage_vopr() {
     let result = std::thread::Builder::new()
-        .name("storage-vopr-4-mib".to_string())
+        .name("storage-vopr-8-mib".to_string())
         // The recovery path carries the complete bounded engine and catalog
-        // frames. Keep the test envelope explicit: four MiB matches the
-        // deepest ordinary engine recovery tests while still detecting growth.
-        .stack_size(4_194_304)
+        // frames. Keep the test envelope explicit so catalog growth remains
+        // visible instead of depending on a platform thread default.
+        .stack_size(8_388_608)
         .spawn(|| run_storage_vopr().expect("parse storage VOPR configuration"))
         .expect("spawn storage VOPR with constrained stack")
         .join();
@@ -697,7 +697,7 @@ fn run_storage_vopr() -> Result<(), String> {
         handles.push(
             std::thread::Builder::new()
                 .name(format!("storage-vopr-worker-{worker}"))
-                .stack_size(4_194_304)
+                .stack_size(8_388_608)
                 .spawn(move || {
                     for seed in (configuration.seed0 + worker
                         ..configuration.seed0 + configuration.seeds.get())

@@ -194,6 +194,12 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingTriggerDefinition>,
     },
+    PolicyCreated(u32),
+    PolicyDropped(u32),
+    PolicyAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingPolicyDefinition>,
+    },
     RoutineIdentityAltered {
         slot: u32,
         prior: Option<crate::storage::PendingRoutineIdentity>,

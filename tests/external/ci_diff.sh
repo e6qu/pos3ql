@@ -380,6 +380,17 @@ CREATE VIEW outbound_dump.row_view AS
       outbound_dump.dump_rows(1),
       generate_series(10,30,10)
     ) WITH ORDINALITY AS rows(item,label,generated,ordinality);
+CREATE TABLE outbound_dump.protected_rows (id integer PRIMARY KEY, owner_name text);
+INSERT INTO outbound_dump.protected_rows VALUES (1, 'outbound_reader'), (2, 'other');
+ALTER TABLE outbound_dump.protected_rows ENABLE ROW LEVEL SECURITY;
+ALTER TABLE outbound_dump.protected_rows FORCE ROW LEVEL SECURITY;
+CREATE POLICY outbound_reader_rows ON outbound_dump.protected_rows
+  FOR ALL TO outbound_reader
+  USING (owner_name = 'outbound_reader') WITH CHECK (owner_name = 'outbound_reader');
+GRANT SELECT, INSERT ON outbound_dump.protected_rows TO outbound_reader;
+CREATE VIEW outbound_dump.protected_view WITH (security_invoker=true) AS
+  SELECT id,owner_name FROM outbound_dump.protected_rows;
+GRANT SELECT ON outbound_dump.protected_view TO outbound_reader;
 CREATE TABLE outbound_dump.partition_root (id integer, region integer, PRIMARY KEY (id, region))
   PARTITION BY RANGE (id, region);
 CREATE TABLE outbound_dump.partition_mid PARTITION OF outbound_dump.partition_root
@@ -463,6 +474,14 @@ else
              ((outbound_dump.echo_locations(ARRAY[ROW(13,14,NULL)::outbound_type_target.location]))[1]).y,
              ((outbound_dump.echo_marked_locations(ARRAY[ROW(15,16,NULL)::outbound_dump.location_domain]))[1]).east;
       SELECT item,label,generated,ordinality FROM outbound_dump.row_view ORDER BY ordinality;
+      SELECT relrowsecurity,relforcerowsecurity
+        FROM pg_class WHERE oid='outbound_dump.protected_rows'::regclass;
+      SELECT policyname,permissive,cmd,roles,qual IS NOT NULL,with_check IS NOT NULL
+        FROM pg_policies WHERE schemaname='outbound_dump' AND tablename='protected_rows';
+      SELECT reloptions FROM pg_class WHERE oid='outbound_dump.protected_view'::regclass;
+      SET ROLE outbound_reader;
+      SELECT id,owner_name FROM outbound_dump.protected_view ORDER BY id;
+      RESET ROLE;
       SELECT id,region FROM outbound_dump.partition_root ORDER BY id;
       SELECT a.atttypmod,c.collname
         FROM pg_attribute AS a
@@ -472,7 +491,7 @@ else
                               AND typname = 'metadata')
          AND a.attname = 'code';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n10|1\n20|2\n7|C'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\n7|C'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

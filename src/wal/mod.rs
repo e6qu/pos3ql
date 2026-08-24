@@ -107,6 +107,11 @@ const KIND_ALTER_TRIGGER: u8 = 57;
 const KIND_CREATE_COMPOSITE: u8 = 58;
 const KIND_DROP_COMPOSITE: u8 = 59;
 const KIND_ALTER_ENUM_IDENTITY: u8 = 60;
+const KIND_SET_SUBSCRIPTION_BOOTSTRAP: u8 = 61;
+const KIND_RESET_SUBSCRIPTION_RELATIONS: u8 = 62;
+const KIND_ADD_SUBSCRIPTION_RELATION: u8 = 63;
+const KIND_COMPLETE_SUBSCRIPTION_CLEANUP: u8 = 64;
+const KIND_FAIL_SUBSCRIPTION: u8 = 65;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -114,7 +119,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_ENUM_IDENTITY;
+const LAST_KIND: u8 = KIND_FAIL_SUBSCRIPTION;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -453,7 +458,8 @@ pub(crate) enum WalOp<'a> {
         publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
         publication_count: usize,
         enabled: bool,
-        slot_name: &'a str,
+        slot: crate::storage::SubscriptionSlot,
+        bootstrap: crate::storage::SubscriptionBootstrap,
     },
     DropSubscription {
         name: &'a str,
@@ -470,6 +476,33 @@ pub(crate) enum WalOp<'a> {
     SetSubscriptionEnabled {
         name: &'a str,
         enabled: bool,
+    },
+    SetSubscriptionBootstrap {
+        name: &'a str,
+        bootstrap: crate::storage::SubscriptionBootstrap,
+    },
+    ResetSubscriptionRelations {
+        name: &'a str,
+        created_at: u64,
+        definition_generation: u64,
+    },
+    AddSubscriptionRelation {
+        name: &'a str,
+        created_at: u64,
+        definition_generation: u64,
+        schema: &'a str,
+        table: &'a str,
+    },
+    CompleteSubscriptionCleanup {
+        name: &'a str,
+        created_at: u64,
+    },
+    FailSubscription {
+        name: &'a str,
+        created_at: u64,
+        definition_generation: u64,
+        sqlstate: &'a str,
+        message: &'a str,
     },
     AlterSubscription {
         name: &'a str,
@@ -1396,6 +1429,11 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropSubscription { .. } => KIND_DROP_SUBSCRIPTION,
         WalOp::AdvanceSubscription { .. } => KIND_ADVANCE_SUBSCRIPTION,
         WalOp::SetSubscriptionEnabled { .. } => KIND_SET_SUBSCRIPTION_ENABLED,
+        WalOp::SetSubscriptionBootstrap { .. } => KIND_SET_SUBSCRIPTION_BOOTSTRAP,
+        WalOp::ResetSubscriptionRelations { .. } => KIND_RESET_SUBSCRIPTION_RELATIONS,
+        WalOp::AddSubscriptionRelation { .. } => KIND_ADD_SUBSCRIPTION_RELATION,
+        WalOp::CompleteSubscriptionCleanup { .. } => KIND_COMPLETE_SUBSCRIPTION_CLEANUP,
+        WalOp::FailSubscription { .. } => KIND_FAIL_SUBSCRIPTION,
         WalOp::AlterSubscription { .. } => KIND_ALTER_SUBSCRIPTION,
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
@@ -1591,7 +1629,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             connection,
             publications,
             publication_count,
-            slot_name,
+            slot,
             ..
         } => {
             1 + name.len()
@@ -1605,11 +1643,27 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .sum::<usize>()
                 + 1
                 + 1
-                + slot_name.len()
+                + match slot {
+                    crate::storage::SubscriptionSlot::Absent => 1,
+                    crate::storage::SubscriptionSlot::External(name)
+                    | crate::storage::SubscriptionSlot::Managed(name) => 2 + name.as_str().len(),
+                }
         }
         WalOp::DropSubscription { name } => 1 + name.len(),
         WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8 + 8 + 8,
         WalOp::SetSubscriptionEnabled { name, .. } => 1 + name.len() + 1,
+        WalOp::SetSubscriptionBootstrap { name, .. } => 1 + name.len() + 1,
+        WalOp::ResetSubscriptionRelations { name, .. } => 1 + name.len() + 8 + 8,
+        WalOp::AddSubscriptionRelation {
+            name,
+            schema,
+            table,
+            ..
+        } => 1 + name.len() + 8 + 8 + 1 + schema.len() + 1 + table.len(),
+        WalOp::CompleteSubscriptionCleanup { name, .. } => 1 + name.len() + 8,
+        WalOp::FailSubscription { name, message, .. } => {
+            1 + name.len() + 8 + 8 + 5 + 1 + message.len()
+        }
         WalOp::AlterSubscription {
             name,
             connection,
@@ -2354,7 +2408,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publications,
             publication_count,
             enabled,
-            slot_name,
+            slot,
+            bootstrap,
         } => {
             connection.len() <= u16::MAX as usize
                 && *publication_count <= crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS
@@ -2367,7 +2422,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     .iter()
                     .all(|publication| name_bytes(buffer, publication.as_str()))
                 && buffer.append(&[u8::from(*enabled)])
-                && name_bytes(buffer, slot_name)
+                && buffer.append(&[bootstrap.code()])
+                && match slot {
+                    crate::storage::SubscriptionSlot::Absent => buffer.append(&[0]),
+                    crate::storage::SubscriptionSlot::External(name) => {
+                        buffer.append(&[1]) && name_bytes(buffer, name.as_str())
+                    }
+                    crate::storage::SubscriptionSlot::Managed(name) => {
+                        buffer.append(&[2]) && name_bytes(buffer, name.as_str())
+                    }
+                }
         }
         WalOp::DropSubscription { name } => name_bytes(buffer, name),
         WalOp::AdvanceSubscription {
@@ -2383,6 +2447,49 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::SetSubscriptionEnabled { name, enabled } => {
             name_bytes(buffer, name) && buffer.append(&[u8::from(*enabled)])
+        }
+        WalOp::SetSubscriptionBootstrap { name, bootstrap } => {
+            name_bytes(buffer, name) && buffer.append(&[bootstrap.code()])
+        }
+        WalOp::ResetSubscriptionRelations {
+            name,
+            created_at,
+            definition_generation,
+        } => {
+            name_bytes(buffer, name)
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&definition_generation.to_le_bytes())
+        }
+        WalOp::AddSubscriptionRelation {
+            name,
+            created_at,
+            definition_generation,
+            schema,
+            table,
+        } => {
+            name_bytes(buffer, name)
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&definition_generation.to_le_bytes())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, table)
+        }
+        WalOp::CompleteSubscriptionCleanup { name, created_at } => {
+            name_bytes(buffer, name) && buffer.append(&created_at.to_le_bytes())
+        }
+        WalOp::FailSubscription {
+            name,
+            created_at,
+            definition_generation,
+            sqlstate,
+            message,
+        } => {
+            sqlstate.len() == 5
+                && message.len() <= u8::MAX as usize
+                && name_bytes(buffer, name)
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&definition_generation.to_le_bytes())
+                && buffer.append(sqlstate.as_bytes())
+                && name_bytes(buffer, message)
         }
         WalOp::AlterSubscription {
             name,
@@ -3731,7 +3838,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
-            let slot_name = take_name(&mut at)?;
+            let bootstrap = crate::storage::SubscriptionBootstrap::from_code(*payload.get(at)?)?;
+            at += 1;
+            let slot_kind = *payload.get(at)?;
+            at += 1;
+            let slot = match slot_kind {
+                0 => crate::storage::SubscriptionSlot::Absent,
+                1 => crate::storage::SubscriptionSlot::External(
+                    crate::storage::ReplicationSlotName::parse(take_name(&mut at)?).ok()?,
+                ),
+                2 => crate::storage::SubscriptionSlot::Managed(
+                    crate::storage::ReplicationSlotName::parse(take_name(&mut at)?).ok()?,
+                ),
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::CreateSubscription {
                 name,
                 owner,
@@ -3739,7 +3859,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publications,
                 publication_count: count,
                 enabled,
-                slot_name,
+                slot,
+                bootstrap,
             })
         }
         KIND_DROP_SUBSCRIPTION => {
@@ -3771,6 +3892,67 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             at += 1;
             (at == payload.len()).then_some(WalOp::SetSubscriptionEnabled { name, enabled })
+        }
+        KIND_SET_SUBSCRIPTION_BOOTSTRAP => {
+            let name = take_name(&mut at)?;
+            let bootstrap = crate::storage::SubscriptionBootstrap::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetSubscriptionBootstrap { name, bootstrap })
+        }
+        KIND_RESET_SUBSCRIPTION_RELATIONS => {
+            let name = take_name(&mut at)?;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition_generation =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            (at == payload.len()).then_some(WalOp::ResetSubscriptionRelations {
+                name,
+                created_at,
+                definition_generation,
+            })
+        }
+        KIND_ADD_SUBSCRIPTION_RELATION => {
+            let name = take_name(&mut at)?;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition_generation =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::AddSubscriptionRelation {
+                name,
+                created_at,
+                definition_generation,
+                schema,
+                table,
+            })
+        }
+        KIND_COMPLETE_SUBSCRIPTION_CLEANUP => {
+            let name = take_name(&mut at)?;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            (at == payload.len()).then_some(WalOp::CompleteSubscriptionCleanup { name, created_at })
+        }
+        KIND_FAIL_SUBSCRIPTION => {
+            let name = take_name(&mut at)?;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition_generation =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let sqlstate = core::str::from_utf8(payload.get(at..at + 5)?).ok()?;
+            crate::sql::eval::SqlState::parse(sqlstate)?;
+            at += 5;
+            let message = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::FailSubscription {
+                name,
+                created_at,
+                definition_generation,
+                sqlstate,
+                message,
+            })
         }
         KIND_ALTER_SUBSCRIPTION => {
             let name = take_name(&mut at)?;

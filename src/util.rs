@@ -2,6 +2,14 @@
 
 use core::fmt;
 
+/// Writes one already formatted diagnostic without touching the heap. Runtime
+/// failure reporting remains usable after the startup allocation freeze.
+pub(crate) fn stderr_line(message: &str) {
+    unsafe {
+        libc::write(2, message.as_ptr().cast(), message.len());
+    }
+}
+
 /// A fixed-capacity string on the stack; `fmt::Write` that truncates
 /// (marked) instead of failing, for error messages and number formatting
 /// on paths that must not allocate.

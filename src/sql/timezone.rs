@@ -33,8 +33,8 @@ pub struct Dst {
     end: Trans,
 }
 
-/// A rule-based zone: fixed offsets with an optional POSIX DST rule. The
-/// embedded fallback set and TZif footer rules both take this form.
+/// A rule-based zone: fixed offsets with an optional POSIX DST rule. Fixed
+/// zones and parsed TZif footer rules both take this form.
 #[derive(Debug, Clone, Copy)]
 pub struct PosixZone {
     std_off: i32,

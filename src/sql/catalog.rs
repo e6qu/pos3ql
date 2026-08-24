@@ -449,6 +449,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_statistic_ext"
                 | "pg_publication"
                 | "pg_publication_rel"
+                | "pg_publication_tables"
                 | "pg_publication_namespace"
                 | "pg_replication_slots"
                 | "pg_subscription"
@@ -604,21 +605,10 @@ pub fn synthesize<'a>(
         (false, "pg_publication") => pg_publication(storage, txid, arena),
         (false, "pg_publication_namespace") => pg_publication_namespace(storage, txid, arena),
         (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
+        (false, "pg_publication_tables") => pg_publication_tables(storage, txid, arena),
         (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
         (false, "pg_subscription") => pg_subscription(storage, txid, arena),
-        (false, "pg_subscription_rel") => finish(
-            def_of(
-                "pg_subscription_rel",
-                &[
-                    ("srsubid", ColType::Int4),
-                    ("srrelid", ColType::Int4),
-                    ("srsubstate", ColType::Bpchar),
-                    ("srsublsn", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_subscription_rel") => pg_subscription_rel(storage, txid, arena),
         (false, "pg_inherits") => pg_inherits(storage, txid, arena),
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
@@ -3936,6 +3926,106 @@ fn pg_publication_rel<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn pg_publication_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_publication_tables",
+        &[
+            ("pubname", ColType::Name),
+            ("schemaname", ColType::Name),
+            ("tablename", ColType::Name),
+            ("attnames", ColType::Array(super::types::ArrElem::Name)),
+            ("rowfilter", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
+        let published = publication.definition_for(txid);
+        let mut emitted = [usize::MAX; 256];
+        let mut emitted_count = 0;
+        for (table_slot, table) in storage.live_tables() {
+            if !table.visible_to(txid) {
+                continue;
+            }
+            let explicit = super::publication_partition_member(storage, publication, table_slot);
+            let schema =
+                super::publication_partition_schema_member(storage, publication, table_slot);
+            if !published.all_tables && !schema && explicit.is_none() {
+                continue;
+            }
+            let output = if published.publish_via_partition_root {
+                super::partition_root(storage, table_slot)
+            } else {
+                table_slot
+            };
+            if emitted[..emitted_count].contains(&output) {
+                continue;
+            }
+            if emitted_count == emitted.len() || count == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_publication_tables exceeds {} rows",
+                    rows.len()
+                ));
+            }
+            emitted[emitted_count] = output;
+            emitted_count += 1;
+            let output_definition = storage.table_def(output, txid);
+            let effective_explicit =
+                super::publication_partition_member(storage, publication, output);
+            let column_mask = if published.all_tables || schema {
+                u64::MAX
+            } else if let Some(index) = effective_explicit.or(explicit) {
+                if usize::from(published.tables[index]) != output
+                    && !published.publish_via_partition_root
+                {
+                    u64::MAX
+                } else {
+                    let mask = published.table_column_masks[index];
+                    if mask == 0 { u64::MAX } else { mask }
+                }
+            } else {
+                u64::MAX
+            };
+            let mut attribute_values = [Datum::Null; crate::storage::MAX_COLUMNS];
+            let mut attribute_count = 0;
+            for (column, metadata) in output_definition.columns().iter().enumerate() {
+                if column_mask & (1u64 << column) != 0 {
+                    attribute_values[attribute_count] = text(metadata.name.as_str(), arena)?;
+                    attribute_count += 1;
+                }
+            }
+            let attributes = Datum::Array {
+                element: super::types::ArrElem::Name,
+                raw: super::array::build(&attribute_values[..attribute_count], arena)?,
+            };
+            let row_filter = effective_explicit
+                .or(explicit)
+                .map(|index| published.table_filters.get(index))
+                .filter(|filter| !filter.is_empty());
+            rows[count] = row(
+                &[
+                    text(publication.name_for(txid).as_str(), arena)?,
+                    text(output_definition.schema.as_str(), arena)?,
+                    text(output_definition.name.as_str(), arena)?,
+                    attributes,
+                    match row_filter {
+                        Some(filter) => text(filter, arena)?,
+                        None => Datum::Null,
+                    },
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn pg_replication_slots<'a>(
     storage: &Storage,
     arena: &'a Arena,
@@ -4065,10 +4155,9 @@ fn pg_subscription<'a>(
                 Datum::Bool(true),
                 Datum::Bool(false),
                 text(connection.as_str(), arena)?,
-                if subscription.slot_name == crate::storage::SqlName::EMPTY {
-                    Datum::Null
-                } else {
-                    text(subscription.slot_name.as_str(), arena)?
+                match subscription.slot.name() {
+                    Some(slot) => text(slot.as_str(), arena)?,
+                    None => Datum::Null,
                 },
                 text("off", arena)?,
                 publications,
@@ -4079,6 +4168,55 @@ fn pg_subscription<'a>(
         count += 1;
     }
     finish(definition, &rows[..count], arena)
+}
+
+fn pg_subscription_rel<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_subscription_rel",
+        &[
+            ("srsubid", ColType::Int4),
+            ("srrelid", ColType::Int4),
+            ("srsubstate", ColType::Bpchar),
+            ("srsublsn", ColType::Text),
+        ],
+    );
+    let count = storage
+        .subscriptions_with_slots_visible_to(txid)
+        .map(|(_, subscription)| {
+            storage
+                .subscription_relations_visible_to(subscription, txid)
+                .count()
+        })
+        .sum();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut index = 0;
+    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+        for relation in storage.subscription_relations_visible_to(subscription, txid) {
+            let lsn = relation.synchronization_lsn();
+            let rendered_lsn = stack_format!(32, "0/{lsn:X}");
+            rows[index] = row(
+                &[
+                    Datum::Int4(FIRST_USER_OID + 95_000 + subscription.created_at as i32),
+                    Datum::Int4(table_oid(storage, relation.table_slot())),
+                    text(relation.state().pg_code(), arena)?,
+                    if lsn == 0 {
+                        Datum::Null
+                    } else {
+                        text(rendered_lsn.as_str(), arena)?
+                    },
+                ],
+                arena,
+            )?;
+            index += 1;
+        }
+    }
+    finish(definition, rows, arena)
 }
 
 fn pg_inherits<'a>(

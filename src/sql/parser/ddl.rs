@@ -14,8 +14,9 @@ use crate::sql::ast::{
     AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
     CreateTrigger, DomainCheck, Expr, PartitionBound, PartitionClause, PartitionStrategy,
     PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineTargetKind, SubscriptionOptions, SubscriptionSlotName, TriggerEvent,
-    TriggerIdentity, TriggerTiming, TriggerTransitionTables,
+    RoutineIdentity, RoutineTargetKind, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionSlotName, SubscriptionSlotPlan, TriggerEvent, TriggerIdentity, TriggerTiming,
+    TriggerTransitionTables,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -1515,12 +1516,10 @@ impl<'a> Parser<'a> {
             }
         }
         let mut connect = true;
-        let mut options = SubscriptionOptions {
-            enabled: true,
-            create_slot: true,
-            copy_data: true,
-            slot_name: SubscriptionSlotName::Default,
-        };
+        let mut enabled = true;
+        let mut create_slot = true;
+        let mut copy_data = true;
+        let mut slot_name = Some(SubscriptionSlotName::Default);
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             let mut seen_connect = false;
@@ -1541,31 +1540,33 @@ impl<'a> Parser<'a> {
                     if core::mem::replace(&mut seen_enabled, true) {
                         return Err(self.err_here("duplicate subscription option enabled"));
                     }
-                    options.enabled = value;
+                    enabled = value;
                 } else if key.eq_ignore_ascii_case("create_slot") {
                     let value = self.subscription_bool_option(key)?;
                     if core::mem::replace(&mut seen_create_slot, true) {
                         return Err(self.err_here("duplicate subscription option create_slot"));
                     }
-                    options.create_slot = value;
+                    create_slot = value;
                 } else if key.eq_ignore_ascii_case("copy_data") {
                     let value = self.subscription_bool_option(key)?;
                     if core::mem::replace(&mut seen_copy_data, true) {
                         return Err(self.err_here("duplicate subscription option copy_data"));
                     }
-                    options.copy_data = value;
+                    copy_data = value;
                 } else if key.eq_ignore_ascii_case("slot_name") {
                     if core::mem::replace(&mut seen_slot_name, true) {
                         return Err(self.err_here("duplicate subscription option slot_name"));
                     }
                     self.expect_op("=")?;
-                    options.slot_name = if self.eat_ident("none")? {
-                        SubscriptionSlotName::None
+                    slot_name = if self.eat_ident("none")? {
+                        None
                     } else if let Tok::Str(value) = self.peeked {
                         self.advance()?;
-                        SubscriptionSlotName::Named(value)
+                        Some(SubscriptionSlotName::Named(value))
                     } else {
-                        SubscriptionSlotName::Named(self.any_ident("subscription slot name")?)
+                        Some(SubscriptionSlotName::Named(
+                            self.any_ident("subscription slot name")?,
+                        ))
                     };
                 } else {
                     return Err(self.err_here("subscription option is not implemented"));
@@ -1576,26 +1577,40 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
             if !connect {
-                if (seen_enabled && options.enabled)
-                    || (seen_create_slot && options.create_slot)
-                    || (seen_copy_data && options.copy_data)
+                if (seen_enabled && enabled)
+                    || (seen_create_slot && create_slot)
+                    || (seen_copy_data && copy_data)
                 {
                     return Err(self.err_here(
                         "connect = false requires enabled, create_slot, and copy_data to be false",
                     ));
                 }
-                options.enabled = false;
-                options.create_slot = false;
-                options.copy_data = false;
+                enabled = false;
+                create_slot = false;
+                copy_data = false;
             }
         }
-        if options.slot_name == SubscriptionSlotName::None
-            && (options.enabled || options.create_slot)
-        {
+        if slot_name.is_none() && (enabled || create_slot) {
             return Err(
                 self.err_here("slot_name = NONE requires enabled and create_slot to be false")
             );
         }
+        let slot = match (slot_name, create_slot) {
+            (Some(name), true) => SubscriptionSlotPlan::Managed(name),
+            (Some(name), false) => SubscriptionSlotPlan::External(name),
+            (None, false) => SubscriptionSlotPlan::Absent,
+            (None, true) => unreachable!("slot_name NONE was rejected with create_slot"),
+        };
+        let options = SubscriptionOptions {
+            connect: if connect {
+                SubscriptionConnect::Now
+            } else {
+                SubscriptionConnect::Deferred
+            },
+            enabled,
+            copy_data,
+            slot,
+        };
         Ok(Stmt::CreateSubscription {
             name,
             connection,

@@ -920,6 +920,11 @@ impl<'a> Parser<'a> {
                 // TRANSACTION ...: retain the characteristics so execution can
                 // reject isolation/read modes it cannot actually provide.
                 let transaction = self.eat_ident("transaction")?;
+                if transaction && self.eat_ident("snapshot")? {
+                    return Ok(Stmt::SetTransactionSnapshot(
+                        self.str_literal("snapshot identifier")?,
+                    ));
+                }
                 let characteristics = if transaction {
                     true
                 } else if self.eat_ident("characteristics")? {
@@ -3108,9 +3113,22 @@ impl<'a> Parser<'a> {
                     publications: self.arena_slice(&publications[..count])?,
                     refresh,
                 }
+            } else if self.eat_ident("refresh")? {
+                self.expect_ident("publication")?;
+                let copy_data = if self.eat_ident("with")? {
+                    self.expect_op("(")?;
+                    self.expect_ident("copy_data")?;
+                    let _ = self.eat_op("=")?;
+                    let copy_data = self.role_option_boolean()?;
+                    self.expect_op(")")?;
+                    copy_data
+                } else {
+                    true
+                };
+                AlterSubscriptionAction::RefreshPublications { copy_data }
             } else {
                 return Err(self.err_here(
-                    "expected ENABLE, DISABLE, CONNECTION, or SET PUBLICATION after ALTER SUBSCRIPTION",
+                    "expected ENABLE, DISABLE, CONNECTION, SET PUBLICATION, or REFRESH PUBLICATION after ALTER SUBSCRIPTION",
                 ));
             };
             return Ok(Stmt::AlterSubscription { name, action });

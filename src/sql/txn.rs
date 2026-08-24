@@ -212,6 +212,11 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingSubscriptionEnabled>,
     },
+    SubscriptionBootstrapChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingSubscriptionBootstrap>,
+    },
+    SubscriptionRelationsChanged,
     SubscriptionDefinitionChanged {
         slot: u32,
         prior: Option<crate::storage::PendingSubscriptionDefinition>,
@@ -450,6 +455,30 @@ impl TxnState {
                 *self.snapshot_lsn.get_or_insert(current_lsn)
             }
         }
+    }
+
+    pub fn import_snapshot(&mut self, snapshot: u64) -> Result<(), SqlError> {
+        if !self.is_explicit() {
+            return Err(sql_err!(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION SNAPSHOT can only be used in transaction blocks"
+            ));
+        }
+        if self.snapshot_taken {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION SNAPSHOT must be called before any query"
+            ));
+        }
+        if self.isolation == IsolationLevel::ReadCommitted {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a snapshot-importing transaction must use REPEATABLE READ or SERIALIZABLE"
+            ));
+        }
+        self.snapshot_lsn = Some(snapshot);
+        self.snapshot_taken = true;
+        Ok(())
     }
 
     pub fn snapshot_lsn(&self) -> Option<u64> {

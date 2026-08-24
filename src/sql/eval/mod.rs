@@ -146,6 +146,7 @@ macro_rules! sql_err {
 
 pub mod sqlstate {
     pub const SYNTAX_ERROR: &str = "42601";
+    pub const INVALID_NAME: &str = "42602";
     pub const UNDEFINED_COLUMN: &str = "42703";
     pub const UNDEFINED_TABLE: &str = "42P01";
     pub const DUPLICATE_TABLE: &str = "42P07";
@@ -5400,8 +5401,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Macaddr(_) => "macaddr",
         Datum::Macaddr8(_) => "macaddr8",
         Datum::Record(_) => "record",
-        // The real enum type name is dynamic; this fallback is used only in
-        // error messages where the catalog is not in scope.
+        // The catalog-free diagnostic names the dynamic enum category.
         Datum::Enum { .. } => "enum",
         Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
     }

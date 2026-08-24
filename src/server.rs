@@ -116,6 +116,8 @@ struct SubscriptionBootstrapWork {
     table: usize,
     copy_setup: Option<crate::sql::exec::CopySetup>,
     line: crate::mem::buffer::FixedBuf,
+    binary_header_pending: bool,
+    binary_end_seen: bool,
 }
 
 fn subscription_name_array(
@@ -243,6 +245,7 @@ fn subscription_discovery_query(
 
 fn subscription_copy_query(
     table: SubscriptionBootstrapTable,
+    binary: bool,
 ) -> Result<crate::util::StackStr<SUBSCRIPTION_QUERY_BYTES>, ()> {
     use core::fmt::Write as _;
     let mut query = crate::util::StackStr::new();
@@ -261,6 +264,9 @@ fn subscription_copy_query(
         let _ = write!(query, " WHERE {}", table.filter.as_str());
     }
     let _ = write!(query, ") TO STDOUT");
+    if binary {
+        let _ = write!(query, " (FORMAT binary)");
+    }
     (!query.is_truncated()).then_some(query).ok_or(())
 }
 
@@ -350,11 +356,13 @@ struct SubscriptionBinding {
     endpoint: crate::pg::replication_client::ConnectionInfo,
     publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     publication_count: usize,
-    slot: crate::storage::SqlName,
-    bootstrap_slot: crate::storage::SqlName,
+    slot: Option<crate::storage::SqlName>,
+    manage_slot_behavior: bool,
+    bootstrap_slot: Option<crate::storage::SqlName>,
     drop_bootstrap_slot: bool,
     bootstrap: crate::storage::SubscriptionBootstrap,
     enabled: bool,
+    behavior: crate::storage::SubscriptionBehavior,
 }
 
 impl From<crate::sql::SubscriptionRuntime> for SubscriptionBinding {
@@ -365,10 +373,12 @@ impl From<crate::sql::SubscriptionRuntime> for SubscriptionBinding {
             publications: runtime.publications,
             publication_count: runtime.publication_count,
             slot: runtime.slot,
+            manage_slot_behavior: runtime.manage_slot_behavior,
             bootstrap_slot: runtime.bootstrap_slot,
             drop_bootstrap_slot: runtime.drop_bootstrap_slot,
             bootstrap: runtime.bootstrap,
             enabled: runtime.enabled,
+            behavior: runtime.behavior,
         }
     }
 }
@@ -508,6 +518,7 @@ impl Server {
                         config.txn_rows,
                         config.subscription_arena_bytes,
                         0,
+                        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
                     )?,
                     sql: crate::pg::replication_client::ReplicationClient::new_unbound(
                         budget,
@@ -537,6 +548,8 @@ impl Server {
                             "subscription_copy_line",
                             config.copy_line_bytes,
                         )?,
+                        binary_header_pending: false,
+                        binary_end_seen: false,
                     },
                     name: None,
                     definition: None,
@@ -1094,19 +1107,26 @@ impl Server {
                     let worker = &mut self.subscriptions[slot];
                     worker
                         .apply
-                        .bind(runtime.stream, runtime.confirmed_lsn)
+                        .bind(runtime.stream, runtime.confirmed_lsn, runtime.behavior)
                         .map_err(|_| std::io::Error::other("bind subscription apply"))?;
                     let bind = match runtime.bootstrap {
                         crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data } => {
+                            let bootstrap_slot = runtime.bootstrap_slot.ok_or_else(|| {
+                                std::io::Error::other(
+                                    "managed subscription bootstrap has no publisher slot",
+                                )
+                            })?;
                             worker.bootstrap.stage = SubscriptionBootstrapStage::AwaitingSnapshot;
                             worker.bootstrap.snapshot = None;
                             worker.bootstrap.tables.clear();
                             worker.bootstrap.table = 0;
                             worker.bootstrap.copy_setup = None;
                             worker.bootstrap.line.clear();
-                            let result = worker
-                                .client
-                                .bind_create_slot(runtime.endpoint, runtime.bootstrap_slot);
+                            let result = worker.client.bind_create_slot(
+                                runtime.endpoint,
+                                bootstrap_slot,
+                                runtime.behavior,
+                            );
                             if result.is_err() {
                                 worker.bootstrap.stage = SubscriptionBootstrapStage::Idle;
                             }
@@ -1116,29 +1136,44 @@ impl Server {
                         crate::storage::SubscriptionBootstrap::CopyExternalSlot
                         | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
                         | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
+                            let bootstrap_slot = runtime.bootstrap_slot.ok_or_else(|| {
+                                std::io::Error::other(
+                                    "subscription synchronization has no temporary slot",
+                                )
+                            })?;
                             worker.bootstrap.stage = SubscriptionBootstrapStage::AwaitingSnapshot;
                             worker.bootstrap.snapshot = None;
                             worker.bootstrap.tables.clear();
                             worker.bootstrap.table = 0;
                             worker.bootstrap.copy_setup = None;
                             worker.bootstrap.line.clear();
-                            let result = worker
-                                .client
-                                .bind_create_slot(runtime.endpoint, runtime.bootstrap_slot);
+                            let result = worker.client.bind_create_slot(
+                                runtime.endpoint,
+                                bootstrap_slot,
+                                crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+                            );
                             if result.is_err() {
                                 worker.bootstrap.stage = SubscriptionBootstrapStage::Idle;
                             }
                             result
                         }
-                        crate::storage::SubscriptionBootstrap::Ready if runtime.enabled => worker
-                            .client
-                            .bind(crate::pg::replication_client::ReplicationClientSetup {
-                                endpoint: runtime.endpoint,
-                                slot: runtime.slot,
-                                publications: &runtime.publications[..runtime.publication_count],
-                                start_lsn: runtime.confirmed_lsn,
-                                protocol: crate::pg::pgoutput::ProtocolVersion::V4,
-                            }),
+                        crate::storage::SubscriptionBootstrap::Ready if runtime.enabled => {
+                            let publisher_slot = runtime.slot.ok_or_else(|| {
+                                std::io::Error::other("enabled subscription has no publisher slot")
+                            })?;
+                            worker.client.bind(
+                                crate::pg::replication_client::ReplicationClientSetup {
+                                    endpoint: runtime.endpoint,
+                                    slot: publisher_slot,
+                                    publications: &runtime.publications
+                                        [..runtime.publication_count],
+                                    start_lsn: runtime.confirmed_lsn,
+                                    protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+                                    behavior: runtime.behavior,
+                                    manage_slot_behavior: runtime.manage_slot_behavior,
+                                },
+                            )
+                        }
                         _ => {
                             worker.apply.unbind();
                             continue;
@@ -1221,7 +1256,12 @@ impl Server {
             table.name,
             &table.columns[..table.column_count],
         )?;
-        let query = subscription_copy_query(table).map_err(|_| {
+        let binary = worker
+            .definition
+            .expect("bootstrap worker has a definition")
+            .behavior
+            .binary;
+        let query = subscription_copy_query(table, binary).map_err(|_| {
             crate::sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "subscription COPY query exceeds its fixed capacity"
@@ -1234,6 +1274,8 @@ impl Server {
             )
         })?;
         worker.bootstrap.copy_setup = Some(setup);
+        worker.bootstrap.binary_header_pending = binary;
+        worker.bootstrap.binary_end_seen = false;
         worker.bootstrap.stage = SubscriptionBootstrapStage::Copying;
         Ok(true)
     }
@@ -1252,7 +1294,7 @@ impl Server {
             worker.client.unbind();
             worker
                 .client
-                .bind_drop_slot(binding.endpoint, binding.bootstrap_slot)
+                .bind_drop_slot(binding.endpoint, binding.bootstrap_slot.ok_or(())?)
                 .map_err(|_| ())?;
             let fd = worker.client.raw_fd();
             self.reactor
@@ -1405,9 +1447,9 @@ impl Server {
             }
         }
         if failed {
-            let stream = self.subscriptions[slot]
-                .definition
-                .map(|binding| binding.stream);
+            let binding = self.subscriptions[slot].definition;
+            let stream = binding.map(|binding| binding.stream);
+            let retry = binding.is_none_or(|binding| !binding.behavior.disable_on_error);
             self.unbind_subscription(slot);
             if let (Some(stream), Some(failure)) = (stream, publisher_failure) {
                 let failure = crate::storage::SubscriptionFailure {
@@ -1416,10 +1458,9 @@ impl Server {
                 };
                 if let Err(error) = self.engine.fail_subscription(stream, failure) {
                     log_subscription_error(Some(stream.name()), &error);
-                    self.subscriptions[slot].retry_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(1));
                 }
-            } else {
+            }
+            if retry {
                 self.subscriptions[slot].retry_at =
                     Some(std::time::Instant::now() + Duration::from_secs(1));
             }
@@ -1478,37 +1519,98 @@ impl Server {
                         SubscriptionBootstrapStage::Copying,
                         crate::pg::replication_client::SqlEvent::CopyOut {
                             fields,
-                            binary: false,
+                            binary,
                         },
                     ) if usize::from(fields)
                         == worker
                             .bootstrap
                             .copy_setup
                             .expect("copying stage owns setup")
-                            .n_targets => {}
+                            .n_targets
+                        && binary
+                            == worker
+                                .definition
+                                .expect("copying stage owns definition")
+                                .behavior
+                                .binary => {}
                     (
                         SubscriptionBootstrapStage::Copying,
                         crate::pg::replication_client::SqlEvent::CopyData(bytes),
                     ) => {
-                        for byte in bytes {
-                            if *byte == b'\n' {
-                                let setup = worker
-                                    .bootstrap
-                                    .copy_setup
-                                    .expect("copying stage owns setup");
-                                if let Err(error) = worker.apply.copy_line(
-                                    &mut self.engine,
-                                    &setup,
+                        let binary = worker
+                            .definition
+                            .expect("copying stage owns definition")
+                            .behavior
+                            .binary;
+                        if binary {
+                            if !worker.bootstrap.line.append(bytes) {
+                                return Err(crate::pg::replication_client::ClientError::WireFull);
+                            }
+                            if worker.bootstrap.binary_header_pending {
+                                match crate::sql::copy::binary_header(
                                     worker.bootstrap.line.readable(),
                                 ) {
-                                    local_failure = Some(error);
-                                    return Err(
-                                        crate::pg::replication_client::ClientError::PublisherError,
-                                    );
+                                    crate::sql::copy::BinaryHeader::Incomplete => return Ok(()),
+                                    crate::sql::copy::BinaryHeader::Bad => {
+                                        return Err(crate::pg::replication_client::ClientError::PublisherError);
+                                    }
+                                    crate::sql::copy::BinaryHeader::Done(length) => {
+                                        worker.bootstrap.line.consume(length);
+                                        worker.bootstrap.binary_header_pending = false;
+                                    }
                                 }
-                                worker.bootstrap.line.clear();
-                            } else if !worker.bootstrap.line.append(&[*byte]) {
-                                return Err(crate::pg::replication_client::ClientError::WireFull);
+                            }
+                            loop {
+                                match crate::sql::copy::binary_frame(
+                                    worker.bootstrap.line.readable(),
+                                ) {
+                                    crate::sql::copy::BinaryFrame::Incomplete => break,
+                                    crate::sql::copy::BinaryFrame::Bad => {
+                                        return Err(crate::pg::replication_client::ClientError::PublisherError);
+                                    }
+                                    crate::sql::copy::BinaryFrame::Trailer => {
+                                        worker.bootstrap.line.consume(2);
+                                        worker.bootstrap.binary_end_seen = true;
+                                    }
+                                    crate::sql::copy::BinaryFrame::Row(length) => {
+                                        if worker.bootstrap.binary_end_seen {
+                                            return Err(crate::pg::replication_client::ClientError::PublisherError);
+                                        }
+                                        let setup = worker
+                                            .bootstrap
+                                            .copy_setup
+                                            .expect("copying stage owns setup");
+                                        if let Err(error) = worker.apply.copy_binary_row(
+                                            &mut self.engine,
+                                            &setup,
+                                            &worker.bootstrap.line.readable()[..length],
+                                        ) {
+                                            local_failure = Some(error);
+                                            return Err(crate::pg::replication_client::ClientError::PublisherError);
+                                        }
+                                        worker.bootstrap.line.consume(length);
+                                    }
+                                }
+                            }
+                        } else {
+                            for byte in bytes {
+                                if *byte == b'\n' {
+                                    let setup = worker
+                                        .bootstrap
+                                        .copy_setup
+                                        .expect("copying stage owns setup");
+                                    if let Err(error) = worker.apply.copy_line(
+                                        &mut self.engine,
+                                        &setup,
+                                        worker.bootstrap.line.readable(),
+                                    ) {
+                                        local_failure = Some(error);
+                                        return Err(crate::pg::replication_client::ClientError::PublisherError);
+                                    }
+                                    worker.bootstrap.line.clear();
+                                } else if !worker.bootstrap.line.append(&[*byte]) {
+                                    return Err(crate::pg::replication_client::ClientError::WireFull);
+                                }
                             }
                         }
                     }
@@ -1516,7 +1618,16 @@ impl Server {
                         SubscriptionBootstrapStage::Copying,
                         crate::pg::replication_client::SqlEvent::CopyDone,
                     ) => {
-                        if !worker.bootstrap.line.is_empty() {
+                        let binary = worker
+                            .definition
+                            .expect("copying stage owns definition")
+                            .behavior
+                            .binary;
+                        if !worker.bootstrap.line.is_empty()
+                            || (binary
+                                && (worker.bootstrap.binary_header_pending
+                                    || !worker.bootstrap.binary_end_seen))
+                        {
                             return Err(crate::pg::replication_client::ClientError::PublisherError);
                         }
                         let setup = worker
@@ -1643,9 +1754,9 @@ impl Server {
             }
         }
         if failed {
-            let stream = self.subscriptions[slot]
-                .definition
-                .map(|binding| binding.stream);
+            let binding = self.subscriptions[slot].definition;
+            let stream = binding.map(|binding| binding.stream);
+            let retry = binding.is_none_or(|binding| !binding.behavior.disable_on_error);
             if let Some(failure) = &local_failure {
                 log_subscription_error(self.subscriptions[slot].name, failure);
             }
@@ -1661,13 +1772,12 @@ impl Server {
                         message: failure.message,
                     })
                 });
-            if let (Some(stream), Some(failure)) = (stream, durable_failure) {
-                if let Err(error) = self.engine.fail_subscription(stream, failure) {
-                    log_subscription_error(Some(stream.name()), &error);
-                    self.subscriptions[slot].retry_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(1));
-                }
-            } else {
+            if let (Some(stream), Some(failure)) = (stream, durable_failure)
+                && let Err(error) = self.engine.fail_subscription(stream, failure)
+            {
+                log_subscription_error(Some(stream.name()), &error);
+            }
+            if retry {
                 self.subscriptions[slot].retry_at =
                     Some(std::time::Instant::now() + Duration::from_secs(1));
             }
@@ -2058,12 +2168,14 @@ mod tests {
             endpoint,
             publications,
             publication_count: 1,
-            slot: crate::storage::SqlName::parse("publisher_slot").unwrap(),
-            bootstrap_slot: crate::storage::SqlName::parse("publisher_slot").unwrap(),
+            slot: Some(crate::storage::SqlName::parse("publisher_slot").unwrap()),
+            manage_slot_behavior: false,
+            bootstrap_slot: Some(crate::storage::SqlName::parse("publisher_slot").unwrap()),
             drop_bootstrap_slot: false,
             confirmed_lsn: 12,
             bootstrap: crate::storage::SubscriptionBootstrap::Ready,
             enabled: true,
+            behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
         };
         let binding = SubscriptionBinding::from(runtime);
         let mut advanced = runtime;

@@ -3761,6 +3761,11 @@ impl Checkpointer {
                 | (u8::from(publication.publish_delete) << 3)
                 | (u8::from(publication.publish_truncate) << 4);
             let flags = flags | (u8::from(publication.publish_via_partition_root) << 5);
+            let flags = flags
+                | (u8::from(matches!(
+                    publication.publish_generated_columns,
+                    crate::storage::PublishGeneratedColumns::Stored
+                )) << 6);
             write!(
                 &mut self.manifest_buf,
                 "pub {} {} {} {} {}",
@@ -3832,10 +3837,11 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rslot {} {} {}",
+                    "rslot {} {} {} {}",
                     name.as_str(),
                     slot.restart_lsn,
                     slot.confirmed_flush_lsn,
+                    slot.behavior.code(),
                 ),
             )?;
         }
@@ -3894,7 +3900,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
+                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
                     subscription.ownership.owner,
                     u8::from(subscription.enabled),
@@ -3902,6 +3908,17 @@ impl Checkpointer {
                     slot_kind,
                     slot_name.as_str(),
                     subscription.bootstrap.code(),
+                    u8::from(subscription.behavior.binary),
+                    subscription.behavior.streaming.code(),
+                    subscription.behavior.synchronous_commit.code(),
+                    u8::from(subscription.behavior.two_phase),
+                    u8::from(subscription.behavior.disable_on_error),
+                    u8::from(subscription.behavior.password_required),
+                    u8::from(subscription.behavior.run_as_owner),
+                    subscription.behavior.origin.code(),
+                    u8::from(subscription.behavior.failover),
+                    u8::from(subscription.behavior.skip_lsn.is_some()),
+                    subscription.behavior.skip_lsn.unwrap_or(0),
                     subscription.created_at,
                     subscription.definition_generation,
                     subscription.confirmed_lsn,
@@ -5511,6 +5528,11 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
                 publish_via_partition_root: flags & 32 != 0,
+                publish_generated_columns: if flags & 64 != 0 {
+                    crate::storage::PublishGeneratedColumns::Stored
+                } else {
+                    crate::storage::PublishGeneratedColumns::None
+                },
             },
             0,
         )
@@ -5534,6 +5556,9 @@ fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), Checkp
         .and_then(decode_hex_name)?;
     let restart_lsn = parse_field(words.next(), "replication slot restart LSN")?;
     let confirmed_flush_lsn = parse_field(words.next(), "replication slot confirmed LSN")?;
+    let behavior = parse_field(words.next(), "replication slot behavior")?;
+    let behavior = crate::storage::ReplicationSlotBehavior::from_code(behavior)
+        .ok_or(CheckpointSetupError::Corrupt("replication slot behavior"))?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt(
             "trailing replication slot fields",
@@ -5545,6 +5570,7 @@ fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), Checkp
                 .map_err(|_| CheckpointSetupError::Corrupt("replication slot name"))?,
             restart_lsn,
             confirmed_flush_lsn,
+            behavior,
         )
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -5833,6 +5859,51 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
     .ok_or(CheckpointSetupError::Corrupt(
         "subscription bootstrap state",
     ))?;
+    let subscription_flag = |word, field| match parse_field::<u8>(word, field)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CheckpointSetupError::Corrupt(field)),
+    };
+    let binary = subscription_flag(words.next(), "subscription binary setting")?;
+    let streaming = crate::storage::SubscriptionStreaming::from_code(parse_field::<u8>(
+        words.next(),
+        "subscription streaming setting",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt(
+        "subscription streaming setting",
+    ))?;
+    let synchronous_commit = crate::storage::SubscriptionSynchronousCommit::from_code(
+        parse_field::<u8>(words.next(), "subscription synchronous commit setting")?,
+    )
+    .ok_or(CheckpointSetupError::Corrupt(
+        "subscription synchronous commit setting",
+    ))?;
+    let two_phase = subscription_flag(words.next(), "subscription two phase setting")?;
+    let disable_on_error =
+        subscription_flag(words.next(), "subscription disable on error setting")?;
+    let password_required =
+        subscription_flag(words.next(), "subscription password required setting")?;
+    let run_as_owner = subscription_flag(words.next(), "subscription run as owner setting")?;
+    let origin = crate::storage::SubscriptionOrigin::from_code(parse_field::<u8>(
+        words.next(),
+        "subscription origin setting",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("subscription origin setting"))?;
+    let failover = subscription_flag(words.next(), "subscription failover setting")?;
+    let skip_present = subscription_flag(words.next(), "subscription skip LSN setting")?;
+    let skip_value = parse_field::<u64>(words.next(), "subscription skip LSN")?;
+    let behavior = crate::storage::SubscriptionBehavior {
+        binary,
+        streaming,
+        synchronous_commit,
+        two_phase,
+        disable_on_error,
+        password_required,
+        run_as_owner,
+        origin,
+        failover,
+        skip_lsn: skip_present.then_some(skip_value),
+    };
     let created_at = parse_field(words.next(), "subscription creation stamp")?;
     let definition_generation = parse_field(words.next(), "subscription definition generation")?;
     let confirmed_lsn = parse_field(words.next(), "subscription confirmed LSN")?;
@@ -5907,6 +5978,7 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
                 publications: &publications[..count],
                 enabled,
                 slot: publisher_slot,
+                behavior,
                 bootstrap,
             },
             0,

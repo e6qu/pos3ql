@@ -341,6 +341,8 @@ enum ClientState {
     AwaitingSslResponse,
     AwaitingAuthentication,
     AwaitingReady,
+    AwaitingSlotAlter,
+    AwaitingSlotAlterReady,
     AwaitingSlotResult,
     SnapshotReady,
     AwaitingDropResult,
@@ -413,6 +415,9 @@ pub struct ReplicationClient {
     publications: FixedVec<SqlName>,
     start_lsn: u64,
     protocol: ProtocolVersion,
+    behavior: crate::storage::SubscriptionBehavior,
+    manage_slot_behavior: bool,
+    decode: pginput::DecodeState,
     stream: Option<Transport>,
     receive: FixedBuf,
     send: FixedBuf,
@@ -427,12 +432,14 @@ pub struct ReplicationClient {
 /// socket creation.  Passing one value makes a client unable to accidentally
 /// combine an endpoint with another subscription's slot or progress frontier.
 #[derive(Clone, Copy)]
-pub struct ReplicationClientSetup<'a> {
+pub(crate) struct ReplicationClientSetup<'a> {
     pub endpoint: ConnectionInfo,
     pub slot: SqlName,
     pub publications: &'a [SqlName],
     pub start_lsn: u64,
     pub protocol: ProtocolVersion,
+    pub behavior: crate::storage::SubscriptionBehavior,
+    pub manage_slot_behavior: bool,
 }
 
 impl ReplicationClient {
@@ -444,7 +451,8 @@ impl ReplicationClient {
         publication_capacity * core::mem::size_of::<SqlName>() + receive_bytes + send_bytes
     }
 
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         budget: &mut Budget,
         setup: ReplicationClientSetup<'_>,
         receive_bytes: usize,
@@ -476,6 +484,9 @@ impl ReplicationClient {
             publications: FixedVec::new(budget, "subscription_publications", publication_capacity)?,
             start_lsn: 0,
             protocol: ProtocolVersion::V4,
+            behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+            manage_slot_behavior: false,
+            decode: pginput::DecodeState::new(true),
             stream: None,
             receive: FixedBuf::new(budget, "subscription_receive", receive_bytes)?,
             send: FixedBuf::new(budget, "subscription_send", send_bytes)?,
@@ -487,7 +498,7 @@ impl ReplicationClient {
         })
     }
 
-    pub fn bind(&mut self, setup: ReplicationClientSetup<'_>) -> Result<(), ClientError> {
+    pub(crate) fn bind(&mut self, setup: ReplicationClientSetup<'_>) -> Result<(), ClientError> {
         if self.state != ClientState::Idle || self.stream.is_some() {
             return Err(ClientError::Protocol(FrameError::Malformed));
         }
@@ -497,6 +508,8 @@ impl ReplicationClient {
             publications,
             start_lsn,
             protocol,
+            behavior,
+            manage_slot_behavior,
         } = setup;
         if endpoint.ssl_mode() == SslMode::Require && self.tls.is_none() {
             return Err(ClientError::UnsupportedTls);
@@ -521,6 +534,12 @@ impl ReplicationClient {
                 self.slot = slot;
                 self.start_lsn = start_lsn;
                 self.protocol = protocol;
+                self.behavior = behavior;
+                self.manage_slot_behavior = manage_slot_behavior;
+                self.decode = pginput::DecodeState::new(matches!(
+                    behavior.streaming,
+                    crate::storage::SubscriptionStreaming::Parallel
+                ));
                 self.purpose = ClientPurpose::Stream;
                 self.stream = Some(Transport::plain(stream));
                 self.state = ClientState::Connecting;
@@ -539,6 +558,9 @@ impl ReplicationClient {
         self.slot = SqlName::EMPTY;
         self.publications.clear();
         self.start_lsn = 0;
+        self.behavior = crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT;
+        self.manage_slot_behavior = false;
+        self.decode = pginput::DecodeState::new(true);
         self.receive.clear();
         self.send.clear();
         self.scram = None;
@@ -551,8 +573,11 @@ impl ReplicationClient {
         &mut self,
         endpoint: ConnectionInfo,
         slot: SqlName,
+        behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<(), ClientError> {
-        self.bind_command(endpoint, slot, ClientPurpose::CreateSlot)
+        self.bind_command(endpoint, slot, ClientPurpose::CreateSlot)?;
+        self.behavior = behavior;
+        Ok(())
     }
 
     pub(crate) fn bind_drop_slot(
@@ -789,6 +814,9 @@ impl ReplicationClient {
                 publications,
                 start_lsn,
                 protocol,
+                behavior,
+                manage_slot_behavior,
+                decode,
                 purpose,
                 slot_snapshot,
                 send,
@@ -805,6 +833,9 @@ impl ReplicationClient {
                     publications,
                     start_lsn: *start_lsn,
                     protocol: *protocol,
+                    behavior: *behavior,
+                    manage_slot_behavior: *manage_slot_behavior,
+                    decode,
                     purpose: *purpose,
                     slot_snapshot,
                     scram,
@@ -882,6 +913,9 @@ struct FrameSink<'a> {
     publications: &'a [SqlName],
     start_lsn: u64,
     protocol: ProtocolVersion,
+    behavior: crate::storage::SubscriptionBehavior,
+    manage_slot_behavior: bool,
+    decode: &'a mut pginput::DecodeState,
     purpose: ClientPurpose,
     slot_snapshot: &'a mut Option<SlotSnapshot>,
     scram: &'a mut Option<ScramClient>,
@@ -899,6 +933,9 @@ fn consume_frame<'a>(
         publications,
         start_lsn,
         protocol,
+        behavior,
+        manage_slot_behavior,
+        decode,
         purpose,
         slot_snapshot,
         scram,
@@ -931,12 +968,18 @@ fn consume_frame<'a>(
             transaction_status: b'I',
         } if *state == ClientState::AwaitingReady => match purpose {
             ClientPurpose::Stream => {
-                start_replication(send, slot, start_lsn, publications, protocol)
-                    .map_err(|_| ClientError::WireFull)?;
-                *state = ClientState::AwaitingCopyBoth;
+                if manage_slot_behavior {
+                    alter_replication_slot(send, slot, behavior)
+                        .map_err(|_| ClientError::WireFull)?;
+                    *state = ClientState::AwaitingSlotAlter;
+                } else {
+                    start_replication(send, slot, start_lsn, publications, protocol, behavior)
+                        .map_err(|_| ClientError::WireFull)?;
+                    *state = ClientState::AwaitingCopyBoth;
+                }
             }
             ClientPurpose::CreateSlot => {
-                create_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
+                create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingSlotResult;
             }
             ClientPurpose::DropSlot => {
@@ -967,6 +1010,18 @@ fn consume_frame<'a>(
             tag: "DROP_REPLICATION_SLOT",
         } if *state == ClientState::AwaitingDropResult => {
             *state = ClientState::CommandComplete;
+        }
+        BackendFrame::CommandComplete {
+            tag: "ALTER_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingSlotAlter => {
+            *state = ClientState::AwaitingSlotAlterReady;
+        }
+        BackendFrame::ReadyForQuery {
+            transaction_status: b'I',
+        } if *state == ClientState::AwaitingSlotAlterReady => {
+            start_replication(send, slot, start_lsn, publications, protocol, behavior)
+                .map_err(|_| ClientError::WireFull)?;
+            *state = ClientState::AwaitingCopyBoth;
         }
         BackendFrame::ReadyForQuery {
             transaction_status: b'I',
@@ -1006,7 +1061,8 @@ fn consume_frame<'a>(
             *state = ClientState::Streaming;
         }
         BackendFrame::CopyData(payload) if *state == ClientState::Streaming => {
-            let frame = pginput::copy_data(payload).map_err(FrameError::Pgoutput)?;
+            let frame =
+                pginput::copy_data_with_state(payload, decode).map_err(FrameError::Pgoutput)?;
             return Ok(Some(ClientEvent::Replication(frame)));
         }
         BackendFrame::ParameterStatus { .. }
@@ -1607,12 +1663,58 @@ fn parse_lsn(value: &str) -> Option<u64> {
     Some((u64::from_str_radix(high, 16).ok()? << 32) | u64::from_str_radix(low, 16).ok()?)
 }
 
-pub fn create_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(), WireFull> {
+pub(crate) fn create_replication_slot(
+    buffer: &mut FixedBuf,
+    slot: SqlName,
+    behavior: crate::storage::SubscriptionBehavior,
+) -> Result<(), WireFull> {
     let mark = buffer.mark();
     let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
     message.bytes(b"CREATE_REPLICATION_SLOT ");
     append_identifier(&mut message, slot.as_str());
-    message.bytes(b" LOGICAL pgoutput (SNAPSHOT 'export')");
+    message.bytes(b" LOGICAL pgoutput (SNAPSHOT 'export', TWO_PHASE ");
+    message.bytes(if behavior.two_phase {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.bytes(b", FAILOVER ");
+    message.bytes(if behavior.failover {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.u8(b')');
+    message.u8(0);
+    if message.finish().is_err() {
+        buffer.truncate_to(mark);
+        return Err(WireFull);
+    }
+    Ok(())
+}
+
+fn alter_replication_slot(
+    buffer: &mut FixedBuf,
+    slot: SqlName,
+    behavior: crate::storage::SubscriptionBehavior,
+) -> Result<(), WireFull> {
+    let mark = buffer.mark();
+    let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
+    message.bytes(b"ALTER_REPLICATION_SLOT ");
+    append_identifier(&mut message, slot.as_str());
+    message.bytes(b" (TWO_PHASE ");
+    message.bytes(if behavior.two_phase {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.bytes(b", FAILOVER ");
+    message.bytes(if behavior.failover {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.u8(b')');
     message.u8(0);
     if message.finish().is_err() {
         buffer.truncate_to(mark);
@@ -1637,12 +1739,13 @@ pub fn drop_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(),
 /// Starts a pgoutput stream at a durable LSN. Publication names cross as a
 /// SQL literal containing separately quoted identifiers, so punctuation in a
 /// legal PostgreSQL name cannot alter the replication command.
-pub fn start_replication(
+pub(crate) fn start_replication(
     buffer: &mut FixedBuf,
     slot: SqlName,
     start_lsn: u64,
     publications: &[SqlName],
     version: ProtocolVersion,
+    behavior: crate::storage::SubscriptionBehavior,
 ) -> Result<(), WireFull> {
     if publications.is_empty() {
         return Err(WireFull);
@@ -1675,6 +1778,26 @@ pub fn start_replication(
         }
         append_identifier(&mut message, publication.as_str());
     }
+    message.bytes(b"', binary '");
+    message.bytes(if behavior.binary {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.bytes(b"', streaming '");
+    message.bytes(match behavior.streaming {
+        crate::storage::SubscriptionStreaming::Off => b"off",
+        crate::storage::SubscriptionStreaming::On => b"on",
+        crate::storage::SubscriptionStreaming::Parallel => b"parallel",
+    });
+    message.bytes(b"', two_phase '");
+    message.bytes(if behavior.two_phase {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
+    message.bytes(b"', origin '");
+    message.bytes(behavior.origin.as_str().as_bytes());
     message.bytes(b"')");
     message.u8(0);
     if message.finish().is_err() {
@@ -1771,19 +1894,34 @@ mod tests {
             0xABCD_EF01,
             &publications,
             ProtocolVersion::V4,
+            crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
         )
         .unwrap();
         let command = core::str::from_utf8(&out.readable()[5..out.len() - 1]).unwrap();
         assert_eq!(
             command,
-            "START_REPLICATION SLOT \"slot\" LOGICAL 0/ABCDEF01 (proto_version '4', publication_names '\"first\", \"a\"\"b\"')"
+            "START_REPLICATION SLOT \"slot\" LOGICAL 0/ABCDEF01 (proto_version '4', publication_names '\"first\", \"a\"\"b\"', binary 'false', streaming 'parallel', two_phase 'false', origin 'any')"
         );
         out.clear();
-        create_replication_slot(&mut out, SqlName::parse("slot").unwrap()).unwrap();
+        create_replication_slot(
+            &mut out,
+            SqlName::parse("slot").unwrap(),
+            crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        )
+        .unwrap();
         let command = core::str::from_utf8(&out.readable()[5..out.len() - 1]).unwrap();
         assert_eq!(
             command,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL pgoutput (SNAPSHOT 'export')"
+            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL pgoutput (SNAPSHOT 'export', TWO_PHASE false, FAILOVER false)"
+        );
+        out.clear();
+        let mut behavior = crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT;
+        behavior.failover = true;
+        alter_replication_slot(&mut out, SqlName::parse("slot").unwrap(), behavior).unwrap();
+        let command = core::str::from_utf8(&out.readable()[5..out.len() - 1]).unwrap();
+        assert_eq!(
+            command,
+            "ALTER_REPLICATION_SLOT \"slot\" (TWO_PHASE false, FAILOVER true)"
         );
     }
 
@@ -1938,6 +2076,8 @@ mod tests {
                 publications: &[SqlName::parse("changes").unwrap()],
                 start_lsn: 0,
                 protocol: ProtocolVersion::V4,
+                behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+                manage_slot_behavior: false,
             },
             4096,
             4096,
@@ -2076,6 +2216,8 @@ mod tests {
                 publications: &[SqlName::parse("changes").unwrap()],
                 start_lsn: 0,
                 protocol: ProtocolVersion::V4,
+                behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+                manage_slot_behavior: false,
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);

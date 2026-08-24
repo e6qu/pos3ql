@@ -164,8 +164,7 @@ fn parse_cancel_request(packet: &[u8]) -> Option<CancelRequest> {
 struct ReplicationStream {
     slot: SqlName,
     /// pgoutput defaults to text; binary tuples require explicit negotiation.
-    binary: bool,
-    proto_version: super::pgoutput::ProtocolVersion,
+    options: PgoutputNegotiation,
     /// Durable slot confirmation, advanced only by a valid standby flush.
     cursor_lsn: u64,
     /// Connection-local send cursor. Reconnect starts again at `cursor_lsn`,
@@ -1274,11 +1273,14 @@ impl Conn {
         let mark = self.send.mark();
         let mut responder = Responder::new(&mut self.send);
         let now = Instant::now();
-        match engine.emit_replication_transaction(
+        match engine.emit_replication_transaction_for_origin(
             stream.scan_lsn,
-            self.replication_publications.as_slice(),
-            stream.binary,
-            stream.proto_version,
+            crate::sql::ReplicationEmission {
+                publications: self.replication_publications.as_slice(),
+                binary: stream.options.binary,
+                origin: stream.options.origin,
+                protocol: stream.options.proto_version,
+            },
             &mut self.copy_buf,
             &mut responder,
         ) {
@@ -2593,8 +2595,9 @@ impl Conn {
                 Ok(LogicalReplicationCommand::CreateSlot {
                     name,
                     export_snapshot,
+                    behavior,
                 }) => {
-                    let restart_lsn = match engine.create_replication_slot(name) {
+                    let restart_lsn = match engine.create_replication_slot(name, behavior) {
                         Ok(lsn) => lsn,
                         Err(error) => {
                             let mut responder = Responder::new(&mut self.send);
@@ -2697,12 +2700,35 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
+                Ok(LogicalReplicationCommand::AlterSlot { name, behavior }) => {
+                    if let Err(error) = engine.alter_replication_slot(name, behavior) {
+                        let mut responder = Responder::new(&mut self.send);
+                        if responder
+                            .error(error.sqlstate, error.message.as_str())
+                            .and_then(|()| responder.ready_for_query(b'I'))
+                            .is_err()
+                        {
+                            return Step::Close;
+                        }
+                        self.recv.consume(total);
+                        return Step::Continue;
+                    }
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder
+                        .command_complete("ALTER_REPLICATION_SLOT")
+                        .and_then(|()| responder.ready_for_query(b'I'))
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 Ok(LogicalReplicationCommand::Start {
                     name,
                     publication,
                     requested_lsn,
-                    binary,
-                    proto_version,
+                    options,
                 }) => {
                     self.replication_publications.clear();
                     if let Err(error) = parse_pgoutput_publication_names(
@@ -2734,8 +2760,7 @@ impl Conn {
                     }
                     self.replication_stream = Some(ReplicationStream {
                         slot: name.sql_name(),
-                        binary,
-                        proto_version,
+                        options,
                         cursor_lsn,
                         scan_lsn: cursor_lsn.max(requested_lsn),
                         last_sent_lsn: cursor_lsn.max(requested_lsn),
@@ -2861,24 +2886,41 @@ fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
                 || text
                     .trim_start()
                     .get(..21)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("drop_replication_slot"))))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("drop_replication_slot"))
+                || text
+                    .trim_start()
+                    .get(..22)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("alter_replication_slot"))))
 }
 
 enum LogicalReplicationCommand<'a> {
     CreateSlot {
         name: crate::storage::ReplicationSlotName,
         export_snapshot: bool,
+        behavior: crate::storage::ReplicationSlotBehavior,
     },
     DropSlot {
         name: crate::storage::ReplicationSlotName,
+    },
+    AlterSlot {
+        name: crate::storage::ReplicationSlotName,
+        behavior: crate::storage::ReplicationSlotBehavior,
     },
     Start {
         name: crate::storage::ReplicationSlotName,
         publication: &'a str,
         requested_lsn: u64,
-        binary: bool,
-        proto_version: super::pgoutput::ProtocolVersion,
+        options: PgoutputNegotiation,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PgoutputNegotiation {
+    binary: bool,
+    streaming: crate::storage::SubscriptionStreaming,
+    two_phase: bool,
+    origin: crate::storage::SubscriptionOrigin,
+    proto_version: super::pgoutput::ProtocolVersion,
 }
 
 fn parse_logical_replication_command(
@@ -2902,6 +2944,16 @@ fn parse_logical_replication_command(
         }
         return Ok(LogicalReplicationCommand::DropSlot { name });
     }
+    if command.eq_ignore_ascii_case("alter_replication_slot") {
+        let name = take_replication_slot_name(&mut input)?.ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "ALTER_REPLICATION_SLOT requires a slot name"
+            )
+        })?;
+        let behavior = parse_alter_slot_options(input)?;
+        return Ok(LogicalReplicationCommand::AlterSlot { name, behavior });
+    }
     if command.eq_ignore_ascii_case("start_replication") {
         let slot_keyword = take_replication_word(&mut input)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires SLOT"))?;
@@ -2924,13 +2976,12 @@ fn parse_logical_replication_command(
         }
         let requested_lsn = parse_lsn(lsn)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "invalid START_REPLICATION LSN"))?;
-        let (publication, binary, proto_version) = parse_pgoutput_options(input)?;
+        let (publication, options) = parse_pgoutput_options(input)?;
         return Ok(LogicalReplicationCommand::Start {
             name,
             publication,
             requested_lsn,
-            binary,
-            proto_version,
+            options,
         });
     }
     if !command.eq_ignore_ascii_case("create_replication_slot") {
@@ -2963,20 +3014,87 @@ fn parse_logical_replication_command(
             "only LOGICAL pgoutput replication slots are supported"
         ));
     }
-    let export_snapshot = parse_create_slot_snapshot_option(input)?;
+    let (export_snapshot, behavior) = parse_create_slot_options(input)?;
     Ok(LogicalReplicationCommand::CreateSlot {
         name,
         export_snapshot,
+        behavior,
     })
 }
 
-fn parse_create_slot_snapshot_option(input: &str) -> Result<bool, SqlError> {
-    let input = input.trim();
-    if input.is_empty() || input.eq_ignore_ascii_case("export_snapshot") {
+fn replication_option_bool(option: &str, value: Option<&str>) -> Result<bool, SqlError> {
+    let Some(value) = value else {
         return Ok(true);
+    };
+    let value = value.trim_matches('\'');
+    if ["true", "on", "yes", "1"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Ok(true)
+    } else if ["false", "off", "no", "0"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Ok(false)
+    } else {
+        Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid {} option value",
+            option
+        ))
     }
-    if input.eq_ignore_ascii_case("noexport_snapshot") {
-        return Ok(false);
+}
+
+fn parse_create_slot_options(
+    input: &str,
+) -> Result<(bool, crate::storage::ReplicationSlotBehavior), SqlError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok((true, crate::storage::ReplicationSlotBehavior::DEFAULT));
+    }
+    if !input.starts_with('(') {
+        let mut export_snapshot = true;
+        let mut behavior = crate::storage::ReplicationSlotBehavior::DEFAULT;
+        let mut saw_snapshot = false;
+        let mut saw_two_phase = false;
+        for option in input.split_ascii_whitespace() {
+            if option.eq_ignore_ascii_case("export_snapshot") {
+                if saw_snapshot {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "duplicate SNAPSHOT option"
+                    ));
+                }
+                export_snapshot = true;
+                saw_snapshot = true;
+            } else if option.eq_ignore_ascii_case("noexport_snapshot") {
+                if saw_snapshot {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "duplicate SNAPSHOT option"
+                    ));
+                }
+                export_snapshot = false;
+                saw_snapshot = true;
+            } else if option.eq_ignore_ascii_case("two_phase") {
+                if saw_two_phase {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "duplicate TWO_PHASE option"
+                    ));
+                }
+                behavior.two_phase = true;
+                saw_two_phase = true;
+            } else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "logical replication slot option \"{}\" is not supported",
+                    option
+                ));
+            }
+        }
+        return Ok((export_snapshot, behavior));
     }
     let Some(inner) = input
         .strip_prefix('(')
@@ -2987,37 +3105,108 @@ fn parse_create_slot_snapshot_option(input: &str) -> Result<bool, SqlError> {
             "logical replication slot option is not supported"
         ));
     };
-    let inner = inner.trim();
-    let Some(split) = inner.find(char::is_whitespace) else {
+    let mut export_snapshot = true;
+    let mut behavior = crate::storage::ReplicationSlotBehavior::DEFAULT;
+    let mut saw_snapshot = false;
+    let mut saw_two_phase = false;
+    let mut saw_failover = false;
+    for raw in inner.split(',') {
+        let mut words = raw.split_ascii_whitespace();
+        let option = words.next().ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "empty logical replication slot option"
+            )
+        })?;
+        let value = words.next();
+        if words.next().is_some() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid {} replication slot option",
+                option
+            ));
+        }
+        if option.eq_ignore_ascii_case("snapshot") {
+            if core::mem::replace(&mut saw_snapshot, true) {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate SNAPSHOT option"
+                ));
+            }
+            let value = value.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "SNAPSHOT requires 'export', 'use', or 'nothing'"
+                )
+            })?;
+            if value.eq_ignore_ascii_case("'export'") {
+                export_snapshot = true;
+            } else if value.eq_ignore_ascii_case("'nothing'") {
+                export_snapshot = false;
+            } else if value.eq_ignore_ascii_case("'use'") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "CREATE_REPLICATION_SLOT SNAPSHOT 'use' is not supported"
+                ));
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid SNAPSHOT option value"
+                ));
+            }
+        } else if option.eq_ignore_ascii_case("two_phase") {
+            if core::mem::replace(&mut saw_two_phase, true) {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate TWO_PHASE option"
+                ));
+            }
+            behavior.two_phase = replication_option_bool(option, value)?;
+        } else if option.eq_ignore_ascii_case("failover") {
+            if core::mem::replace(&mut saw_failover, true) {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate FAILOVER option"
+                ));
+            }
+            behavior.failover = replication_option_bool(option, value)?;
+        } else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "logical replication slot option \"{}\" is not supported",
+                option
+            ));
+        }
+    }
+    Ok((export_snapshot, behavior))
+}
+
+fn parse_alter_slot_options(
+    input: &str,
+) -> Result<crate::storage::ReplicationSlotBehavior, SqlError> {
+    let input = input.trim();
+    let Some(inner) = input
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
-            "SNAPSHOT requires 'export', 'use', or 'nothing'"
+            "ALTER_REPLICATION_SLOT requires parenthesized options"
         ));
     };
-    let (option, value) = inner.split_at(split);
-    if !option.eq_ignore_ascii_case("snapshot") {
+    if inner.split(',').any(|option| {
+        option
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("snapshot"))
+    }) {
         return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "logical replication slot option \"{}\" is not supported",
-            option
+            sqlstate::SYNTAX_ERROR,
+            "ALTER_REPLICATION_SLOT does not accept SNAPSHOT"
         ));
     }
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("'export'") {
-        Ok(true)
-    } else if value.eq_ignore_ascii_case("'nothing'") {
-        Ok(false)
-    } else if value.eq_ignore_ascii_case("'use'") {
-        Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "CREATE_REPLICATION_SLOT SNAPSHOT 'use' is not supported"
-        ))
-    } else {
-        Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "invalid SNAPSHOT option value"
-        ))
-    }
+    let (_, behavior) = parse_create_slot_options(input)?;
+    Ok(behavior)
 }
 
 fn take_replication_word<'a>(input: &mut &'a str) -> Option<&'a str> {
@@ -3084,9 +3273,7 @@ fn parse_lsn(value: &str) -> Option<u64> {
 /// Parses pgoutput's parenthesized option list without accepting ignored
 /// keys. Values are SQL-style single-quoted strings; the bounded publication
 /// name is copied only after every option has been validated.
-fn parse_pgoutput_options(
-    input: &str,
-) -> Result<(&str, bool, super::pgoutput::ProtocolVersion), SqlError> {
+fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), SqlError> {
     let mut input = input.trim();
     let Some(body) = input.strip_prefix('(') else {
         return Err(sql_err!(
@@ -3099,6 +3286,12 @@ fn parse_pgoutput_options(
     let mut proto_version = None;
     let mut binary = false;
     let mut saw_binary = false;
+    let mut streaming = crate::storage::SubscriptionStreaming::Off;
+    let mut saw_streaming = false;
+    let mut two_phase = false;
+    let mut saw_two_phase = false;
+    let mut origin = crate::storage::SubscriptionOrigin::None;
+    let mut saw_origin = false;
     loop {
         input = input.trim_start();
         if let Some(rest) = input.strip_prefix(')') {
@@ -3169,21 +3362,52 @@ fn parse_pgoutput_options(
         } else if key.eq_ignore_ascii_case("messages") {
             require_pgoutput_disabled_option("messages", value)?;
         } else if key.eq_ignore_ascii_case("two_phase") {
-            require_pgoutput_disabled_option("two_phase", value)?;
+            if saw_two_phase {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput two_phase option"
+                ));
+            }
+            two_phase = pgoutput_bool("two_phase", value)?;
+            saw_two_phase = true;
         } else if key.eq_ignore_ascii_case("streaming") {
-            if !value.eq_ignore_ascii_case("off") {
+            if saw_streaming {
                 return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "pgoutput streaming must be 'off'"
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput streaming option"
                 ));
             }
+            streaming = if value.eq_ignore_ascii_case("off") {
+                crate::storage::SubscriptionStreaming::Off
+            } else if value.eq_ignore_ascii_case("on") {
+                crate::storage::SubscriptionStreaming::On
+            } else if value.eq_ignore_ascii_case("parallel") {
+                crate::storage::SubscriptionStreaming::Parallel
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid pgoutput streaming value"
+                ));
+            };
+            saw_streaming = true;
         } else if key.eq_ignore_ascii_case("origin") {
-            if !value.eq_ignore_ascii_case("none") {
+            if saw_origin {
                 return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "pgoutput origin must be 'none'"
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput origin option"
                 ));
             }
+            origin = if value.eq_ignore_ascii_case("none") {
+                crate::storage::SubscriptionOrigin::None
+            } else if value.eq_ignore_ascii_case("any") {
+                crate::storage::SubscriptionOrigin::Any
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid pgoutput origin value"
+                ));
+            };
+            saw_origin = true;
         } else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3218,7 +3442,60 @@ fn parse_pgoutput_options(
             "publication_names contains an empty name"
         ));
     }
-    Ok((publication, binary, proto_version))
+    if streaming != crate::storage::SubscriptionStreaming::Off
+        && proto_version < super::pgoutput::ProtocolVersion::V2
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pgoutput streaming requires protocol version 2 or later"
+        ));
+    }
+    if two_phase && proto_version < super::pgoutput::ProtocolVersion::V3 {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pgoutput two_phase requires protocol version 3 or later"
+        ));
+    }
+    if streaming == crate::storage::SubscriptionStreaming::Parallel
+        && proto_version < super::pgoutput::ProtocolVersion::V4
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "parallel pgoutput streaming requires protocol version 4"
+        ));
+    }
+    Ok((
+        publication,
+        PgoutputNegotiation {
+            binary,
+            streaming,
+            two_phase,
+            origin,
+            proto_version,
+        },
+    ))
+}
+
+fn pgoutput_bool(option: &str, value: &str) -> Result<bool, SqlError> {
+    if value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("yes")
+        || value == "1"
+    {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
+        || value == "0"
+    {
+        Ok(false)
+    } else {
+        Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid pgoutput {} value",
+            option
+        ))
+    }
 }
 
 fn require_pgoutput_disabled_option(option: &str, value: &str) -> Result<(), SqlError> {
@@ -4024,12 +4301,14 @@ mod tests {
         let LogicalReplicationCommand::CreateSlot {
             name,
             export_snapshot,
+            behavior,
         } = command
         else {
             panic!("expected CREATE_REPLICATION_SLOT")
         };
         assert_eq!(name.as_str(), "changes");
         assert!(!export_snapshot);
+        assert_eq!(behavior, crate::storage::ReplicationSlotBehavior::DEFAULT);
         assert!(
             parse_logical_replication_command(
                 "CREATE_REPLICATION_SLOT changes LOGICAL test_decoding"
@@ -4082,6 +4361,32 @@ mod tests {
                 ..
             })
         ));
+        let options = parse_logical_replication_command(
+            "CREATE_REPLICATION_SLOT changes2 LOGICAL pgoutput (SNAPSHOT 'export', TWO_PHASE false, FAILOVER true)",
+        )
+        .unwrap();
+        assert!(matches!(
+            options,
+            LogicalReplicationCommand::CreateSlot {
+                behavior: crate::storage::ReplicationSlotBehavior {
+                    two_phase: false,
+                    failover: true,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_logical_replication_command(
+                "ALTER_REPLICATION_SLOT changes2 (TWO_PHASE false, FAILOVER true)"
+            ),
+            Ok(LogicalReplicationCommand::AlterSlot {
+                behavior: crate::storage::ReplicationSlotBehavior {
+                    two_phase: false,
+                    failover: true,
+                },
+                ..
+            })
+        ));
         let dropped =
             parse_logical_replication_command("DROP_REPLICATION_SLOT \"changes\"").unwrap();
         let LogicalReplicationCommand::DropSlot { name } = dropped else {
@@ -4100,8 +4405,7 @@ mod tests {
             name,
             publication,
             requested_lsn,
-            binary,
-            proto_version,
+            options,
         } = command
         else {
             panic!("expected START_REPLICATION")
@@ -4109,24 +4413,30 @@ mod tests {
         assert_eq!(name.as_str(), "changes");
         assert_eq!(publication, "changes_pub");
         assert_eq!(requested_lsn, 0);
-        assert!(!binary);
-        assert_eq!(proto_version, crate::pg::pgoutput::ProtocolVersion::V1);
+        assert!(!options.binary);
+        assert_eq!(
+            options.proto_version,
+            crate::pg::pgoutput::ProtocolVersion::V1
+        );
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'true', proto_version '1')",
         )
         .unwrap();
-        let LogicalReplicationCommand::Start { binary, .. } = command else {
+        let LogicalReplicationCommand::Start { options, .. } = command else {
             panic!("expected START_REPLICATION")
         };
-        assert!(binary);
+        assert!(options.binary);
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub')",
         )
         .unwrap();
-        let LogicalReplicationCommand::Start { proto_version, .. } = command else {
+        let LogicalReplicationCommand::Start { options, .. } = command else {
             panic!("expected START_REPLICATION")
         };
-        assert_eq!(proto_version, crate::pg::pgoutput::ProtocolVersion::V2);
+        assert_eq!(
+            options.proto_version,
+            crate::pg::pgoutput::ProtocolVersion::V2
+        );
         for (value, expected) in [
             ("3", crate::pg::pgoutput::ProtocolVersion::V3),
             ("4", crate::pg::pgoutput::ProtocolVersion::V4),
@@ -4135,10 +4445,10 @@ mod tests {
                 "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '{value}', publication_names 'changes_pub', messages 'FALSE', streaming 'off', two_phase '0', origin 'none')"
             );
             let command = parse_logical_replication_command(&input).unwrap();
-            let LogicalReplicationCommand::Start { proto_version, .. } = command else {
+            let LogicalReplicationCommand::Start { options, .. } = command else {
                 panic!("expected START_REPLICATION")
             };
-            assert_eq!(proto_version, expected);
+            assert_eq!(options.proto_version, expected);
         }
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 1/2 (proto_version '1', publication_names 'changes_pub')",
@@ -4167,6 +4477,20 @@ mod tests {
         let mut publications = FixedVec::new(&mut budget, "test publications", 1).unwrap();
         parse_pgoutput_publication_names(publication, &mut publications).unwrap();
         assert_eq!(publications.as_slice()[0].as_str(), "O'Brien");
+        let LogicalReplicationCommand::Start { options, .. } =
+            parse_logical_replication_command(
+                "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '4', publication_names 'changes_pub', streaming 'parallel', two_phase 'true', origin 'any')",
+            )
+            .unwrap()
+        else {
+            panic!("expected START_REPLICATION")
+        };
+        assert_eq!(
+            options.streaming,
+            crate::storage::SubscriptionStreaming::Parallel
+        );
+        assert!(options.two_phase);
+        assert_eq!(options.origin, crate::storage::SubscriptionOrigin::Any);
         assert!(
             parse_logical_replication_command(
                 "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1')"
@@ -4176,8 +4500,8 @@ mod tests {
         for input in [
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '5', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', streaming 'true')",
-            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '3', publication_names 'changes_pub', two_phase 'true')",
-            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '4', publication_names 'changes_pub', origin 'any')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub', two_phase 'true')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '4', publication_names 'changes_pub', origin 'local')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/not-lsn (proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub,')",

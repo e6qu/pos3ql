@@ -10,7 +10,7 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::pg::{
-    pginput::{OldTuple, Tuple, TupleColumn},
+    pginput::{OldTuple, Tuple, TupleColumn, UpdateIdentity},
     subscription_apply::RelationBinding,
 };
 use crate::sql_err;
@@ -6191,6 +6191,7 @@ fn remove_schema_from_publications(
                 publish_delete: definition.publish_delete,
                 publish_truncate: definition.publish_truncate,
                 publish_via_partition_root: definition.publish_via_partition_root,
+                publish_generated_columns: definition.publish_generated_columns,
             },
         ) {
             storage.rollback_publication_alter(slot, prior);
@@ -6220,6 +6221,7 @@ pub fn create_publication(
     schemas: &[&str],
     publish: crate::sql::ast::PublicationOperations,
     publish_via_partition_root: bool,
+    publish_generated_columns: crate::sql::ast::PublishGeneratedColumns,
     responder: &mut Responder,
 ) -> Outcome {
     if all_tables && (!tables.is_empty() || !schemas.is_empty()) {
@@ -6254,6 +6256,7 @@ pub fn create_publication(
             publish_delete: publish.delete,
             publish_truncate: publish.truncate,
             publish_via_partition_root,
+            publish_generated_columns: publish_generated_columns.into(),
         },
         txn.txid,
     ) {
@@ -6278,6 +6281,7 @@ pub fn create_publication(
                     publish_delete: publish.delete,
                     publish_truncate: publish.truncate,
                     publish_via_partition_root,
+                    publish_generated_columns: publish_generated_columns.into(),
                 },
             ) {
                 storage.rollback_publication_create(slot);
@@ -6425,6 +6429,12 @@ pub fn create_subscription(
             "must be superuser to create subscriptions"
         ));
     }
+    if options.behavior.two_phase {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "two_phase subscriptions require durable prepared transactions, which are not supported by the object-native transaction model"
+        ));
+    }
     let name = match SqlName::parse(name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -6508,6 +6518,7 @@ pub fn create_subscription(
             publications: &publication_names[..publications.len()],
             enabled: options.enabled,
             slot: publisher_slot,
+            behavior: options.behavior.into(),
             bootstrap,
         },
         txn.txid,
@@ -6533,6 +6544,7 @@ pub fn create_subscription(
             publication_count: publications.len(),
             enabled: options.enabled,
             slot: publisher_slot,
+            behavior: options.behavior.into(),
             bootstrap,
         },
     ) {
@@ -6567,6 +6579,15 @@ pub fn alter_subscription(
     if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
         return sql_fail(error);
     }
+    let actor_superuser = storage
+        .current_role_slot(txn.txid)
+        .is_some_and(|role| storage.role(role).attributes_to(txn.txid).superuser);
+    if !actor_superuser && !subscription.behavior.password_required {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "only superusers may modify subscriptions with password_required = false"
+        ));
+    }
     match action {
         crate::sql::ast::AlterSubscriptionAction::Enable
         | crate::sql::ast::AlterSubscriptionAction::Disable => {
@@ -6578,7 +6599,7 @@ pub fn alter_subscription(
                         "cannot enable a subscription without an existing publisher slot"
                     ));
                 }
-                let (connection, _, _) = storage.subscription_definition_to(slot, txn.txid);
+                let (connection, _, _, _, _) = storage.subscription_definition_to(slot, txn.txid);
                 if let Err(error) = validate_enabled_subscription(connection) {
                     return sql_fail(error);
                 }
@@ -6617,68 +6638,70 @@ pub fn alter_subscription(
             {
                 return sql_fail(error);
             }
-            let (_, publications, publication_count) =
+            let (_, publications, publication_count, publisher_slot, behavior) =
                 storage.subscription_definition_to(slot, txn.txid);
             if let Err(error) = alter_subscription_definition(
                 storage,
                 wal,
                 txn,
-                slot,
-                name,
-                connection,
-                &publications[..publication_count],
+                SubscriptionDefinitionUpdate {
+                    slot,
+                    name,
+                    connection,
+                    publications: &publications[..publication_count],
+                    publisher_slot,
+                    behavior,
+                },
             ) {
                 return sql_fail(error);
             }
         }
-        crate::sql::ast::AlterSubscriptionAction::SetPublications {
-            publications,
-            refresh,
-        } => {
-            let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
-            if publications.is_empty() {
-                return sql_fail(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "subscription publication list must not be empty"
-                ));
-            }
-            if publications.len() > names.len() {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many publications in subscription (limit {})",
-                    names.len()
-                ));
-            }
-            for (index, publication) in publications.iter().enumerate() {
-                let publication = match SqlName::parse(publication) {
-                    Ok(publication) => publication,
-                    Err(error) => return sql_fail(error),
-                };
-                if names[..index].contains(&publication) {
-                    return sql_fail(sql_err!(
-                        sqlstate::DUPLICATE_OBJECT,
-                        "publication \"{}\" is listed more than once",
-                        publication.as_str()
-                    ));
-                }
-                names[index] = publication;
-            }
-            let (connection, _, _) = storage.subscription_definition_to(slot, txn.txid);
+        action @ (crate::sql::ast::AlterSubscriptionAction::SetPublications { .. }
+        | crate::sql::ast::AlterSubscriptionAction::AddPublications { .. }
+        | crate::sql::ast::AlterSubscriptionAction::DropPublications { .. }) => {
+            let (requested, refresh, operation) = match action {
+                crate::sql::ast::AlterSubscriptionAction::SetPublications {
+                    publications,
+                    refresh,
+                } => (publications, refresh, SubscriptionPublicationChange::Set),
+                crate::sql::ast::AlterSubscriptionAction::AddPublications {
+                    publications,
+                    refresh,
+                } => (publications, refresh, SubscriptionPublicationChange::Add),
+                crate::sql::ast::AlterSubscriptionAction::DropPublications {
+                    publications,
+                    refresh,
+                } => (publications, refresh, SubscriptionPublicationChange::Drop),
+                _ => unreachable!(),
+            };
+            let (connection, current, current_count, publisher_slot, behavior) =
+                storage.subscription_definition_to(slot, txn.txid);
+            let (names, count) = match subscription_publication_change(
+                &current[..current_count],
+                requested,
+                operation,
+            ) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            };
             if let Err(error) = alter_subscription_definition(
                 storage,
                 wal,
                 txn,
-                slot,
-                name,
-                connection,
-                &names[..publications.len()],
+                SubscriptionDefinitionUpdate {
+                    slot,
+                    name,
+                    connection,
+                    publications: &names[..count],
+                    publisher_slot,
+                    behavior,
+                },
             ) {
                 return sql_fail(error);
             }
-            if matches!(
-                refresh,
-                crate::sql::ast::SubscriptionPublicationRefresh::Refresh
-            ) && let Err(error) = stage_subscription_refresh(storage, wal, txn, slot, name, true)
+            if let crate::sql::ast::SubscriptionPublicationRefresh::Refresh { copy_data } = refresh
+                && let Err(error) =
+                    stage_subscription_refresh(storage, wal, txn, slot, name, copy_data)
             {
                 return sql_fail(error);
             }
@@ -6689,8 +6712,290 @@ pub fn alter_subscription(
                 return sql_fail(error);
             }
         }
+        crate::sql::ast::AlterSubscriptionAction::SetOptions(patch) => {
+            let alters_remote_slot = patch.failover.is_some() || patch.two_phase == Some(false);
+            if alters_remote_slot && txn.is_explicit() {
+                return sql_fail(sql_err!(
+                    sqlstate::ACTIVE_SQL_TRANSACTION,
+                    "ALTER SUBSCRIPTION SET (failover or two_phase) cannot run inside a transaction block"
+                ));
+            }
+            let (connection, publications, publication_count, mut publisher_slot, mut behavior) =
+                storage.subscription_definition_to(slot, txn.txid);
+            if (patch.failover.is_some() || patch.two_phase.is_some())
+                && subscription.enabled_to(txn.txid)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot set failover or two_phase for an enabled subscription"
+                ));
+            }
+            if let Some(setting) = patch.slot {
+                publisher_slot = match setting {
+                    crate::sql::ast::SubscriptionSlotSetting::Named(value) => {
+                        match crate::storage::ReplicationSlotName::parse(value) {
+                            Ok(name) => crate::storage::SubscriptionSlot::External(name),
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    crate::sql::ast::SubscriptionSlotSetting::Absent => {
+                        crate::storage::SubscriptionSlot::Absent
+                    }
+                };
+            }
+            if alters_remote_slot && publisher_slot.name().is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot alter failover or two_phase without an associated replication slot"
+                ));
+            }
+            if publisher_slot.name().is_none() && subscription.enabled_to(txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot set slot_name = NONE for an enabled subscription"
+                ));
+            }
+            if let Some(value) = patch.binary {
+                behavior.binary = value;
+            }
+            if let Some(value) = patch.streaming {
+                behavior.streaming = value.into();
+            }
+            if let Some(value) = patch.synchronous_commit {
+                behavior.synchronous_commit = value.into();
+            }
+            if let Some(value) = patch.two_phase {
+                if value {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "two_phase subscriptions require durable prepared transactions, which are not supported by the object-native transaction model"
+                    ));
+                }
+                behavior.two_phase = value;
+            }
+            if let Some(value) = patch.disable_on_error {
+                behavior.disable_on_error = value;
+            }
+            if let Some(value) = patch.password_required {
+                if !value && !actor_superuser {
+                    return sql_fail(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "only superusers may set password_required = false"
+                    ));
+                }
+                behavior.password_required = value;
+            }
+            if let Some(value) = patch.run_as_owner {
+                behavior.run_as_owner = value;
+            }
+            if let Some(value) = patch.origin {
+                behavior.origin = value.into();
+            }
+            if let Some(value) = patch.failover {
+                behavior.failover = value;
+            }
+            if let Err(error) = alter_subscription_definition(
+                storage,
+                wal,
+                txn,
+                SubscriptionDefinitionUpdate {
+                    slot,
+                    name,
+                    connection,
+                    publications: &publications[..publication_count],
+                    publisher_slot,
+                    behavior,
+                },
+            ) {
+                return sql_fail(error);
+            }
+        }
+        crate::sql::ast::AlterSubscriptionAction::Skip { lsn } => {
+            let (connection, publications, publication_count, publisher_slot, mut behavior) =
+                storage.subscription_definition_to(slot, txn.txid);
+            behavior.skip_lsn = lsn;
+            if let Err(error) = alter_subscription_definition(
+                storage,
+                wal,
+                txn,
+                SubscriptionDefinitionUpdate {
+                    slot,
+                    name,
+                    connection,
+                    publications: &publications[..publication_count],
+                    publisher_slot,
+                    behavior,
+                },
+            ) {
+                return sql_fail(error);
+            }
+        }
+        crate::sql::ast::AlterSubscriptionAction::SetOwner(role_name) => {
+            let role_name = resolve_role_name(role_name);
+            let Some(new_owner) = storage.find_role_visible(role_name.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    role_name.as_str()
+                ));
+            };
+            let Some(current_role) = storage.current_role_slot(txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                ));
+            };
+            let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+            if !superuser
+                && current_role != new_owner
+                && !storage.role_can_set(current_role, new_owner, txn.txid)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be able to SET ROLE \"{}\"",
+                    role_name.as_str()
+                ));
+            }
+            let prior = match storage.set_subscription_owner(slot, new_owner, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetSubscriptionOwner {
+                    name,
+                    owner: new_owner as u16,
+                },
+            ) {
+                storage.restore_subscription_owner_pending(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionOwnerChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_subscription_owner_pending(slot, prior);
+                return sql_fail(error);
+            }
+        }
+        crate::sql::ast::AlterSubscriptionAction::Rename(new_name) => {
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.rename_subscription(slot, new_name, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenameSubscription {
+                    name,
+                    new_name: new_name.as_str(),
+                },
+            ) {
+                storage.rollback_subscription_rename(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_subscription_rename(slot, prior);
+                return sql_fail(error);
+            }
+        }
     }
     Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?))
+}
+
+#[derive(Clone, Copy)]
+enum SubscriptionPublicationChange {
+    Set,
+    Add,
+    Drop,
+}
+
+fn subscription_publication_change(
+    current: &[SqlName],
+    requested: &[&str],
+    operation: SubscriptionPublicationChange,
+) -> Result<
+    (
+        [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
+        usize,
+    ),
+    SqlError,
+> {
+    if requested.is_empty() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subscription publication list must not be empty"
+        ));
+    }
+    let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+    let mut count = 0usize;
+    if !matches!(operation, SubscriptionPublicationChange::Set) {
+        names[..current.len()].copy_from_slice(current);
+        count = current.len();
+    }
+    for (request_index, requested_name) in requested.iter().enumerate() {
+        let publication = SqlName::parse(requested_name)?;
+        if requested[..request_index]
+            .iter()
+            .any(|candidate| SqlName::parse(candidate).is_ok_and(|name| name == publication))
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "publication \"{}\" is listed more than once",
+                publication.as_str()
+            ));
+        }
+        match operation {
+            SubscriptionPublicationChange::Set | SubscriptionPublicationChange::Add => {
+                if names[..count].contains(&publication) {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "publication \"{}\" is already subscribed",
+                        publication.as_str()
+                    ));
+                }
+                if count == names.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many publications in subscription (limit {})",
+                        names.len()
+                    ));
+                }
+                names[count] = publication;
+                count += 1;
+            }
+            SubscriptionPublicationChange::Drop => {
+                let Some(index) = names[..count].iter().position(|name| *name == publication)
+                else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "publication \"{}\" is not subscribed",
+                        publication.as_str()
+                    ));
+                };
+                names.copy_within(index + 1..count, index);
+                count -= 1;
+                names[count] = SqlName::EMPTY;
+            }
+        }
+    }
+    if count == 0 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subscription publication list must not be empty"
+        ));
+    }
+    Ok((names, count))
 }
 
 fn stage_subscription_refresh(
@@ -6748,21 +7053,42 @@ fn validate_enabled_subscription(
     connection.require_endpoint().map(|_| ())
 }
 
+struct SubscriptionDefinitionUpdate<'a> {
+    slot: usize,
+    name: &'a str,
+    connection: crate::storage::SubscriptionConnInfo,
+    publications: &'a [SqlName],
+    publisher_slot: crate::storage::SubscriptionSlot,
+    behavior: crate::storage::SubscriptionBehavior,
+}
+
 fn alter_subscription_definition(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    slot: usize,
-    name: &str,
-    connection: crate::storage::SubscriptionConnInfo,
-    publications: &[SqlName],
+    update: SubscriptionDefinitionUpdate<'_>,
 ) -> Result<(), SqlError> {
-    let change = storage.set_subscription_definition(slot, connection, publications, txn.txid)?;
+    let SubscriptionDefinitionUpdate {
+        slot,
+        name,
+        connection,
+        publications,
+        publisher_slot,
+        behavior,
+    } = update;
+    let change = storage.set_subscription_definition(
+        slot,
+        connection,
+        publications,
+        publisher_slot,
+        behavior,
+        txn.txid,
+    )?;
     if !change.changed {
         return Ok(());
     }
     let prior = change.prior;
-    let (connection, publications, publication_count) =
+    let (connection, publications, publication_count, publisher_slot, behavior) =
         storage.subscription_definition_to(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
@@ -6773,6 +7099,8 @@ fn alter_subscription_definition(
             connection: connection.as_str(),
             publications,
             publication_count,
+            slot: publisher_slot,
+            behavior,
         },
     ) {
         storage.restore_subscription_definition(slot, prior);
@@ -6956,6 +7284,7 @@ pub fn alter_publication(
         crate::sql::ast::AlterPublicationAction::SetOptions {
             publish,
             publish_via_partition_root,
+            publish_generated_columns,
         } => {
             if let Some(operations) = publish {
                 definition.publish_insert = operations.insert;
@@ -6965,6 +7294,9 @@ pub fn alter_publication(
             }
             if let Some(via_root) = publish_via_partition_root {
                 definition.publish_via_partition_root = via_root;
+            }
+            if let Some(generated) = publish_generated_columns {
+                definition.publish_generated_columns = generated.into();
             }
         }
         crate::sql::ast::AlterPublicationAction::SetTargets { tables, schemas } => {
@@ -7149,6 +7481,7 @@ pub fn alter_publication(
             publish_delete: definition.publish_delete,
             publish_truncate: definition.publish_truncate,
             publish_via_partition_root: definition.publish_via_partition_root,
+            publish_generated_columns: definition.publish_generated_columns,
         },
     ) {
         storage.rollback_publication_alter(slot, prior);
@@ -21682,6 +22015,12 @@ pub struct ReplicationRow {
     rowid: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReplicationUpdate<'a> {
+    pub identity: UpdateIdentity<'a>,
+    pub new: Tuple<'a>,
+}
+
 impl ReplicationRow {
     pub fn table_slot(self) -> usize {
         self.table_slot
@@ -21703,6 +22042,30 @@ pub fn locate_replication_row(
     arena: &Arena,
 ) -> Result<ReplicationRow, SqlError> {
     let expected = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    locate_replication_row_by_values(
+        storage,
+        txn,
+        binding,
+        &expected,
+        binding.old_remote_to_local(old.identity),
+        arena,
+    )
+}
+
+fn locate_replication_row_by_values(
+    storage: &Storage,
+    txn: &TxnState,
+    binding: RelationBinding,
+    expected: &[Datum<'_>; MAX_COLUMNS],
+    identity_columns: &[usize],
+    arena: &Arena,
+) -> Result<ReplicationRow, SqlError> {
+    if identity_columns.is_empty() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription UPDATE has no replica identity columns"
+        ));
+    }
     let table_index = binding.table_slot();
     let definition = storage.table_def(table_index, txn.txid);
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -21721,20 +22084,17 @@ pub fn locate_replication_row(
             let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
             let mut actual = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..definition.n_columns], &mut actual)?;
-            let equal = binding.old_remote_to_local(old.identity).iter().try_fold(
-                true,
-                |same, &column| {
-                    if !same {
-                        return Ok(false);
-                    }
-                    let left = &expected[column];
-                    let right = &actual[column];
-                    if left.is_null() || right.is_null() {
-                        return Ok(left.is_null() && right.is_null());
-                    }
-                    compare_datums(left, right).map(|ordering| ordering.is_eq())
-                },
-            )?;
+            let equal = identity_columns.iter().try_fold(true, |same, &column| {
+                if !same {
+                    return Ok(false);
+                }
+                let left = &expected[column];
+                let right = &actual[column];
+                if left.is_null() || right.is_null() {
+                    return Ok(left.is_null() && right.is_null());
+                }
+                compare_datums(left, right).map(|ordering| ordering.is_eq())
+            })?;
             if equal
                 && found
                     .replace(ReplicationRow {
@@ -21857,16 +22217,40 @@ pub fn apply_replication_delete(
 /// actions, and pending-version path as SQL UPDATE.  An unchanged-TOAST field
 /// is copied only from the uniquely locked local row; it can never be
 /// reinterpreted as a NULL or as a value from a different replica identity.
-pub fn apply_replication_update(
+pub(crate) fn apply_replication_update(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
-    old: OldTuple<'_>,
-    new: Tuple<'_>,
+    update: ReplicationUpdate<'_>,
     arena: &Arena,
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
-    let row = locate_replication_row(storage, txn, binding, old, arena)?;
+    let ReplicationUpdate { identity, new } = update;
+    let row = match identity {
+        UpdateIdentity::Old(old) => locate_replication_row(storage, txn, binding, old, arena)?,
+        UpdateIdentity::NewTupleKey => {
+            let expected = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+            for (remote, field) in new.columns().iter().enumerate() {
+                let local = binding.remote_to_local()[remote];
+                if binding.key_local_columns().contains(&local)
+                    && matches!(field, TupleColumn::UnchangedToast)
+                {
+                    return Err(sql_err!(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "subscription UPDATE omits a replica identity key value"
+                    ));
+                }
+            }
+            locate_replication_row_by_values(
+                storage,
+                txn,
+                binding,
+                &expected,
+                binding.key_local_columns(),
+                arena,
+            )?
+        }
+    };
     let table_index = binding.table_slot();
     let row_table = row.table_slot();
     match storage.acquire_row_lock(

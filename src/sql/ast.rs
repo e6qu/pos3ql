@@ -308,6 +308,7 @@ pub enum Stmt<'a> {
         schemas: &'a [&'a str],
         publish: PublicationOperations,
         publish_via_partition_root: bool,
+        publish_generated_columns: PublishGeneratedColumns,
     },
     /// ALTER PUBLICATION name SET (publish = ...) or change its explicit
     /// relation membership.
@@ -680,6 +681,81 @@ pub struct SubscriptionOptions<'a> {
     pub enabled: bool,
     pub copy_data: bool,
     pub slot: SubscriptionSlotPlan<'a>,
+    pub behavior: SubscriptionBehavior,
+}
+
+/// PostgreSQL-visible behavior retained by a subscription after creation.
+/// Defaults are resolved by the parser, so the catalog and worker receive one
+/// complete state rather than a bag of optional strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionBehavior {
+    pub binary: bool,
+    pub streaming: SubscriptionStreaming,
+    pub synchronous_commit: SubscriptionSynchronousCommit,
+    pub two_phase: bool,
+    pub disable_on_error: bool,
+    pub password_required: bool,
+    pub run_as_owner: bool,
+    pub origin: SubscriptionOrigin,
+    pub failover: bool,
+}
+
+impl SubscriptionBehavior {
+    pub const POSTGRESQL_18_DEFAULT: Self = Self {
+        binary: false,
+        streaming: SubscriptionStreaming::Parallel,
+        synchronous_commit: SubscriptionSynchronousCommit::Off,
+        two_phase: false,
+        disable_on_error: false,
+        password_required: true,
+        run_as_owner: false,
+        origin: SubscriptionOrigin::Any,
+        failover: false,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionStreaming {
+    Off,
+    On,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionSynchronousCommit {
+    Off,
+    Local,
+    RemoteWrite,
+    On,
+    RemoteApply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionOrigin {
+    None,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionSlotSetting<'a> {
+    Named(&'a str),
+    Absent,
+}
+
+/// Transactional `ALTER SUBSCRIPTION SET` patch. Each field is typed before
+/// execution; `None` means the SQL did not name that setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionSettingsPatch<'a> {
+    pub slot: Option<SubscriptionSlotSetting<'a>>,
+    pub binary: Option<bool>,
+    pub streaming: Option<SubscriptionStreaming>,
+    pub synchronous_commit: Option<SubscriptionSynchronousCommit>,
+    pub two_phase: Option<bool>,
+    pub disable_on_error: Option<bool>,
+    pub password_required: Option<bool>,
+    pub run_as_owner: Option<bool>,
+    pub origin: Option<SubscriptionOrigin>,
+    pub failover: Option<bool>,
 }
 
 /// Whether CREATE SUBSCRIPTION may contact the publisher. `Deferred` is the
@@ -716,9 +792,23 @@ pub enum AlterSubscriptionAction<'a> {
         publications: &'a [&'a str],
         refresh: SubscriptionPublicationRefresh,
     },
+    AddPublications {
+        publications: &'a [&'a str],
+        refresh: SubscriptionPublicationRefresh,
+    },
+    DropPublications {
+        publications: &'a [&'a str],
+        refresh: SubscriptionPublicationRefresh,
+    },
     RefreshPublications {
         copy_data: bool,
     },
+    SetOptions(SubscriptionSettingsPatch<'a>),
+    Skip {
+        lsn: Option<u64>,
+    },
+    SetOwner(&'a str),
+    Rename(&'a str),
 }
 
 /// The instant at which a trigger observes a DML change.
@@ -859,7 +949,7 @@ pub enum AlterTriggerAction<'a> {
 /// a stream-definition change and is never inferred from an omitted option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionPublicationRefresh {
-    Refresh,
+    Refresh { copy_data: bool },
     NoRefresh,
 }
 
@@ -871,6 +961,7 @@ pub enum AlterPublicationAction<'a> {
     SetOptions {
         publish: Option<PublicationOperations>,
         publish_via_partition_root: Option<bool>,
+        publish_generated_columns: Option<PublishGeneratedColumns>,
     },
     SetOwner(&'a str),
     Rename(&'a str),
@@ -886,6 +977,12 @@ pub enum AlterPublicationAction<'a> {
         tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishGeneratedColumns {
+    None,
+    Stored,
 }
 
 impl PublicationOperations {

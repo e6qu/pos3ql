@@ -112,6 +112,9 @@ const KIND_RESET_SUBSCRIPTION_RELATIONS: u8 = 62;
 const KIND_ADD_SUBSCRIPTION_RELATION: u8 = 63;
 const KIND_COMPLETE_SUBSCRIPTION_CLEANUP: u8 = 64;
 const KIND_FAIL_SUBSCRIPTION: u8 = 65;
+const KIND_SET_SUBSCRIPTION_OWNER: u8 = 66;
+const KIND_RENAME_SUBSCRIPTION: u8 = 67;
+const KIND_ALTER_REPLICATION_SLOT: u8 = 68;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -119,7 +122,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_FAIL_SUBSCRIPTION;
+const LAST_KIND: u8 = KIND_ALTER_REPLICATION_SLOT;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -421,6 +424,7 @@ pub(crate) enum WalOp<'a> {
         publish_delete: bool,
         publish_truncate: bool,
         publish_via_partition_root: bool,
+        publish_generated_columns: crate::storage::PublishGeneratedColumns,
     },
     DropPublication {
         name: &'a str,
@@ -442,6 +446,7 @@ pub(crate) enum WalOp<'a> {
         publish_delete: bool,
         publish_truncate: bool,
         publish_via_partition_root: bool,
+        publish_generated_columns: crate::storage::PublishGeneratedColumns,
     },
     SetPublicationOwner {
         name: &'a str,
@@ -459,6 +464,7 @@ pub(crate) enum WalOp<'a> {
         publication_count: usize,
         enabled: bool,
         slot: crate::storage::SubscriptionSlot,
+        behavior: crate::storage::SubscriptionBehavior,
         bootstrap: crate::storage::SubscriptionBootstrap,
     },
     DropSubscription {
@@ -509,6 +515,16 @@ pub(crate) enum WalOp<'a> {
         connection: &'a str,
         publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
         publication_count: usize,
+        slot: crate::storage::SubscriptionSlot,
+        behavior: crate::storage::SubscriptionBehavior,
+    },
+    SetSubscriptionOwner {
+        name: &'a str,
+        owner: u16,
+    },
+    RenameSubscription {
+        name: &'a str,
+        new_name: &'a str,
     },
     CreateTrigger {
         name: &'a str,
@@ -549,6 +565,11 @@ pub(crate) enum WalOp<'a> {
     CreateReplicationSlot {
         name: &'a str,
         restart_lsn: u64,
+        behavior: crate::storage::ReplicationSlotBehavior,
+    },
+    AlterReplicationSlot {
+        name: &'a str,
+        behavior: crate::storage::ReplicationSlotBehavior,
     },
     DropReplicationSlot {
         name: &'a str,
@@ -1435,6 +1456,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CompleteSubscriptionCleanup { .. } => KIND_COMPLETE_SUBSCRIPTION_CLEANUP,
         WalOp::FailSubscription { .. } => KIND_FAIL_SUBSCRIPTION,
         WalOp::AlterSubscription { .. } => KIND_ALTER_SUBSCRIPTION,
+        WalOp::SetSubscriptionOwner { .. } => KIND_SET_SUBSCRIPTION_OWNER,
+        WalOp::RenameSubscription { .. } => KIND_RENAME_SUBSCRIPTION,
+        WalOp::AlterReplicationSlot { .. } => KIND_ALTER_REPLICATION_SLOT,
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
         WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
@@ -1643,6 +1667,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .sum::<usize>()
                 + 1
                 + 1
+                + 18
                 + match slot {
                     crate::storage::SubscriptionSlot::Absent => 1,
                     crate::storage::SubscriptionSlot::External(name)
@@ -1669,6 +1694,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             connection,
             publications,
             publication_count,
+            slot,
+            ..
         } => {
             1 + name.len()
                 + 2
@@ -1678,7 +1705,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .iter()
                     .map(|publication| 1 + publication.as_str().len())
                     .sum::<usize>()
+                + 18
+                + match slot {
+                    crate::storage::SubscriptionSlot::Absent => 1,
+                    crate::storage::SubscriptionSlot::External(name)
+                    | crate::storage::SubscriptionSlot::Managed(name) => 2 + name.as_str().len(),
+                }
         }
+        WalOp::SetSubscriptionOwner { name, .. } => 1 + name.len() + 2,
+        WalOp::RenameSubscription { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::CreateTrigger {
             name,
             target: _,
@@ -1728,7 +1763,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
         WalOp::Commit { .. } => 4,
-        WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8,
+        WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8 + 1,
+        WalOp::AlterReplicationSlot { name, .. } => 1 + name.len() + 1,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
         WalOp::AdvanceReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::CreateIndex {
@@ -2154,6 +2190,24 @@ pub(crate) fn encoded_record_len(operation: &WalOp) -> usize {
     HEADER_LEN + encoded_payload_len(operation)
 }
 
+fn append_subscription_behavior(
+    buffer: &mut FixedBuf,
+    behavior: crate::storage::SubscriptionBehavior,
+) -> bool {
+    buffer.append(&[
+        u8::from(behavior.binary),
+        behavior.streaming.code(),
+        behavior.synchronous_commit.code(),
+        u8::from(behavior.two_phase),
+        u8::from(behavior.disable_on_error),
+        u8::from(behavior.password_required),
+        u8::from(behavior.run_as_owner),
+        behavior.origin.code(),
+        u8::from(behavior.failover),
+        u8::from(behavior.skip_lsn.is_some()),
+    ]) && buffer.append(&behavior.skip_lsn.unwrap_or(0).to_le_bytes())
+}
+
 fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
         buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
@@ -2331,6 +2385,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publish_delete,
             publish_truncate,
             publish_via_partition_root,
+            publish_generated_columns,
             schemas,
             schema_count,
         } => {
@@ -2340,6 +2395,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u8::from(*publish_delete) << 3)
                 | (u8::from(*publish_truncate) << 4)
                 | (u8::from(*publish_via_partition_root) << 5);
+            let flags = flags
+                | (u8::from(matches!(
+                    publish_generated_columns,
+                    crate::storage::PublishGeneratedColumns::Stored
+                )) << 6);
             let mut ok = name_bytes(buffer, name)
                 && buffer.append(&owner.to_le_bytes())
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
@@ -2372,6 +2432,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publish_delete,
             publish_truncate,
             publish_via_partition_root,
+            publish_generated_columns,
         } => {
             let flags = u8::from(*all_tables)
                 | (u8::from(*publish_insert) << 1)
@@ -2379,6 +2440,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u8::from(*publish_delete) << 3)
                 | (u8::from(*publish_truncate) << 4)
                 | (u8::from(*publish_via_partition_root) << 5);
+            let flags = flags
+                | (u8::from(matches!(
+                    publish_generated_columns,
+                    crate::storage::PublishGeneratedColumns::Stored
+                )) << 6);
             let mut ok = name_bytes(buffer, name)
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
@@ -2409,6 +2475,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             publication_count,
             enabled,
             slot,
+            behavior,
             bootstrap,
         } => {
             connection.len() <= u16::MAX as usize
@@ -2423,6 +2490,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     .all(|publication| name_bytes(buffer, publication.as_str()))
                 && buffer.append(&[u8::from(*enabled)])
                 && buffer.append(&[bootstrap.code()])
+                && append_subscription_behavior(buffer, *behavior)
                 && match slot {
                     crate::storage::SubscriptionSlot::Absent => buffer.append(&[0]),
                     crate::storage::SubscriptionSlot::External(name) => {
@@ -2496,6 +2564,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             connection,
             publications,
             publication_count,
+            slot,
+            behavior,
         } => {
             connection.len() <= u16::MAX as usize
                 && *publication_count <= crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS
@@ -2506,10 +2576,35 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && publications[..*publication_count]
                     .iter()
                     .all(|publication| name_bytes(buffer, publication.as_str()))
+                && append_subscription_behavior(buffer, *behavior)
+                && match slot {
+                    crate::storage::SubscriptionSlot::Absent => buffer.append(&[0]),
+                    crate::storage::SubscriptionSlot::External(name) => {
+                        buffer.append(&[1]) && name_bytes(buffer, name.as_str())
+                    }
+                    crate::storage::SubscriptionSlot::Managed(name) => {
+                        buffer.append(&[2]) && name_bytes(buffer, name.as_str())
+                    }
+                }
+        }
+        WalOp::SetSubscriptionOwner { name, owner } => {
+            name_bytes(buffer, name) && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::RenameSubscription { name, new_name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
-        WalOp::CreateReplicationSlot { name, restart_lsn } => {
-            name_bytes(buffer, name) && buffer.append(&restart_lsn.to_le_bytes())
+        WalOp::CreateReplicationSlot {
+            name,
+            restart_lsn,
+            behavior,
+        } => {
+            name_bytes(buffer, name)
+                && buffer.append(&restart_lsn.to_le_bytes())
+                && buffer.append(&[behavior.code()])
+        }
+        WalOp::AlterReplicationSlot { name, behavior } => {
+            name_bytes(buffer, name) && buffer.append(&[behavior.code()])
         }
         WalOp::DropReplicationSlot { name } => name_bytes(buffer, name),
         WalOp::AdvanceReplicationSlot {
@@ -3283,6 +3378,39 @@ fn legacy_collation(ctype: ColType) -> crate::sql::ast::Collation {
     }
 }
 
+fn decode_subscription_behavior(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::SubscriptionBehavior> {
+    let boolean = |value| match value {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    let behavior = crate::storage::SubscriptionBehavior {
+        binary: boolean(*payload.get(*at)?)?,
+        streaming: crate::storage::SubscriptionStreaming::from_code(*payload.get(*at + 1)?)?,
+        synchronous_commit: crate::storage::SubscriptionSynchronousCommit::from_code(
+            *payload.get(*at + 2)?,
+        )?,
+        two_phase: boolean(*payload.get(*at + 3)?)?,
+        disable_on_error: boolean(*payload.get(*at + 4)?)?,
+        password_required: boolean(*payload.get(*at + 5)?)?,
+        run_as_owner: boolean(*payload.get(*at + 6)?)?,
+        origin: crate::storage::SubscriptionOrigin::from_code(*payload.get(*at + 7)?)?,
+        failover: boolean(*payload.get(*at + 8)?)?,
+        skip_lsn: match *payload.get(*at + 9)? {
+            0 => None,
+            1 => Some(u64::from_le_bytes(
+                payload.get(*at + 10..*at + 18)?.try_into().ok()?,
+            )),
+            _ => return None,
+        },
+    };
+    *at += 18;
+    Some(behavior)
+}
+
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
@@ -3739,6 +3867,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
                 publish_via_partition_root: flags & 32 != 0,
+                publish_generated_columns: if flags & 64 != 0 {
+                    crate::storage::PublishGeneratedColumns::Stored
+                } else {
+                    crate::storage::PublishGeneratedColumns::None
+                },
             })
         }
         KIND_DROP_PUBLICATION => {
@@ -3800,6 +3933,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
                 publish_via_partition_root: flags & 32 != 0,
+                publish_generated_columns: if flags & 64 != 0 {
+                    crate::storage::PublishGeneratedColumns::Stored
+                } else {
+                    crate::storage::PublishGeneratedColumns::None
+                },
             })
         }
         KIND_SET_PUBLICATION_OWNER => {
@@ -3840,6 +3978,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let bootstrap = crate::storage::SubscriptionBootstrap::from_code(*payload.get(at)?)?;
             at += 1;
+            let behavior = decode_subscription_behavior(payload, &mut at)?;
             let slot_kind = *payload.get(at)?;
             at += 1;
             let slot = match slot_kind {
@@ -3860,6 +3999,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 publication_count: count,
                 enabled,
                 slot,
+                behavior,
                 bootstrap,
             })
         }
@@ -3971,12 +4111,38 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             for publication in &mut publications[..count] {
                 *publication = crate::storage::SqlName::parse(take_name(&mut at)?).ok()?;
             }
+            let behavior = decode_subscription_behavior(payload, &mut at)?;
+            let slot_kind = *payload.get(at)?;
+            at += 1;
+            let slot = match slot_kind {
+                0 => crate::storage::SubscriptionSlot::Absent,
+                1 => crate::storage::SubscriptionSlot::External(
+                    crate::storage::ReplicationSlotName::parse(take_name(&mut at)?).ok()?,
+                ),
+                2 => crate::storage::SubscriptionSlot::Managed(
+                    crate::storage::ReplicationSlotName::parse(take_name(&mut at)?).ok()?,
+                ),
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::AlterSubscription {
                 name,
                 connection,
                 publications,
                 publication_count: count,
+                slot,
+                behavior,
             })
+        }
+        KIND_SET_SUBSCRIPTION_OWNER => {
+            let name = take_name(&mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::SetSubscriptionOwner { name, owner })
+        }
+        KIND_RENAME_SUBSCRIPTION => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameSubscription { name, new_name })
         }
         KIND_CREATE_TRIGGER => {
             let name = take_name(&mut at)?;
@@ -4084,7 +4250,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let restart_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
-            (at == payload.len()).then_some(WalOp::CreateReplicationSlot { name, restart_lsn })
+            let behavior = crate::storage::ReplicationSlotBehavior::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::CreateReplicationSlot {
+                name,
+                restart_lsn,
+                behavior,
+            })
+        }
+        KIND_ALTER_REPLICATION_SLOT => {
+            let name = take_name(&mut at)?;
+            let behavior = crate::storage::ReplicationSlotBehavior::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::AlterReplicationSlot { name, behavior })
         }
         KIND_DROP_REPLICATION_SLOT => {
             let name = take_name(&mut at)?;
@@ -6364,6 +6542,7 @@ mod tests {
                 &WalOp::CreateReplicationSlot {
                     name: "changes",
                     restart_lsn: 10,
+                    behavior: crate::storage::ReplicationSlotBehavior::DEFAULT,
                 },
             )
             .unwrap();
@@ -6397,6 +6576,7 @@ mod tests {
                     publish_delete: true,
                     publish_truncate: true,
                     publish_via_partition_root: false,
+                    publish_generated_columns: crate::storage::PublishGeneratedColumns::None,
                 },
             )
             .unwrap();
@@ -6416,6 +6596,7 @@ mod tests {
                     publish_delete: true,
                     publish_truncate: false,
                     publish_via_partition_root: true,
+                    publish_generated_columns: crate::storage::PublishGeneratedColumns::Stored,
                 },
             )
             .unwrap();
@@ -6519,6 +6700,10 @@ mod tests {
                     connection: "host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable",
                     publications,
                     publication_count: 2,
+                    slot: crate::storage::SubscriptionSlot::External(
+                        crate::storage::ReplicationSlotName::parse("apply_changes").unwrap(),
+                    ),
+                    behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
                 },
             )
             .unwrap();

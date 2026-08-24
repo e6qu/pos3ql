@@ -14,9 +14,10 @@ use crate::sql::ast::{
     AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
     CreateTrigger, DomainCheck, Expr, PartitionBound, PartitionClause, PartitionStrategy,
     PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineTargetKind, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionSlotName, SubscriptionSlotPlan, TriggerEvent, TriggerIdentity, TriggerTiming,
-    TriggerTransitionTables,
+    RoutineIdentity, RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TriggerEvent, TriggerIdentity,
+    TriggerTiming, TriggerTransitionTables,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -1459,6 +1460,7 @@ impl<'a> Parser<'a> {
         };
         let mut publish = None;
         let mut publish_via_partition_root = None;
+        let mut publish_generated_columns = None;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             loop {
@@ -1469,13 +1471,33 @@ impl<'a> Parser<'a> {
                     self.expect_op("=")?;
                     let value = self.str_literal("publication publish option")?;
                     publish = Some(self.publication_operations(value)?);
-                } else {
-                    self.expect_ident("publish_via_partition_root")?;
+                } else if self.eat_ident("publish_via_partition_root")? {
                     if publish_via_partition_root.is_some() {
                         return Err(self.err_here("conflicting or redundant options"));
                     }
                     publish_via_partition_root =
                         Some(self.subscription_bool_option("publish_via_partition_root")?);
+                } else {
+                    self.expect_ident("publish_generated_columns")?;
+                    if publish_generated_columns.is_some() {
+                        return Err(self.err_here("conflicting or redundant options"));
+                    }
+                    publish_generated_columns = Some(
+                        match self.subscription_option_value(
+                            "publish_generated_columns must be none or stored",
+                        )? {
+                            value if value.eq_ignore_ascii_case("none") => {
+                                crate::sql::ast::PublishGeneratedColumns::None
+                            }
+                            value if value.eq_ignore_ascii_case("stored") => {
+                                crate::sql::ast::PublishGeneratedColumns::Stored
+                            }
+                            _ => {
+                                return Err(self
+                                    .err_here("publish_generated_columns must be none or stored"));
+                            }
+                        },
+                    );
                 }
                 if !self.eat_op(",")? {
                     break;
@@ -1488,6 +1510,8 @@ impl<'a> Parser<'a> {
             None => PublicationOperations::ALL,
         };
         let publish_via_partition_root = publish_via_partition_root.unwrap_or_default();
+        let publish_generated_columns =
+            publish_generated_columns.unwrap_or(crate::sql::ast::PublishGeneratedColumns::None);
         Ok(Stmt::CreatePublication {
             name,
             all_tables,
@@ -1495,6 +1519,7 @@ impl<'a> Parser<'a> {
             schemas,
             publish,
             publish_via_partition_root,
+            publish_generated_columns,
         })
     }
 
@@ -1520,6 +1545,7 @@ impl<'a> Parser<'a> {
         let mut create_slot = true;
         let mut copy_data = true;
         let mut slot_name = Some(SubscriptionSlotName::Default);
+        let mut behavior = SubscriptionBehavior::POSTGRESQL_18_DEFAULT;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             let mut seen_connect = false;
@@ -1527,6 +1553,15 @@ impl<'a> Parser<'a> {
             let mut seen_create_slot = false;
             let mut seen_copy_data = false;
             let mut seen_slot_name = false;
+            let mut seen_binary = false;
+            let mut seen_streaming = false;
+            let mut seen_synchronous_commit = false;
+            let mut seen_two_phase = false;
+            let mut seen_disable_on_error = false;
+            let mut seen_password_required = false;
+            let mut seen_run_as_owner = false;
+            let mut seen_origin = false;
+            let mut seen_failover = false;
             loop {
                 let key = self.any_ident("subscription option")?;
                 if key.eq_ignore_ascii_case("connect") {
@@ -1568,8 +1603,57 @@ impl<'a> Parser<'a> {
                             self.any_ident("subscription slot name")?,
                         ))
                     };
+                } else if key.eq_ignore_ascii_case("binary") {
+                    if core::mem::replace(&mut seen_binary, true) {
+                        return Err(self.err_here("duplicate subscription option binary"));
+                    }
+                    behavior.binary = self.subscription_bool_option(key)?;
+                } else if key.eq_ignore_ascii_case("streaming") {
+                    if core::mem::replace(&mut seen_streaming, true) {
+                        return Err(self.err_here("duplicate subscription option streaming"));
+                    }
+                    behavior.streaming = self.subscription_streaming()?;
+                } else if key.eq_ignore_ascii_case("synchronous_commit") {
+                    if core::mem::replace(&mut seen_synchronous_commit, true) {
+                        return Err(
+                            self.err_here("duplicate subscription option synchronous_commit")
+                        );
+                    }
+                    behavior.synchronous_commit = self.subscription_synchronous_commit()?;
+                } else if key.eq_ignore_ascii_case("two_phase") {
+                    if core::mem::replace(&mut seen_two_phase, true) {
+                        return Err(self.err_here("duplicate subscription option two_phase"));
+                    }
+                    behavior.two_phase = self.subscription_bool_option(key)?;
+                } else if key.eq_ignore_ascii_case("disable_on_error") {
+                    if core::mem::replace(&mut seen_disable_on_error, true) {
+                        return Err(self.err_here("duplicate subscription option disable_on_error"));
+                    }
+                    behavior.disable_on_error = self.subscription_bool_option(key)?;
+                } else if key.eq_ignore_ascii_case("password_required") {
+                    if core::mem::replace(&mut seen_password_required, true) {
+                        return Err(
+                            self.err_here("duplicate subscription option password_required")
+                        );
+                    }
+                    behavior.password_required = self.subscription_bool_option(key)?;
+                } else if key.eq_ignore_ascii_case("run_as_owner") {
+                    if core::mem::replace(&mut seen_run_as_owner, true) {
+                        return Err(self.err_here("duplicate subscription option run_as_owner"));
+                    }
+                    behavior.run_as_owner = self.subscription_bool_option(key)?;
+                } else if key.eq_ignore_ascii_case("origin") {
+                    if core::mem::replace(&mut seen_origin, true) {
+                        return Err(self.err_here("duplicate subscription option origin"));
+                    }
+                    behavior.origin = self.subscription_origin()?;
+                } else if key.eq_ignore_ascii_case("failover") {
+                    if core::mem::replace(&mut seen_failover, true) {
+                        return Err(self.err_here("duplicate subscription option failover"));
+                    }
+                    behavior.failover = self.subscription_bool_option(key)?;
                 } else {
-                    return Err(self.err_here("subscription option is not implemented"));
+                    return Err(self.err_here("unrecognized subscription option"));
                 }
                 if self.eat_op(")")? {
                     break;
@@ -1610,6 +1694,7 @@ impl<'a> Parser<'a> {
             enabled,
             copy_data,
             slot,
+            behavior,
         };
         Ok(Stmt::CreateSubscription {
             name,
@@ -1619,7 +1704,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn subscription_bool_option(&mut self, option: &str) -> Result<bool, ParseError> {
+    pub(super) fn subscription_bool_option(&mut self, option: &str) -> Result<bool, ParseError> {
         if !self.eat_op("=")? {
             return Ok(true);
         }
@@ -1634,6 +1719,62 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         Ok(value)
+    }
+
+    pub(super) fn subscription_option_value(
+        &mut self,
+        expected: &'static str,
+    ) -> Result<&'a str, ParseError> {
+        self.expect_op("=")?;
+        let value = match self.peeked {
+            Tok::Ident(value) | Tok::Str(value) => value,
+            _ => return Err(self.err_here(expected)),
+        };
+        self.advance()?;
+        Ok(value)
+    }
+
+    pub(super) fn subscription_streaming(&mut self) -> Result<SubscriptionStreaming, ParseError> {
+        let value = self.subscription_option_value("streaming requires off, on, or parallel")?;
+        if value.eq_ignore_ascii_case("off") || value == "false" || value == "0" {
+            Ok(SubscriptionStreaming::Off)
+        } else if value.eq_ignore_ascii_case("on") || value == "true" || value == "1" {
+            Ok(SubscriptionStreaming::On)
+        } else if value.eq_ignore_ascii_case("parallel") {
+            Ok(SubscriptionStreaming::Parallel)
+        } else {
+            Err(self.err_here("streaming requires off, on, or parallel"))
+        }
+    }
+
+    pub(super) fn subscription_synchronous_commit(
+        &mut self,
+    ) -> Result<SubscriptionSynchronousCommit, ParseError> {
+        let value = self.subscription_option_value("invalid synchronous_commit value")?;
+        if value.eq_ignore_ascii_case("off") {
+            Ok(SubscriptionSynchronousCommit::Off)
+        } else if value.eq_ignore_ascii_case("local") {
+            Ok(SubscriptionSynchronousCommit::Local)
+        } else if value.eq_ignore_ascii_case("remote_write") {
+            Ok(SubscriptionSynchronousCommit::RemoteWrite)
+        } else if value.eq_ignore_ascii_case("on") {
+            Ok(SubscriptionSynchronousCommit::On)
+        } else if value.eq_ignore_ascii_case("remote_apply") {
+            Ok(SubscriptionSynchronousCommit::RemoteApply)
+        } else {
+            Err(self.err_here("invalid synchronous_commit value"))
+        }
+    }
+
+    pub(super) fn subscription_origin(&mut self) -> Result<SubscriptionOrigin, ParseError> {
+        let value = self.subscription_option_value("origin requires none or any")?;
+        if value.eq_ignore_ascii_case("none") {
+            Ok(SubscriptionOrigin::None)
+        } else if value.eq_ignore_ascii_case("any") {
+            Ok(SubscriptionOrigin::Any)
+        } else {
+            Err(self.err_here("origin requires none or any"))
+        }
     }
 
     /// `ALTER PUBLICATION name { SET (publish = ...) | { ADD | SET | DROP }
@@ -1651,6 +1792,7 @@ impl<'a> Parser<'a> {
             if self.eat_op("(")? {
                 let mut publish = None;
                 let mut publish_via_partition_root = None;
+                let mut publish_generated_columns = None;
                 loop {
                     if self.eat_ident("publish")? {
                         if publish.is_some() {
@@ -1659,13 +1801,34 @@ impl<'a> Parser<'a> {
                         self.expect_op("=")?;
                         let value = self.str_literal("publication publish option")?;
                         publish = Some(self.publication_operations(value)?);
-                    } else {
-                        self.expect_ident("publish_via_partition_root")?;
+                    } else if self.eat_ident("publish_via_partition_root")? {
                         if publish_via_partition_root.is_some() {
                             return Err(self.err_here("conflicting or redundant options"));
                         }
                         publish_via_partition_root =
                             Some(self.subscription_bool_option("publish_via_partition_root")?);
+                    } else {
+                        self.expect_ident("publish_generated_columns")?;
+                        if publish_generated_columns.is_some() {
+                            return Err(self.err_here("conflicting or redundant options"));
+                        }
+                        publish_generated_columns = Some(
+                            match self.subscription_option_value(
+                                "publish_generated_columns must be none or stored",
+                            )? {
+                                value if value.eq_ignore_ascii_case("none") => {
+                                    crate::sql::ast::PublishGeneratedColumns::None
+                                }
+                                value if value.eq_ignore_ascii_case("stored") => {
+                                    crate::sql::ast::PublishGeneratedColumns::Stored
+                                }
+                                _ => {
+                                    return Err(self.err_here(
+                                        "publish_generated_columns must be none or stored",
+                                    ));
+                                }
+                            },
+                        );
                     }
                     if !self.eat_op(",")? {
                         break;
@@ -1675,6 +1838,7 @@ impl<'a> Parser<'a> {
                 AlterPublicationAction::SetOptions {
                     publish,
                     publish_via_partition_root,
+                    publish_generated_columns,
                 }
             } else {
                 let (tables, schemas) = self.publication_targets()?;

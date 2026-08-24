@@ -3804,7 +3804,7 @@ fn pg_publication<'a>(
                 Datum::Bool(definition.publish_delete),
                 Datum::Bool(definition.publish_truncate),
                 Datum::Bool(definition.publish_via_partition_root),
-                text("n", arena)?,
+                text(definition.publish_generated_columns.pg_code(), arena)?,
             ],
             arena,
         )?;
@@ -3977,19 +3977,31 @@ fn pg_publication_tables<'a>(
             let output_definition = storage.table_def(output, txid);
             let effective_explicit =
                 super::publication_partition_member(storage, publication, output);
+            let implicit_mask = || {
+                output_definition
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| {
+                        !column.default.is_generated()
+                            || published.publish_generated_columns
+                                == crate::storage::PublishGeneratedColumns::Stored
+                    })
+                    .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+            };
             let column_mask = if published.all_tables || schema {
-                u64::MAX
+                implicit_mask()
             } else if let Some(index) = effective_explicit.or(explicit) {
                 if usize::from(published.tables[index]) != output
                     && !published.publish_via_partition_root
                 {
-                    u64::MAX
+                    implicit_mask()
                 } else {
                     let mask = published.table_column_masks[index];
-                    if mask == 0 { u64::MAX } else { mask }
+                    if mask == 0 { implicit_mask() } else { mask }
                 }
             } else {
-                u64::MAX
+                implicit_mask()
             };
             let mut attribute_values = [Datum::Null; crate::storage::MAX_COLUMNS];
             let mut attribute_count = 0;
@@ -4045,6 +4057,15 @@ fn pg_replication_slots<'a>(
             ("catalog_xmin", ColType::Text),
             ("restart_lsn", ColType::Text),
             ("confirmed_flush_lsn", ColType::Text),
+            ("wal_status", ColType::Text),
+            ("safe_wal_size", ColType::Int8),
+            ("two_phase", ColType::Bool),
+            ("two_phase_at", ColType::Text),
+            ("inactive_since", ColType::Timestamptz),
+            ("conflicting", ColType::Bool),
+            ("invalidation_reason", ColType::Text),
+            ("failover", ColType::Bool),
+            ("synced", ColType::Bool),
         ],
     );
     let mut rows: [&[Datum]; 256] = [&[]; 256];
@@ -4073,6 +4094,19 @@ fn pg_replication_slots<'a>(
                 Datum::Null,
                 text(restart_lsn.as_str(), arena)?,
                 text(confirmed_lsn.as_str(), arena)?,
+                text("reserved", arena)?,
+                Datum::Null,
+                Datum::Bool(slot.behavior.two_phase),
+                if slot.behavior.two_phase {
+                    text(restart_lsn.as_str(), arena)?
+                } else {
+                    Datum::Null
+                },
+                Datum::Null,
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Bool(slot.behavior.failover),
+                Datum::Bool(false),
             ],
             arena,
         )?;
@@ -4123,7 +4157,7 @@ fn pg_subscription<'a>(
                 rows.len()
             ));
         }
-        let (connection, subscription_publications, publication_count) =
+        let (connection, subscription_publications, publication_count, publisher_slot, behavior) =
             subscription.definition_to(txid);
         let mut publications = [Datum::Null; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
         for (index, publication) in subscription_publications[..publication_count]
@@ -4136,32 +4170,53 @@ fn pg_subscription<'a>(
             element: super::types::ArrElem::Text,
             raw: super::array::build(&publications[..publication_count], arena)?,
         };
+        let skip_lsn = match behavior.skip_lsn {
+            Some(lsn) => {
+                let value = stack_format!(32, "0/{lsn:X}");
+                text(value.as_str(), arena)?
+            }
+            None => Datum::Null,
+        };
         rows[count] = row(
             &[
                 Datum::Int4(6107),
                 Datum::Int4(FIRST_USER_OID + 95_000 + subscription.created_at as i32),
                 Datum::Int4(5),
-                Datum::Null,
+                skip_lsn,
                 text(subscription.name.as_str(), arena)?,
                 Datum::Int4(Storage::role_oid(
                     subscription.ownership.owner_to(txid) as usize
                 )),
                 Datum::Bool(subscription.enabled_to(txid)),
-                Datum::Bool(false),
-                text("f", arena)?,
-                text("d", arena)?,
-                Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(true),
-                Datum::Bool(false),
+                Datum::Bool(behavior.binary),
+                text(behavior.streaming.pg_code(), arena)?,
+                text(
+                    if behavior.two_phase {
+                        if matches!(
+                            subscription.bootstrap_to(txid),
+                            crate::storage::SubscriptionBootstrap::Ready
+                        ) {
+                            "e"
+                        } else {
+                            "p"
+                        }
+                    } else {
+                        "d"
+                    },
+                    arena,
+                )?,
+                Datum::Bool(behavior.disable_on_error),
+                Datum::Bool(behavior.password_required),
+                Datum::Bool(behavior.run_as_owner),
+                Datum::Bool(behavior.failover),
                 text(connection.as_str(), arena)?,
-                match subscription.slot.name() {
+                match publisher_slot.name() {
                     Some(slot) => text(slot.as_str(), arena)?,
                     None => Datum::Null,
                 },
-                text("off", arena)?,
+                text(behavior.synchronous_commit.as_str(), arena)?,
                 publications,
-                text("any", arena)?,
+                text(behavior.origin.as_str(), arena)?,
             ],
             arena,
         )?;

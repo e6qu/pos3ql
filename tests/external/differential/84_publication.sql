@@ -3,6 +3,11 @@
 CREATE TABLE publication_source (id integer PRIMARY KEY, value text);
 CREATE TABLE publication_second (id integer PRIMARY KEY);
 CREATE TABLE publication_third (id integer PRIMARY KEY);
+CREATE TABLE publication_generated (
+  id integer PRIMARY KEY,
+  source text,
+  derived text GENERATED ALWAYS AS (source || '-derived') STORED
+);
 CREATE SCHEMA publication_schema;
 CREATE TABLE publication_schema.schema_selected (id integer PRIMARY KEY);
 
@@ -11,6 +16,11 @@ CREATE PUBLICATION publication_changes
   WITH (publish = 'insert, update, delete');
 CREATE PUBLICATION publication_all FOR ALL TABLES;
 CREATE PUBLICATION publication_empty;
+CREATE PUBLICATION publication_generated_changes FOR TABLE publication_generated
+  WITH (publish_generated_columns = 'stored');
+SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
+ALTER PUBLICATION publication_generated_changes SET (publish_generated_columns = 'none');
+SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
 CREATE ROLE publication_owner_target;
 ALTER PUBLICATION publication_empty OWNER TO publication_owner_target;
 SELECT role.rolname FROM pg_publication publication
@@ -73,7 +83,9 @@ SELECT relname
 
 ALTER PUBLICATION publication_schema_changes DROP TABLES IN SCHEMA publication_schema;
 ALTER PUBLICATION publication_schema_changes ADD TABLE publication_schema.schema_selected, TABLES IN SCHEMA publication_schema;
-DROP PUBLICATION publication_changes, publication_all, publication_empty_renamed, publication_schema_changes;
+DROP PUBLICATION publication_changes, publication_all, publication_empty_renamed,
+  publication_schema_changes, publication_generated_changes;
+DROP TABLE publication_generated;
 DROP TABLE publication_third;
 DROP PUBLICATION IF EXISTS publication_missing;
 DROP TABLE publication_second;

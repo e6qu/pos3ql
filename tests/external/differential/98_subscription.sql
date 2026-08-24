@@ -6,15 +6,29 @@ DROP SUBSCRIPTION IF EXISTS archived_changes;
 CREATE SUBSCRIPTION archived_changes
   CONNECTION 'host=publisher port=5432'
   PUBLICATION sales, inventory
-  WITH (connect = false, slot_name = NONE);
-SELECT subname, subenabled, subconninfo, subslotname, subpublications
+  WITH (connect = false, slot_name = NONE, binary = true, streaming = parallel,
+        synchronous_commit = remote_apply, two_phase = false,
+        disable_on_error = true, password_required = false,
+        run_as_owner = true, origin = none, failover = true);
+SELECT subname, subenabled, subconninfo, subslotname, subpublications,
+       subbinary, substream, subsynccommit, subdisableonerr,
+       subpasswordrequired, subrunasowner, suborigin, subfailover
   FROM pg_subscription
   WHERE subname = 'archived_changes';
 ALTER SUBSCRIPTION archived_changes
   CONNECTION 'host=publisher-two port=5433';
 ALTER SUBSCRIPTION archived_changes SET PUBLICATION inventory, sales WITH (refresh = false);
-SELECT subname, subenabled, subconninfo, subslotname, subpublications
+ALTER SUBSCRIPTION archived_changes SET
+  (binary = false, streaming = on, synchronous_commit = local,
+   disable_on_error = false, password_required = true,
+   run_as_owner = false, origin = any, failover = false, two_phase = false);
+ALTER SUBSCRIPTION archived_changes SKIP (lsn = '0/2A');
+ALTER SUBSCRIPTION archived_changes RENAME TO archived_changes_renamed;
+SELECT subname, subenabled, subconninfo, subslotname, subpublications,
+       subskiplsn, subbinary, substream, subsynccommit, subdisableonerr,
+       subpasswordrequired, subrunasowner, suborigin, subfailover
   FROM pg_subscription
-  WHERE subname = 'archived_changes';
-DROP SUBSCRIPTION archived_changes;
-SELECT count(*) FROM pg_subscription WHERE subname = 'archived_changes';
+  WHERE subname = 'archived_changes_renamed';
+ALTER SUBSCRIPTION archived_changes_renamed SKIP (lsn = NONE);
+DROP SUBSCRIPTION archived_changes_renamed;
+SELECT count(*) FROM pg_subscription WHERE subname = 'archived_changes_renamed';

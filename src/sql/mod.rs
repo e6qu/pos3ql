@@ -71,12 +71,14 @@ pub(crate) struct SubscriptionRuntime {
     pub endpoint: crate::pg::replication_client::ConnectionInfo,
     pub publications: [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
-    pub slot: SqlName,
-    pub bootstrap_slot: SqlName,
+    pub slot: Option<SqlName>,
+    pub manage_slot_behavior: bool,
+    pub bootstrap_slot: Option<SqlName>,
     pub drop_bootstrap_slot: bool,
     pub confirmed_lsn: u64,
     pub bootstrap: crate::storage::SubscriptionBootstrap,
     pub enabled: bool,
+    pub behavior: crate::storage::SubscriptionBehavior,
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +144,14 @@ static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
     rows: &[],
     external_run: None,
 };
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReplicationEmission<'a> {
+    pub publications: &'a [SqlName],
+    pub binary: bool,
+    pub origin: crate::storage::SubscriptionOrigin,
+    pub protocol: crate::pg::pgoutput::ProtocolVersion,
+}
 
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
@@ -742,6 +752,20 @@ fn publication_column_mask(
     operation: PublicationOperation,
 ) -> Result<Option<u64>, SqlError> {
     let mut selected = 0u64;
+    let mut matched = false;
+    let implicit_mask = |publication: &crate::storage::PublicationDef| {
+        let definition = storage.table_def(table_slot, 0);
+        definition
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                !column.default.is_generated()
+                    || publication.publish_generated_columns
+                        == crate::storage::PublishGeneratedColumns::Stored
+            })
+            .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+    };
     for name in publication_names {
         let publication = storage.publication(name.as_str()).ok_or_else(|| {
             sql_err!(
@@ -762,7 +786,9 @@ fn publication_column_mask(
             continue;
         }
         if publication.all_tables || schema_member {
-            return Ok(Some(u64::MAX));
+            matched = true;
+            selected |= implicit_mask(publication);
+            continue;
         }
         if let Some(index) = explicit {
             if usize::from(publication.tables[index]) != table_slot
@@ -770,16 +796,20 @@ fn publication_column_mask(
             {
                 // Default pgoutput identity is the physical leaf, whose
                 // implicit membership has no ancestor column projection.
-                return Ok(Some(u64::MAX));
+                matched = true;
+                selected |= implicit_mask(publication);
+                continue;
             }
             let mask = publication.table_column_masks[index];
             if mask == 0 {
-                return Ok(Some(u64::MAX));
+                selected |= implicit_mask(publication);
+            } else {
+                selected |= mask;
             }
-            selected |= mask;
+            matched = true;
         }
     }
-    Ok((selected != 0).then_some(selected))
+    Ok(matched.then_some(selected))
 }
 
 /// True when the subscribed publication union selects this row.  A missing
@@ -965,7 +995,8 @@ impl Engine {
             .subscriptions_with_slots_visible_to(0)
             .find(|(index, _subscription)| *index == slot)
             .filter(|(_, subscription)| {
-                subscription.failure.is_none()
+                (subscription.failure.is_none()
+                    || (!subscription.behavior.disable_on_error && subscription.enabled_to(0)))
                     && (subscription.enabled_to(0)
                         || !matches!(
                             subscription.bootstrap,
@@ -975,21 +1006,23 @@ impl Engine {
             })
             .and_then(|(_, subscription)| {
                 subscription.connection.endpoint().and_then(|endpoint| {
+                    let publisher_slot = subscription
+                        .slot
+                        .name()
+                        .map(crate::storage::ReplicationSlotName::sql_name);
                     let bootstrap_slot = match subscription.bootstrap {
                         crate::storage::SubscriptionBootstrap::CopyExternalSlot
                         | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
                         | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
                             let generated =
                                 stack_format!(63, "pos3ql_{:x}_sync", subscription.created_at);
-                            crate::storage::ReplicationSlotName::parse(generated.as_str())
-                                .ok()?
-                                .sql_name()
+                            Some(
+                                crate::storage::ReplicationSlotName::parse(generated.as_str())
+                                    .ok()?
+                                    .sql_name(),
+                            )
                         }
-                        _ => subscription
-                            .slot
-                            .name()
-                            .map(crate::storage::ReplicationSlotName::sql_name)
-                            .unwrap_or(subscription.name),
+                        _ => publisher_slot,
                     };
                     self.storage
                         .subscription_stream(slot, 0)
@@ -998,11 +1031,11 @@ impl Engine {
                             endpoint: endpoint.for_subscription(subscription.name),
                             publications: subscription.publications,
                             publication_count: subscription.publication_count,
-                            slot: subscription
-                                .slot
-                                .name()
-                                .map(crate::storage::ReplicationSlotName::sql_name)
-                                .unwrap_or(subscription.name),
+                            slot: publisher_slot,
+                            manage_slot_behavior: matches!(
+                                subscription.slot,
+                                crate::storage::SubscriptionSlot::Managed(_)
+                            ),
                             bootstrap_slot,
                             drop_bootstrap_slot: matches!(
                                 subscription.bootstrap,
@@ -1013,6 +1046,7 @@ impl Engine {
                             confirmed_lsn: subscription.confirmed_lsn,
                             bootstrap: subscription.bootstrap,
                             enabled: subscription.enabled_to(0),
+                            behavior: subscription.behavior,
                         })
                 })
             })
@@ -1157,6 +1191,78 @@ impl Engine {
         Ok(true)
     }
 
+    pub(crate) fn stage_subscription_skip(
+        &mut self,
+        txn: &mut TxnState,
+        stream: crate::storage::SubscriptionStream,
+        final_lsn: u64,
+        confirmed_lsn: u64,
+    ) -> Result<(), SqlError> {
+        let current = self
+            .storage
+            .subscription_stream(stream.slot(), txn.txid)
+            .filter(|current| {
+                current.created_at() == stream.created_at()
+                    && current.definition_generation() == stream.definition_generation()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "subscription SKIP targets a replaced stream definition"
+                )
+            })?;
+        let (connection, publications, publication_count, publisher_slot, mut behavior) = self
+            .storage
+            .subscription_definition_to(current.slot(), txn.txid);
+        if behavior.skip_lsn != Some(final_lsn) {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "subscription SKIP does not match the remote transaction finish LSN"
+            ));
+        }
+        behavior.skip_lsn = None;
+        let change = self.storage.set_subscription_definition(
+            current.slot(),
+            connection,
+            &publications[..publication_count],
+            publisher_slot,
+            behavior,
+            txn.txid,
+        )?;
+        let lsn = self.storage.bump_lsn();
+        if let Err(error) = self.wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterSubscription {
+                name: current.name().as_str(),
+                connection: connection.as_str(),
+                publications,
+                publication_count,
+                slot: publisher_slot,
+                behavior,
+            },
+        ) {
+            self.storage
+                .restore_subscription_definition(current.slot(), change.prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(DdlUndo::SubscriptionDefinitionChanged {
+            slot: current.slot() as u32,
+            prior: change.prior,
+        }) {
+            self.storage
+                .restore_subscription_definition(current.slot(), change.prior);
+            return Err(error);
+        }
+        if !self.stage_subscription_advance(txn, current, confirmed_lsn)? {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "subscription SKIP did not advance its durable frontier"
+            ));
+        }
+        Ok(())
+    }
+
     /// Registers a publisher relation descriptor before any of its tuples can
     /// enter the ordinary local write path.
     pub fn register_subscription_relation(
@@ -1168,63 +1274,167 @@ impl Engine {
         relations.register(&self.storage, txn.txid, relation)
     }
 
-    pub fn apply_subscription_insert(
+    pub(crate) fn apply_subscription_insert(
         &mut self,
         txn: &mut TxnState,
+        stream: crate::storage::SubscriptionStream,
         binding: crate::pg::subscription_apply::RelationBinding,
         tuple: crate::pg::pginput::Tuple<'_>,
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
-        exec::apply_replication_insert(
+        let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
+        let prior = eval::funcs::system::current_user_owned();
+        eval::funcs::system::set_current_user(role.as_str());
+        let result = exec::apply_replication_insert(
             &mut self.storage,
             txn,
             binding,
             tuple,
             arena,
             trigger_context,
-        )
+        );
+        eval::funcs::system::set_current_user(prior.as_str());
+        result
     }
 
-    pub fn apply_subscription_delete(
+    pub(crate) fn apply_subscription_delete(
         &mut self,
         txn: &mut TxnState,
+        stream: crate::storage::SubscriptionStream,
         binding: crate::pg::subscription_apply::RelationBinding,
         old: crate::pg::pginput::OldTuple<'_>,
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
-        exec::apply_replication_delete(&mut self.storage, txn, binding, old, arena, trigger_context)
-    }
-
-    pub fn apply_subscription_update(
-        &mut self,
-        txn: &mut TxnState,
-        binding: crate::pg::subscription_apply::RelationBinding,
-        old: crate::pg::pginput::OldTuple<'_>,
-        new: crate::pg::pginput::Tuple<'_>,
-        arena: &Arena,
-        trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
-    ) -> Result<(), SqlError> {
-        exec::apply_replication_update(
+        let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
+        let prior = eval::funcs::system::current_user_owned();
+        eval::funcs::system::set_current_user(role.as_str());
+        let result = exec::apply_replication_delete(
             &mut self.storage,
             txn,
             binding,
             old,
-            new,
             arena,
             trigger_context,
-        )
+        );
+        eval::funcs::system::set_current_user(prior.as_str());
+        result
     }
 
-    pub fn apply_subscription_truncate(
+    pub(crate) fn apply_subscription_update(
         &mut self,
         txn: &mut TxnState,
+        stream: crate::storage::SubscriptionStream,
+        binding: crate::pg::subscription_apply::RelationBinding,
+        update: exec::ReplicationUpdate<'_>,
+        arena: &Arena,
+        trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
+    ) -> Result<(), SqlError> {
+        let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
+        let prior = eval::funcs::system::current_user_owned();
+        eval::funcs::system::set_current_user(role.as_str());
+        let result = exec::apply_replication_update(
+            &mut self.storage,
+            txn,
+            binding,
+            update,
+            arena,
+            trigger_context,
+        );
+        eval::funcs::system::set_current_user(prior.as_str());
+        result
+    }
+
+    pub(crate) fn begin_subscription_subtransaction(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        xid: u32,
+    ) -> Result<(), SqlError> {
+        let name = crate::stack_format!(63, "pgoutput_{xid}");
+        if txn.savepoint_index(name.as_str()).is_some() {
+            return Ok(());
+        }
+        txn.savepoint(
+            name.as_str(),
+            self.wal.stage_mark(txn.txid),
+            self.storage.lock_mark(),
+        )?;
+        guc.savepoint();
+        Ok(())
+    }
+
+    pub(crate) fn rollback_subscription_subtransaction(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        xid: u32,
+    ) -> bool {
+        let name = crate::stack_format!(63, "pgoutput_{xid}");
+        let Some(index) = txn.savepoint_index(name.as_str()) else {
+            return false;
+        };
+        self.rollback_to_savepoint(txn, index, guc);
+        txn.release_savepoints_from(index);
+        guc.release_savepoints_from(index);
+        true
+    }
+
+    pub(crate) fn apply_subscription_truncate(
+        &mut self,
+        txn: &mut TxnState,
+        stream: crate::storage::SubscriptionStream,
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
     ) -> Result<(), SqlError> {
+        if tables.is_empty() {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription TRUNCATE has no relations"
+            ));
+        }
+        if tables.len() > crate::sql::txn::MAX_TRUNCATE_TABLES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription TRUNCATE exceeds its fixed table capacity"
+            ));
+        }
+        for &table in tables {
+            self.subscription_apply_role(stream, table, txn.txid)?;
+        }
         exec::apply_replication_truncate(&mut self.storage, txn, tables, cascade, restart_identity)
+    }
+
+    fn subscription_apply_role(
+        &self,
+        stream: crate::storage::SubscriptionStream,
+        table_slot: usize,
+        txid: u32,
+    ) -> Result<SqlName, SqlError> {
+        let subscription = self
+            .storage
+            .subscriptions_with_slots_visible_to(txid)
+            .find(|(slot, subscription)| {
+                *slot == stream.slot()
+                    && subscription.created_at == stream.created_at()
+                    && subscription.definition_generation == stream.definition_generation()
+            })
+            .map(|(_, subscription)| subscription)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "subscription apply authority targets a replaced stream"
+                )
+            })?;
+        let owner = if subscription.behavior.run_as_owner {
+            subscription.ownership.owner_to(txid) as usize
+        } else {
+            self.storage
+                .object_owner(self.storage.table_access_object(table_slot, txid), txid)
+        };
+        Ok(self.storage.role(owner).name_to(txid))
     }
 
     pub(crate) fn coerce_parameter_null<'a>(
@@ -1583,6 +1793,7 @@ impl Engine {
     pub(crate) fn create_replication_slot(
         &mut self,
         name: crate::storage::ReplicationSlotName,
+        behavior: crate::storage::ReplicationSlotBehavior,
     ) -> Result<u64, SqlError> {
         if self.storage.replication_slot(name.as_str()).is_some() {
             return Err(sql_err!(
@@ -1611,6 +1822,7 @@ impl Engine {
             &WalOp::CreateReplicationSlot {
                 name: name.as_str(),
                 restart_lsn,
+                behavior,
             },
         ) {
             self.wal.discard_stage(transaction_id);
@@ -1624,7 +1836,8 @@ impl Engine {
             }
         };
         self.wal.commit();
-        self.storage.create_replication_slot(name, restart_lsn)?;
+        self.storage
+            .create_replication_slot(name, restart_lsn, behavior)?;
         self.storage.set_lsn(commit_lsn);
         Ok(restart_lsn)
     }
@@ -1679,6 +1892,58 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn alter_replication_slot(
+        &mut self,
+        name: crate::storage::ReplicationSlotName,
+        behavior: crate::storage::ReplicationSlotBehavior,
+    ) -> Result<(), SqlError> {
+        let current = self
+            .storage
+            .replication_slot(name.as_str())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    name.as_str()
+                )
+            })?;
+        if current.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                name.as_str()
+            ));
+        }
+        self.next_txid = self.next_txid.wrapping_add(1).max(1);
+        let transaction_id = self.next_txid;
+        let lsn =
+            self.storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
+        if let Err(error) = self.wal.stage(
+            transaction_id,
+            lsn,
+            &WalOp::AlterReplicationSlot {
+                name: name.as_str(),
+                behavior,
+            },
+        ) {
+            self.wal.discard_stage(transaction_id);
+            return Err(error);
+        }
+        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.wal.discard_stage(transaction_id);
+                return Err(error);
+            }
+        };
+        self.wal.commit();
+        self.storage.alter_replication_slot(name, behavior)?;
+        self.storage.set_lsn(commit_lsn);
+        Ok(())
+    }
+
     pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
         self.storage.activate_replication_slot(name)
     }
@@ -1725,6 +1990,7 @@ impl Engine {
     /// Emits the next complete committed transaction selected by one logical
     /// publication. The cursor advances only after every CopyData frame for
     /// that transaction fitted in the caller's fixed send buffer.
+    #[cfg(test)]
     pub(crate) fn emit_replication_transaction(
         &mut self,
         floor: u64,
@@ -1734,6 +2000,32 @@ impl Engine {
         scratch: &mut FixedBuf,
         responder: &mut Responder,
     ) -> Result<Option<(u64, bool)>, SqlError> {
+        self.emit_replication_transaction_for_origin(
+            floor,
+            ReplicationEmission {
+                publications: publication_names,
+                binary,
+                origin: crate::storage::SubscriptionOrigin::Any,
+                protocol: proto_version,
+            },
+            scratch,
+            responder,
+        )
+    }
+
+    pub(crate) fn emit_replication_transaction_for_origin(
+        &mut self,
+        floor: u64,
+        emission: ReplicationEmission<'_>,
+        scratch: &mut FixedBuf,
+        responder: &mut Responder,
+    ) -> Result<Option<(u64, bool)>, SqlError> {
+        let ReplicationEmission {
+            publications: publication_names,
+            binary,
+            origin,
+            protocol: proto_version,
+        } = emission;
         self.work.reset();
         let storage = &self.storage;
         let filter_arena = &self.work;
@@ -1750,6 +2042,7 @@ impl Engine {
         let mut encode = |end_lsn, transaction: &[u8]| {
             let mut at = 0usize;
             let mut transaction_id = 0u32;
+            let mut has_replication_origin = false;
             let mut truncates = [PendingTruncate {
                 command_id: 0,
                 table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
@@ -1767,6 +2060,12 @@ impl Engine {
                     crate::wal::decode_record(&transaction[at + 16..at + total])
                 {
                     transaction_id = id;
+                }
+                if matches!(
+                    crate::wal::decode_record(&transaction[at + 16..at + total]),
+                    Some(WalOp::AdvanceSubscription { .. })
+                ) {
+                    has_replication_origin = true;
                 }
                 if let Some(WalOp::Truncate {
                     tables,
@@ -1847,6 +2146,9 @@ impl Engine {
                     truncate_count += 1;
                 }
                 at += total;
+            }
+            if origin == crate::storage::SubscriptionOrigin::None && has_replication_origin {
+                return Ok(());
             }
             // A pgoutput transaction exists only when at least one operation
             // selected by the publication union survives statement-level
@@ -2931,6 +3233,12 @@ impl Engine {
                 DdlUndo::SubscriptionDefinitionChanged { slot, .. } => self
                     .storage
                     .commit_subscription_definition(*slot as usize, txn.txid),
+                DdlUndo::SubscriptionOwnerChanged { slot, .. } => self
+                    .storage
+                    .commit_subscription_owner(*slot as usize, txn.txid),
+                DdlUndo::SubscriptionRenamed { slot, .. } => self
+                    .storage
+                    .commit_subscription_rename(*slot as usize, txn.txid),
                 DdlUndo::MatviewCreated(slot) => {
                     self.storage.commit_matview_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -3189,6 +3497,12 @@ impl Engine {
             DdlUndo::SubscriptionDefinitionChanged { slot, prior } => self
                 .storage
                 .restore_subscription_definition(slot as usize, prior),
+            DdlUndo::SubscriptionOwnerChanged { slot, prior } => self
+                .storage
+                .restore_subscription_owner_pending(slot as usize, prior),
+            DdlUndo::SubscriptionRenamed { slot, prior } => self
+                .storage
+                .rollback_subscription_rename(slot as usize, prior),
             DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
             DdlUndo::MatviewDropped(slot) => {
                 self.storage.rollback_matview_drop(slot as usize, txid);
@@ -6544,6 +6858,7 @@ impl Engine {
                 schemas,
                 publish,
                 publish_via_partition_root,
+                publish_generated_columns,
             } => exec::create_publication(
                 &mut self.storage,
                 &mut self.wal,
@@ -6554,6 +6869,7 @@ impl Engine {
                 schemas,
                 *publish,
                 *publish_via_partition_root,
+                *publish_generated_columns,
                 responder,
             ),
             Stmt::AlterPublication { name, action } => exec::alter_publication(
@@ -8124,12 +8440,19 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
     match operator {
         WalOp::Commit { .. } => {}
         WalOp::Truncate { .. } => {}
-        WalOp::CreateReplicationSlot { name, restart_lsn } => {
+        WalOp::CreateReplicationSlot {
+            name,
+            restart_lsn,
+            behavior,
+        } => {
             storage.create_replication_slot(
                 crate::storage::ReplicationSlotName::parse(name)?,
                 restart_lsn,
+                behavior,
             )?;
         }
+        WalOp::AlterReplicationSlot { name, behavior } => storage
+            .alter_replication_slot(crate::storage::ReplicationSlotName::parse(name)?, behavior)?,
         WalOp::DropReplicationSlot { name } => storage.drop_replication_slot(name)?,
         WalOp::AdvanceReplicationSlot {
             name,
@@ -8458,6 +8781,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_delete,
             publish_truncate,
             publish_via_partition_root,
+            publish_generated_columns,
         } => {
             let slot = storage.create_publication(
                 crate::storage::PublicationSpec {
@@ -8472,6 +8796,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     publish_delete,
                     publish_truncate,
                     publish_via_partition_root,
+                    publish_generated_columns,
                 },
                 0,
             )?;
@@ -8497,6 +8822,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_delete,
             publish_truncate,
             publish_via_partition_root,
+            publish_generated_columns,
         } => {
             let definition = crate::storage::PublicationDefinition {
                 all_tables,
@@ -8513,6 +8839,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 publish_delete,
                 publish_truncate,
                 publish_via_partition_root,
+                publish_generated_columns,
             };
             let (slot, _) = storage.alter_publication(name, definition, 0)?;
             storage.commit_publication_alter(slot, 0);
@@ -8546,6 +8873,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publication_count,
             enabled,
             slot: publisher_slot,
+            behavior,
             bootstrap,
         } => {
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
@@ -8559,6 +8887,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     publications: &publications[..publication_count],
                     enabled,
                     slot: publisher_slot,
+                    behavior,
                     bootstrap,
                 },
                 0,
@@ -8745,6 +9074,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             connection,
             publications,
             publication_count,
+            slot: publisher_slot,
+            behavior,
         } => {
             let (slot, subscription) = storage.subscription(name, 0).ok_or_else(|| {
                 sql_err!(
@@ -8762,12 +9093,35 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     slot,
                     connection,
                     &publications[..publication_count],
+                    publisher_slot,
+                    behavior,
                     0,
                 )?
                 .changed
             {
                 storage.commit_subscription_definition(slot, 0);
             }
+        }
+        WalOp::SetSubscriptionOwner { name, owner } => {
+            let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal owner change for unknown subscription \"{}\"",
+                    name
+                )
+            })?;
+            storage.restore_subscription_owner(slot, owner);
+        }
+        WalOp::RenameSubscription { name, new_name } => {
+            let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal rename for unknown subscription \"{}\"",
+                    name
+                )
+            })?;
+            storage.rename_subscription(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
+            storage.commit_subscription_rename(slot, 0);
         }
         WalOp::RenameIndex {
             schema,

@@ -221,6 +221,14 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingSubscriptionDefinition>,
     },
+    SubscriptionOwnerChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingOwnership>,
+    },
+    SubscriptionRenamed {
+        slot: u32,
+        prior: Option<crate::storage::PendingSubscriptionName>,
+    },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
     MatviewCreated(u32),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.

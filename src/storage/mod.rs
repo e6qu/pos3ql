@@ -2364,6 +2364,7 @@ pub struct PublicationDef {
     pub publish_delete: bool,
     pub publish_truncate: bool,
     pub publish_via_partition_root: bool,
+    pub publish_generated_columns: PublishGeneratedColumns,
     pending_definition: Option<PendingPublicationDefinition>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -2386,6 +2387,7 @@ pub(crate) struct PublicationDefinition {
     pub publish_delete: bool,
     pub publish_truncate: bool,
     pub publish_via_partition_root: bool,
+    pub publish_generated_columns: PublishGeneratedColumns,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2424,6 +2426,31 @@ pub struct PublicationSpec<'a> {
     pub publish_delete: bool,
     pub publish_truncate: bool,
     pub publish_via_partition_root: bool,
+    pub publish_generated_columns: PublishGeneratedColumns,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishGeneratedColumns {
+    None,
+    Stored,
+}
+
+impl PublishGeneratedColumns {
+    pub(crate) const fn pg_code(self) -> &'static str {
+        match self {
+            Self::None => "n",
+            Self::Stored => "s",
+        }
+    }
+}
+
+impl From<crate::sql::ast::PublishGeneratedColumns> for PublishGeneratedColumns {
+    fn from(value: crate::sql::ast::PublishGeneratedColumns) -> Self {
+        match value {
+            crate::sql::ast::PublishGeneratedColumns::None => Self::None,
+            crate::sql::ast::PublishGeneratedColumns::Stored => Self::Stored,
+        }
+    }
 }
 
 /// Durable state required to resume a logical replication consumer. A slot is
@@ -2434,8 +2461,38 @@ pub(crate) struct ReplicationSlotDef {
     pub name: SqlName,
     pub restart_lsn: u64,
     pub confirmed_flush_lsn: u64,
+    pub behavior: ReplicationSlotBehavior,
     pub active: bool,
     pub live: bool,
+}
+
+/// PostgreSQL logical-slot properties that affect what the publisher retains
+/// and where the slot can resume. They are one durable state, not command text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplicationSlotBehavior {
+    pub two_phase: bool,
+    pub failover: bool,
+}
+
+impl ReplicationSlotBehavior {
+    pub(crate) const DEFAULT: Self = Self {
+        two_phase: false,
+        failover: false,
+    };
+
+    pub(crate) const fn code(self) -> u8 {
+        self.two_phase as u8 | ((self.failover as u8) << 1)
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        if code & !3 != 0 {
+            return None;
+        }
+        Some(Self {
+            two_phase: code & 1 != 0,
+            failover: code & 2 != 0,
+        })
+    }
 }
 
 /// A logical-replication subscription. Connection information and publication
@@ -2448,6 +2505,7 @@ pub(crate) struct SubscriptionDef {
     /// An acknowledgement is valid for exactly one such definition.
     pub definition_generation: u64,
     pub name: SqlName,
+    pending_name: Option<PendingSubscriptionName>,
     pub connection: SubscriptionConnInfo,
     pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
@@ -2455,6 +2513,7 @@ pub(crate) struct SubscriptionDef {
     pub enabled: bool,
     pending_enabled: Option<PendingSubscriptionEnabled>,
     pub slot: SubscriptionSlot,
+    pub behavior: SubscriptionBehavior,
     pub bootstrap: SubscriptionBootstrap,
     pending_bootstrap: Option<PendingSubscriptionBootstrap>,
     pub(crate) cleanup: SubscriptionCleanup,
@@ -2585,6 +2644,12 @@ pub(crate) struct PendingSubscriptionBootstrap {
     bootstrap: SubscriptionBootstrap,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSubscriptionName {
+    pub txid: u32,
+    pub name: SqlName,
+}
+
 /// One transaction-private replacement for a subscription's stream identity.
 /// Keeping connection and publication names together prevents a worker from
 /// combining one committed half with one staged half.
@@ -2594,6 +2659,8 @@ pub(crate) struct PendingSubscriptionDefinition {
     connection: SubscriptionConnInfo,
     publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
     publication_count: usize,
+    slot: SubscriptionSlot,
+    behavior: SubscriptionBehavior,
 }
 
 impl core::fmt::Debug for PendingSubscriptionDefinition {
@@ -2631,6 +2698,199 @@ pub(crate) enum SubscriptionBootstrapChange {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubscriptionBehavior {
+    pub binary: bool,
+    pub streaming: SubscriptionStreaming,
+    pub synchronous_commit: SubscriptionSynchronousCommit,
+    pub two_phase: bool,
+    pub disable_on_error: bool,
+    pub password_required: bool,
+    pub run_as_owner: bool,
+    pub origin: SubscriptionOrigin,
+    pub failover: bool,
+    pub skip_lsn: Option<u64>,
+}
+
+impl SubscriptionBehavior {
+    pub(crate) const POSTGRESQL_18_DEFAULT: Self = Self {
+        binary: false,
+        streaming: SubscriptionStreaming::Parallel,
+        synchronous_commit: SubscriptionSynchronousCommit::Off,
+        two_phase: false,
+        disable_on_error: false,
+        password_required: true,
+        run_as_owner: false,
+        origin: SubscriptionOrigin::Any,
+        failover: false,
+        skip_lsn: None,
+    };
+}
+
+impl From<crate::sql::ast::SubscriptionBehavior> for SubscriptionBehavior {
+    fn from(value: crate::sql::ast::SubscriptionBehavior) -> Self {
+        Self {
+            binary: value.binary,
+            streaming: value.streaming.into(),
+            synchronous_commit: value.synchronous_commit.into(),
+            two_phase: value.two_phase,
+            disable_on_error: value.disable_on_error,
+            password_required: value.password_required,
+            run_as_owner: value.run_as_owner,
+            origin: value.origin.into(),
+            failover: value.failover,
+            skip_lsn: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionStreaming {
+    Off,
+    On,
+    Parallel,
+}
+
+impl SubscriptionStreaming {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Parallel => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Off),
+            1 => Some(Self::On),
+            2 => Some(Self::Parallel),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn pg_code(self) -> &'static str {
+        match self {
+            Self::Off => "f",
+            Self::On => "t",
+            Self::Parallel => "p",
+        }
+    }
+}
+
+impl From<crate::sql::ast::SubscriptionStreaming> for SubscriptionStreaming {
+    fn from(value: crate::sql::ast::SubscriptionStreaming) -> Self {
+        match value {
+            crate::sql::ast::SubscriptionStreaming::Off => Self::Off,
+            crate::sql::ast::SubscriptionStreaming::On => Self::On,
+            crate::sql::ast::SubscriptionStreaming::Parallel => Self::Parallel,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionSynchronousCommit {
+    Off,
+    Local,
+    RemoteWrite,
+    On,
+    RemoteApply,
+}
+
+impl SubscriptionSynchronousCommit {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Local => 1,
+            Self::RemoteWrite => 2,
+            Self::On => 3,
+            Self::RemoteApply => 4,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Off),
+            1 => Some(Self::Local),
+            2 => Some(Self::RemoteWrite),
+            3 => Some(Self::On),
+            4 => Some(Self::RemoteApply),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Local => "local",
+            Self::RemoteWrite => "remote_write",
+            Self::On => "on",
+            Self::RemoteApply => "remote_apply",
+        }
+    }
+}
+
+impl From<crate::sql::ast::SubscriptionSynchronousCommit> for SubscriptionSynchronousCommit {
+    fn from(value: crate::sql::ast::SubscriptionSynchronousCommit) -> Self {
+        match value {
+            crate::sql::ast::SubscriptionSynchronousCommit::Off => Self::Off,
+            crate::sql::ast::SubscriptionSynchronousCommit::Local => Self::Local,
+            crate::sql::ast::SubscriptionSynchronousCommit::RemoteWrite => Self::RemoteWrite,
+            crate::sql::ast::SubscriptionSynchronousCommit::On => Self::On,
+            crate::sql::ast::SubscriptionSynchronousCommit::RemoteApply => Self::RemoteApply,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionOrigin {
+    None,
+    Any,
+}
+
+impl SubscriptionOrigin {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Any => 1,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Any),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Any => "any",
+        }
+    }
+}
+
+impl From<crate::sql::ast::SubscriptionOrigin> for SubscriptionOrigin {
+    fn from(value: crate::sql::ast::SubscriptionOrigin) -> Self {
+        match value {
+            crate::sql::ast::SubscriptionOrigin::None => Self::None,
+            crate::sql::ast::SubscriptionOrigin::Any => Self::Any,
+        }
+    }
+}
+
+impl SubscriptionBehavior {
+    fn same_publisher_stream(self, other: Self) -> bool {
+        self.binary == other.binary
+            && self.streaming == other.streaming
+            && self.two_phase == other.two_phase
+            && self.origin == other.origin
+            && self.failover == other.failover
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionSpec<'a> {
     pub name: SqlName,
@@ -2638,6 +2898,7 @@ pub(crate) struct SubscriptionSpec<'a> {
     pub publications: &'a [SqlName],
     pub enabled: bool,
     pub slot: SubscriptionSlot,
+    pub behavior: SubscriptionBehavior,
     pub bootstrap: SubscriptionBootstrap,
 }
 
@@ -2716,6 +2977,12 @@ impl SubscriptionDef {
         self.ddl_state.visible_to(txid)
     }
 
+    pub(crate) fn name_for(&self, txid: u32) -> SqlName {
+        self.pending_name
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+
     pub(crate) fn enabled_to(&self, txid: u32) -> bool {
         self.pending_enabled
             .filter(|pending| pending.txid == txid)
@@ -2735,16 +3002,26 @@ impl SubscriptionDef {
         SubscriptionConnInfo,
         [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
         usize,
+        SubscriptionSlot,
+        SubscriptionBehavior,
     ) {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(
-                (self.connection, self.publications, self.publication_count),
+                (
+                    self.connection,
+                    self.publications,
+                    self.publication_count,
+                    self.slot,
+                    self.behavior,
+                ),
                 |pending| {
                     (
                         pending.connection,
                         pending.publications,
                         pending.publication_count,
+                        pending.slot,
+                        pending.behavior,
                     )
                 },
             )
@@ -2810,6 +3087,7 @@ impl PublicationDef {
             publish_delete: self.publish_delete,
             publish_truncate: self.publish_truncate,
             publish_via_partition_root: self.publish_via_partition_root,
+            publish_generated_columns: self.publish_generated_columns,
         }
     }
 
@@ -2832,6 +3110,7 @@ impl PublicationDef {
         self.publish_delete = definition.publish_delete;
         self.publish_truncate = definition.publish_truncate;
         self.publish_via_partition_root = definition.publish_via_partition_root;
+        self.publish_generated_columns = definition.publish_generated_columns;
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> PublicationDefinition {
@@ -5454,6 +5733,7 @@ impl Storage {
                     publish_delete: true,
                     publish_truncate: true,
                     publish_via_partition_root: false,
+                    publish_generated_columns: PublishGeneratedColumns::None,
                     pending_definition: None,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
@@ -5468,6 +5748,7 @@ impl Storage {
                     name: SqlName::EMPTY,
                     restart_lsn: 0,
                     confirmed_flush_lsn: 0,
+                    behavior: ReplicationSlotBehavior::DEFAULT,
                     active: false,
                     live: false,
                 })
@@ -5480,6 +5761,7 @@ impl Storage {
                     created_at: 0,
                     definition_generation: 0,
                     name: SqlName::EMPTY,
+                    pending_name: None,
                     connection: SubscriptionConnInfo::parse(
                         "host=127.0.0.1 port=1 user=disabled dbname=disabled sslmode=disable",
                     )
@@ -5490,6 +5772,7 @@ impl Storage {
                     enabled: false,
                     pending_enabled: None,
                     slot: SubscriptionSlot::Absent,
+                    behavior: SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
                     bootstrap: SubscriptionBootstrap::Deferred,
                     pending_bootstrap: None,
                     cleanup: SubscriptionCleanup::None,
@@ -12018,6 +12301,7 @@ impl Storage {
         &mut self,
         name: ReplicationSlotName,
         restart_lsn: u64,
+        behavior: ReplicationSlotBehavior,
     ) -> Result<usize, SqlError> {
         if self
             .replication_slots
@@ -12041,6 +12325,7 @@ impl Storage {
             name: name.sql_name(),
             restart_lsn,
             confirmed_flush_lsn: restart_lsn,
+            behavior,
             active: false,
             live: true,
         };
@@ -12051,6 +12336,33 @@ impl Storage {
         self.replication_slots
             .iter()
             .find(|slot| slot.live && slot.name.as_str() == name)
+    }
+
+    pub(crate) fn alter_replication_slot(
+        &mut self,
+        name: ReplicationSlotName,
+        behavior: ReplicationSlotBehavior,
+    ) -> Result<(), SqlError> {
+        let slot = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name == name.sql_name())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    name.as_str()
+                )
+            })?;
+        if slot.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                name.as_str()
+            ));
+        }
+        slot.behavior = behavior;
+        Ok(())
     }
 
     pub(crate) fn replication_slots_with_slots(
@@ -12079,6 +12391,7 @@ impl Storage {
         name: ReplicationSlotName,
         restart_lsn: u64,
         confirmed_flush_lsn: u64,
+        behavior: ReplicationSlotBehavior,
     ) -> Result<(), SqlError> {
         if confirmed_flush_lsn < restart_lsn {
             return Err(sql_err!(
@@ -12086,7 +12399,7 @@ impl Storage {
                 "replication slot confirmed LSN precedes restart LSN"
             ));
         }
-        let slot = self.create_replication_slot(name, restart_lsn)?;
+        let slot = self.create_replication_slot(name, restart_lsn, behavior)?;
         self.replication_slots[slot].confirmed_flush_lsn = confirmed_flush_lsn;
         Ok(())
     }
@@ -12114,6 +12427,7 @@ impl Storage {
             name: SqlName::EMPTY,
             restart_lsn: 0,
             confirmed_flush_lsn: 0,
+            behavior: ReplicationSlotBehavior::DEFAULT,
             active: false,
             live: false,
         };
@@ -12217,7 +12531,7 @@ impl Storage {
 
     pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, &SubscriptionDef)> {
         self.subscriptions_with_slots_visible_to(txid)
-            .find(|(_, subscription)| subscription.name.as_str() == name)
+            .find(|(_, subscription)| subscription.name_for(txid).as_str() == name)
     }
 
     pub(crate) fn create_subscription(
@@ -12269,11 +12583,9 @@ impl Storage {
                 "subscription slot ownership does not match its bootstrap state"
             ));
         }
-        if self
-            .subscriptions
-            .iter()
-            .any(|subscription| subscription.visible_to(txid) && subscription.name == spec.name)
-        {
+        if self.subscriptions.iter().any(|subscription| {
+            subscription.visible_to(txid) && subscription.name_for(txid) == spec.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "subscription \"{}\" already exists",
@@ -12297,6 +12609,7 @@ impl Storage {
             created_at: self.catalog_seq,
             definition_generation: 1,
             name: spec.name,
+            pending_name: None,
             connection: spec.connection,
             publications,
             publication_count: spec.publications.len(),
@@ -12304,6 +12617,7 @@ impl Storage {
             enabled: spec.enabled,
             pending_enabled: None,
             slot: spec.slot,
+            behavior: spec.behavior,
             bootstrap: spec.bootstrap,
             pending_bootstrap: None,
             cleanup: SubscriptionCleanup::None,
@@ -12324,7 +12638,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         let Some(slot) = self.subscriptions.iter().position(|subscription| {
-            subscription.visible_to(txid) && subscription.name.as_str() == name
+            subscription.visible_to(txid) && subscription.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
@@ -12382,6 +12696,95 @@ impl Storage {
             owner,
             pending: None,
         };
+    }
+
+    pub(crate) fn set_subscription_owner(
+        &mut self,
+        slot: usize,
+        owner: usize,
+        txid: u32,
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.require_subscription_owner(slot, txid)?;
+        let prior = self.subscriptions[slot].ownership.pending;
+        self.subscriptions[slot].ownership.pending = Some(PendingOwnership {
+            txid,
+            owner: owner as u16,
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn restore_subscription_owner_pending(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingOwnership>,
+    ) {
+        self.subscriptions[slot].ownership.pending = prior;
+    }
+
+    pub(crate) fn commit_subscription_owner(&mut self, slot: usize, txid: u32) {
+        let ownership = &mut self.subscriptions[slot].ownership;
+        if let Some(pending) = ownership.pending
+            && pending.txid == txid
+        {
+            ownership.owner = pending.owner;
+            ownership.pending = None;
+        }
+    }
+
+    pub(crate) fn rename_subscription(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingSubscriptionName>, SqlError> {
+        if self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .any(|(other, subscription)| {
+                other != slot
+                    && subscription.visible_to(txid)
+                    && subscription.name_for(txid) == name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "subscription \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let subscription = &mut self.subscriptions[slot];
+        if let Some(pending) = subscription.pending_name
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "subscription \"{}\" is being renamed by another transaction",
+                subscription.name.as_str()
+            ));
+        }
+        let prior = subscription.pending_name;
+        subscription.pending_name = Some(PendingSubscriptionName { txid, name });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_subscription_rename(&mut self, slot: usize, txid: u32) {
+        let subscription = &mut self.subscriptions[slot];
+        if let Some(pending) = subscription.pending_name
+            && pending.txid == txid
+        {
+            subscription.name = pending.name;
+            subscription.pending_name = None;
+            subscription.definition_generation += 1;
+        }
+    }
+
+    pub(crate) fn rollback_subscription_rename(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingSubscriptionName>,
+    ) {
+        self.subscriptions[slot].pending_name = prior;
     }
 
     pub(crate) fn commit_subscription_drop(&mut self, slot: usize) {
@@ -12545,6 +12948,8 @@ impl Storage {
         slot: usize,
         connection: SubscriptionConnInfo,
         publications: &[SqlName],
+        publisher_slot: SubscriptionSlot,
+        behavior: SubscriptionBehavior,
         txid: u32,
     ) -> Result<SubscriptionDefinitionChange, SqlError> {
         self.ensure_subscription_changeable(slot, txid)?;
@@ -12566,9 +12971,17 @@ impl Storage {
                 (subscription.publications, subscription.publication_count),
                 |pending| (pending.publications, pending.publication_count),
             );
+        let (current_slot, current_behavior) = subscription
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or((subscription.slot, subscription.behavior), |pending| {
+                (pending.slot, pending.behavior)
+            });
         if current_connection.as_str() == connection.as_str()
             && current_count == publications.len()
             && current_publications[..current_count] == *publications
+            && current_slot == publisher_slot
+            && current_behavior == behavior
         {
             return Ok(SubscriptionDefinitionChange {
                 changed: false,
@@ -12583,6 +12996,8 @@ impl Storage {
             connection,
             publications: names,
             publication_count: publications.len(),
+            slot: publisher_slot,
+            behavior,
         });
         Ok(SubscriptionDefinitionChange {
             changed: true,
@@ -12601,6 +13016,8 @@ impl Storage {
         SubscriptionConnInfo,
         [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
         usize,
+        SubscriptionSlot,
+        SubscriptionBehavior,
     ) {
         self.subscriptions[slot].definition_to(txid)
     }
@@ -12610,18 +13027,31 @@ impl Storage {
         if let Some(pending) = subscription.pending_definition
             && pending.txid == txid
         {
+            let replaces_stream = subscription.connection.as_str() != pending.connection.as_str()
+                || subscription.publication_count != pending.publication_count
+                || subscription.publications[..subscription.publication_count]
+                    != pending.publications[..pending.publication_count]
+                || subscription.slot != pending.slot
+                || !subscription
+                    .behavior
+                    .same_publisher_stream(pending.behavior);
             subscription.connection = pending.connection;
             subscription.publications = pending.publications;
             subscription.publication_count = pending.publication_count;
-            subscription.definition_generation = subscription
-                .definition_generation
-                .checked_add(1)
-                .expect("subscription definition generation exhausted");
+            subscription.slot = pending.slot;
+            subscription.behavior = pending.behavior;
+            if replaces_stream {
+                subscription.definition_generation = subscription
+                    .definition_generation
+                    .checked_add(1)
+                    .expect("subscription definition generation exhausted");
+            }
             subscription.pending_definition = None;
             subscription.failure = None;
             for relation in self.subscription_relations.iter_mut() {
                 if relation.ddl_state == CatalogDdlState::Present
                     && relation.subscription_created_at == subscription.created_at
+                    && replaces_stream
                 {
                     relation.definition_generation = subscription.definition_generation;
                 }
@@ -12650,6 +13080,9 @@ impl Storage {
             ));
         }
         subscription.failure = Some(failure);
+        if subscription.behavior.disable_on_error {
+            subscription.enabled = false;
+        }
         Ok(())
     }
 
@@ -12992,6 +13425,7 @@ impl Storage {
             publish_delete: spec.publish_delete,
             publish_truncate: spec.publish_truncate,
             publish_via_partition_root: spec.publish_via_partition_root,
+            publish_generated_columns: spec.publish_generated_columns,
             pending_definition: None,
             ownership: self.initial_ownership(txid),
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -18186,7 +18620,11 @@ mod tests {
         let mut budget = Budget::new(1 << 22);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage
-            .create_replication_slot(ReplicationSlotName::parse("changes").unwrap(), 42)
+            .create_replication_slot(
+                ReplicationSlotName::parse("changes").unwrap(),
+                42,
+                ReplicationSlotBehavior::DEFAULT,
+            )
             .unwrap();
         let slot = storage.replication_slot("changes").unwrap();
         assert_eq!(slot.restart_lsn, 42);
@@ -18194,7 +18632,11 @@ mod tests {
         assert!(!slot.active);
         assert_eq!(
             storage
-                .create_replication_slot(ReplicationSlotName::parse("other").unwrap(), 43)
+                .create_replication_slot(
+                    ReplicationSlotName::parse("other").unwrap(),
+                    43,
+                    ReplicationSlotBehavior::DEFAULT,
+                )
                 .unwrap_err()
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED

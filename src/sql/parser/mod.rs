@@ -3058,6 +3058,158 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn subscription_publication_change(
+        &mut self,
+    ) -> Result<(&'a [&'a str], SubscriptionPublicationRefresh), ParseError> {
+        let mut publications = [""; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == publications.len() {
+                return Err(self.limit("subscription publications", publications.len()));
+            }
+            publications[count] = self.any_ident("publication name")?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let mut refresh = true;
+        let mut copy_data = true;
+        let mut saw_refresh = false;
+        let mut saw_copy_data = false;
+        if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            loop {
+                let option = self.any_ident("publication option")?;
+                if option.eq_ignore_ascii_case("refresh") {
+                    if core::mem::replace(&mut saw_refresh, true) {
+                        return Err(self.err_here("duplicate publication option refresh"));
+                    }
+                    let _ = self.eat_op("=")?;
+                    refresh = self.role_option_boolean()?;
+                } else if option.eq_ignore_ascii_case("copy_data") {
+                    if core::mem::replace(&mut saw_copy_data, true) {
+                        return Err(self.err_here("duplicate publication option copy_data"));
+                    }
+                    let _ = self.eat_op("=")?;
+                    copy_data = self.role_option_boolean()?;
+                } else {
+                    return Err(self.err_here("unrecognized publication option"));
+                }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        if !refresh && saw_copy_data {
+            return Err(self.err_here("copy_data requires refresh = true"));
+        }
+        Ok((
+            self.arena_slice(&publications[..count])?,
+            if refresh {
+                SubscriptionPublicationRefresh::Refresh { copy_data }
+            } else {
+                SubscriptionPublicationRefresh::NoRefresh
+            },
+        ))
+    }
+
+    fn subscription_settings_patch(&mut self) -> Result<SubscriptionSettingsPatch<'a>, ParseError> {
+        let mut patch = SubscriptionSettingsPatch {
+            slot: None,
+            binary: None,
+            streaming: None,
+            synchronous_commit: None,
+            two_phase: None,
+            disable_on_error: None,
+            password_required: None,
+            run_as_owner: None,
+            origin: None,
+            failover: None,
+        };
+        self.expect_op("(")?;
+        loop {
+            let key = self.any_ident("subscription setting")?;
+            if key.eq_ignore_ascii_case("slot_name") {
+                if patch.slot.is_some() {
+                    return Err(self.err_here("duplicate subscription setting slot_name"));
+                }
+                self.expect_op("=")?;
+                patch.slot = Some(if self.eat_ident("none")? {
+                    SubscriptionSlotSetting::Absent
+                } else {
+                    let value = match self.peeked {
+                        Tok::Ident(value) | Tok::Str(value) => value,
+                        _ => return Err(self.err_here("slot_name requires a name or NONE")),
+                    };
+                    self.advance()?;
+                    SubscriptionSlotSetting::Named(value)
+                });
+            } else if key.eq_ignore_ascii_case("binary") {
+                if patch.binary.is_some() {
+                    return Err(self.err_here("duplicate subscription setting binary"));
+                }
+                patch.binary = Some(self.subscription_bool_option(key)?);
+            } else if key.eq_ignore_ascii_case("streaming") {
+                if patch.streaming.is_some() {
+                    return Err(self.err_here("duplicate subscription setting streaming"));
+                }
+                patch.streaming = Some(self.subscription_streaming()?);
+            } else if key.eq_ignore_ascii_case("synchronous_commit") {
+                if patch.synchronous_commit.is_some() {
+                    return Err(self.err_here("duplicate subscription setting synchronous_commit"));
+                }
+                patch.synchronous_commit = Some(self.subscription_synchronous_commit()?);
+            } else if key.eq_ignore_ascii_case("two_phase") {
+                if patch.two_phase.is_some() {
+                    return Err(self.err_here("duplicate subscription setting two_phase"));
+                }
+                patch.two_phase = Some(self.subscription_bool_option(key)?);
+            } else if key.eq_ignore_ascii_case("disable_on_error") {
+                if patch.disable_on_error.is_some() {
+                    return Err(self.err_here("duplicate subscription setting disable_on_error"));
+                }
+                patch.disable_on_error = Some(self.subscription_bool_option(key)?);
+            } else if key.eq_ignore_ascii_case("password_required") {
+                if patch.password_required.is_some() {
+                    return Err(self.err_here("duplicate subscription setting password_required"));
+                }
+                patch.password_required = Some(self.subscription_bool_option(key)?);
+            } else if key.eq_ignore_ascii_case("run_as_owner") {
+                if patch.run_as_owner.is_some() {
+                    return Err(self.err_here("duplicate subscription setting run_as_owner"));
+                }
+                patch.run_as_owner = Some(self.subscription_bool_option(key)?);
+            } else if key.eq_ignore_ascii_case("origin") {
+                if patch.origin.is_some() {
+                    return Err(self.err_here("duplicate subscription setting origin"));
+                }
+                patch.origin = Some(self.subscription_origin()?);
+            } else if key.eq_ignore_ascii_case("failover") {
+                if patch.failover.is_some() {
+                    return Err(self.err_here("duplicate subscription setting failover"));
+                }
+                patch.failover = Some(self.subscription_bool_option(key)?);
+            } else {
+                return Err(self.err_here("unrecognized subscription setting"));
+            }
+            if self.eat_op(")")? {
+                break;
+            }
+            self.expect_op(",")?;
+        }
+        Ok(patch)
+    }
+
+    fn subscription_lsn(value: &str) -> Option<u64> {
+        let (high, low) = value.split_once('/')?;
+        if high.is_empty() || low.is_empty() || high.len() > 8 || low.len() > 8 {
+            return None;
+        }
+        Some((u64::from_str_radix(high, 16).ok()? << 32) | u64::from_str_radix(low, 16).ok()?)
+    }
+
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         use crate::sql::ast::AlterOwnerKind;
@@ -3073,7 +3225,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("subscription")? {
             let name = self.any_ident("subscription name")?;
-            let action = if self.eat_ident("enable")? {
+            let action = if self.eat_ident("owner")? {
+                self.expect_ident("to")?;
+                AlterSubscriptionAction::SetOwner(self.any_ident("role name")?)
+            } else if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                AlterSubscriptionAction::Rename(self.any_ident("new subscription name")?)
+            } else if self.eat_ident("enable")? {
                 AlterSubscriptionAction::Enable
             } else if self.eat_ident("disable")? {
                 AlterSubscriptionAction::Disable
@@ -3082,35 +3240,28 @@ impl<'a> Parser<'a> {
                     self.str_literal("subscription connection string")?,
                 )
             } else if self.eat_ident("set")? {
-                self.expect_ident("publication")?;
-                let mut publications = [""; MAX_LIST];
-                let mut count = 0;
-                loop {
-                    if count == publications.len() {
-                        return Err(self.limit("subscription publications", publications.len()));
-                    }
-                    publications[count] = self.any_ident("publication name")?;
-                    count += 1;
-                    if !self.eat_op(",")? {
-                        break;
+                if self.peeked == Tok::Op("(") {
+                    AlterSubscriptionAction::SetOptions(self.subscription_settings_patch()?)
+                } else {
+                    self.expect_ident("publication")?;
+                    let (publications, refresh) = self.subscription_publication_change()?;
+                    AlterSubscriptionAction::SetPublications {
+                        publications,
+                        refresh,
                     }
                 }
-                let refresh = if self.eat_ident("with")? {
-                    self.expect_op("(")?;
-                    self.expect_ident("refresh")?;
-                    let _ = self.eat_op("=")?;
-                    let refresh = self.role_option_boolean()?;
-                    self.expect_op(")")?;
-                    if refresh {
-                        crate::sql::ast::SubscriptionPublicationRefresh::Refresh
-                    } else {
-                        crate::sql::ast::SubscriptionPublicationRefresh::NoRefresh
-                    }
-                } else {
-                    crate::sql::ast::SubscriptionPublicationRefresh::Refresh
-                };
-                AlterSubscriptionAction::SetPublications {
-                    publications: self.arena_slice(&publications[..count])?,
+            } else if self.eat_ident("add")? {
+                self.expect_ident("publication")?;
+                let (publications, refresh) = self.subscription_publication_change()?;
+                AlterSubscriptionAction::AddPublications {
+                    publications,
+                    refresh,
+                }
+            } else if self.eat_ident("drop")? {
+                self.expect_ident("publication")?;
+                let (publications, refresh) = self.subscription_publication_change()?;
+                AlterSubscriptionAction::DropPublications {
+                    publications,
                     refresh,
                 }
             } else if self.eat_ident("refresh")? {
@@ -3126,10 +3277,27 @@ impl<'a> Parser<'a> {
                     true
                 };
                 AlterSubscriptionAction::RefreshPublications { copy_data }
+            } else if self.eat_ident("skip")? {
+                self.expect_op("(")?;
+                self.expect_ident("lsn")?;
+                self.expect_op("=")?;
+                let lsn = if self.eat_ident("none")? {
+                    None
+                } else {
+                    let value = match self.peeked {
+                        Tok::Ident(value) | Tok::Str(value) => value,
+                        _ => return Err(self.err_here("subscription skip LSN is invalid")),
+                    };
+                    self.advance()?;
+                    Some(
+                        Self::subscription_lsn(value)
+                            .ok_or_else(|| self.err_here("subscription skip LSN is invalid"))?,
+                    )
+                };
+                self.expect_op(")")?;
+                AlterSubscriptionAction::Skip { lsn }
             } else {
-                return Err(self.err_here(
-                    "expected ENABLE, DISABLE, CONNECTION, SET PUBLICATION, or REFRESH PUBLICATION after ALTER SUBSCRIPTION",
-                ));
+                return Err(self.err_here("invalid ALTER SUBSCRIPTION action"));
             };
             return Ok(Stmt::AlterSubscription { name, action });
         }

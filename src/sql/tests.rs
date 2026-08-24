@@ -988,7 +988,20 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
-        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
+        .create_replication_slot(
+            crate::storage::ReplicationSlotName::parse("changes").unwrap(),
+            crate::storage::ReplicationSlotBehavior::DEFAULT,
+        )
+        .unwrap();
+    let slot_behavior = crate::storage::ReplicationSlotBehavior {
+        two_phase: true,
+        failover: true,
+    };
+    engine
+        .alter_replication_slot(
+            crate::storage::ReplicationSlotName::parse("changes").unwrap(),
+            slot_behavior,
+        )
         .unwrap();
     assert_eq!(
         engine
@@ -1010,6 +1023,14 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
             .confirmed_flush_lsn,
         restart_lsn
     );
+    assert_eq!(
+        recovered
+            .storage
+            .replication_slot("changes")
+            .unwrap()
+            .behavior,
+        slot_behavior
+    );
     assert!(recovered.checkpoint().unwrap());
     drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1019,13 +1040,14 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let output = run_with(
         &mut checkpoint_recovered,
         &mut checkpoint_budget,
-        "SELECT slot_name, plugin, slot_type, active, restart_lsn, confirmed_flush_lsn
+        "SELECT slot_name, plugin, slot_type, active, restart_lsn, confirmed_flush_lsn,
+                two_phase, failover, synced
            FROM pg_replication_slots",
     );
     let lsn = format!("0/{restart_lsn:X}");
     assert_eq!(
         data_rows(&output),
-        [format!("changes|pgoutput|logical|f|{lsn}|{lsn}")]
+        [format!("changes|pgoutput|logical|f|{lsn}|{lsn}|t|t|f")]
     );
 }
 
@@ -3449,6 +3471,17 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple() {
 }
 
 #[test]
+fn logical_replication_generated_column_policy_is_typed_and_applied() {
+    std::thread::Builder::new()
+        .name("logical-generated-columns".into())
+        .stack_size(4 << 20)
+        .spawn(logical_replication_generated_column_policy_is_typed_and_applied_on_sized_stack)
+        .expect("logical generated-column test thread starts")
+        .join()
+        .expect("logical generated-column test thread completes");
+}
+
+#[test]
 fn logical_replication_selects_a_quoted_publication_name() {
     std::thread::Builder::new()
         .name("logical-quoted-publication".into())
@@ -3941,6 +3974,83 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple_on_si
     );
 }
 
+fn logical_replication_generated_column_policy_is_typed_and_applied_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    let setup = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE generated_table (
+           id int PRIMARY KEY,
+           source text,
+           derived text GENERATED ALWAYS AS (source || '-derived') STORED
+         );
+         CREATE PUBLICATION generated_changes FOR TABLE generated_table
+           WITH (publish = 'insert', publish_generated_columns = none);",
+    );
+    assert!(!setup.contains("ERROR"), "{setup}");
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pubgencols FROM pg_publication WHERE pubname = 'generated_changes'",
+    );
+    assert_eq!(data_rows(&catalog), ["n"], "{catalog:?}");
+    let first_floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO generated_table (id, source) VALUES (1, 'first')",
+    );
+    let mut scratch = crate::mem::FixedBuf::new(&mut budget, "generated scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "generated send", 1 << 16).unwrap();
+    engine
+        .emit_replication_transaction(
+            first_floor,
+            &[crate::storage::SqlName::parse("generated_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V4,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("generated publication transaction is retained");
+    assert!(!send.readable().windows(7).any(|bytes| bytes == b"derived"));
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER PUBLICATION generated_changes SET (publish_generated_columns = stored)",
+    );
+    let second_floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO generated_table (id, source) VALUES (2, 'second')",
+    );
+    scratch.clear();
+    send.clear();
+    engine
+        .emit_replication_transaction(
+            second_floor,
+            &[crate::storage::SqlName::parse("generated_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V4,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("stored generated publication transaction is retained");
+    assert!(send.readable().windows(7).any(|bytes| bytes == b"derived"));
+    assert!(
+        send.readable()
+            .windows(14)
+            .any(|bytes| bytes == b"second-derived")
+    );
+}
+
 fn logical_replication_selects_a_quoted_publication_name_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -4081,7 +4191,10 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
         "CREATE TABLE t (id int); CREATE PUBLICATION changes FOR TABLE t",
     );
     let floor = engine
-        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
+        .create_replication_slot(
+            crate::storage::ReplicationSlotName::parse("changes").unwrap(),
+            crate::storage::ReplicationSlotBehavior::DEFAULT,
+        )
         .unwrap();
     engine.advance_replication_slot("changes", floor).unwrap();
 
@@ -4107,7 +4220,10 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
 fn rejected_slot_acknowledgement_does_not_reach_wal() {
     let (mut engine, _) = test_engine();
     let floor = engine
-        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
+        .create_replication_slot(
+            crate::storage::ReplicationSlotName::parse("changes").unwrap(),
+            crate::storage::ReplicationSlotBehavior::DEFAULT,
+        )
         .unwrap();
     let durable_lsn = engine.replication_identity().1;
 
@@ -9236,10 +9352,8 @@ fn range_table_covers_wide_conformance_queries_on_sized_stack() {
 
 #[test]
 fn selective_join_component_precedes_independent_cross_filters() {
-    // The final cardinality is small, but postponing the t1/t6 equality until
-    // after the six independent filters creates more than sixteen million
-    // nested-loop candidates. Equivalent FROM permutations must all establish
-    // that selective component before multiplying it.
+    // Equivalent FROM permutations must establish the selective t1/t6
+    // component before multiplying the independent filters.
     let (mut e, mut b) = test_engine();
     for definition in [
         "CREATE TABLE t1(a1 int, d1 int)",
@@ -9275,9 +9389,23 @@ fn selective_join_component_precedes_independent_cross_filters() {
         "t1,t4,t5,t7,t9,t3,t2,t6",
         "t5,t9,t1,t6,t3,t7,t2,t4",
     ] {
-        let sql = format!(
-            "SET statement_timeout=10000; SELECT count(*) FROM {from} WHERE {qualification}"
+        let plan = data_rows(&run_with(
+            &mut e,
+            &mut b,
+            &format!("EXPLAIN SELECT count(*) FROM {from} WHERE {qualification}"),
+        ));
+        let first_scans = plan
+            .iter()
+            .filter(|row| row.contains("Seq Scan on "))
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(first_scans.len(), 2, "FROM {from}: {plan:?}");
+        assert!(
+            first_scans.iter().any(|row| row.contains(" on t1 "))
+                && first_scans.iter().any(|row| row.contains(" on t6 ")),
+            "FROM {from}: {plan:?}"
         );
+        let sql = format!("SELECT count(*) FROM {from} WHERE {qualification}");
         let rows = data_rows(&run_with(&mut e, &mut b, &sql));
         assert_eq!(rows, ["1620"], "FROM {from}");
     }
@@ -25012,7 +25140,7 @@ fn enabled_subscription_has_one_complete_durable_worker_description() {
         .subscription_runtime(0)
         .expect("enabled subscription has a complete worker binding");
     assert_eq!(runtime.stream.name().as_str(), "apply_changes");
-    assert_eq!(runtime.slot.as_str(), "publisher_slot");
+    assert_eq!(runtime.slot.unwrap().as_str(), "publisher_slot");
     assert_eq!(
         runtime.publications[..runtime.publication_count],
         [SqlName::parse("changes").unwrap()]
@@ -25189,6 +25317,104 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
         ]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn subscription_behavior_owner_and_name_are_one_durable_typed_state() {
+    let config = test_config("subscription-complete-options");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE subscription_owner;
+         CREATE SUBSCRIPTION apply_changes CONNECTION
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=apply_changes sslmode=disable'
+         PUBLICATION changes WITH (
+           connect = false,
+           slot_name = NONE,
+           binary = true,
+           streaming = on,
+           synchronous_commit = remote_apply,
+           disable_on_error = true,
+           password_required = false,
+           run_as_owner = true,
+           origin = none,
+           failover = true,
+           two_phase = false
+         );
+         ALTER SUBSCRIPTION apply_changes OWNER TO subscription_owner;
+         ALTER SUBSCRIPTION apply_changes RENAME TO durable_changes",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT subname, subbinary, substream, subsynccommit, subdisableonerr,
+                    subpasswordrequired, subrunasowner, suborigin, subfailover
+             FROM pg_subscription WHERE subname = 'durable_changes'",
+        )),
+        ["durable_changes|t|t|remote_apply|t|f|t|none|t"]
+    );
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 27);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT subname, subbinary, substream, subsynccommit, subdisableonerr,
+                    subpasswordrequired, subrunasowner, suborigin, subfailover
+             FROM pg_subscription WHERE subname = 'durable_changes'",
+        )),
+        ["durable_changes|t|t|remote_apply|t|f|t|none|t"]
+    );
+    assert_eq!(
+        replayed
+            .storage
+            .subscription("durable_changes", 0)
+            .unwrap()
+            .1
+            .ownership
+            .owner_to(0),
+        replayed
+            .storage
+            .find_role_visible("subscription_owner", 0)
+            .unwrap() as u16
+    );
+    let unsupported = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "ALTER SUBSCRIPTION durable_changes SET (two_phase = true)",
+    );
+    assert!(String::from_utf8_lossy(&unsupported).contains("0A000"));
+    let absent_slot = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "ALTER SUBSCRIPTION durable_changes SET (failover = false, two_phase = false)",
+    );
+    assert!(String::from_utf8_lossy(&absent_slot).contains("55000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT subfailover, subtwophasestate FROM pg_subscription WHERE subname = 'durable_changes'",
+        )),
+        ["t|d"]
+    );
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "CREATE SUBSCRIPTION external_changes CONNECTION
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=external_changes sslmode=disable'
+         PUBLICATION changes WITH (connect = false, slot_name = publisher_slot)",
+    );
+    let transaction_block = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "BEGIN; ALTER SUBSCRIPTION external_changes SET (failover = true); ROLLBACK",
+    );
+    assert!(String::from_utf8_lossy(&transaction_block).contains("25001"));
 }
 
 #[test]
@@ -25433,7 +25659,7 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
 }
 
 #[test]
-fn subscription_failure_is_durable_and_refresh_is_an_explicit_restart() {
+fn subscription_failure_policy_is_durable_and_typed() {
     let mut config = test_config("subscription-failure-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -25447,8 +25673,8 @@ fn subscription_failure_is_durable_and_refresh_is_an_explicit_restart() {
         &mut engine,
         &mut budget,
         "CREATE SUBSCRIPTION failed_changes CONNECTION \
-         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
-         PUBLICATION changes WITH (connect = false)",
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=failed_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = failed_slot)",
     );
     let stream = engine.subscription_stream("failed_changes").unwrap();
     engine
@@ -25460,7 +25686,36 @@ fn subscription_failure_is_durable_and_refresh_is_an_explicit_restart() {
             },
         )
         .unwrap();
-    assert!(engine.subscription_runtime(0).is_none());
+    assert!(
+        engine.subscription_runtime(0).is_some(),
+        "the PostgreSQL default keeps the worker eligible for retry"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION disabled_on_error CONNECTION
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=disabled_on_error sslmode=disable'
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = disabled_slot, disable_on_error = true)",
+    );
+    let disabled_stream = engine.subscription_stream("disabled_on_error").unwrap();
+    engine
+        .fail_subscription(
+            disabled_stream,
+            crate::storage::SubscriptionFailure {
+                sqlstate: crate::sql::eval::SqlState::parse("23505").unwrap(),
+                message: crate::util::StackStr::from_str("replicated key conflicts"),
+            },
+        )
+        .unwrap();
+    assert!(
+        !engine
+            .storage
+            .subscription("disabled_on_error", 0)
+            .unwrap()
+            .1
+            .enabled
+    );
+    assert!(engine.subscription_runtime(1).is_none());
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
@@ -25611,16 +25866,23 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
          'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
          CREATE FUNCTION audit_replication_statement() RETURNS trigger LANGUAGE plpgsql AS \
          'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
+         CREATE FUNCTION audit_replication_truncate() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica truncate''); RETURN NULL; END'; \
          CREATE TRIGGER replicated_replica_insert BEFORE INSERT ON replicated \
          FOR EACH ROW EXECUTE FUNCTION audit_replication_insert(); \
          CREATE TRIGGER replicated_replica_statement AFTER INSERT ON replicated \
          FOR EACH STATEMENT EXECUTE FUNCTION audit_replication_statement(); \
+         CREATE TRIGGER replicated_replica_truncate AFTER TRUNCATE ON replicated \
+         FOR EACH STATEMENT EXECUTE FUNCTION audit_replication_truncate(); \
          ALTER TABLE replicated ENABLE REPLICA TRIGGER replicated_replica_insert; \
          ALTER TABLE replicated ENABLE REPLICA TRIGGER replicated_replica_statement; \
+         ALTER TABLE replicated ENABLE REPLICA TRIGGER replicated_replica_truncate; \
+         CREATE PUBLICATION local_changes FOR TABLE replicated; \
          CREATE SUBSCRIPTION apply_changes CONNECTION \
          'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
          PUBLICATION changes WITH (connect = false, slot_name = NONE)",
     );
+    let origin_floor = engine.storage.lsn();
     let mut apply = SubscriptionApply::new(
         &mut budget,
         engine.subscription_stream("apply_changes").unwrap(),
@@ -25628,6 +25890,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         config.txn_rows,
         1 << 16,
         engine.subscription_confirmed_lsn("apply_changes").unwrap(),
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
     )
     .unwrap();
     let relation = [
@@ -25669,6 +25932,43 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         ["1|first|local"]
     );
     assert_eq!(apply.confirmed_lsn(), 41);
+    let mut origin_scratch =
+        crate::mem::FixedBuf::new(&mut budget, "origin filter scratch", 1 << 16).unwrap();
+    let mut origin_send =
+        crate::mem::FixedBuf::new(&mut budget, "origin filter send", 1 << 16).unwrap();
+    let (_, any_emitted) = engine
+        .emit_replication_transaction_for_origin(
+            origin_floor,
+            crate::sql::ReplicationEmission {
+                publications: &[crate::storage::SqlName::parse("local_changes").unwrap()],
+                binary: false,
+                origin: crate::storage::SubscriptionOrigin::Any,
+                protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+            },
+            &mut origin_scratch,
+            &mut Responder::new(&mut origin_send),
+        )
+        .unwrap()
+        .expect("applied transaction remains in the publisher journal");
+    assert!(any_emitted);
+    origin_scratch.clear();
+    origin_send.clear();
+    let (_, none_emitted) = engine
+        .emit_replication_transaction_for_origin(
+            origin_floor,
+            crate::sql::ReplicationEmission {
+                publications: &[crate::storage::SqlName::parse("local_changes").unwrap()],
+                binary: false,
+                origin: crate::storage::SubscriptionOrigin::None,
+                protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+            },
+            &mut origin_scratch,
+            &mut Responder::new(&mut origin_send),
+        )
+        .unwrap()
+        .expect("origin filtering advances across the applied transaction");
+    assert!(!none_emitted);
+    assert!(origin_send.is_empty());
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -25681,9 +25981,11 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     begin[8] = 80;
     begin[20] = 2;
     receive(&mut apply, &mut engine, 80, &begin);
+    // PostgreSQL omits the old tuple for the usual replica-identity update;
+    // the key in the new tuple identifies the local row.
     let update = [
-        b'U', 0, 0, 0, 1, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0, 1,
-        b'1', b't', 0, 0, 0, 6, b's', b'e', b'c', b'o', b'n', b'd',
+        b'U', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 6, b's', b'e', b'c',
+        b'o', b'n', b'd',
     ];
     receive(&mut apply, &mut engine, 80, &update);
     commit[9] = 80;
@@ -25756,6 +26058,14 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             "SELECT * FROM replicated"
         ))
         .is_empty()
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT note FROM replication_trigger_audit ORDER BY note"
+        )),
+        ["replica insert", "replica insert"]
     );
 
     // A replayed remote transaction is parsed but cannot write a duplicate
@@ -25839,8 +26149,8 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         "a keepalive WAL end is informational and may trail an imported snapshot frontier"
     );
     // An ALTER replaces the publisher stream before this worker can process
-    // its next raw pgoutput transaction. The stale worker may decode frames,
-    // but it cannot commit rows or an acknowledgement for the new stream.
+    // its next raw pgoutput transaction. Authority is checked before the
+    // first row mutation, so stale work never reaches the local write path.
     run_with(
         &mut engine,
         &mut budget,
@@ -25851,11 +26161,8 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     receive(&mut apply, &mut engine, 130, &begin);
     let mut stale_insert = durable_insert;
     stale_insert[13] = b'3';
-    receive(&mut apply, &mut engine, 130, &stale_insert);
-    commit[9] = 130;
-    commit[17] = 131;
-    let bytes = frame(131, &commit);
-    let parsed = copy_data(&bytes[..25 + commit.len()]).unwrap();
+    let bytes = frame(130, &stale_insert);
+    let parsed = copy_data(&bytes[..25 + stale_insert.len()]).unwrap();
     let error = apply.receive(&mut engine, parsed).unwrap_err();
     assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
     assert_eq!(apply.confirmed_lsn(), 121);
@@ -25883,6 +26190,205 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         replayed.subscription_confirmed_lsn("apply_changes"),
         Some(121),
         "a restart cannot replay committed rows without their matching acknowledgement frontier"
+    );
+}
+
+#[test]
+fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
+    use crate::pg::pginput::{DecodeState, copy_data, copy_data_with_state};
+    use crate::pg::subscription_apply::{ApplyResult, SubscriptionApply};
+
+    fn frame(end_lsn: u64, plugin: &[u8]) -> [u8; 256] {
+        let mut frame = [0_u8; 256];
+        frame[0] = b'w';
+        frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
+        frame[25..25 + plugin.len()].copy_from_slice(plugin);
+        frame
+    }
+
+    let config = test_config("streamed-pgoutput-skip");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE streamed_rows (id int PRIMARY KEY, value text);
+         CREATE SUBSCRIPTION streamed_changes CONNECTION
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable'
+         PUBLICATION changes WITH (connect = false, slot_name = NONE, streaming = parallel)",
+    );
+    let stream = engine.subscription_stream("streamed_changes").unwrap();
+    let behavior = engine
+        .storage
+        .subscription("streamed_changes", 0)
+        .unwrap()
+        .1
+        .behavior;
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        stream,
+        8,
+        config.txn_rows,
+        1 << 16,
+        0,
+        behavior,
+    )
+    .unwrap();
+    let relation = [
+        b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b's', b't', b'r', b'e', b'a',
+        b'm', b'e', b'd', b'_', b'r', b'o', b'w', b's', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0,
+        23, 255, 255, 255, 255, 0, b'v', b'a', b'l', b'u', b'e', 0, 0, 0, 0, 25, 255, 255, 255,
+        255,
+    ];
+    let bytes = frame(1, &relation);
+    apply
+        .receive(
+            &mut engine,
+            copy_data(&bytes[..25 + relation.len()]).unwrap(),
+        )
+        .unwrap();
+    let mut decode = DecodeState::new(true);
+    for plugin in [
+        &[b'S', 0, 0, 0, 7, 1][..],
+        &[
+            b'I', 0, 0, 0, 8, 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'2', b't', 0, 0, 0, 7,
+            b'a', b'b', b'o', b'r', b't', b'e', b'd',
+        ],
+        b"E",
+    ] {
+        let bytes = frame(140, plugin);
+        assert_eq!(
+            apply
+                .receive(
+                    &mut engine,
+                    copy_data_with_state(&bytes[..25 + plugin.len()], &mut decode).unwrap(),
+                )
+                .unwrap(),
+            ApplyResult::None
+        );
+    }
+    let mut subtransaction_abort = [0_u8; 25];
+    subtransaction_abort[0] = b'A';
+    subtransaction_abort[4] = 7;
+    subtransaction_abort[8] = 8;
+    subtransaction_abort[16] = 139;
+    let bytes = frame(140, &subtransaction_abort);
+    assert_eq!(
+        apply
+            .receive(
+                &mut engine,
+                copy_data_with_state(&bytes[..50], &mut decode).unwrap(),
+            )
+            .unwrap(),
+        ApplyResult::None
+    );
+    for plugin in [
+        &[b'S', 0, 0, 0, 7, 0][..],
+        &[
+            b'I', 0, 0, 0, 7, 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 8,
+            b's', b't', b'r', b'e', b'a', b'm', b'e', b'd',
+        ],
+        b"E",
+    ] {
+        let bytes = frame(140, plugin);
+        assert_eq!(
+            apply
+                .receive(
+                    &mut engine,
+                    copy_data_with_state(&bytes[..25 + plugin.len()], &mut decode).unwrap(),
+                )
+                .unwrap(),
+            ApplyResult::None
+        );
+    }
+    let mut streamed_commit = [0_u8; 30];
+    streamed_commit[0] = b'c';
+    streamed_commit[4] = 7;
+    streamed_commit[13] = 140;
+    streamed_commit[21] = 141;
+    let bytes = frame(141, &streamed_commit);
+    assert_eq!(
+        apply
+            .receive(
+                &mut engine,
+                copy_data_with_state(&bytes[..55], &mut decode).unwrap(),
+            )
+            .unwrap(),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 141,
+            reply_requested: false,
+        }
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM streamed_rows"
+        )),
+        ["1|streamed"]
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION streamed_changes SKIP (lsn = '0/C8')",
+    );
+    let behavior = engine
+        .storage
+        .subscription("streamed_changes", 0)
+        .unwrap()
+        .1
+        .behavior;
+    apply.bind(stream, 141, behavior).unwrap();
+    let mut begin = [0_u8; 21];
+    begin[0] = b'B';
+    begin[8] = 200;
+    begin[20] = 8;
+    let skipped_insert = [
+        b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'2', b't', 0, 0, 0, 7, b's', b'k', b'i',
+        b'p', b'p', b'e', b'd',
+    ];
+    for plugin in [&begin[..], &skipped_insert[..]] {
+        let bytes = frame(200, plugin);
+        apply
+            .receive(&mut engine, copy_data(&bytes[..25 + plugin.len()]).unwrap())
+            .unwrap();
+    }
+    let mut commit = [0_u8; 26];
+    commit[0] = b'C';
+    commit[9] = 200;
+    commit[17] = 201;
+    let bytes = frame(201, &commit);
+    assert_eq!(
+        apply
+            .receive(&mut engine, copy_data(&bytes[..51]).unwrap())
+            .unwrap(),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 201,
+            reply_requested: false,
+        }
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM streamed_rows"
+        )),
+        ["1|streamed"]
+    );
+    assert_eq!(
+        engine
+            .storage
+            .subscription("streamed_changes", 0)
+            .unwrap()
+            .1
+            .behavior
+            .skip_lsn,
+        None
+    );
+    assert_eq!(
+        engine.subscription_confirmed_lsn("streamed_changes"),
+        Some(201)
     );
 }
 
@@ -25970,6 +26476,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         config.txn_rows,
         1 << 16,
         0,
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
     )
     .unwrap();
     assert_eq!(

@@ -49,6 +49,18 @@ pub struct OldTuple<'a> {
     pub tuple: Tuple<'a>,
 }
 
+/// The row identity carried by an UPDATE. PostgreSQL may omit an old image
+/// when the new tuple contains the replica-identity key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the decoded identity stays inline because apply-time wire decoding cannot allocate"
+)]
+pub enum UpdateIdentity<'a> {
+    Old(OldTuple<'a>),
+    NewTupleKey,
+}
+
 impl<'a> Tuple<'a> {
     pub fn columns(&self) -> &[TupleColumn<'a>] {
         &self.columns[..self.count]
@@ -114,26 +126,67 @@ pub enum Message<'a> {
         commit_lsn: u64,
         end_lsn: u64,
     },
-    Relation(Relation<'a>),
+    Relation {
+        xid: Option<u32>,
+        relation: Relation<'a>,
+    },
     Type {
+        xid: Option<u32>,
         oid: u32,
         namespace: &'a str,
         name: &'a str,
     },
     Insert {
+        xid: Option<u32>,
         relation_id: u32,
         new: Tuple<'a>,
     },
     Update {
+        xid: Option<u32>,
         relation_id: u32,
-        old: Option<OldTuple<'a>>,
+        identity: UpdateIdentity<'a>,
         new: Tuple<'a>,
     },
     Delete {
+        xid: Option<u32>,
         relation_id: u32,
         old: OldTuple<'a>,
     },
-    Truncate(Truncate),
+    Truncate {
+        xid: Option<u32>,
+        truncate: Truncate,
+    },
+    StreamStart {
+        xid: u32,
+        first_segment: bool,
+    },
+    StreamStop,
+    StreamCommit {
+        xid: u32,
+        commit_lsn: u64,
+        end_lsn: u64,
+    },
+    StreamAbort {
+        xid: u32,
+        subxid: u32,
+        abort_lsn: Option<u64>,
+        abort_time: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeState {
+    streamed_segment: bool,
+    parallel: bool,
+}
+
+impl DecodeState {
+    pub const fn new(parallel: bool) -> Self {
+        Self {
+            streamed_segment: false,
+            parallel,
+        }
+    }
 }
 
 #[allow(
@@ -246,8 +299,15 @@ fn tuple<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     Ok(Tuple { columns, count })
 }
 
-fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
+fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, DecodeError> {
     let mut input = Input::new(bytes);
+    let streamed_xid = |input: &mut Input<'a>, state: DecodeState| {
+        if state.streamed_segment {
+            input.u32().map(Some)
+        } else {
+            Ok(None)
+        }
+    };
     let message = match input.u8()? {
         b'B' => {
             let final_lsn = input.u64()?;
@@ -268,6 +328,7 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
             }
         }
         b'R' => {
+            let xid = streamed_xid(&mut input, *state)?;
             let id = input.u32()?;
             let namespace = input.cstr()?;
             let name = input.cstr()?;
@@ -290,33 +351,40 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
                     type_modifier: input.i32()?,
                 };
             }
-            Message::Relation(Relation {
-                id,
-                namespace,
-                name,
-                replica_identity,
-                columns,
-                count,
-            })
+            Message::Relation {
+                xid,
+                relation: Relation {
+                    id,
+                    namespace,
+                    name,
+                    replica_identity,
+                    columns,
+                    count,
+                },
+            }
         }
         b'Y' => Message::Type {
+            xid: streamed_xid(&mut input, *state)?,
             oid: input.u32()?,
             namespace: input.cstr()?,
             name: input.cstr()?,
         },
         b'I' => {
+            let xid = streamed_xid(&mut input, *state)?;
             let relation_id = input.u32()?;
             Message::Insert {
+                xid,
                 relation_id,
                 new: tuple(&mut input)?,
             }
         }
         b'U' => {
+            let xid = streamed_xid(&mut input, *state)?;
             let relation_id = input.u32()?;
-            let old = match input.bytes.get(input.at).copied() {
+            let identity = match input.bytes.get(input.at).copied() {
                 Some(tag @ (b'K' | b'O')) => {
                     input.at += 1;
-                    Some(OldTuple {
+                    UpdateIdentity::Old(OldTuple {
                         identity: if tag == b'K' {
                             ReplicaIdentity::Key
                         } else {
@@ -325,15 +393,17 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
                         tuple: tuple(&mut input)?,
                     })
                 }
-                _ => None,
+                _ => UpdateIdentity::NewTupleKey,
             };
             Message::Update {
+                xid,
                 relation_id,
-                old,
+                identity,
                 new: tuple(&mut input)?,
             }
         }
         b'D' => {
+            let xid = streamed_xid(&mut input, *state)?;
             let relation_id = input.u32()?;
             let tag = input.u8()?;
             let identity = match tag {
@@ -342,6 +412,7 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
                 _ => return Err(DecodeError::Invalid),
             };
             Message::Delete {
+                xid,
                 relation_id,
                 old: OldTuple {
                     identity,
@@ -350,6 +421,7 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
             }
         }
         b'T' => {
+            let xid = streamed_xid(&mut input, *state)?;
             let count: usize = input.u32()?.try_into().map_err(|_| DecodeError::Limit)?;
             if count > MAX_TRUNCATE_RELATIONS {
                 return Err(DecodeError::Limit);
@@ -362,12 +434,64 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
             for relation_id in &mut relation_ids[..count] {
                 *relation_id = input.u32()?;
             }
-            Message::Truncate(Truncate {
-                relation_ids,
-                count,
-                cascade: flags & 1 != 0,
-                restart_identity: flags & 2 != 0,
-            })
+            Message::Truncate {
+                xid,
+                truncate: Truncate {
+                    relation_ids,
+                    count,
+                    cascade: flags & 1 != 0,
+                    restart_identity: flags & 2 != 0,
+                },
+            }
+        }
+        b'S' => {
+            if state.streamed_segment {
+                return Err(DecodeError::Invalid);
+            }
+            let xid = input.u32()?;
+            let first_segment = match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid),
+            };
+            state.streamed_segment = true;
+            Message::StreamStart { xid, first_segment }
+        }
+        b'E' => {
+            if !state.streamed_segment {
+                return Err(DecodeError::Invalid);
+            }
+            state.streamed_segment = false;
+            Message::StreamStop
+        }
+        b'c' => {
+            let xid = input.u32()?;
+            if input.u8()? != 0 {
+                return Err(DecodeError::Invalid);
+            }
+            let commit_lsn = input.u64()?;
+            let end_lsn = input.u64()?;
+            let _commit_time = input.u64()?;
+            Message::StreamCommit {
+                xid,
+                commit_lsn,
+                end_lsn,
+            }
+        }
+        b'A' => {
+            let xid = input.u32()?;
+            let subxid = input.u32()?;
+            let (abort_lsn, abort_time) = if state.parallel {
+                (Some(input.u64()?), Some(input.u64()?))
+            } else {
+                (None, None)
+            };
+            Message::StreamAbort {
+                xid,
+                subxid,
+                abort_lsn,
+                abort_time,
+            }
         }
         _ => return Err(DecodeError::Invalid),
     };
@@ -375,14 +499,24 @@ fn message(bytes: &[u8]) -> Result<Message<'_>, DecodeError> {
 }
 
 /// Decodes one complete `CopyData` payload received during `START_REPLICATION`.
-pub fn copy_data(bytes: &[u8]) -> Result<CopyData<'_>, DecodeError> {
+pub fn copy_data_with_state<'a>(
+    bytes: &'a [u8],
+    state: &mut DecodeState,
+) -> Result<CopyData<'a>, DecodeError> {
     let mut input = Input::new(bytes);
     match input.u8()? {
         b'w' => {
             let start_lsn = input.u64()?;
             let end_lsn = input.u64()?;
             let _send_time = input.u64()?;
-            let message = message(input.bytes(input.bytes.len() - input.at)?)?;
+            let prior = *state;
+            let message = match message(input.bytes(input.bytes.len() - input.at)?, state) {
+                Ok(message) => message,
+                Err(error) => {
+                    *state = prior;
+                    return Err(error);
+                }
+            };
             Ok(CopyData::XLogData {
                 start_lsn,
                 end_lsn,
@@ -409,6 +543,10 @@ pub fn copy_data(bytes: &[u8]) -> Result<CopyData<'_>, DecodeError> {
     }
 }
 
+pub fn copy_data(bytes: &[u8]) -> Result<CopyData<'_>, DecodeError> {
+    copy_data_with_state(bytes, &mut DecodeState::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,7 +571,10 @@ mod tests {
             let CopyData::XLogData {
                 start_lsn,
                 end_lsn,
-                message: Message::Insert { relation_id, new },
+                message:
+                    Message::Insert {
+                        relation_id, new, ..
+                    },
             } = copy_data(&bytes[..25 + plugin.len()]).unwrap()
             else {
                 panic!("wrong frame")
@@ -458,7 +599,7 @@ mod tests {
         ];
         let bytes = xlog(&relation_frame);
         let CopyData::XLogData {
-            message: Message::Relation(relation),
+            message: Message::Relation { relation, .. },
             ..
         } = copy_data(&bytes[..25 + relation_frame.len()]).unwrap()
         else {
@@ -484,8 +625,9 @@ mod tests {
             message:
                 Message::Update {
                     relation_id,
-                    old: Some(old),
+                    identity: UpdateIdentity::Old(old),
                     new,
+                    ..
                 },
             ..
         } = copy_data(&bytes[..25 + plugin.len()]).unwrap()
@@ -512,5 +654,66 @@ mod tests {
             })
         );
         assert_eq!(copy_data(b"w\0\0\0\0"), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn streamed_transactions_require_typed_segment_and_xid_framing() {
+        let mut state = DecodeState::new(true);
+        let start = xlog(&[b'S', 0, 0, 0, 7, 1]);
+        assert!(matches!(
+            copy_data_with_state(&start[..31], &mut state),
+            Ok(CopyData::XLogData {
+                message: Message::StreamStart {
+                    xid: 7,
+                    first_segment: true
+                },
+                ..
+            })
+        ));
+        let insert = [
+            b'I', 0, 0, 0, 7, 0, 0, 0, 3, b'N', 0, 1, b't', 0, 0, 0, 1, b'9',
+        ];
+        let bytes = xlog(&insert);
+        let CopyData::XLogData {
+            message:
+                Message::Insert {
+                    xid: Some(7),
+                    relation_id: 3,
+                    ..
+                },
+            ..
+        } = copy_data_with_state(&bytes[..25 + insert.len()], &mut state).unwrap()
+        else {
+            panic!("streamed INSERT lost its transaction identity")
+        };
+        let stop = xlog(b"E");
+        assert!(matches!(
+            copy_data_with_state(&stop[..26], &mut state),
+            Ok(CopyData::XLogData {
+                message: Message::StreamStop,
+                ..
+            })
+        ));
+        let mut commit = [0_u8; 30];
+        commit[0] = b'c';
+        commit[4] = 7;
+        commit[13] = 40;
+        commit[21] = 41;
+        let bytes = xlog(&commit);
+        assert!(matches!(
+            copy_data_with_state(&bytes[..55], &mut state),
+            Ok(CopyData::XLogData {
+                message: Message::StreamCommit {
+                    xid: 7,
+                    commit_lsn: 40,
+                    end_lsn: 41
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            copy_data_with_state(&stop[..26], &mut state),
+            Err(DecodeError::Invalid)
+        );
     }
 }

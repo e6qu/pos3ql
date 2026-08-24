@@ -50,6 +50,10 @@ impl RelationBinding {
             ReplicaIdentity::Old => self.remote_to_local(),
         }
     }
+
+    pub fn key_local_columns(&self) -> &[usize] {
+        &self.key_remote_to_local[..self.key_count]
+    }
 }
 
 /// Fixed, connection-local relation bindings for one apply worker.
@@ -117,20 +121,6 @@ impl RelationMap {
                     column.name
                 ));
             }
-            let local_column = &definition.columns()[local];
-            let local_type = storage
-                .declared_column_type(local_column, txid)?
-                .replication_oid();
-            if column.type_oid != local_type as u32 || column.type_modifier != local_column.type_mod
-            {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "subscription relation \"{}.{}\" column \"{}\" does not match local type",
-                    relation.namespace,
-                    relation.name,
-                    column.name
-                ));
-            }
             remote_to_local[remote] = local;
             if column.key {
                 key_remote_to_local[key_count] = local;
@@ -185,7 +175,8 @@ impl RelationMap {
 enum RemoteTransaction {
     Idle,
     Applying { final_lsn: u64 },
-    Skipping { final_lsn: u64 },
+    Skipping { final_lsn: u64, configured: bool },
+    Streaming { xid: u32, segment_open: bool },
 }
 
 /// Result of applying one receive frame.  The replication transport may emit
@@ -213,6 +204,7 @@ pub struct SubscriptionApply {
     trigger_scratch: crate::sql::exec::DmlScratch,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
+    behavior: crate::storage::SubscriptionBehavior,
 }
 
 impl SubscriptionApply {
@@ -235,6 +227,7 @@ impl SubscriptionApply {
         txn_rows: usize,
         arena_bytes: usize,
         confirmed_lsn: u64,
+        behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<Self, BudgetError> {
         Ok(Self {
             stream,
@@ -250,6 +243,7 @@ impl SubscriptionApply {
             trigger_scratch: FixedVec::new(budget, "subscription_trigger_scratch", txn_rows)?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,
+            behavior,
         })
     }
 
@@ -348,6 +342,29 @@ impl SubscriptionApply {
         result
     }
 
+    pub(crate) fn copy_binary_row(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        setup: &crate::sql::exec::CopySetup,
+        row: &[u8],
+    ) -> Result<(), SqlError> {
+        let mark = self.arena.mark();
+        self.trigger_response.clear();
+        let mut responder = Responder::new(&mut self.trigger_response);
+        let result = engine
+            .copy_row_binary(
+                setup,
+                &mut self.txn,
+                self.guc.seq_session(),
+                &self.arena,
+                &mut responder,
+                row,
+            )
+            .map(|_| ());
+        unsafe { self.arena.rewind_to(mark) };
+        result
+    }
+
     pub(crate) fn finish_copy_table(
         &mut self,
         engine: &mut crate::sql::Engine,
@@ -384,6 +401,7 @@ impl SubscriptionApply {
         &mut self,
         stream: crate::storage::SubscriptionStream,
         confirmed_lsn: u64,
+        behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<(), SqlError> {
         if self.remote != RemoteTransaction::Idle || self.txn.is_active() {
             return Err(Self::protocol_error(
@@ -392,6 +410,7 @@ impl SubscriptionApply {
         }
         self.stream = stream;
         self.confirmed_lsn = confirmed_lsn;
+        self.behavior = behavior;
         self.relations.clear();
         self.arena.reset();
         self.trigger_response.clear();
@@ -429,6 +448,43 @@ impl SubscriptionApply {
         self.arena.reset();
     }
 
+    fn require_message_xid(&self, xid: Option<u32>) -> Result<(), SqlError> {
+        match (self.remote, xid) {
+            (
+                RemoteTransaction::Streaming {
+                    segment_open: true, ..
+                },
+                Some(_),
+            ) => Ok(()),
+            (RemoteTransaction::Applying { .. } | RemoteTransaction::Skipping { .. }, None) => {
+                Ok(())
+            }
+            _ => Err(Self::protocol_error(
+                "subscription message transaction identity does not match the active transaction",
+            )),
+        }
+    }
+
+    fn begin_message_subtransaction(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        xid: Option<u32>,
+    ) -> Result<(), SqlError> {
+        self.require_message_xid(xid)?;
+        if let (
+            RemoteTransaction::Streaming {
+                xid: top,
+                segment_open: true,
+            },
+            Some(message),
+        ) = (self.remote, xid)
+            && message != top
+        {
+            engine.begin_subscription_subtransaction(&mut self.txn, &self.guc, message)?;
+        }
+        Ok(())
+    }
+
     fn apply_message(
         &mut self,
         engine: &mut crate::sql::Engine,
@@ -444,7 +500,16 @@ impl SubscriptionApply {
                 }
                 self.arena.reset();
                 if final_lsn <= self.confirmed_lsn {
-                    self.remote = RemoteTransaction::Skipping { final_lsn };
+                    self.remote = RemoteTransaction::Skipping {
+                        final_lsn,
+                        configured: false,
+                    };
+                } else if self.behavior.skip_lsn == Some(final_lsn) {
+                    engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                    self.remote = RemoteTransaction::Skipping {
+                        final_lsn,
+                        configured: true,
+                    };
                 } else {
                     engine.begin_subscription_apply(&mut self.txn, &self.guc);
                     self.remote = RemoteTransaction::Applying { final_lsn };
@@ -474,13 +539,34 @@ impl SubscriptionApply {
                         reply_requested: false,
                     })
                 }
-                RemoteTransaction::Skipping { final_lsn }
-                    if commit_lsn == final_lsn && end_lsn <= self.confirmed_lsn =>
-                {
+                RemoteTransaction::Skipping {
+                    final_lsn,
+                    configured: false,
+                } if commit_lsn == final_lsn && end_lsn <= self.confirmed_lsn => {
                     self.remote = RemoteTransaction::Idle;
                     self.arena.reset();
                     Ok(ApplyResult::Acknowledge {
                         flushed_lsn: self.confirmed_lsn,
+                        reply_requested: false,
+                    })
+                }
+                RemoteTransaction::Skipping {
+                    final_lsn,
+                    configured: true,
+                } if commit_lsn == final_lsn && end_lsn <= frame_end_lsn => {
+                    engine.stage_subscription_skip(
+                        &mut self.txn,
+                        self.stream,
+                        final_lsn,
+                        end_lsn,
+                    )?;
+                    engine.commit_txn(&mut self.txn, &self.guc)?;
+                    self.behavior.skip_lsn = None;
+                    self.confirmed_lsn = end_lsn;
+                    self.remote = RemoteTransaction::Idle;
+                    self.arena.reset();
+                    Ok(ApplyResult::Acknowledge {
+                        flushed_lsn: end_lsn,
                         reply_requested: false,
                     })
                 }
@@ -491,15 +577,30 @@ impl SubscriptionApply {
                     frame_end_lsn
                 )),
             },
-            Message::Relation(relation) => {
+            Message::Relation { xid, relation } => {
+                if xid.is_some() {
+                    self.require_message_xid(xid)?;
+                }
                 engine.register_subscription_relation(&mut self.relations, &self.txn, relation)?;
                 Ok(ApplyResult::None)
             }
-            Message::Insert { relation_id, new } => {
+            Message::Insert {
+                xid,
+                relation_id,
+                new,
+            } => {
+                self.begin_message_subtransaction(engine, xid)?;
                 if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
                     return Ok(ApplyResult::None);
                 }
-                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                if !matches!(
+                    self.remote,
+                    RemoteTransaction::Applying { .. }
+                        | RemoteTransaction::Streaming {
+                            segment_open: true,
+                            ..
+                        }
+                ) {
                     return Err(Self::protocol_error(
                         "subscription INSERT is outside BEGIN/COMMIT",
                     ));
@@ -516,6 +617,7 @@ impl SubscriptionApply {
                     );
                     engine.apply_subscription_insert(
                         &mut self.txn,
+                        self.stream,
                         self.relations.binding(relation_id)?,
                         new,
                         &self.arena,
@@ -527,21 +629,27 @@ impl SubscriptionApply {
                 Ok(ApplyResult::None)
             }
             Message::Update {
+                xid,
                 relation_id,
-                old,
+                identity,
                 new,
             } => {
+                self.begin_message_subtransaction(engine, xid)?;
                 if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
                     return Ok(ApplyResult::None);
                 }
-                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                if !matches!(
+                    self.remote,
+                    RemoteTransaction::Applying { .. }
+                        | RemoteTransaction::Streaming {
+                            segment_open: true,
+                            ..
+                        }
+                ) {
                     return Err(Self::protocol_error(
                         "subscription UPDATE is outside BEGIN/COMMIT",
                     ));
                 }
-                let old = old.ok_or_else(|| {
-                    Self::protocol_error("subscription UPDATE lacks a replica identity tuple")
-                })?;
                 self.trigger_response.clear();
                 self.trigger_scratch.clear();
                 let mut responder = Responder::new(&mut self.trigger_response);
@@ -554,9 +662,9 @@ impl SubscriptionApply {
                     );
                     engine.apply_subscription_update(
                         &mut self.txn,
+                        self.stream,
                         self.relations.binding(relation_id)?,
-                        old,
-                        new,
+                        crate::sql::exec::ReplicationUpdate { identity, new },
                         &self.arena,
                         &mut trigger_context,
                     )
@@ -565,11 +673,23 @@ impl SubscriptionApply {
                 result?;
                 Ok(ApplyResult::None)
             }
-            Message::Delete { relation_id, old } => {
+            Message::Delete {
+                xid,
+                relation_id,
+                old,
+            } => {
+                self.begin_message_subtransaction(engine, xid)?;
                 if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
                     return Ok(ApplyResult::None);
                 }
-                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                if !matches!(
+                    self.remote,
+                    RemoteTransaction::Applying { .. }
+                        | RemoteTransaction::Streaming {
+                            segment_open: true,
+                            ..
+                        }
+                ) {
                     return Err(Self::protocol_error(
                         "subscription DELETE is outside BEGIN/COMMIT",
                     ));
@@ -586,6 +706,7 @@ impl SubscriptionApply {
                     );
                     engine.apply_subscription_delete(
                         &mut self.txn,
+                        self.stream,
                         self.relations.binding(relation_id)?,
                         old,
                         &self.arena,
@@ -600,12 +721,25 @@ impl SubscriptionApply {
             // row application.  A Type frame contains no relation membership
             // or row state, so its successful typed decode has no local state
             // transition to make.
-            Message::Type { .. } => Ok(ApplyResult::None),
-            Message::Truncate(truncate) => {
+            Message::Type { xid, .. } => {
+                if xid.is_some() {
+                    self.require_message_xid(xid)?;
+                }
+                Ok(ApplyResult::None)
+            }
+            Message::Truncate { xid, truncate } => {
+                self.begin_message_subtransaction(engine, xid)?;
                 if matches!(self.remote, RemoteTransaction::Skipping { .. }) {
                     return Ok(ApplyResult::None);
                 }
-                if !matches!(self.remote, RemoteTransaction::Applying { .. }) {
+                if !matches!(
+                    self.remote,
+                    RemoteTransaction::Applying { .. }
+                        | RemoteTransaction::Streaming {
+                            segment_open: true,
+                            ..
+                        }
+                ) {
                     return Err(Self::protocol_error(
                         "subscription TRUNCATE is outside BEGIN/COMMIT",
                     ));
@@ -624,10 +758,111 @@ impl SubscriptionApply {
                 }
                 engine.apply_subscription_truncate(
                     &mut self.txn,
+                    self.stream,
                     &tables[..truncate.relation_ids().len()],
                     truncate.cascade,
                     truncate.restart_identity,
                 )?;
+                Ok(ApplyResult::None)
+            }
+            Message::StreamStart { xid, first_segment } => {
+                match self.remote {
+                    RemoteTransaction::Idle if first_segment => {
+                        self.arena.reset();
+                        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                        self.remote = RemoteTransaction::Streaming {
+                            xid,
+                            segment_open: true,
+                        };
+                    }
+                    RemoteTransaction::Streaming {
+                        xid: active,
+                        segment_open: false,
+                    } if active == xid && !first_segment => {
+                        self.remote = RemoteTransaction::Streaming {
+                            xid,
+                            segment_open: true,
+                        };
+                    }
+                    _ => {
+                        return Err(Self::protocol_error(
+                            "subscription STREAM START is not valid for the active transaction",
+                        ));
+                    }
+                }
+                Ok(ApplyResult::None)
+            }
+            Message::StreamStop => {
+                let RemoteTransaction::Streaming {
+                    xid,
+                    segment_open: true,
+                } = self.remote
+                else {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM STOP has no open segment",
+                    ));
+                };
+                self.remote = RemoteTransaction::Streaming {
+                    xid,
+                    segment_open: false,
+                };
+                Ok(ApplyResult::None)
+            }
+            Message::StreamCommit {
+                xid,
+                commit_lsn,
+                end_lsn,
+            } => {
+                let RemoteTransaction::Streaming {
+                    xid: active,
+                    segment_open: false,
+                } = self.remote
+                else {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM COMMIT has no stopped transaction",
+                    ));
+                };
+                if active != xid || commit_lsn > end_lsn || end_lsn > frame_end_lsn {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM COMMIT has an invalid transaction identity or LSN",
+                    ));
+                }
+                if !engine.stage_subscription_advance(&mut self.txn, self.stream, end_lsn)? {
+                    return Err(Self::protocol_error(
+                        "subscription received a non-monotonic streamed commit",
+                    ));
+                }
+                engine.commit_txn(&mut self.txn, &self.guc)?;
+                self.confirmed_lsn = end_lsn;
+                self.remote = RemoteTransaction::Idle;
+                self.arena.reset();
+                Ok(ApplyResult::Acknowledge {
+                    flushed_lsn: end_lsn,
+                    reply_requested: false,
+                })
+            }
+            Message::StreamAbort { xid, subxid, .. } => {
+                let RemoteTransaction::Streaming { xid: active, .. } = self.remote else {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM ABORT has no active streamed transaction",
+                    ));
+                };
+                if active != xid {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM ABORT targets another transaction",
+                    ));
+                }
+                if subxid == xid {
+                    self.abort(engine);
+                } else if !engine.rollback_subscription_subtransaction(
+                    &mut self.txn,
+                    &self.guc,
+                    subxid,
+                ) {
+                    return Err(Self::protocol_error(
+                        "subscription STREAM ABORT targets an unknown subtransaction",
+                    ));
+                }
                 Ok(ApplyResult::None)
             }
         }

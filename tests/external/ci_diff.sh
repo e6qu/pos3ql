@@ -341,6 +341,26 @@ CREATE TABLE outbound_dump.item_tags (
   PRIMARY KEY (item_id, tag_id)
 );
 INSERT INTO outbound_dump.item_tags VALUES (1, 1);
+CREATE TABLE outbound_dump.constraint_parent (id integer PRIMARY KEY);
+INSERT INTO outbound_dump.constraint_parent VALUES (1);
+CREATE TABLE outbound_dump.constraint_items (
+  id integer,
+  key_value integer,
+  parent_id integer,
+  slot int4range,
+  active boolean,
+  CONSTRAINT outbound_constraint_key UNIQUE (key_value)
+    DEFERRABLE INITIALLY DEFERRED,
+  CONSTRAINT outbound_constraint_exclusion EXCLUDE USING gist
+    (slot WITH &&) WHERE (active)
+    DEFERRABLE INITIALLY DEFERRED
+);
+INSERT INTO outbound_dump.constraint_items VALUES (-1, 1, 999, '[1,4)', false);
+ALTER TABLE outbound_dump.constraint_items ADD CONSTRAINT outbound_constraint_check
+  CHECK (id > 0) NOT VALID;
+ALTER TABLE outbound_dump.constraint_items ADD CONSTRAINT outbound_constraint_fk
+  FOREIGN KEY (parent_id) REFERENCES outbound_dump.constraint_parent(id)
+  DEFERRABLE INITIALLY DEFERRED NOT VALID;
 CREATE SEQUENCE outbound_dump.manual_sequence START WITH 41;
 SELECT nextval('outbound_dump.manual_sequence');
 CREATE MATERIALIZED VIEW outbound_dump.item_count AS SELECT count(*) AS count FROM outbound_dump.items;
@@ -429,6 +449,10 @@ else
       SELECT count FROM outbound_dump.item_count;
       SELECT nextval('outbound_dump.manual_sequence');
       SELECT count(*) FROM outbound_dump.item_tags;
+      SELECT conname,contype,condeferrable,condeferred,convalidated,conenforced
+        FROM pg_constraint
+       WHERE conrelid = 'outbound_dump.constraint_items'::regclass
+       ORDER BY conname;
       SELECT has_table_privilege('outbound_reader', 'outbound_dump.items', 'SELECT'),
              has_sequence_privilege('outbound_reader', 'outbound_dump.manual_sequence', 'USAGE'),
              has_function_privilege('outbound_reader', 'outbound_dump.dump_answer()', 'EXECUTE');
@@ -448,7 +472,7 @@ else
                               AND typname = 'metadata')
          AND a.attname = 'code';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n10|1\n20|2\n7|C'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\n10|1\n20|2\n7|C'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

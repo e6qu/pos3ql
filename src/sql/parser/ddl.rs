@@ -11,8 +11,9 @@ use super::{
 };
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterTriggerAction, AlterTypeAction, CreateDomain, CreateRoutine, CreateSchemaElement,
-    CreateTrigger, DomainCheck, Expr, PartitionBound, PartitionClause, PartitionStrategy,
+    AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming, ConstraintValidation,
+    CreateDomain, CreateRoutine, CreateSchemaElement, CreateTrigger, DomainCheck,
+    ExclusionOperator, Expr, PartitionBound, PartitionClause, PartitionStrategy,
     PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
     RoutineIdentity, RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect,
     SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
@@ -2413,6 +2414,7 @@ impl<'a> Parser<'a> {
         let mut cons = [TableConstraint::Unique {
             name: None,
             columns: &[],
+            timing: ConstraintTiming::NotDeferrable,
         }; MAX_LIST];
         let mut n_cons = 0;
         let mut likes = [LikeClause {
@@ -2462,8 +2464,9 @@ impl<'a> Parser<'a> {
                         | Tok::Ident("unique")
                         | Tok::Ident("check")
                         | Tok::Ident("foreign")
+                        | Tok::Ident("exclude")
                 ) {
-                    let c = self.table_constraint(cons_name)?;
+                    let c = self.table_constraint(cons_name, false)?;
                     if n_cons == MAX_LIST {
                         return Err(self.limit("constraint list", MAX_LIST));
                     }
@@ -2517,16 +2520,18 @@ impl<'a> Parser<'a> {
                     default = Some(self.column_default_expression()?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
-                    // An explicitly named single-column UNIQUE desugars to a
-                    // table constraint so the name is retained; an unnamed one
-                    // rides the column flag with a synthesized name.
-                    if let Some(cons_name) = col_cons_name {
+                    let timing = self.constraint_timing(false)?;
+                    // A named or deferrable single-column constraint needs a
+                    // durable key object; only the default unnamed form can use
+                    // the compact column flag.
+                    if col_cons_name.is_some() || timing.is_deferrable() {
                         if n_cons == MAX_LIST {
                             return Err(self.limit("constraint list", MAX_LIST));
                         }
                         cons[n_cons] = TableConstraint::Unique {
-                            name: Some(cons_name),
+                            name: col_cons_name,
                             columns: self.arena_slice(&[col_name])?,
+                            timing,
                         };
                         n_cons += 1;
                         continue;
@@ -2534,13 +2539,15 @@ impl<'a> Parser<'a> {
                     unique = true;
                 } else if self.eat_ident("primary")? {
                     self.expect_ident("key")?;
-                    if let Some(cons_name) = col_cons_name {
+                    let timing = self.constraint_timing(false)?;
+                    if col_cons_name.is_some() || timing.is_deferrable() {
                         if n_cons == MAX_LIST {
                             return Err(self.limit("constraint list", MAX_LIST));
                         }
                         cons[n_cons] = TableConstraint::PrimaryKey {
-                            name: Some(cons_name),
+                            name: col_cons_name,
                             columns: self.arena_slice(&[col_name])?,
+                            timing,
                         };
                         n_cons += 1;
                         // PRIMARY KEY implies NOT NULL; attach_constraints sets
@@ -2553,7 +2560,7 @@ impl<'a> Parser<'a> {
                     not_null = true;
                 } else if self.eat_ident("check")? {
                     // Desugar a column CHECK to a table-level CHECK.
-                    let c = self.check_constraint(col_cons_name)?;
+                    let c = self.check_constraint(col_cons_name, false)?;
                     if n_cons == MAX_LIST {
                         return Err(self.limit("constraint list", MAX_LIST));
                     }
@@ -2563,7 +2570,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("references")? {
                     // Desugar a column REFERENCES to a single-column FK.
                     let child = self.arena_slice(&[col_name])?;
-                    let c = self.references_tail(col_cons_name, child)?;
+                    let c = self.references_tail(col_cons_name, child, false)?;
                     if n_cons == MAX_LIST {
                         return Err(self.limit("constraint list", MAX_LIST));
                     }
@@ -2776,23 +2783,89 @@ impl<'a> Parser<'a> {
     pub(super) fn table_constraint(
         &mut self,
         name: Option<&'a str>,
+        allow_not_valid: bool,
     ) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("primary")? {
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;
-            Ok(TableConstraint::PrimaryKey { name, columns })
+            let timing = self.constraint_timing(false)?;
+            Ok(TableConstraint::PrimaryKey {
+                name,
+                columns,
+                timing,
+            })
         } else if self.eat_ident("unique")? {
             let columns = self.column_name_list()?;
-            Ok(TableConstraint::Unique { name, columns })
+            let timing = self.constraint_timing(false)?;
+            Ok(TableConstraint::Unique {
+                name,
+                columns,
+                timing,
+            })
         } else if self.eat_ident("check")? {
-            self.check_constraint(name)
+            self.check_constraint(name, allow_not_valid)
+        } else if self.eat_ident("exclude")? {
+            self.exclusion_constraint(name)
         } else {
             self.expect_ident("foreign")?;
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;
             self.expect_ident("references")?;
-            self.references_tail(name, columns)
+            self.references_tail(name, columns, allow_not_valid)
         }
+    }
+
+    fn exclusion_constraint(
+        &mut self,
+        name: Option<&'a str>,
+    ) -> Result<TableConstraint<'a>, ParseError> {
+        if self.eat_ident("using")? {
+            let method = self.col_ident("exclusion index method")?;
+            if method != "gist" {
+                return Err(self.err_here("only GiST exclusion constraints are supported"));
+            }
+        }
+        self.expect_op("(")?;
+        let mut columns = [""; MAX_LIST];
+        let mut operators = [ExclusionOperator::Equal; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == columns.len() {
+                return Err(self.limit("exclusion elements", columns.len()));
+            }
+            columns[count] = self.col_ident("exclusion column")?;
+            self.expect_ident("with")?;
+            operators[count] = match self.any_op_token()? {
+                "=" => ExclusionOperator::Equal,
+                "&&" => ExclusionOperator::Overlaps,
+                "-|-" => ExclusionOperator::Adjacent,
+                _ => return Err(self.err_here("unsupported exclusion operator")),
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        let (predicate, predicate_text) = if self.eat_ident("where")? {
+            self.expect_op("(")?;
+            let start = self.peek_at;
+            let expression = self.expression(0)?;
+            let text = self.arena_str(self.text[start..self.peek_at].trim_end())?;
+            self.expect_op(")")?;
+            (Some(expression), Some(text))
+        } else {
+            (None, None)
+        };
+        let timing = self.constraint_timing(false)?;
+        Ok(TableConstraint::Exclusion {
+            name,
+            columns: self.arena_slice(&columns[..count])?,
+            operators: self.arena_slice(&operators[..count])?,
+            predicate,
+            predicate_text,
+            timing,
+        })
     }
 
     /// A CHECK (predicate): captures the predicate's source text for durable
@@ -2800,6 +2873,7 @@ impl<'a> Parser<'a> {
     fn check_constraint(
         &mut self,
         name: Option<&'a str>,
+        allow_not_valid: bool,
     ) -> Result<TableConstraint<'a>, ParseError> {
         self.expect_op("(")?;
         let start = self.peek_at;
@@ -2807,10 +2881,12 @@ impl<'a> Parser<'a> {
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
+        let (_, validation) = self.constraint_attributes(false, true, allow_not_valid)?;
         Ok(TableConstraint::Check {
             name,
             expression,
             text,
+            validation,
         })
     }
 
@@ -2820,6 +2896,7 @@ impl<'a> Parser<'a> {
         &mut self,
         name: Option<&'a str>,
         columns: &'a [&'a str],
+        allow_not_valid: bool,
     ) -> Result<TableConstraint<'a>, ParseError> {
         let parent = self.qual_name("referenced table")?;
         let parent_cols = if self.peeked == Tok::Op("(") {
@@ -2843,6 +2920,7 @@ impl<'a> Parser<'a> {
                 on_update = action;
             }
         }
+        let (timing, validation) = self.constraint_attributes(true, true, allow_not_valid)?;
         Ok(TableConstraint::ForeignKey {
             name,
             columns,
@@ -2850,7 +2928,95 @@ impl<'a> Parser<'a> {
             parent_cols,
             on_delete,
             on_update,
+            timing,
+            validation,
         })
+    }
+
+    /// Parses the attributes shared by table constraints and returns only
+    /// states that execution can represent. `ENFORCED` is accepted for every
+    /// constraint; `NOT ENFORCED` is limited to CHECK and FOREIGN KEY by the
+    /// caller.
+    fn constraint_attributes(
+        &mut self,
+        can_defer: bool,
+        can_disable: bool,
+        allow_not_valid: bool,
+    ) -> Result<(ConstraintTiming, ConstraintValidation), ParseError> {
+        let mut deferrable = None;
+        let mut initial = None;
+        let mut enforced = None;
+        let mut not_valid = false;
+        loop {
+            let not_attribute = if self.peeked == Tok::Ident("not") {
+                let mut lookahead = self.lexer.clone();
+                matches!(
+                    lookahead.next_token()?,
+                    Tok::Ident("deferrable") | Tok::Ident("enforced") | Tok::Ident("valid")
+                )
+            } else {
+                false
+            };
+            if self.eat_ident("deferrable")? {
+                if !can_defer || deferrable.replace(true).is_some() {
+                    return Err(self.err_here("invalid or duplicate DEFERRABLE clause"));
+                }
+            } else if not_attribute {
+                self.expect_ident("not")?;
+                if self.eat_ident("deferrable")? {
+                    if !can_defer || deferrable.replace(false).is_some() {
+                        return Err(self.err_here("invalid or duplicate NOT DEFERRABLE clause"));
+                    }
+                } else if self.eat_ident("enforced")? {
+                    if !can_disable || enforced.replace(false).is_some() {
+                        return Err(self.err_here("invalid or duplicate NOT ENFORCED clause"));
+                    }
+                } else {
+                    self.expect_ident("valid")?;
+                    if !allow_not_valid || not_valid {
+                        return Err(self.err_here("invalid or duplicate NOT VALID clause"));
+                    }
+                    not_valid = true;
+                }
+            } else if self.eat_ident("initially")? {
+                let mode = if self.eat_ident("deferred")? {
+                    ConstraintMode::Deferred
+                } else {
+                    self.expect_ident("immediate")?;
+                    ConstraintMode::Immediate
+                };
+                if !can_defer || initial.replace(mode).is_some() {
+                    return Err(self.err_here("invalid or duplicate INITIALLY clause"));
+                }
+            } else if self.eat_ident("enforced")? {
+                if !can_disable || enforced.replace(true).is_some() {
+                    return Err(self.err_here("invalid or duplicate ENFORCED clause"));
+                }
+            } else {
+                break;
+            }
+        }
+        if initial.is_some() && deferrable != Some(true) {
+            return Err(self.err_here("INITIALLY requires DEFERRABLE"));
+        }
+        let timing = match deferrable {
+            Some(true) => {
+                ConstraintTiming::Deferrable(initial.unwrap_or(ConstraintMode::Immediate))
+            }
+            Some(false) | None => ConstraintTiming::NotDeferrable,
+        };
+        let validation = match (enforced, not_valid) {
+            (Some(false), _) => ConstraintValidation::NotEnforced,
+            (_, true) => ConstraintValidation::EnforcedNotValid,
+            _ => ConstraintValidation::EnforcedValidated,
+        };
+        Ok((timing, validation))
+    }
+
+    fn constraint_timing(&mut self, allow_not_valid: bool) -> Result<ConstraintTiming, ParseError> {
+        let (timing, validation) = self.constraint_attributes(true, false, allow_not_valid)?;
+        debug_assert_eq!(validation, ConstraintValidation::EnforcedValidated);
+        Ok(timing)
     }
 
     fn fk_action(&mut self) -> Result<FkAction, ParseError> {

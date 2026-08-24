@@ -222,6 +222,7 @@ pub mod sqlstate {
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const CHECK_VIOLATION: &str = "23514";
+    pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
     pub const INVALID_FOREIGN_KEY: &str = "42830";
@@ -3796,6 +3797,18 @@ pub fn bit_aggregate<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     binary(operator, a, b, false, false, arena)
+}
+
+pub(crate) fn exclusion_operator<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    Ok(matches!(
+        binary(operator, left, right, false, false, arena)?,
+        Datum::Bool(true)
+    ))
 }
 
 /// The result kind of a temporal `generate_series` / `date_bin`: a plain

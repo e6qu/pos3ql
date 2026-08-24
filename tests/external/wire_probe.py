@@ -2576,6 +2576,42 @@ def test_partitioned_tables_over_raw_wire():
     s.close()
 
 
+def test_deferred_constraint_commit_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_deferred_constraint (value integer, "
+        "CONSTRAINT wire_deferred_key UNIQUE (value) DEFERRABLE INITIALLY DEFERRED); "
+        "INSERT INTO wire_deferred_constraint VALUES (1); BEGIN",
+    )
+    check(
+        "raw wire: deferred constraint setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    inserted = extended_binary_parameter(
+        s,
+        "INSERT INTO wire_deferred_constraint VALUES ($1)",
+        23,
+        struct.pack("!i", 1),
+    )
+    check(
+        "raw wire: binary Bind can raise a deferred obligation",
+        not any(kind == b"E" for kind, _ in inserted)
+        and inserted[-1] == (b"Z", b"T"),
+        inserted,
+    )
+    committed = simple_query(s, "COMMIT")
+    check(
+        "raw wire: commit reports the deferred SQLSTATE and leaves idle state",
+        has_sqlstate(committed, "23505") and committed[-1] == (b"Z", b"I"),
+        committed,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

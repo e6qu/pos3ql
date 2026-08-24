@@ -761,8 +761,7 @@ pub fn check_all_unique(
         self_rowid,
         txid,
         arena,
-    )?;
-    check_unique_keys(storage, table_index, def, schema, values, self_rowid, txid)
+    )
 }
 
 /// Rejects an indexed tuple before its row or CREATE INDEX WAL can commit if
@@ -909,49 +908,28 @@ pub fn check_unique_indexes(
     Ok(())
 }
 
-/// Enforces multi-column PRIMARY KEY / UNIQUE table constraints (single-column
-/// ones ride the column flags via [`check_unique`]), served by the value index.
-#[allow(clippy::too_many_arguments)]
-fn check_unique_keys(
-    storage: &Storage,
-    table_index: usize,
-    def: &TableDef,
-    schema: &[ColType],
-    values: &[Datum],
-    self_rowid: Option<u64>,
-    txid: u32,
-) -> Result<(), SqlError> {
-    for uk in def.uniques() {
-        enforce_key_uniqueness(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            uk.columns(),
-            false,
-            &ConstraintName::Named(uk.name.as_str()),
-        )?;
-    }
-    Ok(())
-}
-
 /// Pre-parsed CHECK predicates for a statement, aligned with `def.checks()`.
-pub(crate) type ParsedChecks<'a> = [Option<&'a Expr<'a>>; crate::storage::MAX_CHECKS];
+pub(crate) type ParsedChecks<'a> =
+    [Option<&'a Expr<'a>>; crate::storage::MAX_CHECKS + crate::storage::MAX_EXCLUSIONS];
 
 /// Re-parses every stored CHECK predicate once per statement into the arena.
 pub(crate) fn parse_checks<'a>(
     def: &'a TableDef,
     arena: &'a Arena,
 ) -> Result<ParsedChecks<'a>, SqlError> {
-    let mut out: ParsedChecks<'a> = [None; crate::storage::MAX_CHECKS];
+    let mut out: ParsedChecks<'a> =
+        [None; crate::storage::MAX_CHECKS + crate::storage::MAX_EXCLUSIONS];
     for (i, c) in def.checks().iter().enumerate() {
         out[i] = Some(crate::sql::parser::parse_expr(
             c.expression.as_str(),
             arena,
         )?);
+    }
+    for (index, exclusion) in def.exclusions().iter().enumerate() {
+        if let Some(predicate) = &exclusion.predicate {
+            out[crate::storage::MAX_CHECKS + index] =
+                Some(crate::sql::parser::parse_expr(predicate.as_str(), arena)?);
+        }
     }
     Ok(out)
 }
@@ -1007,6 +985,7 @@ pub(crate) fn enforce_row_constraints(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
+    mut txn: Option<&mut TxnState>,
     checks: &ParsedChecks,
     arena: &Arena,
     params: &[Datum],
@@ -1030,6 +1009,30 @@ pub(crate) fn enforce_row_constraints(
             check_all_unique(
                 storage, candidate, def, schema, values, self_rowid, txid, arena,
             )?;
+            check_or_defer_unique_keys(
+                storage,
+                candidate,
+                constraint_table,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                txn.as_deref_mut(),
+            )?;
+            check_or_defer_exclusions(
+                storage,
+                candidate,
+                constraint_table,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                txn.as_deref_mut(),
+                checks,
+                arena,
+            )?;
         }
     } else {
         check_all_unique(
@@ -1042,10 +1045,42 @@ pub(crate) fn enforce_row_constraints(
             txid,
             arena,
         )?;
+        check_or_defer_unique_keys(
+            storage,
+            table_index,
+            constraint_table,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            txn.as_deref_mut(),
+        )?;
+        check_or_defer_exclusions(
+            storage,
+            table_index,
+            constraint_table,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            txn.as_deref_mut(),
+            checks,
+            arena,
+        )?;
     }
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
-    check_fk_child(storage, def, values, txid)?;
+    check_or_defer_fk_child(
+        storage,
+        constraint_table,
+        def,
+        values,
+        self_rowid,
+        txid,
+        txn,
+    )?;
     Ok(())
 }
 
@@ -1095,6 +1130,9 @@ fn check_row_checks(
         ..crate::sql::eval::NO_HOOKS
     };
     for (i, c) in def.checks().iter().enumerate() {
+        if !c.validation.enforced() {
+            continue;
+        }
         let Some(expression) = checks[i] else {
             continue;
         };
@@ -1123,6 +1161,9 @@ fn check_fk_child(
     txid: u32,
 ) -> Result<(), SqlError> {
     for fk in def.fkeys() {
+        if !fk.validation.enforced() {
+            continue;
+        }
         if fk.columns().iter().any(|&c| values[c as usize].is_null()) {
             continue;
         }
@@ -1156,6 +1197,642 @@ fn check_fk_child(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_or_defer_unique_keys(
+    storage: &Storage,
+    table_index: usize,
+    constraint_table: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    mut txn: Option<&mut TxnState>,
+) -> Result<(), SqlError> {
+    for key in def.uniques() {
+        if key.timing.is_deferrable()
+            && let Some(transaction) = txn.as_deref_mut()
+        {
+            let identity = transaction.constraint_identity(constraint_table as u32, key.name);
+            transaction
+                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            continue;
+        }
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            key.columns(),
+            false,
+            &ConstraintName::Named(key.name.as_str()),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_or_defer_exclusions(
+    storage: &Storage,
+    table_index: usize,
+    constraint_table: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    mut txn: Option<&mut TxnState>,
+    expressions: &ParsedChecks,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for (index, exclusion) in def.exclusions().iter().enumerate() {
+        if exclusion.timing.is_deferrable()
+            && let Some(transaction) = txn.as_deref_mut()
+        {
+            let identity = transaction.constraint_identity(constraint_table as u32, exclusion.name);
+            transaction
+                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            continue;
+        }
+        enforce_exclusion_constraint(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            exclusion,
+            expressions[crate::storage::MAX_CHECKS + index],
+            arena,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_exclusion_constraint(
+    storage: &Storage,
+    table_index: usize,
+    def: &TableDef,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    exclusion: &crate::storage::ExclusionConstraint,
+    predicate: Option<&Expr>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let predicate_holds = |row: &[Datum]| -> Result<bool, SqlError> {
+        let Some(predicate) = predicate else {
+            return Ok(true);
+        };
+        let context = RowCtx {
+            def,
+            values: row,
+            alias: None,
+        };
+        Ok(matches!(
+            eval_full(predicate, arena, &[], &context, &hooks)?,
+            Datum::Bool(true)
+        ))
+    };
+    if !predicate_holds(values)? {
+        return Ok(());
+    }
+    storage.for_each_row_state(table_index, &mut |rowid, state| {
+        use core::ops::ControlFlow;
+        if self_rowid == Some(rowid) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let conflicts = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            let other = &other[..def.n_columns];
+            if !predicate_holds(other)? {
+                return Ok(false);
+            }
+            for position in 0..exclusion.n_cols {
+                let column = exclusion.columns[position] as usize;
+                if values[column].is_null() || other[column].is_null() {
+                    return Ok(false);
+                }
+                let operator = match exclusion.operators[position] {
+                    crate::storage::ExclusionOperator::Equal => crate::sql::ast::BinaryOp::Eq,
+                    crate::storage::ExclusionOperator::Overlaps => {
+                        crate::sql::ast::BinaryOp::Overlaps
+                    }
+                    crate::storage::ExclusionOperator::Adjacent => {
+                        crate::sql::ast::BinaryOp::Adjacent
+                    }
+                };
+                if !crate::sql::eval::exclusion_operator(
+                    operator,
+                    values[column],
+                    other[column],
+                    arena,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        if conflicts {
+            return Err(sql_err!(
+                sqlstate::EXCLUSION_VIOLATION,
+                "conflicting key value violates exclusion constraint \"{}\"",
+                exclusion.name.as_str()
+            ));
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(())
+}
+
+fn check_or_defer_fk_child(
+    storage: &Storage,
+    constraint_table: usize,
+    def: &TableDef,
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    mut txn: Option<&mut TxnState>,
+) -> Result<(), SqlError> {
+    for fk in def.fkeys() {
+        if !fk.validation.enforced()
+            || fk
+                .columns()
+                .iter()
+                .any(|&column| values[column as usize].is_null())
+        {
+            continue;
+        }
+        if fk.timing.is_deferrable()
+            && let Some(transaction) = txn.as_deref_mut()
+        {
+            let identity = transaction.constraint_identity(constraint_table as u32, fk.name);
+            transaction
+                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            continue;
+        }
+        check_fk_child_one(storage, def, fk, values, txid)?;
+    }
+    Ok(())
+}
+
+fn check_fk_child_one(
+    storage: &Storage,
+    def: &TableDef,
+    fk: &crate::storage::ForeignKey,
+    values: &[Datum],
+    txid: u32,
+) -> Result<(), SqlError> {
+    let Some(parent_index) =
+        storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
+    else {
+        return Err(sql_err!(
+            sqlstate::FOREIGN_KEY_VIOLATION,
+            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+            def.name.as_str(),
+            fk.name.as_str()
+        ));
+    };
+    let parent = *storage.table_def(parent_index, txid);
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    parent.schema(&mut schema);
+    if parent_has_key(
+        storage,
+        parent_index,
+        &schema[..parent.n_columns],
+        fk.parent_cols(),
+        fk.columns(),
+        values,
+        txid,
+    )? {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::FOREIGN_KEY_VIOLATION,
+            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+            def.name.as_str(),
+            fk.name.as_str()
+        ))
+    }
+}
+
+/// Validates the current image of the row that created a deferred obligation.
+/// A deleted row has discharged its obligation. This row scope is essential
+/// for NOT VALID constraints, whose pre-existing rows are not retroactively
+/// subject to ordinary DML enforcement.
+pub(crate) fn validate_constraint_obligation(
+    storage: &Storage,
+    constraint: crate::sql::txn::ConstraintIdentity,
+    rowid: u64,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<crate::storage::ConstraintTiming>, SqlError> {
+    let table_index = constraint.table as usize;
+    if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
+        return Ok(None);
+    }
+    let definition = *storage.table_def(table_index, txid);
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    let key = definition
+        .uniques()
+        .iter()
+        .find(|key| key.name == constraint.name)
+        .copied();
+    let foreign_key = definition
+        .fkeys()
+        .iter()
+        .find(|foreign_key| foreign_key.name == constraint.name)
+        .copied();
+    let exclusion = definition
+        .exclusions()
+        .iter()
+        .find(|exclusion| exclusion.name == constraint.name)
+        .copied();
+    let timing = key
+        .map(|key| key.timing)
+        .or_else(|| foreign_key.map(|foreign_key| foreign_key.timing))
+        .or_else(|| exclusion.map(|exclusion| exclusion.timing));
+    let Some(timing) = timing else {
+        return Ok(None);
+    };
+    let predicate = match exclusion.and_then(|constraint| constraint.predicate) {
+        Some(source) => {
+            let source = arena
+                .alloc_str(source.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            Some(crate::sql::parser::parse_expr(source, arena)?)
+        }
+        None => None,
+    };
+    constraint_row_tables(storage, table_index, txid, |row_table| {
+        let Some(state) = storage.row_state(row_table, rowid)? else {
+            return Ok(());
+        };
+        let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
+            return Ok(());
+        };
+        storage.with_row_bytes(row_table, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            let values = &values[..definition.n_columns];
+            if let Some(key) = key {
+                enforce_key_uniqueness(
+                    storage,
+                    row_table,
+                    &definition,
+                    schema,
+                    values,
+                    Some(rowid),
+                    txid,
+                    key.columns(),
+                    false,
+                    &ConstraintName::Named(key.name.as_str()),
+                )?;
+            } else if let Some(foreign_key) = foreign_key {
+                if foreign_key.validation.enforced()
+                    && !foreign_key
+                        .columns()
+                        .iter()
+                        .any(|&column| values[column as usize].is_null())
+                {
+                    check_fk_child_one(storage, &definition, &foreign_key, values, txid)?;
+                }
+            } else if let Some(exclusion) = exclusion {
+                enforce_exclusion_constraint(
+                    storage,
+                    row_table,
+                    &definition,
+                    schema,
+                    values,
+                    Some(rowid),
+                    txid,
+                    &exclusion,
+                    predicate,
+                    arena,
+                )?;
+            }
+            Ok(())
+        })
+    })?;
+    Ok(Some(timing))
+}
+
+fn constraint_row_tables(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    mut visit: impl FnMut(usize) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let definition = storage.table_def(table_index, txid);
+    if !definition.partition.is_partitioned() {
+        return visit(table_index);
+    }
+    for candidate in 0..storage.table_count() {
+        if storage.table(candidate).visible_to(txid)
+            && !storage
+                .table_def(candidate, txid)
+                .partition
+                .is_partitioned()
+            && storage.partition_descends_from(candidate, table_index, txid)
+        {
+            visit(candidate)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_foreign_key_constraint(
+    storage: &Storage,
+    table_index: usize,
+    definition: &TableDef,
+    foreign_key: &crate::storage::ForeignKey,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    constraint_row_tables(storage, table_index, txid, |row_table| {
+        storage.for_each_row_state(row_table, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            storage.with_row_bytes(row_table, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                if foreign_key
+                    .columns()
+                    .iter()
+                    .any(|&column| values[column as usize].is_null())
+                {
+                    return Ok(());
+                }
+                check_fk_child_one(
+                    storage,
+                    definition,
+                    foreign_key,
+                    &values[..definition.n_columns],
+                    txid,
+                )
+            })?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    })
+}
+
+pub(crate) fn validate_check_constraint(
+    storage: &Storage,
+    table_index: usize,
+    definition: &TableDef,
+    check: &crate::storage::CheckConstraint,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    constraint_row_tables(storage, table_index, txid, |row_table| {
+        storage.for_each_row_state(row_table, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            storage.with_row_bytes(row_table, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                let context = RowCtx {
+                    def: definition,
+                    values: &values[..definition.n_columns],
+                    alias: None,
+                };
+                if matches!(
+                    eval_full(expression, arena, &[], &context, &hooks)?,
+                    Datum::Bool(false)
+                ) {
+                    return Err(sql_err!(
+                        sqlstate::CHECK_VIOLATION,
+                        "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                        check.name.as_str(),
+                        definition.name.as_str()
+                    ));
+                }
+                Ok(())
+            })?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    })
+}
+
+/// Checks and removes obligations whose current mode requires this boundary.
+/// `immediate_only` is the statement boundary; `false` is transaction commit.
+pub(crate) fn validate_deferred_constraints(
+    storage: &Storage,
+    txn: &mut TxnState,
+    immediate_only: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut index = 0;
+    while index < txn.deferred_constraints().len() {
+        let obligation = txn.deferred_constraints()[index];
+        let current = txn.current_constraint_identity(obligation.constraint);
+        if !txn.constraint_identity_is_current(obligation.constraint) {
+            txn.clear_deferred_constraint(obligation);
+            continue;
+        }
+        let Some(timing) = constraint_timing(storage, current, txn.txid) else {
+            txn.clear_deferred_constraint(obligation);
+            continue;
+        };
+        if immediate_only
+            && txn.constraint_mode(obligation.constraint, timing)
+                == crate::sql::ast::ConstraintMode::Deferred
+        {
+            index += 1;
+            continue;
+        }
+        validate_constraint_obligation(storage, current, obligation.rowid, txn.txid, arena)?;
+        txn.clear_deferred_constraint(obligation);
+    }
+    Ok(())
+}
+
+pub(crate) fn constraint_timing(
+    storage: &Storage,
+    constraint: crate::sql::txn::ConstraintIdentity,
+    txid: u32,
+) -> Option<crate::storage::ConstraintTiming> {
+    let table_index = constraint.table as usize;
+    if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
+        return None;
+    }
+    let definition = storage.table_def(table_index, txid);
+    definition
+        .uniques()
+        .iter()
+        .find(|key| key.name == constraint.name)
+        .map(|key| key.timing)
+        .or_else(|| {
+            definition
+                .fkeys()
+                .iter()
+                .find(|foreign_key| foreign_key.name == constraint.name)
+                .map(|foreign_key| foreign_key.timing)
+        })
+        .or_else(|| {
+            definition
+                .exclusions()
+                .iter()
+                .find(|exclusion| exclusion.name == constraint.name)
+                .map(|exclusion| exclusion.timing)
+        })
+}
+
+fn named_constraint_timing(
+    definition: &TableDef,
+    name: &str,
+) -> Option<crate::storage::ConstraintTiming> {
+    if let Some(key) = definition
+        .uniques()
+        .iter()
+        .find(|key| key.name.as_str() == name)
+    {
+        return Some(key.timing);
+    }
+    if let Some(foreign_key) = definition
+        .fkeys()
+        .iter()
+        .find(|foreign_key| foreign_key.name.as_str() == name)
+    {
+        return Some(foreign_key.timing);
+    }
+    if let Some(exclusion) = definition
+        .exclusions()
+        .iter()
+        .find(|exclusion| exclusion.name.as_str() == name)
+    {
+        return Some(exclusion.timing);
+    }
+    if definition
+        .checks()
+        .iter()
+        .any(|check| check.name.as_str() == name)
+    {
+        return Some(crate::storage::ConstraintTiming::NotDeferrable);
+    }
+    for column in definition.columns() {
+        let synthesized = if column.primary {
+            crate::stack_format!(128, "{}_pkey", definition.name.as_str())
+        } else if column.unique {
+            crate::stack_format!(
+                128,
+                "{}_{}_key",
+                definition.name.as_str(),
+                column.name.as_str()
+            )
+        } else {
+            continue;
+        };
+        if synthesized.as_str() == name {
+            return Some(crate::storage::ConstraintTiming::NotDeferrable);
+        }
+    }
+    None
+}
+
+/// Resolves a `SET CONSTRAINTS` name with PostgreSQL's first-schema search
+/// rule while retaining every same-schema match.
+pub(crate) fn resolve_constraint_name(
+    storage: &Storage,
+    written: &crate::sql::ast::QualName<'_>,
+    txid: u32,
+    output: &mut [crate::sql::txn::ConstraintIdentity],
+) -> Result<usize, SqlError> {
+    let mut collect_schema = |schema: &str| -> Result<usize, SqlError> {
+        let mut count = 0;
+        for table in 0..storage.table_count() {
+            if !storage.table(table).visible_to(txid) {
+                continue;
+            }
+            let definition = storage.table_def(table, txid);
+            if definition.schema.as_str() != schema {
+                continue;
+            }
+            let Some(timing) = named_constraint_timing(definition, written.name) else {
+                continue;
+            };
+            if !timing.is_deferrable() {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "constraint \"{}\" is not deferrable",
+                    written.name
+                ));
+            }
+            if count == output.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "SET CONSTRAINTS matches more than {} constraints",
+                    output.len()
+                ));
+            }
+            output[count] = crate::sql::txn::ConstraintIdentity {
+                table: table as u32,
+                name: crate::storage::SqlName::parse(written.name)?,
+                generation: 0,
+            };
+            count += 1;
+        }
+        Ok(count)
+    };
+
+    if let Some(schema) = written.schema {
+        let count = collect_schema(schema)?;
+        if count != 0 {
+            return Ok(count);
+        }
+    } else {
+        for entry in storage.path().entries() {
+            let crate::storage::PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            let schema = storage.schema_def(*schema_slot as usize).name;
+            let count = collect_schema(schema.as_str())?;
+            if count != 0 {
+                return Ok(count);
+            }
+        }
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_OBJECT,
+        "constraint \"{}\" does not exist",
+        written.name
+    ))
 }
 
 /// Whether any row of the parent (visible to `txid`) has, in `parent_cols`, the
@@ -1248,6 +1925,9 @@ pub(crate) fn apply_fk_parent_actions(
         let cschema = &cschema[..cdef.n_columns];
         for fk_index in 0..cdef.n_fkeys {
             let fk = cdef.fkeys[fk_index];
+            if !fk.validation.enforced() {
+                continue;
+            }
             if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
                 continue;
             }
@@ -1278,6 +1958,9 @@ pub(crate) fn apply_fk_parent_actions(
             } else {
                 fk.on_update
             };
+            let deferred_identity = (action == crate::storage::FkAction::NoAction
+                && fk.timing.is_deferrable())
+            .then(|| txn.constraint_identity(child_index as u32, fk.name));
 
             // Collect the referencing rows first: the rewrites below mutate
             // the row map, so the scan must complete before them.
@@ -1314,6 +1997,9 @@ pub(crate) fn apply_fk_parent_actions(
                 })?;
                 if is_match {
                     n_match += 1;
+                    if let Some(identity) = deferred_identity {
+                        txn.defer_constraint(identity, rowid)?;
+                    }
                 }
                 Ok(ControlFlow::Continue(()))
             })?;
@@ -1321,6 +2007,9 @@ pub(crate) fn apply_fk_parent_actions(
                 continue;
             }
             use crate::storage::FkAction as StorageFkAction;
+            if deferred_identity.is_some() {
+                continue;
+            }
             if matches!(
                 action,
                 StorageFkAction::NoAction | StorageFkAction::Restrict
@@ -1421,8 +2110,7 @@ pub(crate) fn apply_fk_parent_actions(
                         StorageFkAction::SetNull => Datum::Null,
                         StorageFkAction::SetDefault => match &cdef.columns()[cc as usize].default {
                             crate::storage::ColumnDefault::None => Datum::Null,
-                            crate::storage::ColumnDefault::Constant { value, .. }
-                            | crate::storage::ColumnDefault::LegacyConstant(value) => {
+                            crate::storage::ColumnDefault::Constant { value, .. } => {
                                 value.as_datum()
                             }
                             crate::storage::ColumnDefault::Expression(_) => {
@@ -1482,6 +2170,7 @@ pub(crate) fn apply_fk_parent_actions(
                     new_child,
                     Some(rowid),
                     txn.txid,
+                    Some(txn),
                     &checks,
                     arena,
                     params,

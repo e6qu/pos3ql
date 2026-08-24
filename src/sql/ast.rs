@@ -240,6 +240,13 @@ pub enum Stmt<'a> {
     ReleaseSavepoint(&'a str),
     /// ROLLBACK TO [SAVEPOINT] name.
     RollbackToSavepoint(&'a str),
+    /// Change the transaction-local timing of one or more deferrable
+    /// constraints. Names remain structured so search-path resolution happens
+    /// once against catalog identities at execution.
+    SetConstraints {
+        targets: ConstraintTargets<'a>,
+        mode: ConstraintMode,
+    },
     /// LOCK [TABLE] relation [, ...] [IN lockmode MODE] [NOWAIT].
     LockTable {
         tables: &'a [QualName<'a>],
@@ -1618,10 +1625,12 @@ pub enum TableConstraint<'a> {
     PrimaryKey {
         name: Option<&'a str>,
         columns: &'a [&'a str],
+        timing: ConstraintTiming,
     },
     Unique {
         name: Option<&'a str>,
         columns: &'a [&'a str],
+        timing: ConstraintTiming,
     },
     Check {
         name: Option<&'a str>,
@@ -1629,6 +1638,7 @@ pub enum TableConstraint<'a> {
         /// Source text of the predicate, stored durably and re-parsed at
         /// enforcement time.
         text: &'a str,
+        validation: ConstraintValidation,
     },
     ForeignKey {
         name: Option<&'a str>,
@@ -1638,7 +1648,77 @@ pub enum TableConstraint<'a> {
         parent_cols: &'a [&'a str],
         on_delete: FkAction,
         on_update: FkAction,
+        timing: ConstraintTiming,
+        validation: ConstraintValidation,
     },
+    Exclusion {
+        name: Option<&'a str>,
+        columns: &'a [&'a str],
+        operators: &'a [ExclusionOperator],
+        predicate: Option<&'a Expr<'a>>,
+        predicate_text: Option<&'a str>,
+        timing: ConstraintTiming,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionOperator {
+    Equal,
+    Overlaps,
+    Adjacent,
+}
+
+/// The transaction-local check mode selected by a constraint definition or
+/// `SET CONSTRAINTS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintMode {
+    Immediate,
+    Deferred,
+}
+
+/// A constraint is either permanently immediate or has an explicit initial
+/// mode. This prevents `INITIALLY DEFERRED` from existing independently of
+/// `DEFERRABLE` after parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintTiming {
+    NotDeferrable,
+    Deferrable(ConstraintMode),
+}
+
+impl ConstraintTiming {
+    pub const fn is_deferrable(self) -> bool {
+        matches!(self, Self::Deferrable(_))
+    }
+
+    pub const fn initially_deferred(self) -> bool {
+        matches!(self, Self::Deferrable(ConstraintMode::Deferred))
+    }
+}
+
+/// Validation and enforcement cannot form the contradictory state "validated
+/// but not enforced".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintValidation {
+    EnforcedValidated,
+    EnforcedNotValid,
+    NotEnforced,
+}
+
+impl ConstraintValidation {
+    pub const fn enforced(self) -> bool {
+        !matches!(self, Self::NotEnforced)
+    }
+
+    pub const fn validated(self) -> bool {
+        matches!(self, Self::EnforcedValidated)
+    }
+}
+
+/// `ALL` is a semantic selector, not a constraint named `all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintTargets<'a> {
+    All,
+    Named(&'a [QualName<'a>]),
 }
 
 /// A MIN/MAXVALUE option, three-valued so ALTER SEQUENCE can tell "left alone"
@@ -2205,12 +2285,18 @@ pub enum AlterAction<'a> {
     DropConstraint {
         name: &'a str,
         if_exists: bool,
+        cascade: bool,
     },
     /// ALTER TABLE ... RENAME CONSTRAINT old TO new.
     RenameConstraint {
         from: &'a str,
         to: &'a str,
     },
+    AlterConstraint {
+        name: &'a str,
+        alteration: ConstraintAlteration,
+    },
+    ValidateConstraint(&'a str),
     /// ALTER TABLE trigger-state command with a parser-classified target.
     SetTriggerEnabled {
         target: TriggerEnableTarget<'a>,
@@ -2223,6 +2309,16 @@ pub enum AlterAction<'a> {
     DetachPartition {
         child: QualName<'a>,
     },
+}
+
+/// The independently optional attributes of `ALTER CONSTRAINT`. Execution
+/// combines them with the existing typed definition before accepting the new
+/// state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstraintAlteration {
+    pub deferrable: Option<bool>,
+    pub initially: Option<ConstraintMode>,
+    pub enforced: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

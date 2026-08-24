@@ -327,6 +327,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Savepoint(_)
         | Stmt::ReleaseSavepoint(_)
         | Stmt::RollbackToSavepoint(_)
+        | Stmt::SetConstraints { .. }
         | Stmt::LockTable { .. }
         | Stmt::Set { .. }
         | Stmt::Reset(_)
@@ -2641,6 +2642,13 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
+        self.work.reset();
+        if let Err(error) =
+            exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         if txn.isolation == IsolationLevel::Serializable
             && (!txn.touched().is_empty() || !txn.ddl().is_empty())
             && let Err(error) = self.storage.validate_serializable(txn.txid)
@@ -3657,6 +3665,11 @@ impl Engine {
         txn.rewind_ddl(mark.ddl);
         txn.rewind_statistics(mark.statistics);
         txn.rewind_subscription_advances(mark.subscription_advances);
+        txn.rewind_constraints(
+            mark.constraint_obligations,
+            mark.constraint_modes,
+            mark.constraint_renames,
+        );
         txn.rewind_notifications(
             mark.notifications,
             mark.notification_payload,
@@ -3689,6 +3702,11 @@ impl Engine {
         txn.rewind_ddl(sp.ddl_mark);
         txn.rewind_statistics(sp.statistics_mark);
         txn.rewind_subscription_advances(sp.subscription_advance_mark);
+        txn.rewind_constraints(
+            sp.constraint_obligation_mark,
+            sp.constraint_mode_mark,
+            sp.constraint_rename_mark,
+        );
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         self.storage.rollback_locks_to(txn.txid, sp.lock_mark);
         txn.rollback_savepoints_after(index);
@@ -4158,6 +4176,7 @@ impl Engine {
             &mut self.dml_scratch,
             &self.copy_transition_scratch,
         )?;
+        exec::constraints::validate_deferred_constraints(&self.storage, txn, true, &self.work)?;
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -4376,7 +4395,16 @@ impl Engine {
                     let outcome = self.execute_stmt(
                         &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
                     )?;
-                    let outcome = outcome.and_then(|()| query::check_timeout());
+                    let outcome = outcome
+                        .and_then(|()| {
+                            exec::constraints::validate_deferred_constraints(
+                                &self.storage,
+                                txn,
+                                true,
+                                arena,
+                            )
+                        })
+                        .and_then(|()| query::check_timeout());
                     if let Err(mut e) = outcome {
                         if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                             || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
@@ -4500,6 +4528,9 @@ impl Engine {
             .execute_stmt(
                 &statement, arena, params, txn, sqlprep, cursors, guc, responder,
             )?
+            .and_then(|()| {
+                exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
+            })
             .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
@@ -7746,6 +7777,115 @@ impl Engine {
                 };
                 self.rollback_to_savepoint(txn, index, guc);
                 responder.command_complete("ROLLBACK")?;
+                Ok(Ok(()))
+            }
+            Stmt::SetConstraints { targets, mode } => {
+                if !txn.is_explicit() {
+                    responder.warning(
+                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "SET CONSTRAINTS can only be used in transaction blocks",
+                    )?;
+                    responder.command_complete("SET CONSTRAINTS")?;
+                    return Ok(Ok(()));
+                }
+                let empty = txn::ConstraintIdentity {
+                    table: 0,
+                    name: crate::storage::SqlName::EMPTY,
+                    generation: 0,
+                };
+                let mut identities = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
+                let count = match targets {
+                    crate::sql::ast::ConstraintTargets::All => 0,
+                    crate::sql::ast::ConstraintTargets::Named(names) => {
+                        let mut count = 0;
+                        for name in *names {
+                            let mut matches = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
+                            let matched = match exec::constraints::resolve_constraint_name(
+                                &self.storage,
+                                name,
+                                txn.txid,
+                                &mut matches,
+                            ) {
+                                Ok(matched) => matched,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            for identity in matches[..matched].iter().copied() {
+                                let identity =
+                                    txn.constraint_identity(identity.table, identity.name);
+                                if identities[..count].contains(&identity) {
+                                    continue;
+                                }
+                                if count == identities.len() {
+                                    return Ok(Err(sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "SET CONSTRAINTS matches more than {} constraints",
+                                        identities.len()
+                                    )));
+                                }
+                                identities[count] = identity;
+                                count += 1;
+                            }
+                        }
+                        count
+                    }
+                };
+                let additional = if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
+                    1
+                } else {
+                    count
+                };
+                if !txn.can_record_constraint_modes(additional) {
+                    return Ok(Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "transaction changes constraint modes more than {} times",
+                        txn::MAX_DEFERRED_CONSTRAINTS
+                    )));
+                }
+                if *mode == crate::sql::ast::ConstraintMode::Immediate {
+                    if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
+                        if let Err(error) = exec::constraints::validate_deferred_constraints(
+                            &self.storage,
+                            txn,
+                            false,
+                            arena,
+                        ) {
+                            return Ok(Err(error));
+                        }
+                    } else {
+                        for identity in identities[..count].iter().copied() {
+                            while let Some(obligation) = txn.deferred_constraint_for(identity) {
+                                if let Err(error) =
+                                    exec::constraints::validate_constraint_obligation(
+                                        &self.storage,
+                                        identity,
+                                        obligation.rowid,
+                                        txn.txid,
+                                        arena,
+                                    )
+                                {
+                                    return Ok(Err(error));
+                                }
+                                txn.clear_deferred_constraint(obligation);
+                            }
+                        }
+                    }
+                }
+                let result = if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
+                    txn.record_constraint_mode(None, *mode)
+                } else {
+                    let mut result = Ok(());
+                    for identity in identities[..count].iter().copied() {
+                        if let Err(error) = txn.record_constraint_mode(Some(identity), *mode) {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                    result
+                };
+                if let Err(error) = result {
+                    return Ok(Err(error));
+                }
+                responder.command_complete("SET CONSTRAINTS")?;
                 Ok(Ok(()))
             }
             Stmt::Set { name, value, local } => {

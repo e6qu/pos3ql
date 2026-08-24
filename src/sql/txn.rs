@@ -41,6 +41,9 @@ pub struct Savepoint {
     pub notify_payload_mark: usize,
     pub listen_mark: usize,
     pub subscription_advance_mark: usize,
+    pub constraint_obligation_mark: usize,
+    pub constraint_mode_mark: usize,
+    pub constraint_rename_mark: usize,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -59,6 +62,9 @@ pub(crate) struct StatementMark {
     pub notification_payload: usize,
     pub listen_ops: usize,
     pub subscription_advances: usize,
+    pub constraint_obligations: usize,
+    pub constraint_modes: usize,
+    pub constraint_renames: usize,
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
@@ -150,6 +156,9 @@ pub struct TxnState {
     /// Publisher positions staged with the local transaction that applied
     /// them.  They are journaled immediately before the transaction marker.
     subscription_advances: FixedVec<crate::storage::SubscriptionAdvance>,
+    deferred_constraints: FixedVec<ConstraintObligation>,
+    constraint_modes: FixedVec<ConstraintModeChange>,
+    constraint_renames: FixedVec<ConstraintLifecycle>,
 }
 
 /// How to undo one DDL statement.
@@ -331,6 +340,44 @@ pub(crate) enum DdlUndo {
 pub const MAX_TXN_DDL: usize = 64;
 pub const MAX_TXN_ANALYZE: usize = 64;
 const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
+pub const MAX_DEFERRED_CONSTRAINTS: usize = 128;
+
+/// A constraint's transaction identity. Names are unique within a table and
+/// the table slot remains stable across relation renames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConstraintIdentity {
+    pub(crate) table: u32,
+    pub(crate) name: crate::storage::SqlName,
+    pub(crate) generation: u16,
+}
+
+/// One row whose transaction-visible state must satisfy a deferred
+/// constraint at the next applicable boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConstraintObligation {
+    pub(crate) constraint: ConstraintIdentity,
+    pub(crate) rowid: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConstraintModeChange {
+    /// `None` represents `SET CONSTRAINTS ALL` without expanding catalog state
+    /// into the transaction pool.
+    pub(crate) constraint: Option<ConstraintIdentity>,
+    pub(crate) mode: crate::sql::ast::ConstraintMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintLifecycle {
+    Rename {
+        identity: ConstraintIdentity,
+        to: crate::storage::SqlName,
+    },
+    Drop {
+        identity: ConstraintIdentity,
+        next_generation: u16,
+    },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StatisticsUndo {
@@ -352,6 +399,9 @@ impl TxnState {
                 * core::mem::size_of::<crate::sql::notify::ListenOp>()
             + SUBSCRIPTION_ADVANCES_PER_TXN
                 * core::mem::size_of::<crate::storage::SubscriptionAdvance>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintObligation>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintModeChange>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintLifecycle>()
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -396,6 +446,21 @@ impl TxnState {
                 budget,
                 "txn_subscription_advances",
                 SUBSCRIPTION_ADVANCES_PER_TXN,
+            )?,
+            deferred_constraints: FixedVec::new(
+                budget,
+                "txn_deferred_constraints",
+                MAX_DEFERRED_CONSTRAINTS,
+            )?,
+            constraint_modes: FixedVec::new(
+                budget,
+                "txn_constraint_modes",
+                MAX_DEFERRED_CONSTRAINTS,
+            )?,
+            constraint_renames: FixedVec::new(
+                budget,
+                "txn_constraint_renames",
+                MAX_DEFERRED_CONSTRAINTS,
             )?,
         })
     }
@@ -642,6 +707,213 @@ impl TxnState {
         &self.subscription_advances
     }
 
+    pub(crate) fn constraint_mode(
+        &self,
+        constraint: ConstraintIdentity,
+        timing: crate::storage::ConstraintTiming,
+    ) -> crate::sql::ast::ConstraintMode {
+        let constraint = self.current_constraint_identity(constraint);
+        for change in self.constraint_modes.iter().rev() {
+            if change.constraint.is_none()
+                || change
+                    .constraint
+                    .map(|identity| self.current_constraint_identity(identity))
+                    == Some(constraint)
+            {
+                return change.mode;
+            }
+        }
+        if timing.initially_deferred() {
+            crate::sql::ast::ConstraintMode::Deferred
+        } else {
+            crate::sql::ast::ConstraintMode::Immediate
+        }
+    }
+
+    pub(crate) fn record_constraint_mode(
+        &mut self,
+        constraint: Option<ConstraintIdentity>,
+        mode: crate::sql::ast::ConstraintMode,
+    ) -> Result<(), SqlError> {
+        self.constraint_modes
+            .push(ConstraintModeChange { constraint, mode })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction changes constraint modes more than {} times",
+                    MAX_DEFERRED_CONSTRAINTS
+                )
+            })
+    }
+
+    pub(crate) fn can_record_constraint_modes(&self, additional: usize) -> bool {
+        self.constraint_modes
+            .len()
+            .checked_add(additional)
+            .is_some_and(|needed| needed <= self.constraint_modes.capacity())
+    }
+
+    pub(crate) fn defer_constraint(
+        &mut self,
+        constraint: ConstraintIdentity,
+        rowid: u64,
+    ) -> Result<(), SqlError> {
+        let obligation = ConstraintObligation { constraint, rowid };
+        if self.deferred_constraints.contains(&obligation) {
+            return Ok(());
+        }
+        self.deferred_constraints.push(obligation).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction defers more than {} constraints",
+                MAX_DEFERRED_CONSTRAINTS
+            )
+        })
+    }
+
+    pub(crate) fn deferred_constraints(&self) -> &[ConstraintObligation] {
+        &self.deferred_constraints
+    }
+
+    pub(crate) fn deferred_constraint_for(
+        &self,
+        current: ConstraintIdentity,
+    ) -> Option<ConstraintObligation> {
+        self.deferred_constraints
+            .iter()
+            .copied()
+            .find(|obligation| self.current_constraint_identity(obligation.constraint) == current)
+    }
+
+    pub(crate) fn clear_deferred_constraint(&mut self, obligation: ConstraintObligation) {
+        if let Some(index) = self
+            .deferred_constraints
+            .iter()
+            .position(|item| *item == obligation)
+        {
+            self.deferred_constraints.swap_remove(index);
+        }
+    }
+
+    pub(crate) fn rename_constraint(
+        &mut self,
+        table: u32,
+        from: crate::storage::SqlName,
+        to: crate::storage::SqlName,
+    ) -> Result<(), SqlError> {
+        let identity = self.constraint_identity(table, from);
+        self.constraint_renames
+            .push(ConstraintLifecycle::Rename { identity, to })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction renames more than {} constraints",
+                    MAX_DEFERRED_CONSTRAINTS
+                )
+            })
+    }
+
+    pub(crate) fn drop_constraint(
+        &mut self,
+        table: u32,
+        name: crate::storage::SqlName,
+    ) -> Result<(), SqlError> {
+        let identity = self.constraint_identity(table, name);
+        let next_generation = identity.generation.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "constraint generation is exhausted"
+            )
+        })?;
+        self.constraint_renames
+            .push(ConstraintLifecycle::Drop {
+                identity,
+                next_generation,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction changes more than {} constraint identities",
+                    MAX_DEFERRED_CONSTRAINTS
+                )
+            })
+    }
+
+    pub(crate) fn constraint_identity(
+        &self,
+        table: u32,
+        name: crate::storage::SqlName,
+    ) -> ConstraintIdentity {
+        for event in self.constraint_renames.iter().rev() {
+            match *event {
+                ConstraintLifecycle::Drop {
+                    identity,
+                    next_generation,
+                } if identity.table == table && identity.name == name => {
+                    return ConstraintIdentity {
+                        table,
+                        name,
+                        generation: next_generation,
+                    };
+                }
+                ConstraintLifecycle::Rename { identity, to }
+                    if identity.table == table && to == name =>
+                {
+                    return ConstraintIdentity {
+                        table,
+                        name,
+                        generation: identity.generation,
+                    };
+                }
+                _ => {}
+            }
+        }
+        ConstraintIdentity {
+            table,
+            name,
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn current_constraint_identity(
+        &self,
+        mut identity: ConstraintIdentity,
+    ) -> ConstraintIdentity {
+        for event in self.constraint_renames.iter() {
+            if let ConstraintLifecycle::Rename {
+                identity: renamed,
+                to,
+            } = *event
+                && renamed == identity
+            {
+                identity.name = to;
+            }
+        }
+        identity
+    }
+
+    pub(crate) fn constraint_identity_is_current(&self, identity: ConstraintIdentity) -> bool {
+        let current = self.current_constraint_identity(identity);
+        self.constraint_identity(current.table, current.name) == current
+    }
+
+    pub(crate) fn rewind_constraints(
+        &mut self,
+        obligation_mark: usize,
+        mode_mark: usize,
+        rename_mark: usize,
+    ) {
+        while self.deferred_constraints.len() > obligation_mark {
+            self.deferred_constraints.pop();
+        }
+        while self.constraint_modes.len() > mode_mark {
+            self.constraint_modes.pop();
+        }
+        while self.constraint_renames.len() > rename_mark {
+            self.constraint_renames.pop();
+        }
+    }
+
     /// Discards this transaction's buffered notifications and listen ops (at
     /// commit after they are applied, and at rollback).
     pub fn clear_pending_notifications(&mut self) {
@@ -690,6 +962,9 @@ impl TxnState {
             notify_payload_mark: self.notify_payloads.mark(),
             listen_mark: self.pending_listen_ops.len(),
             subscription_advance_mark: self.subscription_advances.len(),
+            constraint_obligation_mark: self.deferred_constraints.len(),
+            constraint_mode_mark: self.constraint_modes.len(),
+            constraint_rename_mark: self.constraint_renames.len(),
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -713,6 +988,9 @@ impl TxnState {
             notification_payload: self.notify_payloads.mark(),
             listen_ops: self.pending_listen_ops.len(),
             subscription_advances: self.subscription_advances.len(),
+            constraint_obligations: self.deferred_constraints.len(),
+            constraint_modes: self.constraint_modes.len(),
+            constraint_renames: self.constraint_renames.len(),
         }
     }
 
@@ -826,5 +1104,8 @@ impl TxnState {
         self.notify_payloads.clear();
         self.pending_listen_ops.clear();
         self.subscription_advances.clear();
+        self.deferred_constraints.clear();
+        self.constraint_modes.clear();
+        self.constraint_renames.clear();
     }
 }

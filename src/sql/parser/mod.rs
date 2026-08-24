@@ -68,7 +68,9 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::DropColumn(_) | AlterAction::DropConstraint { .. } => 0,
         AlterAction::AlterColumnType { .. } => 1,
         AlterAction::AddColumn(_) => 2,
-        AlterAction::AddConstraint(_) => 3,
+        AlterAction::AddConstraint(_)
+        | AlterAction::AlterConstraint { .. }
+        | AlterAction::ValidateConstraint(_) => 3,
         AlterAction::SetDefault { .. }
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
@@ -877,6 +879,32 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("set") => {
                 self.advance()?;
+                if self.eat_ident("constraints")? {
+                    let targets = if self.eat_ident("all")? {
+                        ConstraintTargets::All
+                    } else {
+                        let mut names = [QualName::bare(""); MAX_LIST];
+                        let mut count = 0;
+                        loop {
+                            if count == names.len() {
+                                return Err(self.limit("constraint names", names.len()));
+                            }
+                            names[count] = self.qual_name("constraint name")?;
+                            count += 1;
+                            if !self.eat_op(",")? {
+                                break;
+                            }
+                        }
+                        ConstraintTargets::Named(self.arena_slice(&names[..count])?)
+                    };
+                    let mode = if self.eat_ident("deferred")? {
+                        ConstraintMode::Deferred
+                    } else {
+                        self.expect_ident("immediate")?;
+                        ConstraintMode::Immediate
+                    };
+                    return Ok(Stmt::SetConstraints { targets, mode });
+                }
                 let session_modifier = self.eat_ident("session")?;
                 let local = if session_modifier {
                     false
@@ -3606,7 +3634,7 @@ impl<'a> Parser<'a> {
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
                 return Ok(AlterAction::AddConstraint(
-                    self.table_constraint(Some(cname))?,
+                    self.table_constraint(Some(cname), true)?,
                 ));
             }
             if matches!(
@@ -3616,7 +3644,9 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
             ) {
-                return Ok(AlterAction::AddConstraint(self.table_constraint(None)?));
+                return Ok(AlterAction::AddConstraint(
+                    self.table_constraint(None, true)?,
+                ));
             }
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
@@ -3673,16 +3703,83 @@ impl<'a> Parser<'a> {
                     true
                 };
                 let name = self.col_ident("constraint name")?;
-                // CASCADE/RESTRICT: this engine tracks no cross-object
-                // dependencies on a constraint, so both are accepted and the
-                // drop is unconditional.
-                let _ = self.eat_ident("cascade")? || self.eat_ident("restrict")?;
-                Ok(AlterAction::DropConstraint { name, if_exists })
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                Ok(AlterAction::DropConstraint {
+                    name,
+                    if_exists,
+                    cascade,
+                })
             } else {
                 let _ = self.eat_ident("column")?;
                 Ok(AlterAction::DropColumn(self.col_ident("column name")?))
             }
+        } else if self.eat_ident("validate")? {
+            self.expect_ident("constraint")?;
+            Ok(AlterAction::ValidateConstraint(
+                self.col_ident("constraint name")?,
+            ))
         } else if self.eat_ident("alter")? {
+            if self.eat_ident("constraint")? {
+                let name = self.col_ident("constraint name")?;
+                let mut alteration = ConstraintAlteration {
+                    deferrable: None,
+                    initially: None,
+                    enforced: None,
+                };
+                loop {
+                    if self.eat_ident("deferrable")? {
+                        if alteration.deferrable.replace(true).is_some() {
+                            return Err(self.err_here("duplicate DEFERRABLE clause"));
+                        }
+                    } else if self.eat_ident("not")? {
+                        if self.eat_ident("deferrable")? {
+                            if alteration.deferrable.replace(false).is_some() {
+                                return Err(self.err_here("duplicate NOT DEFERRABLE clause"));
+                            }
+                        } else {
+                            self.expect_ident("enforced")?;
+                            if alteration.enforced.replace(false).is_some() {
+                                return Err(self.err_here("duplicate NOT ENFORCED clause"));
+                            }
+                        }
+                    } else if self.eat_ident("initially")? {
+                        let mode = if self.eat_ident("deferred")? {
+                            ConstraintMode::Deferred
+                        } else {
+                            self.expect_ident("immediate")?;
+                            ConstraintMode::Immediate
+                        };
+                        if alteration.initially.replace(mode).is_some() {
+                            return Err(self.err_here("duplicate INITIALLY clause"));
+                        }
+                    } else if self.eat_ident("enforced")? {
+                        if alteration.enforced.replace(true).is_some() {
+                            return Err(self.err_here("duplicate ENFORCED clause"));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if alteration.deferrable.is_none()
+                    && alteration.initially.is_none()
+                    && alteration.enforced.is_none()
+                {
+                    return Err(self.err_here("expected a constraint attribute"));
+                }
+                if alteration.deferrable == Some(false)
+                    && alteration.initially == Some(ConstraintMode::Deferred)
+                {
+                    return Err(
+                        self.err_here("constraint declared INITIALLY DEFERRED must be DEFERRABLE")
+                    );
+                }
+                return Ok(AlterAction::AlterConstraint { name, alteration });
+            }
             // ALTER [COLUMN] col { SET DEFAULT e | DROP DEFAULT | SET NOT NULL
             // | DROP NOT NULL }.
             let _ = self.eat_ident("column")?;
@@ -5701,6 +5798,25 @@ mod tests {
                 };
                 assert!(d.if_exists);
             },
+        );
+    }
+
+    #[test]
+    fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
+        for sql in [
+            "CREATE TABLE t (id integer UNIQUE ENFORCED)",
+            "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
+            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED)",
+            "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID)",
+            "CREATE TABLE t (id integer, EXCLUDE USING btree (id WITH =))",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+            });
+        }
+        with_parser(
+            "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
+            |parser| assert!(parser.next_stmt().unwrap().is_some()),
         );
     }
 

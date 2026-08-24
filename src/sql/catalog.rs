@@ -561,6 +561,16 @@ pub fn synthesize<'a>(
                     ],
                     arena,
                 )?,
+                row(
+                    &[
+                        Datum::Int4(2601),
+                        Datum::Int4(783),
+                        text("gist", arena)?,
+                        Datum::Int4(0),
+                        text("i", arena)?,
+                    ],
+                    arena,
+                )?,
             ],
             arena,
         ),
@@ -1663,6 +1673,9 @@ struct IdxInfo {
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
+    is_constraint: bool,
+    is_exclusion: bool,
+    timing: crate::storage::ConstraintTiming,
     constraint_parent_oid: i32,
 }
 
@@ -1672,6 +1685,7 @@ fn parent_constraint_oid(
     child_slot: usize,
     columns: &[u16],
     is_primary: bool,
+    is_exclusion: bool,
 ) -> i32 {
     let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
         return 0;
@@ -1681,22 +1695,42 @@ fn parent_constraint_oid(
     let mut position = 0usize;
     for (column, metadata) in parent.columns().iter().enumerate() {
         if metadata.primary {
-            if is_primary && columns == [column as u16] {
+            if !is_exclusion && is_primary && columns == [column as u16] {
                 return index_oid(parent_slot, position) + 500_000;
             }
             position += 1;
         } else if metadata.unique {
-            if !is_primary && columns == [column as u16] {
+            if !is_exclusion && !is_primary && columns == [column as u16] {
                 return index_oid(parent_slot, position) + 500_000;
             }
             position += 1;
         }
     }
     for unique in parent.uniques() {
-        if unique.is_primary == is_primary && unique.columns() == columns {
+        if !is_exclusion && unique.is_primary == is_primary && unique.columns() == columns {
             return index_oid(parent_slot, position) + 500_000;
         }
         position += 1;
+    }
+    if is_exclusion {
+        let child = storage.table_def(child_slot, txid);
+        let Some(child_exclusion) = child
+            .exclusions()
+            .iter()
+            .find(|exclusion| exclusion.columns() == columns)
+        else {
+            return 0;
+        };
+        for exclusion in parent.exclusions() {
+            if exclusion.columns() == child_exclusion.columns()
+                && exclusion.operators[..exclusion.n_cols]
+                    == child_exclusion.operators[..child_exclusion.n_cols]
+                && exclusion.predicate == child_exclusion.predicate
+            {
+                return index_oid(parent_slot, position) + 500_000;
+            }
+            position += 1;
+        }
     }
     0
 }
@@ -1724,6 +1758,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                       is_primary: bool,
                       is_unique: bool,
                       is_constraint: bool,
+                      is_exclusion: bool,
+                      timing: crate::storage::ConstraintTiming,
                       name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
@@ -1745,8 +1781,11 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 predicate,
                 is_primary,
                 is_unique,
+                is_constraint,
+                is_exclusion,
+                timing,
                 constraint_parent_oid: if is_constraint {
-                    parent_constraint_oid(storage, txid, slot, columns, is_primary)
+                    parent_constraint_oid(storage, txid, slot, columns, is_primary, is_exclusion)
                 } else {
                     0
                 },
@@ -1769,6 +1808,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     true,
                     true,
                     true,
+                    false,
+                    crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
             } else if col.unique {
@@ -1786,6 +1827,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     false,
                     true,
                     true,
+                    false,
+                    crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
             }
@@ -1803,7 +1846,28 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 uk.is_primary,
                 true,
                 true,
+                false,
+                uk.timing,
                 stack_str_64(uk.name.as_str()),
+            ));
+        }
+        for exclusion in def.exclusions() {
+            visit(mk(
+                exclusion.columns(),
+                [false; crate::storage::MAX_INDEX_COLS],
+                &[],
+                [false; crate::storage::MAX_INDEX_COLS],
+                [false; crate::storage::MAX_INDEX_COLS],
+                exclusion
+                    .predicate
+                    .map(|predicate| StackStr::from_str(predicate.as_str())),
+                false,
+                false,
+                false,
+                true,
+                true,
+                exclusion.timing,
+                stack_str_64(exclusion.name.as_str()),
             ));
         }
         // Explicit CREATE INDEX on this table.
@@ -1819,6 +1883,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 false,
                 index.unique,
                 false,
+                false,
+                crate::storage::ConstraintTiming::NotDeferrable,
                 stack_str_64(index.name_for(txid).as_str()),
             ));
         }
@@ -1842,6 +1908,9 @@ fn empty_index() -> IdxInfo {
         predicate: None,
         is_primary: false,
         is_unique: false,
+        is_constraint: false,
+        is_exclusion: false,
+        timing: crate::storage::ConstraintTiming::NotDeferrable,
         constraint_parent_oid: 0,
     }
 }
@@ -3181,6 +3250,31 @@ fn check_is_inherited(
         .any(|parent| parent.name == child.name && parent.expression == child.expression)
 }
 
+fn append_constraint_attributes(
+    rendered: &mut impl core::fmt::Write,
+    timing: crate::storage::ConstraintTiming,
+    validation: crate::storage::ConstraintValidation,
+) {
+    match timing {
+        crate::storage::ConstraintTiming::NotDeferrable => {}
+        crate::storage::ConstraintTiming::DeferrableImmediate => {
+            let _ = rendered.write_str(" DEFERRABLE");
+        }
+        crate::storage::ConstraintTiming::DeferrableDeferred => {
+            let _ = rendered.write_str(" DEFERRABLE INITIALLY DEFERRED");
+        }
+    }
+    match validation {
+        crate::storage::ConstraintValidation::EnforcedValidated => {}
+        crate::storage::ConstraintValidation::EnforcedNotValid => {
+            let _ = rendered.write_str(" NOT VALID");
+        }
+        crate::storage::ConstraintValidation::NotEnforced => {
+            let _ = rendered.write_str(" NOT ENFORCED");
+        }
+    }
+}
+
 /// The schema-qualified foreign-key definition used by catalog clients and
 /// dump/restore.
 pub fn constraint_def_text<'a>(
@@ -3224,6 +3318,7 @@ pub fn constraint_def_text<'a>(
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
         let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
+        append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
             &s,
             "foreign key definition is too long",
@@ -3244,6 +3339,11 @@ pub fn constraint_def_text<'a>(
             let mut rendered = StackStr::<1024>::new();
             use core::fmt::Write as _;
             let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            append_constraint_attributes(
+                &mut rendered,
+                crate::storage::ConstraintTiming::NotDeferrable,
+                check.validation,
+            );
             return Ok(Some(alloc_rendered(
                 &rendered,
                 "table constraint definition is too long",
@@ -3275,12 +3375,46 @@ pub fn constraint_def_text<'a>(
     }
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
-        if oid != info.oid + 500_000 || (!info.is_primary && !info.is_unique) {
+        if oid != info.oid + 500_000 || !info.is_constraint {
             continue;
         }
         let table = storage.table_def(info.table_slot, txid);
         let mut rendered = StackStr::<640>::new();
         use core::fmt::Write as _;
+        if info.is_exclusion {
+            let exclusion = table
+                .exclusions()
+                .iter()
+                .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
+                .expect("exclusion index has its constraint");
+            let _ = rendered.write_str("EXCLUDE USING gist (");
+            for position in 0..exclusion.n_cols {
+                if position != 0 {
+                    let _ = rendered.write_str(", ");
+                }
+                write_identifier(
+                    &mut rendered,
+                    table.columns()[exclusion.columns[position] as usize]
+                        .name
+                        .as_str(),
+                );
+                let _ = write!(rendered, " WITH {}", exclusion.operators[position].sql());
+            }
+            let _ = rendered.write_str(")");
+            if let Some(predicate) = &exclusion.predicate {
+                let _ = write!(rendered, " WHERE ({})", predicate.as_str());
+            }
+            append_constraint_attributes(
+                &mut rendered,
+                exclusion.timing,
+                crate::storage::ConstraintValidation::EnforcedValidated,
+            );
+            return Ok(Some(alloc_rendered(
+                &rendered,
+                "exclusion constraint definition is too long",
+                arena,
+            )?));
+        }
         let _ = rendered.write_str(if info.is_primary {
             "PRIMARY KEY ("
         } else {
@@ -3293,6 +3427,11 @@ pub fn constraint_def_text<'a>(
             let _ = rendered.write_str(table.columns()[column as usize].name.as_str());
         }
         let _ = rendered.write_str(")");
+        append_constraint_attributes(
+            &mut rendered,
+            info.timing,
+            crate::storage::ConstraintValidation::EnforcedValidated,
+        );
         return Ok(Some(alloc_rendered(
             &rendered,
             "unique constraint definition is too long",
@@ -3505,7 +3644,11 @@ pub fn index_def_text<'a>(
         write_identifier(&mut s, def.schema.as_str());
         let _ = s.write_char('.');
         write_identifier(&mut s, def.name.as_str());
-        let _ = s.write_str(" USING btree (");
+        let _ = s.write_str(if info.is_exclusion {
+            " USING gist ("
+        } else {
+            " USING btree ("
+        });
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -4609,8 +4752,8 @@ fn pg_class<'a>(
                 text("i", arena)?, // relkind: index
                 Datum::Int4(info.n_cols as i32),
                 Datum::Float8(0.0),
-                Datum::Int4(0),   // relpages
-                Datum::Int4(403), // relam: btree
+                Datum::Int4(0), // relpages
+                Datum::Int4(if info.is_exclusion { 783 } else { 403 }),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Table,
@@ -4786,6 +4929,7 @@ fn pg_constraint<'a>(
             ("confrelid", ColType::Int4),
             ("condeferrable", ColType::Bool),
             ("condeferred", ColType::Bool),
+            ("conenforced", ColType::Bool),
             ("convalidated", ColType::Bool),
             ("conperiod", ColType::Bool),
             ("confupdtype", ColType::Bpchar),
@@ -4815,7 +4959,12 @@ fn pg_constraint<'a>(
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
     for info in indexes {
-        let contype = if info.is_primary {
+        if !info.is_constraint {
+            continue;
+        }
+        let contype = if info.is_exclusion {
+            "x"
+        } else if info.is_primary {
             "p"
         } else if info.is_unique {
             "u"
@@ -4835,8 +4984,9 @@ fn pg_constraint<'a>(
                 Datum::Int4(info.constraint_parent_oid),
                 Datum::Int4(info.oid), // conindid -> the backing index
                 Datum::Int4(0),        // confrelid
-                Datum::Bool(false),
-                Datum::Bool(false),
+                Datum::Bool(info.timing.is_deferrable()),
+                Datum::Bool(info.timing.initially_deferred()),
+                Datum::Bool(true),
                 Datum::Bool(true),  // convalidated
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?,  // confupdtype (n/a for non-FK)
@@ -4856,7 +5006,17 @@ fn pg_constraint<'a>(
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
-                empty_int_array(arena)?,
+                if info.is_exclusion {
+                    let table = storage.table_def(info.table_slot, txid);
+                    let exclusion = table
+                        .exclusions()
+                        .iter()
+                        .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
+                        .expect("exclusion index has its constraint");
+                    exclusion_operator_array(&exclusion.operators[..exclusion.n_cols], arena)?
+                } else {
+                    empty_int_array(arena)?
+                },
                 Datum::Null,
             ],
             arena,
@@ -4894,9 +5054,10 @@ fn pg_constraint<'a>(
                 Datum::Int4(constraint_parent_oid),
                 Datum::Int4(conindid),
                 Datum::Int4(info.confrelid),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(true),
+                Datum::Bool(fk.timing.is_deferrable()),
+                Datum::Bool(fk.timing.initially_deferred()),
+                Datum::Bool(fk.validation.enforced()),
+                Datum::Bool(fk.validation.validated()),
                 Datum::Bool(false),
                 text(fk_action_char(fk.on_update), arena)?,
                 text(fk_action_char(fk.on_delete), arena)?,
@@ -4951,7 +5112,8 @@ fn pg_constraint<'a>(
                     Datum::Int4(0),
                     Datum::Bool(false),
                     Datum::Bool(false),
-                    Datum::Bool(true),
+                    Datum::Bool(check.validation.enforced()),
+                    Datum::Bool(check.validation.validated()),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
@@ -5012,6 +5174,7 @@ fn pg_constraint<'a>(
                     Datum::Bool(false),
                     Datum::Bool(false),
                     Datum::Bool(true),
+                    Datum::Bool(true),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
@@ -5061,6 +5224,7 @@ fn pg_constraint<'a>(
                     Datum::Int4(0),
                     Datum::Bool(false),
                     Datum::Bool(false),
+                    Datum::Bool(true),
                     Datum::Bool(true),
                     Datum::Bool(false),
                     text(" ", arena)?,
@@ -5379,6 +5543,24 @@ fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     })
 }
 
+fn exclusion_operator_array<'a>(
+    operators: &[crate::storage::ExclusionOperator],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    for (index, operator) in operators.iter().copied().enumerate() {
+        values[index] = Datum::Int4(match operator {
+            crate::storage::ExclusionOperator::Equal => 3882,
+            crate::storage::ExclusionOperator::Overlaps => 3888,
+            crate::storage::ExclusionOperator::Adjacent => 3897,
+        });
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(&values[..operators.len()], arena)?,
+    })
+}
+
 fn pg_index<'a>(
     storage: &Storage,
     txid: u32,
@@ -5435,7 +5617,7 @@ fn pg_index<'a>(
                 Datum::Bool(info.is_unique),
                 Datum::Bool(false), // indisclustered
                 Datum::Bool(true),  // indisvalid
-                Datum::Bool(true),  // constraints are checked immediately
+                Datum::Bool(!info.timing.is_deferrable()),
                 Datum::Bool(false), // indisreplident
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
@@ -6889,7 +7071,11 @@ fn pg_indexes<'a>(
             write_identifier(&mut indexdef, table_def.schema.as_str());
             let _ = indexdef.write_char('.');
             write_identifier(&mut indexdef, table_def.name.as_str());
-            let _ = indexdef.write_str(" USING btree (");
+            let _ = indexdef.write_str(if info.is_exclusion {
+                " USING gist ("
+            } else {
+                " USING btree ("
+            });
             for k in 0..info.n_cols {
                 if k > 0 {
                     let _ = indexdef.write_str(", ");
@@ -8587,6 +8773,8 @@ fn info_table_constraints<'a>(
     let mut append = |name: &str,
                       kind: &str,
                       nulls_distinct: Option<&str>,
+                      timing: crate::storage::ConstraintTiming,
+                      validation: crate::storage::ConstraintValidation,
                       table: &TableDef|
      -> Result<(), SqlError> {
         if count == output.len() {
@@ -8604,9 +8792,16 @@ fn info_table_constraints<'a>(
                 text(table.schema.as_str(), arena)?,
                 text(table.name.as_str(), arena)?,
                 text(kind, arena)?,
-                text("NO", arena)?,
-                text("NO", arena)?,
-                text("YES", arena)?,
+                text(if timing.is_deferrable() { "YES" } else { "NO" }, arena)?,
+                text(
+                    if timing.initially_deferred() {
+                        "YES"
+                    } else {
+                        "NO"
+                    },
+                    arena,
+                )?,
+                text(if validation.enforced() { "YES" } else { "NO" }, arena)?,
                 nulls_distinct.map_or(Ok(Datum::Null), |value| text(value, arena))?,
             ],
             arena,
@@ -8622,14 +8817,35 @@ fn info_table_constraints<'a>(
         for column in table.columns() {
             if column.primary {
                 let name = inline_primary_constraint_name(table);
-                append(name.as_str(), "PRIMARY KEY", None, table)?;
+                append(
+                    name.as_str(),
+                    "PRIMARY KEY",
+                    None,
+                    crate::storage::ConstraintTiming::NotDeferrable,
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                    table,
+                )?;
             } else if column.unique {
                 let name = inline_unique_constraint_name(table, column);
-                append(name.as_str(), "UNIQUE", Some("YES"), table)?;
+                append(
+                    name.as_str(),
+                    "UNIQUE",
+                    Some("YES"),
+                    crate::storage::ConstraintTiming::NotDeferrable,
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                    table,
+                )?;
             }
             if column.not_null.is_required() {
                 let name = not_null_constraint_name(table, column);
-                append(name.as_str(), "CHECK", None, table)?;
+                append(
+                    name.as_str(),
+                    "CHECK",
+                    None,
+                    crate::storage::ConstraintTiming::NotDeferrable,
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                    table,
+                )?;
             }
         }
         for unique in table.uniques() {
@@ -8641,14 +8857,30 @@ fn info_table_constraints<'a>(
                     "UNIQUE"
                 },
                 (!unique.is_primary).then_some("YES"),
+                unique.timing,
+                crate::storage::ConstraintValidation::EnforcedValidated,
                 table,
             )?;
         }
         for check in table.checks() {
-            append(check.name.as_str(), "CHECK", None, table)?;
+            append(
+                check.name.as_str(),
+                "CHECK",
+                None,
+                crate::storage::ConstraintTiming::NotDeferrable,
+                check.validation,
+                table,
+            )?;
         }
         for foreign_key in table.fkeys() {
-            append(foreign_key.name.as_str(), "FOREIGN KEY", None, table)?;
+            append(
+                foreign_key.name.as_str(),
+                "FOREIGN KEY",
+                None,
+                foreign_key.timing,
+                foreign_key.validation,
+                table,
+            )?;
         }
     }
     finish(definition, &output[..count], arena)

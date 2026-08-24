@@ -1,7 +1,10 @@
 //! CREATE TABLE definition and constraint construction.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{ColumnDef, Expr, FkAction, QualName, TableConstraint};
+use crate::sql::ast::{
+    ColumnDef, ConstraintMode, ConstraintTiming as AstConstraintTiming,
+    ConstraintValidation as AstConstraintValidation, Expr, FkAction, QualName, TableConstraint,
+};
 use crate::sql::eval::{EvalHooks, NoColumns, SqlError, cast_to, eval_full, sqlstate};
 use crate::sql::types::ColType;
 use crate::sql_err;
@@ -607,6 +610,7 @@ pub(super) fn attach_constraints(
     storage: &Storage,
     def: &mut TableDef,
     constraints: &[TableConstraint],
+    merge_equivalent: bool,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -617,7 +621,11 @@ pub(super) fn attach_constraints(
         || def.uniques[..def.n_uniques].iter().any(|k| k.is_primary);
     for con in constraints {
         match con {
-            TableConstraint::PrimaryKey { name, columns } => {
+            TableConstraint::PrimaryKey {
+                name,
+                columns,
+                timing,
+            } => {
                 if has_primary {
                     return Err(sql_err!(
                         crate::sql::eval::sqlstate::INVALID_TABLE_DEFINITION,
@@ -635,25 +643,41 @@ pub(super) fn attach_constraints(
                 // synthesized name; an explicitly named one is a first-class
                 // key so DROP / RENAME CONSTRAINT and the violation message all
                 // see the given name (its NOT NULL is already set above).
-                if n == 1 && name.is_none() {
+                if n == 1 && name.is_none() && !timing.is_deferrable() {
                     def.columns[indices[0] as usize].primary = true;
                     def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "pkey", &indices, n, true)?;
+                    add_unique_key(def, *name, "pkey", &indices, n, true, *timing)?;
                 }
             }
-            TableConstraint::Unique { name, columns } => {
+            TableConstraint::Unique {
+                name,
+                columns,
+                timing,
+            } => {
                 let (indices, n) = resolve_cols(def, columns)?;
-                if n == 1 && name.is_none() {
+                let stored_timing = storage_timing(*timing);
+                let equivalent_flag = n == 1
+                    && !stored_timing.is_deferrable()
+                    && (def.columns[indices[0] as usize].unique
+                        || def.columns[indices[0] as usize].primary);
+                let equivalent_key = def.uniques().iter().any(|key| {
+                    !key.is_primary && key.timing == stored_timing && key.columns() == &indices[..n]
+                });
+                if merge_equivalent && (equivalent_flag || equivalent_key) {
+                    continue;
+                }
+                if n == 1 && name.is_none() && !stored_timing.is_deferrable() {
                     def.columns[indices[0] as usize].unique = true;
                 } else {
-                    add_unique_key(def, *name, "key", &indices, n, false)?;
+                    add_unique_key(def, *name, "key", &indices, n, false, *timing)?;
                 }
             }
             TableConstraint::Check {
                 name,
                 expression,
                 text,
+                validation,
             } => {
                 let referenced_cols = check_referenced_columns(expression, def)?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
@@ -677,6 +701,7 @@ pub(super) fn attach_constraints(
                 let mut c = CheckConstraint {
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
+                    validation: storage_validation(*validation),
                 };
                 let _ = core::fmt::Write::write_str(&mut c.expression, text);
                 if c.expression.is_truncated() {
@@ -695,6 +720,8 @@ pub(super) fn attach_constraints(
                 parent_cols,
                 on_delete,
                 on_update,
+                timing,
+                validation,
             } => {
                 attach_fkey(
                     storage,
@@ -705,9 +732,80 @@ pub(super) fn attach_constraints(
                     parent_cols,
                     *on_delete,
                     *on_update,
+                    *timing,
+                    *validation,
                     txid,
                     arena,
                 )?;
+            }
+            TableConstraint::Exclusion {
+                name,
+                columns,
+                operators,
+                predicate,
+                predicate_text,
+                timing,
+            } => {
+                let (indices, count) = resolve_cols(def, columns)?;
+                for &column in &indices[..count] {
+                    if !matches!(
+                        def.columns[column as usize].ctype,
+                        crate::sql::types::ColType::Range(_)
+                    ) {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "data type {} has no default operator class for access method \"gist\"",
+                            def.columns[column as usize].ctype.name()
+                        ));
+                    }
+                }
+                if def.n_exclusions == crate::storage::MAX_EXCLUSIONS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "a table can have at most {} exclusion constraints",
+                        crate::storage::MAX_EXCLUSIONS
+                    ));
+                }
+                if let Some(expression) = predicate {
+                    let _ = check_referenced_columns(expression, def)?;
+                }
+                let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
+                exclusion.name = match name {
+                    Some(name) => SqlName::parse(name)?,
+                    None => auto_key_name(def, &indices[..count], "excl", true)?,
+                };
+                exclusion.columns[..count].copy_from_slice(&indices[..count]);
+                for (index, operator) in operators.iter().copied().enumerate() {
+                    exclusion.operators[index] = match operator {
+                        crate::sql::ast::ExclusionOperator::Equal => {
+                            crate::storage::ExclusionOperator::Equal
+                        }
+                        crate::sql::ast::ExclusionOperator::Overlaps => {
+                            crate::storage::ExclusionOperator::Overlaps
+                        }
+                        crate::sql::ast::ExclusionOperator::Adjacent => {
+                            crate::storage::ExclusionOperator::Adjacent
+                        }
+                    };
+                }
+                exclusion.n_cols = count;
+                exclusion.timing = storage_timing(*timing);
+                exclusion.predicate = match predicate_text {
+                    Some(text) => {
+                        let mut stored = crate::util::StackStr::new();
+                        let _ = core::fmt::Write::write_str(&mut stored, text);
+                        if stored.is_truncated() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "exclusion predicate is too long"
+                            ));
+                        }
+                        Some(stored)
+                    }
+                    None => None,
+                };
+                def.exclusions[def.n_exclusions] = exclusion;
+                def.n_exclusions += 1;
             }
         }
     }
@@ -808,6 +906,9 @@ fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
         || def.fkeys[..def.n_fkeys]
             .iter()
             .any(|f| f.name.as_str() == name)
+        || def.exclusions[..def.n_exclusions]
+            .iter()
+            .any(|exclusion| exclusion.name.as_str() == name)
     {
         return true;
     }
@@ -834,6 +935,7 @@ pub(super) fn add_unique_key(
     indices: &[u16; MAX_INDEX_COLS],
     n: usize,
     is_primary: bool,
+    timing: AstConstraintTiming,
 ) -> Result<(), SqlError> {
     if def.n_uniques == crate::storage::MAX_UNIQUES {
         return Err(sql_err!(
@@ -852,6 +954,7 @@ pub(super) fn add_unique_key(
     k.columns[..n].copy_from_slice(&indices[..n]);
     k.n_cols = n;
     k.is_primary = is_primary;
+    k.timing = storage_timing(timing);
     def.uniques[def.n_uniques] = k;
     def.n_uniques += 1;
     Ok(())
@@ -870,6 +973,8 @@ fn attach_fkey(
     parent_cols: &[&str],
     on_delete: FkAction,
     on_update: FkAction,
+    timing: AstConstraintTiming,
+    validation: AstConstraintValidation,
     txid: u32,
     _arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -1009,6 +1114,8 @@ fn attach_fkey(
     fk.n_parent_cols = n_parent;
     fk.on_delete = fk_action_of(on_delete);
     fk.on_update = fk_action_of(on_update);
+    fk.timing = storage_timing(timing);
+    fk.validation = storage_validation(validation);
     def.fkeys[def.n_fkeys] = fk;
     def.n_fkeys += 1;
     Ok(())
@@ -1037,6 +1144,30 @@ pub(super) fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize)
 
 /// Whether `columns` (as a set) exactly matches some unique key of the table: a
 /// single UNIQUE/PRIMARY column flag, or a multi-column key constraint.
+pub(super) fn references_named_key(def: &TableDef, name: &str, columns: &[u16]) -> bool {
+    if columns.len() == 1 {
+        let c = &def.columns()[columns[0] as usize];
+        if c.primary {
+            return crate::stack_format!(96, "{}_pkey", def.name.as_str()).as_str() == name;
+        }
+        if c.unique {
+            return crate::stack_format!(128, "{}_{}_key", def.name.as_str(), c.name.as_str())
+                .as_str()
+                == name;
+        }
+    }
+    def.uniques()
+        .iter()
+        .find(|uk| {
+            !uk.timing.is_deferrable() && uk.n_cols == columns.len() && {
+                let key_columns = uk.columns();
+                columns.iter().all(|c| key_columns.contains(c))
+                    && key_columns.iter().all(|c| columns.contains(c))
+            }
+        })
+        .is_some_and(|key| key.name.as_str() == name)
+}
+
 fn is_unique_key(def: &TableDef, columns: &[u16]) -> bool {
     if columns.len() == 1 {
         let c = &def.columns()[columns[0] as usize];
@@ -1045,9 +1176,33 @@ fn is_unique_key(def: &TableDef, columns: &[u16]) -> bool {
         }
     }
     def.uniques().iter().any(|uk| {
-        uk.n_cols == columns.len() && {
+        !uk.timing.is_deferrable() && uk.n_cols == columns.len() && {
             let a = uk.columns();
             columns.iter().all(|c| a.contains(c)) && a.iter().all(|c| columns.contains(c))
         }
     })
+}
+
+fn storage_timing(timing: AstConstraintTiming) -> crate::storage::ConstraintTiming {
+    match timing {
+        AstConstraintTiming::NotDeferrable => crate::storage::ConstraintTiming::NotDeferrable,
+        AstConstraintTiming::Deferrable(ConstraintMode::Immediate) => {
+            crate::storage::ConstraintTiming::DeferrableImmediate
+        }
+        AstConstraintTiming::Deferrable(ConstraintMode::Deferred) => {
+            crate::storage::ConstraintTiming::DeferrableDeferred
+        }
+    }
+}
+
+fn storage_validation(validation: AstConstraintValidation) -> crate::storage::ConstraintValidation {
+    match validation {
+        AstConstraintValidation::EnforcedValidated => {
+            crate::storage::ConstraintValidation::EnforcedValidated
+        }
+        AstConstraintValidation::EnforcedNotValid => {
+            crate::storage::ConstraintValidation::EnforcedNotValid
+        }
+        AstConstraintValidation::NotEnforced => crate::storage::ConstraintValidation::NotEnforced,
+    }
 }

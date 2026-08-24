@@ -43,6 +43,25 @@ try:
 except psycopg.errors.DivisionByZero as e:
     print("error mapping ok:", e.sqlstate)
 
+# Deferred obligations created by an extended-protocol Bind are checked by
+# COMMIT, and a failed commit rolls the transaction back completely.
+cur.execute("DROP TABLE IF EXISTS drv_deferred")
+cur.execute(
+    "CREATE TABLE drv_deferred (value integer, "
+    "CONSTRAINT drv_deferred_key UNIQUE (value) DEFERRABLE INITIALLY DEFERRED)"
+)
+cur.execute("INSERT INTO drv_deferred VALUES (1)")
+cur.execute("BEGIN")
+cur.execute("INSERT INTO drv_deferred VALUES (%s)", (1,))
+try:
+    cur.execute("COMMIT")
+    raise AssertionError("expected deferred unique violation")
+except psycopg.errors.UniqueViolation as e:
+    assert e.sqlstate == "23505", e.sqlstate
+cur.execute("SELECT count(*) FROM drv_deferred")
+assert cur.fetchone() == (1,)
+print("deferred constraint extended protocol ok")
+
 # NULL parameter handling.
 cur.execute("INSERT INTO drv VALUES (%s, %s, %s)", (4, None, 1.0))
 cur.execute("SELECT name IS NULL FROM drv WHERE id = %s", (4,))

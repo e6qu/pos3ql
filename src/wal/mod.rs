@@ -156,7 +156,6 @@ fn append_stored_dependency_name(buffer: &mut FixedBuf, name: &str) -> bool {
 pub(crate) enum WalStoredQueryDependencies<'a> {
     Captured(&'a StoredQueryDependencies),
     Encoded(&'a [u8]),
-    LegacyEmpty,
 }
 
 impl WalStoredQueryDependencies<'_> {
@@ -181,7 +180,6 @@ impl WalStoredQueryDependencies<'_> {
                     .sum::<usize>()
             }
             Self::Encoded(bytes) => bytes.len(),
-            Self::LegacyEmpty => 0,
         }
     }
 
@@ -207,7 +205,6 @@ impl WalStoredQueryDependencies<'_> {
                 ok
             }
             Self::Encoded(bytes) => buffer.append(bytes),
-            Self::LegacyEmpty => true,
         }
     }
 
@@ -221,7 +218,6 @@ impl WalStoredQueryDependencies<'_> {
                     "corrupt stored-query dependencies in journal"
                 )
             }),
-            Self::LegacyEmpty => Ok(StoredQueryDependencies::EMPTY),
         }
     }
 }
@@ -1529,12 +1525,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             // uniques
             n += 1;
             for uk in def.uniques() {
-                n += 1 + uk.name.as_str().len() + 2 + uk.n_cols * 2;
+                n += 1 + uk.name.as_str().len() + 3 + uk.n_cols * 2;
             }
             // checks
             n += 1;
             for check in def.checks() {
-                n += 1 + check.name.as_str().len() + 2 + check.expression.as_str().len();
+                n += 1 + check.name.as_str().len() + 3 + check.expression.as_str().len();
             }
             // foreign keys
             n += 1;
@@ -1547,10 +1543,21 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     + fk.parent.as_str().len()
                     + 1
                     + fk.n_parent_cols * 2
-                    + 2;
+                    + 4;
             }
-            // Trailing schema block (absent in journals from before schemas
-            // existed; replay defaults those to public).
+            // exclusion constraints
+            n += 1;
+            for exclusion in def.exclusions() {
+                n += 1
+                    + exclusion.name.as_str().len()
+                    + 2
+                    + exclusion.n_cols * 3
+                    + 2
+                    + exclusion
+                        .predicate
+                        .as_ref()
+                        .map_or(0, |predicate| predicate.as_str().len());
+            }
             n += 1 + def.schema.as_str().len();
             for fk in def.fkeys() {
                 n += 1 + fk.parent_schema.as_str().len();
@@ -2247,7 +2254,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[def.n_uniques as u8]);
             for uk in def.uniques() {
                 ok &= name_bytes(buffer, uk.name.as_str());
-                ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8]);
+                ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8, uk.timing.code()]);
                 for &c in uk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
@@ -2257,6 +2264,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for check in def.checks() {
                 ok &= name_bytes(buffer, check.name.as_str());
                 let e = check.expression.as_str();
+                ok &= buffer.append(&[check.validation.code()]);
                 ok &= buffer.append(&(e.len() as u16).to_le_bytes());
                 ok &= buffer.append(e.as_bytes());
             }
@@ -2273,7 +2281,28 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 for &c in fk.parent_cols() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
-                ok &= buffer.append(&[fk.on_delete.code(), fk.on_update.code()]);
+                ok &= buffer.append(&[
+                    fk.on_delete.code(),
+                    fk.on_update.code(),
+                    fk.timing.code(),
+                    fk.validation.code(),
+                ]);
+            }
+            ok &= buffer.append(&[def.n_exclusions as u8]);
+            for exclusion in def.exclusions() {
+                ok &= name_bytes(buffer, exclusion.name.as_str());
+                ok &= buffer.append(&[exclusion.n_cols as u8, exclusion.timing.code()]);
+                for position in 0..exclusion.n_cols {
+                    ok &= buffer.append(&exclusion.columns[position].to_le_bytes());
+                    ok &= buffer.append(&[exclusion.operators[position].code()]);
+                }
+                let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
+                ok &= buffer.append(
+                    &(predicate.map_or(u16::MAX, |value| value.len() as u16)).to_le_bytes(),
+                );
+                if let Some(predicate) = predicate {
+                    ok &= buffer.append(predicate.as_bytes());
+                }
             }
             ok &= name_bytes(buffer, def.schema.as_str());
             for fk in def.fkeys() {
@@ -3367,17 +3396,6 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     (at == payload.len()).then_some(statistics)
 }
 
-/// WAL records written before collations had their own trailing field still
-/// carry the PostgreSQL default on textual columns. Noncollatable columns have
-/// no collation even in that historical representation.
-fn legacy_collation(ctype: ColType) -> crate::sql::ast::Collation {
-    if ctype.is_collatable() {
-        crate::sql::ast::Collation::Default
-    } else {
-        crate::sql::ast::Collation::None
-    }
-}
-
 fn decode_subscription_behavior(
     payload: &[u8],
     at: &mut usize,
@@ -3489,7 +3507,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
                     type_mod,
-                    collation: legacy_collation(ColType::from_code(meta[0])?),
+                    collation: crate::sql::ast::Collation::None,
                     not_null,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
@@ -3510,8 +3528,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             def.n_uniques = n_uniques;
             for u in 0..n_uniques {
                 let uname = take_name(&mut at)?;
-                let meta = payload.get(at..at + 2)?;
-                at += 2;
+                let meta = payload.get(at..at + 3)?;
+                at += 3;
                 let n = meta[1] as usize;
                 if n > MAX_INDEX_COLS {
                     return None;
@@ -3519,6 +3537,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let mut uk = UniqueKey::EMPTY;
                 uk.name = SqlName::parse(uname).ok()?;
                 uk.is_primary = meta[0] != 0;
+                uk.timing = crate::storage::ConstraintTiming::from_code(meta[2])?;
                 uk.n_cols = n;
                 for c in uk.columns.iter_mut().take(n) {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
@@ -3535,6 +3554,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             def.n_checks = n_checks;
             for k in 0..n_checks {
                 let constraint_name = take_name(&mut at)?;
+                let validation =
+                    crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
+                at += 1;
                 let elen =
                     u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
                 at += 2;
@@ -3543,6 +3565,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let text = core::str::from_utf8(raw).ok()?;
                 let mut check = CheckConstraint::EMPTY;
                 check.name = SqlName::parse(constraint_name).ok()?;
+                check.validation = validation;
                 core::fmt::Write::write_str(&mut check.expression, text).ok()?;
                 if check.expression.is_truncated() {
                     return None;
@@ -3582,37 +3605,66 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                let acts = payload.get(at..at + 2)?;
-                at += 2;
+                let acts = payload.get(at..at + 4)?;
+                at += 4;
                 fk.on_delete = FkAction::from_code(acts[0])?;
                 fk.on_update = FkAction::from_code(acts[1])?;
+                fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
+                fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
                 def.fkeys[f] = fk;
             }
-            // Trailing schema block; a journal from before schemas existed
-            // ends here, and everything defaults to public.
-            if at < payload.len() {
-                def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
-                for f in 0..def.n_fkeys {
-                    def.fkeys[f].parent_schema = SqlName::parse(take_name(&mut at)?).ok()?;
-                }
-            } else {
-                def.schema = SqlName::parse("public").ok()?;
-                for f in 0..def.n_fkeys {
-                    def.fkeys[f].parent_schema = SqlName::parse("public").ok()?;
-                }
+            let n_exclusions = *payload.get(at)? as usize;
+            at += 1;
+            if n_exclusions > crate::storage::MAX_EXCLUSIONS {
+                return None;
             }
-            if at < payload.len() {
-                let collations = payload.get(at..at + n_cols)?;
-                at += n_cols;
-                for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
-                    column.collation = match code {
-                        0 => crate::sql::ast::Collation::Default,
-                        1 => crate::sql::ast::Collation::C,
-                        2 => crate::sql::ast::Collation::Posix,
-                        3 => crate::sql::ast::Collation::UcsBasic,
-                        4 => crate::sql::ast::Collation::None,
-                        _ => return None,
-                    };
+            def.n_exclusions = n_exclusions;
+            for index in 0..n_exclusions {
+                let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
+                exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
+                let meta = payload.get(at..at + 2)?;
+                at += 2;
+                exclusion.n_cols = meta[0] as usize;
+                if exclusion.n_cols == 0 || exclusion.n_cols > MAX_INDEX_COLS {
+                    return None;
+                }
+                exclusion.timing = crate::storage::ConstraintTiming::from_code(meta[1])?;
+                for position in 0..exclusion.n_cols {
+                    exclusion.columns[position] =
+                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    exclusion.operators[position] =
+                        crate::storage::ExclusionOperator::from_code(*payload.get(at)?)?;
+                    at += 1;
+                }
+                let predicate_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                if predicate_len != u16::MAX {
+                    let predicate_len = predicate_len as usize;
+                    let source = core::str::from_utf8(payload.get(at..at + predicate_len)?).ok()?;
+                    at += predicate_len;
+                    let predicate = crate::util::StackStr::from_str(source);
+                    if predicate.is_truncated() {
+                        return None;
+                    }
+                    exclusion.predicate = Some(predicate);
+                }
+                def.exclusions[index] = exclusion;
+            }
+            def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            for f in 0..def.n_fkeys {
+                def.fkeys[f].parent_schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            }
+            let collations = payload.get(at..at + n_cols)?;
+            at += n_cols;
+            for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
+                column.collation = match code {
+                    0 => crate::sql::ast::Collation::Default,
+                    1 => crate::sql::ast::Collation::C,
+                    2 => crate::sql::ast::Collation::Posix,
+                    3 => crate::sql::ast::Collation::UcsBasic,
+                    4 => crate::sql::ast::Collation::None,
+                    _ => return None,
                 }
             }
             def.partition = decode_partition(payload, &mut at)?;
@@ -3641,11 +3693,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
+            let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTable { schema, name })
         }
         KIND_UPSERT => {
@@ -3656,37 +3704,31 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 4;
             let row = payload.get(at..at + row_len)?;
             at += row_len;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
+            let schema = take_name(&mut at)?;
+            let is_update = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
             };
-            let (is_update, old_row) = if at == payload.len() {
-                (false, None)
-            } else {
-                let is_update = *payload.get(at)? != 0;
-                at += 1;
-                let has_old = *payload.get(at)? != 0;
-                at += 1;
-                let old_row = if has_old {
+            at += 1;
+            let old_row = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
                     let length =
                         u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
                     at += 4;
                     let old = payload.get(at..at + length)?;
                     at += length;
                     Some(old)
-                } else {
-                    None
-                };
-                (is_update, old_row)
+                }
+                _ => return None,
             };
-            let command_id = if at == payload.len() {
-                0
-            } else {
-                let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-                at += 4;
-                command_id
-            };
+            let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
             (at == payload.len()).then_some(WalOp::Upsert {
                 schema,
                 table,
@@ -3701,34 +3743,25 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
-            let old_row = if at == payload.len() {
-                None
-            } else {
-                let has_old = *payload.get(at)? != 0;
-                at += 1;
-                if has_old {
+            let schema = take_name(&mut at)?;
+            let old_row = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
                     let length =
                         u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
                     at += 4;
                     let old = payload.get(at..at + length)?;
                     at += length;
                     Some(old)
-                } else {
-                    None
                 }
+                _ => return None,
             };
-            let command_id = if at == payload.len() {
-                0
-            } else {
-                let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-                at += 4;
-                command_id
-            };
+            let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
             (at == payload.len()).then_some(WalOp::Delete {
                 schema,
                 table,
@@ -3771,27 +3804,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let raw = payload.get(at..at + sql_len)?;
             at += sql_len;
             let sql = core::str::from_utf8(raw).ok()?;
-            let (schema, path) = if at < payload.len() {
-                let schema = take_name(&mut at)?;
-                let path_len =
-                    u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
-                at += 2;
-                let raw = payload.get(at..at + path_len)?;
-                at += path_len;
-                (schema, core::str::from_utf8(raw).ok()?)
-            } else {
-                ("public", "\"$user\", public")
-            };
-            let dependencies = if at < payload.len() {
-                let encoded = payload.get(at..)?;
-                if !validate_stored_query_dependencies(encoded) {
-                    return None;
-                }
-                at = payload.len();
-                WalStoredQueryDependencies::Encoded(encoded)
-            } else {
-                WalStoredQueryDependencies::LegacyEmpty
-            };
+            let schema = take_name(&mut at)?;
+            let path_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let raw = payload.get(at..at + path_len)?;
+            at += path_len;
+            let path = core::str::from_utf8(raw).ok()?;
+            let encoded = payload.get(at..)?;
+            if !validate_stored_query_dependencies(encoded) {
+                return None;
+            }
+            at = payload.len();
+            let dependencies = WalStoredQueryDependencies::Encoded(encoded);
             (at == payload.len()).then_some(WalOp::CreateView {
                 schema,
                 name,
@@ -3802,11 +3826,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP_VIEW => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
+            let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
         }
         KIND_CREATE_PUBLICATION => {
@@ -4291,16 +4311,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += path_len;
             let populated = *payload.get(at)? != 0;
             at += 1;
-            let dependencies = if at < payload.len() {
-                let encoded = payload.get(at..)?;
-                if !validate_stored_query_dependencies(encoded) {
-                    return None;
-                }
-                at = payload.len();
-                WalStoredQueryDependencies::Encoded(encoded)
-            } else {
-                WalStoredQueryDependencies::LegacyEmpty
-            };
+            let encoded = payload.get(at..)?;
+            if !validate_stored_query_dependencies(encoded) {
+                return None;
+            }
+            at = payload.len();
+            let dependencies = WalStoredQueryDependencies::Encoded(encoded);
             (at == payload.len()).then_some(WalOp::CreateMatview {
                 schema,
                 name,
@@ -4342,99 +4358,83 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                 at += 2;
             }
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
+            let schema = take_name(&mut at)?;
             let mut descending = [false; MAX_INDEX_COLS];
             let mut nulls_first = [false; MAX_INDEX_COLS];
             let mut predicate = None;
             let mut include_columns = [0u16; MAX_INDEX_COLS];
-            let mut n_include_cols = 0usize;
-            let mut nulls_not_distinct = false;
-            if at < payload.len() {
-                if *payload.get(at)? != 0xa1 {
+            if *payload.get(at)? != 0xa1 {
+                return None;
+            }
+            at += 1;
+            for i in 0..n_cols {
+                let flags = *payload.get(at)?;
+                at += 1;
+                if flags & !0b11 != 0 {
                     return None;
                 }
-                at += 1;
-                for i in 0..n_cols {
-                    let flags = *payload.get(at)?;
+                descending[i] = flags & 1 != 0;
+                nulls_first[i] = flags & 2 != 0;
+            }
+            if *payload.get(at)? != 0xa2 {
+                return None;
+            }
+            at += 1;
+            match *payload.get(at)? {
+                0 => at += 1,
+                1 => {
                     at += 1;
-                    if flags & !0b11 != 0 {
-                        return None;
-                    }
-                    descending[i] = flags & 1 != 0;
-                    nulls_first[i] = flags & 2 != 0;
-                }
-            }
-            if at < payload.len() {
-                if *payload.get(at)? != 0xa2 {
-                    return None;
-                }
-                at += 1;
-                match *payload.get(at)? {
-                    0 => at += 1,
-                    1 => {
-                        at += 1;
-                        let len =
-                            u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-                        at += 2;
-                        let raw = payload.get(at..at + len)?;
-                        at += len;
-                        predicate = Some(core::str::from_utf8(raw).ok()?);
-                    }
-                    _ => return None,
-                }
-            }
-            if at < payload.len() {
-                if *payload.get(at)? != 0xa3 {
-                    return None;
-                }
-                at += 1;
-                n_include_cols = *payload.get(at)? as usize;
-                at += 1;
-                if n_include_cols > MAX_INDEX_COLS {
-                    return None;
-                }
-                for column in include_columns.iter_mut().take(n_include_cols) {
-                    *column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                    at += 2;
-                }
-            }
-            if at < payload.len() {
-                if *payload.get(at)? != 0xa4 {
-                    return None;
-                }
-                at += 1;
-                nulls_not_distinct = match *payload.get(at)? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                };
-                at += 1;
-            }
-            if at < payload.len() {
-                if *payload.get(at)? != 0xa5 {
-                    return None;
-                }
-                at += 1;
-                let mask = *payload.get(at)?;
-                at += 1;
-                if mask >> n_cols != 0 {
-                    return None;
-                }
-                for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
-                    if mask & (1 << index) == 0 {
-                        continue;
-                    }
                     let len =
                         u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
                     at += 2;
                     let raw = payload.get(at..at + len)?;
                     at += len;
-                    *expression = Some(core::str::from_utf8(raw).ok()?);
+                    predicate = Some(core::str::from_utf8(raw).ok()?);
                 }
+                _ => return None,
+            }
+            if *payload.get(at)? != 0xa3 {
+                return None;
+            }
+            at += 1;
+            let n_include_cols = *payload.get(at)? as usize;
+            at += 1;
+            if n_include_cols > MAX_INDEX_COLS {
+                return None;
+            }
+            for column in include_columns.iter_mut().take(n_include_cols) {
+                *column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+            }
+            if *payload.get(at)? != 0xa4 {
+                return None;
+            }
+            at += 1;
+            let nulls_not_distinct = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            if *payload.get(at)? != 0xa5 {
+                return None;
+            }
+            at += 1;
+            let mask = *payload.get(at)?;
+            at += 1;
+            if mask >> n_cols != 0 {
+                return None;
+            }
+            for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
+                if mask & (1 << index) == 0 {
+                    continue;
+                }
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 1;
+                at += 1;
+                let raw = payload.get(at..at + len)?;
+                at += len;
+                *expression = Some(core::str::from_utf8(raw).ok()?);
             }
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 schema,
@@ -4454,11 +4454,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
+            let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropIndex { schema, name })
         }
         KIND_RENAME_INDEX => {
@@ -4477,11 +4473,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let schema = if at < payload.len() {
-                take_name(&mut at)?
-            } else {
-                "public"
-            };
+            let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::SequenceSet {
                 schema,
                 table,
@@ -4675,6 +4667,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *check = crate::storage::CheckConstraint {
                     name: SqlName::parse(cname).ok()?,
                     expression: crate::util::StackStr::from_str(expr),
+                    validation: crate::storage::ConstraintValidation::EnforcedValidated,
                 };
             }
             (at == payload.len()).then_some(WalOp::CreateDomain(crate::storage::DomainDef {
@@ -5976,7 +5969,7 @@ mod tests {
     }
 
     #[test]
-    fn object_acl_codec_keeps_routine_identity_and_decodes_legacy_records() {
+    fn object_acl_codec_keeps_routine_identity() {
         let mut budget = Budget::new(1024);
         let mut buffer = FixedBuf::new(&mut budget, "routine acl wal", 1024).unwrap();
         append_record(
@@ -6000,49 +5993,6 @@ mod tests {
             panic!("expected object ACL WAL operation");
         };
         assert_eq!(object_oid, 16_401);
-
-        let legacy_acl = [
-            crate::storage::AccessClass::Table as u8,
-            6,
-            b'p',
-            b'u',
-            b'b',
-            b'l',
-            b'i',
-            b'c',
-            1,
-            b't',
-            6,
-            b'P',
-            b'U',
-            b'B',
-            b'L',
-            b'I',
-            b'C',
-            8,
-            b'p',
-            b'o',
-            b's',
-            b't',
-            b'g',
-            b'r',
-            b'e',
-            b's',
-            1,
-            0,
-            0,
-            0,
-        ];
-        let WalOp::SetObjectAcl {
-            object_oid,
-            schema,
-            name,
-            ..
-        } = decode_op(KIND_SET_OBJECT_ACL, &legacy_acl).unwrap()
-        else {
-            panic!("expected legacy object ACL WAL operation");
-        };
-        assert_eq!((object_oid, schema, name), (0, "public", "t"));
     }
 
     fn test_config(dir: &str) -> Config {
@@ -6113,18 +6063,19 @@ mod tests {
             auto_increment_step: 1,
             user_type: None,
         };
-        // A multi-column UNIQUE, a CHECK, and a FOREIGN KEY, so the WAL
-        // round-trip covers every constraint kind.
+        // Exercise every durable constraint state in one table record.
         let mut uk = UniqueKey::EMPTY;
         uk.name = SqlName::parse("t_id_v_key").unwrap();
         uk.columns[0] = 0;
         uk.columns[1] = 1;
         uk.n_cols = 2;
+        uk.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
         def.uniques[0] = uk;
         def.n_uniques = 1;
         let mut check = CheckConstraint::EMPTY;
         check.name = SqlName::parse("t_check").unwrap();
         core::fmt::Write::write_str(&mut check.expression, "id > 0").unwrap();
+        check.validation = crate::storage::ConstraintValidation::NotEnforced;
         def.checks[0] = check;
         def.n_checks = 1;
         let mut fk = ForeignKey::EMPTY;
@@ -6135,8 +6086,19 @@ mod tests {
         fk.parent_cols[0] = 3;
         fk.n_parent_cols = 1;
         fk.on_delete = FkAction::Restrict;
+        fk.timing = crate::storage::ConstraintTiming::DeferrableImmediate;
+        fk.validation = crate::storage::ConstraintValidation::EnforcedNotValid;
         def.fkeys[0] = fk;
         def.n_fkeys = 1;
+        let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
+        exclusion.name = SqlName::parse("t_id_excl").unwrap();
+        exclusion.columns[0] = 0;
+        exclusion.operators[0] = crate::storage::ExclusionOperator::Adjacent;
+        exclusion.n_cols = 1;
+        exclusion.predicate = Some(crate::util::StackStr::from_str("id > 0"));
+        exclusion.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
+        def.exclusions[0] = exclusion;
+        def.n_exclusions = 1;
         def
     }
 
@@ -6158,13 +6120,13 @@ mod tests {
     fn truncated_table_payload_is_rejected() {
         let definition = sample_def();
         let mut budget = Budget::new(4096);
-        let mut payload = FixedBuf::new(&mut budget, "legacy table payload", 4096).unwrap();
+        let mut payload = FixedBuf::new(&mut budget, "truncated table payload", 4096).unwrap();
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTable(definition)
         ));
-        let legacy_len = payload.len() - definition.n_columns;
-        assert!(decode_op(KIND_CREATE, &payload.readable()[..legacy_len]).is_none());
+        let truncated_len = payload.len() - definition.n_columns;
+        assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
     }
 
     #[test]
@@ -6206,6 +6168,37 @@ mod tests {
         assert_eq!(
             restored.columns[0].not_null,
             crate::storage::NotNullOrigin::LocalAndInherited
+        );
+        assert_eq!(restored.n_exclusions, 1);
+        assert_eq!(
+            (
+                restored.exclusions[0].operators[0],
+                restored.exclusions[0].timing,
+                restored.exclusions[0]
+                    .predicate
+                    .as_ref()
+                    .map(|predicate| predicate.as_str()),
+            ),
+            (
+                crate::storage::ExclusionOperator::Adjacent,
+                crate::storage::ConstraintTiming::DeferrableDeferred,
+                Some("id > 0"),
+            )
+        );
+        assert_eq!(
+            restored.uniques[0].timing,
+            crate::storage::ConstraintTiming::DeferrableDeferred
+        );
+        assert_eq!(
+            restored.checks[0].validation,
+            crate::storage::ConstraintValidation::NotEnforced
+        );
+        assert_eq!(
+            (restored.fkeys[0].timing, restored.fkeys[0].validation,),
+            (
+                crate::storage::ConstraintTiming::DeferrableImmediate,
+                crate::storage::ConstraintValidation::EnforcedNotValid,
+            )
         );
         assert!(matches!(
             lower[0],
@@ -6871,43 +6864,6 @@ mod tests {
         })
         .unwrap();
         assert!(seen);
-    }
-
-    #[test]
-    fn legacy_index_payload_defaults_to_ascending_nulls_last() {
-        let payload = [
-            1, b'u', 1, b't', 1, 2, 0, 0, 1, 0, 6, b'p', b'u', b'b', b'l', b'i', b'c',
-        ];
-        let Some(WalOp::CreateIndex {
-            schema,
-            name,
-            table,
-            columns,
-            expressions,
-            descending,
-            nulls_first,
-            n_cols,
-            include_columns,
-            n_include_cols,
-            nulls_not_distinct,
-            predicate,
-            unique,
-        }) = decode_op(KIND_CREATE_INDEX, &payload)
-        else {
-            panic!("legacy CREATE INDEX payload must decode");
-        };
-        assert_eq!(schema, "public");
-        assert_eq!(name, "u");
-        assert_eq!(table, "t");
-        assert_eq!(&columns[..n_cols], [0, 1]);
-        assert!(expressions.iter().all(Option::is_none));
-        assert!(unique);
-        assert!(!descending[..n_cols].iter().any(|direction| *direction));
-        assert!(!nulls_first[..n_cols].iter().any(|placement| *placement));
-        assert_eq!(predicate, None);
-        assert_eq!(n_include_cols, 0);
-        assert!(include_columns.iter().all(|column| *column == 0));
-        assert!(!nulls_not_distinct);
     }
 
     #[test]

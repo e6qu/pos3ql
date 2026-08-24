@@ -490,6 +490,10 @@ fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
 }
 
 fn test_engine() -> (Engine, Budget) {
+    test_engine_with_budget(1 << 26)
+}
+
+fn test_engine_with_budget(bytes: usize) -> (Engine, Budget) {
     // Each test gets its own journal; the caller's function name is not
     // available, so a counter differentiates them.
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -497,7 +501,7 @@ fn test_engine() -> (Engine, Budget) {
     let n = N.fetch_add(1, Ordering::SeqCst);
     let name = format!("t{n}");
     let config = test_config(&name);
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(bytes);
     let engine = Engine::new(&config, &mut budget).unwrap();
     (engine, budget)
 }
@@ -9083,6 +9087,862 @@ fn savepoints_rollback_and_release() {
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     assert!(run_txn(&mut e, &mut b, &mut t, "ROLLBACK TO SAVEPOINT nope").contains("3B001"));
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
+}
+
+#[test]
+fn deferrable_constraints_follow_statement_transaction_and_savepoint_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE deferred_unique (id integer, \
+         CONSTRAINT deferred_unique_key UNIQUE (id) DEFERRABLE INITIALLY IMMEDIATE)",
+    );
+    let catalog = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SELECT condeferrable, condeferred, conenforced, convalidated \
+           FROM pg_constraint WHERE conname = 'deferred_unique_key'; \
+         SELECT is_deferrable, initially_deferred, enforced \
+           FROM information_schema.table_constraints \
+          WHERE constraint_name = 'deferred_unique_key'; \
+         SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = 'deferred_unique_key'",
+    ));
+    assert_eq!(catalog, ["t|f|t|t", "YES|NO|YES", "UNIQUE (id) DEFERRABLE"]);
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_unique VALUES (1), (2)",
+    );
+    let swapped = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE deferred_unique SET id = 3 - id",
+    );
+    assert!(swapped.contains("UPDATE 2"), "{swapped}");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE deferred_parent (id integer PRIMARY KEY); \
+         CREATE TABLE deferred_child (parent_id integer, \
+           CONSTRAINT deferred_child_fk FOREIGN KEY (parent_id) \
+           REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_child VALUES (9)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_parent VALUES (9)",
+    );
+    let committed = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(committed.contains("COMMIT"), "{committed}");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SAVEPOINT before_orphan",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_child VALUES (10)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ROLLBACK TO SAVEPOINT before_orphan",
+    );
+    let committed = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(committed.contains("COMMIT"), "{committed}");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_child VALUES (11)",
+    );
+    let immediate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS deferred_child_fk IMMEDIATE",
+    );
+    assert!(immediate.contains("23503"), "{immediate}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO deferred_child VALUES (12); \
+         ALTER TABLE deferred_child RENAME CONSTRAINT deferred_child_fk TO renamed_fk",
+    );
+    let renamed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS renamed_fk IMMEDIATE",
+    );
+    assert!(renamed.contains("23503"), "{renamed}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE regenerated (value integer, \
+           CONSTRAINT regenerated_key UNIQUE (value) DEFERRABLE); \
+         INSERT INTO regenerated VALUES (1)",
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS regenerated_key DEFERRED; \
+         ALTER TABLE regenerated DROP CONSTRAINT regenerated_key; \
+         ALTER TABLE regenerated ADD CONSTRAINT regenerated_key \
+           UNIQUE (value) DEFERRABLE INITIALLY IMMEDIATE",
+    );
+    let regenerated = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO regenerated VALUES (1)",
+    );
+    assert!(regenerated.contains("23505"), "{regenerated}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+}
+
+#[test]
+fn not_valid_and_not_enforced_constraints_have_distinct_lifecycles() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE lifecycle (value integer); INSERT INTO lifecycle VALUES (-1)",
+    );
+    let added = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE lifecycle ADD CONSTRAINT positive CHECK (value > 0) NOT VALID",
+    );
+    assert!(added.contains("ALTER TABLE"), "{added}");
+    let rejected = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO lifecycle VALUES (-2)",
+    );
+    assert!(rejected.contains("23514"), "{rejected}");
+    let invalid = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE lifecycle VALIDATE CONSTRAINT positive",
+    );
+    assert!(invalid.contains("23514"), "{invalid}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE lifecycle SET value = 1; \
+         ALTER TABLE lifecycle VALIDATE CONSTRAINT positive",
+    );
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE lifecycle ADD CONSTRAINT below_ten \
+         CHECK (value < 10) NOT ENFORCED; INSERT INTO lifecycle VALUES (20)",
+    );
+    let invalid_enforcement = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE lifecycle ALTER CONSTRAINT below_ten ENFORCED",
+    );
+    assert!(
+        invalid_enforcement.contains("42809"),
+        "{invalid_enforcement}"
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE lifecycle SET value = 2 WHERE value = 20; \
+         ALTER TABLE lifecycle DROP CONSTRAINT below_ten; \
+         ALTER TABLE lifecycle ADD CONSTRAINT below_ten CHECK (value < 10)",
+    );
+    let rejected = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO lifecycle VALUES (30)",
+    );
+    assert!(rejected.contains("23514"), "{rejected}");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE enforcement_parent (id integer PRIMARY KEY); \
+         CREATE TABLE enforcement_child (parent_id integer, \
+           CONSTRAINT enforcement_fk FOREIGN KEY (parent_id) \
+             REFERENCES enforcement_parent(id) NOT ENFORCED); \
+         INSERT INTO enforcement_child VALUES (999)",
+    );
+    let invalid_foreign_key = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE enforcement_child ALTER CONSTRAINT enforcement_fk ENFORCED",
+    );
+    assert!(
+        invalid_foreign_key.contains("23503"),
+        "{invalid_foreign_key}"
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO enforcement_parent VALUES (1); \
+         UPDATE enforcement_child SET parent_id = 1; \
+         ALTER TABLE enforcement_child ALTER CONSTRAINT enforcement_fk ENFORCED",
+    );
+    let rejected_foreign_key = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO enforcement_child VALUES (999)",
+    );
+    assert!(
+        rejected_foreign_key.contains("23503"),
+        "{rejected_foreign_key}"
+    );
+    let catalog = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SELECT conenforced, convalidated FROM pg_constraint \
+          WHERE conname IN ('positive', 'below_ten') ORDER BY conname",
+    ));
+    assert_eq!(catalog, ["t|t", "t|t"]);
+}
+
+#[test]
+fn exclusion_constraints_enforce_predicates_and_transaction_modes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE booking (slot int4range, active boolean, \
+           CONSTRAINT booking_no_overlap EXCLUDE USING gist \
+           (slot WITH &&) WHERE (active) DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let catalog = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SELECT contype, condeferrable, condeferred, conenforced, convalidated, \
+                conindid <> 0, conexclop \
+           FROM pg_constraint WHERE conname = 'booking_no_overlap'; \
+         SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = 'booking_no_overlap'; \
+         SELECT access_method.amname, index_catalog.indimmediate \
+           FROM pg_constraint constraint_catalog \
+           JOIN pg_class index_relation ON index_relation.oid = constraint_catalog.conindid \
+           JOIN pg_am access_method ON access_method.oid = index_relation.relam \
+           JOIN pg_index index_catalog ON index_catalog.indexrelid = index_relation.oid \
+          WHERE constraint_catalog.conname = 'booking_no_overlap'",
+    ));
+    assert_eq!(
+        catalog,
+        [
+            "x|t|t|t|t|t|{3888}",
+            "EXCLUDE USING gist (slot WITH &&) WHERE (active) DEFERRABLE INITIALLY DEFERRED",
+            "gist|f",
+        ]
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO booking VALUES ('[1,5)', true), ('[3,7)', true)",
+    );
+    let immediate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS booking_no_overlap IMMEDIATE",
+    );
+    assert!(immediate.contains("23P01"), "{immediate}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO booking VALUES ('[1,5)', true), ('[3,7)', false)",
+    );
+    let conflict = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO booking VALUES ('[4,6)', true)",
+    );
+    assert!(conflict.contains("23P01"), "{conflict}");
+}
+
+#[test]
+fn column_rename_rebinds_table_owned_constraint_expressions() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    let altered = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE renamed_constraint_expression (\
+           lower integer, label text, slot int4range, active boolean, \
+           generated integer GENERATED ALWAYS AS (lower + 1) STORED, \
+           CONSTRAINT positive_lower CHECK (lower > 0 AND lower(label) <> ''), \
+           CONSTRAINT available_slot EXCLUDE USING gist (slot WITH &&) \
+             WHERE (active AND lower > 0)); \
+         ALTER TABLE renamed_constraint_expression RENAME COLUMN lower TO \"select\"",
+    );
+    assert!(altered.contains("ALTER TABLE"), "{altered}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "INSERT INTO renamed_constraint_expression \
+               (\"select\", label, slot, active) VALUES (2, 'A', '[1,4)', true); \
+             SELECT \"select\", generated FROM renamed_constraint_expression; \
+             SELECT bool_and(pg_get_constraintdef(oid) LIKE '%\"select\"%') \
+               FROM pg_constraint \
+              WHERE conrelid = 'renamed_constraint_expression'::regclass",
+        )),
+        ["2|3", "t"]
+    );
+    let checked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO renamed_constraint_expression \
+           (\"select\", label, slot, active) VALUES (0, 'B', '[8,9)', true)",
+    );
+    assert!(checked.contains("23514"), "{checked}");
+    let excluded = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO renamed_constraint_expression \
+           (\"select\", label, slot, active) VALUES (3, 'C', '[2,3)', true)",
+    );
+    assert!(excluded.contains("23P01"), "{excluded}");
+}
+
+#[test]
+fn dropping_referenced_key_obeys_restrict_and_cascade() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE drop_key_parent (id integer, \
+           CONSTRAINT drop_key_unique UNIQUE (id)); \
+         ALTER TABLE drop_key_parent ADD CONSTRAINT drop_key_duplicate UNIQUE (id); \
+         CREATE TABLE drop_key_child (parent_id integer, \
+           CONSTRAINT drop_key_foreign FOREIGN KEY (parent_id) \
+             REFERENCES drop_key_parent(id))",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE drop_key_parent DROP CONSTRAINT drop_key_duplicate RESTRICT",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'drop_key_foreign'",
+        )),
+        ["1"]
+    );
+    let restricted = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE drop_key_parent DROP CONSTRAINT drop_key_unique RESTRICT",
+    );
+    assert!(restricted.contains("2BP01"), "{restricted}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE drop_key_parent DROP CONSTRAINT drop_key_unique CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint \
+              WHERE conname IN ('drop_key_unique', 'drop_key_foreign')",
+        )),
+        ["0"]
+    );
+}
+
+#[test]
+fn create_table_merges_equivalent_unique_constraints_but_alter_adds_one() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 128).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE merged_unique (id integer, \
+           CONSTRAINT first_unique UNIQUE (id), \
+           CONSTRAINT merged_unique_name UNIQUE (id))",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT conname FROM pg_constraint \
+              WHERE conrelid = 'merged_unique'::regclass AND contype = 'u'",
+        )),
+        ["first_unique"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE merged_unique ADD CONSTRAINT later_unique UNIQUE (id)",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT conname FROM pg_constraint \
+              WHERE conrelid = 'merged_unique'::regclass AND contype = 'u' \
+              ORDER BY conname",
+        )),
+        ["first_unique", "later_unique"]
+    );
+}
+
+#[test]
+fn on_conflict_never_uses_a_deferrable_constraint_or_plain_index_name() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE arbiter_rules (value integer, other integer, \
+           CONSTRAINT deferred_key UNIQUE (value) DEFERRABLE); \
+         CREATE UNIQUE INDEX plain_unique_index ON arbiter_rules (other)",
+    );
+    let named = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO arbiter_rules VALUES (1, 1) \
+         ON CONFLICT ON CONSTRAINT deferred_key DO NOTHING",
+    );
+    assert!(named.contains("55000"), "{named}");
+    let index_name = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO arbiter_rules VALUES (1, 1) \
+         ON CONFLICT ON CONSTRAINT plain_unique_index DO NOTHING",
+    );
+    assert!(index_name.contains("42704"), "{index_name}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO arbiter_rules VALUES (1, 1)",
+    );
+    let untargeted = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO arbiter_rules VALUES (1, 2) ON CONFLICT DO NOTHING",
+    );
+    assert!(untargeted.contains("23505"), "{untargeted}");
+}
+
+#[test]
+fn foreign_key_no_action_defers_but_restrict_does_not() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE action_parent (id integer PRIMARY KEY); \
+         CREATE TABLE no_action_child (id integer REFERENCES action_parent(id) \
+           ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED); \
+         CREATE TABLE restrict_child (id integer REFERENCES action_parent(id) \
+           ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED); \
+         INSERT INTO action_parent VALUES (1), (2); \
+         INSERT INTO no_action_child VALUES (1); \
+         INSERT INTO restrict_child VALUES (2)",
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "DELETE FROM action_parent WHERE id = 1; \
+         DELETE FROM no_action_child WHERE id = 1",
+    );
+    let committed = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(committed.contains("COMMIT"), "{committed}");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    let restricted = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "DELETE FROM action_parent WHERE id = 2",
+    );
+    assert!(restricted.contains("23001"), "{restricted}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+}
+
+#[test]
+fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_deferred (value integer, \
+           CONSTRAINT copy_deferred_key UNIQUE (value) DEFERRABLE)",
+    );
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "copy sql", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    engine
+        .execute_simple(
+            "COPY copy_deferred FROM STDIN",
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            1,
+        )
+        .unwrap();
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters streaming mode");
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"1",
+    )
+    .unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        guc.seq_session(),
+        &arena,
+        b"1",
+    )
+    .unwrap();
+    let error = finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap_err();
+    assert_eq!(error.sqlstate, "23505");
+    engine.copy_abort(&mut txn, &guc);
+}
+
+#[test]
+fn constraint_lifecycle_survives_cold_object_store_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("constraint-lifecycle-cold-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("sql-constraint-lifecycle-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_parent (id integer PRIMARY KEY); \
+         INSERT INTO durable_parent VALUES (1); \
+         CREATE TABLE durable_constraints (\
+           id integer, key_value integer, parent_id integer, \
+           slot int4range, active boolean); \
+         INSERT INTO durable_constraints VALUES (-1, 1, 999, '[1,4)', false); \
+         ALTER TABLE durable_constraints ADD CONSTRAINT durable_key \
+           UNIQUE (key_value) DEFERRABLE INITIALLY DEFERRED; \
+         ALTER TABLE durable_constraints ADD CONSTRAINT durable_check \
+           CHECK (id > 0) NOT VALID; \
+         ALTER TABLE durable_constraints ADD CONSTRAINT durable_fk \
+           FOREIGN KEY (parent_id) REFERENCES durable_parent(id) \
+           DEFERRABLE INITIALLY DEFERRED NOT VALID; \
+         ALTER TABLE durable_constraints ADD CONSTRAINT durable_exclusion \
+           EXCLUDE USING gist (slot WITH &&) WHERE (active) \
+           DEFERRABLE INITIALLY DEFERRED; \
+         CREATE TABLE durable_drop_parent (id integer, \
+           CONSTRAINT durable_drop_key UNIQUE (id)); \
+         CREATE TABLE durable_drop_child (parent_id integer \
+           REFERENCES durable_drop_parent(id)); \
+         ALTER TABLE durable_drop_parent DROP CONSTRAINT durable_drop_key CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT conname, contype, condeferrable, condeferred, convalidated, conenforced \
+               FROM pg_constraint \
+              WHERE conrelid = 'durable_constraints'::regclass \
+              ORDER BY conname",
+        )),
+        [
+            "durable_check|c|f|f|f|t",
+            "durable_exclusion|x|t|t|t|t",
+            "durable_fk|f|t|t|f|t",
+            "durable_key|u|t|t|t|t",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*) FROM pg_constraint \
+              WHERE conrelid = 'durable_drop_child'::regclass AND contype = 'f'",
+        )),
+        ["0"]
+    );
+    let mut txn = TxnState::new(&mut recovered_budget, 256).unwrap();
+
+    run_txn(&mut recovered, &mut recovered_budget, &mut txn, "BEGIN");
+    let inserted = run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "INSERT INTO durable_constraints VALUES (2, 1, 1, '[8,9)', false)",
+    );
+    assert!(inserted.contains("INSERT 0 1"), "{inserted}");
+    let duplicate = run_txn(&mut recovered, &mut recovered_budget, &mut txn, "COMMIT");
+    assert!(duplicate.contains("23505"), "{duplicate}");
+
+    run_txn(&mut recovered, &mut recovered_budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "INSERT INTO durable_constraints VALUES \
+           (2, 2, 1, '[10,14)', true), (3, 3, 1, '[12,16)', true)",
+    );
+    let excluded = run_txn(&mut recovered, &mut recovered_budget, &mut txn, "COMMIT");
+    assert!(excluded.contains("23P01"), "{excluded}");
+
+    run_txn(&mut recovered, &mut recovered_budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "INSERT INTO durable_constraints VALUES (2, 2, 777, '[8,9)', false)",
+    );
+    let foreign = run_txn(&mut recovered, &mut recovered_budget, &mut txn, "COMMIT");
+    assert!(foreign.contains("23503"), "{foreign}");
+
+    let checked = run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "INSERT INTO durable_constraints VALUES (-2, 2, 1, '[8,9)', false)",
+    );
+    assert!(checked.contains("23514"), "{checked}");
+    let validation = run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "ALTER TABLE durable_constraints VALIDATE CONSTRAINT durable_check",
+    );
+    assert!(validation.contains("23514"), "{validation}");
+    run_txn(
+        &mut recovered,
+        &mut recovered_budget,
+        &mut txn,
+        "UPDATE durable_constraints SET id = 1, parent_id = 1; \
+         ALTER TABLE durable_constraints VALIDATE CONSTRAINT durable_check; \
+         ALTER TABLE durable_constraints VALIDATE CONSTRAINT durable_fk; \
+         ALTER TABLE durable_constraints ALTER CONSTRAINT durable_fk INITIALLY IMMEDIATE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT conname, condeferred, convalidated \
+               FROM pg_constraint \
+              WHERE conname IN ('durable_check', 'durable_fk') ORDER BY conname",
+        )),
+        ["durable_check|f|t", "durable_fk|f|t"]
+    );
+}
+
+#[test]
+fn every_mutation_path_raises_deferred_row_obligations() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 512).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE mutation_constraints (id integer PRIMARY KEY, key_value integer, slot int4range, \
+           CONSTRAINT mutation_key UNIQUE (key_value) DEFERRABLE INITIALLY DEFERRED, \
+           CONSTRAINT mutation_exclusion EXCLUDE USING gist (slot WITH &&) \
+             DEFERRABLE INITIALLY DEFERRED); \
+         INSERT INTO mutation_constraints VALUES (1, 1, '[1,4)'), (2, 2, '[8,10)'); \
+         CREATE TABLE mutation_source (id integer PRIMARY KEY, key_value integer, slot int4range); \
+         INSERT INTO mutation_source VALUES (2, 1, '[2,3)')",
+    );
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE mutation_constraints SET key_value = 1 WHERE id = 2",
+    );
+    let updated = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(updated.contains("23505"), "{updated}");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "MERGE INTO mutation_constraints AS target USING mutation_source AS source \
+           ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET key_value = source.key_value",
+    );
+    let merged = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(merged.contains("23505"), "{merged}");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE FUNCTION mutation_force_duplicate() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN NEW.key_value := 1; RETURN NEW; END'; \
+         CREATE TRIGGER mutation_force_duplicate BEFORE INSERT ON mutation_constraints \
+           FOR EACH ROW EXECUTE FUNCTION mutation_force_duplicate()",
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO mutation_constraints VALUES (3, 3, '[12,14)')",
+    );
+    let triggered = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(triggered.contains("23505"), "{triggered}");
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE mutation_constraints SET slot = '[2,5)' WHERE id = 2",
+    );
+    let excluded = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(excluded.contains("23P01"), "{excluded}");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE partition_constraints (bucket integer, key_value integer, \
+           CONSTRAINT partition_key UNIQUE (bucket, key_value) DEFERRABLE INITIALLY DEFERRED) \
+           PARTITION BY RANGE (bucket); \
+         CREATE TABLE partition_constraints_low PARTITION OF partition_constraints \
+           FOR VALUES FROM (0) TO (10); \
+         INSERT INTO partition_constraints VALUES (1, 1)",
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO partition_constraints VALUES (1, 1)",
+    );
+    let partitioned = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(partitioned.contains("23505"), "{partitioned}");
 }
 
 #[test]
@@ -24425,7 +25285,9 @@ fn catalog_joins_and_subqueries() {
 
 #[test]
 fn psql_catalog_listing_contracts() {
-    let (mut engine, mut budget) = test_engine();
+    // This catalog probe intentionally creates a fresh connection-sized arena
+    // for each query instead of reusing a production connection's buffers.
+    let (mut engine, mut budget) = test_engine_with_budget((1 << 26) + (2 << 20));
     run_with(
         &mut engine,
         &mut budget,

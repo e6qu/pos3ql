@@ -443,10 +443,6 @@ pub enum ColumnDefault {
         value: OwnedDatum,
         expression: StackStr<DEFAULT_EXPR_MAX>,
     },
-    /// A pre-source journal entry. New DDL never constructs this variant;
-    /// keeping it explicit lets recovery preserve an older durable default
-    /// without admitting incomplete state into new catalog writes.
-    LegacyConstant(OwnedDatum),
     Expression(StackStr<DEFAULT_EXPR_MAX>),
     Generated(StackStr<DEFAULT_EXPR_MAX>),
 }
@@ -456,7 +452,7 @@ impl ColumnDefault {
 
     pub const fn expression(&self) -> Option<&StackStr<DEFAULT_EXPR_MAX>> {
         match self {
-            Self::None | Self::LegacyConstant(_) => None,
+            Self::None => None,
             Self::Constant { expression, .. }
             | Self::Expression(expression)
             | Self::Generated(expression) => Some(expression),
@@ -465,7 +461,7 @@ impl ColumnDefault {
 
     pub const fn constant(&self) -> Option<&OwnedDatum> {
         match self {
-            Self::Constant { value, .. } | Self::LegacyConstant(value) => Some(value),
+            Self::Constant { value, .. } => Some(value),
             Self::None | Self::Expression(_) | Self::Generated(_) => None,
         }
     }
@@ -482,7 +478,7 @@ impl ColumnDefault {
         match (value, expression, generated) {
             (None, None, false) => Some(Self::None),
             (Some(value), Some(expression), false) => Some(Self::Constant { value, expression }),
-            (Some(value), None, false) => Some(Self::LegacyConstant(value)),
+            (Some(_), None, false) => None,
             (None, Some(expression), false) => Some(Self::Expression(expression)),
             (None, Some(expression), true) => Some(Self::Generated(expression)),
             _ => None,
@@ -993,6 +989,11 @@ pub(crate) const MAX_CHECKS: usize = 8;
 pub(crate) const CHECK_SQL_MAX: usize = 512;
 /// Maximum number of FOREIGN KEY constraints per table.
 pub(crate) const MAX_FKEYS: usize = 8;
+/// Maximum number of exclusion constraints per table.
+pub(crate) const MAX_EXCLUSIONS: usize = 8;
+/// Exclusion predicates share the bounded table-definition footprint with
+/// CHECK expressions. Exhaustion is reported while parsing DDL.
+pub(crate) const EXCLUSION_PREDICATE_MAX: usize = 128;
 
 /// A referential action for ON DELETE / ON UPDATE. Mirrors the parser's
 /// `FkAction` so the storage/WAL/checkpoint layers do not depend on the AST.
@@ -1028,6 +1029,78 @@ impl FkAction {
     }
 }
 
+/// Durable constraint check timing. A deferred initial mode can only exist on
+/// a deferrable constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintTiming {
+    NotDeferrable,
+    DeferrableImmediate,
+    DeferrableDeferred,
+}
+
+impl ConstraintTiming {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::NotDeferrable => 0,
+            Self::DeferrableImmediate => 1,
+            Self::DeferrableDeferred => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::NotDeferrable),
+            1 => Some(Self::DeferrableImmediate),
+            2 => Some(Self::DeferrableDeferred),
+            _ => None,
+        }
+    }
+
+    pub const fn is_deferrable(self) -> bool {
+        !matches!(self, Self::NotDeferrable)
+    }
+
+    pub const fn initially_deferred(self) -> bool {
+        matches!(self, Self::DeferrableDeferred)
+    }
+}
+
+/// Durable validation/enforcement state for CHECK and FOREIGN KEY
+/// constraints. The enum excludes a validated-but-unenforced state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintValidation {
+    EnforcedValidated,
+    EnforcedNotValid,
+    NotEnforced,
+}
+
+impl ConstraintValidation {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::EnforcedValidated => 0,
+            Self::EnforcedNotValid => 1,
+            Self::NotEnforced => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::EnforcedValidated),
+            1 => Some(Self::EnforcedNotValid),
+            2 => Some(Self::NotEnforced),
+            _ => None,
+        }
+    }
+
+    pub const fn enforced(self) -> bool {
+        !matches!(self, Self::NotEnforced)
+    }
+
+    pub const fn validated(self) -> bool {
+        matches!(self, Self::EnforcedValidated)
+    }
+}
+
 /// A multi-column UNIQUE or PRIMARY KEY constraint. Single-column PK/UNIQUE
 /// declared inline on a column stays on that column's flags; this covers the
 /// multi-column table-level form.
@@ -1037,6 +1110,7 @@ pub struct UniqueKey {
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
     pub is_primary: bool,
+    pub timing: ConstraintTiming,
 }
 
 impl UniqueKey {
@@ -1045,6 +1119,66 @@ impl UniqueKey {
         columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
         is_primary: false,
+        timing: ConstraintTiming::NotDeferrable,
+    };
+
+    pub fn columns(&self) -> &[u16] {
+        &self.columns[..self.n_cols]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionOperator {
+    Equal,
+    Overlaps,
+    Adjacent,
+}
+
+impl ExclusionOperator {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Equal => 0,
+            Self::Overlaps => 1,
+            Self::Adjacent => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Equal),
+            1 => Some(Self::Overlaps),
+            2 => Some(Self::Adjacent),
+            _ => None,
+        }
+    }
+
+    pub const fn sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::Overlaps => "&&",
+            Self::Adjacent => "-|-",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExclusionConstraint {
+    pub name: SqlName,
+    pub columns: [u16; MAX_INDEX_COLS],
+    pub operators: [ExclusionOperator; MAX_INDEX_COLS],
+    pub n_cols: usize,
+    pub predicate: Option<StackStr<EXCLUSION_PREDICATE_MAX>>,
+    pub timing: ConstraintTiming,
+}
+
+impl ExclusionConstraint {
+    pub const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        columns: [0; MAX_INDEX_COLS],
+        operators: [ExclusionOperator::Equal; MAX_INDEX_COLS],
+        n_cols: 0,
+        predicate: None,
+        timing: ConstraintTiming::NotDeferrable,
     };
 
     pub fn columns(&self) -> &[u16] {
@@ -1058,12 +1192,14 @@ impl UniqueKey {
 pub struct CheckConstraint {
     pub name: SqlName,
     pub expression: StackStr<CHECK_SQL_MAX>,
+    pub validation: ConstraintValidation,
 }
 
 impl CheckConstraint {
     pub const EMPTY: Self = CheckConstraint {
         name: SqlName::EMPTY,
         expression: StackStr::new(),
+        validation: ConstraintValidation::EnforcedValidated,
     };
 }
 
@@ -1080,6 +1216,8 @@ pub struct ForeignKey {
     pub n_parent_cols: usize,
     pub on_delete: FkAction,
     pub on_update: FkAction,
+    pub timing: ConstraintTiming,
+    pub validation: ConstraintValidation,
 }
 
 impl ForeignKey {
@@ -1093,6 +1231,8 @@ impl ForeignKey {
         n_parent_cols: 0,
         on_delete: FkAction::NoAction,
         on_update: FkAction::NoAction,
+        timing: ConstraintTiming::NotDeferrable,
+        validation: ConstraintValidation::EnforcedValidated,
     };
 
     pub fn columns(&self) -> &[u16] {
@@ -1118,6 +1258,8 @@ pub struct TableDef {
     pub n_checks: usize,
     pub fkeys: [ForeignKey; MAX_FKEYS],
     pub n_fkeys: usize,
+    pub exclusions: [ExclusionConstraint; MAX_EXCLUSIONS],
+    pub n_exclusions: usize,
     pub partition: PartitionDef,
 }
 
@@ -1234,6 +1376,8 @@ impl TableDef {
             n_checks: 0,
             fkeys: [ForeignKey::EMPTY; MAX_FKEYS],
             n_fkeys: 0,
+            exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
+            n_exclusions: 0,
             partition: PartitionDef::NONE,
         }
     }
@@ -1252,6 +1396,10 @@ impl TableDef {
 
     pub fn fkeys(&self) -> &[ForeignKey] {
         &self.fkeys[..self.n_fkeys]
+    }
+
+    pub fn exclusions(&self) -> &[ExclusionConstraint] {
+        &self.exclusions[..self.n_exclusions]
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -18669,6 +18817,7 @@ mod tests {
             Some(ColumnDefault::Generated(_))
         ));
         assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, true).is_none());
+        assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, false).is_none());
         assert!(
             ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), true).is_none()
         );

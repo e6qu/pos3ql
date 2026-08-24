@@ -2537,6 +2537,42 @@ def test_partitioned_tables_over_raw_wire():
         first_text_row(moved) == "11:high",
         moved,
     )
+    tree = simple_query(
+        s,
+        "CREATE TABLE wire_partition_tree (id integer, region integer) PARTITION BY RANGE (id); "
+        "CREATE TABLE wire_partition_mid PARTITION OF wire_partition_tree FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region); "
+        "CREATE TABLE wire_partition_east PARTITION OF wire_partition_mid FOR VALUES IN (1); "
+        "CREATE TABLE wire_partition_other (id integer, region integer); "
+        "ALTER TABLE wire_partition_mid ATTACH PARTITION wire_partition_other DEFAULT; "
+        "INSERT INTO wire_partition_tree VALUES (10, 1), (20, 2); "
+        "ALTER TABLE wire_partition_mid DETACH PARTITION wire_partition_other; "
+        "SELECT id || ':' || region FROM wire_partition_other",
+    )
+    check(
+        "raw wire: subpartition attach and detach retain the physical row",
+        first_text_row(tree) == "20:2",
+        tree,
+    )
+    bound = simple_query(
+        s,
+        "SELECT relpartbound FROM pg_class WHERE relname = 'wire_partition_east'",
+    )
+    description = next(payload for kind, payload in bound if kind == b"T")
+    check(
+        "raw wire: partition bounds retain pg_node_tree metadata",
+        row_description_type_oids(description) == [194]
+        and first_text_row(bound) == "FOR VALUES IN (1)",
+        bound,
+    )
+    cleanup = simple_query(
+        s,
+        "DROP TABLE wire_partition_east, wire_partition_other, wire_partition_mid, wire_partition_tree",
+    )
+    check(
+        "raw wire: partition hierarchy cleanup succeeds",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
+    )
     s.close()
 
 

@@ -1063,6 +1063,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
     }
+    fn partition_key_def<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::partition_key_def_text(self.storage, self.txid, oid, arena)
+    }
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::relname_text(self.storage, self.txid, oid, arena)
     }
@@ -3091,10 +3098,11 @@ pub(crate) fn lock_result_row(
             let Some(rowid) = rowid else {
                 continue;
             };
-            let slot = if matches!(
-                storage.table_def(scope.slots[table], txid).partition,
-                crate::storage::PartitionDef::Parent { .. }
-            ) {
+            let slot = if storage
+                .table_def(scope.slots[table], txid)
+                .partition
+                .is_partitioned()
+            {
                 storage
                     .partition_row_owner(scope.slots[table], rowid, txid)?
                     .ok_or_else(|| {

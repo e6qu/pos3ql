@@ -274,6 +274,23 @@ cur.execute("SELECT id, note FROM drv_partitioned")
 assert cur.fetchone() == (11, "high")
 print("partitioned extended protocol routing ok")
 
+cur.execute("CREATE TABLE drv_partition_tree (id int, region int) PARTITION BY RANGE (id)")
+cur.execute(
+    "CREATE TABLE drv_partition_mid PARTITION OF drv_partition_tree "
+    "FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region)"
+)
+cur.execute("CREATE TABLE drv_partition_leaf PARTITION OF drv_partition_mid FOR VALUES IN (1)")
+cur.execute("CREATE TABLE drv_partition_other (id int, region int)")
+cur.execute("ALTER TABLE drv_partition_mid ATTACH PARTITION drv_partition_other DEFAULT")
+cur.executemany("INSERT INTO drv_partition_tree VALUES (%s, %s)", [(10, 1), (20, 2)])
+cur.execute("SELECT id, region FROM drv_partition_tree WHERE id = %s", (20,))
+assert cur.fetchone() == (20, 2)
+cur.execute("ALTER TABLE drv_partition_mid DETACH PARTITION drv_partition_other")
+cur.execute("SELECT id, region FROM drv_partition_other")
+assert cur.fetchone() == (20, 2)
+print("subpartition attach/detach extended protocol ok")
+cur.execute("DROP TABLE drv_partition_leaf, drv_partition_other, drv_partition_mid, drv_partition_tree")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

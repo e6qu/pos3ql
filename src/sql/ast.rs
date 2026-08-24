@@ -307,6 +307,7 @@ pub enum Stmt<'a> {
         tables: &'a [PublicationTarget<'a>],
         schemas: &'a [&'a str],
         publish: PublicationOperations,
+        publish_via_partition_root: bool,
     },
     /// ALTER PUBLICATION name SET (publish = ...) or change its explicit
     /// relation membership.
@@ -848,7 +849,10 @@ pub enum SubscriptionPublicationRefresh {
 /// partially reinterpret.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterPublicationAction<'a> {
-    SetOperations(PublicationOperations),
+    SetOptions {
+        publish: Option<PublicationOperations>,
+        publish_via_partition_root: Option<bool>,
+    },
     SetOwner(&'a str),
     Rename(&'a str),
     SetTargets {
@@ -1435,7 +1439,14 @@ pub enum PartitionClause<'a> {
     Of {
         parent: QualName<'a>,
         bound: PartitionBound<'a>,
+        subpartition: Option<PartitionBy<'a>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartitionBy<'a> {
+    pub strategy: PartitionStrategy,
+    pub columns: &'a [&'a str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2088,6 +2099,13 @@ pub enum AlterAction<'a> {
     SetTriggerEnabled {
         target: TriggerEnableTarget<'a>,
         enabled: TriggerEnableMode,
+    },
+    AttachPartition {
+        child: QualName<'a>,
+        bound: PartitionBound<'a>,
+    },
+    DetachPartition {
+        child: QualName<'a>,
     },
 }
 

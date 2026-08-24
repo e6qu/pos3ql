@@ -13,6 +13,7 @@ pub mod oid {
     pub const INT8: i32 = 20;
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
+    pub const PG_NODE_TREE: i32 = 194;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
     pub const OID_ARRAY: i32 = 1028;
@@ -122,6 +123,9 @@ pub enum ColType {
     /// PostgreSQL's zero-based, space-delimited `int2vector` catalog type.
     /// It is transient catalog data and is never accepted as a stored column.
     Int2Vector,
+    /// PostgreSQL's internal parse-tree text used by catalog definition
+    /// reconstructors. It is transient catalog data, never a stored column.
+    PgNodeTree,
     Int4,
     /// PostgreSQL object identity, retaining its catalog and wire metadata
     /// while sharing the engine's four-byte integer datum storage.
@@ -316,6 +320,7 @@ impl ColType {
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
+            Self::PgNodeTree => oid::PG_NODE_TREE,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
             Self::Regtype => oid::REGTYPE,
@@ -368,6 +373,7 @@ impl ColType {
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
+            oid::PG_NODE_TREE => Some(Self::PgNodeTree),
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
             oid::REGPROC => Some(Self::Regproc),
@@ -466,7 +472,7 @@ impl ColType {
             Self::Void => 4,
             Self::Bool => 1,
             Self::Int2 => 2,
-            Self::Int2Vector => -1,
+            Self::Int2Vector | Self::PgNodeTree => -1,
             Self::Int4
             | Self::Oid
             | Self::Regtype
@@ -507,7 +513,7 @@ impl ColType {
     pub fn storage(self) -> ColType {
         match self {
             Self::Float4 => Self::Float8,
-            Self::Varchar | Self::Bpchar | Self::Name => Self::Text,
+            Self::Varchar | Self::Bpchar | Self::Name | Self::PgNodeTree => Self::Text,
             Self::Oid => Self::Int4,
             Self::Regtype
             | Self::Regproc
@@ -528,6 +534,7 @@ impl ColType {
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
+            Self::PgNodeTree => "pg_node_tree",
             Self::Int4 => "int4",
             Self::Oid => "oid",
             Self::Regtype => "regtype",
@@ -588,6 +595,7 @@ impl ColType {
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
+            Self::PgNodeTree => "pg_node_tree",
             Self::Int4 => "integer",
             Self::Oid => "oid",
             Self::Regtype => "regtype",
@@ -661,6 +669,7 @@ impl ColType {
             Self::Numeric => 11,
             Self::Int2 => 12,
             Self::Int2Vector => 55,
+            Self::PgNodeTree => 67,
             Self::Float4 => 13,
             Self::Varchar => 14,
             Self::Bpchar => 15,

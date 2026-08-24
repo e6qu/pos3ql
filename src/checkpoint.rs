@@ -1234,7 +1234,7 @@ impl Checkpointer {
                     let default = ColumnDefault::from_parts(
                         default_from_hex(default_hex)?,
                         default_expr,
-                        not_null & 16 != 0,
+                        not_null & 32 != 0,
                     )
                     .ok_or(CheckpointSetupError::Corrupt(
                         "invalid column default state",
@@ -1245,13 +1245,14 @@ impl Checkpointer {
                         ctype,
                         type_mod,
                         collation,
-                        not_null: not_null & 1 != 0,
-                        unique: not_null & 2 != 0,
-                        primary: not_null & 4 != 0,
-                        auto_increment: not_null & 8 != 0,
+                        not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
+                        unique: not_null & 4 != 0,
+                        primary: not_null & 8 != 0,
+                        auto_increment: not_null & 16 != 0,
                         default,
-                        is_identity: not_null & 32 != 0,
-                        identity_always: not_null & 64 != 0,
+                        is_identity: not_null & 64 != 0,
+                        identity_always: not_null & 128 != 0,
                         auto_increment_step,
                     };
                     *seen += 1;
@@ -3396,13 +3397,13 @@ impl Checkpointer {
                         let _ = write!(dexpr_hex, "0");
                     }
                 }
-                let flags = u8::from(c.not_null)
-                    | (u8::from(c.unique) << 1)
-                    | (u8::from(c.primary) << 2)
-                    | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.default.is_generated()) << 4)
-                    | (u8::from(c.is_identity) << 5)
-                    | (u8::from(c.identity_always) << 6);
+                let flags = c.not_null.code()
+                    | (u8::from(c.unique) << 2)
+                    | (u8::from(c.primary) << 3)
+                    | (u8::from(c.auto_increment) << 4)
+                    | (u8::from(c.default.is_generated()) << 5)
+                    | (u8::from(c.is_identity) << 6)
+                    | (u8::from(c.identity_always) << 7);
                 // The user-defined type name, hex-encoded (`0` = ordinary base type),
                 // before the name (which may contain spaces).
                 let mut domain_schema_hex = StackStr::<130>::new();
@@ -3755,6 +3756,7 @@ impl Checkpointer {
                 | (u8::from(publication.publish_update) << 2)
                 | (u8::from(publication.publish_delete) << 3)
                 | (u8::from(publication.publish_truncate) << 4);
+            let flags = flags | (u8::from(publication.publish_via_partition_root) << 5);
             write!(
                 &mut self.manifest_buf,
                 "pub {} {} {} {} {}",
@@ -5445,6 +5447,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 publish_update: flags & 4 != 0,
                 publish_delete: flags & 8 != 0,
                 publish_truncate: flags & 16 != 0,
+                publish_via_partition_root: flags & 32 != 0,
             },
             0,
         )
@@ -6026,7 +6029,7 @@ fn empty_column() -> ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
-        not_null: false,
+        not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -6073,49 +6076,43 @@ fn write_partition_manifest(
     buffer: &mut FixedBuf,
     partition: PartitionDef,
 ) -> Result<(), SqlError> {
-    match partition {
-        PartitionDef::None => write_manifest(buffer, "part n"),
-        PartitionDef::Parent {
-            strategy,
-            keys,
-            n_keys,
-        } => {
-            let strategy = match strategy {
-                PartitionStrategy::Range => "r",
-                PartitionStrategy::List => "l",
-                PartitionStrategy::Hash => "h",
-            };
-            let mut line = StackStr::<512>::new();
-            use core::fmt::Write;
-            let _ = write!(line, "part p {strategy} {n_keys}");
-            for key in &keys[..usize::from(n_keys)] {
-                let _ = write!(line, " {key}");
-            }
-            write_manifest(buffer, line.as_str())
+    let mut line = StackStr::<4096>::new();
+    use core::fmt::Write;
+    let _ = write!(line, "part 2");
+    if let Some(scheme) = partition.scheme {
+        let strategy = match scheme.strategy {
+            PartitionStrategy::Range => "r",
+            PartitionStrategy::List => "l",
+            PartitionStrategy::Hash => "h",
+        };
+        let _ = write!(line, " p {strategy} {}", scheme.n_keys);
+        for key in &scheme.keys[..usize::from(scheme.n_keys)] {
+            let _ = write!(line, " {key}");
         }
-        PartitionDef::Child { parent, bound } => match bound {
-            PartitionBound::Default => write_manifest(buffer, format_args!("part c {parent} d")),
-            PartitionBound::Hash { modulus, remainder } => write_manifest(
-                buffer,
-                format_args!("part c {parent} h {modulus} {remainder}"),
-            ),
+    } else {
+        let _ = write!(line, " n");
+    }
+    if let Some(attachment) = partition.attachment {
+        let _ = write!(line, " c {}", attachment.parent);
+        match attachment.bound {
+            PartitionBound::Default => {
+                let _ = write!(line, " d");
+            }
+            PartitionBound::Hash { modulus, remainder } => {
+                let _ = write!(line, " h {modulus} {remainder}");
+            }
             PartitionBound::List { values, n_values } => {
-                let mut line = StackStr::<2048>::new();
-                use core::fmt::Write;
-                let _ = write!(line, "part c {parent} l {n_values}");
+                let _ = write!(line, " l {n_values}");
                 for value in &values[..usize::from(n_values)] {
                     let _ = write!(line, " {}", default_to_hex(&Some(*value)).as_str());
                 }
-                write_manifest(buffer, line.as_str())
             }
             PartitionBound::Range {
                 lower,
                 upper,
                 n_keys,
             } => {
-                let mut line = StackStr::<2048>::new();
-                use core::fmt::Write;
-                let _ = write!(line, "part c {parent} r {n_keys}");
+                let _ = write!(line, " r {n_keys}");
                 for i in 0..usize::from(n_keys) {
                     let _ = write!(
                         line,
@@ -6124,10 +6121,12 @@ fn write_partition_manifest(
                         partition_bound_value_text(upper[i]).as_str()
                     );
                 }
-                write_manifest(buffer, line.as_str())
             }
-        },
+        }
+    } else {
+        let _ = write!(line, " n");
     }
+    write_manifest(buffer, line.as_str())
 }
 
 fn partition_bound_value_text(
@@ -6156,8 +6155,11 @@ fn parse_partition_manifest(
     words: &mut core::str::Split<'_, char>,
 ) -> Result<PartitionDef, CheckpointSetupError> {
     let corrupt = || CheckpointSetupError::Corrupt("bad partition metadata");
-    match words.next().ok_or_else(corrupt)? {
-        "n" => Ok(PartitionDef::None),
+    if words.next().ok_or_else(corrupt)? != "2" {
+        return Err(corrupt());
+    }
+    let scheme = match words.next().ok_or_else(corrupt)? {
+        "n" => None,
         "p" => {
             let strategy = match words.next().ok_or_else(corrupt)? {
                 "r" => PartitionStrategy::Range,
@@ -6173,12 +6175,16 @@ fn parse_partition_manifest(
             for key in &mut keys[..usize::from(n_keys)] {
                 *key = parse_field(words.next(), "partition key")?;
             }
-            Ok(PartitionDef::Parent {
+            Some(crate::storage::PartitionScheme {
                 strategy,
                 keys,
                 n_keys,
             })
         }
+        _ => return Err(corrupt()),
+    };
+    let attachment = match words.next().ok_or_else(corrupt)? {
+        "n" => None,
         "c" => {
             let parent: u16 = parse_field(words.next(), "partition parent")?;
             let bound = match words.next().ok_or_else(corrupt)? {
@@ -6221,10 +6227,11 @@ fn parse_partition_manifest(
                 }
                 _ => return Err(corrupt()),
             };
-            Ok(PartitionDef::Child { parent, bound })
+            Some(crate::storage::PartitionAttachment { parent, bound })
         }
-        _ => Err(corrupt()),
-    }
+        _ => return Err(corrupt()),
+    };
+    Ok(PartitionDef { scheme, attachment })
 }
 
 #[cfg(test)]

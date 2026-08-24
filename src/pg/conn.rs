@@ -1413,13 +1413,18 @@ impl Conn {
                     copy.end_seen = true;
                 } else {
                     copy.line = copy.line.saturating_add(1);
-                    match engine.copy_row_line(
-                        &copy.setup,
-                        &mut self.txn,
-                        self.guc.seq_session(),
-                        &self.arena,
-                        line,
-                    ) {
+                    let outcome = {
+                        let mut responder = Responder::new(&mut self.send);
+                        engine.copy_row_line(
+                            &copy.setup,
+                            &mut self.txn,
+                            self.guc.seq_session(),
+                            &self.arena,
+                            &mut responder,
+                            line,
+                        )
+                    };
+                    match outcome {
                         Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                         Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                         Err(error) => record_copy_input_error(&mut self.send, copy, error),
@@ -1494,13 +1499,18 @@ impl Conn {
                     self.arena.reset();
                     if !copy.end_seen && copy.failed.is_none() {
                         let row = &self.copy_buf.readable()[..len];
-                        match engine.copy_row_binary(
-                            &copy.setup,
-                            &mut self.txn,
-                            self.guc.seq_session(),
-                            &self.arena,
-                            row,
-                        ) {
+                        let outcome = {
+                            let mut responder = Responder::new(&mut self.send);
+                            engine.copy_row_binary(
+                                &copy.setup,
+                                &mut self.txn,
+                                self.guc.seq_session(),
+                                &self.arena,
+                                &mut responder,
+                                row,
+                            )
+                        };
+                        match outcome {
                             Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                             Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                             Err(e) => copy.failed = Some(e),
@@ -1541,13 +1551,18 @@ impl Conn {
                 && !crate::sql::copy::is_end_marker(line)
             {
                 copy.line = copy.line.saturating_add(1);
-                match engine.copy_row_line(
-                    &copy.setup,
-                    &mut self.txn,
-                    self.guc.seq_session(),
-                    &self.arena,
-                    line,
-                ) {
+                let outcome = {
+                    let mut responder = Responder::new(&mut self.send);
+                    engine.copy_row_line(
+                        &copy.setup,
+                        &mut self.txn,
+                        self.guc.seq_session(),
+                        &self.arena,
+                        &mut responder,
+                        line,
+                    )
+                };
+                match outcome {
                     Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                     Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
                     Err(error) => record_copy_input_error(&mut self.send, copy, error),
@@ -1562,9 +1577,12 @@ impl Conn {
                 engine.copy_abort(&mut self.txn, &self.guc);
                 Err(e)
             }
-            None => engine
-                .copy_finish(&mut self.txn, &self.guc)
-                .map(|()| copy.count),
+            None => {
+                let mut responder = Responder::new(&mut self.send);
+                engine
+                    .copy_finish(&copy.setup, &mut self.txn, &self.guc, &mut responder)
+                    .map(|()| copy.count)
+            }
         };
         let failed = outcome.is_err();
         let mut responder = Responder::new(&mut self.send);

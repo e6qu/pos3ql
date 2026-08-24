@@ -1012,16 +1012,37 @@ pub(crate) fn enforce_row_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     check_index_tuple_sizes(storage, def, values, txid)?;
-    check_all_unique(
-        storage,
-        table_index,
-        def,
-        schema,
-        values,
-        self_rowid,
-        txid,
-        arena,
-    )?;
+    let constraint_table = storage
+        .find_visible(def.schema.as_str(), def.name.as_str(), txid)
+        .unwrap_or(table_index);
+    if def.partition.is_partitioned() {
+        for candidate in 0..storage.table_count() {
+            if !storage.table(candidate).visible_to(txid)
+                || storage
+                    .table_def(candidate, txid)
+                    .partition
+                    .is_partitioned()
+                || (candidate != constraint_table
+                    && !storage.partition_descends_from(candidate, constraint_table, txid))
+            {
+                continue;
+            }
+            check_all_unique(
+                storage, candidate, def, schema, values, self_rowid, txid, arena,
+            )?;
+        }
+    } else {
+        check_all_unique(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            arena,
+        )?;
+    }
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;

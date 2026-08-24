@@ -8,14 +8,15 @@
 
 use crate::mem::arena::Arena;
 use crate::storage::{
-    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, PartitionDef, PartitionStrategy, SqlName,
-    Storage, TableDef,
+    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, OwnedDatum, PartitionBound,
+    PartitionBoundValue, PartitionStrategy, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::eval::{
-    ColumnLookup, SqlError, ident_needs_quotes, resolved_expression_collation, sqlstate,
+    ColumnLookup, SqlError, datum_to_text, ident_needs_quotes, quote_literal_str,
+    resolved_expression_collation, sqlstate,
 };
 use super::types::{ColType, Datum, TypeMod};
 
@@ -165,6 +166,14 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         name: "current_setting",
         result_oid: 25,
         argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3352,
+        name: "pg_get_partkeydef",
+        result_oid: 25,
+        argument_types: "26",
         argument_count: 1,
         volatility: "s",
     },
@@ -1664,6 +1673,42 @@ struct IdxInfo {
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
+    constraint_parent_oid: i32,
+}
+
+fn parent_constraint_oid(
+    storage: &Storage,
+    txid: u32,
+    child_slot: usize,
+    columns: &[u16],
+    is_primary: bool,
+) -> i32 {
+    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
+        return 0;
+    };
+    let parent_slot = usize::from(attachment.parent);
+    let parent = storage.table_def(parent_slot, txid);
+    let mut position = 0usize;
+    for (column, metadata) in parent.columns().iter().enumerate() {
+        if metadata.primary {
+            if is_primary && columns == [column as u16] {
+                return index_oid(parent_slot, position) + 500_000;
+            }
+            position += 1;
+        } else if metadata.unique {
+            if !is_primary && columns == [column as u16] {
+                return index_oid(parent_slot, position) + 500_000;
+            }
+            position += 1;
+        }
+    }
+    for unique in parent.uniques() {
+        if unique.is_primary == is_primary && unique.columns() == columns {
+            return index_oid(parent_slot, position) + 500_000;
+        }
+        position += 1;
+    }
+    0
 }
 
 /// Enumerates every index relation psql `\d` would show: a single-column PK or
@@ -1688,6 +1733,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                       nulls_not_distinct: bool,
                       is_primary: bool,
                       is_unique: bool,
+                      is_constraint: bool,
                       name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
@@ -1709,6 +1755,11 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 predicate,
                 is_primary,
                 is_unique,
+                constraint_parent_oid: if is_constraint {
+                    parent_constraint_oid(storage, txid, slot, columns, is_primary)
+                } else {
+                    0
+                },
             };
             pos += 1;
             info
@@ -1727,6 +1778,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     false,
                     true,
                     true,
+                    true,
                     name,
                 ));
             } else if col.unique {
@@ -1742,6 +1794,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                     None,
                     false,
                     false,
+                    true,
                     true,
                     name,
                 ));
@@ -1759,6 +1812,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 false,
                 uk.is_primary,
                 true,
+                true,
                 stack_str_64(uk.name.as_str()),
             ));
         }
@@ -1774,6 +1828,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.nulls_not_distinct,
                 false,
                 index.unique,
+                false,
                 stack_str_64(index.name_for(txid).as_str()),
             ));
         }
@@ -1797,6 +1852,7 @@ fn empty_index() -> IdxInfo {
         predicate: None,
         is_primary: false,
         is_unique: false,
+        constraint_parent_oid: 0,
     }
 }
 
@@ -3091,6 +3147,50 @@ fn collect_fkeys<'a>(
     Ok(foreign_keys)
 }
 
+fn inherited_foreign_key_parent_oid(
+    storage: &Storage,
+    txid: u32,
+    child_slot: usize,
+    child: &crate::storage::ForeignKey,
+) -> i32 {
+    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
+        return 0;
+    };
+    let parent_slot = usize::from(attachment.parent);
+    storage
+        .table_def(parent_slot, txid)
+        .fkeys()
+        .iter()
+        .position(|parent| {
+            parent.name == child.name
+                && parent.columns() == child.columns()
+                && parent.parent_schema == child.parent_schema
+                && parent.parent == child.parent
+                && parent.parent_cols() == child.parent_cols()
+                && parent.on_delete == child.on_delete
+                && parent.on_update == child.on_update
+        })
+        .map_or(0, |index| {
+            FIRST_FK_OID + parent_slot as i32 * MAX_INDEXES_PER_TABLE + index as i32
+        })
+}
+
+fn check_is_inherited(
+    storage: &Storage,
+    txid: u32,
+    child_slot: usize,
+    child: &crate::storage::CheckConstraint,
+) -> bool {
+    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
+        return false;
+    };
+    storage
+        .table_def(usize::from(attachment.parent), txid)
+        .checks()
+        .iter()
+        .any(|parent| parent.name == child.name && parent.expression == child.expression)
+}
+
 /// The schema-qualified foreign-key definition used by catalog clients and
 /// dump/restore.
 pub fn constraint_def_text<'a>(
@@ -3210,6 +3310,154 @@ pub fn constraint_def_text<'a>(
         )?));
     }
     Ok(None)
+}
+
+/// PostgreSQL's executable partition-key clause for pg_dump and catalog
+/// clients. The OID boundary resolves once to a typed table slot; the durable
+/// scheme already owns column offsets and therefore cannot render a stale name.
+pub fn partition_key_def_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = oid
+        .checked_sub(FIRST_USER_OID)
+        .and_then(|slot| usize::try_from(slot).ok())
+        .filter(|slot| *slot < storage.table_count())
+    else {
+        return Ok(None);
+    };
+    if !storage.table(slot).visible_to(txid) {
+        return Ok(None);
+    }
+    let definition = storage.table_def(slot, txid);
+    let Some(scheme) = definition.partition.scheme else {
+        return Ok(None);
+    };
+    let mut rendered = StackStr::<512>::new();
+    use core::fmt::Write as _;
+    let strategy = match scheme.strategy {
+        PartitionStrategy::Range => "RANGE",
+        PartitionStrategy::List => "LIST",
+        PartitionStrategy::Hash => "HASH",
+    };
+    let _ = write!(rendered, "{} (", strategy);
+    for (position, column) in scheme.keys[..usize::from(scheme.n_keys)].iter().enumerate() {
+        if position != 0 {
+            let _ = rendered.write_str(", ");
+        }
+        write_identifier(
+            &mut rendered,
+            definition.columns()[usize::from(*column)].name.as_str(),
+        );
+    }
+    let _ = rendered.write_char(')');
+    Ok(Some(alloc_rendered(
+        &rendered,
+        "partition key definition is too long",
+        arena,
+    )?))
+}
+
+fn partition_bound_def_text(bound: PartitionBound, arena: &Arena) -> Result<&str, SqlError> {
+    use core::fmt::Write as _;
+
+    let mut rendered = StackStr::<4096>::new();
+    match bound {
+        PartitionBound::Default => {
+            let _ = rendered.write_str("DEFAULT");
+        }
+        PartitionBound::Range {
+            lower,
+            upper,
+            n_keys,
+        } => {
+            let _ = rendered.write_str("FOR VALUES FROM (");
+            for (index, value) in lower.iter().copied().take(usize::from(n_keys)).enumerate() {
+                if index != 0 {
+                    let _ = rendered.write_str(", ");
+                }
+                write_partition_bound_value(&mut rendered, value, arena)?;
+            }
+            let _ = rendered.write_str(") TO (");
+            for (index, value) in upper.iter().copied().take(usize::from(n_keys)).enumerate() {
+                if index != 0 {
+                    let _ = rendered.write_str(", ");
+                }
+                write_partition_bound_value(&mut rendered, value, arena)?;
+            }
+            let _ = rendered.write_char(')');
+        }
+        PartitionBound::List { values, n_values } => {
+            let _ = rendered.write_str("FOR VALUES IN (");
+            for (index, value) in values
+                .iter()
+                .copied()
+                .take(usize::from(n_values))
+                .enumerate()
+            {
+                if index != 0 {
+                    let _ = rendered.write_str(", ");
+                }
+                write_partition_value(&mut rendered, value, arena)?;
+            }
+            let _ = rendered.write_char(')');
+        }
+        PartitionBound::Hash { modulus, remainder } => {
+            let _ = write!(
+                rendered,
+                "FOR VALUES WITH (modulus {modulus}, remainder {remainder})"
+            );
+        }
+    }
+    alloc_rendered(&rendered, "partition bound definition is too long", arena)
+}
+
+fn write_partition_bound_value(
+    out: &mut impl core::fmt::Write,
+    value: PartitionBoundValue,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    match value {
+        PartitionBoundValue::MinValue => {
+            let _ = out.write_str("MINVALUE");
+        }
+        PartitionBoundValue::MaxValue => {
+            let _ = out.write_str("MAXVALUE");
+        }
+        PartitionBoundValue::Value(value) => write_partition_value(out, value, arena)?,
+    }
+    Ok(())
+}
+
+fn write_partition_value(
+    out: &mut impl core::fmt::Write,
+    value: OwnedDatum,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    match value {
+        OwnedDatum::Null => {
+            let _ = out.write_str("NULL");
+        }
+        OwnedDatum::Bool(value) => {
+            let _ = out.write_str(if value { "true" } else { "false" });
+        }
+        OwnedDatum::Int4(_)
+        | OwnedDatum::Oid(_)
+        | OwnedDatum::Int8(_)
+        | OwnedDatum::Numeric { .. } => {
+            let _ = out.write_str(datum_to_text(value.as_datum(), arena)?);
+        }
+        OwnedDatum::Float8(number) if number.is_finite() => {
+            let _ = out.write_str(datum_to_text(value.as_datum(), arena)?);
+        }
+        _ => {
+            let text = datum_to_text(value.as_datum(), arena)?;
+            let _ = out.write_str(quote_literal_str(text, arena)?);
+        }
+    }
+    Ok(())
 }
 
 /// PostgreSQL omits the clause for the default NO ACTION and spells the others.
@@ -3337,7 +3585,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             ctype: ColType::Bool,
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
-            not_null: false,
+            not_null: crate::storage::NotNullOrigin::Nullable,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -3565,7 +3813,7 @@ fn pg_publication<'a>(
                 Datum::Bool(definition.publish_update),
                 Datum::Bool(definition.publish_delete),
                 Datum::Bool(definition.publish_truncate),
-                Datum::Bool(false),
+                Datum::Bool(definition.publish_via_partition_root),
                 text("n", arena)?,
             ],
             arena,
@@ -3847,22 +4095,45 @@ fn pg_inherits<'a>(
             ("inhdetachpending", ColType::Bool),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let inherited_indexes = indexes
+        .iter()
+        .filter(|index| index.constraint_parent_oid != 0)
+        .count();
+    let rows = arena
+        .alloc_slice_with(storage.table_count() + inherited_indexes, |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for child in 0..storage.table_count() {
         if !storage.table(child).visible_to(txid) {
             continue;
         }
-        let PartitionDef::Child { parent, .. } = storage.table_def(child, txid).partition else {
+        let Some(crate::storage::PartitionAttachment { parent, .. }) =
+            storage.table_def(child, txid).partition.attachment
+        else {
             continue;
         };
-        if n == rows.len() {
-            return Err(catalog_capacity_exceeded("pg_inherits"));
-        }
         rows[n] = row(
             &[
                 Datum::Int4(table_oid(storage, child)),
                 Datum::Int4(table_oid(storage, usize::from(parent))),
+                Datum::Int4(1),
+                Datum::Bool(false),
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for index in indexes {
+        if index.constraint_parent_oid == 0 {
+            continue;
+        }
+        rows[n] = row(
+            &[
+                Datum::Int4(index.oid),
+                Datum::Int4(index.constraint_parent_oid - 500_000),
                 Datum::Int4(1),
                 Datum::Bool(false),
             ],
@@ -3894,11 +4165,11 @@ fn pg_partitioned_table<'a>(
         if !storage.table(slot).visible_to(txid) {
             continue;
         }
-        let PartitionDef::Parent {
+        let Some(crate::storage::PartitionScheme {
             strategy,
             keys,
             n_keys,
-        } = storage.table_def(slot, txid).partition
+        }) = storage.table_def(slot, txid).partition.scheme
         else {
             continue;
         };
@@ -3971,6 +4242,7 @@ fn pg_class<'a>(
             ("relminmxid", ColType::Int4),
             ("reloptions", ColType::Array(super::types::ArrElem::Text)),
             ("relispopulated", ColType::Bool),
+            ("relpartbound", ColType::PgNodeTree),
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
@@ -4011,7 +4283,7 @@ fn pg_class<'a>(
         };
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
-        let relkind = if matches!(table_def.partition, PartitionDef::Parent { .. }) {
+        let relkind = if table_def.partition.is_partitioned() {
             "p"
         } else if storage
             .find_matview(table_def.schema.as_str(), table_def.name.as_str(), txid)
@@ -4051,7 +4323,7 @@ fn pg_class<'a>(
                 Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
                 Datum::Bool(false),        // relrowsecurity
                 Datum::Bool(false),        // relforcerowsecurity
-                Datum::Bool(matches!(table_def.partition, PartitionDef::Child { .. })),
+                Datum::Bool(table_def.partition.is_attached()),
                 Datum::Int4(0),    // reltablespace
                 Datum::Int4(0),    // reloftype
                 Datum::Int4(0),    // reltoastrelid
@@ -4066,6 +4338,13 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Null,
                 Datum::Bool(true),
+                table_def
+                    .partition
+                    .attachment
+                    .map(|attachment| partition_bound_def_text(attachment.bound, arena))
+                    .transpose()?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null),
             ],
             arena,
         )?;
@@ -4114,6 +4393,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Null,
                 Datum::Bool(true),
+                Datum::Null,
             ],
             arena,
         )?;
@@ -4165,6 +4445,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Null,
                 Datum::Bool(true),
+                Datum::Null,
             ],
             arena,
         )?;
@@ -4225,6 +4506,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Null,
                 Datum::Bool(true),
+                Datum::Null,
             ],
             arena,
         )?;
@@ -4284,6 +4566,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Null,
                 Datum::Bool(true),
+                Datum::Null,
             ],
             arena,
         )?;
@@ -4356,7 +4639,7 @@ fn pg_constraint<'a>(
                 Datum::Int4(info.table_oid),
                 Datum::Int4(0),
                 text(contype, arena)?,
-                Datum::Int4(0),        // conparentid
+                Datum::Int4(info.constraint_parent_oid),
                 Datum::Int4(info.oid), // conindid -> the backing index
                 Datum::Int4(0),        // confrelid
                 Datum::Bool(false),
@@ -4373,8 +4656,8 @@ fn pg_constraint<'a>(
                     storage.table_def(info.table_slot, txid).schema.as_str(),
                 )),
                 text(" ", arena)?,
-                Datum::Bool(true),
-                Datum::Int4(0),
+                Datum::Bool(info.constraint_parent_oid == 0),
+                Datum::Int4(i32::from(info.constraint_parent_oid != 0)),
                 Datum::Bool(false),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
@@ -4396,6 +4679,8 @@ fn pg_constraint<'a>(
             return Err(catalog_capacity_exceeded("pg_constraint"));
         }
         let fk = &storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
+        let constraint_parent_oid =
+            inherited_foreign_key_parent_oid(storage, txid, info.child_slot, fk);
         // conindid points at the parent's unique/PK index backing the referenced
         // columns, which JDBC joins to for foreign-key metadata.
         let conindid = indexes
@@ -4413,7 +4698,7 @@ fn pg_constraint<'a>(
                 Datum::Int4(info.conrelid),
                 Datum::Int4(0),
                 text("f", arena)?,
-                Datum::Int4(0), // conparentid
+                Datum::Int4(constraint_parent_oid),
                 Datum::Int4(conindid),
                 Datum::Int4(info.confrelid),
                 Datum::Bool(false),
@@ -4430,8 +4715,8 @@ fn pg_constraint<'a>(
                     storage.table_def(info.child_slot, txid).schema.as_str(),
                 )),
                 text("s", arena)?,
-                Datum::Bool(true),
-                Datum::Int4(0),
+                Datum::Bool(constraint_parent_oid == 0),
+                Datum::Int4(i32::from(constraint_parent_oid != 0)),
                 Datum::Bool(false),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
@@ -4456,6 +4741,7 @@ fn pg_constraint<'a>(
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
+            let inherited = check_is_inherited(storage, txid, slot, check);
             out[n] = row(
                 &[
                     Datum::Int4(
@@ -4484,8 +4770,8 @@ fn pg_constraint<'a>(
                         storage.table_def(slot, txid).schema.as_str(),
                     )),
                     text(" ", arena)?,
-                    Datum::Bool(true),
-                    Datum::Int4(0),
+                    Datum::Bool(!inherited),
+                    Datum::Int4(i32::from(inherited)),
                     Datum::Bool(false),
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
@@ -4508,7 +4794,7 @@ fn pg_constraint<'a>(
         }
         let table = storage.table_def(slot, txid);
         for (column_index, column) in table.columns().iter().enumerate() {
-            if !column.not_null {
+            if !column.not_null.is_required() {
                 continue;
             }
             if n == out.len() {
@@ -4541,8 +4827,8 @@ fn pg_constraint<'a>(
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(storage, table.schema.as_str())),
                     text(" ", arena)?,
-                    Datum::Bool(true),
-                    Datum::Int4(0),
+                    Datum::Bool(column.not_null.is_local()),
+                    Datum::Int4(i32::from(column.not_null.is_inherited())),
                     Datum::Bool(false),
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
@@ -5125,7 +5411,7 @@ fn pg_attribute<'a>(
                     text(c.name.as_str(), arena)?,
                     Datum::Int4(catalog_column_type_oid(storage, c, txid)?),
                     Datum::Int4(i as i32 + 1),
-                    Datum::Bool(c.not_null),
+                    Datum::Bool(c.not_null.is_required()),
                     Datum::Int4(i32::from(c.ctype.typlen())),
                     Datum::Int4(c.type_mod),
                     Datum::Bool(!matches!(c.default, crate::storage::ColumnDefault::None)),
@@ -5173,7 +5459,7 @@ fn pg_attribute<'a>(
                 ctype: field.ctype,
                 type_mod: field.type_mod,
                 collation: field.collation,
-                not_null: false,
+                not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -7741,7 +8027,7 @@ fn info_columns<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
-                not_null: false,
+                not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -7868,7 +8154,8 @@ fn info_column_row<'a>(
         .flatten();
     let generated = column.default.is_generated();
     let generated_expression = generated.then(|| column.default.expression()).flatten();
-    let nullable = !column.not_null && !domain.is_some_and(|definition| definition.not_null);
+    let nullable =
+        !column.not_null.is_required() && !domain.is_some_and(|definition| definition.not_null);
     let identity = column.is_identity;
     let identity_sequence = identity
         .then(|| {
@@ -8147,7 +8434,7 @@ fn info_table_constraints<'a>(
                 let name = inline_unique_constraint_name(table, column);
                 append(name.as_str(), "UNIQUE", Some("YES"), table)?;
             }
-            if column.not_null {
+            if column.not_null.is_required() {
                 let name = not_null_constraint_name(table, column);
                 append(name.as_str(), "CHECK", None, table)?;
             }
@@ -8396,7 +8683,7 @@ fn info_constraint_column_usage<'a>(
         total += table
             .columns()
             .iter()
-            .filter(|column| column.not_null)
+            .filter(|column| column.not_null.is_required())
             .count();
         total += table.uniques().iter().map(|key| key.n_cols).sum::<usize>();
         total += table
@@ -8453,7 +8740,7 @@ fn info_constraint_column_usage<'a>(
                 };
                 append(table, table, column_index as u16, name.as_str())?;
             }
-            if column.not_null {
+            if column.not_null.is_required() {
                 let name = not_null_constraint_name(table, column);
                 append(table, table, column_index as u16, name.as_str())?;
             }
@@ -9083,7 +9370,7 @@ fn info_column_privileges<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
-                not_null: false,
+                not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -9383,7 +9670,7 @@ fn info_check_constraints<'a>(
             append(table.schema.as_str(), check.name.as_str(), clause.as_str())?;
         }
         for column in table.columns() {
-            if column.not_null {
+            if column.not_null.is_required() {
                 let name = not_null_constraint_name(table, column);
                 let clause = stack_format!(256, "{} IS NOT NULL", column.name.as_str());
                 append(table.schema.as_str(), name.as_str(), clause.as_str())?;
@@ -9535,7 +9822,7 @@ fn info_column_type_usage<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
-                not_null: false,
+                not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
                 auto_increment: false,

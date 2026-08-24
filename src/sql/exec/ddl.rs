@@ -87,7 +87,7 @@ fn empty_meta() -> ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
-        not_null: false,
+        not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -301,7 +301,7 @@ pub(super) fn build_column(
         } else {
             crate::sql::ast::Collation::None
         },
-        not_null: c.not_null || auto_increment,
+        not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
         unique: c.unique,
         primary: c.primary,
         auto_increment,
@@ -628,7 +628,8 @@ pub(super) fn attach_constraints(
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
                 for &column_index in &indices[..n] {
-                    def.columns[column_index as usize].not_null = true;
+                    def.columns[column_index as usize].not_null =
+                        def.columns[column_index as usize].not_null.add_local();
                 }
                 // An unnamed single-column key rides the column flag with a
                 // synthesized name; an explicitly named one is a first-class

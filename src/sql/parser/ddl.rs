@@ -1456,21 +1456,44 @@ impl<'a> Parser<'a> {
             // transactionally later with ALTER PUBLICATION.
             (false, &[][..], &[][..])
         };
-        let mut publish = PublicationOperations::ALL;
+        let mut publish = None;
+        let mut publish_via_partition_root = None;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
-            self.expect_ident("publish")?;
-            self.expect_op("=")?;
-            let value = self.str_literal("publication publish option")?;
-            publish = self.publication_operations(value)?;
+            loop {
+                if self.eat_ident("publish")? {
+                    if publish.is_some() {
+                        return Err(self.err_here("conflicting or redundant options"));
+                    }
+                    self.expect_op("=")?;
+                    let value = self.str_literal("publication publish option")?;
+                    publish = Some(self.publication_operations(value)?);
+                } else {
+                    self.expect_ident("publish_via_partition_root")?;
+                    if publish_via_partition_root.is_some() {
+                        return Err(self.err_here("conflicting or redundant options"));
+                    }
+                    publish_via_partition_root =
+                        Some(self.subscription_bool_option("publish_via_partition_root")?);
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
             self.expect_op(")")?;
         }
+        let publish = match publish {
+            Some(value) => value,
+            None => PublicationOperations::ALL,
+        };
+        let publish_via_partition_root = publish_via_partition_root.unwrap_or_default();
         Ok(Stmt::CreatePublication {
             name,
             all_tables,
             tables,
             schemas,
             publish,
+            publish_via_partition_root,
         })
     }
 
@@ -1592,7 +1615,7 @@ impl<'a> Parser<'a> {
         let value = match self.peeked {
             Tok::Ident("true" | "on") | Tok::Str("true" | "on" | "1") => true,
             Tok::Ident("false" | "off") | Tok::Str("false" | "off" | "0") => false,
-            _ => return Err(self.err_here("subscription option requires a boolean value")),
+            _ => return Err(self.err_here("option requires a boolean value")),
         };
         self.advance()?;
         Ok(value)
@@ -1611,12 +1634,33 @@ impl<'a> Parser<'a> {
             AlterPublicationAction::Rename(self.any_ident("new publication name")?)
         } else if self.eat_ident("set")? {
             if self.eat_op("(")? {
-                self.expect_ident("publish")?;
-                self.expect_op("=")?;
-                let value = self.str_literal("publication publish option")?;
-                let publish = self.publication_operations(value)?;
+                let mut publish = None;
+                let mut publish_via_partition_root = None;
+                loop {
+                    if self.eat_ident("publish")? {
+                        if publish.is_some() {
+                            return Err(self.err_here("conflicting or redundant options"));
+                        }
+                        self.expect_op("=")?;
+                        let value = self.str_literal("publication publish option")?;
+                        publish = Some(self.publication_operations(value)?);
+                    } else {
+                        self.expect_ident("publish_via_partition_root")?;
+                        if publish_via_partition_root.is_some() {
+                            return Err(self.err_here("conflicting or redundant options"));
+                        }
+                        publish_via_partition_root =
+                            Some(self.subscription_bool_option("publish_via_partition_root")?);
+                    }
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
                 self.expect_op(")")?;
-                AlterPublicationAction::SetOperations(publish)
+                AlterPublicationAction::SetOptions {
+                    publish,
+                    publish_via_partition_root,
+                }
             } else {
                 let (tables, schemas) = self.publication_targets()?;
                 AlterPublicationAction::SetTargets { tables, schemas }
@@ -2121,12 +2165,21 @@ impl<'a> Parser<'a> {
             self.expect_ident("of")?;
             let parent = self.qual_name("partitioned table name")?;
             let bound = self.partition_bound()?;
+            let subpartition = if self.eat_ident("partition")? {
+                Some(self.partition_by_clause()?)
+            } else {
+                None
+            };
             return Ok(Stmt::CreateTable(CreateTable {
                 name,
                 columns: &[],
                 constraints: &[],
                 likes: &[],
-                partition: PartitionClause::Of { parent, bound },
+                partition: PartitionClause::Of {
+                    parent,
+                    bound,
+                    subpartition,
+                },
                 if_not_exists,
             }));
         }
@@ -2369,33 +2422,10 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         let partition = if self.eat_ident("partition")? {
-            self.expect_ident("by")?;
-            let strategy = if self.eat_ident("range")? {
-                PartitionStrategy::Range
-            } else if self.eat_ident("list")? {
-                PartitionStrategy::List
-            } else if self.eat_ident("hash")? {
-                PartitionStrategy::Hash
-            } else {
-                return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
-            };
-            self.expect_op("(")?;
-            let mut columns = [""; MAX_LIST];
-            let mut n_columns = 0;
-            loop {
-                if n_columns == MAX_LIST {
-                    return Err(self.limit("partition key", MAX_LIST));
-                }
-                columns[n_columns] = self.col_ident("partition key column")?;
-                n_columns += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
+            let by = self.partition_by_clause()?;
             PartitionClause::By {
-                strategy,
-                columns: self.arena_slice(&columns[..n_columns])?,
+                strategy: by.strategy,
+                columns: by.columns,
             }
         } else {
             PartitionClause::None
@@ -2413,7 +2443,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {
+    pub(super) fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {
         if self.eat_ident("default")? {
             return Ok(PartitionBound::Default);
         }
@@ -2439,6 +2469,37 @@ impl<'a> Parser<'a> {
         let remainder = self.expression(0)?;
         self.expect_op(")")?;
         Ok(PartitionBound::Hash { modulus, remainder })
+    }
+
+    fn partition_by_clause(&mut self) -> Result<crate::sql::ast::PartitionBy<'a>, ParseError> {
+        self.expect_ident("by")?;
+        let strategy = if self.eat_ident("range")? {
+            PartitionStrategy::Range
+        } else if self.eat_ident("list")? {
+            PartitionStrategy::List
+        } else if self.eat_ident("hash")? {
+            PartitionStrategy::Hash
+        } else {
+            return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
+        };
+        self.expect_op("(")?;
+        let mut columns = [""; MAX_LIST];
+        let mut n_columns = 0;
+        loop {
+            if n_columns == MAX_LIST {
+                return Err(self.limit("partition key", MAX_LIST));
+            }
+            columns[n_columns] = self.col_ident("partition key column")?;
+            n_columns += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(crate::sql::ast::PartitionBy {
+            strategy,
+            columns: self.arena_slice(&columns[..n_columns])?,
+        })
     }
 
     fn partition_bound_values(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {

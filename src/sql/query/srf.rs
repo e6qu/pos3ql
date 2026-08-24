@@ -977,7 +977,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
-        not_null: false,
+        not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,
         auto_increment: false,

@@ -46,6 +46,10 @@ use scan::{
     scan_source_recycling_retaining_match_with_pax_columns, scan_source_recycling_with_pax_columns,
     scan_source_with_pax_columns,
 };
+pub(crate) use scan::{
+    RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
+    row_security_passes,
+};
 
 mod scope;
 pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};
@@ -309,11 +313,11 @@ mod aggregate;
 use aggregate::{AggState, fold_aggregates};
 
 mod srf;
-use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 pub(crate) use srf::{
-    is_srf_name as is_builtin_set_routine, synth_derived_def, synth_derived_def_outer,
-    table_func_rows_outer,
+    expression_has_project_set, is_srf_name as is_builtin_set_routine, synth_derived_def,
+    synth_derived_def_outer, table_func_rows_outer,
 };
+use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
 mod group;
 use group::{grouped_rows, grouped_select};
@@ -323,6 +327,7 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
+pub(crate) use subquery::expression_has_correlated_subquery;
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,

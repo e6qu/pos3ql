@@ -18,7 +18,7 @@ use crate::sql::eval::{
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage, rowenc};
+use crate::storage::{MAX_COLUMNS, PolicyCommandKind, Storage, rowenc};
 
 use super::plan::{
     MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
@@ -29,7 +29,238 @@ use super::{
     simplify_qual, where_passes,
 };
 
+#[derive(Clone, Copy)]
+struct ActivePolicyTables {
+    slots: [usize; MAX_JOIN_TABLES],
+    count: usize,
+}
+
+std::thread_local! {
+    static ACTIVE_POLICY_TABLES: core::cell::Cell<ActivePolicyTables> = const {
+        core::cell::Cell::new(ActivePolicyTables {
+            slots: [usize::MAX; MAX_JOIN_TABLES],
+            count: 0,
+        })
+    };
+}
+
+struct PolicyEvaluationGuard(ActivePolicyTables);
+
+impl Drop for PolicyEvaluationGuard {
+    fn drop(&mut self) {
+        ACTIVE_POLICY_TABLES.with(|active| active.set(self.0));
+    }
+}
+
 struct NoColumns;
+
+#[derive(Clone, Copy)]
+struct PolicyPredicate<'a> {
+    expression: &'a Expr<'a>,
+    permissive: bool,
+    group: u8,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RowSecurityPlan<'a> {
+    table: usize,
+    predicates: [PolicyPredicate<'a>; 2 * crate::storage::MAX_POLICIES_PER_TABLE],
+    count: usize,
+    groups: u8,
+    permissive_always: [bool; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RowSecurityExpression {
+    Using,
+    WithCheck,
+}
+
+pub(crate) fn plan_row_security<'a>(
+    storage: &Storage,
+    table: usize,
+    role: usize,
+    command: PolicyCommandKind,
+    expression_kind: RowSecurityExpression,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<RowSecurityPlan<'a>>, SqlError> {
+    if !storage.row_security_applies(table, role, txid) {
+        return Ok(None);
+    }
+    let definition = storage.table_def(table, txid);
+    if !crate::sql::guc::active_row_security() {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "query would be affected by row-level security policy for table \"{}\"",
+            definition.name.as_str()
+        ));
+    }
+    let mut predicates = [PolicyPredicate {
+        expression: &Expr::Null,
+        permissive: false,
+        group: 0,
+    }; 2 * crate::storage::MAX_POLICIES_PER_TABLE];
+    let mut count = 0usize;
+    let mut permissive_always = false;
+    for (_, policy) in storage.policies_for_table(table, txid) {
+        if !policy.command.applies_to(command) {
+            continue;
+        }
+        let policy_definition = policy.definition_for(txid);
+        if !policy_definition.roles.applies_to(storage, role, txid) {
+            continue;
+        }
+        let expression = match expression_kind {
+            RowSecurityExpression::Using => policy_definition.using,
+            RowSecurityExpression::WithCheck => policy_definition.with_check.or_else(|| {
+                matches!(
+                    policy.command,
+                    PolicyCommandKind::All | PolicyCommandKind::Update
+                )
+                .then_some(policy_definition.using)
+                .flatten()
+            }),
+        };
+        match expression {
+            Some(source) => {
+                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                predicates[count] = PolicyPredicate {
+                    expression: super::cte::expand_stored_expression(
+                        expression,
+                        storage,
+                        txid,
+                        &policy_definition.dependencies,
+                        arena,
+                    )?,
+                    permissive: policy.permissive,
+                    group: 0,
+                };
+                count += 1;
+            }
+            None if policy.permissive => permissive_always = true,
+            None => {}
+        }
+    }
+    Ok(Some(RowSecurityPlan {
+        table,
+        predicates,
+        count,
+        groups: 1,
+        permissive_always: [permissive_always, false],
+    }))
+}
+
+pub(crate) fn conjoin_row_security<'a>(
+    first: Option<RowSecurityPlan<'a>>,
+    second: Option<RowSecurityPlan<'a>>,
+) -> Option<RowSecurityPlan<'a>> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(plan), None) | (None, Some(plan)) => Some(plan),
+        (Some(mut first), Some(second)) => {
+            debug_assert_eq!(first.table, second.table);
+            debug_assert_eq!(first.groups, 1);
+            debug_assert_eq!(second.groups, 1);
+            for predicate in &second.predicates[..second.count] {
+                first.predicates[first.count] = PolicyPredicate {
+                    group: 1,
+                    ..*predicate
+                };
+                first.count += 1;
+            }
+            first.groups = 2;
+            first.permissive_always[1] = second.permissive_always[0];
+            Some(first)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn row_security_passes<'a>(
+    plan: RowSecurityPlan<'a>,
+    row: &impl ColumnLookup<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    base_hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    let guard = ACTIVE_POLICY_TABLES.with(|active| {
+        let prior = active.get();
+        if prior.slots[..prior.count].contains(&plan.table) {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "infinite recursion detected in policy for relation \"{}\"",
+                storage.table_def(plan.table, txid).name.as_str()
+            ));
+        }
+        if prior.count == prior.slots.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row-security policy chain exceeds {} relations",
+                prior.slots.len()
+            ));
+        }
+        let mut entered = prior;
+        entered.slots[entered.count] = plan.table;
+        entered.count += 1;
+        active.set(entered);
+        Ok(PolicyEvaluationGuard(prior))
+    })?;
+    let mark = arena.mark();
+    let result = (|| {
+        let mut expressions = [None; 2 * crate::storage::MAX_POLICIES_PER_TABLE];
+        for (index, predicate) in plan.predicates[..plan.count].iter().enumerate() {
+            expressions[index] = Some(predicate.expression);
+        }
+        let subqueries = super::subquery::subquery_hooks_outer(
+            &expressions[..plan.count],
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+        )?;
+        let hooks = EvalHooks {
+            group: None,
+            aggs: None,
+            subs: Some(&subqueries),
+            windows: None,
+            catalog: base_hooks.catalog,
+            srf_index: None,
+            project_sets: None,
+            sequences: base_hooks.sequences,
+        };
+        let mut permissive = plan.permissive_always;
+        for predicate in &plan.predicates[..plan.count] {
+            let passes = match eval_full(predicate.expression, arena, params, row, &hooks)? {
+                Datum::Bool(value) => value,
+                Datum::Null => false,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "row-level security policy expression must be type boolean"
+                    ));
+                }
+            };
+            if predicate.permissive {
+                permissive[usize::from(predicate.group)] |= passes;
+            } else if !passes {
+                return Ok(false);
+            }
+        }
+        Ok(permissive[..usize::from(plan.groups)]
+            .iter()
+            .all(|value| *value))
+    })();
+    // SAFETY: policy subquery values and evaluator scratch do not escape this
+    // boolean gate; the parsed policy expressions were allocated before mark.
+    unsafe { arena.rewind_to(mark) };
+    drop(guard);
+    result
+}
 
 impl<'a> ColumnLookup<'a> for NoColumns {
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -127,6 +358,7 @@ pub(super) enum PaxFullRowReason {
     IncompleteScope,
     WildcardProjection,
     UnprovableExpression,
+    RowSecurityPolicy,
 }
 
 /// The only two legal physical read modes for a source scan.
@@ -165,7 +397,8 @@ impl PaxReadDemand {
                 reason:
                     PaxFullRowReason::IncompleteScope
                     | PaxFullRowReason::WildcardProjection
-                    | PaxFullRowReason::UnprovableExpression,
+                    | PaxFullRowReason::UnprovableExpression
+                    | PaxFullRowReason::RowSecurityPolicy,
                 columns,
             } => {
                 debug_assert!(columns.masks.iter().all(|mask| *mask == 0));
@@ -1488,6 +1721,29 @@ fn scan_source_mode<'a>(
             storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
+    let security_plans = arena
+        .alloc_slice_with(scope.n, |_| None::<RowSecurityPlan<'a>>)
+        .map_err(|_| arena_full())?;
+    for (table, plan) in security_plans.iter_mut().enumerate() {
+        if scope.derived[table].is_some() {
+            continue;
+        }
+        let role = scope.authorization_roles[table].map_or(current_role, usize::from);
+        *plan = plan_row_security(
+            storage,
+            scope.slots[table],
+            role,
+            PolicyCommandKind::Select,
+            RowSecurityExpression::Using,
+            txid,
+            arena,
+        )?;
+    }
+    let pax_demand = if security_plans.iter().any(Option::is_some) {
+        PaxReadDemand::full_row(PaxFullRowReason::RowSecurityPolicy)
+    } else {
+        pax_demand
+    };
     fn recycled<R>(
         arena: &Arena,
         enabled: bool,
@@ -2285,6 +2541,7 @@ fn scan_source_mode<'a>(
         bound_rowids: &mut [Option<u64>],
         matched: &[Option<&[core::cell::Cell<bool>]>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
+        security_plans: &[Option<RowSecurityPlan<'a>>],
         pushdown: &[&[&'a Expr<'a>]],
         order: &[usize],
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
@@ -2292,6 +2549,28 @@ fn scan_source_mode<'a>(
     ) -> Result<bool, SqlError> {
         bound[order[depth]] = Some(candidate);
         bound_rowids[order[depth]] = rowid;
+        let source = order[depth];
+        if let Some(plan) = security_plans[source] {
+            let assembled = assemble(
+                storage,
+                txid,
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                depth + 1,
+                decode_buffers,
+                arena,
+            )?;
+            let context = crate::sql::exec::RowCtx {
+                def: scope.defs[source].expect("row-security source is resolved"),
+                values: assembled.values[source].expect("row-security row is bound"),
+                alias: None,
+            };
+            if !row_security_passes(plan, &context, storage, txid, arena, params, hooks)? {
+                return Ok(false);
+            }
+        }
         if !candidate_passes(
             storage,
             txid,
@@ -2337,6 +2616,7 @@ fn scan_source_mode<'a>(
         // level's table, marking those that found a left partner.
         matched: &[Option<&[core::cell::Cell<bool>]>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
+        security_plans: &[Option<RowSecurityPlan<'a>>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
         pushdown: &[&[&'a Expr<'a>]],
         // Execution order: `order[depth]` is the scope-table joined at this depth
@@ -2399,6 +2679,7 @@ fn scan_source_mode<'a>(
                     bound_rowids,
                     matched,
                     external_match_writer,
+                    security_plans,
                     pushdown,
                     order,
                     decode_buffers,
@@ -2422,6 +2703,7 @@ fn scan_source_mode<'a>(
                         bound_rowids,
                         matched,
                         external_match_writer,
+                        security_plans,
                         pushdown,
                         order,
                         indexed,
@@ -2746,6 +3028,7 @@ fn scan_source_mode<'a>(
                 bound_rowids,
                 matched,
                 external_match_writer,
+                security_plans,
                 pushdown,
                 order,
                 indexed,
@@ -2891,7 +3174,10 @@ fn scan_source_mode<'a>(
     let decode_buffers = arena
         .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
         .map_err(|_| arena_full())?;
-    let hash_plan = if retain_match.is_none() {
+    // A row-security predicate is a security barrier ahead of every user ON
+    // and WHERE expression. The nested plan owns that ordering explicitly;
+    // the hash plan is selected only when no protected source participates.
+    let hash_plan = if retain_match.is_none() && security_plans.iter().all(Option::is_none) {
         select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?
     } else {
         None
@@ -2942,6 +3228,7 @@ fn scan_source_mode<'a>(
             bound_rowids,
             matched,
             external_match_writer,
+            security_plans,
             pushdown,
             order,
             indexed.as_ref(),
@@ -2988,61 +3275,84 @@ fn scan_source_mode<'a>(
             } else {
                 None
             };
-            let mut emit_unmatched =
-                |candidate: BoundRow<'a>,
-                 rowid: Option<u64>,
-                 f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>|
-                 -> Result<bool, SqlError> {
-                    bound.fill(None);
-                    bound_rowids.fill(None);
-                    bound[d] = Some(candidate);
-                    bound_rowids[d] = rowid;
-                    if d + 1 == scope.n {
-                        // Last level: the row is complete once the left side nulls.
-                        let row = assemble(
-                            storage,
-                            txid,
-                            scope,
-                            bound,
-                            bound_rowids,
-                            order,
-                            scope.n,
-                            decode_buffers,
-                            arena,
-                        )?;
-                        if let Some(w) = where_clause {
-                            let chained_row = Chained { inner: &row, outer };
-                            if !where_passes(w, arena, params, &chained_row, hooks)? {
-                                return Ok(true);
-                            }
-                        }
-                        return f(&row);
-                    }
-                    level(
+            let mut emit_unmatched = |candidate: BoundRow<'a>,
+                                      rowid: Option<u64>,
+                                      f: &mut dyn FnMut(
+                &JoinRow<'_, 'a, '_>,
+            ) -> Result<bool, SqlError>|
+             -> Result<bool, SqlError> {
+                bound.fill(None);
+                bound_rowids.fill(None);
+                bound[d] = Some(candidate);
+                bound_rowids[d] = rowid;
+                if let Some(plan) = security_plans[d] {
+                    let row = assemble(
                         storage,
-                        scope,
-                        from,
                         txid,
-                        where_clause,
-                        arena,
-                        params,
-                        hooks,
-                        outer,
-                        d + 1,
+                        scope,
                         bound,
                         bound_rowids,
-                        matched,
-                        external_match_writer,
-                        pushdown,
                         order,
-                        indexed.as_ref(),
+                        d + 1,
                         decode_buffers,
-                        recycle_rows,
-                        retain_match,
-                        pax_demand,
-                        f,
-                    )
-                };
+                        arena,
+                    )?;
+                    let context = crate::sql::exec::RowCtx {
+                        def: scope.defs[d].expect("row-security source is resolved"),
+                        values: row.values[d].expect("row-security row is bound"),
+                        alias: None,
+                    };
+                    if !row_security_passes(plan, &context, storage, txid, arena, params, hooks)? {
+                        return Ok(true);
+                    }
+                }
+                if d + 1 == scope.n {
+                    // Last level: the row is complete once the left side nulls.
+                    let row = assemble(
+                        storage,
+                        txid,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        scope.n,
+                        decode_buffers,
+                        arena,
+                    )?;
+                    if let Some(w) = where_clause {
+                        let chained_row = Chained { inner: &row, outer };
+                        if !where_passes(w, arena, params, &chained_row, hooks)? {
+                            return Ok(true);
+                        }
+                    }
+                    return f(&row);
+                }
+                level(
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    d + 1,
+                    bound,
+                    bound_rowids,
+                    matched,
+                    external_match_writer,
+                    security_plans,
+                    pushdown,
+                    order,
+                    indexed.as_ref(),
+                    decode_buffers,
+                    recycle_rows,
+                    retain_match,
+                    pax_demand,
+                    f,
+                )
+            };
             if let Some(run) = scope.external_runs[d] {
                 let mut reader = storage.external_run_reader()?;
                 let mut index = 0usize;

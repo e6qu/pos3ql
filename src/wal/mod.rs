@@ -115,6 +115,8 @@ const KIND_FAIL_SUBSCRIPTION: u8 = 65;
 const KIND_SET_SUBSCRIPTION_OWNER: u8 = 66;
 const KIND_RENAME_SUBSCRIPTION: u8 = 67;
 const KIND_ALTER_REPLICATION_SLOT: u8 = 68;
+const KIND_SET_POLICY: u8 = 69;
+const KIND_DROP_POLICY: u8 = 70;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -122,7 +124,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_REPLICATION_SLOT;
+const LAST_KIND: u8 = KIND_DROP_POLICY;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -398,6 +400,7 @@ pub(crate) enum WalOp<'a> {
         sql: &'a str,
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
+        security_invoker: bool,
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
@@ -552,6 +555,23 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         new_name: &'a str,
         enabled: u8,
+    },
+    SetPolicy {
+        schema: &'a str,
+        table: &'a str,
+        name: &'a str,
+        command: u8,
+        permissive: bool,
+        roles: [SqlName; crate::storage::MAX_POLICY_ROLES],
+        role_count: usize,
+        using: Option<&'a str>,
+        with_check: Option<&'a str>,
+        dependencies: WalStoredQueryDependencies<'a>,
+    },
+    DropPolicy {
+        schema: &'a str,
+        table: &'a str,
+        name: &'a str,
     },
     /// Marks every preceding record in the committed batch as one atomic
     /// transaction. It has no storage replay effect of its own.
@@ -1458,6 +1478,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
         WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
+        WalOp::SetPolicy { .. } => KIND_SET_POLICY,
+        WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
@@ -1564,6 +1586,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n += def.n_columns;
             n += encoded_partition_len(def.partition);
+            n += 2;
             n
         }
         WalOp::BeginTableRewrite {
@@ -1603,6 +1626,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             sql,
             path,
+            security_invoker: _,
             dependencies,
         } => {
             1 + name.len()
@@ -1612,6 +1636,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + schema.len()
                 + 2
                 + path.len()
+                + 1
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
@@ -1769,6 +1794,38 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             new_name,
             ..
         } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
+        WalOp::SetPolicy {
+            schema,
+            table,
+            name,
+            roles,
+            role_count,
+            using,
+            with_check,
+            dependencies,
+            ..
+        } => {
+            1 + schema.len()
+                + 1
+                + table.len()
+                + 1
+                + name.len()
+                + 3
+                + roles[..*role_count]
+                    .iter()
+                    .map(|role| 1 + role.as_str().len())
+                    .sum::<usize>()
+                + 2
+                + using.map_or(0, str::len)
+                + 2
+                + with_check.map_or(0, str::len)
+                + dependencies.encoded_len()
+        }
+        WalOp::DropPolicy {
+            schema,
+            table,
+            name,
+        } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
         WalOp::Commit { .. } => 4,
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8 + 1,
         WalOp::AlterReplicationSlot { name, .. } => 1 + name.len() + 1,
@@ -2318,6 +2375,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }]);
             }
             ok &= append_partition(buffer, def.partition);
+            ok &= buffer.append(&[
+                u8::from(def.row_level_security.enabled),
+                u8::from(def.row_level_security.forced),
+            ]);
             ok
         }
         WalOp::BeginTableRewrite {
@@ -2390,6 +2451,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             sql,
             path,
+            security_invoker,
             dependencies,
         } => {
             name_bytes(buffer, name)
@@ -2398,6 +2460,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
+                && buffer.append(&[u8::from(*security_invoker)])
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
@@ -3179,6 +3242,41 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, new_name)
                 && buffer.append(&[*enabled])
         }
+        WalOp::SetPolicy {
+            schema,
+            table,
+            name,
+            command,
+            permissive,
+            roles,
+            role_count,
+            using,
+            with_check,
+            dependencies,
+        } => {
+            let append_expression = |buffer: &mut FixedBuf, value: Option<&str>| {
+                let length = value.map_or(u16::MAX, |source| source.len() as u16);
+                buffer.append(&length.to_le_bytes())
+                    && value.is_none_or(|source| buffer.append(source.as_bytes()))
+            };
+            name_bytes(buffer, schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, name)
+                && buffer.append(&[*command, u8::from(*permissive)])
+                && (*role_count <= crate::storage::MAX_POLICY_ROLES)
+                && buffer.append(&[*role_count as u8])
+                && roles[..*role_count]
+                    .iter()
+                    .all(|role| name_bytes(buffer, role.as_str()))
+                && append_expression(buffer, *using)
+                && append_expression(buffer, *with_check)
+                && dependencies.append(buffer)
+        }
+        WalOp::DropPolicy {
+            schema,
+            table,
+            name,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, table) && name_bytes(buffer, name),
     }
 }
 
@@ -3668,6 +3766,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
             }
             def.partition = decode_partition(payload, &mut at)?;
+            def.row_level_security = crate::storage::RowLevelSecurityState {
+                enabled: match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                forced: match *payload.get(at + 1)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+            };
+            at += 2;
             (at == payload.len()).then_some(WalOp::CreateTable(def))
         }
         KIND_REWRITE_TABLE => {
@@ -3810,6 +3921,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let raw = payload.get(at..at + path_len)?;
             at += path_len;
             let path = core::str::from_utf8(raw).ok()?;
+            let security_invoker = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
                 return None;
@@ -3821,6 +3938,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 sql,
                 path,
+                security_invoker,
                 dependencies,
             })
         }
@@ -4259,6 +4377,66 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 new_name,
                 enabled,
+            })
+        }
+        KIND_SET_POLICY => {
+            let schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let command = *payload.get(at)?;
+            crate::storage::PolicyCommandKind::from_code(command)?;
+            let permissive = match *payload.get(at + 1)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 2;
+            let role_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if role_count == 0 || role_count > crate::storage::MAX_POLICY_ROLES {
+                return None;
+            }
+            let mut roles = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
+            for role in &mut roles[..role_count] {
+                *role = SqlName::parse(take_name(&mut at)?).ok()?;
+            }
+            let mut take_expression = || {
+                let length = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                if length == u16::MAX {
+                    return Some(None);
+                }
+                let length = usize::from(length);
+                let source = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                at += length;
+                Some(Some(source))
+            };
+            let using = take_expression()?;
+            let with_check = take_expression()?;
+            let encoded = payload.get(at..)?;
+            decode_stored_query_dependencies(encoded)?;
+            at = payload.len();
+            (at == payload.len()).then_some(WalOp::SetPolicy {
+                schema,
+                table,
+                name,
+                command,
+                permissive,
+                roles,
+                role_count,
+                using,
+                with_check,
+                dependencies: WalStoredQueryDependencies::Encoded(encoded),
+            })
+        }
+        KIND_DROP_POLICY => {
+            let schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropPolicy {
+                schema,
+                table,
+                name,
             })
         }
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
@@ -6305,6 +6483,68 @@ mod tests {
         };
         assert_eq!(target, TriggerTargetKind::View);
         assert_eq!(timing, 2);
+    }
+
+    #[test]
+    fn policy_and_view_security_payloads_roundtrip() {
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "security payload", 4096).unwrap();
+        let mut roles = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
+        roles[0] = SqlName::parse("reader").unwrap();
+        let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetPolicy {
+                schema: "public",
+                table: "protected",
+                name: "reader_rows",
+                command: crate::storage::PolicyCommandKind::Update.code(),
+                permissive: false,
+                roles,
+                role_count: 1,
+                using: Some("tenant = 'reader'"),
+                with_check: Some("tenant = current_user"),
+                dependencies: WalStoredQueryDependencies::Captured(&dependencies),
+            },
+        ));
+        let Some(WalOp::SetPolicy {
+            command,
+            permissive,
+            roles,
+            role_count,
+            using,
+            with_check,
+            ..
+        }) = decode_op(KIND_SET_POLICY, payload.readable())
+        else {
+            panic!("policy payload did not decode");
+        };
+        assert_eq!(command, crate::storage::PolicyCommandKind::Update.code());
+        assert!(!permissive);
+        assert_eq!(role_count, 1);
+        assert_eq!(roles[0].as_str(), "reader");
+        assert_eq!(using, Some("tenant = 'reader'"));
+        assert_eq!(with_check, Some("tenant = current_user"));
+
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateView {
+                schema: "public",
+                name: "reader_view",
+                sql: "SELECT * FROM protected",
+                path: "public",
+                security_invoker: true,
+                dependencies: WalStoredQueryDependencies::Captured(&dependencies),
+            },
+        ));
+        assert!(matches!(
+            decode_op(KIND_CREATE_VIEW, payload.readable()),
+            Some(WalOp::CreateView {
+                security_invoker: true,
+                ..
+            })
+        ));
     }
 
     #[test]

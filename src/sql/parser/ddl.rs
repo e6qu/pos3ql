@@ -13,12 +13,13 @@ use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
     AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming, ConstraintValidation,
     CreateDomain, CreateRoutine, CreateSchemaElement, CreateTrigger, DomainCheck,
-    ExclusionOperator, Expr, PartitionBound, PartitionClause, PartitionStrategy,
-    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect,
-    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
-    SubscriptionStreaming, SubscriptionSynchronousCommit, TriggerEvent, TriggerIdentity,
-    TriggerTiming, TriggerTransitionTables,
+    ExclusionOperator, Expr, PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand,
+    PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations,
+    PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
+    RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TriggerEvent, TriggerIdentity, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -123,6 +124,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("trigger")? {
             return self.create_trigger();
         }
+        if self.eat_ident("policy")? {
+            return self.create_policy();
+        }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             return self.create_materialized_view();
@@ -152,6 +156,153 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn policy_expression(&mut self) -> Result<PolicyExpression<'a>, ParseError> {
+        self.expect_op("(")?;
+        let start = self.peek_at;
+        let expression = self.expression(0)?;
+        let source = self.arena_str(self.text[start..self.peek_at].trim_end())?;
+        self.expect_op(")")?;
+        Ok(PolicyExpression { expression, source })
+    }
+
+    fn policy_roles(&mut self) -> Result<&'a [PolicyRole<'a>], ParseError> {
+        let mut roles = [PolicyRole::Public; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == roles.len() {
+                return Err(self.limit("policy roles", roles.len()));
+            }
+            roles[count] = if self.eat_ident("public")? {
+                PolicyRole::Public
+            } else if self.eat_ident("current_role")? {
+                PolicyRole::CurrentRole
+            } else if self.eat_ident("current_user")? {
+                PolicyRole::CurrentUser
+            } else if self.eat_ident("session_user")? {
+                PolicyRole::SessionUser
+            } else {
+                PolicyRole::Named(self.any_ident("policy role")?)
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&roles[..count])
+    }
+
+    /// CREATE POLICY's command kind decides which expression clauses can
+    /// exist, so illegal INSERT/SELECT/DELETE shapes never enter the AST.
+    fn create_policy(&mut self) -> Result<Stmt<'a>, ParseError> {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            All,
+            Select,
+            Insert,
+            Update,
+            Delete,
+        }
+
+        let name = self.col_ident("policy name")?;
+        self.expect_ident("on")?;
+        let table = self.qual_name("policy table")?;
+        let permissiveness = if self.eat_ident("as")? {
+            if self.eat_ident("permissive")? {
+                PolicyPermissiveness::Permissive
+            } else {
+                self.expect_ident("restrictive")?;
+                PolicyPermissiveness::Restrictive
+            }
+        } else {
+            PolicyPermissiveness::Permissive
+        };
+        let kind = if self.eat_ident("for")? {
+            if self.eat_ident("all")? {
+                Kind::All
+            } else if self.eat_ident("select")? {
+                Kind::Select
+            } else if self.eat_ident("insert")? {
+                Kind::Insert
+            } else if self.eat_ident("update")? {
+                Kind::Update
+            } else if self.eat_ident("delete")? {
+                Kind::Delete
+            } else {
+                return Err(self.unexpected("expected ALL, SELECT, INSERT, UPDATE, or DELETE"));
+            }
+        } else {
+            Kind::All
+        };
+        let roles = if self.eat_ident("to")? {
+            self.policy_roles()?
+        } else {
+            self.arena_slice(&[PolicyRole::Public])?
+        };
+        let using = if self.eat_ident("using")? {
+            Some(self.policy_expression()?)
+        } else {
+            None
+        };
+        let with_check = if self.eat_ident("with")? {
+            self.expect_ident("check")?;
+            Some(self.policy_expression()?)
+        } else {
+            None
+        };
+        let command = match kind {
+            Kind::All => PolicyCommand::All { using, with_check },
+            Kind::Select if with_check.is_none() => PolicyCommand::Select { using },
+            Kind::Insert if using.is_none() => PolicyCommand::Insert { with_check },
+            Kind::Update => PolicyCommand::Update { using, with_check },
+            Kind::Delete if with_check.is_none() => PolicyCommand::Delete { using },
+            Kind::Select | Kind::Delete => {
+                return Err(self.err_here("WITH CHECK cannot be applied to SELECT or DELETE"));
+            }
+            Kind::Insert => {
+                return Err(self.err_here("USING cannot be applied to INSERT"));
+            }
+        };
+        Ok(Stmt::CreatePolicy(crate::sql::ast::CreatePolicy {
+            name,
+            table,
+            permissiveness,
+            roles,
+            command,
+        }))
+    }
+
+    pub(super) fn alter_policy(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let identity = PolicyIdentity {
+            name: self.col_ident("policy name")?,
+            table: {
+                self.expect_ident("on")?;
+                self.qual_name("policy table")?
+            },
+        };
+        let roles = if self.eat_ident("to")? {
+            Some(self.policy_roles()?)
+        } else {
+            None
+        };
+        let using = if self.eat_ident("using")? {
+            Some(self.policy_expression()?)
+        } else {
+            None
+        };
+        let with_check = if self.eat_ident("with")? {
+            self.expect_ident("check")?;
+            Some(self.policy_expression()?)
+        } else {
+            None
+        };
+        Ok(Stmt::AlterPolicy(crate::sql::ast::AlterPolicy {
+            identity,
+            roles,
+            using,
+            with_check,
+        }))
     }
 
     /// CREATE TRIGGER forms with a complete durable execution model.
@@ -1246,10 +1397,12 @@ impl<'a> Parser<'a> {
                 Stmt::CreateView {
                     name,
                     or_replace,
+                    security,
                     sql,
                 } => CreateSchemaElement::View {
                     name,
                     or_replace,
+                    security,
                     sql,
                 },
                 Stmt::CreateIndex {
@@ -1430,6 +1583,29 @@ impl<'a> Parser<'a> {
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("view name")?;
+        let mut security = ViewSecurity::Definer;
+        if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            let mut seen_security = false;
+            loop {
+                if !self.eat_ident("security_invoker")? {
+                    return Err(self.err_here("unsupported view option"));
+                }
+                if seen_security {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
+                seen_security = true;
+                security = if self.subscription_bool_option("security_invoker")? {
+                    ViewSecurity::Invoker
+                } else {
+                    ViewSecurity::Definer
+                };
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+        }
         self.expect_ident("as")?;
         // Capture the raw SELECT text (re-parsed at query time).
         let start = self.peek_at;
@@ -1440,6 +1616,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateView {
             name,
             or_replace,
+            security,
             sql,
         })
     }
@@ -2035,6 +2212,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("trigger")? {
             return self.drop_trigger();
         }
+        if self.eat_ident("policy")? {
+            return self.drop_policy();
+        }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             let (names, if_exists) = self.drop_targets("materialized view name")?;
@@ -2251,6 +2431,29 @@ impl<'a> Parser<'a> {
         Ok(Stmt::DropTrigger {
             triggers: self.arena_slice(&triggers[..count])?,
             if_exists,
+        })
+    }
+
+    fn drop_policy(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.col_ident("policy name")?;
+        self.expect_ident("on")?;
+        let table = self.qual_name("policy table")?;
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropPolicy {
+            policy: PolicyIdentity { name, table },
+            if_exists,
+            cascade,
         })
     }
 

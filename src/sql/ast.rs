@@ -12,6 +12,13 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+/// The privilege identity used while expanding a view body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSecurity {
+    Definer,
+    Invoker,
+}
+
 /// One explicitly named relation in a publication.  An empty `columns` slice
 /// means the PostgreSQL default: publish every column.  Keeping the selected
 /// names beside their relation prevents later execution from losing a column
@@ -115,6 +122,7 @@ pub enum CreateSchemaElement<'a> {
     View {
         name: QualName<'a>,
         or_replace: bool,
+        security: ViewSecurity,
         sql: &'a str,
     },
     Index {
@@ -266,6 +274,7 @@ pub enum Stmt<'a> {
     CreateView {
         name: QualName<'a>,
         or_replace: bool,
+        security: ViewSecurity,
         sql: &'a str,
     },
     /// A SQL routine retains its parsed invocation contract and body spelling.
@@ -361,6 +370,16 @@ pub enum Stmt<'a> {
     DropTrigger {
         triggers: &'a [TriggerIdentity<'a>],
         if_exists: bool,
+    },
+    /// A row-security policy whose command-specific expression shape was
+    /// validated while parsing. In particular, INSERT cannot carry USING and
+    /// SELECT/DELETE cannot carry WITH CHECK.
+    CreatePolicy(CreatePolicy<'a>),
+    AlterPolicy(AlterPolicy<'a>),
+    DropPolicy {
+        policy: PolicyIdentity<'a>,
+        if_exists: bool,
+        cascade: bool,
     },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
@@ -2239,7 +2258,11 @@ pub enum AlterAction<'a> {
         to: &'a str,
     },
     AddColumn(ColumnDef<'a>),
-    DropColumn(&'a str),
+    DropColumn {
+        name: &'a str,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// ALTER [COLUMN] col SET DEFAULT expr.
     SetDefault {
         column: &'a str,
@@ -2302,6 +2325,7 @@ pub enum AlterAction<'a> {
         target: TriggerEnableTarget<'a>,
         enabled: TriggerEnableMode,
     },
+    SetRowLevelSecurity(RowLevelSecurityAlteration),
     AttachPartition {
         child: QualName<'a>,
         bound: PartitionBound<'a>,
@@ -2336,6 +2360,91 @@ pub enum TriggerEnableTarget<'a> {
     Name(&'a str),
     All,
     User,
+}
+
+/// ALTER TABLE's independently durable row-security flags. ENABLE controls
+/// whether policies apply; FORCE controls whether the table owner is subject
+/// to them. Keeping the four commands distinct prevents one flag from being
+/// inferred from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLevelSecurityAlteration {
+    Enable,
+    Disable,
+    Force,
+    NoForce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyPermissiveness {
+    Permissive,
+    Restrictive,
+}
+
+/// PostgreSQL role specifications accepted by a policy TO clause. PUBLIC is
+/// a real all-roles state, not a role name; the three dynamic spellings are
+/// resolved to catalog identities when the DDL executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRole<'a> {
+    Public,
+    CurrentRole,
+    CurrentUser,
+    SessionUser,
+    Named(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolicyExpression<'a> {
+    pub expression: &'a Expr<'a>,
+    pub source: &'a str,
+}
+
+/// The legal expression shape for each CREATE POLICY command. This enum is
+/// the parse boundary: invalid USING/WITH CHECK combinations cannot reach the
+/// catalog as a bag of optional fields.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PolicyCommand<'a> {
+    All {
+        using: Option<PolicyExpression<'a>>,
+        with_check: Option<PolicyExpression<'a>>,
+    },
+    Select {
+        using: Option<PolicyExpression<'a>>,
+    },
+    Insert {
+        with_check: Option<PolicyExpression<'a>>,
+    },
+    Update {
+        using: Option<PolicyExpression<'a>>,
+        with_check: Option<PolicyExpression<'a>>,
+    },
+    Delete {
+        using: Option<PolicyExpression<'a>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatePolicy<'a> {
+    pub name: &'a str,
+    pub table: QualName<'a>,
+    pub permissiveness: PolicyPermissiveness,
+    pub roles: &'a [PolicyRole<'a>],
+    pub command: PolicyCommand<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyIdentity<'a> {
+    pub name: &'a str,
+    pub table: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlterPolicy<'a> {
+    pub identity: PolicyIdentity<'a>,
+    /// None means retain the role list; Some(empty) is impossible because the
+    /// parser requires at least one role after TO.
+    pub roles: Option<&'a [PolicyRole<'a>]>,
+    pub using: Option<PolicyExpression<'a>>,
+    pub with_check: Option<PolicyExpression<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

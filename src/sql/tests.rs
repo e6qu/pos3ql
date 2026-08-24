@@ -490,7 +490,7 @@ fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
 }
 
 fn test_engine() -> (Engine, Budget) {
-    test_engine_with_budget(1 << 26)
+    test_engine_with_budget(1 << 27)
 }
 
 fn test_engine_with_budget(bytes: usize) -> (Engine, Budget) {
@@ -1119,6 +1119,698 @@ fn object_ownership_and_acl_enforce_and_replay() {
 }
 
 #[test]
+fn row_level_security_composes_and_survives_recovery() {
+    let config = test_config("row-level-security-recovery");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE policy_owner;
+         CREATE ROLE policy_reader;
+         CREATE ROLE policy_blocked;
+         GRANT CREATE ON SCHEMA public TO policy_owner;
+         SET ROLE policy_owner;
+         CREATE TABLE protected_rows (tenant text, visible boolean, value integer);
+         INSERT INTO protected_rows VALUES
+           ('policy_reader', true, 1),
+           ('policy_reader', false, 2),
+           ('policy_blocked', true, 3);
+         ALTER TABLE protected_rows ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY reader_rows ON protected_rows
+           AS PERMISSIVE FOR ALL TO policy_reader
+           USING (tenant = 'policy_reader') WITH CHECK (tenant = 'policy_reader');
+         CREATE POLICY visible_rows ON protected_rows
+           AS RESTRICTIVE FOR SELECT TO policy_reader USING (visible);
+         GRANT SELECT, INSERT, UPDATE, DELETE ON protected_rows TO policy_reader;
+         GRANT SELECT ON protected_rows TO policy_blocked;
+         CREATE VIEW protected_definer AS SELECT value FROM protected_rows;
+         CREATE VIEW protected_invoker WITH (security_invoker=true) AS
+           SELECT value FROM protected_rows;
+         GRANT SELECT ON protected_definer, protected_invoker TO policy_reader;
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let selected = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE policy_reader;
+         SELECT value FROM protected_rows ORDER BY value;
+         INSERT INTO protected_rows VALUES ('policy_reader', true, 4);
+         UPDATE protected_rows SET value = value + 10 WHERE value = 4 RETURNING value;
+         DELETE FROM protected_rows WHERE value = 14 RETURNING value;
+         RESET ROLE;
+         SET ROLE policy_blocked;
+         SELECT count(*) FROM protected_rows;",
+    );
+    assert_eq!(data_rows(&selected), ["1", "14", "14", "0"]);
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; SET ROLE policy_reader;
+         INSERT INTO protected_rows VALUES ('policy_blocked', true, 5)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("new row violates row-level security policy"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE;
+         SELECT relrowsecurity, relforcerowsecurity
+           FROM pg_class WHERE relname = 'protected_rows';
+         SELECT policyname, permissive, cmd
+           FROM pg_policies WHERE tablename = 'protected_rows' ORDER BY policyname;",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        [
+            "t|f",
+            "reader_rows|PERMISSIVE|ALL",
+            "visible_rows|RESTRICTIVE|SELECT",
+        ]
+    );
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE protected_rows RENAME tenant TO account_name;
+         SELECT qual, with_check FROM pg_policies
+           WHERE policyname = 'reader_rows';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&renamed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&renamed)
+    );
+    assert_eq!(
+        data_rows(&renamed),
+        ["account_name = 'policy_reader'|account_name = 'policy_reader'"]
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SET ROLE policy_reader;
+         SELECT value FROM protected_rows ORDER BY value;
+         SELECT value FROM protected_definer ORDER BY value;
+         SELECT value FROM protected_invoker ORDER BY value;
+         RESET ROLE;
+         SELECT reloptions FROM pg_class WHERE relname = 'protected_invoker'",
+    );
+    assert_eq!(
+        data_rows(&recovered_rows),
+        ["1", "1", "2", "3", "1", "{security_invoker=true}"]
+    );
+}
+
+#[test]
+fn policy_column_dependencies_restrict_cascade_rollback_and_recover() {
+    let config = test_config("policy-column-dependencies");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE policy_dep_source (id integer, tenant text, keep text);
+         CREATE TABLE policy_dep_target (id integer);
+         ALTER TABLE policy_dep_source ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE policy_dep_target ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY source_tenant ON policy_dep_source USING (tenant = current_user);
+         CREATE POLICY target_tenant ON policy_dep_target
+           USING (EXISTS (SELECT 1 FROM policy_dep_source WHERE tenant = current_user));
+         CREATE POLICY target_unrelated ON policy_dep_target USING (id > 0);
+         CREATE VIEW policy_dep_view AS SELECT tenant FROM policy_dep_source;
+         CREATE VIEW policy_dep_view_chain AS SELECT tenant FROM policy_dep_view;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE policy_dep_source DROP COLUMN tenant",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_policy
+               WHERE polname IN ('source_tenant', 'target_tenant', 'target_unrelated');
+             SELECT tenant FROM policy_dep_source;
+             SELECT tenant FROM policy_dep_view_chain;",
+        )),
+        ["3"]
+    );
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER TABLE policy_dep_source DROP COLUMN tenant CASCADE;
+         ROLLBACK;
+         SELECT count(*) FROM pg_policy
+           WHERE polname IN ('source_tenant', 'target_tenant', 'target_unrelated');
+         SELECT tenant FROM policy_dep_view_chain;",
+    );
+    assert_eq!(data_rows(&rolled_back), ["3"]);
+
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE policy_dep_source DROP COLUMN IF EXISTS missing;
+         ALTER TABLE policy_dep_source DROP COLUMN tenant CASCADE;
+         SELECT polname FROM pg_policy WHERE polrelid = 'policy_dep_target'::regclass;
+         SELECT keep FROM policy_dep_source;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&cascaded).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+    assert_eq!(data_rows(&cascaded), ["target_unrelated"]);
+    for view in ["policy_dep_view", "policy_dep_view_chain"] {
+        let output = run_with(&mut engine, &mut budget, &format!("SELECT * FROM {view}"));
+        assert!(
+            String::from_utf8_lossy(&output).contains("42P01"),
+            "{view}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT polname FROM pg_policy WHERE polrelid = 'policy_dep_target'::regclass;
+             SELECT column_name FROM information_schema.columns
+              WHERE table_name = 'policy_dep_source' ORDER BY ordinal_position;",
+        )),
+        ["target_unrelated", "id", "keep"]
+    );
+}
+
+#[test]
+fn policy_catalog_dependencies_follow_restrict_and_cascade() {
+    let config = test_config("policy-catalog-dependencies");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE policy_object_reader;
+         CREATE TABLE policy_object_target (id integer);
+         INSERT INTO policy_object_target VALUES (1);
+         GRANT SELECT ON policy_object_target TO policy_object_reader;
+         ALTER TABLE policy_object_target ENABLE ROW LEVEL SECURITY;
+         CREATE TABLE policy_object_source (id integer);
+         INSERT INTO policy_object_source VALUES (1);
+         GRANT SELECT ON policy_object_source TO policy_object_reader;
+         CREATE POLICY policy_object_table ON policy_object_target
+           USING (EXISTS (SELECT 1 FROM policy_object_source));",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    for (restrict, cascade, policy) in [
+        (
+            "DROP TABLE policy_object_source",
+            "DROP TABLE policy_object_source CASCADE",
+            "policy_object_table",
+        ),
+        (
+            "DROP VIEW policy_object_view",
+            "DROP VIEW policy_object_view CASCADE",
+            "policy_object_view_policy",
+        ),
+        (
+            "DROP FUNCTION policy_object_function(integer)",
+            "DROP FUNCTION policy_object_function(integer) CASCADE",
+            "policy_object_function_policy",
+        ),
+        (
+            "DROP SEQUENCE policy_object_sequence",
+            "DROP SEQUENCE policy_object_sequence CASCADE",
+            "policy_object_sequence_policy",
+        ),
+        (
+            "DROP DOMAIN policy_object_domain",
+            "DROP DOMAIN policy_object_domain CASCADE",
+            "policy_object_domain_policy",
+        ),
+        (
+            "DROP TYPE policy_object_enum",
+            "DROP TYPE policy_object_enum CASCADE",
+            "policy_object_enum_policy",
+        ),
+    ] {
+        if policy == "policy_object_table" {
+            let rebound = run_with(
+                &mut engine,
+                &mut budget,
+                "ALTER TABLE policy_object_source RENAME TO policy_object_source_renamed;
+                 SET ROLE policy_object_reader;
+                 SELECT id FROM policy_object_target;
+                 RESET ROLE;
+                 ALTER TABLE policy_object_source_renamed RENAME TO policy_object_source;",
+            );
+            assert_eq!(
+                data_rows(&rebound),
+                ["1"],
+                "{}",
+                String::from_utf8_lossy(&rebound)
+            );
+        } else if policy == "policy_object_view_policy" {
+            run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE TABLE policy_object_view_base (id integer);
+                 INSERT INTO policy_object_view_base VALUES (1);
+                 CREATE VIEW policy_object_view AS SELECT id FROM policy_object_view_base;
+                 GRANT SELECT ON policy_object_view TO policy_object_reader;
+                 CREATE POLICY policy_object_view_policy ON policy_object_target
+                   USING (EXISTS (SELECT 1 FROM policy_object_view));",
+            );
+        } else if policy == "policy_object_function_policy" {
+            run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE FUNCTION policy_object_function(integer) RETURNS boolean
+                   LANGUAGE SQL AS 'SELECT $1 > 0';
+                 CREATE POLICY policy_object_function_policy ON policy_object_target
+                   USING (policy_object_function(id));",
+            );
+            let rebound = run_with(
+                &mut engine,
+                &mut budget,
+                "ALTER FUNCTION policy_object_function(integer)
+                   RENAME TO policy_object_function_renamed;
+                 SET ROLE policy_object_reader;
+                 SELECT id FROM policy_object_target;
+                 RESET ROLE;
+                 ALTER FUNCTION policy_object_function_renamed(integer)
+                   RENAME TO policy_object_function;",
+            );
+            assert_eq!(data_rows(&rebound), ["1"]);
+        } else if policy == "policy_object_sequence_policy" {
+            run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE SEQUENCE policy_object_sequence;
+                 GRANT USAGE ON SEQUENCE policy_object_sequence TO policy_object_reader;
+                 CREATE POLICY policy_object_sequence_policy ON policy_object_target
+                   USING (nextval('policy_object_sequence') > 0);",
+            );
+        } else if policy == "policy_object_domain_policy" {
+            run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE DOMAIN policy_object_domain AS integer;
+                 CREATE POLICY policy_object_domain_policy ON policy_object_target
+                   USING (id::policy_object_domain > 0);",
+            );
+            let rebound = run_with(
+                &mut engine,
+                &mut budget,
+                "ALTER DOMAIN policy_object_domain RENAME TO policy_object_domain_renamed;
+                 SET ROLE policy_object_reader;
+                 SELECT id FROM policy_object_target;
+                 RESET ROLE;
+                 ALTER DOMAIN policy_object_domain_renamed RENAME TO policy_object_domain;",
+            );
+            assert_eq!(data_rows(&rebound), ["1"]);
+        } else if policy == "policy_object_enum_policy" {
+            run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE TYPE policy_object_enum AS ENUM ('ok');
+                 CREATE POLICY policy_object_enum_policy ON policy_object_target
+                   USING ('ok'::policy_object_enum = 'ok'::policy_object_enum);",
+            );
+            let rebound = run_with(
+                &mut engine,
+                &mut budget,
+                "ALTER TYPE policy_object_enum RENAME TO policy_object_enum_renamed;
+                 SET ROLE policy_object_reader;
+                 SELECT id FROM policy_object_target;
+                 RESET ROLE;
+                 ALTER TYPE policy_object_enum_renamed RENAME TO policy_object_enum;",
+            );
+            assert_eq!(data_rows(&rebound), ["1"]);
+        }
+        let restricted = run_with(&mut engine, &mut budget, restrict);
+        assert!(
+            String::from_utf8_lossy(&restricted).contains("2BP01"),
+            "{restrict}: {}",
+            String::from_utf8_lossy(&restricted)
+        );
+        let dropped = run_with(&mut engine, &mut budget, cascade);
+        assert!(
+            !String::from_utf8_lossy(&dropped).contains("ERROR"),
+            "{cascade}: {}",
+            String::from_utf8_lossy(&dropped)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                &format!("SELECT count(*) FROM pg_policy WHERE polname = '{policy}'"),
+            )),
+            ["0"],
+            "{policy} must follow its dependency under CASCADE"
+        );
+    }
+
+    let owned_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE policy_owned_role;
+         GRANT CREATE ON SCHEMA public TO policy_owned_role;
+         SET ROLE policy_owned_role;
+         CREATE SEQUENCE policy_owned_sequence;
+         RESET ROLE;
+         CREATE POLICY policy_owned_dependency ON policy_object_target
+           USING (nextval('policy_owned_sequence') > 0);",
+    );
+    assert!(!String::from_utf8_lossy(&owned_setup).contains("ERROR"));
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OWNED BY policy_owned_role RESTRICT",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OWNED BY policy_owned_role CASCADE;
+         SELECT count(*) FROM pg_policy WHERE polname = 'policy_owned_dependency';",
+    );
+    assert_eq!(data_rows(&cascaded), ["0"]);
+
+    let schema_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA policy_dependency_schema;
+         CREATE SEQUENCE policy_dependency_schema.policy_schema_sequence;
+         CREATE POLICY policy_schema_dependency ON policy_object_target
+           USING (nextval('policy_dependency_schema.policy_schema_sequence') > 0);",
+    );
+    assert!(!String::from_utf8_lossy(&schema_setup).contains("ERROR"));
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA policy_dependency_schema RESTRICT",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA policy_dependency_schema CASCADE;
+         SELECT count(*) FROM pg_policy WHERE polname = 'policy_schema_dependency';",
+    );
+    assert_eq!(data_rows(&cascaded), ["0"]);
+}
+
+#[test]
+fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE rls_owner;
+         CREATE ROLE rls_client;
+         GRANT CREATE ON SCHEMA public TO rls_owner;
+         SET ROLE rls_owner;
+         CREATE TABLE rls_target (id integer PRIMARY KEY, tenant text, payload text);
+         INSERT INTO rls_target VALUES
+           (1, 'rls_client', 'client'), (2, 'other', 'other');
+         CREATE TABLE rls_source (id integer, tenant text, payload text);
+         INSERT INTO rls_source VALUES
+           (1, 'rls_client', 'updated'), (3, 'rls_client', 'inserted');
+         ALTER TABLE rls_target ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY client_rows ON rls_target FOR ALL TO rls_client
+           USING (tenant = 'rls_client') WITH CHECK (tenant = 'rls_client');
+         GRANT SELECT, INSERT, UPDATE, DELETE ON rls_target TO rls_client;
+         GRANT SELECT ON rls_source TO rls_client;
+         CREATE VIEW rls_definer AS SELECT id, tenant, payload FROM rls_target;
+         CREATE VIEW rls_invoker WITH (security_invoker=true) AS
+           SELECT id, tenant, payload FROM rls_target;
+         GRANT SELECT ON rls_definer, rls_invoker TO rls_client;
+         CREATE TABLE rls_partitioned (id integer, tenant text) PARTITION BY RANGE (id);
+         CREATE TABLE rls_partitioned_low PARTITION OF rls_partitioned
+           FOR VALUES FROM (0) TO (10);
+         INSERT INTO rls_partitioned VALUES (1, 'rls_client'), (2, 'other');
+         ALTER TABLE rls_partitioned ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY partition_rows ON rls_partitioned FOR ALL TO rls_client
+           USING (tenant = 'rls_client') WITH CHECK (tenant = 'rls_client');
+         GRANT SELECT, INSERT ON rls_partitioned TO rls_client;
+         RESET ROLE;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    let execution = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rls_client;
+         SELECT id FROM rls_target ORDER BY id;
+         SELECT id FROM rls_definer ORDER BY id;
+         SELECT id FROM rls_invoker ORDER BY id;
+         PREPARE rls_saved AS SELECT id FROM rls_target ORDER BY id;
+         EXECUTE rls_saved;
+         BEGIN;
+         DECLARE rls_cursor CURSOR FOR SELECT id FROM rls_target ORDER BY id;
+         FETCH ALL FROM rls_cursor;
+         COMMIT;
+         MERGE INTO rls_target AS target USING rls_source AS source
+           ON target.id = source.id
+           WHEN MATCHED THEN UPDATE SET payload = source.payload
+           WHEN NOT MATCHED THEN INSERT (id, tenant, payload)
+             VALUES (source.id, source.tenant, source.payload);
+         SELECT id, payload FROM rls_target ORDER BY id;
+         SELECT id FROM rls_partitioned ORDER BY id;
+         INSERT INTO rls_partitioned VALUES (3, 'rls_client');
+         SELECT id FROM rls_partitioned ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&execution),
+        [
+            "1",
+            "1",
+            "2",
+            "1",
+            "1",
+            "1",
+            "1|updated",
+            "3|inserted",
+            "1",
+            "1",
+            "3",
+        ],
+        "{}",
+        String::from_utf8_lossy(&execution)
+    );
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rls_client; COPY rls_target (id, tenant) TO STDOUT",
+    );
+    assert_eq!(copy_data_rows(&copied), ["1\trls_client", "3\trls_client"]);
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "rls copy send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "rls copy sql", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "SET ROLE rls_client; COPY rls_target FROM STDIN",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let copy = engine
+        .take_pending_copy()
+        .expect("COPY enters streaming mode");
+    arena.reset();
+    assert_eq!(
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &copy,
+            &mut transaction,
+            guc.seq_session(),
+            &arena,
+            b"4\trls_client\tcopy",
+        )
+        .unwrap(),
+        crate::sql::exec::CopyRowOutcome::Stored
+    );
+    finish_copy(&mut engine, &mut budget, &copy, &mut transaction, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE rls_client; SELECT id FROM rls_target ORDER BY id"
+        )),
+        ["1", "3", "4"]
+    );
+
+    let row_security_off = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rls_client; SET row_security = off; SELECT id FROM rls_target",
+    );
+    assert!(String::from_utf8_lossy(&row_security_off).contains("42501"));
+
+    let forced_owner = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rls_owner;
+         ALTER TABLE rls_target FORCE ROW LEVEL SECURITY;
+         SELECT count(*) FROM rls_target;
+         ALTER TABLE rls_target NO FORCE ROW LEVEL SECURITY;",
+    );
+    assert_eq!(data_rows(&forced_owner), ["0"]);
+
+    let recursive = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rls_owner;
+         CREATE POLICY recursive_rows ON rls_target FOR SELECT TO rls_client
+           USING (EXISTS (SELECT 1 FROM rls_target));
+         RESET ROLE;
+         SET ROLE rls_client;
+         SELECT id FROM rls_target;",
+    );
+    assert!(
+        String::from_utf8_lossy(&recursive).contains("42P17"),
+        "{}",
+        String::from_utf8_lossy(&recursive)
+    );
+}
+
+#[test]
+fn row_level_security_conjoins_select_with_row_reading_update_and_delete() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE policy_reader_writer;
+         CREATE ROLE policy_blind_writer;
+         CREATE TABLE policy_composition (id integer PRIMARY KEY, note text);
+         INSERT INTO policy_composition VALUES (1, 'one'), (2, 'two');
+         ALTER TABLE policy_composition ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY composition_select ON policy_composition
+           FOR SELECT TO policy_reader_writer USING (id = 1);
+         CREATE POLICY composition_update ON policy_composition
+           FOR UPDATE TO policy_reader_writer, policy_blind_writer
+           USING (true) WITH CHECK (true);
+         CREATE POLICY composition_delete ON policy_composition
+           FOR DELETE TO policy_reader_writer USING (true);
+         CREATE POLICY composition_insert ON policy_composition
+           FOR INSERT TO policy_reader_writer WITH CHECK (true);
+         GRANT SELECT, INSERT, UPDATE, DELETE ON policy_composition TO policy_reader_writer;
+         GRANT UPDATE ON policy_composition TO policy_blind_writer;",
+    );
+    let transactional = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE POLICY rolled_back_policy ON policy_composition
+           FOR SELECT USING (true);
+         ROLLBACK;
+         SELECT count(*) FROM pg_policy WHERE polname = 'rolled_back_policy';
+         BEGIN;
+         ALTER POLICY composition_select ON policy_composition USING (true);
+         ROLLBACK;
+         BEGIN;
+         DROP POLICY composition_select ON policy_composition;
+         ROLLBACK;
+         SET ROLE policy_reader_writer;
+         SELECT id FROM policy_composition ORDER BY id;",
+    );
+    assert_eq!(data_rows(&transactional), ["0", "1"]);
+    let full_policy_set = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE POLICY composition_all_one ON policy_composition
+           AS RESTRICTIVE FOR ALL TO policy_reader_writer USING (true) WITH CHECK (true);
+         CREATE POLICY composition_all_two ON policy_composition
+           AS RESTRICTIVE FOR ALL TO policy_reader_writer USING (true) WITH CHECK (true);
+         CREATE POLICY composition_all_three ON policy_composition
+           AS RESTRICTIVE FOR ALL TO policy_reader_writer USING (true) WITH CHECK (true);
+         CREATE POLICY composition_all_four ON policy_composition
+           AS RESTRICTIVE FOR ALL TO policy_reader_writer USING (true) WITH CHECK (true);",
+    );
+    assert!(!String::from_utf8_lossy(&full_policy_set).contains("ERROR"));
+    let blind = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE policy_blind_writer; UPDATE policy_composition SET note = 'blind'",
+    );
+    assert!(!String::from_utf8_lossy(&blind).contains("ERROR"));
+    let hidden_conflict = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE policy_reader_writer;
+         INSERT INTO policy_composition VALUES (2, 'conflict')
+           ON CONFLICT (id) DO UPDATE SET note = 'conflict'",
+    );
+    assert!(
+        String::from_utf8_lossy(&hidden_conflict).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&hidden_conflict)
+    );
+    let visible = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE policy_reader_writer;
+         UPDATE policy_composition SET note = 'visible' RETURNING id;
+         DELETE FROM policy_composition RETURNING id;",
+    );
+    assert_eq!(data_rows(&visible), ["1", "1"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, note FROM policy_composition"
+        )),
+        ["2|blind"]
+    );
+}
+
+#[test]
 fn role_membership_controls_set_role_and_catalog_rows() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -1651,6 +2343,24 @@ fn data_rows(bytes: &[u8]) -> Vec<String> {
         i += 1 + len;
     }
     out
+}
+
+fn copy_data_rows(bytes: &[u8]) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let kind = bytes[at];
+        let length = i32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        if kind == b'd' {
+            rows.push(
+                String::from_utf8_lossy(&bytes[at + 5..at + 1 + length])
+                    .trim_end_matches('\n')
+                    .to_owned(),
+            );
+        }
+        at += 1 + length;
+    }
+    rows
 }
 
 #[test]
@@ -2679,7 +3389,7 @@ fn range_and_multirange_arrays_keep_catalog_and_durable_identity() {
 fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("range-array-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -2704,7 +3414,7 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -2725,7 +3435,7 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
 fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
     let config = test_config("oid-array-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -2791,7 +3501,7 @@ fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
         );
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -3432,7 +4142,7 @@ fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_tex
 fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
     std::thread::Builder::new()
         .name("logical-truncate-pgoutput".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack)
         .expect("logical truncate test thread starts")
         .join()
@@ -3443,7 +4153,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
 fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
     std::thread::Builder::new()
         .name("logical-slot-acknowledgement".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack)
         .expect("logical slot acknowledgement test thread starts")
         .join()
@@ -3454,7 +4164,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
 fn logical_replication_unions_multiple_publications() {
     std::thread::Builder::new()
         .name("logical-publication-union".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_unions_multiple_publications_on_sized_stack)
         .expect("logical publication union test thread starts")
         .join()
@@ -3465,7 +4175,7 @@ fn logical_replication_unions_multiple_publications() {
 fn logical_replication_publication_column_lists_project_relation_and_tuple() {
     std::thread::Builder::new()
         .name("logical-publication-column-list".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(
             logical_replication_publication_column_lists_project_relation_and_tuple_on_sized_stack,
         )
@@ -3478,7 +4188,7 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple() {
 fn logical_replication_generated_column_policy_is_typed_and_applied() {
     std::thread::Builder::new()
         .name("logical-generated-columns".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_generated_column_policy_is_typed_and_applied_on_sized_stack)
         .expect("logical generated-column test thread starts")
         .join()
@@ -3489,7 +4199,7 @@ fn logical_replication_generated_column_policy_is_typed_and_applied() {
 fn logical_replication_selects_a_quoted_publication_name() {
     std::thread::Builder::new()
         .name("logical-quoted-publication".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_selects_a_quoted_publication_name_on_sized_stack)
         .expect("logical quoted publication test thread starts")
         .join()
@@ -3500,7 +4210,7 @@ fn logical_replication_selects_a_quoted_publication_name() {
 fn logical_replication_selects_schema_publications() {
     std::thread::Builder::new()
         .name("logical-schema-publication".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_selects_schema_publications_on_sized_stack)
         .expect("logical schema publication test thread starts")
         .join()
@@ -3511,7 +4221,7 @@ fn logical_replication_selects_schema_publications() {
 fn logical_replication_declares_user_types_before_relations() {
     std::thread::Builder::new()
         .name("logical-replication-types".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_declares_user_types_before_relations_on_sized_stack)
         .expect("logical replication type test thread starts")
         .join()
@@ -3522,7 +4232,7 @@ fn logical_replication_declares_user_types_before_relations() {
 fn logical_replication_omits_transactions_without_published_changes() {
     std::thread::Builder::new()
         .name("logical-publication-filter".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(logical_replication_omits_transactions_without_published_changes_on_sized_stack)
         .expect("logical publication filter test thread starts")
         .join()
@@ -8583,7 +9293,7 @@ fn pg_collation_rows_have_catalog_relation_identity_and_types() {
 fn column_collation_survives_wal_and_checkpoint_recovery() {
     let config = test_config("collation-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -8613,7 +9323,7 @@ fn column_collation_survives_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -10305,7 +11015,7 @@ fn commit_makes_writes_visible_and_durable() {
 
 fn commit_makes_writes_visible_and_durable_on_sized_stack() {
     let config = test_config("txn-durable");
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     {
         let mut e = Engine::new(&config, &mut b).unwrap();
         let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -10333,7 +11043,7 @@ fn commit_makes_writes_visible_and_durable_on_sized_stack() {
             .unwrap();
         assert_eq!(stamped, 2);
     }
-    let mut b2 = Budget::new(1 << 25);
+    let mut b2 = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b2).unwrap();
     let mut t = TxnState::new(&mut b2, 256).unwrap();
     let out = run_txn(&mut e, &mut b2, &mut t, "SELECT id FROM t ORDER BY id");
@@ -10602,7 +11312,7 @@ fn ddl_rolls_back_with_implicit_transaction() {
 fn data_survives_engine_restart() {
     let config = test_config("restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v text)");
         run_with(
@@ -10616,7 +11326,7 @@ fn data_survives_engine_restart() {
         run_with(&mut e, &mut budget, "DROP TABLE gone");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     let bytes = run_with(&mut e, &mut budget, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1|a", "2|B"]);
@@ -10718,7 +11428,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
 fn regtype_columns_survive_wal_and_checkpoint_recovery() {
     let config = test_config("regtype-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -10730,7 +11440,7 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -10756,7 +11466,7 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
 fn reg_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("reg-arrays-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -10796,7 +11506,7 @@ fn reg_arrays_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -10834,7 +11544,7 @@ fn reg_arrays_survive_wal_and_checkpoint_recovery() {
 fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
     let config = test_config("catalog-object-restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -10865,7 +11575,7 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -10911,7 +11621,7 @@ fn indexes_survive_restart() {
     // WAL-replay restart.
     let config = test_config("idx_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (a int, b int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1),(1,2)");
@@ -10922,7 +11632,7 @@ fn indexes_survive_restart() {
         );
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -10948,7 +11658,7 @@ fn views_survive_restart() {
     // View definitions are journaled, so they survive a WAL-replay restart.
     let config = test_config("view_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(
@@ -10965,7 +11675,7 @@ fn views_survive_restart() {
         run_with(&mut e, &mut budget, "DROP VIEW gone");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The surviving view still expands and queries.
     assert_eq!(
@@ -13420,7 +14130,7 @@ fn trigger_arguments_survive_checkpoint_and_recovery() {
 fn row_trigger_new_assignments_are_typed_and_rechecked() {
     let mut config = test_config("row-trigger-body");
     config.max_tables = 16;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -15736,7 +16446,7 @@ fn matview_survives_restart() {
     // restart — and REFRESH still works afterward.
     let config = test_config("matview_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(
@@ -15751,7 +16461,7 @@ fn matview_survives_restart() {
         );
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The materialized rows survived the restart.
     assert_eq!(
@@ -15904,7 +16614,7 @@ fn sequence_basics() {
 fn sequence_survives_restart() {
     let config = test_config("sequence_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -15915,7 +16625,7 @@ fn sequence_survives_restart() {
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // Value state (last=15, is_called) survived replay: the next value is 20.
     assert_eq!(
@@ -15937,7 +16647,7 @@ fn sequence_survives_restart() {
 fn sequence_advance_in_creating_transaction_survives_restart() {
     let config = test_config("sequence_create_advance_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let result = run_with(
             &mut engine,
@@ -15952,7 +16662,7 @@ fn sequence_advance_in_creating_transaction_survives_restart() {
         assert!(!String::from_utf8_lossy(&result).contains("ERROR"));
     }
 
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
@@ -15979,7 +16689,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     // Reserve the durable transaction marker as well as the CREATE record;
     // this remains too small for the later absolute sequence retry record.
     config.wal_bytes = 144;
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
     assert!(
@@ -16089,7 +16799,7 @@ fn foreign_key_set_default_evaluates_expression_per_action() {
 fn expression_default_survives_restart() {
     let config = test_config("default_expr_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE SEQUENCE s");
         run_with(
@@ -16100,7 +16810,7 @@ fn expression_default_survives_restart() {
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The default expression survived replay: the next insert still assigns
     // nextval (continuing the sequence).
@@ -16213,7 +16923,7 @@ fn generated_columns() {
 fn generated_column_survives_restart() {
     let config = test_config("generated_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -16223,7 +16933,7 @@ fn generated_column_survives_restart() {
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The generation expression survived replay: a new insert still computes it.
     run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (20)");
@@ -16542,7 +17252,7 @@ fn sequence_ownership_is_distinct_from_generation() {
 fn identity_survives_restart() {
     let config = test_config("identity_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -16568,7 +17278,7 @@ fn identity_survives_restart() {
         run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME TO ic2");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The identity step (5) and counter survived replay: next value is 15.
     run_with(&mut e, &mut budget, "INSERT INTO ic2 (value) VALUES ('b')");
@@ -16863,7 +17573,7 @@ fn sql_surface_batch() {
 fn altered_table_survives_restart() {
     let config = test_config("alter-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE a (id int, v text)");
         run_with(&mut e, &mut b, "CREATE INDEX a_v_idx ON a (v)");
@@ -16871,7 +17581,7 @@ fn altered_table_survives_restart() {
         run_with(&mut e, &mut b, "ALTER TABLE a ADD COLUMN n int DEFAULT 42");
         run_with(&mut e, &mut b, "ALTER TABLE a RENAME TO b");
     }
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(
         &mut e,
@@ -17313,7 +18023,7 @@ fn value_index_matches_uniqueness_oracle() {
     };
 
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run(&mut e, "CREATE TABLE t (k int UNIQUE, v int)");
         for _ in 0..800 {
@@ -17355,7 +18065,7 @@ fn value_index_matches_uniqueness_oracle() {
     }
 
     // Restart: the index is gone and must be rebuilt from the replayed rows.
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut Budget::new(2 << 20), "SELECT count(*) FROM t");
     assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
@@ -17500,7 +18210,7 @@ fn alter_table_multi_action() {
 #[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE vt (a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO vt VALUES (1, 'x'), (2, 'y')");
@@ -18341,7 +19051,7 @@ fn joins_group_by_subqueries() {
 fn datetime_uuid_bytea_types() {
     let config = test_config("types-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -18367,7 +19077,7 @@ fn datetime_uuid_bytea_types() {
         assert_eq!(data_rows(&bytes), ["1"]);
     }
     // Types survive WAL replay.
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT u FROM ev");
     assert_eq!(data_rows(&bytes), ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]);
@@ -19894,7 +20604,7 @@ fn materialized_view_refresh_uses_captured_dependencies_after_rename() {
 fn comment_survives_restart_and_drop_clears_it() {
     let config = test_config("comment-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
         run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
@@ -19904,7 +20614,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The comment survives WAL replay.
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["durable"]);
@@ -19933,7 +20643,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The drop's comment removal is itself durable across another restart.
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["NULL"]);
@@ -20010,7 +20720,7 @@ fn network_functions_match_postgres() {
 fn network_types_survive_restart() {
     let config = test_config("network-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -20024,7 +20734,7 @@ fn network_types_survive_restart() {
         );
     }
     // The values survive WAL replay byte-for-byte (the rowenc codec).
-    let mut b = Budget::new(1 << 25);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT a, c, m, m8 FROM nd");
     assert_eq!(
@@ -22366,7 +23076,7 @@ fn sequence_alterations_are_private_until_commit() {
 fn domains_survive_restart() {
     let config = test_config("domain-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -22379,7 +23089,7 @@ fn domains_survive_restart() {
     }
     // WAL replay: the domain and its column identity survive.
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(a), a FROM dt");
         assert_eq!(data_rows(&bytes), ["posint|42"]);
@@ -22562,7 +23272,7 @@ fn enums_order_and_enforce() {
 fn enums_survive_restart() {
     let config = test_config("enum-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -22586,7 +23296,7 @@ fn enums_survive_restart() {
     // WAL replay: the enum, its rename, added value, ordering, and column
     // identity survive, including through grouped projection's schema lookup.
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
         assert_eq!(data_rows(&bytes), ["3", "2", "1"]);
@@ -22619,7 +23329,7 @@ fn enums_survive_restart() {
 fn user_type_schema_identity_survives_restart() {
     let config = test_config("user-type-schema-durable");
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE SCHEMA first; CREATE SCHEMA second");
         run_with(
@@ -22678,7 +23388,7 @@ fn user_type_schema_identity_survives_restart() {
         e.commit_wal().unwrap();
     }
     {
-        let mut b = Budget::new(1 << 25);
+        let mut b = Budget::new(1 << 26);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(
             &mut e,
@@ -23675,7 +24385,7 @@ fn current_setting_reads_gucs() {
 fn altered_sequence_definition_and_value_survive_restart() {
     let config = test_config("sequence_alter_restart");
     {
-        let mut budget = Budget::new(1 << 25);
+        let mut budget = Budget::new(1 << 26);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -23686,7 +24396,7 @@ fn altered_sequence_definition_and_value_survive_restart() {
         );
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 25);
+    let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
@@ -25287,7 +25997,7 @@ fn catalog_joins_and_subqueries() {
 fn psql_catalog_listing_contracts() {
     // This catalog probe intentionally creates a fresh connection-sized arena
     // for each query instead of reusing a production connection's buffers.
-    let (mut engine, mut budget) = test_engine_with_budget((1 << 26) + (2 << 20));
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
     run_with(
         &mut engine,
         &mut budget,
@@ -27327,6 +28037,10 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
            FOR VALUES FROM (0) TO (10); \
          CREATE TABLE replicated_partition_high PARTITION OF replicated_partition \
            FOR VALUES FROM (10) TO (20); \
+         ALTER TABLE replicated_partition ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE replicated_partition FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY reject_local_writes ON replicated_partition FOR ALL \
+           USING (false) WITH CHECK (false); \
          CREATE SUBSCRIPTION partition_apply CONNECTION \
            'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
            PUBLICATION partition_changes WITH (connect = false, slot_name = NONE)",

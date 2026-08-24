@@ -375,6 +375,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateTrigger(_)
         | Stmt::AlterTrigger { .. }
         | Stmt::DropTrigger { .. }
+        | Stmt::CreatePolicy(_)
+        | Stmt::AlterPolicy(_)
+        | Stmt::DropPolicy { .. }
         | Stmt::CreateTableAs { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::DropMaterializedView { .. }
@@ -3175,6 +3178,7 @@ impl Engine {
                     let schema = self.storage.table(*slot as usize).def.schema;
                     self.storage.commit_drop(*slot as usize);
                     self.storage.commit_triggers_for_table(*slot as usize);
+                    self.storage.commit_policies_for_table(*slot as usize);
                     // The table's indexes were pending-dropped with it.
                     self.storage
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
@@ -3202,6 +3206,11 @@ impl Engine {
                 DdlUndo::TriggerDropped(slot) => self.storage.commit_trigger_drop(*slot as usize),
                 DdlUndo::TriggerAltered { slot, .. } => {
                     self.storage.commit_trigger_alter(*slot as usize, txn.txid)
+                }
+                DdlUndo::PolicyCreated(slot) => self.storage.commit_policy_create(*slot as usize),
+                DdlUndo::PolicyDropped(slot) => self.storage.commit_policy_drop(*slot as usize),
+                DdlUndo::PolicyAltered { slot, .. } => {
+                    self.storage.commit_policy_alter(*slot as usize, txn.txid)
                 }
                 DdlUndo::RoutineIdentityAltered { slot, .. } => self
                     .storage
@@ -3465,6 +3474,11 @@ impl Engine {
             }
             DdlUndo::TriggerAltered { slot, prior } => {
                 self.storage.rollback_trigger_alter(slot as usize, prior)
+            }
+            DdlUndo::PolicyCreated(slot) => self.storage.rollback_policy_create(slot as usize),
+            DdlUndo::PolicyDropped(slot) => self.storage.rollback_policy_drop(slot as usize, txid),
+            DdlUndo::PolicyAltered { slot, prior } => {
+                self.storage.rollback_policy_alter(slot as usize, prior)
             }
             DdlUndo::RoutineIdentityAltered { slot, prior } => {
                 self.storage.restore_routine_identity(slot as usize, prior)
@@ -6783,6 +6797,7 @@ impl Engine {
             Stmt::CreateView {
                 name,
                 or_replace,
+                security,
                 sql,
             } => exec::create_view(
                 &mut self.storage,
@@ -6791,6 +6806,7 @@ impl Engine {
                 exec::CreateViewCommand {
                     name,
                     or_replace: *or_replace,
+                    security: *security,
                     sql,
                     raw_path: guc.search_path().as_str(),
                 },
@@ -6972,6 +6988,35 @@ impl Engine {
                 txn,
                 trigger,
                 *action,
+                responder,
+            ),
+            Stmt::CreatePolicy(policy) => exec::create_policy(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                policy,
+                arena,
+                responder,
+            ),
+            Stmt::AlterPolicy(policy) => exec::alter_policy(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                policy,
+                arena,
+                responder,
+            ),
+            Stmt::DropPolicy {
+                policy,
+                if_exists,
+                cascade,
+            } => exec::drop_policy(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                policy,
+                *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::CreateTableAs {
@@ -7257,6 +7302,7 @@ impl Engine {
                     let result = if let Stmt::CreateView {
                         name,
                         or_replace,
+                        security,
                         sql,
                     } = requalified
                     {
@@ -7279,6 +7325,7 @@ impl Engine {
                             exec::CreateViewCommand {
                                 name,
                                 or_replace: *or_replace,
+                                security: *security,
                                 sql,
                                 raw_path: schema_path,
                             },
@@ -8431,10 +8478,12 @@ fn requalify_schema_element<'a>(
         ast::CreateSchemaElement::View {
             name,
             or_replace,
+            security,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
             or_replace: *or_replace,
+            security: *security,
             sql,
         },
         ast::CreateSchemaElement::Index {
@@ -8600,6 +8649,76 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let advance = storage.prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
             storage.apply_replication_slot_advance(advance);
+        }
+        WalOp::SetPolicy {
+            schema,
+            table,
+            name,
+            command,
+            permissive,
+            roles,
+            role_count,
+            using,
+            with_check,
+            dependencies,
+        } => {
+            let table_slot = match storage.resolve_relation(Some(schema), table, 0) {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal policy targets unknown table \"{}.{}\"",
+                        schema,
+                        table
+                    ));
+                }
+            };
+            let mut role_slots = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
+            for (index, role) in roles[..role_count].iter().enumerate() {
+                role_slots[index] = if role.as_str().eq_ignore_ascii_case("public") {
+                    crate::storage::PUBLIC_ROLE
+                } else {
+                    storage.find_role_visible(role.as_str(), 0).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "journal policy references unknown role \"{}\"",
+                            role.as_str()
+                        )
+                    })? as u16
+                };
+            }
+            storage.replay_set_policy(crate::storage::PolicySpec {
+                name: crate::storage::SqlName::parse(name)?,
+                table: table_slot,
+                command: crate::storage::PolicyCommandKind::from_code(command).ok_or_else(
+                    || {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "journal policy has invalid command"
+                        )
+                    },
+                )?,
+                permissive,
+                definition: crate::storage::PolicyDefinition {
+                    roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])?,
+                    using: using.map(crate::storage::policy_expression).transpose()?,
+                    with_check: with_check
+                        .map(crate::storage::policy_expression)
+                        .transpose()?,
+                    dependencies: dependencies.materialize()?,
+                },
+            })?;
+        }
+        WalOp::DropPolicy {
+            schema,
+            table,
+            name,
+        } => {
+            if let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+                storage.resolve_relation(Some(schema), table, 0)
+            {
+                storage.replay_drop_policy(table_slot, name);
+            }
         }
         WalOp::CreateTrigger {
             name,
@@ -8875,6 +8994,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             sql,
             path,
+            security_invoker,
             dependencies,
         } => {
             // Replay reconstructs committed state: create then promote.
@@ -8892,6 +9012,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     sql: buffer,
                     creation_path,
                     dependencies,
+                },
+                if security_invoker {
+                    crate::storage::ViewSecurity::Invoker
+                } else {
+                    crate::storage::ViewSecurity::Definer
                 },
                 true,
                 0,

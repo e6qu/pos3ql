@@ -65,7 +65,7 @@ pub const MAX_ALTER_ACTIONS: usize = 32;
 /// (RENAME/SET SCHEMA) never share a list, so their pass is irrelevant.
 fn alter_pass(action: &AlterAction) -> u8 {
     match action {
-        AlterAction::DropColumn(_) | AlterAction::DropConstraint { .. } => 0,
+        AlterAction::DropColumn { .. } | AlterAction::DropConstraint { .. } => 0,
         AlterAction::AlterColumnType { .. } => 1,
         AlterAction::AddColumn(_) => 2,
         AlterAction::AddConstraint(_)
@@ -82,6 +82,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
+        | AlterAction::SetRowLevelSecurity(_)
         | AlterAction::AttachPartition { .. }
         | AlterAction::DetachPartition { .. }
         | AlterAction::SetSchema(_) => 5,
@@ -3332,6 +3333,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("trigger")? {
             return self.alter_trigger();
         }
+        if self.eat_ident("policy")? {
+            return self.alter_policy();
+        }
         if self.eat_ident("index")? {
             return self.alter_index();
         }
@@ -3414,7 +3418,7 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new constraint name")?;
                 AlterAction::RenameConstraint { from, to }
             } else {
-                self.expect_ident("column")?;
+                let _ = self.eat_ident("column")?;
                 let from = self.col_ident("column name")?;
                 self.expect_ident("to")?;
                 let to = self.col_ident("new column name")?;
@@ -3426,7 +3430,43 @@ impl<'a> Parser<'a> {
                 actions: self.arena_slice(&[action])?,
             }));
         }
+        if self.eat_ident("force")? {
+            self.expect_ident("row")?;
+            self.expect_ident("level")?;
+            self.expect_ident("security")?;
+            return Ok(Stmt::AlterTable(AlterTable {
+                table,
+                if_exists,
+                actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Force,
+                )])?,
+            }));
+        }
+        if self.eat_ident("no")? {
+            self.expect_ident("force")?;
+            self.expect_ident("row")?;
+            self.expect_ident("level")?;
+            self.expect_ident("security")?;
+            return Ok(Stmt::AlterTable(AlterTable {
+                table,
+                if_exists,
+                actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::NoForce,
+                )])?,
+            }));
+        }
         let trigger_mode = if self.eat_ident("enable")? {
+            if self.eat_ident("row")? {
+                self.expect_ident("level")?;
+                self.expect_ident("security")?;
+                return Ok(Stmt::AlterTable(AlterTable {
+                    table,
+                    if_exists,
+                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                        RowLevelSecurityAlteration::Enable,
+                    )])?,
+                }));
+            }
             if self.eat_ident("replica")? {
                 Some(crate::sql::ast::TriggerEnableMode::Replica)
             } else if self.eat_ident("always")? {
@@ -3435,6 +3475,17 @@ impl<'a> Parser<'a> {
                 Some(crate::sql::ast::TriggerEnableMode::Origin)
             }
         } else if self.eat_ident("disable")? {
+            if self.eat_ident("row")? {
+                self.expect_ident("level")?;
+                self.expect_ident("security")?;
+                return Ok(Stmt::AlterTable(AlterTable {
+                    table,
+                    if_exists,
+                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                        RowLevelSecurityAlteration::Disable,
+                    )])?,
+                }));
+            }
             Some(crate::sql::ast::TriggerEnableMode::Disabled)
         } else {
             None
@@ -3716,7 +3767,22 @@ impl<'a> Parser<'a> {
                 })
             } else {
                 let _ = self.eat_ident("column")?;
-                Ok(AlterAction::DropColumn(self.col_ident("column name")?))
+                let if_exists = self.eat_ident("if")? && {
+                    self.expect_ident("exists")?;
+                    true
+                };
+                let name = self.col_ident("column name")?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                Ok(AlterAction::DropColumn {
+                    name,
+                    if_exists,
+                    cascade,
+                })
             }
         } else if self.eat_ident("validate")? {
             self.expect_ident("constraint")?;

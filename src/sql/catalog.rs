@@ -9,7 +9,7 @@
 use crate::mem::arena::Arena;
 use crate::storage::{
     ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, OwnedDatum, PartitionBound,
-    PartitionBoundValue, PartitionStrategy, SqlName, Storage, TableDef,
+    PartitionBoundValue, PartitionStrategy, PolicyCommandKind, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
@@ -441,6 +441,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_collation"
                 | "pg_conversion"
                 | "pg_policy"
+                | "pg_policies"
                 | "pg_rewrite"
                 | "pg_trigger"
                 | "pg_event_trigger"
@@ -577,24 +578,8 @@ pub fn synthesize<'a>(
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
         (false, "pg_stats") => pg_stats(storage, txid, arena),
-        (false, "pg_policy") => finish(
-            def_of(
-                "pg_policy",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("polname", ColType::Text),
-                    ("polrelid", ColType::Int4),
-                    ("polcmd", ColType::Bpchar),
-                    ("polpermissive", ColType::Bool),
-                    ("polroles", ColType::Array(super::types::ArrElem::Int4)),
-                    ("polqual", ColType::Text),
-                    ("polwithcheck", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_policy") => pg_policy(storage, txid, arena),
+        (false, "pg_policies") => pg_policies(storage, txid, arena),
         (false, "pg_statistic_ext") => finish(
             def_of(
                 "pg_statistic_ext",
@@ -3908,6 +3893,168 @@ fn publication_oid(slot: usize) -> i32 {
     FIRST_USER_OID + 80_000 + slot as i32
 }
 
+fn policy_command_name(command: PolicyCommandKind) -> &'static str {
+    match command {
+        PolicyCommandKind::All => "ALL",
+        PolicyCommandKind::Select => "SELECT",
+        PolicyCommandKind::Insert => "INSERT",
+        PolicyCommandKind::Update => "UPDATE",
+        PolicyCommandKind::Delete => "DELETE",
+    }
+}
+
+fn policy_role_oids<'a>(
+    roles: crate::storage::PolicyRoles,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_POLICY_ROLES];
+    for (index, role) in roles.entries().iter().copied().enumerate() {
+        values[index] = Datum::Int4(if role == crate::storage::PUBLIC_ROLE {
+            0
+        } else {
+            Storage::role_oid(usize::from(role))
+        });
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Oid,
+        raw: super::array::build(&values[..roles.entries().len()], arena)?,
+    })
+}
+
+fn policy_role_names<'a>(
+    storage: &Storage,
+    roles: crate::storage::PolicyRoles,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_POLICY_ROLES];
+    for (index, role) in roles.entries().iter().copied().enumerate() {
+        values[index] = if role == crate::storage::PUBLIC_ROLE {
+            text("public", arena)?
+        } else {
+            let name = storage.role_name(usize::from(role), txid);
+            text(name.as_str(), arena)?
+        };
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Name,
+        raw: super::array::build(&values[..roles.entries().len()], arena)?,
+    })
+}
+
+fn pg_policy<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_policy",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("polname", ColType::Name),
+            ("polrelid", ColType::Int4),
+            ("polcmd", ColType::Bpchar),
+            ("polpermissive", ColType::Bool),
+            ("polroles", ColType::Array(super::types::ArrElem::Oid)),
+            ("polqual", ColType::PgNodeTree),
+            ("polwithcheck", ColType::PgNodeTree),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, policy) in storage.policies_with_slots_visible_to(txid) {
+        let policy_definition = policy.definition_for(txid);
+        rows[count] = row(
+            &[
+                Datum::Int4(3256),
+                Datum::Int4(crate::storage::policy_oid(policy)),
+                text(policy.name.as_str(), arena)?,
+                Datum::Int4(table_oid(storage, usize::from(policy.table))),
+                text(
+                    core::str::from_utf8(&[policy.command.code()]).unwrap_or("*"),
+                    arena,
+                )?,
+                Datum::Bool(policy.permissive),
+                policy_role_oids(policy_definition.roles, arena)?,
+                policy_definition
+                    .using
+                    .map(|source| text(source.as_str(), arena))
+                    .transpose()?
+                    .unwrap_or(Datum::Null),
+                policy_definition
+                    .with_check
+                    .map(|source| text(source.as_str(), arena))
+                    .transpose()?
+                    .unwrap_or(Datum::Null),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_policies<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_policies",
+        &[
+            ("schemaname", ColType::Name),
+            ("tablename", ColType::Name),
+            ("policyname", ColType::Name),
+            ("permissive", ColType::Text),
+            ("roles", ColType::Array(super::types::ArrElem::Name)),
+            ("cmd", ColType::Text),
+            ("qual", ColType::Text),
+            ("with_check", ColType::Text),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, policy) in storage.policies_with_slots_visible_to(txid) {
+        let table = storage.table_def(usize::from(policy.table), txid);
+        let policy_definition = policy.definition_for(txid);
+        rows[count] = row(
+            &[
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(policy.name.as_str(), arena)?,
+                text(
+                    if policy.permissive {
+                        "PERMISSIVE"
+                    } else {
+                        "RESTRICTIVE"
+                    },
+                    arena,
+                )?,
+                policy_role_names(storage, policy_definition.roles, txid, arena)?,
+                text(policy_command_name(policy.command), arena)?,
+                policy_definition
+                    .using
+                    .map(|source| text(source.as_str(), arena))
+                    .transpose()?
+                    .unwrap_or(Datum::Null),
+                policy_definition
+                    .with_check
+                    .map(|source| text(source.as_str(), arena))
+                    .transpose()?
+                    .unwrap_or(Datum::Null),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn pg_publication<'a>(
     storage: &Storage,
     txid: u32,
@@ -4657,8 +4804,8 @@ fn pg_class<'a>(
                 Datum::Bool(has_index),
                 Datum::Bool(false),        // relhasrules
                 Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
-                Datum::Bool(false),        // relrowsecurity
-                Datum::Bool(false),        // relforcerowsecurity
+                Datum::Bool(table_def.row_level_security.enabled),
+                Datum::Bool(table_def.row_level_security.forced),
                 Datum::Bool(table_def.partition.is_attached()),
                 Datum::Int4(0),    // reltablespace
                 Datum::Int4(0),    // reloftype
@@ -4857,6 +5004,15 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
+        let reloptions = if matches!(view.security, crate::storage::ViewSecurity::Invoker) {
+            let values = [text("security_invoker=true", arena)?];
+            Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&values, arena)?,
+            }
+        } else {
+            Datum::Null
+        };
         out[n] = row(
             &[
                 Datum::Int4(view_oid(slot)),
@@ -4900,7 +5056,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Null,
+                reloptions,
                 Datum::Bool(true),
                 Datum::Null,
             ],

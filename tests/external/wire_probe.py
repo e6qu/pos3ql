@@ -2612,6 +2612,50 @@ def test_deferred_constraint_commit_over_raw_wire():
     s.close()
 
 
+def test_row_security_over_named_statement_and_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_rls_client; "
+        "CREATE TABLE wire_rls_target (id integer PRIMARY KEY, tenant text); "
+        "INSERT INTO wire_rls_target VALUES (1, 'wire_rls_client'), (2, 'other'); "
+        "ALTER TABLE wire_rls_target ENABLE ROW LEVEL SECURITY; "
+        "CREATE POLICY wire_rls_rows ON wire_rls_target TO wire_rls_client "
+        "USING (tenant = 'wire_rls_client'); "
+        "GRANT SELECT ON wire_rls_target TO wire_rls_client; "
+        "SET ROLE wire_rls_client",
+    )
+    check("raw wire: row-security setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    parse = frontend_message(
+        b"P",
+        b"wire_rls_statement\x00SELECT id FROM wire_rls_target ORDER BY id\x00\x00\x00",
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_rls_portal\x00wire_rls_statement\x00" + struct.pack("!hhh", 0, 0, 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_rls_portal\x00")
+    execute = frontend_message(b"E", b"wire_rls_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "raw wire: named portal applies row security before returning rows",
+        description is not None
+        and row_description_type_oids(description) == [23]
+        and [first_text_row([message]) for message in out if message[0] == b"D"] == ["1"],
+        out,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

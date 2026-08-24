@@ -56,6 +56,30 @@ pub(crate) fn expand_stored_query<'a>(
     expand_ctes_with_path(select, storage, txid, Some(path), Some(dependencies), arena)
 }
 
+pub(crate) fn expand_stored_expression<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    subst_expr(
+        expression,
+        Subst {
+            ctes: &[],
+            materialized: &[],
+            storage,
+            txid,
+            depth: 0,
+            path: Some(*storage.path()),
+            dependencies: Some(dependencies),
+            authorization_role: None,
+            qualifier: None,
+        },
+        arena,
+    )
+}
+
 fn expand_ctes_with_path<'a>(
     sel: &'a Select<'a>,
     storage: &Storage,
@@ -1785,7 +1809,12 @@ fn subst_tableref<'a>(
                 view.name.as_str()
             ));
         }
-        let owner = context.storage.object_owner(view_object, context.txid) as u16;
+        let authorization_role = match view.security {
+            crate::storage::ViewSecurity::Definer => {
+                Some(context.storage.object_owner(view_object, context.txid) as u16)
+            }
+            crate::storage::ViewSecurity::Invoker => context.authorization_role,
+        };
         let view_sql = arena
             .alloc_str(view.sql.as_str())
             .map_err(|_| arena_full())?;
@@ -1805,7 +1834,7 @@ fn subst_tableref<'a>(
             depth: context.depth + 1,
             path: Some(view_path),
             dependencies: Some(context.storage.view_dependencies(slot)),
-            authorization_role: Some(owner),
+            authorization_role,
             qualifier: None,
         };
         let expanded = subst_select(vsel, inner, arena)?;

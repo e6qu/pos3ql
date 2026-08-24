@@ -95,7 +95,11 @@ pub(super) fn find_srf<'a>(items: &'a [SelectItem<'a>]) -> Option<&'a Expr<'a>> 
 /// Whether a SELECT list contains a built-in or catalog set-returning call.
 /// This is a planning predicate: overload selection still happens at the
 /// typed execution boundary once the input row is available.
-fn expression_has_project_set(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+pub(crate) fn expression_has_project_set(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
     if let Expr::Call { name, args, .. } = expression
         && (is_srf_name(name) || storage.has_set_routine_candidate(name, args.len(), txid))
     {

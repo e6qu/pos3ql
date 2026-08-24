@@ -34,7 +34,7 @@ ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql
 ALTER OPERATOR	missing	-
 ALTER OPERATOR CLASS	missing	-
 ALTER OPERATOR FAMILY	missing	-
-ALTER POLICY	missing	-
+ALTER POLICY	complete	106_row_level_security.sql
 ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
@@ -86,7 +86,7 @@ CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
 CREATE OPERATOR	missing	-
 CREATE OPERATOR CLASS	missing	-
 CREATE OPERATOR FAMILY	missing	-
-CREATE POLICY	missing	-
+CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
@@ -134,7 +134,7 @@ DROP OPERATOR	missing	-
 DROP OPERATOR CLASS	missing	-
 DROP OPERATOR FAMILY	missing	-
 DROP OWNED	complete	83_roles_acl.sql
-DROP POLICY	missing	-
+DROP POLICY	complete	106_row_level_security.sql
 DROP PROCEDURE	partial	89_sql_procedures.sql
 DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql

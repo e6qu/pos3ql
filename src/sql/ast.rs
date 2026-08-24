@@ -476,6 +476,8 @@ pub enum Stmt<'a> {
     Reset(Option<&'a str>),
     /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
     SetTransaction(&'a str),
+    /// SET TRANSACTION SNAPSHOT 'snapshot_id'.
+    SetTransactionSnapshot(&'a str),
     /// SET ROLE role | NONE and RESET ROLE.
     SetRole {
         role: Option<&'a str>,
@@ -674,21 +676,35 @@ pub struct PublicationOperations {
 /// syntax defaults, captured before execution rather than inferred later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionOptions<'a> {
+    pub connect: SubscriptionConnect,
     pub enabled: bool,
-    pub create_slot: bool,
     pub copy_data: bool,
-    pub slot_name: SubscriptionSlotName<'a>,
+    pub slot: SubscriptionSlotPlan<'a>,
 }
 
-/// The publisher-slot association is distinct from its textual spelling.
-/// A named slot is an already-created publisher resource. `NONE` describes a
-/// disabled local catalog entry; `Default` preserves omitted PostgreSQL syntax
-/// so execution can reject unimplemented remote slot creation explicitly.
+/// Whether CREATE SUBSCRIPTION may contact the publisher. `Deferred` is the
+/// complete `connect = false` state; it cannot carry an enabled or copy plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionConnect {
+    Now,
+    Deferred,
+}
+
+/// A slot name has already been resolved as PostgreSQL's default or an
+/// explicit identifier, but does not yet borrow the subscription name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionSlotName<'a> {
     Default,
-    None,
     Named(&'a str),
+}
+
+/// Remote-slot ownership is decided at the parse boundary. This prevents a
+/// later worker from treating an external slot as one it may drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionSlotPlan<'a> {
+    Managed(SubscriptionSlotName<'a>),
+    External(SubscriptionSlotName<'a>),
+    Absent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -699,6 +715,9 @@ pub enum AlterSubscriptionAction<'a> {
     SetPublications {
         publications: &'a [&'a str],
         refresh: SubscriptionPublicationRefresh,
+    },
+    RefreshPublications {
+        copy_data: bool,
     },
 }
 

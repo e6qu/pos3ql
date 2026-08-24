@@ -1,12 +1,10 @@
 //! The IANA time-zone database, read from the system's TZif files (RFC 8536).
 //!
 //! Postgres resolves named zones through the full tz database — historical
-//! transitions included — where the embedded rules in [`super::timezone`]
-//! model only each zone's present POSIX rule. This module closes that gap:
-//! a zone name is matched case-insensitively against a catalog of the
-//! installed zone names (walked once at startup, before the allocator
-//! freezes), its TZif file parsed into a fixed-size cache slot, and an
-//! instant resolved by binary search over the real transition history, with
+//! transitions included. A zone name is matched case-insensitively against
+//! a catalog of the installed zone names (walked once at startup, before the
+//! allocator freezes), its TZif file parsed into a fixed-size cache slot, and
+//! an instant resolved by binary search over the real transition history, with
 //! the file's POSIX footer rule covering instants past the last transition.
 //!
 //! Static-memory discipline: the catalog and cache are fixed pools in
@@ -99,16 +97,14 @@ std::thread_local! {
     // allocation, and half a megabyte of inline pools overflowed a 2 MiB test
     // thread. The boxes are allocated in `init_catalog`, before the allocator
     // freezes; a thread that never initialized (no zoneinfo, or the catalog
-    // was skipped) resolves nothing and lookup falls back to the embedded
-    // rules.
+    // was skipped) resolves no named zones.
     static CACHE: RefCell<Option<Box<Cache>>> = const { RefCell::new(None) };
     static CATALOG: RefCell<Option<Box<Catalog>>> = const { RefCell::new(None) };
 }
 
 /// Walks the system zoneinfo directory into the name catalog. Called once at
 /// startup, before the allocator freezes (`read_dir` allocates); a missing
-/// directory leaves the catalog empty and named-zone lookup falls back to the
-/// embedded rule set.
+/// directory leaves the catalog empty and named-zone lookup rejects the name.
 pub fn init_catalog() {
     let root = std::path::Path::new(zoneinfo_root());
     CATALOG.with(|c| {
@@ -205,7 +201,11 @@ pub fn load(name: &str) -> Option<TzifSlot> {
         if cache.n == MAX_CACHED {
             // A loud limit, not an eviction: a session-visible zone must stay
             // resolvable for the server's lifetime.
-            eprintln!("pos3ql: time-zone cache full ({MAX_CACHED} zones); refusing {name}");
+            let message = crate::stack_format!(
+                256,
+                "pos3ql: time-zone cache full ({MAX_CACHED} zones); refusing {name}\n"
+            );
+            crate::util::stderr_line(message.as_str());
             return None;
         }
         let mut path = StackStr::<128>::new();
@@ -418,8 +418,7 @@ mod tests {
 
     #[test]
     fn new_york_matches_history_and_present() {
-        // Hermetic skip when the host has no zoneinfo (the embedded rules
-        // then serve lookups, tested in `timezone`).
+        // Hermetic skip when the host has no zoneinfo.
         let Some(slot) = load_or_skip("America/New_York") else {
             return;
         };

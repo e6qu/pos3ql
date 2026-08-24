@@ -684,7 +684,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
 }
 
 /// PostgreSQL's output-column name for a SELECT-list expression: `name_of`
-/// with the per-node fallback ("case" for a CASE, else "?column?").
+/// followed by the mandated per-node default ("case" for CASE, otherwise
+/// "?column?").
 pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     if let Some(n) = name_of(expression) {
         return n;

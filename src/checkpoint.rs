@@ -286,8 +286,8 @@ const MERGE_TRIGGER: usize = 4;
 
 /// Merge id-scratch capacity, in (rowid, source) entries. Sized generously
 /// past a full table plus its tombstone backlog; a pair whose combined count
-/// exceeds it skips its merge that cycle (the full-rewrite fallback at a
-/// filled list stays the safety net).
+/// exceeds it skips its merge that cycle. A filled list has one mandatory
+/// full-rewrite transition.
 const MERGE_SCRATCH_ENTRIES: usize = 512 * 1024;
 
 /// How far one merge beat may go — the pause a beat inserts between
@@ -1940,6 +1940,10 @@ impl Checkpointer {
                 Some("sub") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_subscription(storage, line)?;
+                }
+                Some("subrel") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_subscription_relation(storage, line)?;
                 }
                 Some("rtn") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -3837,7 +3841,7 @@ impl Checkpointer {
         }
         // Subscriptions are catalog state, not a local worker cache. Hex
         // fields preserve conninfo whitespace in the line-oriented manifest.
-        for (_, subscription) in storage.subscriptions_with_slots_visible_to(0) {
+        for (_, subscription) in storage.subscriptions_with_slots_durable() {
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             let mut connection =
@@ -3849,8 +3853,23 @@ impl Checkpointer {
             for byte in subscription.connection.as_str().as_bytes() {
                 let _ = write!(connection, "{byte:02x}");
             }
-            for byte in subscription.slot_name.as_str().as_bytes() {
-                let _ = write!(slot_name, "{byte:02x}");
+            let slot_kind = match subscription.slot {
+                crate::storage::SubscriptionSlot::Absent => 0,
+                crate::storage::SubscriptionSlot::External(slot) => {
+                    for byte in slot.as_str().as_bytes() {
+                        let _ = write!(slot_name, "{byte:02x}");
+                    }
+                    1
+                }
+                crate::storage::SubscriptionSlot::Managed(slot) => {
+                    for byte in slot.as_str().as_bytes() {
+                        let _ = write!(slot_name, "{byte:02x}");
+                    }
+                    2
+                }
+            };
+            if slot_kind == 0 {
+                let _ = write!(slot_name, "-");
             }
             let mut publications =
                 StackStr::<{ crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS * 130 }>::new();
@@ -3860,22 +3879,66 @@ impl Checkpointer {
                     let _ = write!(publications, "{byte:02x}");
                 }
             }
+            let mut failure_message = StackStr::<384>::new();
+            let failure_code = subscription.failure.map_or_else(
+                || StackStr::<5>::from_str("-"),
+                |failure| StackStr::<5>::from_str(failure.sqlstate.as_str()),
+            );
+            if let Some(failure) = subscription.failure {
+                for byte in failure.message.as_str().as_bytes() {
+                    let _ = write!(failure_message, "{byte:02x}");
+                }
+            } else {
+                let _ = write!(failure_message, "-");
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sub {} {} {} {} {} {} {} {} {}{}",
+                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
                     subscription.ownership.owner,
                     u8::from(subscription.enabled),
                     connection.as_str(),
+                    slot_kind,
                     slot_name.as_str(),
+                    subscription.bootstrap.code(),
                     subscription.created_at,
                     subscription.definition_generation,
                     subscription.confirmed_lsn,
+                    u8::from(
+                        subscription.cleanup
+                            == crate::storage::SubscriptionCleanup::DropManagedSlot
+                    ),
+                    u8::from(subscription.failure.is_some()),
+                    failure_code.as_str(),
+                    failure_message.as_str(),
                     subscription.publication_count,
                     publications.as_str(),
                 ),
             )?;
+            for relation in storage.subscription_relations_visible_to(subscription, 0) {
+                let table = storage.table_def(relation.table_slot(), 0);
+                let mut schema = StackStr::<130>::new();
+                let mut table_name = StackStr::<130>::new();
+                for byte in table.schema.as_str().as_bytes() {
+                    let _ = write!(schema, "{byte:02x}");
+                }
+                for byte in table.name.as_str().as_bytes() {
+                    let _ = write!(table_name, "{byte:02x}");
+                }
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "subrel {} {} {} {} {} {}",
+                        subscription.created_at,
+                        subscription.definition_generation,
+                        schema.as_str(),
+                        table_name.as_str(),
+                        relation.state().code(),
+                        relation.synchronization_lsn(),
+                    ),
+                )?;
+            }
         }
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
@@ -5477,7 +5540,12 @@ fn load_replication_slot(storage: &mut Storage, line: &str) -> Result<(), Checkp
         ));
     }
     storage
-        .restore_replication_slot(sql_name(&name)?, restart_lsn, confirmed_flush_lsn)
+        .restore_replication_slot(
+            crate::storage::ReplicationSlotName::parse(&name)
+                .map_err(|_| CheckpointSetupError::Corrupt("replication slot name"))?,
+            restart_lsn,
+            confirmed_flush_lsn,
+        )
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
                 "manifest replication slot rejected: {}",
@@ -5738,14 +5806,75 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             crate::storage::SubscriptionConnInfo::parse(&value)
                 .map_err(|_| CheckpointSetupError::Corrupt("invalid subscription connection"))
         })?;
-    let slot_name = words
+    let slot_kind = parse_field::<u8>(words.next(), "subscription slot kind")?;
+    let slot_word = words
         .next()
-        .ok_or(CheckpointSetupError::Corrupt("subscription slot name"))
-        .and_then(decode_hex_name)
-        .and_then(|value| sql_name(&value))?;
+        .ok_or(CheckpointSetupError::Corrupt("subscription slot name"))?;
+    let publisher_slot = match slot_kind {
+        0 if slot_word == "-" => crate::storage::SubscriptionSlot::Absent,
+        1 => crate::storage::SubscriptionSlot::External(decode_hex_name(slot_word).and_then(
+            |value| {
+                crate::storage::ReplicationSlotName::parse(&value)
+                    .map_err(|_| CheckpointSetupError::Corrupt("subscription slot name"))
+            },
+        )?),
+        2 => crate::storage::SubscriptionSlot::Managed(decode_hex_name(slot_word).and_then(
+            |value| {
+                crate::storage::ReplicationSlotName::parse(&value)
+                    .map_err(|_| CheckpointSetupError::Corrupt("subscription slot name"))
+            },
+        )?),
+        _ => return Err(CheckpointSetupError::Corrupt("subscription slot kind")),
+    };
+    let bootstrap = crate::storage::SubscriptionBootstrap::from_code(parse_field::<u8>(
+        words.next(),
+        "subscription bootstrap state",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt(
+        "subscription bootstrap state",
+    ))?;
     let created_at = parse_field(words.next(), "subscription creation stamp")?;
     let definition_generation = parse_field(words.next(), "subscription definition generation")?;
     let confirmed_lsn = parse_field(words.next(), "subscription confirmed LSN")?;
+    let cleanup = match parse_field::<u8>(words.next(), "subscription cleanup state")? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(CheckpointSetupError::Corrupt("subscription cleanup state"));
+        }
+    };
+    let failure = match parse_field::<u8>(words.next(), "subscription failure state")? {
+        0 => {
+            if words.next() != Some("-") || words.next() != Some("-") {
+                return Err(CheckpointSetupError::Corrupt("subscription failure state"));
+            }
+            None
+        }
+        1 => {
+            let code = words
+                .next()
+                .and_then(crate::sql::eval::SqlState::parse)
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "subscription failure SQLSTATE",
+                ))?;
+            let message = words
+                .next()
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "subscription failure message",
+                ))
+                .and_then(decode_hex_name)?;
+            if message.is_empty() {
+                return Err(CheckpointSetupError::Corrupt(
+                    "subscription failure message",
+                ));
+            }
+            Some(crate::storage::SubscriptionFailure {
+                sqlstate: code,
+                message: StackStr::from_str(&message),
+            })
+        }
+        _ => return Err(CheckpointSetupError::Corrupt("subscription failure state")),
+    };
     let count: usize = parse_field(words.next(), "subscription publication count")?;
     if count == 0 || count > crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS {
         return Err(CheckpointSetupError::Corrupt(
@@ -5766,14 +5895,9 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
         ));
     }
     if enabled {
-        let endpoint = connection
+        connection
             .require_endpoint()
             .map_err(|_| CheckpointSetupError::Corrupt("enabled subscription endpoint"))?;
-        if endpoint.application_name().is_none() {
-            return Err(CheckpointSetupError::Corrupt(
-                "enabled subscription application name",
-            ));
-        }
     }
     let slot = storage
         .create_subscription(
@@ -5782,7 +5906,8 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
                 connection,
                 publications: &publications[..count],
                 enabled,
-                slot_name,
+                slot: publisher_slot,
+                bootstrap,
             },
             0,
         )
@@ -5821,7 +5946,82 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             ))?;
         storage.apply_subscription_advance(advance);
     }
+    if cleanup {
+        let dropped = storage
+            .drop_subscription(&name, 0)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest subscription cleanup rejected: {}",
+                    error.message.as_str()
+                ))
+            })?
+            .ok_or(CheckpointSetupError::Corrupt("subscription cleanup target"))?;
+        storage.commit_subscription_drop(dropped);
+    } else if let Some(failure) = failure {
+        let stream = storage
+            .subscription_stream(slot, 0)
+            .ok_or(CheckpointSetupError::Corrupt("subscription failure target"))?;
+        storage
+            .fail_subscription(stream, failure)
+            .map_err(|_| CheckpointSetupError::Corrupt("subscription failure target"))?;
+    }
     Ok(())
+}
+
+fn load_subscription_relation(
+    storage: &mut Storage,
+    line: &str,
+) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split(' ');
+    let _ = words.next();
+    let created_at = parse_field(words.next(), "subscription relation creation stamp")?;
+    let definition_generation =
+        parse_field(words.next(), "subscription relation definition generation")?;
+    let schema = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt(
+            "subscription relation schema",
+        ))
+        .and_then(decode_hex_name)?;
+    let table = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("subscription relation table"))
+        .and_then(decode_hex_name)?;
+    let state = crate::storage::SubscriptionRelationState::from_code(parse_field::<u8>(
+        words.next(),
+        "subscription relation state",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("subscription relation state"))?;
+    let synchronization_lsn =
+        parse_field(words.next(), "subscription relation synchronization LSN")?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt(
+            "trailing subscription relation fields",
+        ));
+    }
+    let slot = storage
+        .subscriptions_with_slots_visible_to(0)
+        .find(|(_, subscription)| {
+            subscription.created_at == created_at
+                && subscription.definition_generation == definition_generation
+        })
+        .map(|(slot, _)| slot)
+        .ok_or(CheckpointSetupError::Corrupt(
+            "subscription relation stream identity",
+        ))?;
+    let stream = storage
+        .subscription_stream(slot, 0)
+        .ok_or(CheckpointSetupError::Corrupt(
+            "subscription relation stream identity",
+        ))?;
+    storage
+        .restore_subscription_relation(stream, &schema, &table, state, synchronization_lsn)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest subscription relation rejected: {}",
+                error.message.as_str()
+            ))
+        })
 }
 
 #[inline(never)]

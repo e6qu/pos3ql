@@ -257,6 +257,126 @@ impl SubscriptionApply {
         self.confirmed_lsn
     }
 
+    pub(crate) fn establish_frontier(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        confirmed_lsn: u64,
+    ) -> Result<(), SqlError> {
+        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+        let result = engine
+            .stage_subscription_advance(&mut self.txn, self.stream, confirmed_lsn)
+            .and_then(|advanced| {
+                if !advanced {
+                    return Err(Self::protocol_error(
+                        "subscription bootstrap frontier did not advance",
+                    ));
+                }
+                engine.commit_txn(&mut self.txn, &self.guc)
+            });
+        if result.is_err() && self.txn.is_active() {
+            engine.rollback_txn(&mut self.txn, &self.guc);
+        }
+        if result.is_ok() {
+            self.confirmed_lsn = confirmed_lsn;
+        }
+        result
+    }
+
+    pub(crate) fn begin_bootstrap(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+    ) -> Result<(), SqlError> {
+        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+        self.txn.mode = crate::sql::txn::TxnMode::Explicit;
+        engine.begin_subscription_relation_refresh(&mut self.txn, self.stream)
+    }
+
+    pub(crate) fn register_bootstrap_relation(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        schema: crate::storage::SqlName,
+        table: crate::storage::SqlName,
+    ) -> Result<(), SqlError> {
+        engine.stage_subscription_relation(
+            &mut self.txn,
+            self.stream,
+            schema.as_str(),
+            table.as_str(),
+        )
+    }
+
+    pub(crate) fn start_copy_table(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        schema: crate::storage::SqlName,
+        table: crate::storage::SqlName,
+        columns: &[crate::storage::SqlName],
+    ) -> Result<crate::sql::exec::CopySetup, SqlError> {
+        let setup = engine.subscription_copy_setup(schema, table, columns, self.txn.txid)?;
+        self.trigger_response.clear();
+        let mut responder = Responder::new(&mut self.trigger_response);
+        engine.copy_start(
+            &setup,
+            &mut self.txn,
+            self.guc.seq_session(),
+            &self.arena,
+            &mut responder,
+        )?;
+        Ok(setup)
+    }
+
+    pub(crate) fn copy_line(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        setup: &crate::sql::exec::CopySetup,
+        line: &[u8],
+    ) -> Result<(), SqlError> {
+        let mark = self.arena.mark();
+        self.trigger_response.clear();
+        let mut responder = Responder::new(&mut self.trigger_response);
+        let result = engine
+            .copy_row_line(
+                setup,
+                &mut self.txn,
+                self.guc.seq_session(),
+                &self.arena,
+                &mut responder,
+                line,
+            )
+            .map(|_| ());
+        unsafe { self.arena.rewind_to(mark) };
+        result
+    }
+
+    pub(crate) fn finish_copy_table(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        setup: &crate::sql::exec::CopySetup,
+    ) -> Result<(), SqlError> {
+        self.trigger_response.clear();
+        let mut responder = Responder::new(&mut self.trigger_response);
+        engine.copy_finish(setup, &mut self.txn, &self.guc, &mut responder)
+    }
+
+    pub(crate) fn finish_bootstrap(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        confirmed_lsn: u64,
+    ) -> Result<(), SqlError> {
+        let advanced =
+            engine.stage_subscription_advance(&mut self.txn, self.stream, confirmed_lsn)?;
+        if !advanced {
+            return Err(Self::protocol_error(
+                "subscription bootstrap frontier did not advance",
+            ));
+        }
+        let result = engine.commit_txn(&mut self.txn, &self.guc);
+        if result.is_ok() {
+            self.confirmed_lsn = confirmed_lsn;
+        }
+        result
+    }
+
     /// Rebinds a preallocated worker after its former transport has stopped.
     /// The worker must be idle, so no transaction, row lock, relation mapping,
     /// or arena reference can cross a subscription identity change.
@@ -526,20 +646,12 @@ impl SubscriptionApply {
                 end_lsn, message, ..
             } => self.apply_message(engine, end_lsn, message),
             CopyData::PrimaryKeepalive {
-                end_lsn,
+                end_lsn: _,
                 reply_requested,
-            } => {
-                if end_lsn < self.confirmed_lsn {
-                    Err(Self::protocol_error(
-                        "publisher keepalive regressed behind acknowledged subscription progress",
-                    ))
-                } else {
-                    Ok(ApplyResult::Acknowledge {
-                        flushed_lsn: self.confirmed_lsn,
-                        reply_requested,
-                    })
-                }
-            }
+            } => Ok(ApplyResult::Acknowledge {
+                flushed_lsn: self.confirmed_lsn,
+                reply_requested,
+            }),
         };
         if result.is_err() {
             self.abort(engine);

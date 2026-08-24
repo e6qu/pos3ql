@@ -127,6 +127,13 @@ impl ConnectionInfo {
         self.application_name.as_ref().map(StackStr::as_str)
     }
 
+    pub(crate) fn for_subscription(mut self, subscription: SqlName) -> Self {
+        if self.application_name.is_none() {
+            self.application_name = Some(StackStr::from_str(subscription.as_str()));
+        }
+        self
+    }
+
     pub fn ssl_mode(&self) -> SslMode {
         self.ssl_mode
     }
@@ -262,6 +269,7 @@ pub enum ClientError {
     MissingApplicationName,
     UnsupportedTls,
     Authentication,
+    Publisher(PublisherDiagnostic),
     PublisherError,
     Closed,
 }
@@ -301,10 +309,27 @@ impl core::fmt::Display for ClientError {
                 write!(formatter, "subscription TLS transport is not configured")
             }
             Self::Authentication => write!(formatter, "publisher authentication cannot proceed"),
+            Self::Publisher(error) => {
+                write!(
+                    formatter,
+                    "publisher error [{}]: {}",
+                    error.sqlstate,
+                    error.message.as_str()
+                )
+            }
             Self::PublisherError => write!(formatter, "publisher rejected replication startup"),
             Self::Closed => write!(formatter, "publisher closed replication transport"),
         }
     }
+}
+
+/// A PostgreSQL ErrorResponse reduced to the stable fields needed for
+/// diagnostics and typed recovery decisions. Unknown fields remain protocol
+/// compatible without entering runtime state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublisherDiagnostic {
+    pub sqlstate: crate::sql::eval::SqlState,
+    pub message: StackStr<192>,
 }
 
 impl std::error::Error for ClientError {}
@@ -316,8 +341,67 @@ enum ClientState {
     AwaitingSslResponse,
     AwaitingAuthentication,
     AwaitingReady,
+    AwaitingSlotResult,
+    SnapshotReady,
+    AwaitingDropResult,
+    CommandComplete,
+    SqlReady,
+    AwaitingSql,
+    CopyOut,
     AwaitingCopyBoth,
     Streaming,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientPurpose {
+    Unbound,
+    Stream,
+    CreateSlot,
+    DropSlot,
+    Sql,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "SQL rows retain bounded inline columns; indirection would require runtime allocation"
+)]
+pub enum SqlEvent<'a> {
+    RowDescription { fields: u16 },
+    DataRow(SqlDataRow<'a>),
+    CopyOut { fields: u16, binary: bool },
+    CopyData(&'a [u8]),
+    CopyDone,
+    CommandComplete { tag: &'a str },
+    Ready { transaction_status: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlDataRow<'a> {
+    columns: [Option<&'a [u8]>; crate::storage::MAX_COLUMNS],
+    count: usize,
+}
+
+impl<'a> SqlDataRow<'a> {
+    pub fn columns(&self) -> &[Option<&'a [u8]>] {
+        &self.columns[..self.count]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "pgoutput and SQL events remain inline so the runtime transport cannot allocate"
+)]
+pub enum ClientEvent<'a> {
+    Replication(CopyData<'a>),
+    Sql(SqlEvent<'a>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotSnapshot {
+    pub consistent_lsn: u64,
+    pub name: StackStr<128>,
 }
 
 /// Bounded generic PostgreSQL replication transport.  It owns no apply state:
@@ -335,6 +419,8 @@ pub struct ReplicationClient {
     state: ClientState,
     scram: Option<ScramClient>,
     tls: Option<Arc<rustls::ClientConfig>>,
+    purpose: ClientPurpose,
+    slot_snapshot: Option<SlotSnapshot>,
 }
 
 /// All immutable replication-stream parameters are parsed and selected before
@@ -396,6 +482,8 @@ impl ReplicationClient {
             state: ClientState::Idle,
             scram: None,
             tls: tls.map(|tls| tls.config.clone()),
+            purpose: ClientPurpose::Unbound,
+            slot_snapshot: None,
         })
     }
 
@@ -433,6 +521,7 @@ impl ReplicationClient {
                 self.slot = slot;
                 self.start_lsn = start_lsn;
                 self.protocol = protocol;
+                self.purpose = ClientPurpose::Stream;
                 self.stream = Some(Transport::plain(stream));
                 self.state = ClientState::Connecting;
                 Ok(())
@@ -453,7 +542,80 @@ impl ReplicationClient {
         self.receive.clear();
         self.send.clear();
         self.scram = None;
+        self.purpose = ClientPurpose::Unbound;
+        self.slot_snapshot = None;
         self.state = ClientState::Idle;
+    }
+
+    pub(crate) fn bind_create_slot(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+    ) -> Result<(), ClientError> {
+        self.bind_command(endpoint, slot, ClientPurpose::CreateSlot)
+    }
+
+    pub(crate) fn bind_drop_slot(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+    ) -> Result<(), ClientError> {
+        self.bind_command(endpoint, slot, ClientPurpose::DropSlot)
+    }
+
+    pub(crate) fn bind_sql(&mut self, endpoint: ConnectionInfo) -> Result<(), ClientError> {
+        self.bind_command(endpoint, SqlName::EMPTY, ClientPurpose::Sql)
+    }
+
+    fn bind_command(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+        purpose: ClientPurpose,
+    ) -> Result<(), ClientError> {
+        if self.state != ClientState::Idle || self.stream.is_some() {
+            return Err(ClientError::Protocol(FrameError::Malformed));
+        }
+        if endpoint.ssl_mode() == SslMode::Require && self.tls.is_none() {
+            return Err(ClientError::UnsupportedTls);
+        }
+        if endpoint.application_name().is_none() {
+            return Err(ClientError::MissingApplicationName);
+        }
+        let stream = open_nonblocking(endpoint.socket_addr())?;
+        self.endpoint = Some(endpoint);
+        self.slot = slot;
+        self.purpose = purpose;
+        self.stream = Some(Transport::plain(stream));
+        self.state = ClientState::Connecting;
+        Ok(())
+    }
+
+    pub(crate) fn slot_snapshot(&self) -> Option<SlotSnapshot> {
+        (self.state == ClientState::SnapshotReady)
+            .then_some(self.slot_snapshot)
+            .flatten()
+    }
+
+    pub(crate) fn command_complete(&self) -> bool {
+        self.state == ClientState::CommandComplete
+    }
+
+    pub(crate) fn query(&mut self, query: &str) -> Result<(), ClientError> {
+        if self.state != ClientState::SqlReady || query.is_empty() || query.as_bytes().contains(&0)
+        {
+            return Err(ClientError::Protocol(FrameError::Malformed));
+        }
+        let mark = self.send.mark();
+        let mut message = MsgOut::begin(&mut self.send, wire::FMSG_QUERY);
+        message.bytes(query.as_bytes());
+        message.u8(0);
+        if message.finish().is_err() {
+            self.send.truncate_to(mark);
+            return Err(ClientError::WireFull);
+        }
+        self.state = ClientState::AwaitingSql;
+        Ok(())
     }
 
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
@@ -475,13 +637,14 @@ impl ReplicationClient {
 
     fn queue_startup(&mut self) -> Result<(), ClientError> {
         let endpoint = self.endpoint.expect("bound replication worker");
-        startup(
+        startup_packet(
             &mut self.send,
             endpoint.user(),
             endpoint.database(),
             endpoint
                 .application_name()
                 .expect("constructor requires application_name"),
+            self.purpose != ClientPurpose::Sql,
         )
         .map_err(|_| ClientError::WireFull)?;
         self.state = ClientState::AwaitingAuthentication;
@@ -565,7 +728,7 @@ impl ReplicationClient {
     /// consumed or compacted.
     pub fn readable(
         &mut self,
-        mut visit: impl FnMut(CopyData<'_>) -> Result<(), ClientError>,
+        mut visit: impl FnMut(ClientEvent<'_>) -> Result<(), ClientError>,
     ) -> Result<(), ClientError> {
         loop {
             let writable = self.receive.writable();
@@ -626,6 +789,8 @@ impl ReplicationClient {
                 publications,
                 start_lsn,
                 protocol,
+                purpose,
+                slot_snapshot,
                 send,
                 state,
                 scram,
@@ -640,6 +805,8 @@ impl ReplicationClient {
                     publications,
                     start_lsn: *start_lsn,
                     protocol: *protocol,
+                    purpose: *purpose,
+                    slot_snapshot,
                     scram,
                 },
                 frame,
@@ -715,13 +882,15 @@ struct FrameSink<'a> {
     publications: &'a [SqlName],
     start_lsn: u64,
     protocol: ProtocolVersion,
+    purpose: ClientPurpose,
+    slot_snapshot: &'a mut Option<SlotSnapshot>,
     scram: &'a mut Option<ScramClient>,
 }
 
 fn consume_frame<'a>(
     sink: FrameSink<'_>,
     frame: BackendFrame<'a>,
-) -> Result<Option<CopyData<'a>>, ClientError> {
+) -> Result<Option<ClientEvent<'a>>, ClientError> {
     let FrameSink {
         send,
         state,
@@ -730,6 +899,8 @@ fn consume_frame<'a>(
         publications,
         start_lsn,
         protocol,
+        purpose,
+        slot_snapshot,
         scram,
     } = sink;
     match frame {
@@ -758,21 +929,92 @@ fn consume_frame<'a>(
         }
         BackendFrame::ReadyForQuery {
             transaction_status: b'I',
-        } if *state == ClientState::AwaitingReady => {
-            start_replication(send, slot, start_lsn, publications, protocol)
-                .map_err(|_| ClientError::WireFull)?;
-            *state = ClientState::AwaitingCopyBoth;
+        } if *state == ClientState::AwaitingReady => match purpose {
+            ClientPurpose::Stream => {
+                start_replication(send, slot, start_lsn, publications, protocol)
+                    .map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingCopyBoth;
+            }
+            ClientPurpose::CreateSlot => {
+                create_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingSlotResult;
+            }
+            ClientPurpose::DropSlot => {
+                drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingDropResult;
+            }
+            ClientPurpose::Sql => {
+                *state = ClientState::SqlReady;
+                return Ok(Some(ClientEvent::Sql(SqlEvent::Ready {
+                    transaction_status: b'I',
+                })));
+            }
+            ClientPurpose::Unbound => {
+                return Err(ClientError::Protocol(FrameError::Malformed));
+            }
+        },
+        BackendFrame::RowDescription { fields: 4 } if *state == ClientState::AwaitingSlotResult => {
+        }
+        BackendFrame::DataRow(row) if *state == ClientState::AwaitingSlotResult => {
+            *slot_snapshot = Some(parse_slot_snapshot(row)?);
+        }
+        BackendFrame::CommandComplete {
+            tag: "CREATE_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingSlotResult && slot_snapshot.is_some() => {
+            *state = ClientState::SnapshotReady;
+        }
+        BackendFrame::CommandComplete {
+            tag: "DROP_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingDropResult => {
+            *state = ClientState::CommandComplete;
+        }
+        BackendFrame::ReadyForQuery {
+            transaction_status: b'I',
+        } if matches!(
+            *state,
+            ClientState::SnapshotReady | ClientState::CommandComplete
+        ) => {}
+        BackendFrame::RowDescription { fields } if *state == ClientState::AwaitingSql => {
+            return Ok(Some(ClientEvent::Sql(SqlEvent::RowDescription { fields })));
+        }
+        BackendFrame::DataRow(row) if *state == ClientState::AwaitingSql => {
+            return Ok(Some(ClientEvent::Sql(SqlEvent::DataRow(row))));
+        }
+        BackendFrame::CopyOut { fields, binary } if *state == ClientState::AwaitingSql => {
+            *state = ClientState::CopyOut;
+            return Ok(Some(ClientEvent::Sql(SqlEvent::CopyOut { fields, binary })));
+        }
+        BackendFrame::CopyData(payload) if *state == ClientState::CopyOut => {
+            return Ok(Some(ClientEvent::Sql(SqlEvent::CopyData(payload))));
+        }
+        BackendFrame::CopyDone if *state == ClientState::CopyOut => {
+            *state = ClientState::AwaitingSql;
+            return Ok(Some(ClientEvent::Sql(SqlEvent::CopyDone)));
+        }
+        BackendFrame::CommandComplete { tag } if *state == ClientState::AwaitingSql => {
+            return Ok(Some(ClientEvent::Sql(SqlEvent::CommandComplete { tag })));
+        }
+        BackendFrame::ReadyForQuery { transaction_status }
+            if *state == ClientState::AwaitingSql && matches!(transaction_status, b'I' | b'T') =>
+        {
+            *state = ClientState::SqlReady;
+            return Ok(Some(ClientEvent::Sql(SqlEvent::Ready {
+                transaction_status,
+            })));
         }
         BackendFrame::CopyBoth if *state == ClientState::AwaitingCopyBoth => {
             *state = ClientState::Streaming;
         }
-        BackendFrame::CopyData(frame) if *state == ClientState::Streaming => {
-            return Ok(Some(frame));
+        BackendFrame::CopyData(payload) if *state == ClientState::Streaming => {
+            let frame = pginput::copy_data(payload).map_err(FrameError::Pgoutput)?;
+            return Ok(Some(ClientEvent::Replication(frame)));
         }
         BackendFrame::ParameterStatus { .. }
         | BackendFrame::BackendKeyData
         | BackendFrame::Notice { .. } => {}
-        BackendFrame::Error { .. } => return Err(ClientError::PublisherError),
+        BackendFrame::Error { fields } => {
+            return Err(ClientError::Publisher(publisher_diagnostic(fields)?));
+        }
         _ => return Err(ClientError::Protocol(FrameError::Malformed)),
     }
     Ok(None)
@@ -1031,9 +1273,124 @@ pub enum BackendFrame<'a> {
     BackendKeyData,
     ReadyForQuery { transaction_status: u8 },
     CopyBoth,
-    CopyData(CopyData<'a>),
+    CopyOut { fields: u16, binary: bool },
+    CopyData(&'a [u8]),
+    CopyDone,
+    RowDescription { fields: u16 },
+    DataRow(SqlDataRow<'a>),
+    CommandComplete { tag: &'a str },
     Error { fields: &'a [u8] },
     Notice { fields: &'a [u8] },
+}
+
+fn row_description_fields(payload: &[u8]) -> Result<u16, FrameError> {
+    let count = u16::from_be_bytes(
+        payload
+            .get(..2)
+            .ok_or(FrameError::Malformed)?
+            .try_into()
+            .unwrap(),
+    );
+    let mut at = 2;
+    for _ in 0..count {
+        let _ = cstr_at(payload, &mut at)?;
+        at = at.checked_add(18).ok_or(FrameError::Malformed)?;
+        if at > payload.len() {
+            return Err(FrameError::Malformed);
+        }
+    }
+    (at == payload.len())
+        .then_some(count)
+        .ok_or(FrameError::Malformed)
+}
+
+fn copy_out_fields(payload: &[u8]) -> Result<(u16, bool), FrameError> {
+    let binary = match payload.first() {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(FrameError::Malformed),
+    };
+    let fields = u16::from_be_bytes(
+        payload
+            .get(1..3)
+            .ok_or(FrameError::Malformed)?
+            .try_into()
+            .unwrap(),
+    );
+    let expected = 3usize
+        .checked_add(usize::from(fields) * 2)
+        .ok_or(FrameError::Malformed)?;
+    if payload.len() != expected {
+        return Err(FrameError::Malformed);
+    }
+    for format in payload[3..].chunks_exact(2) {
+        let format = i16::from_be_bytes(format.try_into().unwrap());
+        if format != i16::from(binary) {
+            return Err(FrameError::Malformed);
+        }
+    }
+    Ok((fields, binary))
+}
+
+fn data_row(payload: &[u8]) -> Result<SqlDataRow<'_>, FrameError> {
+    let count = usize::from(u16::from_be_bytes(
+        payload
+            .get(..2)
+            .ok_or(FrameError::Malformed)?
+            .try_into()
+            .unwrap(),
+    ));
+    if count > crate::storage::MAX_COLUMNS {
+        return Err(FrameError::Malformed);
+    }
+    let mut columns = [None; crate::storage::MAX_COLUMNS];
+    let mut at = 2;
+    for column in &mut columns[..count] {
+        let length = i32::from_be_bytes(
+            payload
+                .get(at..at + 4)
+                .ok_or(FrameError::Malformed)?
+                .try_into()
+                .unwrap(),
+        );
+        at += 4;
+        if length == -1 {
+            continue;
+        }
+        let length: usize = length.try_into().map_err(|_| FrameError::Malformed)?;
+        let value = payload
+            .get(at..at.checked_add(length).ok_or(FrameError::Malformed)?)
+            .ok_or(FrameError::Malformed)?;
+        at += length;
+        *column = Some(value);
+    }
+    (at == payload.len())
+        .then_some(SqlDataRow { columns, count })
+        .ok_or(FrameError::Malformed)
+}
+
+fn parse_slot_snapshot(row: SqlDataRow<'_>) -> Result<SlotSnapshot, ClientError> {
+    let [slot_name, consistent_lsn, snapshot_name, output_plugin] = row.columns() else {
+        return Err(FrameError::Malformed.into());
+    };
+    let _slot_name = core::str::from_utf8(slot_name.ok_or(FrameError::Malformed)?)
+        .map_err(|_| FrameError::Malformed)?;
+    let consistent_lsn = core::str::from_utf8(consistent_lsn.ok_or(FrameError::Malformed)?)
+        .map_err(|_| FrameError::Malformed)?;
+    let snapshot_name = core::str::from_utf8(snapshot_name.ok_or(FrameError::Malformed)?)
+        .map_err(|_| FrameError::Malformed)?;
+    if *output_plugin != Some(b"pgoutput".as_slice()) {
+        return Err(FrameError::Malformed.into());
+    }
+    let consistent_lsn = parse_lsn(consistent_lsn).ok_or(FrameError::Malformed)?;
+    let name = StackStr::from_str(snapshot_name);
+    if name.is_truncated() || name.as_str().is_empty() {
+        return Err(FrameError::Malformed.into());
+    }
+    Ok(SlotSnapshot {
+        consistent_lsn,
+        name,
+    })
 }
 
 fn cstr_at<'a>(bytes: &'a [u8], at: &mut usize) -> Result<&'a str, FrameError> {
@@ -1045,6 +1402,49 @@ fn cstr_at<'a>(bytes: &'a [u8], at: &mut usize) -> Result<&'a str, FrameError> {
     let raw = bytes.get(*at..*at + length).ok_or(FrameError::Malformed)?;
     *at += length + 1;
     core::str::from_utf8(raw).map_err(|_| FrameError::Malformed)
+}
+
+fn publisher_diagnostic(fields: &[u8]) -> Result<PublisherDiagnostic, FrameError> {
+    let mut at = 0;
+    let mut sqlstate = None;
+    let mut message = None;
+    loop {
+        let kind = *fields.get(at).ok_or(FrameError::Malformed)?;
+        at += 1;
+        if kind == 0 {
+            if at != fields.len() {
+                return Err(FrameError::Malformed);
+            }
+            break;
+        }
+        let value = cstr_at(fields, &mut at)?;
+        match kind {
+            b'C' => {
+                if sqlstate.is_some() {
+                    return Err(FrameError::Malformed);
+                }
+                sqlstate = crate::sql::eval::SqlState::parse(value);
+                if sqlstate.is_none() {
+                    return Err(FrameError::Malformed);
+                }
+            }
+            b'M' => {
+                if message.is_some() {
+                    return Err(FrameError::Malformed);
+                }
+                let value = StackStr::from_str(value);
+                if value.is_truncated() || value.as_str().is_empty() {
+                    return Err(FrameError::Malformed);
+                }
+                message = Some(value);
+            }
+            _ => {}
+        }
+    }
+    Ok(PublisherDiagnostic {
+        sqlstate: sqlstate.ok_or(FrameError::Malformed)?,
+        message: message.ok_or(FrameError::Malformed)?,
+    })
 }
 
 fn authentication(payload: &[u8]) -> Result<Authentication<'_>, FrameError> {
@@ -1116,8 +1516,23 @@ pub fn next_frame(bytes: &[u8]) -> Result<Option<(usize, BackendFrame<'_>)>, Fra
         // and uses the protocol's text format marker. pgoutput's binary
         // envelopes live inside subsequent CopyData frames.
         wire::MSG_COPY_BOTH_RESPONSE if payload == [0, 0, 0] => BackendFrame::CopyBoth,
-        wire::FMSG_COPY_DATA => {
-            BackendFrame::CopyData(pginput::copy_data(payload).map_err(FrameError::Pgoutput)?)
+        wire::MSG_COPY_OUT_RESPONSE => {
+            let (fields, binary) = copy_out_fields(payload)?;
+            BackendFrame::CopyOut { fields, binary }
+        }
+        wire::FMSG_COPY_DATA => BackendFrame::CopyData(payload),
+        wire::FMSG_COPY_DONE if payload.is_empty() => BackendFrame::CopyDone,
+        wire::MSG_ROW_DESCRIPTION => BackendFrame::RowDescription {
+            fields: row_description_fields(payload)?,
+        },
+        wire::MSG_DATA_ROW => BackendFrame::DataRow(data_row(payload)?),
+        wire::MSG_COMMAND_COMPLETE => {
+            let mut at = 0;
+            let tag = cstr_at(payload, &mut at)?;
+            if at != payload.len() {
+                return Err(FrameError::Malformed);
+            }
+            BackendFrame::CommandComplete { tag }
         }
         wire::MSG_ERROR_RESPONSE => BackendFrame::Error { fields: payload },
         wire::MSG_NOTICE_RESPONSE => BackendFrame::Notice { fields: payload },
@@ -1134,6 +1549,16 @@ pub fn startup(
     database: &str,
     application_name: &str,
 ) -> Result<(), WireFull> {
+    startup_packet(buffer, user, database, application_name, true)
+}
+
+fn startup_packet(
+    buffer: &mut FixedBuf,
+    user: &str,
+    database: &str,
+    application_name: &str,
+    replication: bool,
+) -> Result<(), WireFull> {
     if [user, database, application_name]
         .iter()
         .any(|value| value.is_empty() || value.as_bytes().contains(&0))
@@ -1148,8 +1573,9 @@ pub fn startup(
         && buffer.append(&[0])
         && buffer.append(b"database\0")
         && buffer.append(database.as_bytes())
-        && buffer.append(&[0])
-        && buffer.append(b"replication\0database\0")
+        && buffer.append(&[0]);
+    let ok = ok
+        && (!replication || buffer.append(b"replication\0database\0"))
         && buffer.append(b"application_name\0")
         && buffer.append(application_name.as_bytes())
         && buffer.append(&[0, 0]);
@@ -1171,6 +1597,41 @@ fn append_identifier(out: &mut MsgOut<'_>, identifier: &str) {
         out.u8(byte);
     }
     out.u8(b'\"');
+}
+
+fn parse_lsn(value: &str) -> Option<u64> {
+    let (high, low) = value.split_once('/')?;
+    if high.is_empty() || low.is_empty() || high.len() > 8 || low.len() > 8 {
+        return None;
+    }
+    Some((u64::from_str_radix(high, 16).ok()? << 32) | u64::from_str_radix(low, 16).ok()?)
+}
+
+pub fn create_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(), WireFull> {
+    let mark = buffer.mark();
+    let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
+    message.bytes(b"CREATE_REPLICATION_SLOT ");
+    append_identifier(&mut message, slot.as_str());
+    message.bytes(b" LOGICAL pgoutput (SNAPSHOT 'export')");
+    message.u8(0);
+    if message.finish().is_err() {
+        buffer.truncate_to(mark);
+        return Err(WireFull);
+    }
+    Ok(())
+}
+
+pub fn drop_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(), WireFull> {
+    let mark = buffer.mark();
+    let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
+    message.bytes(b"DROP_REPLICATION_SLOT ");
+    append_identifier(&mut message, slot.as_str());
+    message.u8(0);
+    if message.finish().is_err() {
+        buffer.truncate_to(mark);
+        return Err(WireFull);
+    }
+    Ok(())
 }
 
 /// Starts a pgoutput stream at a durable LSN. Publication names cross as a
@@ -1317,6 +1778,13 @@ mod tests {
             command,
             "START_REPLICATION SLOT \"slot\" LOGICAL 0/ABCDEF01 (proto_version '4', publication_names '\"first\", \"a\"\"b\"')"
         );
+        out.clear();
+        create_replication_slot(&mut out, SqlName::parse("slot").unwrap()).unwrap();
+        let command = core::str::from_utf8(&out.readable()[5..out.len() - 1]).unwrap();
+        assert_eq!(
+            command,
+            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL pgoutput (SNAPSHOT 'export')"
+        );
     }
 
     #[test]
@@ -1339,6 +1807,16 @@ mod tests {
                 BackendFrame::Authentication(Authentication::CleartextPassword)
             )))
         );
+
+        let fields = b"SERROR\0C42704\0Mreplication slot does not exist\0\0";
+        let diagnostic = publisher_diagnostic(fields).unwrap();
+        assert_eq!(diagnostic.sqlstate, "42704");
+        assert_eq!(
+            diagnostic.message.as_str(),
+            "replication slot does not exist"
+        );
+        assert!(publisher_diagnostic(b"SERROR\0Mmissing code\0\0").is_err());
+        assert!(publisher_diagnostic(b"C42704\0Mfirst\0Msecond\0\0").is_err());
     }
 
     #[test]
@@ -1470,15 +1948,18 @@ mod tests {
         while (!client.is_streaming() || keepalive.is_none()) && Instant::now() < deadline {
             client.writable().unwrap();
             client
-                .readable(|frame| match frame {
-                    CopyData::PrimaryKeepalive {
+                .readable(|event| match event {
+                    ClientEvent::Replication(CopyData::PrimaryKeepalive {
                         end_lsn,
                         reply_requested,
-                    } => {
+                    }) => {
                         keepalive = Some((end_lsn, reply_requested));
                         Ok(())
                     }
-                    CopyData::XLogData { .. } => Err(ClientError::Protocol(FrameError::Malformed)),
+                    ClientEvent::Replication(CopyData::XLogData { .. }) => {
+                        Err(ClientError::Protocol(FrameError::Malformed))
+                    }
+                    ClientEvent::Sql(_) => Err(ClientError::Protocol(FrameError::Malformed)),
                 })
                 .unwrap();
             std::thread::yield_now();

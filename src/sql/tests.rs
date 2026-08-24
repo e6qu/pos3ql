@@ -988,7 +988,7 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
-        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
         .unwrap();
     assert_eq!(
         engine
@@ -4081,7 +4081,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
         "CREATE TABLE t (id int); CREATE PUBLICATION changes FOR TABLE t",
     );
     let floor = engine
-        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
         .unwrap();
     engine.advance_replication_slot("changes", floor).unwrap();
 
@@ -4107,7 +4107,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack() {
 fn rejected_slot_acknowledgement_does_not_reach_wal() {
     let (mut engine, _) = test_engine();
     let floor = engine
-        .create_replication_slot(crate::storage::SqlName::parse("changes").unwrap())
+        .create_replication_slot(crate::storage::ReplicationSlotName::parse("changes").unwrap())
         .unwrap();
     let durable_lsn = engine.replication_identity().1;
 
@@ -24859,7 +24859,7 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
          PUBLICATION changes",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("remote-slot creation and initial copy"),
+        String::from_utf8_lossy(&rejected).contains("requires a numeric host"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
@@ -24871,10 +24871,22 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
          PUBLICATION changes WITH (connect = false)",
     );
     assert!(
-        String::from_utf8_lossy(&named_slot)
-            .contains("disabled subscriptions require slot_name = NONE"),
+        !String::from_utf8_lossy(&named_slot).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&named_slot)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT subenabled, subslotname FROM pg_subscription WHERE subname = 'named_slot_changes'",
+        )),
+        ["f|named_slot_changes"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SUBSCRIPTION named_slot_changes",
     );
     let contradictory = run_with(
         &mut engine,
@@ -25143,15 +25155,15 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
         "{}",
         String::from_utf8_lossy(&invalid)
     );
-    let unsupported_refresh = run_with(
+    let refresh = run_with(
         &mut engine,
         &mut budget,
-        "ALTER SUBSCRIPTION apply_changes SET PUBLICATION sales",
+        "BEGIN; ALTER SUBSCRIPTION apply_changes REFRESH PUBLICATION WITH (copy_data = false); ROLLBACK",
     );
     assert!(
-        String::from_utf8_lossy(&unsupported_refresh).contains("requires WITH (refresh = false)"),
+        !String::from_utf8_lossy(&refresh).contains("ERROR"),
         "{}",
-        String::from_utf8_lossy(&unsupported_refresh)
+        String::from_utf8_lossy(&refresh)
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -25277,6 +25289,254 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
             .confirmed_lsn,
         41,
         "the acknowledgement frontier is recovered with the local transaction"
+    );
+}
+
+#[test]
+fn subscription_relation_refresh_is_atomic_and_checkpointed() {
+    let mut config = test_config("subscription-relation-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("subscription-relation-recovery-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE public.items (id integer PRIMARY KEY); \
+         CREATE SUBSCRIPTION item_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false)",
+    );
+    let stream = engine.subscription_stream("item_changes").unwrap();
+    let guc = GucState::new();
+    let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
+
+    engine.begin_subscription_apply(&mut txn, &guc);
+    txn.mode = TxnMode::Explicit;
+    engine
+        .begin_subscription_relation_refresh(&mut txn, stream)
+        .unwrap();
+    engine
+        .stage_subscription_relation(&mut txn, stream, "public", "items")
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_subscription_rel",
+        )),
+        ["0"],
+        "another transaction must not see a half-built relation catalog"
+    );
+    engine.rollback_txn(&mut txn, &guc);
+
+    engine.begin_subscription_apply(&mut txn, &guc);
+    txn.mode = TxnMode::Explicit;
+    engine
+        .begin_subscription_relation_refresh(&mut txn, stream)
+        .unwrap();
+    engine
+        .stage_subscription_relation(&mut txn, stream, "public", "items")
+        .unwrap();
+    assert!(
+        engine
+            .stage_subscription_advance(&mut txn, stream, 0x2a)
+            .unwrap()
+    );
+    engine.commit_txn(&mut txn, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT srsubstate, srsublsn FROM pg_subscription_rel",
+        )),
+        ["r|0/2A"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT srsubstate, srsublsn FROM pg_subscription_rel",
+        )),
+        ["r|0/2A"],
+        "checkpoint recovery must retain table synchronization state"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
+    let mut config = test_config("subscription-managed-cleanup");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("subscription-managed-cleanup-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION managed_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (enabled = false, copy_data = false); \
+         DROP SUBSCRIPTION managed_changes",
+    );
+    assert!(
+        engine.storage.subscription("managed_changes", 0).is_none(),
+        "DROP hides the local catalog object at commit"
+    );
+    let cleanup = engine
+        .subscription_cleanup_runtime(0)
+        .expect("managed publisher slot cleanup remains durable");
+    assert_eq!(cleanup.slot.as_str(), "managed_changes");
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let cleanup = replayed
+        .subscription_cleanup_runtime(0)
+        .expect("checkpoint recovery retains pending remote cleanup");
+    replayed
+        .complete_subscription_cleanup(0, cleanup.created_at, cleanup.name)
+        .unwrap();
+    assert!(replayed.subscription_cleanup_runtime(0).is_none());
+    drop(replayed);
+
+    let mut final_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    assert!(final_engine.subscription_cleanup_runtime(0).is_none());
+    let created = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "CREATE SUBSCRIPTION managed_changes CONNECTION 'host=publisher port=5432' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "cleanup completion releases the catalog slot: {}",
+        String::from_utf8_lossy(&created)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn subscription_failure_is_durable_and_refresh_is_an_explicit_restart() {
+    let mut config = test_config("subscription-failure-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("subscription-failure-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION failed_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false)",
+    );
+    let stream = engine.subscription_stream("failed_changes").unwrap();
+    engine
+        .fail_subscription(
+            stream,
+            crate::storage::SubscriptionFailure {
+                sqlstate: crate::sql::eval::SqlState::parse("42P01").unwrap(),
+                message: crate::util::StackStr::from_str("publisher relation is missing"),
+            },
+        )
+        .unwrap();
+    assert!(engine.subscription_runtime(0).is_none());
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let failure = replayed
+        .storage
+        .subscription("failed_changes", 0)
+        .unwrap()
+        .1
+        .failure
+        .expect("checkpoint recovery retains the publisher diagnostic");
+    assert_eq!(failure.sqlstate, "42P01");
+    assert_eq!(failure.message.as_str(), "publisher relation is missing");
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "ALTER SUBSCRIPTION failed_changes REFRESH PUBLICATION WITH (copy_data = false)",
+    );
+    assert!(
+        replayed
+            .storage
+            .subscription("failed_changes", 0)
+            .unwrap()
+            .1
+            .failure
+            .is_none(),
+        "an explicit refresh clears the durable failure before restarting"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn exported_replication_snapshot_pins_one_importable_sql_snapshot() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE snapshot_source (id integer PRIMARY KEY); INSERT INTO snapshot_source VALUES (1)",
+    );
+    let exported = engine
+        .export_replication_snapshot(77, engine.storage.lsn())
+        .unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO snapshot_source VALUES (2)",
+    );
+    let imported = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '{}'; \
+             SELECT id FROM snapshot_source ORDER BY id; COMMIT",
+            exported.as_str()
+        ),
+    );
+    assert_eq!(
+        data_rows(&imported),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&imported)
+    );
+    engine.invalidate_replication_snapshot(77);
+    let expired = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '{}'; ROLLBACK",
+            exported.as_str()
+        ),
+    );
+    assert!(
+        String::from_utf8_lossy(&expired).contains("snapshot identifier is no longer valid"),
+        "{}",
+        String::from_utf8_lossy(&expired)
     );
 }
 
@@ -25564,6 +25824,19 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             flushed_lsn: 121,
             reply_requested: false
         }
+    );
+    let mut keepalive = [0_u8; 18];
+    keepalive[0] = b'k';
+    keepalive[1..9].copy_from_slice(&100_u64.to_be_bytes());
+    keepalive[17] = 1;
+    let parsed = copy_data(&keepalive).unwrap();
+    assert_eq!(
+        apply.receive(&mut engine, parsed).unwrap(),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 121,
+            reply_requested: true,
+        },
+        "a keepalive WAL end is informational and may trail an imported snapshot frontier"
     );
     // An ALTER replaces the publisher stream before this worker can process
     // its next raw pgoutput transaction. The stale worker may decode frames,

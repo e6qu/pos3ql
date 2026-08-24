@@ -6410,12 +6410,6 @@ pub fn create_subscription(
         publications,
         options,
     } = command;
-    if options.create_slot || options.copy_data {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "subscription remote-slot creation and initial copy are not supported"
-        ));
-    }
     let role = match storage.current_role_slot(txn.txid) {
         Some(role) => role,
         None => {
@@ -6439,35 +6433,50 @@ pub fn create_subscription(
         Ok(connection) => connection,
         Err(error) => return sql_fail(error),
     };
-    let slot_name = match (options.enabled, options.slot_name) {
-        (true, crate::sql::ast::SubscriptionSlotName::Named(slot)) => match SqlName::parse(slot) {
-            Ok(slot) => slot,
-            Err(error) => return sql_fail(error),
-        },
-        (true, _) => {
-            return sql_fail(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "enabled subscriptions require an explicit existing slot_name"
-            ));
+    let resolve_slot_name = |slot: crate::sql::ast::SubscriptionSlotName<'_>| match slot {
+        crate::sql::ast::SubscriptionSlotName::Default => {
+            crate::storage::ReplicationSlotName::parse(name.as_str())
         }
-        (false, crate::sql::ast::SubscriptionSlotName::None) => SqlName::EMPTY,
-        (false, _) => {
-            return sql_fail(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "disabled subscriptions require slot_name = NONE"
-            ));
+        crate::sql::ast::SubscriptionSlotName::Named(slot) => {
+            crate::storage::ReplicationSlotName::parse(slot)
         }
     };
-    if options.enabled {
-        let endpoint = match connection.require_endpoint() {
-            Ok(endpoint) => endpoint,
+    let publisher_slot = match options.slot {
+        crate::sql::ast::SubscriptionSlotPlan::Managed(slot) => match resolve_slot_name(slot) {
+            Ok(slot) => crate::storage::SubscriptionSlot::Managed(slot),
             Err(error) => return sql_fail(error),
-        };
-        if endpoint.application_name().is_none() {
-            return sql_fail(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "enabled subscriptions require application_name in the connection string"
-            ));
+        },
+        crate::sql::ast::SubscriptionSlotPlan::External(slot) => match resolve_slot_name(slot) {
+            Ok(slot) => crate::storage::SubscriptionSlot::External(slot),
+            Err(error) => return sql_fail(error),
+        },
+        crate::sql::ast::SubscriptionSlotPlan::Absent => crate::storage::SubscriptionSlot::Absent,
+    };
+    let bootstrap = match (options.connect, publisher_slot, options.copy_data) {
+        (crate::sql::ast::SubscriptionConnect::Deferred, _, _) => {
+            crate::storage::SubscriptionBootstrap::Deferred
+        }
+        (
+            crate::sql::ast::SubscriptionConnect::Now,
+            crate::storage::SubscriptionSlot::Managed(_),
+            copy_data,
+        ) => crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data },
+        (
+            crate::sql::ast::SubscriptionConnect::Now,
+            crate::storage::SubscriptionSlot::External(_),
+            true,
+        ) => crate::storage::SubscriptionBootstrap::CopyExternalSlot,
+        (
+            crate::sql::ast::SubscriptionConnect::Now,
+            crate::storage::SubscriptionSlot::Absent,
+            true,
+        ) => crate::storage::SubscriptionBootstrap::CopyWithoutSlot,
+        _ => crate::storage::SubscriptionBootstrap::Ready,
+    };
+    if options.enabled {
+        match connection.require_endpoint() {
+            Ok(_) => {}
+            Err(error) => return sql_fail(error),
         }
     }
     let mut publication_names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
@@ -6498,7 +6507,8 @@ pub fn create_subscription(
             connection,
             publications: &publication_names[..publications.len()],
             enabled: options.enabled,
-            slot_name,
+            slot: publisher_slot,
+            bootstrap,
         },
         txn.txid,
     ) {
@@ -6522,7 +6532,8 @@ pub fn create_subscription(
             publications: publication_names,
             publication_count: publications.len(),
             enabled: options.enabled,
-            slot_name: slot_name.as_str(),
+            slot: publisher_slot,
+            bootstrap,
         },
     ) {
         storage.rollback_subscription_create(slot);
@@ -6561,7 +6572,7 @@ pub fn alter_subscription(
         | crate::sql::ast::AlterSubscriptionAction::Disable => {
             let enabled = matches!(action, crate::sql::ast::AlterSubscriptionAction::Enable);
             if enabled {
-                if subscription.slot_name == SqlName::EMPTY {
+                if subscription.slot.name().is_none() {
                     return sql_fail(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "cannot enable a subscription without an existing publisher slot"
@@ -6624,15 +6635,6 @@ pub fn alter_subscription(
             publications,
             refresh,
         } => {
-            if matches!(
-                refresh,
-                crate::sql::ast::SubscriptionPublicationRefresh::Refresh
-            ) {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "ALTER SUBSCRIPTION SET PUBLICATION requires WITH (refresh = false); initial table synchronization is not supported"
-                ));
-            }
             let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
             if publications.is_empty() {
                 return sql_fail(sql_err!(
@@ -6673,22 +6675,77 @@ pub fn alter_subscription(
             ) {
                 return sql_fail(error);
             }
+            if matches!(
+                refresh,
+                crate::sql::ast::SubscriptionPublicationRefresh::Refresh
+            ) && let Err(error) = stage_subscription_refresh(storage, wal, txn, slot, name, true)
+            {
+                return sql_fail(error);
+            }
+        }
+        crate::sql::ast::AlterSubscriptionAction::RefreshPublications { copy_data } => {
+            if let Err(error) = stage_subscription_refresh(storage, wal, txn, slot, name, copy_data)
+            {
+                return sql_fail(error);
+            }
         }
     }
     Ok(Ok(responder.command_complete("ALTER SUBSCRIPTION")?))
 }
 
+fn stage_subscription_refresh(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    slot: usize,
+    name: &str,
+    copy_data: bool,
+) -> Result<(), SqlError> {
+    let subscription = storage
+        .subscription(name, txn.txid)
+        .map(|(_, subscription)| *subscription)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "subscription \"{}\" does not exist",
+                name
+            )
+        })?;
+    if subscription.slot.name().is_none() {
+        return Err(sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "cannot refresh a subscription without a replication slot"
+        ));
+    }
+    validate_enabled_subscription(subscription.connection)?;
+    let bootstrap = crate::storage::SubscriptionBootstrap::Refresh { copy_data };
+    let prior = match storage.set_subscription_bootstrap(slot, bootstrap, txn.txid)? {
+        crate::storage::SubscriptionBootstrapChange::Unchanged => return Ok(()),
+        crate::storage::SubscriptionBootstrapChange::Changed { prior } => prior,
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetSubscriptionBootstrap { name, bootstrap },
+    ) {
+        storage.restore_subscription_bootstrap(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionBootstrapChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_subscription_bootstrap(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_enabled_subscription(
     connection: crate::storage::SubscriptionConnInfo,
 ) -> Result<(), SqlError> {
-    let endpoint = connection.require_endpoint()?;
-    if endpoint.application_name().is_none() {
-        return Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "enabled subscriptions require application_name in the connection string"
-        ));
-    }
-    Ok(())
+    connection.require_endpoint().map(|_| ())
 }
 
 fn alter_subscription_definition(
@@ -20786,6 +20843,90 @@ pub fn copy_begin(
         reject_limit: opts.reject_limit,
         log_verbosity: opts.log_verbosity,
         filter,
+    })
+}
+
+pub(crate) fn subscription_copy_setup(
+    storage: &Storage,
+    schema: SqlName,
+    table: SqlName,
+    columns: &[SqlName],
+    txid: u32,
+) -> Result<CopySetup, SqlError> {
+    let table_index = storage
+        .find_visible(schema.as_str(), table.as_str(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "subscription relation \"{}.{}\" does not exist locally",
+                schema.as_str(),
+                table.as_str()
+            )
+        })?;
+    let definition = storage.table_def(table_index, txid);
+    let mut targets = [0usize; MAX_COLUMNS];
+    if columns.is_empty() || columns.len() > definition.n_columns {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subscription relation \"{}.{}\" has an invalid published column list",
+            schema.as_str(),
+            table.as_str()
+        ));
+    }
+    for (index, column) in columns.iter().enumerate() {
+        let local = definition.column_index(column.as_str()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "subscription relation \"{}.{}\" has no local column \"{}\"",
+                schema.as_str(),
+                table.as_str(),
+                column.as_str()
+            )
+        })?;
+        if targets[..index].contains(&local) {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "subscription relation \"{}.{}\" repeats local column \"{}\"",
+                schema.as_str(),
+                table.as_str(),
+                column.as_str()
+            ));
+        }
+        if definition.columns()[local].default.is_generated() {
+            return Err(sql_err!(
+                sqlstate::GENERATED_ALWAYS,
+                "cannot copy into generated column \"{}\"",
+                column.as_str()
+            ));
+        }
+        targets[index] = local;
+    }
+    Ok(CopySetup {
+        table_index,
+        txid,
+        targets,
+        n_targets: columns.len(),
+        fmt: CopyFmt {
+            csv: false,
+            binary: false,
+            delimiter: b'\t',
+            quote: b'"',
+            escape: b'"',
+            header: crate::sql::ast::CopyHeader::None,
+            null: StackStr::from_str("\\N"),
+            default: None,
+            force_quote_all: false,
+            force_quote: 0,
+            force_not_null: 0,
+            force_null: 0,
+        },
+        on_error: crate::sql::ast::CopyErrorAction::Stop,
+        reject_limit: None,
+        log_verbosity: crate::sql::ast::CopyLogVerbosity::Default,
+        filter: CopyFilter {
+            mode: CopyFilterMode::All,
+            source: StackStr::new(),
+        },
     })
 }
 

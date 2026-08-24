@@ -2578,6 +2578,7 @@ impl Conn {
             return Step::Continue;
         }
         if self.replication == ReplicationMode::Logical {
+            engine.invalidate_replication_snapshot(self.id);
             let command = {
                 let payload = &self.recv.readable()[5..total];
                 let Ok(text) = MsgIn::new(payload).cstr() else {
@@ -2589,7 +2590,10 @@ impl Conn {
                 parse_logical_replication_command(text)
             };
             match command {
-                Ok(LogicalReplicationCommand::CreateSlot { name }) => {
+                Ok(LogicalReplicationCommand::CreateSlot {
+                    name,
+                    export_snapshot,
+                }) => {
                     let restart_lsn = match engine.create_replication_slot(name) {
                         Ok(lsn) => lsn,
                         Err(error) => {
@@ -2628,10 +2632,32 @@ impl Conn {
                             -1,
                         ),
                     ];
+                    let snapshot_name = if export_snapshot {
+                        match engine.export_replication_snapshot(self.id, restart_lsn) {
+                            Ok(name) => Some(name),
+                            Err(error) => {
+                                let _ = engine.drop_replication_slot(name);
+                                let mut responder = Responder::new(&mut self.send);
+                                if responder
+                                    .error(error.sqlstate, error.message.as_str())
+                                    .and_then(|()| responder.ready_for_query(b'I'))
+                                    .is_err()
+                                {
+                                    return Step::Close;
+                                }
+                                self.recv.consume(total);
+                                return Step::Continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let values = [
                         Datum::Text(name.as_str()),
                         Datum::Text(lsn.as_str()),
-                        Datum::Null,
+                        snapshot_name
+                            .as_ref()
+                            .map_or(Datum::Null, |name| Datum::Text(name.as_str())),
                         Datum::Text("pgoutput"),
                     ];
                     let mut responder = Responder::new(&mut self.send);
@@ -2707,7 +2733,7 @@ impl Conn {
                         return Step::Close;
                     }
                     self.replication_stream = Some(ReplicationStream {
-                        slot: name,
+                        slot: name.sql_name(),
                         binary,
                         proto_version,
                         cursor_lsn,
@@ -2840,13 +2866,14 @@ fn is_replication_command(mode: ReplicationMode, text: &str) -> bool {
 
 enum LogicalReplicationCommand<'a> {
     CreateSlot {
-        name: SqlName,
+        name: crate::storage::ReplicationSlotName,
+        export_snapshot: bool,
     },
     DropSlot {
-        name: SqlName,
+        name: crate::storage::ReplicationSlotName,
     },
     Start {
-        name: SqlName,
+        name: crate::storage::ReplicationSlotName,
         publication: &'a str,
         requested_lsn: u64,
         binary: bool,
@@ -2861,26 +2888,24 @@ fn parse_logical_replication_command(
     let mut input = text;
     let command = take_replication_word(&mut input).unwrap_or_default();
     if command.eq_ignore_ascii_case("drop_replication_slot") {
-        let name = take_replication_word(&mut input).ok_or_else(|| {
+        let name = take_replication_slot_name(&mut input)?.ok_or_else(|| {
             sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "DROP_REPLICATION_SLOT requires a slot name"
             )
         })?;
-        if !is_replication_slot_name(name) || take_replication_word(&mut input).is_some() {
+        if take_replication_word(&mut input).is_some() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "invalid DROP_REPLICATION_SLOT input"
             ));
         }
-        return Ok(LogicalReplicationCommand::DropSlot {
-            name: SqlName::parse(name)?,
-        });
+        return Ok(LogicalReplicationCommand::DropSlot { name });
     }
     if command.eq_ignore_ascii_case("start_replication") {
         let slot_keyword = take_replication_word(&mut input)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires SLOT"))?;
-        let name = take_replication_word(&mut input).ok_or_else(|| {
+        let name = take_replication_slot_name(&mut input)?.ok_or_else(|| {
             sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "START_REPLICATION requires a slot name"
@@ -2891,10 +2916,7 @@ fn parse_logical_replication_command(
         })?;
         let lsn = take_replication_word(&mut input)
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "START_REPLICATION requires an LSN"))?;
-        if !slot_keyword.eq_ignore_ascii_case("slot")
-            || !logical.eq_ignore_ascii_case("logical")
-            || !is_replication_slot_name(name)
-        {
+        if !slot_keyword.eq_ignore_ascii_case("slot") || !logical.eq_ignore_ascii_case("logical") {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "invalid START_REPLICATION input"
@@ -2904,7 +2926,7 @@ fn parse_logical_replication_command(
             .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "invalid START_REPLICATION LSN"))?;
         let (publication, binary, proto_version) = parse_pgoutput_options(input)?;
         return Ok(LogicalReplicationCommand::Start {
-            name: SqlName::parse(name)?,
+            name,
             publication,
             requested_lsn,
             binary,
@@ -2917,18 +2939,12 @@ fn parse_logical_replication_command(
             "expected CREATE_REPLICATION_SLOT"
         ));
     }
-    let name = take_replication_word(&mut input).ok_or_else(|| {
+    let name = take_replication_slot_name(&mut input)?.ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
             "CREATE_REPLICATION_SLOT requires a slot name"
         )
     })?;
-    if !is_replication_slot_name(name) {
-        return Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "invalid replication slot name"
-        ));
-    }
     let kind = take_replication_word(&mut input).ok_or_else(|| {
         sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -2947,24 +2963,61 @@ fn parse_logical_replication_command(
             "only LOGICAL pgoutput replication slots are supported"
         ));
     }
-    let snapshot = take_replication_word(&mut input);
-    if snapshot.is_none() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "logical slot snapshot export is not supported; specify NOEXPORT_SNAPSHOT"
-        ));
-    }
-    if !snapshot.is_some_and(|value| value.eq_ignore_ascii_case("noexport_snapshot"))
-        || take_replication_word(&mut input).is_some()
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "only NOEXPORT_SNAPSHOT logical replication slots are supported"
-        ));
-    }
+    let export_snapshot = parse_create_slot_snapshot_option(input)?;
     Ok(LogicalReplicationCommand::CreateSlot {
-        name: SqlName::parse(name)?,
+        name,
+        export_snapshot,
     })
+}
+
+fn parse_create_slot_snapshot_option(input: &str) -> Result<bool, SqlError> {
+    let input = input.trim();
+    if input.is_empty() || input.eq_ignore_ascii_case("export_snapshot") {
+        return Ok(true);
+    }
+    if input.eq_ignore_ascii_case("noexport_snapshot") {
+        return Ok(false);
+    }
+    let Some(inner) = input
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "logical replication slot option is not supported"
+        ));
+    };
+    let inner = inner.trim();
+    let Some(split) = inner.find(char::is_whitespace) else {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "SNAPSHOT requires 'export', 'use', or 'nothing'"
+        ));
+    };
+    let (option, value) = inner.split_at(split);
+    if !option.eq_ignore_ascii_case("snapshot") {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "logical replication slot option \"{}\" is not supported",
+            option
+        ));
+    }
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("'export'") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("'nothing'") {
+        Ok(false)
+    } else if value.eq_ignore_ascii_case("'use'") {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "CREATE_REPLICATION_SLOT SNAPSHOT 'use' is not supported"
+        ))
+    } else {
+        Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid SNAPSHOT option value"
+        ))
+    }
 }
 
 fn take_replication_word<'a>(input: &mut &'a str) -> Option<&'a str> {
@@ -2976,6 +3029,39 @@ fn take_replication_word<'a>(input: &mut &'a str) -> Option<&'a str> {
     let (word, rest) = input.split_at(end);
     *input = rest;
     Some(word)
+}
+
+fn take_replication_slot_name(
+    input: &mut &str,
+) -> Result<Option<crate::storage::ReplicationSlotName>, SqlError> {
+    *input = input.trim_start_matches(char::is_whitespace);
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let value = if let Some(quoted) = input.strip_prefix('"') {
+        let end = quoted.find('"').ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "unterminated quoted replication slot name"
+            )
+        })?;
+        let value = &quoted[..end];
+        *input = &quoted[end + 1..];
+        if input
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid replication slot name terminator"
+            ));
+        }
+        value
+    } else {
+        take_replication_word(input).expect("nonempty input has one word")
+    };
+    crate::storage::ReplicationSlotName::parse(value).map(Some)
 }
 
 fn parse_lsn(value: &str) -> Option<u64> {
@@ -3301,14 +3387,6 @@ fn parse_publication_names_impl(
         };
         input = rest;
     }
-}
-
-fn is_replication_slot_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 63
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 enum Step {
@@ -3943,10 +4021,15 @@ mod tests {
             "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput NOEXPORT_SNAPSHOT;",
         )
         .unwrap();
-        let LogicalReplicationCommand::CreateSlot { name } = command else {
+        let LogicalReplicationCommand::CreateSlot {
+            name,
+            export_snapshot,
+        } = command
+        else {
             panic!("expected CREATE_REPLICATION_SLOT")
         };
         assert_eq!(name.as_str(), "changes");
+        assert!(!export_snapshot);
         assert!(
             parse_logical_replication_command(
                 "CREATE_REPLICATION_SLOT changes LOGICAL test_decoding"
@@ -3965,10 +4048,42 @@ mod tests {
                 .is_err()
         );
         assert!(
-            parse_logical_replication_command("CREATE_REPLICATION_SLOT changes LOGICAL pgoutput")
+            parse_logical_replication_command("CREATE_REPLICATION_SLOT Bad LOGICAL pgoutput")
                 .is_err()
         );
-        let dropped = parse_logical_replication_command("DROP_REPLICATION_SLOT changes").unwrap();
+        assert!(
+            parse_logical_replication_command("CREATE_REPLICATION_SLOT bad-name LOGICAL pgoutput")
+                .is_err()
+        );
+        assert!(matches!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT \"changes\" LOGICAL pgoutput"
+            ),
+            Ok(LogicalReplicationCommand::CreateSlot {
+                export_snapshot: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput (SNAPSHOT 'export')"
+            ),
+            Ok(LogicalReplicationCommand::CreateSlot {
+                export_snapshot: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput (SNAPSHOT 'nothing')"
+            ),
+            Ok(LogicalReplicationCommand::CreateSlot {
+                export_snapshot: false,
+                ..
+            })
+        ));
+        let dropped =
+            parse_logical_replication_command("DROP_REPLICATION_SLOT \"changes\"").unwrap();
         let LogicalReplicationCommand::DropSlot { name } = dropped else {
             panic!("expected DROP_REPLICATION_SLOT")
         };

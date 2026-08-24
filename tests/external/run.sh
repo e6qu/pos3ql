@@ -47,8 +47,9 @@ if [[ -n "${POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT:-}" ]]; then
     exit 1
   fi
 else
-  SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516)
+SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516)
 fi
+SUB_POS3QL_PORT=$(select_port "${POS3QL_SUBSCRIPTION_POS3QL_PORT:-}" 15542 15562)
 STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540)
 
 PASS=0
@@ -131,6 +132,9 @@ cleanup() {
   # up to five seconds to go, then force it.
   if [[ -n "${SERVER_PID:-}" ]]; then
     stop_pos3ql "$SERVER_PID"
+  fi
+  if [[ -n "${SUB_POS3QL_PID:-}" ]]; then
+    stop_pos3ql "$SUB_POS3QL_PID"
   fi
   if [[ -n "${GATEWAY_PID:-}" ]]; then
     kill "$GATEWAY_PID" 2>/dev/null
@@ -719,21 +723,27 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   else
   SUB_PSQL="$SUB_PGBIN/psql"
   if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
-    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL)" \
-    -c "CREATE PUBLICATION subscription_apply_pub FOR TABLE subscription_target" \
-    -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_target" \
-    -c "SELECT pg_create_logical_replication_slot('subscription_apply_slot', 'pgoutput')" \
+    -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'subscription_apply%' OR slot_name LIKE 'pos3ql_%_sync'" \
+    -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter" \
+    -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target" \
+    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text)" \
+    -c "CREATE TABLE subscription_refresh_target (id int PRIMARY KEY, body text NOT NULL)" \
+    -c "INSERT INTO subscription_target VALUES (-1, 'filtered', 'publisher'), (1, 'first', 'publisher'), (2, 'second', 'publisher')" \
+    -c "INSERT INTO subscription_refresh_target VALUES (10, 'refresh-copy')" \
+    -c "CREATE PUBLICATION subscription_apply_pub FOR TABLE subscription_target (id, body) WHERE (id > 0)" \
+    -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_refresh_target" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher setup"
   elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
-    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL)" \
-    -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub WITH (create_slot = false, copy_data = false, slot_name = subscription_apply_slot)" \
+    -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
+    -c "CREATE TABLE subscription_refresh_target (id int PRIMARY KEY, body text NOT NULL)" \
+    -c "CREATE TABLE subscription_trigger_audit (id int)" \
+    -c "CREATE FUNCTION audit_subscription_copy() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN INSERT INTO subscription_trigger_audit VALUES (NEW.id); RETURN NEW; END'" \
+    -c "CREATE TRIGGER subscription_copy_trigger BEFORE INSERT ON subscription_target FOR EACH ROW EXECUTE FUNCTION audit_subscription_copy()" \
+    -c "ALTER TABLE subscription_target ENABLE REPLICA TRIGGER subscription_copy_trigger" \
+    -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub" \
     >/dev/null 2>&1; then
     bad "logical subscription subscriber setup"
-  elif ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
-    -c "BEGIN; INSERT INTO subscription_target VALUES (1, 'first'), (2, 'second'); COMMIT" \
-    >/dev/null 2>&1; then
-    bad "logical subscription publisher transaction"
   else
   subscription_rows() {
     "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
@@ -756,20 +766,62 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     tail -100 "$WORK/subscription-pg.log"
   }
   if subscription_wait $'1|first\n2|second'; then
-    ok "subscription applies one PostgreSQL transaction atomically"
+    copied_default=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+      -c "SELECT string_agg(publisher_only, ',' ORDER BY id) FROM subscription_target")
+    relation_state=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+      -c "SELECT count(*), min(srsubstate), bool_and(srsublsn IS NOT NULL) FROM pg_subscription_rel")
+    trigger_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+      -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM subscription_trigger_audit")
+    [[ "$copied_default" == "subscriber-default,subscriber-default" ]] \
+      && ok "initial COPY applies publication projection and subscriber defaults" \
+      || bad "initial COPY subscriber defaults (got $copied_default)"
+    [[ "$relation_state" == "1|r|t" ]] \
+      && ok "initial COPY publishes one durable ready table state" \
+      || bad "initial COPY table state (got $relation_state)"
+    [[ "$trigger_rows" == "1,2" ]] \
+      && ok "initial COPY uses replication-origin row triggers" \
+      || bad "initial COPY trigger rows (got $trigger_rows)"
   else
-    bad "subscription initial apply (got $(subscription_rows))"
+    bad "filtered initial COPY (got $(subscription_rows))"
+    subscription_diagnostics
+  fi
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    -c "BEGIN; INSERT INTO subscription_target VALUES (-2, 'also-filtered', 'publisher'), (3, 'streamed', 'publisher'); COMMIT" \
+    >/dev/null 2>&1; then
+    bad "logical subscription publisher transaction"
+  elif subscription_wait $'1|first\n2|second\n3|streamed'; then
+    trigger_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+      -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM subscription_trigger_audit")
+    [[ "$trigger_rows" == "1,2,3" ]] \
+      && ok "subscription applies a filtered transaction through replication-origin triggers" \
+      || bad "subscription stream trigger rows (got $trigger_rows)"
+  else
+    bad "subscription initial stream (got $(subscription_rows))"
     subscription_diagnostics
   fi
   if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
-    -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub_after_alter WITH (refresh = false)" \
+    -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub, subscription_apply_pub_after_alter" \
     -c "ALTER SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_rebound sslmode=disable'" \
     >/dev/null 2>&1; then
     bad "logical subscription definition alteration"
-  elif ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
-    -c "INSERT INTO subscription_target VALUES (3, 'after-alter')" >/dev/null 2>&1; then
+  else
+    refresh_rows=""
+    for _ in {1..100}; do
+      refresh_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+        -c "SELECT id, body FROM subscription_refresh_target ORDER BY id" 2>&1)
+      [[ "$refresh_rows" == "10|refresh-copy" ]] && break
+      sleep 0.1
+    done
+    relation_state=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+      -c "SELECT count(*), min(srsubstate), bool_and(srsublsn IS NOT NULL) FROM pg_subscription_rel")
+    [[ "$refresh_rows" == "10|refresh-copy" && "$relation_state" == "2|r|t" ]] \
+      && ok "publication refresh copies only the newly subscribed table and records both states" \
+      || bad "publication refresh (rows $refresh_rows, state $relation_state)"
+  fi
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    -c "INSERT INTO subscription_target VALUES (4, 'after-alter', 'publisher')" >/dev/null 2>&1; then
     bad "logical subscription post-alter publisher transaction"
-  elif subscription_wait $'1|first\n2|second\n3|after-alter'; then
+  elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter'; then
     ok "subscription reconnects from its committed altered definition"
   else
     bad "subscription post-alter apply (got $(subscription_rows))"
@@ -778,13 +830,13 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
   start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
   SERVER_PID=$START_PID
-  if subscription_wait $'1|first\n2|second\n3|after-alter'; then
+  if subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter'; then
     if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
-      -c "INSERT INTO subscription_target VALUES (4, 'after-crash')" >/dev/null 2>&1; then
+      -c "INSERT INTO subscription_target VALUES (5, 'after-crash', 'publisher')" >/dev/null 2>&1; then
     bad "logical subscription post-crash publisher transaction"
-    elif subscription_wait $'1|first\n2|second\n3|after-alter\n4|after-crash'; then
+    elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n5|after-crash'; then
       slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
-        -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply_slot'")
+        -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
       [[ "$slot_lsn" == "t" ]] && ok "subscription crash recovery resumes from durable acknowledgement" \
         || bad "subscription publisher acknowledgement was not durable (got $slot_lsn)"
     else
@@ -794,6 +846,23 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "subscription local WAL recovery (got $(subscription_rows))"
     subscription_diagnostics
   fi
+  if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "DROP SUBSCRIPTION subscription_apply" >/dev/null 2>&1; then
+    bad "managed subscription drop"
+  else
+    publisher_slot_count=1
+    for _ in {1..100}; do
+      publisher_slot_count=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
+        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
+      [[ "$publisher_slot_count" == "0" ]] && break
+      sleep 0.1
+    done
+    local_subscription_count=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+      -c "SELECT count(*) FROM pg_subscription WHERE subname = 'subscription_apply'")
+    [[ "$publisher_slot_count" == "0" && "$local_subscription_count" == "0" ]] \
+      && ok "managed subscription drop removes the publisher slot and local catalog object" \
+      || bad "managed subscription cleanup (publisher $publisher_slot_count, local $local_subscription_count)"
+  fi
   fi
   "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" stop -m immediate >/dev/null
   rm -rf "$SUB_PG_SOCK"
@@ -802,6 +871,127 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
 else
   bad "logical subscription apply needs POS3QL_PGBIN with a PostgreSQL publisher"
 fi
+
+step "logical subscription apply from a pos3ql publisher"
+cat > "$WORK/subscription-pos3ql.conf" <<EOF
+listen_addr = 127.0.0.1:${SUB_POS3QL_PORT}
+data_dir = ${WORK}/subscription-pos3ql-data
+max_connections = 6
+memtable_bytes = 8MiB
+wal_bytes = 8MiB
+object_store = on
+object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
+object_store_namespace = pos3ql-external
+object_store_prefix = subscription-publisher-$$/
+wal_upload = on
+wal_upload_sync = on
+sql_arena_bytes = 4MiB
+wal_buffer_bytes = 2MiB
+max_tables = 16
+table_rows = 4096
+max_value_indexes = 16
+max_replication_slots = 4
+work_arena_bytes = 16MiB
+EOF
+start_pos3ql "$WORK/subscription-pos3ql.conf" "$WORK/subscription-pos3ql.log" $SUB_POS3QL_PORT
+SUB_POS3QL_PID=$START_PID
+if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+  -c "CREATE TABLE pos3ql_subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text)" \
+  -c "INSERT INTO pos3ql_subscription_target VALUES (-1, 'filtered', 'private'), (1, 'snapshot', 'private')" \
+  -c "CREATE PUBLICATION pos3ql_subscription_pub FOR TABLE pos3ql_subscription_target (id, body) WHERE (id > 0)" \
+  >/dev/null 2>&1; then
+  bad "pos3ql logical publisher setup"
+elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  -c "CREATE TABLE pos3ql_subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
+  -c "CREATE SUBSCRIPTION pos3ql_subscription CONNECTION 'host=127.0.0.1 port=$SUB_POS3QL_PORT user=postgres dbname=postgres application_name=pos3ql_to_pos3ql sslmode=disable' PUBLICATION pos3ql_subscription_pub" \
+  >/dev/null 2>&1; then
+  bad "pos3ql logical subscriber setup"
+else
+  pos3ql_subscription_rows() {
+    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+      -c "SELECT id, body, publisher_only FROM pos3ql_subscription_target ORDER BY id" 2>&1
+  }
+  pos3ql_subscription_wait() {
+    local expected=$1 actual=""
+    for _ in {1..100}; do
+      actual=$(pos3ql_subscription_rows)
+      [[ "$actual" == "$expected" ]] && return 0
+      sleep 0.1
+    done
+    printf '%s\n' "$actual"
+    return 1
+  }
+  if pos3ql_subscription_wait "1|snapshot|subscriber-default"; then
+    ok "pos3ql publisher exports and copies one filtered projected snapshot"
+  else
+    bad "pos3ql publisher initial snapshot (got $(pos3ql_subscription_rows))"
+    tail -60 "$WORK/subscription-pos3ql.log"
+    tail -60 "$WORK/server.log"
+  fi
+  if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+    -c "INSERT INTO pos3ql_subscription_target VALUES (-2, 'filtered-stream', 'private'), (2, 'stream', 'private')" \
+    >/dev/null 2>&1; then
+    bad "pos3ql logical publisher transaction"
+  elif pos3ql_subscription_wait $'1|snapshot|subscriber-default\n2|stream|subscriber-default'; then
+    ok "pos3ql publisher hands the snapshot frontier to pgoutput exactly"
+  else
+    bad "pos3ql publisher steady stream (got $(pos3ql_subscription_rows))"
+  fi
+  if "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "DROP SUBSCRIPTION pos3ql_subscription" >/dev/null 2>&1; then
+    pos3ql_slot_count=1
+    for _ in {1..100}; do
+      pos3ql_slot_count=$("$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -t -A \
+        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pos3ql_subscription'")
+      [[ "$pos3ql_slot_count" == "0" ]] && break
+      sleep 0.1
+    done
+    [[ "$pos3ql_slot_count" == "0" ]] \
+      && ok "pos3ql managed publisher slot cleanup completes" \
+      || bad "pos3ql managed publisher slot cleanup (got $pos3ql_slot_count)"
+  else
+    bad "pos3ql managed subscription drop"
+  fi
+
+  if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+    -c "CREATE TABLE pos3ql_subscription_mismatch (id int PRIMARY KEY, body text NOT NULL)" \
+    -c "INSERT INTO pos3ql_subscription_mismatch VALUES (1, 'incompatible')" \
+    -c "CREATE PUBLICATION pos3ql_subscription_mismatch_pub FOR TABLE pos3ql_subscription_mismatch" \
+    >"$WORK/subscription-mismatch-publisher.out" 2>&1; then
+    bad "subscription mismatch publisher setup"
+    cat "$WORK/subscription-mismatch-publisher.out"
+  elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "CREATE TABLE pos3ql_subscription_mismatch (id int PRIMARY KEY)" \
+    -c "CREATE SUBSCRIPTION pos3ql_subscription_mismatch CONNECTION 'host=127.0.0.1 port=$SUB_POS3QL_PORT user=postgres dbname=postgres application_name=pos3ql_mismatch sslmode=disable' PUBLICATION pos3ql_subscription_mismatch_pub" \
+    >"$WORK/subscription-mismatch-subscriber.out" 2>&1; then
+    bad "subscription mismatch subscriber setup"
+    cat "$WORK/subscription-mismatch-subscriber.out"
+  else
+  mismatch_count=0
+  for _ in {1..100}; do
+    mismatch_count=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
+    [[ "$mismatch_count" == "1" ]] && break
+    sleep 0.1
+  done
+  sleep 0.3
+  mismatch_count_after=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
+  stop_pos3ql "$SERVER_PID"
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  SERVER_PID=$START_PID
+  sleep 0.3
+  mismatch_count_restarted=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
+  if [[ "$mismatch_count" == "1" && "$mismatch_count_after" == "1" && "$mismatch_count_restarted" == "1" ]]; then
+    ok "subscription schema failure is actionable, durable, and not retried"
+  else
+    bad "subscription schema failure persistence (counts $mismatch_count/$mismatch_count_after/$mismatch_count_restarted)"
+    tail -60 "$WORK/server.log"
+  fi
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+    -c "DROP SUBSCRIPTION pos3ql_subscription_mismatch" >/dev/null 2>&1
+  fi
+fi
+stop_pos3ql "$SUB_POS3QL_PID"
+SUB_POS3QL_PID=""
 
 fi # subscription
 

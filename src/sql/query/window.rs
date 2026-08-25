@@ -107,11 +107,11 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     let mut n_aggs = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            collect_grouped_aggs(expression, &mut agg_nodes, &mut n_aggs)?;
+            collect_grouped_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         }
     }
     for ob in statement.order_by {
-        collect_grouped_aggs(ob.expression, &mut agg_nodes, &mut n_aggs)?;
+        collect_grouped_aggs(ob.expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
     }
 
     // The inner select: one named column per grouping key and per aggregate.
@@ -737,6 +737,7 @@ fn frame_excludes(
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn compute_window<'a>(
     storage: &Storage,
+    txid: u32,
     node: &'a Expr<'a>,
     rows: &[&'a [Datum<'a>]],
     scope: &QueryScope<'a>,
@@ -1124,6 +1125,92 @@ fn compute_window<'a>(
         } else if let Some(frame) = &spec.frame {
             // Aggregate over an explicit frame: computed per row (an empty
             // frame aggregates zero rows — count 0, sum NULL).
+            if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
+                let mut moving_state = AggState::default();
+                if moving_state.init_moving(node, storage, txid, &super::ScopeCols(scope), arena)? {
+                    let mut active: Option<(usize, usize)> = None;
+                    for j in 0..m {
+                        let range = frame_range(
+                            storage,
+                            frame,
+                            spec.order_by,
+                            scope,
+                            rows,
+                            offs,
+                            p,
+                            j,
+                            arena,
+                            params,
+                            hooks,
+                        )?;
+                        let Some((start, end)) = range else {
+                            moving_state = AggState::default();
+                            let selected = moving_state.init_moving(
+                                node,
+                                storage,
+                                txid,
+                                &super::ScopeCols(scope),
+                                arena,
+                            )?;
+                            debug_assert!(selected);
+                            active = None;
+                            out[p[j]] = moving_state.finish(arena, hooks.catalog)?;
+                            continue;
+                        };
+                        let mut rebuild = false;
+                        if let Some((old_start, old_end)) = active {
+                            if start < old_start || end < old_end {
+                                rebuild = true;
+                            } else {
+                                let remove_end = start.min(old_end.saturating_add(1));
+                                for index in old_start..remove_end {
+                                    let row = window_row(scope, rows[p[index]], offs);
+                                    if !moving_state
+                                        .remove_moving(node, arena, params, &row, hooks)?
+                                    {
+                                        rebuild = true;
+                                        break;
+                                    }
+                                }
+                                if !rebuild {
+                                    let add_start = if start > old_end {
+                                        start
+                                    } else {
+                                        old_end.saturating_add(1)
+                                    };
+                                    for index in add_start..=end {
+                                        let row = window_row(scope, rows[p[index]], offs);
+                                        moving_state.update(node, arena, params, &row, hooks)?;
+                                    }
+                                }
+                            }
+                        } else {
+                            for index in start..=end {
+                                let row = window_row(scope, rows[p[index]], offs);
+                                moving_state.update(node, arena, params, &row, hooks)?;
+                            }
+                        }
+                        if rebuild {
+                            moving_state = AggState::default();
+                            let selected = moving_state.init_moving(
+                                node,
+                                storage,
+                                txid,
+                                &super::ScopeCols(scope),
+                                arena,
+                            )?;
+                            debug_assert!(selected);
+                            for index in start..=end {
+                                let row = window_row(scope, rows[p[index]], offs);
+                                moving_state.update(node, arena, params, &row, hooks)?;
+                            }
+                        }
+                        active = Some((start, end));
+                        out[p[j]] = moving_state.finish(arena, hooks.catalog)?;
+                    }
+                    continue;
+                }
+            }
             for j in 0..m {
                 let range = frame_range(
                     storage,
@@ -1155,7 +1242,7 @@ fn compute_window<'a>(
                     )?
                 };
                 let mut st = AggState::default();
-                st.init(node)?;
+                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
                 if let Some((fs, fe)) = range {
                     for i in fs..=fe {
                         if frame_excludes(frame.exclusion, j, peers, i) {
@@ -1175,7 +1262,7 @@ fn compute_window<'a>(
             //    value at the end of their peer group.
             if spec.order_by.is_empty() {
                 let mut st = AggState::default();
-                st.init(node)?;
+                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
                 for &ri in p {
                     let r = window_row(scope, rows[ri], offs);
                     st.update(node, arena, params, &r, hooks)?;
@@ -1220,7 +1307,7 @@ fn compute_window<'a>(
                     }
                     // Frame is p[0..=e]; aggregate and assign to peers p[j..=e].
                     let mut st = AggState::default();
-                    st.init(node)?;
+                    st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
                     for &ri in &p[..=e] {
                         let r = window_row(scope, rows[ri], offs);
                         st.update(node, arena, params, &r, hooks)?;
@@ -1424,7 +1511,9 @@ pub(crate) fn project_window_rows<'a>(
     // Compute each window function's per-row values.
     let mut win_vals: [&[Datum]; MAX_WINDOWS] = [empty; MAX_WINDOWS];
     for (wi, &node) in win_nodes.iter().enumerate() {
-        win_vals[wi] = compute_window(storage, node, rows, scope, &offs, arena, params, hooks)?;
+        win_vals[wi] = compute_window(
+            storage, txid, node, rows, scope, &offs, arena, params, hooks,
+        )?;
     }
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
@@ -1802,28 +1891,29 @@ pub(crate) fn external_window_into<'a>(
                 .alloc_slice_with(16, |_| 0)
                 .map_err(|_| arena_full())?;
             let mut count = 0usize;
-            let mut finish_partition = |rows: &[&'a [Datum<'a>]],
-                                        pos_of: &[i64]|
-             -> Result<(), SqlError> {
-                let out = compute_window(storage, node, rows, scope, &offs, arena, params, hooks)?;
-                for (r, &pos) in pos_of.iter().enumerate() {
-                    storage
-                        .with_block_store(|blocks| {
-                            win_sorter.push_projected_by(
-                                blocks,
-                                3,
-                                |index| match index {
-                                    0 => Datum::Int8(pos),
-                                    1 => Datum::Int4(wi as i32),
-                                    _ => out[r],
-                                },
-                                &mut win_compare,
-                            )
-                        })
-                        .expect("spill-attached block store")?;
-                }
-                Ok(())
-            };
+            let mut finish_partition =
+                |rows: &[&'a [Datum<'a>]], pos_of: &[i64]| -> Result<(), SqlError> {
+                    let out = compute_window(
+                        storage, txid, node, rows, scope, &offs, arena, params, hooks,
+                    )?;
+                    for (r, &pos) in pos_of.iter().enumerate() {
+                        storage
+                            .with_block_store(|blocks| {
+                                win_sorter.push_projected_by(
+                                    blocks,
+                                    3,
+                                    |index| match index {
+                                        0 => Datum::Int8(pos),
+                                        1 => Datum::Int4(wi as i32),
+                                        _ => out[r],
+                                    },
+                                    &mut win_compare,
+                                )
+                            })
+                            .expect("spill-attached block store")?;
+                    }
+                    Ok(())
+                };
             loop {
                 let keep_scanning = {
                     let Some(context) = spec_reader.context() else {

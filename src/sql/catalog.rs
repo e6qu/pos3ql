@@ -376,6 +376,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
 const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_type", PG_TYPE_OID),
     ("pg_proc", PG_PROC_OID),
+    ("pg_aggregate", 2600),
     ("pg_class", PG_CLASS_OID),
     ("pg_attribute", 1249),
     ("pg_amop", 2602),
@@ -496,6 +497,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_range"
                 | "pg_settings"
                 | "pg_proc"
+                | "pg_aggregate"
                 | "pg_operator"
                 | "pg_opclass"
                 | "pg_opfamily"
@@ -758,6 +760,7 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_proc") => pg_proc(storage, txid, arena),
+        (false, "pg_aggregate") => pg_aggregate(storage, txid, arena),
         (false, "pg_operator") => pg_operator(arena),
         (false, "pg_opclass") => finish(
             def_of(
@@ -2593,6 +2596,13 @@ pub(crate) fn operator_oid_by_name(
     Ok(found)
 }
 
+pub(crate) fn operator_oid_for_types(name: &str, left: ColType, right: ColType) -> Option<i32> {
+    CATALOG_OPERATORS.iter().find_map(|operator| {
+        (operator.name == name && operator.left == left && operator.right == right)
+            .then_some(operator.oid)
+    })
+}
+
 pub(crate) fn operator_name_by_oid(
     oid: i32,
     signature: bool,
@@ -2636,6 +2646,13 @@ pub fn function_def_text<'a>(
         return Ok(None);
     };
     let routine = storage.routine_for(slot, txid);
+    if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is an aggregate function",
+            routine.name_for(txid).as_str()
+        ));
+    }
     use core::fmt::Write;
     let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
     write!(
@@ -2664,12 +2681,12 @@ pub fn function_def_text<'a>(
         crate::storage::RoutineKind::Function { result } => {
             write!(definition, ") RETURNS ").map_err(|_| super::eval::arena_full())?;
             write_routine_result_type(&mut definition, &result)?;
-            write!(definition, " LANGUAGE sql AS '")
+            write!(definition, " LANGUAGE sql")
         }
         crate::storage::RoutineKind::SetFunction { result } => {
             write!(definition, ") RETURNS SETOF ").map_err(|_| super::eval::arena_full())?;
             write_routine_result_type(&mut definition, &result)?;
-            write!(definition, " LANGUAGE sql AS '")
+            write!(definition, " LANGUAGE sql")
         }
         crate::storage::RoutineKind::TableFunction => {
             write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;
@@ -2687,14 +2704,33 @@ pub fn function_def_text<'a>(
                 write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
                     .map_err(|_| super::eval::arena_full())?;
             }
-            write!(definition, ") LANGUAGE sql AS '")
+            write!(definition, ") LANGUAGE sql")
         }
         crate::storage::RoutineKind::Trigger => {
-            write!(definition, ") RETURNS trigger LANGUAGE sql AS '")
+            write!(definition, ") RETURNS trigger LANGUAGE plpgsql")
         }
-        crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql AS '"),
+        crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql"),
+        crate::storage::RoutineKind::Aggregate(_) => unreachable!("rejected above"),
     }
     .map_err(|_| super::eval::arena_full())?;
+    match routine.attributes.volatility {
+        crate::storage::RoutineVolatility::Immutable => write!(definition, " IMMUTABLE"),
+        crate::storage::RoutineVolatility::Stable => write!(definition, " STABLE"),
+        crate::storage::RoutineVolatility::Volatile => Ok(()),
+    }
+    .map_err(|_| super::eval::arena_full())?;
+    if routine.attributes.strict {
+        write!(definition, " STRICT").map_err(|_| super::eval::arena_full())?;
+    }
+    match routine.attributes.parallel {
+        crate::storage::RoutineParallel::Safe => write!(definition, " PARALLEL SAFE"),
+        crate::storage::RoutineParallel::Restricted => {
+            write!(definition, " PARALLEL RESTRICTED")
+        }
+        crate::storage::RoutineParallel::Unsafe => Ok(()),
+    }
+    .map_err(|_| super::eval::arena_full())?;
+    write!(definition, " AS '").map_err(|_| super::eval::arena_full())?;
     for character in routine.body.as_str().chars() {
         write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
         if character == '\'' {
@@ -2820,6 +2856,18 @@ pub fn function_result_text<'a>(
         }
         crate::storage::RoutineKind::Procedure => {
             write!(output, "void").map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineKind::Aggregate(aggregate) => {
+            write_routine_type_name(
+                &mut output,
+                aggregate.result_type.ctype,
+                aggregate.result_type.user_type,
+                aggregate
+                    .result_type
+                    .user_type
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+            )
+            .map_err(|_| super::eval::arena_full())?;
         }
     }
     arena
@@ -7407,25 +7455,52 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     crate::storage::RoutineKind::TableFunction => crate::sql::types::oid::RECORD,
                     crate::storage::RoutineKind::Trigger => crate::sql::types::oid::TRIGGER,
                     crate::storage::RoutineKind::Procedure => crate::sql::types::oid::VOID,
+                    crate::storage::RoutineKind::Aggregate(aggregate) => storage
+                        .routine_type_oid(
+                            aggregate.result_type.ctype,
+                            aggregate.result_type.user_type,
+                            txid,
+                        )
+                        .expect("aggregate result type is catalog-resolved"),
                 }),
                 Datum::Bool(routine.kind.is_set_returning()),
                 Datum::Bpchar(routine.kind.catalog_kind()),
                 text(argument_types.as_str(), arena)?,
-                Datum::Bpchar("v"),
-                Datum::Bpchar("u"),
+                Datum::Bpchar(match routine.attributes.volatility {
+                    crate::storage::RoutineVolatility::Immutable => "i",
+                    crate::storage::RoutineVolatility::Stable => "s",
+                    crate::storage::RoutineVolatility::Volatile => "v",
+                }),
+                Datum::Bpchar(match routine.kind {
+                    crate::storage::RoutineKind::Aggregate(aggregate) => match aggregate.parallel {
+                        crate::storage::RoutineParallel::Safe => "s",
+                        crate::storage::RoutineParallel::Restricted => "r",
+                        crate::storage::RoutineParallel::Unsafe => "u",
+                    },
+                    _ => match routine.attributes.parallel {
+                        crate::storage::RoutineParallel::Safe => "s",
+                        crate::storage::RoutineParallel::Restricted => "r",
+                        crate::storage::RoutineParallel::Unsafe => "u",
+                    },
+                }),
                 Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(false),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
-                Datum::Int4(
-                    if matches!(routine.kind, crate::storage::RoutineKind::Trigger) {
-                        13563
+                Datum::Int4(match routine.kind {
+                    crate::storage::RoutineKind::Trigger => 13563,
+                    crate::storage::RoutineKind::Aggregate(_) => 12,
+                    _ => 14,
+                }),
+                text(
+                    if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
+                        "aggregate_dummy"
                     } else {
-                        14
+                        routine.body.as_str()
                     },
-                ),
-                text(routine.body.as_str(), arena)?,
+                    arena,
+                )?,
                 text("", arena)?,
-                Datum::Bool(false),
+                Datum::Bool(routine.attributes.strict),
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Float8(100.0),
@@ -7438,6 +7513,161 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         count += 1;
     }
     finish(definition, &rows[..count], arena)
+}
+
+fn pg_aggregate<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let regproc = |oid: i32| -> Result<Datum<'a>, SqlError> {
+        let name = if oid == 0 {
+            arena.alloc_str("-").map_err(|_| arena_full())?
+        } else {
+            let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate support function {} does not exist",
+                    oid
+                )
+            })?;
+            let routine = storage.routine_for(slot, txid);
+            let mut qualified = crate::util::StackStr::<130>::new();
+            write_identifier(&mut qualified, routine.schema_for(txid).as_str());
+            let _ = core::fmt::Write::write_char(&mut qualified, '.');
+            write_identifier(&mut qualified, routine.name_for(txid).as_str());
+            if qualified.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "qualified routine name is too long"
+                ));
+            }
+            arena
+                .alloc_str(qualified.as_str())
+                .map_err(|_| arena_full())?
+        };
+        Ok(Datum::RegObject {
+            type_oid: super::types::oid::REGPROC,
+            referenced_oid: oid,
+            name,
+        })
+    };
+    let definition = def_of(
+        "pg_aggregate",
+        &[
+            ("aggfnoid", ColType::Regproc),
+            ("aggkind", ColType::Bpchar),
+            ("aggnumdirectargs", ColType::Int2),
+            ("aggtransfn", ColType::Regproc),
+            ("aggfinalfn", ColType::Regproc),
+            ("aggcombinefn", ColType::Regproc),
+            ("aggserialfn", ColType::Regproc),
+            ("aggdeserialfn", ColType::Regproc),
+            ("aggmtransfn", ColType::Regproc),
+            ("aggminvtransfn", ColType::Regproc),
+            ("aggmfinalfn", ColType::Regproc),
+            ("aggfinalextra", ColType::Bool),
+            ("aggmfinalextra", ColType::Bool),
+            ("aggfinalmodify", ColType::Bpchar),
+            ("aggmfinalmodify", ColType::Bpchar),
+            ("aggsortop", ColType::Oid),
+            ("aggtranstype", ColType::Oid),
+            ("aggtransspace", ColType::Int4),
+            ("aggmtranstype", ColType::Oid),
+            ("aggmtransspace", ColType::Int4),
+            ("agginitval", ColType::Text),
+            ("aggminitval", ColType::Text),
+        ],
+    );
+    let count = (0..storage.routine_count())
+        .filter(|slot| {
+            storage.routine(*slot).visible_to(txid)
+                && matches!(
+                    storage.routine_for(*slot, txid).kind,
+                    crate::storage::RoutineKind::Aggregate(_)
+                )
+        })
+        .count();
+    let rows = arena
+        .alloc_slice_with(count.max(1), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let modify = |value: crate::storage::AggregateFinalModify| match value {
+        crate::storage::AggregateFinalModify::ReadOnly => "r",
+        crate::storage::AggregateFinalModify::Shareable => "s",
+        crate::storage::AggregateFinalModify::ReadWrite => "w",
+    };
+    let mut index = 0usize;
+    for slot in 0..storage.routine_count() {
+        let routine = storage.routine_for(slot, txid);
+        if !routine.visible_to(txid) {
+            continue;
+        }
+        let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
+            continue;
+        };
+        let final_function = aggregate.final_function;
+        let partial = aggregate.partial;
+        let serde = partial.and_then(|partial| partial.serde);
+        let moving = aggregate.moving;
+        let moving_final = moving.and_then(|moving| moving.final_function);
+        let state_oid = storage
+            .routine_type_oid(
+                aggregate.state_type.ctype,
+                aggregate.state_type.user_type,
+                txid,
+            )
+            .expect("aggregate state type is catalog-resolved");
+        let moving_state_oid = moving.map_or(0, |moving| {
+            storage
+                .routine_type_oid(moving.state_type.ctype, moving.state_type.user_type, txid)
+                .expect("moving aggregate state type is catalog-resolved")
+        });
+        rows[index] = row(
+            &[
+                regproc(crate::storage::routine_oid(&routine))?,
+                Datum::Bpchar(match aggregate.kind {
+                    crate::storage::AggregateKind::Normal => "n",
+                    crate::storage::AggregateKind::OrderedSet => "o",
+                    crate::storage::AggregateKind::HypotheticalSet => "h",
+                }),
+                Datum::Int2(i16::from(aggregate.direct_argument_count)),
+                regproc(aggregate.transition_oid)?,
+                regproc(final_function.map_or(0, |function| function.function_oid))?,
+                regproc(partial.map_or(0, |partial| partial.combine_oid))?,
+                regproc(serde.map_or(0, |serde| serde.serialize_oid))?,
+                regproc(serde.map_or(0, |serde| serde.deserialize_oid))?,
+                regproc(moving.map_or(0, |moving| moving.transition_oid))?,
+                regproc(moving.map_or(0, |moving| moving.inverse_oid))?,
+                regproc(moving_final.map_or(0, |function| function.function_oid))?,
+                Datum::Bool(final_function.is_some_and(|function| function.extra)),
+                Datum::Bool(moving_final.is_some_and(|function| function.extra)),
+                Datum::Bpchar(final_function.map_or("r", |function| modify(function.modify))),
+                Datum::Bpchar(moving_final.map_or("r", |function| modify(function.modify))),
+                Datum::Int4(aggregate.sort_operator_oid.unwrap_or(0)),
+                Datum::Int4(state_oid),
+                Datum::Int4(
+                    aggregate
+                        .state_space
+                        .map_or(0, |space| i32::try_from(space).unwrap_or(i32::MAX)),
+                ),
+                Datum::Int4(moving_state_oid),
+                Datum::Int4(
+                    moving
+                        .and_then(|moving| moving.state_space)
+                        .map_or(0, |space| i32::try_from(space).unwrap_or(i32::MAX)),
+                ),
+                aggregate
+                    .initial_condition
+                    .map_or(Ok(Datum::Null), |value| text(value.as_str(), arena))?,
+                moving
+                    .and_then(|moving| moving.initial_condition)
+                    .map_or(Ok(Datum::Null), |value| text(value.as_str(), arena))?,
+            ],
+            arena,
+        )?;
+        index += 1;
+    }
+    finish(definition, &rows[..index], arena)
 }
 
 fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -7550,6 +7780,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     );
     let types = [
         ColType::Void,
+        ColType::Internal,
         ColType::Bool,
         ColType::Int2,
         ColType::Int2Vector,
@@ -7607,6 +7838,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Record,
     ];
     let category = |t: &ColType| match t {
+        ColType::Void | ColType::Internal | ColType::Record => "P",
         ColType::Bool => "B",
         ColType::Int2
         | ColType::Int4
@@ -7641,7 +7873,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(i32::from(t.typlen())),
                 Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
                 Datum::Int4(PG_CATALOG_NS_OID),
-                text("b", arena)?,
+                text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
                 text(category(t), arena)?,
                 Datum::Int4(0), // typbasetype
                 Datum::Int4(0), // typelem
@@ -7668,6 +7900,107 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     let mut n = types.len();
     for (oid, name, length, category, element, array, relation, kind) in [
         (18, "char", 1, "Z", 0, 1002, 0, "b"),
+        (
+            super::types::oid::ANYELEMENT,
+            "anyelement",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYARRAY,
+            "anyarray",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYNONARRAY,
+            "anynonarray",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
+        (
+            super::types::oid::ANYRANGE,
+            "anyrange",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYMULTIRANGE,
+            "anymultirange",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYCOMPATIBLE,
+            "anycompatible",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYCOMPATIBLEARRAY,
+            "anycompatiblearray",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYCOMPATIBLENONARRAY,
+            "anycompatiblenonarray",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYCOMPATIBLERANGE,
+            "anycompatiblerange",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
+            super::types::oid::ANYCOMPATIBLEMULTIRANGE,
+            "anycompatiblemultirange",
+            -1,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
         (
             super::types::oid::PG_STATISTIC_ROW,
             "pg_statistic",
@@ -8985,7 +9318,13 @@ fn info_routines<'a>(
         ],
     );
     let count = (0..storage.routine_count())
-        .filter(|slot| storage.routine(*slot).visible_to(txid))
+        .filter(|slot| {
+            storage.routine(*slot).visible_to(txid)
+                && !matches!(
+                    storage.routine_for(*slot, txid).kind,
+                    crate::storage::RoutineKind::Aggregate(_)
+                )
+        })
         .count();
     let output = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -8993,7 +9332,9 @@ fn info_routines<'a>(
     let mut row_index = 0;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
-        if !routine.visible_to(txid) {
+        if !routine.visible_to(txid)
+            || matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
+        {
             continue;
         }
         let specific_name = routine_specific_name(&routine, txid);

@@ -1414,11 +1414,11 @@ fn subquery_exists<'a>(
         let mut n_aggs = 0;
         for item in select.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_aggs(expression, &mut agg_nodes, &mut n_aggs)?;
+                collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
             }
         }
         if let Some(h) = select.having {
-            collect_aggs(h, &mut agg_nodes, &mut n_aggs)?;
+            collect_aggs(h, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         }
         if n_aggs > 0 || select.having.is_some() {
             let base = Chained {
@@ -1428,6 +1428,8 @@ fn subquery_exists<'a>(
             let hook_data = fromless_aggregate_hooks(
                 select,
                 &agg_nodes[..n_aggs],
+                storage,
+                txid,
                 arena,
                 params,
                 &base,
@@ -1976,7 +1978,7 @@ pub(super) fn correlated_where_passes<'a>(
 /// (no spurious error), matching that these accept an unknown literal as-is.
 pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
     match ct {
-        ColType::Void => Datum::Null,
+        ColType::Void | ColType::Internal => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.
         ColType::Record => Datum::Record(&[]),
         // A named composite is not an anonymous record: even an empty
@@ -2320,9 +2322,15 @@ fn run_subquery<'a>(
     // its body belongs to the row-source executor just as a grouped one does.
     let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win_probe = 0;
-    collect_windows(item, &mut win_probe, &mut n_win_probe)?;
+    collect_windows(item, &mut win_probe, &mut n_win_probe, storage, txid)?;
     for ob in select.order_by {
-        collect_windows(ob.expression, &mut win_probe, &mut n_win_probe)?;
+        collect_windows(
+            ob.expression,
+            &mut win_probe,
+            &mut n_win_probe,
+            storage,
+            txid,
+        )?;
     }
     // A set-returning function in the subquery's select list expands to many
     // rows, so its body belongs to the row-source executor too (which handles
@@ -2439,11 +2447,13 @@ fn run_subquery<'a>(
         let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
             [(core::ptr::null(), &Expr::Null); MAX_AGGS];
         let mut n_aggs = 0;
-        collect_aggs(item, &mut agg_nodes, &mut n_aggs)?;
+        collect_aggs(item, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         if n_aggs > 0 {
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 select,
                 &agg_nodes[..n_aggs],
+                storage,
+                txid,
                 arena,
                 params,
                 &Chained {
@@ -2537,7 +2547,7 @@ fn run_subquery<'a>(
     let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
-    collect_aggs(item, &mut agg_nodes, &mut n_aggs)?;
+    collect_aggs(item, &mut agg_nodes, &mut n_aggs, storage, txid)?;
     if n_aggs > 0 {
         let agg_values = fold_aggregates(
             storage,

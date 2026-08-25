@@ -10,19 +10,21 @@ use super::{
     QualName, Stmt, TableConstraint, Tok,
 };
 use crate::sql::ast::{
-    AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction, AlterTypeAction,
-    ConstraintMode, ConstraintTiming, ConstraintValidation, CreateDomain, CreateRoutine,
-    CreateSchemaElement, CreateStatistics, CreateTrigger, DomainCheck, ExclusionOperator, Expr,
-    IndexBuildMode, IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, PartitionBound,
-    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
-    PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget, RoleOptions,
-    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind, StatisticsExpression,
-    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
-    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
-    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
-    TriggerIdentity, TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
+    AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
+    AlterIndexAction, AlterPublicationAction, AlterRoutineAction, AlterStatisticsAction,
+    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming,
+    ConstraintValidation, CreateDomain, CreateRoutine, CreateSchemaElement, CreateStatistics,
+    CreateTrigger, DomainCheck, ExclusionOperator, Expr, IndexBuildMode, IndexStorageOptionNames,
+    IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
+    PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
+    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
+    RoutineIdentity, RoutineParallel, RoutineTargetKind, StatisticsExpression, StatisticsKey,
+    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
+    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
+    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit,
+    TablespaceOptionNames, TablespaceOptions, TriggerEvent, TriggerIdentity, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -41,7 +43,487 @@ fn index_expression_source<'a>(expression: &Expr<'a>, text: &'a str) -> &'a str 
     text
 }
 
+#[derive(Clone, Copy)]
+struct AggregateOptions<'a> {
+    transition: Option<QualName<'a>>,
+    state_type: Option<&'a str>,
+    state_space: Option<u32>,
+    final_function: Option<QualName<'a>>,
+    final_extra: Option<bool>,
+    final_modify: Option<AggregateFinalModify>,
+    combine: Option<QualName<'a>>,
+    serial: Option<QualName<'a>>,
+    deserial: Option<QualName<'a>>,
+    initial_condition: Option<&'a str>,
+    moving_transition: Option<QualName<'a>>,
+    moving_inverse: Option<QualName<'a>>,
+    moving_state_type: Option<&'a str>,
+    moving_state_space: Option<u32>,
+    moving_final: Option<QualName<'a>>,
+    moving_final_extra: Option<bool>,
+    moving_final_modify: Option<AggregateFinalModify>,
+    moving_initial_condition: Option<&'a str>,
+    sort_operator: Option<&'a str>,
+    parallel: Option<RoutineParallel>,
+    hypothetical: Option<bool>,
+}
+
+impl AggregateOptions<'_> {
+    const EMPTY: Self = Self {
+        transition: None,
+        state_type: None,
+        state_space: None,
+        final_function: None,
+        final_extra: None,
+        final_modify: None,
+        combine: None,
+        serial: None,
+        deserial: None,
+        initial_condition: None,
+        moving_transition: None,
+        moving_inverse: None,
+        moving_state_type: None,
+        moving_state_space: None,
+        moving_final: None,
+        moving_final_extra: None,
+        moving_final_modify: None,
+        moving_initial_condition: None,
+        sort_operator: None,
+        parallel: None,
+        hypothetical: None,
+    };
+}
+
 impl<'a> Parser<'a> {
+    fn aggregate_argument(&mut self) -> Result<AggregateArgument<'a>, ParseError> {
+        let _ = self.eat_ident("in")?;
+        let variadic = self.eat_ident("variadic")?;
+        let first = self.any_ident("aggregate argument")?;
+        let (name, type_name) = if self.peeked == Tok::Op("[") {
+            self.advance()?;
+            self.expect_op("]")?;
+            while self.peeked == Tok::Op("[") {
+                self.advance()?;
+                self.expect_op("]")?;
+            }
+            (
+                "",
+                self.arena_str(stack_format!(132, "{}[]", first).as_str())?,
+            )
+        } else if matches!(self.peeked, Tok::Op(",") | Tok::Op(")"))
+            || matches!(self.peeked, Tok::Ident("order"))
+        {
+            ("", first)
+        } else {
+            (first, self.type_name()?)
+        };
+        Ok(AggregateArgument {
+            name,
+            type_name,
+            variadic,
+        })
+    }
+
+    fn aggregate_arguments(&mut self) -> Result<AggregateArguments<'a>, ParseError> {
+        if self.eat_op("*")? {
+            self.expect_op(")")?;
+            return Ok(AggregateArguments::Normal(&[]));
+        }
+        let mut direct = [AggregateArgument {
+            name: "",
+            type_name: "",
+            variadic: false,
+        }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut aggregated = direct;
+        let mut direct_count = 0usize;
+        let mut aggregated_count = 0usize;
+        let mut ordered_set = false;
+        if !self.eat_op(")")? {
+            loop {
+                if self.eat_ident("order")? {
+                    self.expect_ident("by")?;
+                    ordered_set = true;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    continue;
+                }
+                let target = if ordered_set {
+                    &mut aggregated
+                } else {
+                    &mut direct
+                };
+                let count = if ordered_set {
+                    &mut aggregated_count
+                } else {
+                    &mut direct_count
+                };
+                if *count == target.len() {
+                    return Err(self.limit("aggregate arguments", target.len()));
+                }
+                target[*count] = self.aggregate_argument()?;
+                *count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                if !ordered_set && self.eat_ident("order")? {
+                    self.expect_ident("by")?;
+                    ordered_set = true;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    continue;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        if ordered_set {
+            Ok(AggregateArguments::OrderedSet {
+                direct: self.arena_slice(&direct[..direct_count])?,
+                aggregated: self.arena_slice(&aggregated[..aggregated_count])?,
+                hypothetical: false,
+            })
+        } else {
+            Ok(AggregateArguments::Normal(
+                self.arena_slice(&direct[..direct_count])?,
+            ))
+        }
+    }
+
+    fn aggregate_option_equals(&mut self) -> Result<(), ParseError> {
+        let _ = self.eat_op("=")?;
+        Ok(())
+    }
+
+    fn aggregate_space(&mut self) -> Result<u32, ParseError> {
+        self.aggregate_option_equals()?;
+        u32::try_from(self.seq_int()?)
+            .map_err(|_| self.err_here("aggregate state space is out of range"))
+    }
+
+    fn aggregate_modify(&mut self) -> Result<AggregateFinalModify, ParseError> {
+        self.aggregate_option_equals()?;
+        if self.eat_ident("read_only")? {
+            Ok(AggregateFinalModify::ReadOnly)
+        } else if self.eat_ident("shareable")? {
+            Ok(AggregateFinalModify::Shareable)
+        } else if self.eat_ident("read_write")? {
+            Ok(AggregateFinalModify::ReadWrite)
+        } else {
+            Err(self.unexpected("expected READ_ONLY, SHAREABLE, or READ_WRITE"))
+        }
+    }
+
+    fn duplicate_aggregate_option(&self, name: &str) -> ParseError {
+        let _ = name;
+        self.err_here("aggregate option specified more than once")
+    }
+
+    fn create_aggregate(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("aggregate name")?;
+        self.expect_op("(")?;
+        let starts_old_options = matches!(
+            self.peeked,
+            Tok::Ident(
+                "sfunc"
+                    | "stype"
+                    | "sspace"
+                    | "finalfunc"
+                    | "finalfunc_extra"
+                    | "finalfunc_modify"
+                    | "combinefunc"
+                    | "serialfunc"
+                    | "deserialfunc"
+                    | "initcond"
+                    | "msfunc"
+                    | "minvfunc"
+                    | "mstype"
+                    | "msspace"
+                    | "mfinalfunc"
+                    | "mfinalfunc_extra"
+                    | "mfinalfunc_modify"
+                    | "minitcond"
+                    | "sortop"
+                    | "parallel"
+                    | "hypothetical"
+            )
+        );
+        let (mut arguments, old_syntax) = if self.eat_ident("basetype")? {
+            self.aggregate_option_equals()?;
+            let arguments = if self.eat_ident("any")? {
+                AggregateArguments::Normal(&[])
+            } else {
+                let type_name = self.type_name()?;
+                let argument = [AggregateArgument {
+                    name: "",
+                    type_name,
+                    variadic: false,
+                }];
+                AggregateArguments::Normal(self.arena_slice(&argument)?)
+            };
+            self.expect_op(",")?;
+            (arguments, true)
+        } else if starts_old_options {
+            let mut error = self.err_here("aggregate input type must be specified");
+            error.sqlstate = sqlstate::INVALID_FUNCTION_DEFINITION;
+            return Err(error);
+        } else {
+            let arguments = self.aggregate_arguments()?;
+            self.expect_op("(")?;
+            (arguments, false)
+        };
+        let mut options = AggregateOptions::EMPTY;
+        loop {
+            if self.eat_ident("sfunc")? {
+                if options.transition.is_some() {
+                    return Err(self.duplicate_aggregate_option("SFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.transition = Some(self.qual_name("transition function")?);
+            } else if self.eat_ident("stype")? {
+                if options.state_type.is_some() {
+                    return Err(self.duplicate_aggregate_option("STYPE"));
+                }
+                self.aggregate_option_equals()?;
+                options.state_type = Some(self.type_name()?);
+            } else if self.eat_ident("sspace")? {
+                if options.state_space.is_some() {
+                    return Err(self.duplicate_aggregate_option("SSPACE"));
+                }
+                options.state_space = Some(self.aggregate_space()?);
+            } else if self.eat_ident("finalfunc")? {
+                if options.final_function.is_some() {
+                    return Err(self.duplicate_aggregate_option("FINALFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.final_function = Some(self.qual_name("final function")?);
+            } else if self.eat_ident("finalfunc_extra")? {
+                if options.final_extra.replace(true).is_some() {
+                    return Err(self.duplicate_aggregate_option("FINALFUNC_EXTRA"));
+                }
+            } else if self.eat_ident("finalfunc_modify")? {
+                if options.final_modify.is_some() {
+                    return Err(self.duplicate_aggregate_option("FINALFUNC_MODIFY"));
+                }
+                options.final_modify = Some(self.aggregate_modify()?);
+            } else if self.eat_ident("combinefunc")? {
+                if options.combine.is_some() {
+                    return Err(self.duplicate_aggregate_option("COMBINEFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.combine = Some(self.qual_name("combine function")?);
+            } else if self.eat_ident("serialfunc")? {
+                if options.serial.is_some() {
+                    return Err(self.duplicate_aggregate_option("SERIALFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.serial = Some(self.qual_name("serialization function")?);
+            } else if self.eat_ident("deserialfunc")? {
+                if options.deserial.is_some() {
+                    return Err(self.duplicate_aggregate_option("DESERIALFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.deserial = Some(self.qual_name("deserialization function")?);
+            } else if self.eat_ident("initcond")? {
+                if options.initial_condition.is_some() {
+                    return Err(self.duplicate_aggregate_option("INITCOND"));
+                }
+                self.aggregate_option_equals()?;
+                options.initial_condition = Some(self.str_literal("initial condition")?);
+            } else if self.eat_ident("msfunc")? {
+                if options.moving_transition.is_some() {
+                    return Err(self.duplicate_aggregate_option("MSFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.moving_transition = Some(self.qual_name("moving transition function")?);
+            } else if self.eat_ident("minvfunc")? {
+                if options.moving_inverse.is_some() {
+                    return Err(self.duplicate_aggregate_option("MINVFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.moving_inverse = Some(self.qual_name("moving inverse function")?);
+            } else if self.eat_ident("mstype")? {
+                if options.moving_state_type.is_some() {
+                    return Err(self.duplicate_aggregate_option("MSTYPE"));
+                }
+                self.aggregate_option_equals()?;
+                options.moving_state_type = Some(self.type_name()?);
+            } else if self.eat_ident("msspace")? {
+                if options.moving_state_space.is_some() {
+                    return Err(self.duplicate_aggregate_option("MSSPACE"));
+                }
+                options.moving_state_space = Some(self.aggregate_space()?);
+            } else if self.eat_ident("mfinalfunc")? {
+                if options.moving_final.is_some() {
+                    return Err(self.duplicate_aggregate_option("MFINALFUNC"));
+                }
+                self.aggregate_option_equals()?;
+                options.moving_final = Some(self.qual_name("moving final function")?);
+            } else if self.eat_ident("mfinalfunc_extra")? {
+                if options.moving_final_extra.replace(true).is_some() {
+                    return Err(self.duplicate_aggregate_option("MFINALFUNC_EXTRA"));
+                }
+            } else if self.eat_ident("mfinalfunc_modify")? {
+                if options.moving_final_modify.is_some() {
+                    return Err(self.duplicate_aggregate_option("MFINALFUNC_MODIFY"));
+                }
+                options.moving_final_modify = Some(self.aggregate_modify()?);
+            } else if self.eat_ident("minitcond")? {
+                if options.moving_initial_condition.is_some() {
+                    return Err(self.duplicate_aggregate_option("MINITCOND"));
+                }
+                self.aggregate_option_equals()?;
+                options.moving_initial_condition =
+                    Some(self.str_literal("moving initial condition")?);
+            } else if self.eat_ident("sortop")? {
+                if options.sort_operator.is_some() {
+                    return Err(self.duplicate_aggregate_option("SORTOP"));
+                }
+                self.aggregate_option_equals()?;
+                let operator = match self.peeked {
+                    Tok::Ident(value) | Tok::Op(value) => value,
+                    _ => return Err(self.unexpected("expected an operator")),
+                };
+                self.advance()?;
+                options.sort_operator = Some(operator);
+            } else if self.eat_ident("parallel")? {
+                if options.parallel.is_some() {
+                    return Err(self.duplicate_aggregate_option("PARALLEL"));
+                }
+                self.aggregate_option_equals()?;
+                options.parallel = Some(if self.eat_ident("safe")? {
+                    RoutineParallel::Safe
+                } else if self.eat_ident("restricted")? {
+                    RoutineParallel::Restricted
+                } else if self.eat_ident("unsafe")? {
+                    RoutineParallel::Unsafe
+                } else {
+                    return Err(self.unexpected("expected SAFE, RESTRICTED, or UNSAFE"));
+                });
+            } else if self.eat_ident("hypothetical")? {
+                if options.hypothetical.replace(true).is_some() {
+                    return Err(self.duplicate_aggregate_option("HYPOTHETICAL"));
+                }
+            } else {
+                return Err(self.unexpected("expected an aggregate option"));
+            }
+            if self.eat_op(")")? {
+                break;
+            }
+            self.expect_op(",")?;
+        }
+        let transition = options
+            .transition
+            .ok_or_else(|| self.err_here("aggregate SFUNC is required"))?;
+        let state_type = options
+            .state_type
+            .ok_or_else(|| self.err_here("aggregate STYPE is required"))?;
+        let ordered_set = matches!(arguments, AggregateArguments::OrderedSet { .. });
+        let final_function = options.final_function.map(|function| AggregateFinal {
+            function,
+            extra: options.final_extra.unwrap_or(false),
+            modify: options.final_modify.unwrap_or(if ordered_set {
+                AggregateFinalModify::ReadWrite
+            } else {
+                AggregateFinalModify::ReadOnly
+            }),
+        });
+        if final_function.is_none()
+            && (options.final_extra.is_some() || options.final_modify.is_some())
+        {
+            return Err(self.err_here("FINALFUNC_EXTRA and FINALFUNC_MODIFY require FINALFUNC"));
+        }
+        if options.serial.is_some() != options.deserial.is_some() {
+            return Err(self.err_here("SERIALFUNC and DESERIALFUNC must be specified together"));
+        }
+        if (options.serial.is_some() || options.deserial.is_some()) && options.combine.is_none() {
+            return Err(self.err_here("SERIALFUNC and DESERIALFUNC require COMBINEFUNC"));
+        }
+        let partial = options.combine.map(|combine| AggregatePartial {
+            combine,
+            serial: options.serial,
+            deserial: options.deserial,
+        });
+        let any_moving = options.moving_transition.is_some()
+            || options.moving_inverse.is_some()
+            || options.moving_state_type.is_some()
+            || options.moving_state_space.is_some()
+            || options.moving_final.is_some()
+            || options.moving_final_extra.is_some()
+            || options.moving_final_modify.is_some()
+            || options.moving_initial_condition.is_some();
+        let moving = if any_moving {
+            let transition = options
+                .moving_transition
+                .ok_or_else(|| self.err_here("MSFUNC is required for moving aggregation"))?;
+            let inverse = options
+                .moving_inverse
+                .ok_or_else(|| self.err_here("MINVFUNC is required for moving aggregation"))?;
+            let state_type = options
+                .moving_state_type
+                .ok_or_else(|| self.err_here("MSTYPE is required for moving aggregation"))?;
+            let final_function = options.moving_final.map(|function| AggregateFinal {
+                function,
+                extra: options.moving_final_extra.unwrap_or(false),
+                modify: options
+                    .moving_final_modify
+                    .unwrap_or(AggregateFinalModify::ReadOnly),
+            });
+            if final_function.is_none()
+                && (options.moving_final_extra.is_some() || options.moving_final_modify.is_some())
+            {
+                return Err(
+                    self.err_here("MFINALFUNC_EXTRA and MFINALFUNC_MODIFY require MFINALFUNC")
+                );
+            }
+            Some(AggregateMoving {
+                transition,
+                inverse,
+                state_type,
+                state_space: options.moving_state_space,
+                final_function,
+                initial_condition: options.moving_initial_condition,
+            })
+        } else {
+            None
+        };
+        if options.hypothetical.unwrap_or(false) {
+            arguments = match arguments {
+                AggregateArguments::OrderedSet {
+                    direct, aggregated, ..
+                } => AggregateArguments::OrderedSet {
+                    direct,
+                    aggregated,
+                    hypothetical: true,
+                },
+                AggregateArguments::Normal(_) => {
+                    return Err(self.err_here("HYPOTHETICAL requires ordered-set arguments"));
+                }
+            };
+        }
+        if old_syntax && matches!(arguments, AggregateArguments::OrderedSet { .. }) {
+            return Err(
+                self.err_here("old aggregate syntax cannot define an ordered-set aggregate")
+            );
+        }
+        Ok(Stmt::CreateAggregate(crate::sql::ast::CreateAggregate {
+            name,
+            or_replace,
+            arguments,
+            definition: AggregateDefinition {
+                transition,
+                state_type,
+                state_space: options.state_space,
+                final_function,
+                partial,
+                moving,
+                initial_condition: options.initial_condition,
+                sort_operator: options.sort_operator,
+                parallel: options.parallel.unwrap_or(RoutineParallel::Unsafe),
+            },
+        }))
+    }
+
     pub(super) fn alter_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.col_ident("trigger name")?;
         self.expect_ident("on")?;
@@ -159,9 +641,12 @@ impl<'a> Parser<'a> {
             if self.eat_ident("procedure")? {
                 return self.create_routine(true, false);
             }
-            return Err(
-                self.unexpected("expected VIEW, FUNCTION, or PROCEDURE after CREATE OR REPLACE")
-            );
+            if self.eat_ident("aggregate")? {
+                return self.create_aggregate(true);
+            }
+            return Err(self.unexpected(
+                "expected VIEW, FUNCTION, PROCEDURE, or AGGREGATE after CREATE OR REPLACE",
+            ));
         }
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
@@ -175,6 +660,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("procedure")? {
             return self.create_routine(false, false);
+        }
+        if self.eat_ident("aggregate")? {
+            return self.create_aggregate(false);
         }
         if self.eat_ident("publication")? {
             return self.create_publication();
@@ -914,14 +1402,90 @@ impl<'a> Parser<'a> {
         } else {
             RoutineCreateKind::Procedure
         };
-        self.expect_ident("language")?;
-        let language = if self.eat_ident("sql")? {
-            crate::sql::ast::RoutineLanguage::Sql
-        } else if self.eat_ident("plpgsql")? {
-            crate::sql::ast::RoutineLanguage::PlPgSql
-        } else {
-            return Err(self.unexpected("supported routine language"));
-        };
+        let mut language = None;
+        let mut body = None;
+        let mut attributes = crate::sql::ast::RoutineAttributes::default();
+        let mut strict_seen = false;
+        let mut volatility_seen = false;
+        let mut parallel_seen = false;
+        while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            if self.eat_ident("language")? {
+                if language.is_some() {
+                    return Err(self.unexpected("one LANGUAGE clause"));
+                }
+                language = Some(if self.eat_ident("sql")? {
+                    crate::sql::ast::RoutineLanguage::Sql
+                } else if self.eat_ident("plpgsql")? {
+                    crate::sql::ast::RoutineLanguage::PlPgSql
+                } else {
+                    return Err(self.unexpected("supported routine language"));
+                });
+            } else if self.eat_ident("as")? {
+                if body.is_some() {
+                    return Err(self.unexpected("one AS clause"));
+                }
+                body = Some(self.str_literal("function body")?);
+            } else if self.eat_ident("strict")? {
+                if strict_seen {
+                    return Err(self.unexpected("one null-input clause"));
+                }
+                strict_seen = true;
+                attributes.strict = true;
+            } else if self.eat_ident("returns")? {
+                self.expect_ident("null")?;
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                if strict_seen {
+                    return Err(self.unexpected("one null-input clause"));
+                }
+                strict_seen = true;
+                attributes.strict = true;
+            } else if self.eat_ident("called")? {
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                if strict_seen {
+                    return Err(self.unexpected("one null-input clause"));
+                }
+                strict_seen = true;
+                attributes.strict = false;
+            } else if self.eat_ident("immutable")? {
+                if volatility_seen {
+                    return Err(self.unexpected("one volatility clause"));
+                }
+                volatility_seen = true;
+                attributes.volatility = crate::sql::ast::RoutineVolatility::Immutable;
+            } else if self.eat_ident("stable")? {
+                if volatility_seen {
+                    return Err(self.unexpected("one volatility clause"));
+                }
+                volatility_seen = true;
+                attributes.volatility = crate::sql::ast::RoutineVolatility::Stable;
+            } else if self.eat_ident("volatile")? {
+                if volatility_seen {
+                    return Err(self.unexpected("one volatility clause"));
+                }
+                volatility_seen = true;
+                attributes.volatility = crate::sql::ast::RoutineVolatility::Volatile;
+            } else if self.eat_ident("parallel")? {
+                if parallel_seen {
+                    return Err(self.unexpected("one PARALLEL clause"));
+                }
+                parallel_seen = true;
+                attributes.parallel = if self.eat_ident("safe")? {
+                    crate::sql::ast::RoutineParallel::Safe
+                } else if self.eat_ident("restricted")? {
+                    crate::sql::ast::RoutineParallel::Restricted
+                } else {
+                    self.expect_ident("unsafe")?;
+                    crate::sql::ast::RoutineParallel::Unsafe
+                };
+            } else {
+                return Err(self.unexpected("routine option"));
+            }
+        }
+        let language = language.ok_or_else(|| self.unexpected("LANGUAGE clause"))?;
         if matches!(kind, RoutineCreateKind::Trigger)
             != matches!(language, crate::sql::ast::RoutineLanguage::PlPgSql)
         {
@@ -933,15 +1497,14 @@ impl<'a> Parser<'a> {
                 }),
             );
         }
-        self.expect_ident("as")?;
-        let body = self.str_literal("function body")?;
         Ok(Stmt::CreateRoutine(CreateRoutine {
             name,
             or_replace,
             arguments: self.arena_slice(&arguments[..count])?,
             kind,
             language,
-            body,
+            attributes,
+            body: body.ok_or_else(|| self.unexpected("AS clause"))?,
         }))
     }
 
@@ -2795,6 +3358,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("domain")? {
             return self.drop_domain();
         }
+        if self.eat_ident("aggregate")? {
+            return self.drop_aggregate();
+        }
         if self.eat_ident("function")? {
             return self.drop_routine(RoutineTargetKind::Function);
         }
@@ -2935,7 +3501,132 @@ impl<'a> Parser<'a> {
                 if_exists,
                 cascade,
             }),
+            RoutineTargetKind::Aggregate => {
+                unreachable!("aggregate DROP has its own typed identity parser")
+            }
         }
+    }
+
+    fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
+        let name = self.qual_name("aggregate name")?;
+        self.expect_op("(")?;
+        let mut direct = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut aggregated = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut direct_count = 0usize;
+        let mut aggregated_count = 0usize;
+        let mut ordered_set = false;
+        if self.eat_op("*")? {
+            self.expect_op(")")?;
+        } else if !self.eat_op(")")? {
+            loop {
+                if self.eat_ident("order")? {
+                    self.expect_ident("by")?;
+                    ordered_set = true;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    continue;
+                }
+                let _ = self.eat_ident("in")?;
+                let _ = self.eat_ident("variadic")?;
+                let target = if ordered_set {
+                    &mut aggregated
+                } else {
+                    &mut direct
+                };
+                let count = if ordered_set {
+                    &mut aggregated_count
+                } else {
+                    &mut direct_count
+                };
+                if *count == target.len() {
+                    return Err(self.limit("aggregate arguments", target.len()));
+                }
+                target[*count] = self.type_name()?;
+                *count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                if !ordered_set && self.eat_ident("order")? {
+                    self.expect_ident("by")?;
+                    ordered_set = true;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    continue;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        Ok(if ordered_set {
+            AggregateIdentity {
+                name,
+                direct_argument_types: self.arena_slice(&direct[..direct_count])?,
+                aggregated_argument_types: self.arena_slice(&aggregated[..aggregated_count])?,
+                ordered_set: true,
+            }
+        } else {
+            AggregateIdentity {
+                name,
+                direct_argument_types: &[],
+                aggregated_argument_types: self.arena_slice(&direct[..direct_count])?,
+                ordered_set: false,
+            }
+        })
+    }
+
+    fn drop_aggregate(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut aggregates = [AggregateIdentity {
+            name: QualName::bare(""),
+            direct_argument_types: &[],
+            aggregated_argument_types: &[],
+            ordered_set: false,
+        }; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == aggregates.len() {
+                return Err(self.limit("aggregates", aggregates.len()));
+            }
+            aggregates[count] = self.aggregate_identity()?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropAggregate {
+            aggregates: self.arena_slice(&aggregates[..count])?,
+            if_exists,
+            cascade,
+        })
+    }
+
+    pub(super) fn alter_aggregate(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let aggregate = self.aggregate_identity()?;
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterRoutineAction::SetOwner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterRoutineAction::Rename(self.col_ident("aggregate name")?)
+        } else if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
+        } else {
+            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
+        };
+        Ok(Stmt::AlterAggregate { aggregate, action })
     }
 
     pub(super) fn drop_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {

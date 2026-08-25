@@ -424,11 +424,45 @@ pub(super) fn groups_for_mask<'a>(
         .map_err(|_| arena_full())?;
     for g in 0..n_groups {
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
-            states[g * n_aggs.max(1) + i].init(node)?;
+            states[g * n_aggs.max(1) + i].init(
+                node,
+                storage,
+                txid,
+                &super::ScopeCols(scope),
+                arena,
+            )?;
+        }
+    }
+    let partial_execution = storage.spill_attached()
+        && states[..n_groups * n_aggs]
+            .iter()
+            .any(AggState::supports_partial);
+    let partial_states: &mut [AggState] = arena
+        .alloc_slice_with(
+            if partial_execution {
+                n_groups * n_aggs.max(1)
+            } else {
+                0
+            },
+            |_| AggState::default(),
+        )
+        .map_err(|_| arena_full())?;
+    if partial_execution {
+        for g in 0..n_groups {
+            for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                partial_states[g * n_aggs.max(1) + i].init(
+                    node,
+                    storage,
+                    txid,
+                    &super::ScopeCols(scope),
+                    arena,
+                )?;
+            }
         }
     }
     if n_aggs > 0 {
         let mut at = 0usize;
+        let mut partial_rows = 0usize;
         let recycling_safe = states[..n_groups * n_aggs]
             .iter()
             .all(AggState::recycling_safe);
@@ -474,9 +508,39 @@ pub(super) fn groups_for_mask<'a>(
             };
             let g = group_of.get(at).copied().unwrap_or(0) as usize;
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                states[g * n_aggs + i].update(node, arena, params, row, row_hooks)?;
+                let index = g * n_aggs + i;
+                if partial_execution && states[index].supports_partial() {
+                    partial_states[index].update(node, arena, params, row, row_hooks)?;
+                } else {
+                    states[index].update(node, arena, params, row, row_hooks)?;
+                }
             }
             at += 1;
+            partial_rows += 1;
+            if partial_execution && partial_rows == 256 {
+                for g in 0..n_groups {
+                    for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                        let index = g * n_aggs + i;
+                        if !states[index].supports_partial() {
+                            continue;
+                        }
+                        states[index].combine_partial(
+                            &partial_states[index],
+                            arena,
+                            row_hooks.catalog,
+                        )?;
+                        partial_states[index] = AggState::default();
+                        partial_states[index].init(
+                            node,
+                            storage,
+                            txid,
+                            &super::ScopeCols(scope),
+                            arena,
+                        )?;
+                    }
+                }
+                partial_rows = 0;
+            }
             Ok(true)
         };
         if recycling_safe {
@@ -490,6 +554,20 @@ pub(super) fn groups_for_mask<'a>(
                 &mut visit,
             )?;
         }
+        if partial_execution && partial_rows > 0 {
+            for g in 0..n_groups {
+                for i in 0..n_aggs {
+                    let index = g * n_aggs + i;
+                    if states[index].supports_partial() {
+                        states[index].combine_partial(
+                            &partial_states[index],
+                            arena,
+                            hooks.catalog,
+                        )?;
+                    }
+                }
+            }
+        }
     }
 
     let out_rows: &mut [&[u8]] = arena
@@ -502,8 +580,10 @@ pub(super) fn groups_for_mask<'a>(
             *slot = crate::sql::exec::decode_projected_pub(rep_keys[g], k);
         }
         let mut agg_vals = [Datum::Null; MAX_AGGS];
-        for i in 0..n_aggs {
-            agg_vals[i] = states[g * n_aggs.max(1) + i].finish(arena, hooks.catalog)?;
+        for (i, (_, node)) in agg_nodes.iter().enumerate() {
+            let state = &mut states[g * n_aggs.max(1) + i];
+            state.initialize_custom_direct(node, arena, params, &ScopeSchema(scope), hooks)?;
+            agg_vals[i] = state.finish(arena, hooks.catalog)?;
         }
         let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
             [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
@@ -606,12 +686,13 @@ pub(super) fn grouped_rows<'a>(
                 "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
             ));
         };
-        if let Some(column) = ungrouped_column(expression, statement.group_by, scope) {
+        if let Some(column) = ungrouped_column(expression, statement.group_by, scope, storage, txid)
+        {
             return Err(ungrouped_error(column, scope));
         }
     }
     if let Some(h) = statement.having
-        && let Some(column) = ungrouped_column(h, statement.group_by, scope)
+        && let Some(column) = ungrouped_column(h, statement.group_by, scope, storage, txid)
     {
         return Err(ungrouped_error(column, scope));
     }
@@ -703,7 +784,7 @@ pub(super) fn grouped_rows<'a>(
         let target = resolve_order_target(ob.expression, statement.items, scope, arena)?;
         // The sort key evaluates against the group, so it faces the same
         // grouping rule as a select item (42803, not a missing-column error).
-        if let Some(column) = ungrouped_column(target, statement.group_by, scope) {
+        if let Some(column) = ungrouped_column(target, statement.group_by, scope, storage, txid) {
             return Err(ungrouped_error(column, scope));
         }
         order_arr[k] = Some(target);
@@ -1090,18 +1171,27 @@ fn ungrouped_column<'e, 'a>(
     expression: &'e Expr<'a>,
     group_by: &[&Expr<'a>],
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
 ) -> Option<&'e Expr<'a>> {
+    let catalog_aggregate = matches!(
+        expression,
+        Expr::Call { name, args, order_by, .. }
+            if storage.has_aggregate_candidate(name, args.len(), txid)
+                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
+    );
     if group_by
         .iter()
         .any(|g| **g == *expression || same_scope_column(scope, g, expression))
         || expression.is_aggregate()
+        || catalog_aggregate
     {
         return None;
     }
     let first = |parts: &[&'e Expr<'a>]| {
         parts
             .iter()
-            .find_map(|e| ungrouped_column(e, group_by, scope))
+            .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
     };
     match expression {
         Expr::Column { .. } | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => Some(expression),
@@ -1125,15 +1215,17 @@ fn ungrouped_column<'e, 'a>(
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::InSubquery { operand, .. }
-        | Expr::QuantifiedSubquery { operand, .. } => ungrouped_column(operand, group_by, scope),
+        | Expr::QuantifiedSubquery { operand, .. } => {
+            ungrouped_column(operand, group_by, scope, storage, txid)
+        }
         Expr::Binary { left, right, .. } => first(&[left, right]),
         Expr::Call { args, .. } => args
             .iter()
-            .find_map(|a| ungrouped_column(a, group_by, scope)),
+            .find_map(|a| ungrouped_column(a, group_by, scope, storage, txid)),
         Expr::InList { operand, list, .. } => {
-            ungrouped_column(operand, group_by, scope).or_else(|| {
+            ungrouped_column(operand, group_by, scope, storage, txid).or_else(|| {
                 list.iter()
-                    .find_map(|e| ungrouped_column(e, group_by, scope))
+                    .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
             })
         }
         Expr::Between {
@@ -1151,17 +1243,21 @@ fn ungrouped_column<'e, 'a>(
             otherwise,
             ..
         } => operand
-            .and_then(|o| ungrouped_column(o, group_by, scope))
+            .and_then(|o| ungrouped_column(o, group_by, scope, storage, txid))
             .or_else(|| whens.iter().find_map(|(c, r)| first(&[c, r])))
-            .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by, scope))),
+            .or_else(|| {
+                otherwise.and_then(|o| ungrouped_column(o, group_by, scope, storage, txid))
+            }),
         Expr::Array(items) => items
             .iter()
-            .find_map(|e| ungrouped_column(e, group_by, scope)),
+            .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid)),
         Expr::Subscript { base, index } => first(&[base, index]),
-        Expr::Slice { base, lower, upper } => ungrouped_column(base, group_by, scope)
-            .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope)))
-            .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope))),
-        Expr::Field { base, .. } => ungrouped_column(base, group_by, scope),
+        Expr::Slice { base, lower, upper } => {
+            ungrouped_column(base, group_by, scope, storage, txid)
+                .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
+                .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
+        }
+        Expr::Field { base, .. } => ungrouped_column(base, group_by, scope, storage, txid),
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }
 }

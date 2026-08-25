@@ -86,7 +86,10 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 SET client_min_messages = warning;
 DO $$
-DECLARE object record;
+DECLARE
+  object record;
+  routine_identity text;
+  routine_identities text[];
 BEGIN
   FOR object IN
     SELECT c.relkind, c.relname
@@ -106,12 +109,13 @@ BEGIN
       object.relname
     );
   END LOOP;
-  FOR object IN
-    SELECT p.oid::regprocedure AS identity
-      FROM pg_proc p
-     WHERE p.pronamespace = 'public'::regnamespace
+  SELECT array_agg(p.oid::regprocedure::text ORDER BY p.oid)
+    INTO routine_identities
+    FROM pg_proc p
+   WHERE p.pronamespace = 'public'::regnamespace;
+  FOREACH routine_identity IN ARRAY coalesce(routine_identities, ARRAY[]::text[])
   LOOP
-    EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', object.identity);
+    EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', routine_identity);
   END LOOP;
   FOR object IN
     SELECT t.typname, t.typtype
@@ -365,6 +369,16 @@ CREATE SEQUENCE outbound_dump.manual_sequence START WITH 41;
 SELECT nextval('outbound_dump.manual_sequence');
 CREATE MATERIALIZED VIEW outbound_dump.item_count AS SELECT count(*) AS count FROM outbound_dump.items;
 CREATE FUNCTION outbound_dump.dump_answer() RETURNS integer LANGUAGE sql AS 'SELECT 42';
+CREATE FUNCTION outbound_dump.dump_total_state(state bigint, value integer)
+RETURNS bigint LANGUAGE sql IMMUTABLE AS 'SELECT coalesce(state, 0) + value';
+CREATE AGGREGATE outbound_dump.dump_total(integer) (
+  SFUNC = outbound_dump.dump_total_state, STYPE = bigint, INITCOND = '0', PARALLEL = SAFE
+);
+CREATE FUNCTION outbound_dump.dump_first_state(state anyelement, value anyelement)
+RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT coalesce(state, value)';
+CREATE AGGREGATE outbound_dump.dump_first(anyelement) (
+  SFUNC = outbound_dump.dump_first_state, STYPE = anyelement
+);
 CREATE FUNCTION outbound_dump.echo_mood(value outbound_type_target.mood) RETURNS outbound_type_target.mood LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_location(value outbound_type_target.location) RETURNS outbound_type_target.location LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_marked_location(value outbound_dump.location_domain) RETURNS outbound_dump.location_domain LANGUAGE sql AS 'SELECT $1';
@@ -503,8 +517,11 @@ else
                             WHERE typnamespace = 'outbound_dump'::regnamespace
                               AND typname = 'metadata')
          AND a.attname = 'code';
+      SELECT outbound_dump.dump_total(value) FROM (VALUES (2), (3), (5)) input(value);
+      SELECT outbound_dump.dump_first(value), outbound_dump.dump_first(label)
+        FROM (VALUES (2, 'x'::text), (3, 'y'::text)) input(value,label);
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nI|1\n7|C'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nI|1\n7|C\n10\n2|x'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

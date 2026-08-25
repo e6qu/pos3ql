@@ -827,80 +827,23 @@ pub(super) fn storage_catalog<'a>(
     }
 }
 
-impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
-    fn statistics_definition<'a>(
+impl StorageCatalog<'_, '_, '_, '_> {
+    fn execute_routine<'a>(
         &self,
-        oid: i32,
-        arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::extended_statistics_definition_by_oid(self.storage, self.txid, oid, arena)
-    }
-    fn statistics_expressions<'a>(
-        &self,
-        oid: i32,
-        arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
-        super::catalog::extended_statistics_expressions_by_oid(self.storage, self.txid, oid, arena)
-    }
-    fn statistics_columns<'a>(
-        &self,
-        oid: i32,
-        arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::extended_statistics_columns_by_oid(self.storage, self.txid, oid, arena)
-    }
-    fn tablespace_location<'a>(
-        &self,
-        oid: i32,
-        arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::tablespace_location_by_oid(self.storage, self.txid, oid, arena)
-    }
-    fn materialize_composite<'a>(
-        &self,
-        slot: u16,
-        physical_fields: u8,
-        text: &'a str,
-        arena: &'a Arena,
-    ) -> Result<Datum<'a>, SqlError> {
-        super::exec::decode_stored_composite_text(
-            text,
-            slot,
-            physical_fields,
-            self.storage,
-            self.txid,
-            arena,
-        )
-    }
-
-    fn compare_text(
-        &self,
-        collation: super::ast::Collation,
-        left: &str,
-        right: &str,
-    ) -> Result<core::cmp::Ordering, SqlError> {
-        self.storage.compare_text(collation, left, right)
-    }
-
-    fn call_routine<'a>(
-        &self,
-        name: &str,
+        slot: usize,
+        routine: crate::storage::RoutineDef,
         arguments: &[Datum<'a>],
-        argument_type_oids: &[i32],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        let Some(slot) =
-            self.storage
-                .routine_slot_for_call_oids(name, argument_type_oids, self.txid)
-        else {
-            return Ok(None);
+        if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
+            return Ok(Some(Datum::Null));
+        }
+        let result_contract = match routine.kind {
+            crate::storage::RoutineKind::Function { result }
+            | crate::storage::RoutineKind::SetFunction { result } => result,
+            _ => unreachable!("routine call resolution returns functions only"),
         };
-        self.storage.require_routine_execute(slot, self.txid)?;
-        let routine = self.storage.routine_for(slot, self.txid);
-        let result_type = routine
-            .kind
-            .function_result()
-            .expect("routine call resolution returns functions only");
+        let result_type = result_contract.ctype;
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
         let function_program = parse_routine_function_program(
             routine.body.as_str(),
@@ -1015,7 +958,123 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 Ok(())
             },
         )?;
-        super::eval::cast_to(result.unwrap_or(Datum::Null), result_type, arena).map(Some)
+        let result = result.unwrap_or(Datum::Null);
+        if result_contract.polymorphic_type().is_some() {
+            Ok(Some(result))
+        } else {
+            super::eval::cast_to(result, result_type, arena).map(Some)
+        }
+    }
+}
+
+impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn statistics_definition<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::extended_statistics_definition_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn statistics_expressions<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        super::catalog::extended_statistics_expressions_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn statistics_columns<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::extended_statistics_columns_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn tablespace_location<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::tablespace_location_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn materialize_composite<'a>(
+        &self,
+        slot: u16,
+        physical_fields: u8,
+        text: &'a str,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::exec::decode_stored_composite_text(
+            text,
+            slot,
+            physical_fields,
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
+    fn compare_text(
+        &self,
+        collation: super::ast::Collation,
+        left: &str,
+        right: &str,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        self.storage.compare_text(collation, left, right)
+    }
+
+    fn call_routine<'a>(
+        &self,
+        name: &str,
+        arguments: &[Datum<'a>],
+        argument_type_oids: &[i32],
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(slot) =
+            self.storage
+                .routine_slot_for_call_oids(name, argument_type_oids, self.txid)
+        else {
+            return Ok(None);
+        };
+        self.storage.require_routine_execute(slot, self.txid)?;
+        let routine = self
+            .storage
+            .routine_for_bound_call(slot, argument_type_oids, self.txid)
+            .expect("resolved routine call has a valid polymorphic binding");
+        self.execute_routine(slot, routine, arguments, arena)
+    }
+
+    fn call_routine_oid<'a>(
+        &self,
+        oid: i32,
+        arguments: &[Datum<'a>],
+        argument_type_oids: &[i32],
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "aggregate support function with OID {} does not exist",
+                oid
+            ));
+        };
+        let routine = self.storage.routine_for(slot, self.txid);
+        if arguments.len() != routine.argument_count || argument_type_oids.len() != arguments.len()
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate support function argument contract changed"
+            ));
+        }
+        let routine = self
+            .storage
+            .routine_for_bound_call(slot, argument_type_oids, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "aggregate support function polymorphic contract does not match its arguments"
+                )
+            })?;
+        self.execute_routine(slot, routine, arguments, arena)
     }
 
     fn routine_result_oid(&self, name: &str, argument_type_oids: &[i32]) -> Option<i32> {
@@ -1805,9 +1864,12 @@ type AggregateHookData<'a> = (&'a [*const Expr<'a>], &'a [Datum<'a>]);
 /// single virtual row (zero rows when WHERE is false). Returns the aggregate
 /// hook data for evaluating the select items, or None when the query yields
 /// no output row at all (WHERE false under GROUP BY, or HAVING false).
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     statement: &'a Select<'a>,
     agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &R,
@@ -1824,7 +1886,7 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     }
     let mut states = [AggState::default(); MAX_AGGS];
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node)?;
+        states[i].init(node, storage, txid, &super::exec::NoCols, arena)?;
     }
     if pass {
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
@@ -2062,6 +2124,8 @@ fn resolve_group_ordinals<'a>(
     statement: &'a Select<'a>,
     scope: Option<&QueryScope<'a>>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<&'a Select<'a>, SqlError> {
     // An aggregate cannot be a grouping key, however it got there — written
     // directly, nested in an expression, or named by a position. Checked after
@@ -2071,7 +2135,7 @@ fn resolve_group_ordinals<'a>(
             let mut nodes: [(*const Expr, &Expr); MAX_AGGS] =
                 [(core::ptr::null(), &Expr::Null); MAX_AGGS];
             let mut n = 0;
-            collect_aggs(key, &mut nodes, &mut n)?;
+            collect_aggs(key, &mut nodes, &mut n, storage, txid)?;
             if n > 0 {
                 return Err(sql_err!(
                     sqlstate::GROUPING_ERROR,
@@ -2535,8 +2599,16 @@ pub(super) fn collect_aggs<'a>(
     expression: &'a Expr<'a>,
     out: &mut [(*const Expr<'a>, &'a Expr<'a>); MAX_AGGS],
     n: &mut usize,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
-    if expression.is_aggregate_use() {
+    let catalog_aggregate = matches!(
+        expression,
+        Expr::Call { name, args, over: None, order_by, .. }
+            if storage.has_aggregate_candidate(name, args.len(), txid)
+                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
+    );
+    if expression.is_aggregate_use() || catalog_aggregate {
         if out[..*n].iter().any(|(p, _)| core::ptr::eq(*p, expression)) {
             return Ok(());
         }
@@ -2550,7 +2622,9 @@ pub(super) fn collect_aggs<'a>(
         *n += 1;
         return Ok(()); // aggregate arguments evaluate per input row
     }
-    walk_children(expression, &mut |child| collect_aggs(child, out, n))
+    walk_children(expression, &mut |child| {
+        collect_aggs(child, out, n, storage, txid)
+    })
 }
 
 /// Collects window-function call nodes (a `Call` with an `OVER` clause).
@@ -2558,6 +2632,8 @@ pub(super) fn collect_windows<'a>(
     expression: &'a Expr<'a>,
     out: &mut [&'a Expr<'a>; MAX_WINDOWS],
     n: &mut usize,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
     if let Expr::Call {
         over: Some(_),
@@ -2582,7 +2658,13 @@ pub(super) fn collect_windows<'a>(
                 "aggregate ORDER BY is not implemented for window functions"
             ));
         }
-        if filter.is_some() && !expression.is_aggregate() {
+        let catalog_aggregate = matches!(
+            expression,
+            Expr::Call { name, args, order_by, .. }
+                if storage.has_aggregate_candidate(name, args.len(), txid)
+                    || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
+        );
+        if filter.is_some() && !expression.is_aggregate() && !catalog_aggregate {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "FILTER is not implemented for non-aggregate window functions"
@@ -2604,7 +2686,9 @@ pub(super) fn collect_windows<'a>(
         // found by the analysis pass, not here.
         return Ok(());
     }
-    walk_children(expression, &mut |child| collect_windows(child, out, n))
+    walk_children(expression, &mut |child| {
+        collect_windows(child, out, n, storage, txid)
+    })
 }
 
 /// Builds a `JoinRow` view over one flat materialized row (all scope columns
@@ -2633,6 +2717,8 @@ fn collect_grouped_aggs<'a>(
     e: &'a Expr<'a>,
     out: &mut [(*const Expr<'a>, &'a Expr<'a>); MAX_AGGS],
     n: &mut usize,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
     if let Expr::Call {
         over: Some(spec),
@@ -2642,28 +2728,34 @@ fn collect_grouped_aggs<'a>(
     } = e
     {
         for a in *args {
-            collect_grouped_aggs(a, out, n)?;
+            collect_grouped_aggs(a, out, n, storage, txid)?;
         }
         for pk in spec.partition_by {
-            collect_grouped_aggs(pk, out, n)?;
+            collect_grouped_aggs(pk, out, n, storage, txid)?;
         }
         for o in spec.order_by {
-            collect_grouped_aggs(o.expression, out, n)?;
+            collect_grouped_aggs(o.expression, out, n, storage, txid)?;
         }
         if let Some(frame) = &spec.frame {
             for bound in [&frame.start, &frame.end] {
                 if let FrameBound::Preceding(x) | FrameBound::Following(x) = bound {
-                    collect_grouped_aggs(x, out, n)?;
+                    collect_grouped_aggs(x, out, n, storage, txid)?;
                 }
             }
         }
         if let Some(f) = filter {
-            collect_grouped_aggs(f, out, n)?;
+            collect_grouped_aggs(f, out, n, storage, txid)?;
         }
         return Ok(());
     }
-    if e.is_aggregate() {
-        return collect_aggs(e, out, n);
+    let catalog_aggregate = matches!(
+        e,
+        Expr::Call { name, args, order_by, .. }
+            if storage.has_aggregate_candidate(name, args.len(), txid)
+                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
+    );
+    if e.is_aggregate() || catalog_aggregate {
+        return collect_aggs(e, out, n, storage, txid);
     }
     // GROUPING() reads the current grouping-set mask, so it must evaluate in
     // the inner grouped select, like an aggregate.
@@ -2686,7 +2778,9 @@ fn collect_grouped_aggs<'a>(
         *n += 1;
         return Ok(());
     }
-    walk_children(e, &mut |child| collect_grouped_aggs(child, out, n))
+    walk_children(e, &mut |child| {
+        collect_grouped_aggs(child, out, n, storage, txid)
+    })
 }
 
 /// Context for [`rewrite_grouped_expr`]: the inner derived table's exposed
@@ -3203,12 +3297,18 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         let mut n_grouped_aggs = 0;
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item {
-                if let Err(e) = collect_windows(expression, &mut win_probe, &mut n_win_probe) {
+                if let Err(e) =
+                    collect_windows(expression, &mut win_probe, &mut n_win_probe, storage, txid)
+                {
                     return sql_fail(e);
                 }
-                if let Err(e) =
-                    collect_grouped_aggs(expression, &mut grouped_aggs, &mut n_grouped_aggs)
-                {
+                if let Err(e) = collect_grouped_aggs(
+                    expression,
+                    &mut grouped_aggs,
+                    &mut n_grouped_aggs,
+                    storage,
+                    txid,
+                ) {
                     return sql_fail(e);
                 }
             }
@@ -3258,7 +3358,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     }
     // A GROUP BY position names a select-list column; resolve it before
     // anything reads the grouping keys.
-    let statement = match resolve_group_ordinals(statement, Some(&scope), arena) {
+    let statement = match resolve_group_ordinals(statement, Some(&scope), arena, storage, txid) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -3431,13 +3531,13 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     let mut n_win = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item
-            && let Err(e) = collect_windows(expression, &mut win_nodes, &mut n_win)
+            && let Err(e) = collect_windows(expression, &mut win_nodes, &mut n_win, storage, txid)
         {
             return sql_fail(e);
         }
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_windows(ob.expression, &mut win_nodes, &mut n_win) {
+        if let Err(e) = collect_windows(ob.expression, &mut win_nodes, &mut n_win, storage, txid) {
             return sql_fail(e);
         }
     }
@@ -3466,18 +3566,18 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     let mut n_aggs = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item
-            && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs)
+            && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)
         {
             return sql_fail(e);
         }
     }
     if let Some(h) = statement.having
-        && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs)
+        && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs, storage, txid)
     {
         return sql_fail(e);
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs) {
+        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs, storage, txid) {
             return sql_fail(e);
         }
     }
@@ -3774,7 +3874,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut n_win = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item
-            && let Err(e) = collect_windows(expression, &mut win_probe, &mut n_win)
+            && let Err(e) = collect_windows(expression, &mut win_probe, &mut n_win, storage, txid)
         {
             return sql_fail(e);
         }
@@ -3797,7 +3897,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     }
     // A GROUP BY position names a select-list column here too — a FROM-less
     // select has no scope, but its positions resolve against the items alone.
-    let statement = match resolve_group_ordinals(statement, None, arena) {
+    let statement = match resolve_group_ordinals(statement, None, arena, storage, txid) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -3872,18 +3972,18 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut n_aggs = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item
-            && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs)
+            && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)
         {
             return sql_fail(e);
         }
     }
     if let Some(h) = statement.having
-        && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs)
+        && let Err(e) = collect_aggs(h, &mut agg_nodes, &mut n_aggs, storage, txid)
     {
         return sql_fail(e);
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs) {
+        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs, storage, txid) {
             return sql_fail(e);
         }
     }
@@ -3912,6 +4012,8 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         let hook_data = match fromless_aggregate_hooks(
             statement,
             &agg_nodes[..n_aggs],
+            storage,
+            txid,
             arena,
             params,
             &super::eval::NoColumns,
@@ -4365,14 +4467,14 @@ fn select_into_rows_mode<'a>(
     let mut n_aggs = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            collect_aggs(expression, &mut agg_nodes, &mut n_aggs)?;
+            collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         }
     }
     if let Some(h) = statement.having {
-        collect_aggs(h, &mut agg_nodes, &mut n_aggs)?;
+        collect_aggs(h, &mut agg_nodes, &mut n_aggs, storage, txid)?;
     }
     for ob in statement.order_by {
-        collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs)?;
+        collect_aggs(ob.expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
     }
     // GROUP BY or aggregates: run the grouped executor (which sorts by any
     // ORDER BY and dedups DISTINCT) and emit each output row, honoring
@@ -4427,6 +4529,8 @@ fn select_into_rows_mode<'a>(
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 &agg_nodes[..n_aggs],
+                storage,
+                txid,
                 arena,
                 params,
                 &super::eval::NoColumns,
@@ -4482,7 +4586,7 @@ fn select_into_rows_mode<'a>(
             return Ok(());
         };
         let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
-        let statement = resolve_group_ordinals(statement, Some(&scope), arena)?;
+        let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
         sub_exprs[0] = statement.where_clause;
@@ -4545,7 +4649,7 @@ fn select_into_rows_mode<'a>(
         let mut n_win = 0;
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_windows(expression, &mut win_probe, &mut n_win)?;
+                collect_windows(expression, &mut win_probe, &mut n_win, storage, txid)?;
             }
         }
         if n_win > 0 {
@@ -4669,11 +4773,11 @@ fn select_into_rows_mode<'a>(
     let mut n_win = 0;
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            collect_windows(expression, &mut win_nodes, &mut n_win)?;
+            collect_windows(expression, &mut win_nodes, &mut n_win, storage, txid)?;
         }
     }
     for ob in statement.order_by {
-        collect_windows(ob.expression, &mut win_nodes, &mut n_win)?;
+        collect_windows(ob.expression, &mut win_nodes, &mut n_win, storage, txid)?;
     }
     if n_win > 0 {
         // Windows over a grouped query: rewrite to the two-level form.
@@ -4682,7 +4786,13 @@ fn select_into_rows_mode<'a>(
         let mut n_grouped_aggs = 0;
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_grouped_aggs(expression, &mut grouped_aggs, &mut n_grouped_aggs)?;
+                collect_grouped_aggs(
+                    expression,
+                    &mut grouped_aggs,
+                    &mut n_grouped_aggs,
+                    storage,
+                    txid,
+                )?;
             }
         }
         if !statement.group_by.is_empty() || statement.having.is_some() || n_grouped_aggs > 0 {
@@ -6278,14 +6388,24 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     }
 
     fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<super::exec::StaticTypeMeta> {
-        let routine = self
+        let result = self
             .storage
-            .function_for_call_oids(name, arguments, self.txid)?;
-        let ctype = routine.kind.function_result()?;
+            .function_for_call_oids(name, arguments, self.txid)
+            .and_then(|routine| match routine.kind {
+                crate::storage::RoutineKind::Function { result }
+                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
+                _ => None,
+            })
+            .or_else(|| {
+                self.storage
+                    .aggregate_for_call_oids(name, arguments, self.txid)
+                    .map(|(_, _, aggregate)| aggregate.result_type)
+            })?;
+        let ctype = result.ctype;
         Some(super::exec::StaticTypeMeta {
             type_oid: self
                 .storage
-                .routine_function_result_oid(&routine, self.txid)?,
+                .routine_type_oid(result.ctype, result.user_type, self.txid)?,
             ctype,
             type_mod: -1,
             collation: if ctype.is_collatable() {

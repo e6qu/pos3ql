@@ -2107,6 +2107,8 @@ impl Conn {
         {
             return Step::Close;
         }
+        let _parameter_types =
+            crate::sql::exec::enter_bound_parameter_types(&param_oids[..n_params as usize]);
         match engine.describe(text, &self.arena, &self.txn, &mut responder) {
             Ok(true) => Step::Continue,
             Ok(false) => {

@@ -2147,6 +2147,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropComposite { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateRoutine(def) => {
             8 + 2
+                + 3
                 + 1
                 + def.name.as_str().len()
                 + 1
@@ -2175,10 +2176,20 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                             1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
                         })
                     }
+                    crate::storage::RoutineKind::Aggregate(aggregate) => {
+                        aggregate.result_type.user_type.map_or(0, |identity| {
+                            1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
+                        })
+                    }
                     _ => 0,
                 }
                 + 2
-                + def.body.as_str().len()
+                + match def.kind {
+                    crate::storage::RoutineKind::Aggregate(aggregate) => {
+                        aggregate.encode_wire().as_str().len()
+                    }
+                    _ => def.body.as_str().len(),
+                }
                 + 1
                 + match def.kind {
                     crate::storage::RoutineKind::TableFunction => {
@@ -2199,7 +2210,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     crate::storage::RoutineKind::Function { .. }
                     | crate::storage::RoutineKind::SetFunction { .. }
                     | crate::storage::RoutineKind::Trigger
-                    | crate::storage::RoutineKind::Procedure => 0,
+                    | crate::storage::RoutineKind::Procedure
+                    | crate::storage::RoutineKind::Aggregate(_) => 0,
                 }
         }
         WalOp::DropRoutine {
@@ -3265,6 +3277,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let result = match def.kind {
                 crate::storage::RoutineKind::Function { result }
                 | crate::storage::RoutineKind::SetFunction { result } => result,
+                crate::storage::RoutineKind::Aggregate(aggregate) => aggregate.result_type,
                 _ => crate::storage::RoutineResult::TEXT,
             };
             ok &= buffer.append(&[result.ctype.code()]);
@@ -3276,8 +3289,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
                 None => ok &= buffer.append(&[0]),
             }
-            ok &= buffer.append(&(def.body.as_str().len() as u16).to_le_bytes())
-                && buffer.append(def.body.as_str().as_bytes());
+            let aggregate_body = match def.kind {
+                crate::storage::RoutineKind::Aggregate(aggregate) => Some(aggregate.encode_wire()),
+                _ => None,
+            };
+            let body = aggregate_body
+                .as_ref()
+                .map_or(def.body.as_str(), crate::util::StackStr::as_str);
+            ok &=
+                buffer.append(&(body.len() as u16).to_le_bytes()) && buffer.append(body.as_bytes());
+            ok &= buffer.append(&[
+                u8::from(def.attributes.strict),
+                def.attributes.volatility.code(),
+                def.attributes.parallel.code(),
+            ]);
             ok &= buffer.append(&[def.kind.wire_code()]);
             if matches!(def.kind, crate::storage::RoutineKind::TableFunction) {
                 ok &= def.result_column_count <= u8::MAX as usize
@@ -5587,6 +5612,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             let body = core::str::from_utf8(payload.get(at..at + body_len)?).ok()?;
             at += body_len;
+            let attributes = crate::storage::RoutineAttributes {
+                strict: match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                volatility: crate::storage::RoutineVolatility::from_code(*payload.get(at + 1)?)?,
+                parallel: crate::storage::RoutineParallel::from_code(*payload.get(at + 2)?)?,
+            };
+            at += 3;
             let mut result_columns =
                 [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut result_column_count = 0;
@@ -5623,6 +5658,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     };
                 }
                 crate::storage::RoutineKind::TableFunction
+            } else if code == 5 {
+                crate::storage::RoutineKind::Aggregate(
+                    crate::storage::AggregateRoutine::decode_wire(body)?,
+                )
             } else {
                 crate::storage::RoutineKind::from_wire_code(code, result)?
             };
@@ -5637,6 +5676,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 kind,
                 result_columns,
                 result_column_count,
+                attributes,
                 body: crate::util::StackStr::from_str(body),
                 ownership: crate::storage::Ownership {
                     owner,

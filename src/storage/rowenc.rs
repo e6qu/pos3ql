@@ -342,6 +342,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
         ColType::Void
+        | ColType::Internal
         | ColType::Int2Vector
         | ColType::OidVector
         | ColType::PgNodeTree
@@ -393,7 +394,7 @@ pub(crate) fn decode<'a>(
         // int2/float4/varchar/bpchar share the byte layout of their storage
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
-            ColType::Void => return Err(corrupt()),
+            ColType::Void | ColType::Internal => return Err(corrupt()),
             ColType::Int2Vector => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

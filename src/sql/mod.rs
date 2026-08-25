@@ -361,10 +361,13 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
         | Stmt::CreateRoutine(_)
+        | Stmt::CreateAggregate(_)
         | Stmt::AlterRoutine { .. }
+        | Stmt::AlterAggregate { .. }
         | Stmt::DropFunction { .. }
         | Stmt::DropProcedure { .. }
         | Stmt::DropRoutine { .. }
+        | Stmt::DropAggregate { .. }
         | Stmt::DropView { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
@@ -6950,6 +6953,14 @@ impl Engine {
                 arena,
                 responder,
             ),
+            Stmt::CreateAggregate(aggregate) => exec::create_aggregate(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                aggregate,
+                arena,
+                responder,
+            ),
             Stmt::Call { name, arguments } => self.execute_call(
                 *name, arguments, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
@@ -6966,6 +6977,14 @@ impl Engine {
                 *action,
                 responder,
             ),
+            Stmt::AlterAggregate { aggregate, action } => exec::alter_aggregate(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                aggregate,
+                *action,
+                responder,
+            ),
             Stmt::DropFunction {
                 functions,
                 if_exists,
@@ -6975,7 +6994,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::DropRoutineCommand {
-                    routines: functions,
+                    targets: exec::DropRoutineTargets::Routines(functions),
                     if_exists: *if_exists,
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Function,
@@ -6991,7 +7010,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::DropRoutineCommand {
-                    routines: procedures,
+                    targets: exec::DropRoutineTargets::Routines(procedures),
                     if_exists: *if_exists,
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Procedure,
@@ -7007,11 +7026,24 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::DropRoutineCommand {
-                    routines,
+                    targets: exec::DropRoutineTargets::Routines(routines),
                     if_exists: *if_exists,
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Either,
                 },
+                responder,
+            ),
+            Stmt::DropAggregate {
+                aggregates,
+                if_exists,
+                cascade,
+            } => exec::drop_aggregate(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                aggregates,
+                *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::DropView {

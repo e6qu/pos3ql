@@ -3493,6 +3493,7 @@ pub(crate) const MAX_DOMAINS: usize = 32;
 /// identity and body.
 pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 16;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
+pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
 pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 
@@ -3531,6 +3532,262 @@ pub(crate) struct RoutineArgumentDef {
     pub user_type: Option<UserTypeName>,
 }
 
+/// PostgreSQL polymorphic pseudo-types are durable routine contracts, not
+/// executor value types. They use the ordinary routine type-name field so WAL
+/// and checkpoints retain the declaration while runtime call binding produces
+/// a concrete [`RoutineResult`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolymorphicType {
+    Element,
+    Array,
+    NonArray,
+    Enum,
+    Range,
+    Multirange,
+    Compatible,
+    CompatibleArray,
+    CompatibleNonArray,
+    CompatibleRange,
+    CompatibleMultirange,
+}
+
+impl PolymorphicType {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Element => "anyelement",
+            Self::Array => "anyarray",
+            Self::NonArray => "anynonarray",
+            Self::Enum => "anyenum",
+            Self::Range => "anyrange",
+            Self::Multirange => "anymultirange",
+            Self::Compatible => "anycompatible",
+            Self::CompatibleArray => "anycompatiblearray",
+            Self::CompatibleNonArray => "anycompatiblenonarray",
+            Self::CompatibleRange => "anycompatiblerange",
+            Self::CompatibleMultirange => "anycompatiblemultirange",
+        }
+    }
+
+    pub(crate) const fn oid(self) -> i32 {
+        use crate::sql::types::oid;
+        match self {
+            Self::Element => oid::ANYELEMENT,
+            Self::Array => oid::ANYARRAY,
+            Self::NonArray => oid::ANYNONARRAY,
+            Self::Enum => oid::ANYENUM,
+            Self::Range => oid::ANYRANGE,
+            Self::Multirange => oid::ANYMULTIRANGE,
+            Self::Compatible => oid::ANYCOMPATIBLE,
+            Self::CompatibleArray => oid::ANYCOMPATIBLEARRAY,
+            Self::CompatibleNonArray => oid::ANYCOMPATIBLENONARRAY,
+            Self::CompatibleRange => oid::ANYCOMPATIBLERANGE,
+            Self::CompatibleMultirange => oid::ANYCOMPATIBLEMULTIRANGE,
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "anyelement" => Self::Element,
+            "anyarray" => Self::Array,
+            "anynonarray" => Self::NonArray,
+            "anyenum" => Self::Enum,
+            "anyrange" => Self::Range,
+            "anymultirange" => Self::Multirange,
+            "anycompatible" => Self::Compatible,
+            "anycompatiblearray" => Self::CompatibleArray,
+            "anycompatiblenonarray" => Self::CompatibleNonArray,
+            "anycompatiblerange" => Self::CompatibleRange,
+            "anycompatiblemultirange" => Self::CompatibleMultirange,
+            _ => return None,
+        })
+    }
+
+    pub(crate) const fn compatible_family(self) -> bool {
+        matches!(
+            self,
+            Self::Compatible
+                | Self::CompatibleArray
+                | Self::CompatibleNonArray
+                | Self::CompatibleRange
+                | Self::CompatibleMultirange
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PolymorphicBinding {
+    simple: Option<i32>,
+    compatible: Option<i32>,
+}
+
+impl PolymorphicBinding {
+    const EMPTY: Self = Self {
+        simple: None,
+        compatible: None,
+    };
+
+    fn bind(&mut self, kind: PolymorphicType, actual_oid: i32) -> Option<()> {
+        let key = polymorphic_element_oid(kind, actual_oid)?;
+        let compatible = matches!(
+            kind,
+            PolymorphicType::Compatible
+                | PolymorphicType::CompatibleArray
+                | PolymorphicType::CompatibleNonArray
+                | PolymorphicType::CompatibleRange
+                | PolymorphicType::CompatibleMultirange
+        );
+        let target = if compatible {
+            &mut self.compatible
+        } else {
+            &mut self.simple
+        };
+        *target = Some(match *target {
+            None => key,
+            Some(bound) if bound == key => bound,
+            Some(bound) if compatible => compatible_type_oid(bound, key)?,
+            Some(_) => return None,
+        });
+        Some(())
+    }
+
+    fn concrete_oid(self, kind: PolymorphicType) -> Option<i32> {
+        let key = if matches!(
+            kind,
+            PolymorphicType::Compatible
+                | PolymorphicType::CompatibleArray
+                | PolymorphicType::CompatibleNonArray
+                | PolymorphicType::CompatibleRange
+                | PolymorphicType::CompatibleMultirange
+        ) {
+            self.compatible?
+        } else {
+            self.simple?
+        };
+        Some(match kind {
+            PolymorphicType::Element
+            | PolymorphicType::NonArray
+            | PolymorphicType::Enum
+            | PolymorphicType::Compatible
+            | PolymorphicType::CompatibleNonArray => key,
+            PolymorphicType::Array | PolymorphicType::CompatibleArray => {
+                array_oid_for_element(key)?
+            }
+            PolymorphicType::Range | PolymorphicType::CompatibleRange => {
+                range_oid_for_element(key)?.0
+            }
+            PolymorphicType::Multirange | PolymorphicType::CompatibleMultirange => {
+                range_oid_for_element(key)?.1
+            }
+        })
+    }
+}
+
+fn compatible_type_oid(left: i32, right: i32) -> Option<i32> {
+    let left = ColType::from_oid(left)?;
+    let right = ColType::from_oid(right)?;
+    let rank = |value: ColType| match value {
+        ColType::Int2 => 1,
+        ColType::Int4 => 2,
+        ColType::Int8 => 3,
+        ColType::Numeric => 4,
+        ColType::Float4 => 5,
+        ColType::Float8 => 6,
+        _ => 0,
+    };
+    let (left_rank, right_rank) = (rank(left), rank(right));
+    (left_rank > 0 && right_rank > 0).then(|| {
+        if left_rank >= right_rank {
+            left.oid()
+        } else {
+            right.oid()
+        }
+    })
+}
+
+fn array_oid_for_element(element_oid: i32) -> Option<i32> {
+    use crate::sql::types::{ArrElem, oid};
+    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&element_oid) {
+        return Some(oid::FIRST_DOMAIN_ARRAY + element_oid - oid::FIRST_DOMAIN);
+    }
+    if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUMS as i32).contains(&element_oid) {
+        return Some(oid::FIRST_ENUM_ARRAY + element_oid - oid::FIRST_ENUM);
+    }
+    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITES as i32).contains(&element_oid) {
+        return Some(oid::FIRST_COMPOSITE_ARRAY + element_oid - oid::FIRST_COMPOSITE);
+    }
+    ArrElem::from_coltype(ColType::from_oid(element_oid)?).map(ArrElem::array_oid)
+}
+
+fn range_oid_for_element(element_oid: i32) -> Option<(i32, i32)> {
+    use crate::sql::types::RangeKind;
+    [
+        RangeKind::Int4,
+        RangeKind::Int8,
+        RangeKind::Num,
+        RangeKind::Date,
+        RangeKind::Ts,
+        RangeKind::Tstz,
+    ]
+    .into_iter()
+    .find(|kind| kind.elem_type().oid() == element_oid)
+    .map(|kind| (kind.oid(), kind.multirange_oid()))
+}
+
+fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32> {
+    use crate::sql::types::{ColType, oid};
+    let actual = ColType::from_oid(actual_oid);
+    match kind {
+        PolymorphicType::Element | PolymorphicType::Compatible => (!matches!(
+            actual,
+            Some(ColType::Void | ColType::Internal | ColType::Record)
+        ) && actual_oid != oid::UNKNOWN)
+            .then_some(actual_oid),
+        PolymorphicType::NonArray | PolymorphicType::CompatibleNonArray => {
+            (!matches!(actual, Some(ColType::Array(_)))
+                && !matches!(
+                    actual,
+                    Some(ColType::Void | ColType::Internal | ColType::Record)
+                )
+                && actual_oid != oid::UNKNOWN)
+                .then_some(actual_oid)
+        }
+        PolymorphicType::Array | PolymorphicType::CompatibleArray => {
+            if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAINS as i32)
+                .contains(&actual_oid)
+            {
+                Some(oid::FIRST_DOMAIN + actual_oid - oid::FIRST_DOMAIN_ARRAY)
+            } else {
+                match actual? {
+                    ColType::Array(element) => Some(element.element_oid()),
+                    _ => None,
+                }
+            }
+        }
+        PolymorphicType::Enum => matches!(actual, Some(ColType::Enum(_))).then_some(actual_oid),
+        PolymorphicType::Range | PolymorphicType::CompatibleRange => match actual? {
+            ColType::Range(kind) => Some(kind.elem_type().oid()),
+            _ => None,
+        },
+        PolymorphicType::Multirange | PolymorphicType::CompatibleMultirange => match actual? {
+            ColType::Multirange(kind) => Some(kind.elem_type().oid()),
+            _ => None,
+        },
+    }
+}
+
+fn polymorphic_type(ctype: ColType, user_type: Option<UserTypeName>) -> Option<PolymorphicType> {
+    let _ = ctype;
+    user_type
+        .filter(|identity| identity.schema.as_str() == "pg_catalog")
+        .and_then(|identity| PolymorphicType::from_name(identity.name.as_str()))
+}
+
+impl RoutineArgumentDef {
+    pub(crate) fn polymorphic_type(self) -> Option<PolymorphicType> {
+        polymorphic_type(self.ctype, self.user_type)
+    }
+}
+
 /// A scalar routine result keeps its executor representation and its durable
 /// catalog identity together.  A bare `ColType::Enum(slot)` cannot survive a
 /// catalog rebuild because slots are allocation details, not identities.
@@ -3552,6 +3809,10 @@ impl RoutineResult {
             user_type: None,
         }
     }
+
+    pub(crate) fn polymorphic_type(self) -> Option<PolymorphicType> {
+        polymorphic_type(self.ctype, self.user_type)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3564,6 +3825,7 @@ pub(crate) struct RoutineSpec {
     pub kind: RoutineKind,
     pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub result_column_count: usize,
+    pub attributes: RoutineAttributes,
     pub body: StackStr<ROUTINE_SQL_MAX>,
 }
 
@@ -3571,12 +3833,484 @@ pub(crate) struct RoutineSpec {
 /// function variant makes a procedure with a fabricated scalar result
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "aggregate contracts stay inline and Copy; catalog heap indirection is forbidden"
+)]
 pub(crate) enum RoutineKind {
     Function { result: RoutineResult },
     SetFunction { result: RoutineResult },
     TableFunction,
     Trigger,
     Procedure,
+    Aggregate(AggregateRoutine),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateKind {
+    Normal,
+    OrderedSet,
+    HypotheticalSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateFinalModify {
+    ReadOnly,
+    Shareable,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineParallel {
+    Safe,
+    Restricted,
+    Unsafe,
+}
+
+impl RoutineParallel {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Safe => 0,
+            Self::Restricted => 1,
+            Self::Unsafe => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Safe),
+            1 => Some(Self::Restricted),
+            2 => Some(Self::Unsafe),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineVolatility {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+impl RoutineVolatility {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Immutable => 0,
+            Self::Stable => 1,
+            Self::Volatile => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Immutable),
+            1 => Some(Self::Stable),
+            2 => Some(Self::Volatile),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoutineAttributes {
+    pub strict: bool,
+    pub volatility: RoutineVolatility,
+    pub parallel: RoutineParallel,
+}
+
+impl RoutineAttributes {
+    pub(crate) const DEFAULT: Self = Self {
+        strict: false,
+        volatility: RoutineVolatility::Volatile,
+        parallel: RoutineParallel::Unsafe,
+    };
+
+    pub(crate) const AGGREGATE: Self = Self::DEFAULT;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateFinalRoutine {
+    pub function_oid: i32,
+    pub extra: bool,
+    pub modify: AggregateFinalModify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateSerde {
+    pub serialize_oid: i32,
+    pub deserialize_oid: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregatePartialRoutine {
+    pub combine_oid: i32,
+    pub combine_strict: bool,
+    pub serde: Option<AggregateSerde>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateMovingRoutine {
+    pub transition_oid: i32,
+    pub inverse_oid: i32,
+    pub state_type: RoutineResult,
+    pub state_space: Option<u32>,
+    pub final_function: Option<AggregateFinalRoutine>,
+    pub initial_condition: Option<StackStr<AGGREGATE_INIT_MAX>>,
+}
+
+/// A catalog aggregate is a distinct routine kind. Every support function is
+/// held by stable object identifier, so rename and schema moves cannot leave a
+/// stale textual reference and DROP can enforce dependencies at one boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateRoutine {
+    pub kind: AggregateKind,
+    pub direct_argument_count: u8,
+    pub variadic_argument: Option<u8>,
+    pub state_type: RoutineResult,
+    pub state_space: Option<u32>,
+    pub result_type: RoutineResult,
+    pub transition_oid: i32,
+    pub final_function: Option<AggregateFinalRoutine>,
+    pub partial: Option<AggregatePartialRoutine>,
+    pub moving: Option<AggregateMovingRoutine>,
+    pub initial_condition: Option<StackStr<AGGREGATE_INIT_MAX>>,
+    pub sort_operator_oid: Option<i32>,
+    pub parallel: RoutineParallel,
+}
+
+impl AggregateRoutine {
+    pub(crate) fn uses_function_oid(self, oid: i32) -> bool {
+        self.transition_oid == oid
+            || self
+                .final_function
+                .is_some_and(|function| function.function_oid == oid)
+            || self.partial.is_some_and(|partial| {
+                partial.combine_oid == oid
+                    || partial.serde.is_some_and(|serde| {
+                        serde.serialize_oid == oid || serde.deserialize_oid == oid
+                    })
+            })
+            || self.moving.is_some_and(|moving| {
+                moving.transition_oid == oid
+                    || moving.inverse_oid == oid
+                    || moving
+                        .final_function
+                        .is_some_and(|function| function.function_oid == oid)
+            })
+    }
+
+    pub(crate) fn encode_wire(self) -> StackStr<ROUTINE_SQL_MAX> {
+        use core::fmt::Write;
+        fn write_type(
+            out: &mut StackStr<ROUTINE_SQL_MAX>,
+            value: RoutineResult,
+        ) -> core::fmt::Result {
+            fn hex(out: &mut StackStr<ROUTINE_SQL_MAX>, value: &str) -> core::fmt::Result {
+                if value.is_empty() {
+                    return out.write_str("-");
+                }
+                for byte in value.as_bytes() {
+                    write!(out, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+            write!(out, "{} ", value.ctype.code())?;
+            if let Some(identity) = value.user_type {
+                hex(out, identity.schema.as_str())?;
+                out.write_str(" ")?;
+                hex(out, identity.name.as_str())
+            } else {
+                out.write_str("- -")
+            }
+        }
+        fn hex(out: &mut StackStr<ROUTINE_SQL_MAX>, value: Option<&str>) -> core::fmt::Result {
+            let Some(value) = value else {
+                return out.write_str("-");
+            };
+            if value.is_empty() {
+                return out.write_str("00");
+            }
+            for byte in value.as_bytes() {
+                write!(out, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+        let mut out = StackStr::new();
+        let kind = match self.kind {
+            AggregateKind::Normal => 0,
+            AggregateKind::OrderedSet => 1,
+            AggregateKind::HypotheticalSet => 2,
+        };
+        let parallel = match self.parallel {
+            RoutineParallel::Safe => 0,
+            RoutineParallel::Restricted => 1,
+            RoutineParallel::Unsafe => 2,
+        };
+        let modify = |value: AggregateFinalModify| match value {
+            AggregateFinalModify::ReadOnly => 0,
+            AggregateFinalModify::Shareable => 1,
+            AggregateFinalModify::ReadWrite => 2,
+        };
+        let _ = write!(
+            out,
+            "{kind} {} {} ",
+            self.direct_argument_count,
+            self.variadic_argument.map_or(-1, i16::from)
+        );
+        let _ = write_type(&mut out, self.state_type);
+        let _ = write!(out, " {} ", self.state_space.map_or(-1, i64::from));
+        let _ = write_type(&mut out, self.result_type);
+        let _ = write!(out, " {} ", self.transition_oid);
+        if let Some(final_function) = self.final_function {
+            let _ = write!(
+                out,
+                "{} {} {} ",
+                final_function.function_oid,
+                u8::from(final_function.extra),
+                modify(final_function.modify)
+            );
+        } else {
+            let _ = out.write_str("-1 0 0 ");
+        }
+        if let Some(partial) = self.partial {
+            let _ = write!(
+                out,
+                "{} {} ",
+                partial.combine_oid,
+                u8::from(partial.combine_strict)
+            );
+            if let Some(serde) = partial.serde {
+                let _ = write!(out, "{} {} ", serde.serialize_oid, serde.deserialize_oid);
+            } else {
+                let _ = out.write_str("-1 -1 ");
+            }
+        } else {
+            let _ = out.write_str("-1 0 -1 -1 ");
+        }
+        if let Some(moving) = self.moving {
+            let _ = write!(out, "{} {} ", moving.transition_oid, moving.inverse_oid);
+            let _ = write_type(&mut out, moving.state_type);
+            let _ = write!(out, " {} ", moving.state_space.map_or(-1, i64::from));
+            if let Some(final_function) = moving.final_function {
+                let _ = write!(
+                    out,
+                    "{} {} {} ",
+                    final_function.function_oid,
+                    u8::from(final_function.extra),
+                    modify(final_function.modify)
+                );
+            } else {
+                let _ = out.write_str("-1 0 0 ");
+            }
+            let _ = hex(
+                &mut out,
+                moving.initial_condition.as_ref().map(StackStr::as_str),
+            );
+        } else {
+            let _ = out.write_str("-1 -1 5 - - -1 -1 0 0 -");
+        }
+        let _ = out.write_str(" ");
+        let _ = hex(
+            &mut out,
+            self.initial_condition.as_ref().map(StackStr::as_str),
+        );
+        let _ = write!(
+            out,
+            " {} {parallel}",
+            self.sort_operator_oid.map_or(-1, i32::from)
+        );
+        out
+    }
+
+    pub(crate) fn decode_wire(encoded: &str) -> Option<Self> {
+        fn decode_hex<const N: usize>(word: &str) -> Option<StackStr<N>> {
+            if word == "-" {
+                return None;
+            }
+            if word == "00" {
+                return Some(StackStr::new());
+            }
+            if !word.len().is_multiple_of(2) {
+                return None;
+            }
+            let bytes = word.as_bytes();
+            if bytes.len() / 2 > N {
+                return None;
+            }
+            let mut decoded = [0_u8; N];
+            let mut index = 0;
+            while index < bytes.len() {
+                let pair = core::str::from_utf8(&bytes[index..index + 2]).ok()?;
+                decoded[index / 2] = u8::from_str_radix(pair, 16).ok()?;
+                index += 2;
+            }
+            let text = core::str::from_utf8(&decoded[..bytes.len() / 2]).ok()?;
+            let mut out = StackStr::new();
+            core::fmt::Write::write_str(&mut out, text).ok()?;
+            (!out.is_truncated()).then_some(out)
+        }
+        fn word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+            words.next()
+        }
+        fn number<'a, T: core::str::FromStr>(
+            words: &mut impl Iterator<Item = &'a str>,
+        ) -> Option<T> {
+            word(words)?.parse().ok()
+        }
+        fn read_type<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<RoutineResult> {
+            let ctype = ColType::from_code(number(words)?)?;
+            let schema = word(words)?;
+            let name = word(words)?;
+            let user_type = if schema == "-" && name == "-" {
+                None
+            } else {
+                let schema = decode_hex::<63>(schema)?;
+                let name = decode_hex::<63>(name)?;
+                Some(UserTypeName {
+                    schema: SqlName::parse(schema.as_str()).ok()?,
+                    name: SqlName::parse(name.as_str()).ok()?,
+                })
+            };
+            Some(RoutineResult { ctype, user_type })
+        }
+        fn parse_final_function(
+            oid: i32,
+            extra: u8,
+            modify: u8,
+        ) -> Option<Option<AggregateFinalRoutine>> {
+            if oid == -1 {
+                return (extra == 0 && modify == 0).then_some(None);
+            }
+            Some(Some(AggregateFinalRoutine {
+                function_oid: oid,
+                extra: match extra {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                modify: match modify {
+                    0 => AggregateFinalModify::ReadOnly,
+                    1 => AggregateFinalModify::Shareable,
+                    2 => AggregateFinalModify::ReadWrite,
+                    _ => return None,
+                },
+            }))
+        }
+        let mut words = encoded.split_whitespace();
+        let kind = match number(&mut words)? {
+            0u8 => AggregateKind::Normal,
+            1 => AggregateKind::OrderedSet,
+            2 => AggregateKind::HypotheticalSet,
+            _ => return None,
+        };
+        let direct_argument_count = number(&mut words)?;
+        let variadic = number::<i16>(&mut words)?;
+        let variadic_argument = if variadic == -1 {
+            None
+        } else {
+            Some(u8::try_from(variadic).ok()?)
+        };
+        let state_type = read_type(&mut words)?;
+        let state_space = match number::<i64>(&mut words)? {
+            -1 => None,
+            value => Some(u32::try_from(value).ok()?),
+        };
+        let result_type = read_type(&mut words)?;
+        let transition_oid = number(&mut words)?;
+        let final_oid = number(&mut words)?;
+        let final_extra = number(&mut words)?;
+        let final_modify = number(&mut words)?;
+        let final_function = parse_final_function(final_oid, final_extra, final_modify)?;
+        let combine_oid = number::<i32>(&mut words)?;
+        let combine_strict = match number::<u8>(&mut words)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let serialize_oid = number::<i32>(&mut words)?;
+        let deserialize_oid = number::<i32>(&mut words)?;
+        let partial = if combine_oid == -1 {
+            if combine_strict || serialize_oid != -1 || deserialize_oid != -1 {
+                return None;
+            }
+            None
+        } else {
+            let serde = if serialize_oid == -1 && deserialize_oid == -1 {
+                None
+            } else if serialize_oid != -1 && deserialize_oid != -1 {
+                Some(AggregateSerde {
+                    serialize_oid,
+                    deserialize_oid,
+                })
+            } else {
+                return None;
+            };
+            Some(AggregatePartialRoutine {
+                combine_oid,
+                combine_strict,
+                serde,
+            })
+        };
+        let moving_transition = number::<i32>(&mut words)?;
+        let moving_inverse = number::<i32>(&mut words)?;
+        let moving_state_type = read_type(&mut words)?;
+        let moving_space = match number::<i64>(&mut words)? {
+            -1 => None,
+            value => Some(u32::try_from(value).ok()?),
+        };
+        let moving_final_oid = number(&mut words)?;
+        let moving_final_extra = number(&mut words)?;
+        let moving_final_modify = number(&mut words)?;
+        let moving_init_word = word(&mut words)?;
+        let moving = if moving_transition == -1 && moving_inverse == -1 {
+            None
+        } else if moving_transition != -1 && moving_inverse != -1 {
+            Some(AggregateMovingRoutine {
+                transition_oid: moving_transition,
+                inverse_oid: moving_inverse,
+                state_type: moving_state_type,
+                state_space: moving_space,
+                final_function: parse_final_function(
+                    moving_final_oid,
+                    moving_final_extra,
+                    moving_final_modify,
+                )?,
+                initial_condition: decode_hex(moving_init_word),
+            })
+        } else {
+            return None;
+        };
+        let initial_condition = decode_hex(word(&mut words)?);
+        let sort_operator_oid = match number::<i32>(&mut words)? {
+            -1 => None,
+            oid => Some(oid),
+        };
+        let parallel = match number(&mut words)? {
+            0u8 => RoutineParallel::Safe,
+            1 => RoutineParallel::Restricted,
+            2 => RoutineParallel::Unsafe,
+            _ => return None,
+        };
+        if words.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            kind,
+            direct_argument_count,
+            variadic_argument,
+            state_type,
+            state_space,
+            result_type,
+            transition_oid,
+            final_function,
+            partial,
+            moving,
+            initial_condition,
+            sort_operator_oid,
+            parallel,
+        })
+    }
 }
 
 impl RoutineKind {
@@ -3584,7 +4318,7 @@ impl RoutineKind {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),
             Self::TableFunction => Some(ColType::Record),
-            Self::Trigger | Self::Procedure => None,
+            Self::Trigger | Self::Procedure | Self::Aggregate(_) => None,
         }
     }
 
@@ -3599,6 +4333,7 @@ impl RoutineKind {
             | Self::TableFunction
             | Self::Trigger => "f",
             Self::Procedure => "p",
+            Self::Aggregate(_) => "a",
         }
     }
 
@@ -3609,6 +4344,7 @@ impl RoutineKind {
             Self::TableFunction => 3,
             Self::Procedure => 1,
             Self::Trigger => 4,
+            Self::Aggregate(_) => 5,
         }
     }
 
@@ -3629,6 +4365,7 @@ enum RoutineCallKind {
     Set,
     Trigger,
     Procedure,
+    Aggregate,
 }
 
 impl RoutineCallKind {
@@ -3638,6 +4375,7 @@ impl RoutineCallKind {
             Self::Set => kind.is_set_returning(),
             Self::Trigger => matches!(kind, RoutineKind::Trigger),
             Self::Procedure => matches!(kind, RoutineKind::Procedure),
+            Self::Aggregate => matches!(kind, RoutineKind::Aggregate(_)),
         }
     }
 }
@@ -3675,6 +4413,7 @@ pub(crate) struct RoutineDef {
     pub kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
+    pub attributes: RoutineAttributes,
     pub body: StackStr<ROUTINE_SQL_MAX>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -3691,6 +4430,7 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
+    pub(crate) attributes: RoutineAttributes,
     pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
 }
 
@@ -3708,6 +4448,7 @@ impl RoutineDef {
         },
         result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         result_column_count: 0,
+        attributes: RoutineAttributes::DEFAULT,
         body: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
@@ -3730,6 +4471,7 @@ impl RoutineDef {
                 kind: pending.kind,
                 result_columns: pending.result_columns,
                 result_column_count: pending.result_column_count,
+                attributes: pending.attributes,
                 body: pending.body,
                 pending_definition: None,
                 ..*self
@@ -15367,6 +16109,9 @@ impl Storage {
             ctype: ColType,
             identity: UserTypeName,
         ) -> Result<ColType, SqlError> {
+            if polymorphic_type(ctype, Some(identity)).is_some() {
+                return Ok(ctype);
+            }
             if let Some(slot) =
                 storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
             {
@@ -15431,6 +16176,18 @@ impl Storage {
                 RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
                     if let Some(identity) = result.user_type {
                         result.ctype = rebind(self, result.ctype, identity)?;
+                    }
+                }
+                RoutineKind::Aggregate(aggregate) => {
+                    for result in [&mut aggregate.state_type, &mut aggregate.result_type] {
+                        if let Some(identity) = result.user_type {
+                            result.ctype = rebind(self, result.ctype, identity)?;
+                        }
+                    }
+                    if let Some(moving) = &mut aggregate.moving
+                        && let Some(identity) = moving.state_type.user_type
+                    {
+                        moving.state_type.ctype = rebind(self, moving.state_type.ctype, identity)?;
                     }
                 }
                 RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {}
@@ -16469,6 +17226,13 @@ impl Storage {
                 RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
                     move_result(result)
                 }
+                RoutineKind::Aggregate(aggregate) => {
+                    move_result(&mut aggregate.state_type);
+                    move_result(&mut aggregate.result_type);
+                    if let Some(moving) = &mut aggregate.moving {
+                        move_result(&mut moving.state_type);
+                    }
+                }
                 _ => {}
             }
             if let Some(pending) = &mut routine.pending_definition {
@@ -16485,6 +17249,13 @@ impl Storage {
                 match &mut pending.kind {
                     RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
                         move_result(result)
+                    }
+                    RoutineKind::Aggregate(aggregate) => {
+                        move_result(&mut aggregate.state_type);
+                        move_result(&mut aggregate.result_type);
+                        if let Some(moving) = &mut aggregate.moving {
+                            move_result(&mut moving.state_type);
+                        }
                     }
                     _ => {}
                 }
@@ -16947,7 +17718,32 @@ impl Storage {
         txid: u32,
     ) -> Option<RoutineDef> {
         self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
-            .map(|slot| self.routine_for(slot, txid))
+            .and_then(|slot| self.routine_for_bound_call(slot, argument_type_oids, txid))
+    }
+
+    pub(crate) fn aggregate_for_call_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<(usize, RoutineDef, AggregateRoutine)> {
+        let slot = self.routine_slot_on_path_oids(
+            name,
+            argument_type_oids,
+            txid,
+            RoutineCallKind::Aggregate,
+        )?;
+        let routine = self.routine_for_bound_call(slot, argument_type_oids, txid)?;
+        let RoutineKind::Aggregate(aggregate) = routine.kind else {
+            unreachable!("aggregate call resolution returned a non-aggregate")
+        };
+        Some((slot, routine, aggregate))
+    }
+
+    pub(crate) fn has_aggregate_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind| {
+            matches!(kind, RoutineKind::Aggregate(_))
+        })
     }
 
     pub(crate) fn function_for_call_oids(
@@ -16960,7 +17756,68 @@ impl Storage {
             .or_else(|| {
                 self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
             })
-            .map(|slot| self.routine_for(slot, txid))
+            .and_then(|slot| self.routine_for_bound_call(slot, argument_type_oids, txid))
+    }
+
+    pub(crate) fn routine_for_bound_call(
+        &self,
+        slot: usize,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        let mut routine = self.routine_for(slot, txid);
+        if routine.argument_count == argument_type_oids.len()
+            && routine
+                .arguments()
+                .iter()
+                .zip(argument_type_oids)
+                .all(|(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid))
+        {
+            return Some(routine);
+        }
+        let binding =
+            self.polymorphic_call_binding(routine.arguments(), argument_type_oids, txid)?;
+        for argument in routine.arguments.iter_mut().take(routine.argument_count) {
+            let Some(kind) = argument.polymorphic_type() else {
+                continue;
+            };
+            let concrete = self.routine_result_for_oid(binding.concrete_oid(kind)?, txid)?;
+            argument.ctype = concrete.ctype;
+            argument.user_type = concrete.user_type;
+        }
+        for column in routine
+            .result_columns
+            .iter_mut()
+            .take(routine.result_column_count)
+        {
+            let Some(kind) = column.polymorphic_type() else {
+                continue;
+            };
+            let concrete = self.routine_result_for_oid(binding.concrete_oid(kind)?, txid)?;
+            column.ctype = concrete.ctype;
+            column.user_type = concrete.user_type;
+        }
+        let resolve = |result: &mut RoutineResult| -> Option<()> {
+            let Some(kind) = result.polymorphic_type() else {
+                return Some(());
+            };
+            *result = self.routine_result_for_oid(binding.concrete_oid(kind)?, txid)?;
+            Some(())
+        };
+        match &mut routine.kind {
+            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
+                resolve(result)?;
+            }
+            RoutineKind::Aggregate(aggregate) => {
+                resolve(&mut aggregate.state_type)?;
+                resolve(&mut aggregate.result_type)?;
+                if let Some(moving) = &mut aggregate.moving {
+                    resolve(&mut moving.state_type)?;
+                }
+            }
+            RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {}
+        }
+        Some(routine)
     }
 
     pub(crate) fn routine_slot_for_function_call_oids(
@@ -17045,7 +17902,10 @@ impl Storage {
     ) -> Option<i32> {
         let result = match routine.kind {
             RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
-            RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {
+            RoutineKind::TableFunction
+            | RoutineKind::Trigger
+            | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_) => {
                 return None;
             }
         };
@@ -17144,22 +18004,58 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routines.iter().position(|routine| {
-            let definition = routine.definition_for(txid);
-            routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.argument_count == argument_type_oids.len()
-                && definition
-                    .arguments()
-                    .iter()
-                    .zip(argument_type_oids)
-                    .all(|(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid))
+        let exact =
+            self.routines.iter().position(|routine| {
+                let definition = routine.definition_for(txid);
+                routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.argument_count == argument_type_oids.len()
+                    && definition.arguments().iter().zip(argument_type_oids).all(
+                        |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
+                    )
+            });
+        exact.or_else(|| {
+            self.routines.iter().position(|routine| {
+                let definition = routine.definition_for(txid);
+                routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.argument_count == argument_type_oids.len()
+                    && self
+                        .polymorphic_call_binding(definition.arguments(), argument_type_oids, txid)
+                        .is_some()
+            })
         })
     }
 
+    fn polymorphic_call_binding(
+        &self,
+        arguments: &[RoutineArgumentDef],
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<PolymorphicBinding> {
+        let mut binding = PolymorphicBinding::EMPTY;
+        let mut saw_polymorphic = false;
+        for (argument, actual_oid) in arguments.iter().zip(argument_type_oids) {
+            let Some(polymorphic) = argument.polymorphic_type() else {
+                if self.routine_argument_oid(argument, txid) != Some(*actual_oid) {
+                    return None;
+                }
+                continue;
+            };
+            saw_polymorphic = true;
+            binding.bind(polymorphic, *actual_oid)?;
+        }
+        saw_polymorphic.then_some(binding)
+    }
+
     fn routine_argument_oid(&self, argument: &RoutineArgumentDef, txid: u32) -> Option<i32> {
+        if let Some(polymorphic) = argument.polymorphic_type() {
+            return Some(polymorphic.oid());
+        }
         self.routine_type_oid(argument.ctype, argument.user_type, txid)
     }
 
@@ -17170,6 +18066,10 @@ impl Storage {
         txid: u32,
     ) -> Option<i32> {
         use crate::sql::types::{ArrElem, oid};
+
+        if let Some(polymorphic) = polymorphic_type(ctype, user_type) {
+            return Some(polymorphic.oid());
+        }
 
         match ctype {
             ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
@@ -17188,6 +18088,66 @@ impl Storage {
         };
         let array = matches!(ctype, ColType::Array(_));
         self.user_type_identity_oid(identity, array, txid)
+    }
+
+    pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
+        use crate::sql::types::{ArrElem, ColType, oid};
+
+        let identity = |schema: SqlName, name: SqlName| Some(UserTypeName { schema, name });
+        if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&type_oid) {
+            let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
+            let domain = self.domain_for(slot, txid);
+            return domain.visible_to(txid).then_some(RoutineResult {
+                ctype: domain.base,
+                user_type: identity(domain.schema, domain.name),
+            });
+        }
+        if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAINS as i32)
+            .contains(&type_oid)
+        {
+            let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN_ARRAY).ok()?;
+            let domain = self.domain_for(slot, txid);
+            return domain.visible_to(txid).then_some(RoutineResult {
+                ctype: ColType::Array(ArrElem::domain(slot as u16, domain.base)?),
+                user_type: identity(domain.schema, domain.name),
+            });
+        }
+        if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUMS as i32).contains(&type_oid) {
+            let slot = usize::try_from(type_oid - oid::FIRST_ENUM).ok()?;
+            let enumeration = self.enum_for(slot, txid);
+            return enumeration.visible_to(txid).then_some(RoutineResult {
+                ctype: ColType::Enum(slot as u16),
+                user_type: identity(enumeration.schema, enumeration.name),
+            });
+        }
+        if (oid::FIRST_ENUM_ARRAY..oid::FIRST_ENUM_ARRAY + MAX_ENUMS as i32).contains(&type_oid) {
+            let slot = usize::try_from(type_oid - oid::FIRST_ENUM_ARRAY).ok()?;
+            let enumeration = self.enum_for(slot, txid);
+            return enumeration.visible_to(txid).then_some(RoutineResult {
+                ctype: ColType::Array(ArrElem::Enum(slot as u16)),
+                user_type: identity(enumeration.schema, enumeration.name),
+            });
+        }
+        if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITES as i32).contains(&type_oid)
+        {
+            let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE).ok()?;
+            let composite = self.composite_for(slot, txid);
+            return composite.visible_to(txid).then_some(RoutineResult {
+                ctype: ColType::Composite(slot as u16),
+                user_type: identity(composite.schema, composite.name),
+            });
+        }
+        if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + MAX_COMPOSITES as i32)
+            .contains(&type_oid)
+        {
+            let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE_ARRAY).ok()?;
+            let composite = self.composite_for(slot, txid);
+            return composite.visible_to(txid).then_some(RoutineResult {
+                ctype: ColType::Array(ArrElem::Composite(slot as u16)),
+                user_type: identity(composite.schema, composite.name),
+            });
+        }
+        ColType::from_oid(type_oid).map(RoutineResult::builtin)
     }
 
     pub(crate) fn user_type_identity_oid(
@@ -17400,6 +18360,7 @@ impl Storage {
             kind,
             result_columns,
             result_column_count,
+            attributes,
             body,
         } = spec;
         match kind {
@@ -17430,6 +18391,7 @@ impl Storage {
             | RoutineKind::SetFunction { .. }
             | RoutineKind::Trigger
             | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_)
                 if result_column_count != 0 =>
             {
                 return Err(sql_err!(
@@ -17440,7 +18402,8 @@ impl Storage {
             RoutineKind::Function { .. }
             | RoutineKind::SetFunction { .. }
             | RoutineKind::Trigger
-            | RoutineKind::Procedure => {}
+            | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_) => {}
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
@@ -17512,6 +18475,7 @@ impl Storage {
             kind,
             result_columns,
             result_column_count,
+            attributes,
             body,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -17561,6 +18525,7 @@ impl Storage {
             routine.kind = pending.kind;
             routine.result_columns = pending.result_columns;
             routine.result_column_count = pending.result_column_count;
+            routine.attributes = pending.attributes;
             routine.body = pending.body;
             routine.pending_definition = None;
         }
@@ -18125,6 +19090,7 @@ impl Storage {
                 self.routines[slot].kind = definition.kind;
                 self.routines[slot].result_columns = definition.result_columns;
                 self.routines[slot].result_column_count = definition.result_column_count;
+                self.routines[slot].attributes = definition.attributes;
                 self.routines[slot].body = definition.body;
                 self.routines[slot].ownership = definition.ownership;
                 self.routines[slot].pending_definition = None;
@@ -18146,6 +19112,7 @@ impl Storage {
                 kind: definition.kind,
                 result_columns: definition.result_columns,
                 result_column_count: definition.result_column_count,
+                attributes: definition.attributes,
                 body: definition.body,
             },
             0,

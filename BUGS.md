@@ -1,6 +1,6 @@
 # Known bugs
 
-There are no known unresolved bugs. Last reviewed: 2026-08-25 after the PostgreSQL 18 extended-statistics audit across SQL, planner behavior, ownership, catalogs, dump/restore, WAL, checkpoints, and cold recovery. Details belong in tests and git history, not this blocker register.
+There are no known unresolved bugs. Last reviewed: 2026-08-25 after the PostgreSQL 18 user-defined aggregate audit across SQL, typed execution, privileges, catalogs, dump/restore, wire behavior, WAL, checkpoints, and object-store recovery. Details belong in tests and git history, not this blocker register.
 
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 

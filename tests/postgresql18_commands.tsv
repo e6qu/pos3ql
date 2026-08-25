@@ -43,7 +43,7 @@ ALTER RULE	missing	-
 ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
 ALTER SERVER	missing	-
-ALTER STATISTICS	missing	-
+ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
 ALTER SYSTEM	missing	-
 ALTER TABLE	partial	45_alter_column.sql
@@ -94,7 +94,7 @@ CREATE RULE	missing	-
 CREATE SCHEMA	partial	37_schemas.sql
 CREATE SEQUENCE	complete	54_sequence.sql
 CREATE SERVER	missing	-
-CREATE STATISTICS	missing	-
+CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	partial	98_subscription.sql and subscription shard (disabled and managed initial synchronization)
 CREATE TABLE	partial	14_surface.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
@@ -143,7 +143,7 @@ DROP RULE	missing	-
 DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql
 DROP SERVER	missing	-
-DROP STATISTICS	missing	-
+DROP STATISTICS	complete	109_extended_statistics.sql
 DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 DROP TABLE	complete	14_surface.sql
 DROP TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)

@@ -57,7 +57,7 @@ use exec::MAX_PROJ;
 use guc::GucState;
 use parser::{ParseError, Parser};
 use prep::SqlPreparedPool;
-use txn::{DdlUndo, IsolationLevel, TxnMode, TxnState};
+use txn::{DdlUndo, IsolationLevel, StatisticsUndo, TxnMode, TxnState};
 use types::{ColDesc, ColType, Datum};
 
 type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError> + 'a;
@@ -378,6 +378,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreatePolicy(_)
         | Stmt::AlterPolicy(_)
         | Stmt::DropPolicy { .. }
+        | Stmt::CreateStatistics(_)
+        | Stmt::AlterStatistics { .. }
+        | Stmt::DropStatistics { .. }
         | Stmt::CreateTableAs { .. }
         | Stmt::RefreshMaterializedView { .. }
         | Stmt::DropMaterializedView { .. }
@@ -2869,6 +2872,32 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        for slot in 0..self.storage.extended_statistics_count() {
+            let Some(statistics) = self
+                .storage
+                .pending_extended_statistics_data_for(slot, txn.txid)
+            else {
+                continue;
+            };
+            let definition = self
+                .storage
+                .extended_statistics(slot)
+                .definition_for(txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::AnalyzeExtendedStatistics {
+                    schema: definition.schema.as_str(),
+                    name: definition.name.as_str(),
+                    statistics: crate::wal::WalExtendedStatisticsData::Captured(&statistics),
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         // Ownership and ACLs are absolute catalog images. They are staged at
         // commit from the transaction-visible overlays, so repeated GRANT,
         // REVOKE, ALTER OWNER, and savepoint rollback publish exactly one
@@ -2905,6 +2934,10 @@ impl Engine {
                 }),
                 DdlUndo::IndexCreated(slot) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Index,
+                    slot: slot as u16,
+                }),
+                DdlUndo::StatisticsCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Statistics,
                     slot: slot as u16,
                 }),
                 DdlUndo::SchemaCreated(slot) => Some(crate::storage::AccessObject {
@@ -3216,6 +3249,18 @@ impl Engine {
                 DdlUndo::PolicyAltered { slot, .. } => {
                     self.storage.commit_policy_alter(*slot as usize, txn.txid)
                 }
+                DdlUndo::StatisticsCreated(slot) => self
+                    .storage
+                    .commit_extended_statistics_create(*slot as usize),
+                DdlUndo::StatisticsDropped(slot) => {
+                    self.storage.commit_extended_statistics_drop(*slot as usize)
+                }
+                DdlUndo::StatisticsAltered { slot, .. } => self
+                    .storage
+                    .commit_extended_statistics_alter(*slot as usize, txn.txid),
+                DdlUndo::StatisticsKeysAltered { slot, .. } => self
+                    .storage
+                    .commit_extended_statistics_alter(*slot as usize, txn.txid),
                 DdlUndo::RoutineIdentityAltered { slot, .. } => self
                     .storage
                     .commit_routine_identity(*slot as usize, txn.txid),
@@ -3436,6 +3481,9 @@ impl Engine {
         for slot in 0..self.storage.table_count() {
             self.storage.commit_table_statistics(slot, txn.txid);
         }
+        for slot in 0..self.storage.extended_statistics_count() {
+            self.storage.commit_extended_statistics_data(slot, txn.txid);
+        }
         // Past the durability point, so these fire iff the transaction really
         // committed: apply its LISTEN/UNLISTEN to the shared registry and move
         // its notifications into the delivery outbox. A pool-exhaustion here is
@@ -3496,6 +3544,18 @@ impl Engine {
             DdlUndo::PolicyAltered { slot, prior } => {
                 self.storage.rollback_policy_alter(slot as usize, prior)
             }
+            DdlUndo::StatisticsCreated(slot) => self
+                .storage
+                .rollback_extended_statistics_create(slot as usize),
+            DdlUndo::StatisticsDropped(slot) => self
+                .storage
+                .rollback_extended_statistics_drop(slot as usize, txid),
+            DdlUndo::StatisticsAltered { slot, prior } => self
+                .storage
+                .rollback_extended_statistics_alter(slot as usize, prior),
+            DdlUndo::StatisticsKeysAltered { slot, prior } => self
+                .storage
+                .rollback_extended_statistics_keys(slot as usize, prior),
             DdlUndo::RoutineIdentityAltered { slot, prior } => {
                 self.storage.restore_routine_identity(slot as usize, prior)
             }
@@ -3677,8 +3737,14 @@ impl Engine {
             self.rollback_ddl(undo, txn.txid);
         }
         for undo in txn.statistics_undo().iter().rev() {
-            self.storage
-                .rollback_table_statistics(undo.table as usize, txn.txid);
+            match *undo {
+                StatisticsUndo::Table(table) => self
+                    .storage
+                    .rollback_table_statistics(table as usize, txn.txid),
+                StatisticsUndo::Extended(statistics) => self
+                    .storage
+                    .rollback_extended_statistics_data(statistics as usize, txn.txid),
+            }
         }
         self.wal.discard_stage(txn.txid);
         guc.rollback_transaction();
@@ -3709,8 +3775,14 @@ impl Engine {
             self.rollback_ddl(txn.ddl()[index], txn.txid);
         }
         for index in (mark.statistics..txn.statistics_undo().len()).rev() {
-            self.storage
-                .rollback_table_statistics(txn.statistics_undo()[index].table as usize, txn.txid);
+            match txn.statistics_undo()[index] {
+                StatisticsUndo::Table(table) => self
+                    .storage
+                    .rollback_table_statistics(table as usize, txn.txid),
+                StatisticsUndo::Extended(statistics) => self
+                    .storage
+                    .rollback_extended_statistics_data(statistics as usize, txn.txid),
+            }
         }
         txn.rewind_touched(mark.touched);
         txn.rewind_truncates(mark.truncates);
@@ -3745,9 +3817,14 @@ impl Engine {
             self.rollback_ddl(txn.ddl()[i], txn.txid);
         }
         for i in (sp.statistics_mark..txn.statistics_undo().len()).rev() {
-            let undo = txn.statistics_undo()[i];
-            self.storage
-                .rollback_table_statistics(undo.table as usize, txn.txid);
+            match txn.statistics_undo()[i] {
+                StatisticsUndo::Table(table) => self
+                    .storage
+                    .rollback_table_statistics(table as usize, txn.txid),
+                StatisticsUndo::Extended(statistics) => self
+                    .storage
+                    .rollback_extended_statistics_data(statistics as usize, txn.txid),
+            }
         }
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_truncates(sp.truncate_mark);
@@ -3949,6 +4026,13 @@ impl Engine {
                     txn.record_statistics(slot as u32)?;
                     total_rows = total_rows
                         .saturating_add(self.storage.analyze_table(slot, txn.txid, &[])?.rows);
+                    exec::analyze_extended_statistics(
+                        &mut self.storage,
+                        txn,
+                        slot,
+                        &[],
+                        &mut self.work,
+                    )?;
                 }
             }
             return Ok(total_rows);
@@ -3972,6 +4056,13 @@ impl Engine {
                     .analyze_table(slot, txn.txid, &selected[..selected_count])?
                     .rows,
             );
+            exec::analyze_extended_statistics(
+                &mut self.storage,
+                txn,
+                slot,
+                &selected[..selected_count],
+                &mut self.work,
+            )?;
         }
         Ok(total_rows)
     }
@@ -7057,6 +7148,35 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateStatistics(statistics) => exec::create_statistics(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                statistics,
+                arena,
+                responder,
+            ),
+            Stmt::AlterStatistics { name, action } => exec::alter_statistics(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropStatistics {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_statistics(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreateTableAs {
                 name,
                 columns,
@@ -9079,6 +9199,88 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             };
             storage.replay_table_statistics(index, statistics.materialize()?);
+        }
+        WalOp::SetExtendedStatistics {
+            created_at,
+            schema,
+            name,
+            table_schema,
+            table,
+            target,
+            kinds,
+            expression_only,
+            keys,
+            key_count,
+        } => {
+            let Some(table_slot) = storage.find_table(table_schema, table) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal statistics object references unknown table \"{}\"",
+                    table
+                ));
+            };
+            let kinds = if expression_only {
+                crate::sql::ast::StatisticsKinds::EXPRESSION
+            } else {
+                crate::sql::ast::StatisticsKinds::from_code(kinds).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal has invalid statistics kinds"
+                    )
+                })?
+            };
+            let mut stored_keys =
+                [crate::storage::ExtendedStatisticsKey::Column(crate::storage::SqlName::EMPTY);
+                    crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+            for (position, key) in keys[..key_count].iter().copied().enumerate() {
+                stored_keys[position] = match key {
+                    crate::wal::WalExtendedStatisticsKey::Column(column) => {
+                        let Some(column) = storage.table_def(table_slot, 0).column_index(column)
+                        else {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal statistics key references unknown column"
+                            ));
+                        };
+                        crate::storage::ExtendedStatisticsKey::Column(
+                            storage.table_def(table_slot, 0).columns()[column].name,
+                        )
+                    }
+                    crate::wal::WalExtendedStatisticsKey::Expression(expression) => {
+                        crate::storage::ExtendedStatisticsKey::Expression(
+                            crate::storage::extended_statistics_expression(expression)?,
+                        )
+                    }
+                };
+            }
+            storage.replay_extended_statistics(crate::storage::ExtendedStatisticsSpec {
+                created_at,
+                schema: crate::storage::SqlName::parse(schema)?,
+                name: crate::storage::SqlName::parse(name)?,
+                table: table_slot as u16,
+                target,
+                keys: stored_keys,
+                n_keys: key_count as u8,
+                kinds,
+                expression_only,
+            })?;
+        }
+        WalOp::DropExtendedStatistics { schema, name } => {
+            storage.replay_drop_extended_statistics(schema, name)?;
+        }
+        WalOp::AnalyzeExtendedStatistics {
+            schema,
+            name,
+            statistics,
+        } => {
+            let Some(slot) = storage.extended_statistics_slot(schema, name, 0) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal analyzes unknown statistics object \"{}\"",
+                    name
+                ));
+            };
+            storage.install_extended_statistics_data(slot, statistics.materialize()?);
         }
         WalOp::DropTable { schema, name } => {
             let Some(index) = storage.find_table(schema, name) else {

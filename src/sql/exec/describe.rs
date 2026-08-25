@@ -1271,6 +1271,25 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 n += 1;
             }
         }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+            let element = expand_array_element_metadata(args, columns)?;
+            for (index, (name, meta)) in [("x", element), ("n", StaticTypeMeta::of(ColType::Int4))]
+                .into_iter()
+                .enumerate()
+            {
+                let mut field_name = crate::util::StackStr::new();
+                let _ = core::fmt::Write::write_str(&mut field_name, name);
+                fields[index] = RecordShapeField {
+                    name: field_name,
+                    ctype: meta.ctype,
+                    type_oid: meta.type_oid,
+                    type_mod: meta.type_mod,
+                    collation: meta.collation,
+                    nested: -1,
+                };
+                n += 1;
+            }
+        }
         Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
             while let Some((field, ctype)) = builtin_record_srf_field(name, n) {
                 let mut field_name = crate::util::StackStr::new();
@@ -1386,6 +1405,30 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
     None
 }
 
+fn expand_array_element_metadata(
+    args: &[&Expr<'_>],
+    columns: &dyn ColTypeResolver,
+) -> Option<StaticTypeMeta> {
+    let argument = *args.first()?;
+    let array = expression_static_metadata(argument, columns)?;
+    let (ctype, type_oid) = match array.ctype {
+        ColType::Array(element) => (element.to_coltype(), element.element_oid()),
+        ColType::Int2Vector => (ColType::Int2, oid::INT2),
+        ColType::OidVector => (ColType::Oid, oid::OID),
+        _ => return None,
+    };
+    Some(StaticTypeMeta {
+        ctype,
+        type_oid,
+        type_mod: array.type_mod,
+        collation: if ctype.is_collatable() {
+            array.collation
+        } else {
+            crate::sql::ast::Collation::None
+        },
+    })
+}
+
 pub(crate) fn builtin_record_srf_field_pub(
     name: &str,
     index: usize,
@@ -1414,6 +1457,11 @@ pub fn record_shape(
                 );
             }
             Some(n)
+        }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+            visit("x", expand_array_element_metadata(args, columns)?.ctype);
+            visit("n", ColType::Int4);
+            Some(2)
         }
         Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
             let mut count = 0;
@@ -1576,6 +1624,15 @@ pub fn record_field_metadata(
             .position(|name| name.eq_ignore_ascii_case(field))
             .and_then(|position| args.get(position))
             .and_then(|argument| expression_static_metadata(argument, columns)),
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+            if field.eq_ignore_ascii_case("x") {
+                expand_array_element_metadata(args, columns)
+            } else if field.eq_ignore_ascii_case("n") {
+                Some(StaticTypeMeta::of(ColType::Int4))
+            } else {
+                None
+            }
+        }
         Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
             let mut index = 0usize;
             let mut found = None;
@@ -2527,18 +2584,13 @@ pub fn infer_type_res(
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
         Expr::Slice { base, .. } => infer_type_res(base, columns)?,
-        // `(record).field`: the field's type from the record's shape. When the
-        // shape is not a statically known record (a `_pg_expandarray` result,
-        // reached directly or through a derived-table column — the shape driver
-        // introspection relies on), fall back to int4, matching its `.x`/`.n`
-        // ordinal fields; a *known* record with a missing field still errors.
+        // `(record).field`: the field's type from the record's shape.
         Expr::Field { base, field } => match record_field_metadata(base, field, columns) {
             Ok(meta) => (meta.type_oid, meta.ctype.typlen()),
-            Err(e) if e.sqlstate == "42809" => of(ColType::Int4),
             // The subquery executor preserves the element's named-composite
             // identity, but this catalog-free inference boundary cannot
             // resolve an inner FROM item. Query description refines this
-            // provisional type before exposing it to a client.
+            // explicit unresolved type before exposing it to a client.
             Err(e)
                 if e.sqlstate == "42703"
                     && matches!(
@@ -2549,7 +2601,7 @@ pub fn infer_type_res(
                         } if matches!(&**array, Expr::ArraySubquery(_))
                     ) =>
             {
-                of(ColType::Text)
+                (oid::UNKNOWN, -2)
             }
             Err(e) => return Err(e),
         },
@@ -2577,7 +2629,11 @@ pub fn infer_type_res(
             | "shobj_description"
             | "pg_encoding_to_char"
             | "array_to_string"
+            | "pg_get_statisticsobjdef"
             | "pg_get_statisticsobjdef_columns" => (oid::TEXT, -1),
+            "pg_get_statisticsobjdef_expressions" => {
+                (crate::sql::types::ArrElem::Text.array_oid(), -1)
+            }
             "pg_typeof" => (oid::REGTYPE, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
             "pg_table_is_visible"
@@ -3034,7 +3090,8 @@ pub fn infer_type_res(
             | "json_each_text"
             | "jsonb_each_text"
             | "pg_options_to_table"
-            | "pg_get_sequence_data" => (oid::RECORD, -1),
+            | "pg_get_sequence_data"
+            | "_pg_expandarray" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
             "make_time" => of(ColType::Time),

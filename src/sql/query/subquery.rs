@@ -1985,7 +1985,11 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Composite(slot) => Datum::Composite { slot, fields: &[] },
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
-        ColType::PgNodeTree => Datum::Text(""),
+        ColType::PgNodeTree
+        | ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray => Datum::Text(""),
         ColType::Oid => Datum::Oid(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,

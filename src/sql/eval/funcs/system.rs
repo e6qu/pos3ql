@@ -319,6 +319,8 @@ pub(crate) fn dispatch<'a>(
             | "col_description"
             | "obj_description"
             | "shobj_description"
+            | "pg_get_statisticsobjdef"
+            | "pg_get_statisticsobjdef_expressions"
             | "pg_get_statisticsobjdef_columns"
             | "format_type"
             | "pg_encoding_to_char"
@@ -885,9 +887,45 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "pg_get_statisticsobjdef_columns" => {
-                // Definitions/comments we do not reconstruct render as empty/NULL,
-                // as PostgreSQL does for an absent comment.
-                Ok(Datum::Null)
+                arity(1)?;
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                Ok(catalog
+                    .statistics_columns(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_get_statisticsobjdef" => {
+                arity(1)?;
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                Ok(catalog
+                    .statistics_definition(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_get_statisticsobjdef_expressions" => {
+                arity(1)?;
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                Ok(catalog
+                    .statistics_expressions(oid, arena)?
+                    .unwrap_or(Datum::Null))
             }
             "format_type" => {
                 arity(2)?;

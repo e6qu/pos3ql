@@ -3408,6 +3408,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("policy")? {
             return self.alter_policy();
         }
+        if self.eat_ident("statistics")? {
+            return self.alter_statistics();
+        }
         if self.eat_ident("index")? {
             return self.alter_index();
         }
@@ -6106,5 +6109,59 @@ mod tests {
             let err = p.next_stmt().unwrap_err();
             assert_eq!(err.at, 7);
         });
+    }
+
+    #[test]
+    fn statistics_grammar_produces_only_valid_typed_states() {
+        with_parser(
+            "CREATE STATISTICS s (ndistinct, dependencies, mcv) ON a, (lower(b)) FROM app.t; \
+             ALTER STATISTICS s SET STATISTICS DEFAULT; \
+             ALTER STATISTICS s SET STATISTICS 10000; \
+             DROP STATISTICS IF EXISTS s CASCADE",
+            |parser| {
+                let Stmt::CreateStatistics(create) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected CREATE STATISTICS")
+                };
+                let StatisticsKeys::Multivariate { kinds, keys } = create.keys else {
+                    panic!("expected multivariate statistics")
+                };
+                assert!(kinds.ndistinct() && kinds.dependencies() && kinds.mcv());
+                assert_eq!(keys.len(), 2);
+                assert!(matches!(keys[1], StatisticsKey::Expression(_)));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterStatistics {
+                        action: AlterStatisticsAction::SetTarget(StatisticsTarget::Default),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterStatistics {
+                        action: AlterStatisticsAction::SetTarget(StatisticsTarget::Value(10000)),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::DropStatistics {
+                        if_exists: true,
+                        cascade: true,
+                        ..
+                    }
+                ));
+            },
+        );
+        for sql in [
+            "CREATE STATISTICS ON a FROM t",
+            "CREATE STATISTICS s (ndistinct) ON (lower(a)) FROM t",
+            "CREATE STATISTICS s (mcv, mcv) ON a, b FROM t",
+            "CREATE STATISTICS IF NOT EXISTS ON a, b FROM t",
+            "ALTER STATISTICS s SET STATISTICS 10001",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+            });
+        }
     }
 }

@@ -401,6 +401,12 @@ CREATE TABLE outbound_dump.partition_other PARTITION OF outbound_dump.partition_
 INSERT INTO outbound_dump.partition_root VALUES (10, 1), (20, 2);
 CREATE INDEX outbound_partition_region_idx ON outbound_dump.partition_root
   (id, region DESC) WITH (fillfactor=75);
+CREATE STATISTICS outbound_dump.outbound_items_mood_note
+  (ndistinct, dependencies, mcv) ON mood, note FROM outbound_dump.items;
+ALTER STATISTICS outbound_dump.outbound_items_mood_note SET STATISTICS 25;
+CREATE STATISTICS outbound_dump.outbound_items_note_lower
+  ON (lower(note)) FROM outbound_dump.items;
+ANALYZE outbound_dump.items;
 GRANT USAGE ON SCHEMA outbound_dump TO outbound_reader;
 GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
 GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
@@ -505,6 +511,21 @@ else
     bad "pos3ql pg_dump round-trip result"
     printf 'expected:\n%s\nobserved:\n%s\n' \
       "$expected_outbound_observed" "$outbound_observed"
+  fi
+  outbound_statistics=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+      SELECT stxname,stxstattarget,pg_get_statisticsobjdef_columns(oid)
+        FROM pg_statistic_ext
+       WHERE stxnamespace='outbound_dump'::regnamespace
+       ORDER BY stxname;
+    " 2>/dev/null)
+  expected_outbound_statistics=$'outbound_items_mood_note|25|mood, note\noutbound_items_note_lower||lower(note)'
+  if [[ "$outbound_statistics" == "$expected_outbound_statistics" ]]; then
+    ok "pos3ql statistics definitions survive pg_dump and PostgreSQL restore"
+  else
+    bad "pos3ql statistics pg_dump round-trip result"
+    printf 'expected:\n%s\nobserved:\n%s\n' \
+      "$expected_outbound_statistics" "$outbound_statistics"
   fi
 fi
 # The curated corpus later creates a public type with the same unqualified

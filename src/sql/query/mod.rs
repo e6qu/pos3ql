@@ -828,6 +828,27 @@ pub(super) fn storage_catalog<'a>(
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn statistics_definition<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::extended_statistics_definition_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn statistics_expressions<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        super::catalog::extended_statistics_expressions_by_oid(self.storage, self.txid, oid, arena)
+    }
+    fn statistics_columns<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::extended_statistics_columns_by_oid(self.storage, self.txid, oid, arena)
+    }
     fn tablespace_location<'a>(
         &self,
         oid: i32,

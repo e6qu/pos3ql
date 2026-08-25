@@ -11,16 +11,18 @@ use super::{
 };
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming,
-    ConstraintValidation, CreateDomain, CreateRoutine, CreateSchemaElement, CreateTrigger,
-    DomainCheck, ExclusionOperator, Expr, IndexBuildMode, IndexStorageOptionNames,
-    IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
-    PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
-    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect,
-    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
-    SubscriptionStreaming, SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
-    TriggerEvent, TriggerIdentity, TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction, AlterTypeAction,
+    ConstraintMode, ConstraintTiming, ConstraintValidation, CreateDomain, CreateRoutine,
+    CreateSchemaElement, CreateStatistics, CreateTrigger, DomainCheck, ExclusionOperator, Expr,
+    IndexBuildMode, IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, PartitionBound,
+    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
+    PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget, RoleOptions,
+    RoutineArgument, RoutineCreateKind, RoutineIdentity, RoutineTargetKind, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
+    TriggerIdentity, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -186,6 +188,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("policy")? {
             return self.create_policy();
         }
+        if self.eat_ident("statistics")? {
+            return self.create_statistics();
+        }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
             return self.create_materialized_view();
@@ -218,6 +223,146 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn create_statistics(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            StatisticsName::Explicit {
+                name: self.qual_name("statistics name")?,
+                if_not_exists: true,
+            }
+        } else if self.peeked == Tok::Ident("on") {
+            StatisticsName::Generated
+        } else {
+            StatisticsName::Explicit {
+                name: self.qual_name("statistics name")?,
+                if_not_exists: false,
+            }
+        };
+        let explicit_kinds = if self.eat_op("(")? {
+            let mut kinds = StatisticsKinds::empty();
+            loop {
+                let kind = self.any_ident("statistics kind")?;
+                let fresh = if kind.eq_ignore_ascii_case("ndistinct") {
+                    kinds.insert_ndistinct()
+                } else if kind.eq_ignore_ascii_case("dependencies") {
+                    kinds.insert_dependencies()
+                } else if kind.eq_ignore_ascii_case("mcv") {
+                    kinds.insert_mcv()
+                } else {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "unrecognized statistics kind \"{}\"", kind),
+                        sqlstate: sqlstate::SYNTAX_ERROR,
+                    });
+                };
+                if !fresh {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "statistics kind \"{}\" specified more than once",
+                            kind
+                        ),
+                        sqlstate: sqlstate::SYNTAX_ERROR,
+                    });
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            Some(kinds)
+        } else {
+            None
+        };
+        self.expect_ident("on")?;
+        let mut keys = [StatisticsKey::Column(""); crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        let mut count = 0usize;
+        loop {
+            if count == keys.len() {
+                return Err(self.limit("statistics expressions", keys.len()));
+            }
+            keys[count] = if self.eat_op("(")? {
+                let start = self.peek_at;
+                let expression = self.expression(0)?;
+                let source =
+                    index_expression_source(expression, self.text[start..self.peek_at].trim());
+                self.expect_op(")")?;
+                StatisticsKey::Expression(StatisticsExpression { expression, source })
+            } else {
+                StatisticsKey::Column(self.col_ident("column name")?)
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_ident("from")?;
+        let table = self.qual_name("table name")?;
+        let keys = if count == 1 {
+            if explicit_kinds.is_some() {
+                return Err(self.err_here(
+                    "when building statistics on a single expression, statistics kinds may not be specified",
+                ));
+            }
+            match keys[0] {
+                StatisticsKey::Expression(expression) => StatisticsKeys::Expression(expression),
+                StatisticsKey::Column(_) => {
+                    return Err(self.err_here("extended statistics require at least 2 columns"));
+                }
+            }
+        } else {
+            StatisticsKeys::Multivariate {
+                kinds: explicit_kinds.unwrap_or(StatisticsKinds::ALL),
+                keys: self.arena_slice(&keys[..count])?,
+            }
+        };
+        Ok(Stmt::CreateStatistics(CreateStatistics {
+            name,
+            keys,
+            table,
+        }))
+    }
+
+    pub(super) fn alter_statistics(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("statistics name")?;
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterStatisticsAction::Owner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterStatisticsAction::Rename(self.col_ident("new statistics name")?)
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("schema")? {
+                AlterStatisticsAction::SetSchema(self.col_ident("schema name")?)
+            } else {
+                self.expect_ident("statistics")?;
+                let target = if self.eat_ident("default")? {
+                    StatisticsTarget::Default
+                } else {
+                    let raw = self.seq_int()?;
+                    if raw == -1 {
+                        StatisticsTarget::Default
+                    } else {
+                        StatisticsTarget::Value(
+                            u16::try_from(raw)
+                                .ok()
+                                .filter(|target| *target <= 10_000)
+                                .ok_or_else(|| {
+                                    self.err_here("statistics target is out of range")
+                                })?,
+                        )
+                    }
+                };
+                AlterStatisticsAction::SetTarget(target)
+            }
+        } else {
+            return Err(self.err_here("expected OWNER, RENAME, or SET after ALTER STATISTICS"));
+        };
+        Ok(Stmt::AlterStatistics { name, action })
     }
 
     fn tablespace_cost(&mut self) -> Result<crate::sql::ast::TablespaceCost, ParseError> {
@@ -2580,6 +2725,20 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("policy")? {
             return self.drop_policy();
+        }
+        if self.eat_ident("statistics")? {
+            let (names, if_exists) = self.drop_targets("statistics name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropStatistics {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;

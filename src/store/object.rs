@@ -748,7 +748,7 @@ mod tests {
         }
         assert!(complete, "mock object response did not complete");
         store
-            .put(b"concurrent write", BlockType::SstIndex, 0)
+            .put(b"concurrent write", BlockType::SstIndexV2, 0)
             .unwrap();
         let mut output = [0u8; 64];
         assert_eq!(
@@ -871,10 +871,10 @@ mod tests {
 
         let mut first = [0u8; super::super::BLOCK_SIZE];
         let (first_id, first_len) =
-            encode(b"first", BlockType::SstDataPaxV1, 0, &mut first).unwrap();
+            encode(b"first", BlockType::SstDataPaxColumnV1, 0, &mut first).unwrap();
         let mut second = [0u8; super::super::BLOCK_SIZE];
         let (second_id, second_len) =
-            encode(b"second", BlockType::SstDataPaxV1, 0, &mut second).unwrap();
+            encode(b"second", BlockType::SstDataPaxColumnV1, 0, &mut second).unwrap();
         let mut container = vec![0u8; first_len + second_len];
         container[..first_len].copy_from_slice(&first[..first_len]);
         container[first_len..].copy_from_slice(&second[..second_len]);
@@ -896,7 +896,7 @@ mod tests {
                     &mut scratch,
                 )
                 .unwrap(),
-            (6, BlockType::SstDataPaxV1)
+            (6, BlockType::SstDataPaxColumnV1)
         );
         assert_eq!(&output[..6], b"second");
         let after = store.io_stats().saturating_sub(before);

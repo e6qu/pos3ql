@@ -301,9 +301,13 @@ mod tests {
     fn a_packed_extent_is_cached_by_its_logical_identity() {
         let mut c = cache(4);
         let mut framed = [0u8; super::super::BLOCK_SIZE];
-        let (logical, framed_len) =
-            super::super::encode(b"range payload", BlockType::SstDataPaxV1, 0, &mut framed)
-                .unwrap();
+        let (logical, framed_len) = super::super::encode(
+            b"range payload",
+            BlockType::SstDataPaxColumnV1,
+            0,
+            &mut framed,
+        )
+        .unwrap();
         let container = c
             .inner
             .put(&framed[..framed_len], BlockType::SstPackedContainerV1, 0)
@@ -320,7 +324,7 @@ mod tests {
                 &mut scratch,
             )
             .unwrap();
-        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(kind, BlockType::SstDataPaxColumnV1);
         assert_eq!(&output[..len], b"range payload");
         assert_eq!(c.stats().misses, 1);
 
@@ -334,7 +338,7 @@ mod tests {
                 &mut scratch,
             )
             .unwrap();
-        assert_eq!(kind, BlockType::SstDataPaxV1);
+        assert_eq!(kind, BlockType::SstDataPaxColumnV1);
         assert_eq!(&output[..len], b"range payload");
         assert_eq!(c.stats().hits, 1);
         assert_eq!(c.stats().misses, 1);

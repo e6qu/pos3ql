@@ -267,59 +267,123 @@ fn column_selectivity(
     (non_null / column_statistics.distinct_values.max(1) as f64).clamp(0.0, 1.0)
 }
 
-/// Returns a joint equality estimate when an AND-conjunction supplies every
-/// column of a collected composite key. This deliberately recognizes only
-/// constant equality arms: joins, parameters, calls, and range predicates
-/// retain the conservative general estimator below.
-fn multi_column_selectivity(
+fn expression_statistics_selectivity(
     storage: &Storage,
     scope: &QueryScope<'_>,
     table: usize,
     expression: &Expr<'_>,
     txid: u32,
+    arena: &Arena,
 ) -> Option<f64> {
-    fn collect(
-        expression: &Expr<'_>,
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+    } = expression
+    else {
+        return None;
+    };
+    let candidate = if right.is_constant() && !right.contains_call() {
+        *left
+    } else if left.is_constant() && !left.contains_call() {
+        *right
+    } else {
+        return None;
+    };
+    if scope.derived[table].is_some() || scope.slots[table] == usize::MAX {
+        return None;
+    }
+    for (slot, statistics) in storage.extended_statistics_for_table(scope.slots[table], txid) {
+        let data = storage.extended_statistics_data(slot, txid);
+        if !data.valid || data.rows == 0 {
+            continue;
+        }
+        for (key, definition) in statistics.keys_for(txid).iter().enumerate() {
+            let crate::storage::ExtendedStatisticsKey::Expression(source) = definition else {
+                continue;
+            };
+            let parsed = crate::sql::parser::parse_expr(source.as_str(), arena).ok()?;
+            if parsed != candidate || !data.expression_statistics[key].valid {
+                continue;
+            }
+            let column = data.expression_statistics[key];
+            let non_null = 1.0 - f64::from(column.null_fraction_ppm) / 1_000_000.0;
+            return Some((non_null / column.distinct_values.max(1) as f64).clamp(0.0, 1.0));
+        }
+    }
+    None
+}
+
+/// Consumes a named PostgreSQL extended-statistics object only when the
+/// conjunction supplies every plain-column key with a constant equality.
+fn extended_statistics_selectivity<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
+    table: usize,
+    expression: &Expr<'a>,
+    txid: u32,
+    arena: &Arena,
+) -> Option<f64> {
+    fn collect<'a>(
+        expression: &Expr<'a>,
         scope: &QueryScope<'_>,
         table: usize,
-        columns: &mut [usize; crate::storage::MAX_INDEX_COLS],
+        arena: &'a Arena,
+        columns: &mut [usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+        values: &mut [Datum<'a>; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
         count: &mut usize,
     ) -> bool {
+        fn column_constant<'e>(
+            candidate: &Expr<'e>,
+            other: &'e Expr<'e>,
+            scope: &QueryScope<'_>,
+            table: usize,
+        ) -> Option<(usize, &'e Expr<'e>)> {
+            let Expr::Column { qualifier, name } = candidate else {
+                return None;
+            };
+            if !other.is_constant() || other.contains_call() {
+                return None;
+            }
+            match scope.find_column(*qualifier, name).ok()? {
+                query::ResolvedColumn::Table(owner, column) if owner == table => {
+                    Some((column, other))
+                }
+                _ => None,
+            }
+        }
         match expression {
             Expr::Binary {
                 operator: BinaryOp::And,
                 left,
                 right,
             } => {
-                collect(left, scope, table, columns, count)
-                    && collect(right, scope, table, columns, count)
+                collect(left, scope, table, arena, columns, values, count)
+                    && collect(right, scope, table, arena, columns, values, count)
             }
             Expr::Binary {
                 operator: BinaryOp::Eq,
                 left,
                 right,
             } => {
-                let column = |candidate: &Expr<'_>, other: &Expr<'_>| {
-                    let Expr::Column { qualifier, name } = candidate else {
-                        return None;
-                    };
-                    if !other.is_constant() || other.contains_call() {
-                        return None;
-                    }
-                    match scope.find_column(*qualifier, name).ok()? {
-                        query::ResolvedColumn::Table(owner, column) if owner == table => {
-                            Some(column)
-                        }
-                        _ => None,
-                    }
-                };
-                let Some(column) = column(left, right).or_else(|| column(right, left)) else {
+                let Some((column, constant)) = column_constant(left, right, scope, table)
+                    .or_else(|| column_constant(right, left, scope, table))
+                else {
                     return false;
                 };
                 if *count == columns.len() || columns[..*count].contains(&column) {
                     return false;
                 }
+                let Ok(value) = crate::sql::eval::eval(
+                    constant,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &crate::sql::eval::NoColumns,
+                ) else {
+                    return false;
+                };
                 columns[*count] = column;
+                values[*count] = value;
                 *count += 1;
                 true
             }
@@ -330,31 +394,109 @@ fn multi_column_selectivity(
     if scope.derived[table].is_some() || scope.slots[table] == usize::MAX {
         return None;
     }
-    let mut columns = [0usize; crate::storage::MAX_INDEX_COLS];
+    let mut columns = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    let mut values = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
     let mut count = 0usize;
-    if !collect(expression, scope, table, &mut columns, &mut count) || count < 2 {
+    if !collect(
+        expression,
+        scope,
+        table,
+        arena,
+        &mut columns,
+        &mut values,
+        &mut count,
+    ) || count < 2
+    {
         return None;
     }
-    let statistics = storage.table_statistics(scope.slots[table], txid);
-    if !statistics.valid || statistics.rows == 0 {
-        return None;
+    for (slot, statistics) in storage.extended_statistics_for_table(scope.slots[table], txid) {
+        if statistics.keys_for(txid).len() != count
+            || statistics.keys_for(txid).iter().any(|key| {
+                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
+                    return true;
+                };
+                let definition = storage.table_def(scope.slots[table], txid);
+                definition
+                    .column_index(column.as_str())
+                    .is_none_or(|column| !columns[..count].contains(&column))
+            })
+        {
+            continue;
+        }
+        let data = storage.extended_statistics_data(slot, txid);
+        if !data.valid || data.rows == 0 {
+            continue;
+        }
+        let mut ordered = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        let indices = [0u16, 1, 2, 3, 4, 5, 6, 7];
+        for (position, key) in statistics.keys_for(txid).iter().enumerate() {
+            let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
+                unreachable!("expression keys were rejected above")
+            };
+            let column = storage
+                .table_def(scope.slots[table], txid)
+                .column_index(column.as_str())?;
+            let source = columns[..count]
+                .iter()
+                .position(|candidate| *candidate == column)?;
+            ordered[position] = values[source];
+        }
+        if statistics.kinds.mcv() {
+            let hash = crate::sql::eval::hash_key(&ordered[..count], &indices[..count]);
+            if let Some(entry) = data.mcv[..usize::from(data.n_mcv)]
+                .iter()
+                .find(|entry| entry.hash == hash)
+            {
+                return Some((entry.count as f64 / data.rows as f64).clamp(0.0, 1.0));
+            }
+        }
+        if statistics.kinds.ndistinct() {
+            return Some(
+                (data.non_null_rows as f64 / data.rows as f64 / data.distinct_values.max(1) as f64)
+                    .clamp(0.0, 1.0),
+            );
+        }
+        if statistics.kinds.dependencies() {
+            let mut selectivities = [1.0f64; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+            for (position, key) in statistics.keys_for(txid).iter().enumerate() {
+                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
+                    unreachable!("expression keys were rejected above")
+                };
+                let column = storage
+                    .table_def(scope.slots[table], txid)
+                    .column_index(column.as_str())?;
+                selectivities[position] =
+                    column_selectivity(storage, scope, table, column, txid, 0.005);
+            }
+            let mut estimate = selectivities.iter().take(count).product::<f64>();
+            for determinant in 0..count {
+                for dependent in 0..count {
+                    let strength = f64::from(
+                        data.dependencies_ppm[determinant
+                            * crate::storage::MAX_EXTENDED_STATISTICS_KEYS
+                            + dependent],
+                    ) / 1_000_000.0;
+                    if strength > 0.0 {
+                        let independent = selectivities[determinant] * selectivities[dependent];
+                        let dependent_estimate = selectivities[determinant]
+                            * (strength + (1.0 - strength) * selectivities[dependent]);
+                        estimate *= dependent_estimate / independent.max(f64::MIN_POSITIVE);
+                        return Some(estimate.clamp(0.0, 1.0));
+                    }
+                }
+            }
+        }
     }
-    let multi = statistics
-        .multi_columns
-        .iter()
-        .find(|statistics| statistics.covers(&columns[..count]))?;
-    Some(
-        (multi.non_null_rows as f64 / statistics.rows as f64 / multi.distinct_values.max(1) as f64)
-            .clamp(0.0, 1.0),
-    )
+    None
 }
 
-fn predicate_selectivity(
+fn predicate_selectivity<'a>(
     storage: &Storage,
     scope: &QueryScope<'_>,
     table: usize,
-    expression: &Expr<'_>,
+    expression: &Expr<'a>,
     txid: u32,
+    arena: &'a Arena,
 ) -> f64 {
     match expression {
         Expr::Binary {
@@ -363,12 +505,12 @@ fn predicate_selectivity(
             right,
         } => {
             if let Some(selectivity) =
-                multi_column_selectivity(storage, scope, table, expression, txid)
+                extended_statistics_selectivity(storage, scope, table, expression, txid, arena)
             {
                 return selectivity;
             }
-            let left = predicate_selectivity(storage, scope, table, left, txid);
-            let right = predicate_selectivity(storage, scope, table, right, txid);
+            let left = predicate_selectivity(storage, scope, table, left, txid, arena);
+            let right = predicate_selectivity(storage, scope, table, right, txid, arena);
             (left * right).clamp(0.0, 1.0)
         }
         Expr::Binary {
@@ -376,8 +518,8 @@ fn predicate_selectivity(
             left,
             right,
         } => {
-            let left = predicate_selectivity(storage, scope, table, left, txid);
-            let right = predicate_selectivity(storage, scope, table, right, txid);
+            let left = predicate_selectivity(storage, scope, table, left, txid, arena);
+            let right = predicate_selectivity(storage, scope, table, right, txid, arena);
             (left + right - left * right).clamp(0.0, 1.0)
         }
         Expr::Binary {
@@ -386,6 +528,13 @@ fn predicate_selectivity(
                 @ (BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq),
             ..
         } => {
+            if *operator == BinaryOp::Eq
+                && let Some(selectivity) = expression_statistics_selectivity(
+                    storage, scope, table, expression, txid, arena,
+                )
+            {
+                return selectivity;
+            }
             let Some((owner, column, _)) = predicate_column(expression, scope) else {
                 return 1.0;
             };
@@ -508,6 +657,7 @@ fn scan_node(
     predicate: Option<&Expr<'_>>,
     txid: u32,
     depth: u8,
+    arena: &Arena,
 ) -> PlanNode {
     let slot = scope.slots[table];
     let derived = scope.derived[table].is_some() || slot == usize::MAX;
@@ -517,7 +667,7 @@ fn scan_node(
         storage.planning_row_estimate(slot)
     };
     let selectivity = predicate.map_or(1.0, |predicate| {
-        predicate_selectivity(storage, scope, table, predicate, txid)
+        predicate_selectivity(storage, scope, table, predicate, txid, arena)
     });
     let output_rows = if rows == 0 {
         0
@@ -622,7 +772,15 @@ pub(super) fn plan_select(
         estimated_rows = 1;
         total_cost = 0.0;
         for &table in &table_order[..scope.n] {
-            let scan = scan_node(storage, scope, table, statement.where_clause, txid, 1);
+            let scan = scan_node(
+                storage,
+                scope,
+                table,
+                statement.where_clause,
+                txid,
+                1,
+                arena,
+            );
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
             total_cost += scan.total_cost;
             object_requests = object_requests.saturating_add(scan.object_requests);
@@ -803,6 +961,7 @@ pub(super) fn plan_select(
                 statement.where_clause,
                 txid,
                 stage_count as u8,
+                arena,
             );
             scan.output = output;
             plan.push(scan)?;

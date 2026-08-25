@@ -1111,6 +1111,20 @@ impl Checkpointer {
             ValueIndexHandle,
         )> = Vec::new();
         let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
+        struct LoadedExtendedStatistics {
+            created_at: u64,
+            table_index: usize,
+            schema: crate::storage::SqlName,
+            name: crate::storage::SqlName,
+            target: Option<u16>,
+            kinds: crate::sql::ast::StatisticsKinds,
+            expression_only: bool,
+            keys: [crate::storage::ExtendedStatisticsKey;
+                crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+            n_keys: u8,
+            data: crate::storage::ExtendedStatisticsData,
+        }
+        let mut extended_statistics: Vec<LoadedExtendedStatistics> = Vec::new();
         let mut saw_end = false;
 
         for line in lines {
@@ -1255,8 +1269,6 @@ impl Checkpointer {
                             analyzed_generation,
                             columns: [crate::storage::ColumnStatistics::EMPTY;
                                 crate::storage::MAX_COLUMNS],
-                            multi_columns: [crate::storage::MultiColumnStatistics::EMPTY;
-                                crate::storage::MAX_MULTICOLUMN_STATISTICS],
                         },
                     ));
                 }
@@ -1305,67 +1317,207 @@ impl Checkpointer {
                         average_width,
                     };
                 }
-                Some("mcstat") => {
-                    let table_index: usize =
-                        parse_field(words.next(), "multi statistics table index")?;
-                    let n_columns: usize =
-                        parse_field(words.next(), "multi statistics column count")?;
-                    if !(2..=crate::storage::MAX_INDEX_COLS).contains(&n_columns) {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "multi-column statistics width out of range",
-                        ));
+                Some("estat") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at: u64 = parse_field(words.next(), "estat identity")?;
+                    let table_index: usize = parse_field(words.next(), "estat table")?;
+                    let target_raw: i32 = parse_field(words.next(), "estat target")?;
+                    let target = match target_raw {
+                        -1 => None,
+                        0..=10_000 => Some(target_raw as u16),
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt("estat target out of range"));
+                        }
+                    };
+                    let kind_code: u8 = parse_field(words.next(), "estat kinds")?;
+                    let expression_only =
+                        match parse_field::<u8>(words.next(), "estat expression kind")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid estat expression kind",
+                                ));
+                            }
+                        };
+                    let kinds = if expression_only && kind_code == 0 {
+                        crate::sql::ast::StatisticsKinds::EXPRESSION
+                    } else if !expression_only {
+                        crate::sql::ast::StatisticsKinds::from_code(kind_code)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid estat kinds"))?
+                    } else {
+                        return Err(CheckpointSetupError::Corrupt("invalid estat kind state"));
+                    };
+                    let n_keys: usize = parse_field(words.next(), "estat key count")?;
+                    if n_keys == 0 || n_keys > crate::storage::MAX_EXTENDED_STATISTICS_KEYS {
+                        return Err(CheckpointSetupError::Corrupt("invalid estat key count"));
                     }
-                    let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
-                    for column in &mut columns[..n_columns] {
-                        *column = parse_field(words.next(), "multi statistics column")?;
-                        if usize::from(*column) >= crate::storage::MAX_COLUMNS {
-                            return Err(CheckpointSetupError::Corrupt(
-                                "multi-column statistics column out of range",
-                            ));
+                    let schema = sql_name(&decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("estat schema missing"))?,
+                    )?)?;
+                    let name = sql_name(&decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("estat name missing"))?,
+                    )?)?;
+                    let mut keys = [crate::storage::ExtendedStatisticsKey::Column(
+                        crate::storage::SqlName::EMPTY,
+                    );
+                        crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+                    for key in &mut keys[..n_keys] {
+                        let token = words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("estat key missing"))?;
+                        if let Some(column) = token.strip_prefix('c') {
+                            *key = crate::storage::ExtendedStatisticsKey::Column(sql_name(
+                                &decode_hex_name(column)?,
+                            )?);
+                        } else if let Some(expression) = token.strip_prefix('e') {
+                            let decoded = decode_hex_name(expression)?;
+                            let source = crate::util::StackStr::from_str(&decoded);
+                            if source.is_truncated() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "estat expression is too long",
+                                ));
+                            }
+                            *key = crate::storage::ExtendedStatisticsKey::Expression(source);
+                        } else {
+                            return Err(CheckpointSetupError::Corrupt("invalid estat key"));
                         }
                     }
-                    let non_null_rows: u64 =
-                        parse_field(words.next(), "multi statistics non-null rows")?;
-                    let distinct_values: u64 =
-                        parse_field(words.next(), "multi statistics distinct values")?;
+                    if words.next().is_some()
+                        || extended_statistics
+                            .iter()
+                            .any(|statistics| statistics.created_at == created_at)
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or malformed estat",
+                        ));
+                    }
+                    extended_statistics.push(LoadedExtendedStatistics {
+                        created_at,
+                        table_index,
+                        schema,
+                        name,
+                        target,
+                        kinds,
+                        expression_only,
+                        keys,
+                        n_keys: n_keys as u8,
+                        data: crate::storage::ExtendedStatisticsData::EMPTY,
+                    });
+                }
+                Some("estatdata") => {
+                    let created_at: u64 = parse_field(words.next(), "estatdata identity")?;
+                    let statistics = extended_statistics
+                        .iter_mut()
+                        .find(|statistics| statistics.created_at == created_at)
+                        .ok_or(CheckpointSetupError::Corrupt("estatdata precedes estat"))?;
+                    if statistics.data.valid {
+                        return Err(CheckpointSetupError::Corrupt("duplicate estatdata"));
+                    }
+                    statistics.data.valid = true;
+                    statistics.data.inherited =
+                        match parse_field::<u8>(words.next(), "estatdata inherited")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid estatdata inherited",
+                                ));
+                            }
+                        };
+                    statistics.data.analyzed_generation =
+                        parse_field(words.next(), "estatdata generation")?;
+                    statistics.data.rows = parse_field(words.next(), "estatdata rows")?;
+                    statistics.data.non_null_rows = parse_field(words.next(), "estatdata nonnull")?;
+                    statistics.data.distinct_values =
+                        parse_field(words.next(), "estatdata distinct")?;
                     if words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "malformed multi-column statistics",
-                        ));
+                        return Err(CheckpointSetupError::Corrupt("malformed estatdata"));
                     }
-                    let Some((_, statistics)) = table_statistics
+                }
+                Some("estatdep") => {
+                    let created_at: u64 = parse_field(words.next(), "estatdep identity")?;
+                    let index: usize = parse_field(words.next(), "estatdep index")?;
+                    let strength: u32 = parse_field(words.next(), "estatdep strength")?;
+                    let statistics = extended_statistics
                         .iter_mut()
-                        .find(|(existing, _)| *existing == table_index)
-                    else {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "multi-column statistics precede table statistics",
-                        ));
-                    };
-                    if statistics.multi_columns.iter().any(|statistic| {
-                        statistic.valid
-                            && statistic.n_columns as usize == n_columns
-                            && statistic.columns[..n_columns] == columns[..n_columns]
-                    }) {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "duplicate multi-column statistics",
-                        ));
+                        .find(|statistics| statistics.created_at == created_at)
+                        .ok_or(CheckpointSetupError::Corrupt("estatdep precedes estat"))?;
+                    if index >= statistics.data.dependencies_ppm.len()
+                        || strength > 1_000_000
+                        || statistics.data.dependencies_ppm[index] != 0
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatdep"));
                     }
-                    let Some(slot) = statistics
-                        .multi_columns
+                    statistics.data.dependencies_ppm[index] = strength;
+                }
+                Some("estatexpr") => {
+                    let created_at: u64 = parse_field(words.next(), "estatexpr identity")?;
+                    let key: usize = parse_field(words.next(), "estatexpr key")?;
+                    let statistics = extended_statistics
                         .iter_mut()
-                        .find(|statistic| !statistic.valid)
-                    else {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "too many multi-column statistics",
-                        ));
-                    };
-                    *slot = crate::storage::MultiColumnStatistics {
+                        .find(|statistics| statistics.created_at == created_at)
+                        .ok_or(CheckpointSetupError::Corrupt("estatexpr precedes estat"))?;
+                    if key >= usize::from(statistics.n_keys)
+                        || statistics.data.expression_statistics[key].valid
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexpr key"));
+                    }
+                    let null_fraction_ppm = parse_field(words.next(), "estatexpr null fraction")?;
+                    let distinct_values = parse_field(words.next(), "estatexpr distinct")?;
+                    let distinct_fraction_ppm =
+                        parse_field(words.next(), "estatexpr distinct fraction")?;
+                    let average_width = parse_field(words.next(), "estatexpr width")?;
+                    if null_fraction_ppm > 1_000_000
+                        || distinct_fraction_ppm > 1_000_000
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexpr"));
+                    }
+                    statistics.data.expression_statistics[key] = crate::storage::ColumnStatistics {
                         valid: true,
-                        columns,
-                        n_columns: n_columns as u8,
-                        non_null_rows,
+                        null_fraction_ppm,
                         distinct_values,
+                        distinct_fraction_ppm,
+                        average_width,
                     };
+                }
+                Some("estatmcv") => {
+                    let created_at: u64 = parse_field(words.next(), "estatmcv identity")?;
+                    let hash: u64 = parse_field(words.next(), "estatmcv hash")?;
+                    let count: u64 = parse_field(words.next(), "estatmcv count")?;
+                    let encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("estatmcv value missing"))?;
+                    let statistics = extended_statistics
+                        .iter_mut()
+                        .find(|statistics| statistics.created_at == created_at)
+                        .ok_or(CheckpointSetupError::Corrupt("estatmcv precedes estat"))?;
+                    let position = usize::from(statistics.data.n_mcv);
+                    if position >= crate::storage::MAX_EXTENDED_STATISTICS_MCV
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many or malformed estatmcv",
+                        ));
+                    }
+                    let decoded = decode_hex_name(encoded)?;
+                    let values = crate::util::StackStr::from_str(&decoded);
+                    if values.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt("estatmcv value is too long"));
+                    }
+                    statistics.data.mcv[position] = crate::storage::ExtendedStatisticsMcv {
+                        valid: true,
+                        hash,
+                        count,
+                        values,
+                    };
+                    statistics.data.n_mcv += 1;
                 }
                 Some("tsch") => {
                     let Some((_, def, _, _)) = pending_def.as_mut() else {
@@ -1859,25 +2011,7 @@ impl Checkpointer {
                     let roster = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("dsst roster"))?;
-                    let handle = if index == "-" {
-                        None
-                    } else {
-                        let (versioned, packed) = match words.next() {
-                            Some("v1") => (false, false),
-                            Some("v2") => (true, false),
-                            Some("v3") => (true, true),
-                            Some(_) | None => {
-                                return Err(CheckpointSetupError::Corrupt("unknown dsst format"));
-                            }
-                        };
-                        Some(SstHandle {
-                            index: parse_block_id(index)?,
-                            filter: parse_block_id(filter)?,
-                            roster: parse_block_id(roster)?,
-                            versioned,
-                            packed,
-                        })
-                    };
+                    let handle = parse_dsst_handle(index, filter, roster, &mut words)?;
                     bssts.push((mindex, idx, count, crc, handle));
                 }
                 Some("vix") => {
@@ -2848,6 +2982,47 @@ impl Checkpointer {
             }
             storage.install_table_statistics(slot, statistics);
         }
+        for statistics in extended_statistics {
+            let table = slot_of
+                .get(statistics.table_index)
+                .copied()
+                .flatten()
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "extended statistics reference unknown table",
+                ))?;
+            if statistics.keys[..usize::from(statistics.n_keys)]
+                .iter()
+                .any(|key| {
+                    matches!(key, crate::storage::ExtendedStatisticsKey::Column(column)
+                    if storage.table(table).def.column_index(column.as_str()).is_none())
+                })
+            {
+                return Err(CheckpointSetupError::Corrupt(
+                    "extended statistics reference a nonexistent column",
+                ));
+            }
+            let slot = storage
+                .replay_extended_statistics(crate::storage::ExtendedStatisticsSpec {
+                    created_at: statistics.created_at,
+                    schema: statistics.schema,
+                    name: statistics.name,
+                    table: table as u16,
+                    target: statistics.target,
+                    keys: statistics.keys,
+                    n_keys: statistics.n_keys,
+                    kinds: statistics.kinds,
+                    expression_only: statistics.expression_only,
+                })
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "manifest extended statistics rejected: {}",
+                        error.message.as_str()
+                    ))
+                })?;
+            if statistics.data.valid {
+                storage.install_extended_statistics_data(slot, statistics.data);
+            }
+        }
 
         storage.rebind_domain_base_types().map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -2949,7 +3124,7 @@ impl Checkpointer {
                     .map_err(|_| CheckpointSetupError::Corrupt("sst data block unreachable"))?;
             let mut at = 0usize;
             while let Some((key, _, _, next)) =
-                crate::store::block_keys_at(&index_buf[..decoded], at, handle.versioned)
+                crate::store::block_keys_at(&index_buf[..decoded], at)
             {
                 max_rowid = Some(key.rowid);
                 at = next;
@@ -3510,31 +3685,6 @@ impl Checkpointer {
                         ),
                     )?;
                 }
-                for statistics in table
-                    .statistics
-                    .multi_columns
-                    .iter()
-                    .filter(|statistic| statistic.valid)
-                {
-                    use core::fmt::Write;
-                    let mut line = StackStr::<256>::new();
-                    let _ = write!(line, "mcstat {slot} {}", statistics.n_columns);
-                    for column in &statistics.columns[..statistics.n_columns as usize] {
-                        let _ = write!(line, " {column}");
-                    }
-                    let _ = write!(
-                        line,
-                        " {} {}",
-                        statistics.non_null_rows, statistics.distinct_values
-                    );
-                    if line.is_truncated() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "multi-column statistics manifest line exceeds its fixed buffer"
-                        ));
-                    }
-                    write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
-                }
             }
             for (ci, c) in table.def.columns().iter().enumerate() {
                 if c.auto_increment {
@@ -3740,13 +3890,7 @@ impl Checkpointer {
                         core::str::from_utf8(&ih).expect("hex"),
                         core::str::from_utf8(&fh).expect("hex"),
                         core::str::from_utf8(&rh).expect("hex"),
-                        if h.packed {
-                            "v3"
-                        } else if h.versioned {
-                            "v2"
-                        } else {
-                            "v1"
-                        },
+                        if h.packed { "v3" } else { "v2" },
                     ),
                 )?;
             }
@@ -3786,6 +3930,111 @@ impl Checkpointer {
                         core::str::from_utf8(&roster).expect("hex"),
                         handle.entries,
                         handle.published_lsn,
+                    ),
+                )?;
+            }
+        }
+        for (statistics_slot, statistics) in storage.extended_statistics_visible(0) {
+            use core::fmt::Write as _;
+            let mutable = statistics.definition_for(0);
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            for byte in mutable.schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in mutable.name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            let mut line = StackStr::<10000>::new();
+            let _ = write!(
+                line,
+                "estat {} {} {} {} {} {} {}",
+                statistics.created_at,
+                statistics.table,
+                mutable.target.map_or(-1i32, i32::from),
+                statistics.kinds.code(),
+                u8::from(statistics.expression_only),
+                statistics.n_keys,
+                schema_hex.as_str(),
+            );
+            let _ = write!(line, " {}", name_hex.as_str());
+            for key in statistics.keys_for(0) {
+                match key {
+                    crate::storage::ExtendedStatisticsKey::Column(column) => {
+                        let _ = line.write_str(" c");
+                        for byte in column.as_str().as_bytes() {
+                            let _ = write!(line, "{byte:02x}");
+                        }
+                    }
+                    crate::storage::ExtendedStatisticsKey::Expression(expression) => {
+                        let _ = line.write_str(" e");
+                        for byte in expression.as_str().as_bytes() {
+                            let _ = write!(line, "{byte:02x}");
+                        }
+                    }
+                }
+            }
+            if line.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "extended-statistics manifest line exceeds its fixed buffer"
+                ));
+            }
+            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+
+            let data = storage.extended_statistics_data(statistics_slot, 0);
+            if !data.valid {
+                continue;
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "estatdata {} {} {} {} {} {}",
+                    statistics.created_at,
+                    u8::from(data.inherited),
+                    data.analyzed_generation,
+                    data.rows,
+                    data.non_null_rows,
+                    data.distinct_values,
+                ),
+            )?;
+            for (index, strength) in data.dependencies_ppm.iter().copied().enumerate() {
+                if strength != 0 {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!("estatdep {} {index} {strength}", statistics.created_at),
+                    )?;
+                }
+            }
+            for (key, column) in data.expression_statistics.iter().copied().enumerate() {
+                if column.valid {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!(
+                            "estatexpr {} {key} {} {} {} {}",
+                            statistics.created_at,
+                            column.null_fraction_ppm,
+                            column.distinct_values,
+                            column.distinct_fraction_ppm,
+                            column.average_width,
+                        ),
+                    )?;
+                }
+            }
+            for entry in &data.mcv[..usize::from(data.n_mcv)] {
+                let mut value_hex =
+                    StackStr::<{ 2 * crate::storage::EXTENDED_STATISTICS_MCV_TEXT_MAX }>::new();
+                for byte in entry.values.as_str().as_bytes() {
+                    let _ = write!(value_hex, "{byte:02x}");
+                }
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "estatmcv {} {} {} {}",
+                        statistics.created_at,
+                        entry.hash,
+                        entry.count,
+                        value_hex.as_str(),
                     ),
                 )?;
             }
@@ -5400,6 +5649,37 @@ fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
     Ok(BlockId(parse_hex_array(hex)?))
 }
 
+fn parse_dsst_handle<'a>(
+    index: &str,
+    filter: &str,
+    roster: &str,
+    words: &mut impl Iterator<Item = &'a str>,
+) -> Result<Option<SstHandle>, CheckpointSetupError> {
+    if index == "-" {
+        if filter != "-" || roster != "-" || words.next().is_some() {
+            return Err(CheckpointSetupError::Corrupt("malformed empty dsst"));
+        }
+        return Ok(None);
+    }
+    if filter == "-" || roster == "-" {
+        return Err(CheckpointSetupError::Corrupt("incomplete dsst handle"));
+    }
+    let packed = match words.next() {
+        Some("v2") => false,
+        Some("v3") => true,
+        Some(_) | None => return Err(CheckpointSetupError::Corrupt("unknown dsst format")),
+    };
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("malformed dsst handle"));
+    }
+    Ok(Some(SstHandle {
+        index: parse_block_id(index)?,
+        filter: parse_block_id(filter)?,
+        roster: parse_block_id(roster)?,
+        packed,
+    }))
+}
+
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {
     match e {
         crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
@@ -6742,6 +7022,35 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn dsst_manifest_accepts_only_current_complete_formats() {
+        let id = "00".repeat(32);
+        let mut direct = "v2".split(' ');
+        assert!(
+            !parse_dsst_handle(&id, &id, &id, &mut direct)
+                .unwrap()
+                .unwrap()
+                .packed
+        );
+        let mut packed = "v3".split(' ');
+        assert!(
+            parse_dsst_handle(&id, &id, &id, &mut packed)
+                .unwrap()
+                .unwrap()
+                .packed
+        );
+        let mut obsolete = "v1".split(' ');
+        assert!(parse_dsst_handle(&id, &id, &id, &mut obsolete).is_err());
+        let mut incomplete = core::iter::empty();
+        assert!(parse_dsst_handle(&id, "-", &id, &mut incomplete).is_err());
+        let mut empty = core::iter::empty();
+        assert!(
+            parse_dsst_handle("-", "-", "-", &mut empty)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn manifest_round_trip_preserves_reference_names() {

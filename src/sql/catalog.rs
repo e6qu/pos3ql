@@ -3647,6 +3647,19 @@ fn write_index_key_metadata(out: &mut impl core::fmt::Write, info: &IdxInfo, pos
     }
 }
 
+fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo) {
+    let _ = out.write_str(" ON ");
+    if info
+        .explicit_definition
+        .is_some_and(|definition| definition.kind.is_partitioned())
+    {
+        let _ = out.write_str("ONLY ");
+    }
+    write_identifier(out, table.schema.as_str());
+    let _ = out.write_char('.');
+    write_identifier(out, table.name.as_str());
+}
+
 fn write_index_storage_options(
     out: &mut impl core::fmt::Write,
     definition: Option<crate::storage::IndexMutableDefinition>,
@@ -3707,10 +3720,7 @@ pub fn index_def_text<'a>(
             if info.is_unique { "UNIQUE " } else { "" }
         );
         write_identifier(&mut s, info.name.as_str());
-        let _ = s.write_str(" ON ");
-        write_identifier(&mut s, def.schema.as_str());
-        let _ = s.write_char('.');
-        write_identifier(&mut s, def.name.as_str());
+        write_index_target(&mut s, def, info);
         let _ = s.write_str(if info.is_exclusion {
             " USING gist ("
         } else {
@@ -7584,10 +7594,7 @@ fn pg_indexes<'a>(
                 if info.is_unique { "UNIQUE " } else { "" },
             );
             write_identifier(&mut indexdef, info.name.as_str());
-            let _ = indexdef.write_str(" ON ");
-            write_identifier(&mut indexdef, table_def.schema.as_str());
-            let _ = indexdef.write_char('.');
-            write_identifier(&mut indexdef, table_def.name.as_str());
+            write_index_target(&mut indexdef, table_def, info);
             let _ = indexdef.write_str(if info.is_exclusion {
                 " USING gist ("
             } else {

@@ -28744,7 +28744,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
              FROM pg_index WHERE indexrelid = 'lifecycle_value_idx'::regclass",
         )),
         [
-            "CREATE INDEX lifecycle_value_idx ON public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
+            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
             "t|t|t|{0,950}|1978 3126|{0,1}",
         ]
     );

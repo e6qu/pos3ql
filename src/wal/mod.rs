@@ -124,6 +124,12 @@ const KIND_DROP_TABLESPACE: u8 = 74;
 const KIND_SET_EXTENDED_STATISTICS: u8 = 75;
 const KIND_DROP_EXTENDED_STATISTICS: u8 = 76;
 const KIND_ANALYZE_EXTENDED_STATISTICS: u8 = 77;
+const KIND_UPSERT_EXTENSION: u8 = 78;
+const KIND_DROP_EXTENSION: u8 = 79;
+const KIND_SET_EXTENSION_DEPENDENCY: u8 = 80;
+const KIND_SET_SEQUENCE_SCHEMA: u8 = 81;
+const KIND_SET_VIEW_SCHEMA: u8 = 82;
+const KIND_SET_EXTENSION_CONFIG: u8 = 83;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -131,7 +137,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ANALYZE_EXTENDED_STATISTICS;
+const LAST_KIND: u8 = KIND_SET_EXTENSION_CONFIG;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -718,10 +724,49 @@ pub(crate) enum WalOp<'a> {
     },
     CreateSchema(&'a str),
     DropSchema(&'a str),
+    UpsertExtension {
+        name: &'a str,
+        schema: &'a str,
+        version: &'a str,
+        relocatable: bool,
+        owner: &'a str,
+        created_at: u64,
+    },
+    DropExtension {
+        name: &'a str,
+    },
+    SetExtensionDependency {
+        extension: &'a str,
+        class: crate::storage::AccessClass,
+        object_oid: i32,
+        schema: &'a str,
+        name: &'a str,
+        kind: crate::storage::ExtensionDependencyKind,
+        exists: bool,
+    },
+    SetExtensionConfig {
+        extension: &'a str,
+        ordinal: u16,
+        relation_kind: crate::storage::ExtensionConfigRelationKind,
+        schema: &'a str,
+        name: &'a str,
+        condition: &'a str,
+        exists: bool,
+    },
     /// ALTER TABLE ... SET SCHEMA: a definition-only move. Replay moves the
     /// table and its indexes and repoints every inbound foreign key, all
     /// deterministically, so no row images are journaled.
     SetTableSchema {
+        schema: &'a str,
+        name: &'a str,
+        new_schema: &'a str,
+    },
+    SetSequenceSchema {
+        schema: &'a str,
+        name: &'a str,
+        new_schema: &'a str,
+    },
+    SetViewSchema {
         schema: &'a str,
         name: &'a str,
         new_schema: &'a str,
@@ -1602,7 +1647,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
         WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
         WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
+        WalOp::UpsertExtension { .. } => KIND_UPSERT_EXTENSION,
+        WalOp::DropExtension { .. } => KIND_DROP_EXTENSION,
+        WalOp::SetExtensionDependency { .. } => KIND_SET_EXTENSION_DEPENDENCY,
         WalOp::SetTableSchema { .. } => KIND_SET_TABLE_SCHEMA,
+        WalOp::SetSequenceSchema { .. } => KIND_SET_SEQUENCE_SCHEMA,
+        WalOp::SetViewSchema { .. } => KIND_SET_VIEW_SCHEMA,
+        WalOp::SetExtensionConfig { .. } => KIND_SET_EXTENSION_CONFIG,
         WalOp::DropTableFk { .. } => KIND_DROP_FK,
         WalOp::CreateMatview { .. } => KIND_CREATE_MATVIEW,
         WalOp::DropMatview { .. } => KIND_DROP_MATVIEW,
@@ -2009,7 +2060,59 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
+        WalOp::UpsertExtension {
+            name,
+            schema,
+            version,
+            owner,
+            ..
+        } => 8 + 1 + name.len() + 1 + schema.len() + 1 + version.len() + 1 + owner.len() + 1,
+        WalOp::DropExtension { name } => 1 + name.len(),
+        WalOp::SetExtensionDependency {
+            extension,
+            class,
+            schema,
+            name,
+            ..
+        } => {
+            1 + extension.len()
+                + 1
+                + usize::from(*class == crate::storage::AccessClass::Routine) * 4
+                + 1
+                + schema.len()
+                + 1
+                + name.len()
+                + 2
+        }
+        WalOp::SetExtensionConfig {
+            extension,
+            schema,
+            name,
+            condition,
+            ..
+        } => {
+            1 + extension.len()
+                + 2
+                + 1
+                + 1
+                + schema.len()
+                + 1
+                + name.len()
+                + 2
+                + condition.len()
+                + 1
+        }
         WalOp::SetTableSchema {
+            schema,
+            name,
+            new_schema,
+        }
+        | WalOp::SetSequenceSchema {
+            schema,
+            name,
+            new_schema,
+        }
+        | WalOp::SetViewSchema {
             schema,
             name,
             new_schema,
@@ -3066,7 +3169,69 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
+        WalOp::UpsertExtension {
+            name,
+            schema,
+            version,
+            relocatable,
+            owner,
+            created_at,
+        } => {
+            buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, version)
+                && buffer.append(&[u8::from(*relocatable)])
+                && name_bytes(buffer, owner)
+        }
+        WalOp::DropExtension { name } => name_bytes(buffer, name),
+        WalOp::SetExtensionDependency {
+            extension,
+            class,
+            object_oid,
+            schema,
+            name,
+            kind,
+            exists,
+        } => {
+            name_bytes(buffer, extension)
+                && buffer.append(&[*class as u8])
+                && (*class != crate::storage::AccessClass::Routine
+                    || buffer.append(&object_oid.to_le_bytes()))
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && buffer.append(&[kind.to_u8(), u8::from(*exists)])
+        }
+        WalOp::SetExtensionConfig {
+            extension,
+            ordinal,
+            relation_kind,
+            schema,
+            name,
+            condition,
+            exists,
+        } => {
+            name_bytes(buffer, extension)
+                && buffer.append(&ordinal.to_le_bytes())
+                && buffer.append(&[relation_kind.to_u8()])
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && u16::try_from(condition.len()).ok().is_some_and(|length| {
+                    buffer.append(&length.to_le_bytes()) && buffer.append(condition.as_bytes())
+                })
+                && buffer.append(&[u8::from(*exists)])
+        }
         WalOp::SetTableSchema {
+            schema,
+            name,
+            new_schema,
+        }
+        | WalOp::SetSequenceSchema {
+            schema,
+            name,
+            new_schema,
+        }
+        | WalOp::SetViewSchema {
             schema,
             name,
             new_schema,
@@ -5759,6 +5924,63 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSchema(name))
         }
+        KIND_UPSERT_EXTENSION => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let version = take_name(&mut at)?;
+            let relocatable = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let owner = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::UpsertExtension {
+                name,
+                schema,
+                version,
+                relocatable,
+                owner,
+                created_at,
+            })
+        }
+        KIND_DROP_EXTENSION => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropExtension { name })
+        }
+        KIND_SET_EXTENSION_DEPENDENCY => {
+            let extension = take_name(&mut at)?;
+            let class = *payload.get(at)?;
+            at += 1;
+            let class = crate::storage::AccessClass::from_u8(class)?;
+            let object_oid = if class == crate::storage::AccessClass::Routine {
+                let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                oid
+            } else {
+                0
+            };
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let kind = crate::storage::ExtensionDependencyKind::from_u8(*payload.get(at)?)?;
+            let exists = match *payload.get(at + 1)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 2;
+            (at == payload.len()).then_some(WalOp::SetExtensionDependency {
+                extension,
+                class,
+                object_oid,
+                schema,
+                name,
+                kind,
+                exists,
+            })
+        }
         KIND_SET_TABLE_SCHEMA => {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -5767,6 +5989,56 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 new_schema,
+            })
+        }
+        KIND_SET_SEQUENCE_SCHEMA => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::SetSequenceSchema {
+                schema,
+                name,
+                new_schema,
+            })
+        }
+        KIND_SET_VIEW_SCHEMA => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::SetViewSchema {
+                schema,
+                name,
+                new_schema,
+            })
+        }
+        KIND_SET_EXTENSION_CONFIG => {
+            let extension = take_name(&mut at)?;
+            let ordinal = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let relation_kind =
+                crate::storage::ExtensionConfigRelationKind::from_u8(*payload.get(at)?)?;
+            at += 1;
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let condition_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let condition = core::str::from_utf8(payload.get(at..at + condition_len)?).ok()?;
+            at += condition_len;
+            let exists = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetExtensionConfig {
+                extension,
+                ordinal,
+                relation_kind,
+                schema,
+                name,
+                condition,
+                exists,
             })
         }
         KIND_DROP_FK => {
@@ -6827,6 +7099,118 @@ mod tests {
             panic!("expected object ACL WAL operation");
         };
         assert_eq!(object_oid, 16_401);
+    }
+
+    #[test]
+    fn extension_catalog_wal_round_trips_typed_dependencies() {
+        let mut budget = Budget::new(4096);
+        let mut buffer = FixedBuf::new(&mut budget, "extension wal", 4096).unwrap();
+        append_record(
+            &mut buffer,
+            1,
+            &WalOp::UpsertExtension {
+                name: "typed_ext",
+                schema: "extensions",
+                version: "2.0",
+                relocatable: true,
+                owner: "postgres",
+                created_at: 47,
+            },
+        )
+        .unwrap();
+        let Some(WalOp::UpsertExtension {
+            name,
+            schema,
+            version,
+            relocatable,
+            owner,
+            created_at,
+        }) = decode_record(&buffer.readable()[16..])
+        else {
+            panic!("expected extension definition WAL operation");
+        };
+        assert_eq!(
+            (name, schema, version, relocatable, owner, created_at),
+            ("typed_ext", "extensions", "2.0", true, "postgres", 47)
+        );
+
+        buffer.clear();
+        append_record(
+            &mut buffer,
+            2,
+            &WalOp::SetExtensionDependency {
+                extension: "typed_ext",
+                class: crate::storage::AccessClass::Routine,
+                object_oid: 100_007,
+                schema: "extensions",
+                name: "typed_identity",
+                kind: crate::storage::ExtensionDependencyKind::Automatic,
+                exists: true,
+            },
+        )
+        .unwrap();
+        let Some(WalOp::SetExtensionDependency {
+            extension,
+            class,
+            object_oid,
+            schema,
+            name,
+            kind,
+            exists,
+        }) = decode_record(&buffer.readable()[16..])
+        else {
+            panic!("expected extension dependency WAL operation");
+        };
+        assert_eq!(extension, "typed_ext");
+        assert_eq!(class, crate::storage::AccessClass::Routine);
+        assert_eq!(object_oid, 100_007);
+        assert_eq!((schema, name), ("extensions", "typed_identity"));
+        assert_eq!(kind, crate::storage::ExtensionDependencyKind::Automatic);
+        assert!(exists);
+
+        buffer.clear();
+        append_record(
+            &mut buffer,
+            3,
+            &WalOp::SetExtensionConfig {
+                extension: "typed_ext",
+                ordinal: 4,
+                relation_kind: crate::storage::ExtensionConfigRelationKind::Table,
+                schema: "extensions",
+                name: "typed_config",
+                condition: "WHERE NOT built_in",
+                exists: true,
+            },
+        )
+        .unwrap();
+        let Some(WalOp::SetExtensionConfig {
+            extension,
+            ordinal,
+            relation_kind,
+            schema,
+            name,
+            condition,
+            exists,
+        }) = decode_record(&buffer.readable()[16..])
+        else {
+            panic!("expected extension configuration WAL operation");
+        };
+        assert_eq!(extension, "typed_ext");
+        assert_eq!(ordinal, 4);
+        assert_eq!(
+            relation_kind,
+            crate::storage::ExtensionConfigRelationKind::Table
+        );
+        assert_eq!((schema, name), ("extensions", "typed_config"));
+        assert_eq!(condition, "WHERE NOT built_in");
+        assert!(exists);
+
+        buffer.clear();
+        append_record(&mut buffer, 4, &WalOp::DropExtension { name: "typed_ext" }).unwrap();
+        assert!(matches!(
+            decode_record(&buffer.readable()[16..]),
+            Some(WalOp::DropExtension { name: "typed_ext" })
+        ));
     }
 
     fn test_config(dir: &str) -> Config {

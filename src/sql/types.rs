@@ -2316,21 +2316,21 @@ impl fmt::Display for Datum<'_> {
             Datum::Multirange { text, .. } => f.write_str(text),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
             Datum::Int2Vector(raw) => {
-                for (index, bytes) in raw.chunks_exact(2).enumerate() {
+                for (index, bytes) in raw.as_chunks::<2>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;
                     }
-                    let value = i16::from_le_bytes([bytes[0], bytes[1]]);
+                    let value = i16::from_le_bytes(*bytes);
                     write!(f, "{value}")?;
                 }
                 Ok(())
             }
             Datum::OidVector(raw) => {
-                for (index, bytes) in raw.chunks_exact(4).enumerate() {
+                for (index, bytes) in raw.as_chunks::<4>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;
                     }
-                    let value = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
+                    let value = u32::from_le_bytes(*bytes);
                     write!(f, "{value}")?;
                 }
                 Ok(())

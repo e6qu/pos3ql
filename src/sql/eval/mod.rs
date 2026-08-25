@@ -3310,14 +3310,16 @@ fn call<'a>(
                     super::array::get(raw, element, k - 1).unwrap_or(Datum::Null)
                 }
                 Datum::Int2Vector(raw) => raw
-                    .chunks_exact(2)
-                    .nth(k - 1)
-                    .map(|bytes| Datum::Int4(i16::from_le_bytes([bytes[0], bytes[1]]) as i32))
+                    .as_chunks::<2>()
+                    .0
+                    .get(k - 1)
+                    .map(|bytes| Datum::Int4(i16::from_le_bytes(*bytes) as i32))
                     .unwrap_or(Datum::Null),
                 Datum::OidVector(raw) => raw
-                    .chunks_exact(4)
-                    .nth(k - 1)
-                    .map(|bytes| Datum::Oid(u32::from_le_bytes(bytes.try_into().unwrap())))
+                    .as_chunks::<4>()
+                    .0
+                    .get(k - 1)
+                    .map(|bytes| Datum::Oid(u32::from_le_bytes(*bytes)))
                     .unwrap_or(Datum::Null),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),

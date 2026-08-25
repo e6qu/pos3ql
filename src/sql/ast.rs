@@ -327,6 +327,27 @@ pub enum Stmt<'a> {
         aggregate: AggregateIdentity<'a>,
         action: AlterRoutineAction<'a>,
     },
+    CreateExtension {
+        name: &'a str,
+        if_not_exists: bool,
+        schema: Option<&'a str>,
+        version: Option<&'a str>,
+        cascade: bool,
+    },
+    AlterExtension {
+        name: &'a str,
+        action: AlterExtensionAction<'a>,
+    },
+    AlterMaterializedViewExtensionDependency {
+        name: QualName<'a>,
+        extension: &'a str,
+        enabled: bool,
+    },
+    DropExtension {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// DROP VIEW [IF EXISTS] name.
     DropView {
         names: &'a [QualName<'a>],
@@ -445,6 +466,7 @@ pub enum Stmt<'a> {
         name: QualName<'a>,
         if_exists: bool,
         options: SeqOptions<'a>,
+        set_schema: Option<&'a str>,
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
     DropSequence {
@@ -749,6 +771,7 @@ pub enum AlterIndexAction<'a> {
     ResetOptions(IndexStorageOptionNames),
     SetStatistics { column: u16, target: i16 },
     AttachPartition(QualName<'a>),
+    ExtensionDependency { extension: &'a str, enabled: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1422,6 +1445,8 @@ pub enum CommentTarget<'a> {
     Schema(&'a str),
     /// TABLESPACE name.
     Tablespace(&'a str),
+    /// EXTENSION name.
+    Extension(&'a str),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
     Type { name: &'a str, domain_only: bool },
 }
@@ -2148,6 +2173,45 @@ pub enum AlterRoutineAction<'a> {
     SetOwner(&'a str),
     Rename(&'a str),
     SetSchema(&'a str),
+    ExtensionDependency { extension: &'a str, enabled: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionRelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+}
+
+/// A closed extension-member identity prevents unsupported object kinds from
+/// reaching the durable dependency graph as unchecked names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionMemberIdentity<'a> {
+    Aggregate(AggregateIdentity<'a>),
+    Routine {
+        kind: RoutineTargetKind,
+        identity: RoutineIdentity<'a>,
+    },
+    Relation {
+        kind: ExtensionRelationKind,
+        name: QualName<'a>,
+    },
+    Schema(&'a str),
+    Domain(QualName<'a>),
+    Type(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterExtensionAction<'a> {
+    Update {
+        version: Option<&'a str>,
+    },
+    SetSchema(&'a str),
+    Member {
+        add: bool,
+        object: ExtensionMemberIdentity<'a>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

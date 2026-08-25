@@ -1379,8 +1379,8 @@ fn copy_out_fields(payload: &[u8]) -> Result<(u16, bool), FrameError> {
     if payload.len() != expected {
         return Err(FrameError::Malformed);
     }
-    for format in payload[3..].chunks_exact(2) {
-        let format = i16::from_be_bytes(format.try_into().unwrap());
+    for format in payload[3..].as_chunks::<2>().0 {
+        let format = i16::from_be_bytes(*format);
         if format != i16::from(binary) {
             return Err(FrameError::Malformed);
         }

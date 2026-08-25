@@ -278,6 +278,7 @@ pub(crate) fn dispatch<'a>(
         name,
         "version"
             | "pg_is_in_recovery"
+            | "pg_extension_config_dump"
             | "current_database"
             | "current_catalog"
             | "current_schema"
@@ -359,6 +360,13 @@ pub(crate) fn dispatch<'a>(
             "pg_is_in_recovery" => {
                 arity(0)?;
                 Ok(Datum::Bool(false))
+            }
+            "pg_extension_config_dump" => {
+                arity(2)?;
+                Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "pg_extension_config_dump() can only be called from an SQL script executed by CREATE EXTENSION"
+                ))
             }
             // There are no grantable ACLs yet. Catalog rows therefore have the
             // same empty default ACL for every supported object kind.

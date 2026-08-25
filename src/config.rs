@@ -60,6 +60,13 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Colon-separated PostgreSQL extension roots; controls live below each
+    /// root's `extension` directory. Empty selects only durable packages.
+    pub extension_control_path: String,
+    /// Number of installation and update scripts retained at startup.
+    pub max_extension_scripts: usize,
+    /// Aggregate bytes retained for SQL extension scripts.
+    pub extension_script_bytes: usize,
     /// Fixed number of durable logical replication slots.
     pub max_replication_slots: usize,
     /// Fixed number of durable logical replication subscriptions.
@@ -178,6 +185,9 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            extension_control_path: String::new(),
+            max_extension_scripts: 128,
+            extension_script_bytes: 4 * MIB,
             max_replication_slots: 16,
             max_subscriptions: 16,
             subscription_receive_bytes: 64 * KIB,
@@ -339,6 +349,15 @@ impl Config {
                 "max_tables" => {
                     config.max_tables =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "extension_control_path" => config.extension_control_path = value.to_string(),
+                "max_extension_scripts" => {
+                    config.max_extension_scripts =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "extension_script_bytes" => {
+                    config.extension_script_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
                 "max_cursors" => {
                     config.max_cursors =
@@ -525,6 +544,16 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "collation_scratch_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if config.max_extension_scripts == 0
+            || config.max_extension_scripts > 256
+            || config.extension_script_bytes == 0
+        {
+            return Err(ConfigError::at(
+                0,
+                "max_extension_scripts must be between 1 and 256 and extension_script_bytes must be greater than zero"
+                    .to_string(),
             ));
         }
         if config.subscription_receive_bytes == 0

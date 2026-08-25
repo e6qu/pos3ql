@@ -2257,6 +2257,16 @@ pub fn drop_table(
                 ));
             }
             Some(crate::storage::ResolvedRelation::Table(index)) => {
+                if let Err(error) = storage.require_not_extension_member(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Table,
+                        slot: index as u16,
+                    },
+                    txn.txid,
+                    "table",
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) = storage.require_owner(
                     crate::storage::AccessObject {
                         class: crate::storage::AccessClass::Table,
@@ -2770,6 +2780,68 @@ fn preserve_object_acl(
     Ok(())
 }
 
+fn materialized_view_access_object(
+    storage: &Storage,
+    name: &QualName,
+    txid: u32,
+) -> Result<Option<crate::storage::AccessObject>, SqlError> {
+    use crate::storage::{AccessClass, AccessObject, ResolvedRelation};
+    match storage.resolve_relation(name.schema, name.name, txid) {
+        Some(ResolvedRelation::Table(table)) => {
+            let definition = storage.table_def(table, txid);
+            let Some(slot) =
+                storage.matview_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a materialized view",
+                    name.name
+                ));
+            };
+            Ok(Some(AccessObject {
+                class: AccessClass::MaterializedView,
+                slot: slot as u16,
+            }))
+        }
+        Some(_) => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a materialized view",
+            name.name
+        )),
+        None => Ok(None),
+    }
+}
+
+pub fn alter_materialized_view_extension_dependency(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &QualName,
+    extension: &str,
+    enabled: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let object = match materialized_view_access_object(storage, name, txn.txid) {
+        Ok(Some(object)) => object,
+        Ok(None) => return sql_fail(undefined_qual(name)),
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "materialized view") {
+        return sql_fail(error);
+    }
+    if let Err(error) = set_extension_dependency(
+        storage,
+        txn,
+        extension,
+        object,
+        crate::storage::ExtensionDependencyKind::Automatic,
+        enabled,
+    ) {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER MATERIALIZED VIEW")?;
+    sql_ok()
+}
+
 pub fn alter_owner(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -2871,32 +2943,12 @@ pub fn alter_owner(
             }
             None => None,
         },
-        AlterOwnerKind::MaterializedView => match relation() {
-            Some(crate::storage::ResolvedRelation::Table(table)) => {
-                let def = *storage.table_def(table, txn.txid);
-                let Some(slot) =
-                    storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
-                else {
-                    return sql_fail(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "\"{}\" is not a materialized view",
-                        name.name
-                    ));
-                };
-                Some(AccessObject {
-                    class: AccessClass::MaterializedView,
-                    slot: slot as u16,
-                })
+        AlterOwnerKind::MaterializedView => {
+            match materialized_view_access_object(storage, name, txn.txid) {
+                Ok(object) => object,
+                Err(error) => return sql_fail(error),
             }
-            Some(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a materialized view",
-                    name.name
-                ));
-            }
-            None => None,
-        },
+        }
         AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txn.txid) {
             Ok(Some(slot)) => Some(AccessObject {
                 class: AccessClass::Sequence,
@@ -3933,7 +3985,7 @@ fn privilege_mask(
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
-        AccessClass::Statistics => PrivilegeSet::NONE,
+        AccessClass::Statistics | AccessClass::Extension => PrivilegeSet::NONE,
     };
     let mut result = PrivilegeSet::NONE;
     for privilege in privileges {
@@ -4197,6 +4249,7 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Composite => DefaultPrivilegeClass::Type,
         AccessClass::Tablespace => return Ok(()),
         AccessClass::Statistics => return Ok(()),
+        AccessClass::Extension => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -5673,6 +5726,16 @@ pub fn drop_schema(
         }
         match storage.find_schema_visible(name, txn.txid) {
             Some(slot) => {
+                if let Err(error) = storage.require_not_extension_member(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Schema,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                    "schema",
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) = storage.require_owner(
                     crate::storage::AccessObject {
                         class: crate::storage::AccessClass::Schema,
@@ -15737,9 +15800,675 @@ pub struct DropRoutineCommand<'a> {
     pub kind: crate::sql::ast::RoutineTargetKind,
 }
 
+pub(crate) const MAX_EXTENSION_UPDATE_PATH: usize = 32;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExtensionExecutionPlan {
+    pub extension: usize,
+    pub package: usize,
+    pub scripts: [u16; MAX_EXTENSION_UPDATE_PATH],
+    pub script_count: usize,
+    pub run_as_bootstrap: bool,
+}
+
+pub(crate) fn prepare_update_extension(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &str,
+    version: Option<&str>,
+) -> Result<ExtensionExecutionPlan, SqlError> {
+    let extension = storage.extension_slot(name, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "extension \"{}\" does not exist",
+            name
+        )
+    })?;
+    storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Extension,
+            slot: extension as u16,
+        },
+        txn.txid,
+        "extension",
+    )?;
+    let (package, target, definition) = storage.extension_package_for_version(name, version)?;
+    if definition.code == crate::storage::ExtensionPackageCode::NativeLibrary {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" requires a native library, which pos3ql does not load",
+            name
+        ));
+    }
+    let (namespace, _relocatable, current) = storage.extension(extension).definition_to(txn.txid);
+    if let Some(required_schema) = definition.schema
+        && storage.schema_def(namespace as usize).name != required_schema
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" version \"{}\" requires schema \"{}\"",
+            name,
+            target.as_str(),
+            required_schema.as_str()
+        ));
+    }
+    let (scripts, script_count) = extension_update_path(storage, package, Some(current), target)?;
+    if script_count == 0 {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "extension \"{}\" is already at version \"{}\"",
+            name,
+            target.as_str()
+        ));
+    }
+    let prior = storage.alter_extension_definition(
+        extension,
+        namespace as usize,
+        definition.relocatable,
+        target,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionAltered {
+        slot: extension as u32,
+        prior,
+    }) {
+        storage.rollback_extension_alter(extension, prior);
+        return Err(error);
+    }
+    Ok(ExtensionExecutionPlan {
+        extension,
+        package,
+        scripts,
+        script_count,
+        run_as_bootstrap: {
+            let current = storage.current_role_slot(txn.txid).ok_or_else(|| {
+                sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist")
+            })?;
+            definition.superuser
+                && definition.trusted
+                && !storage.role(current).attributes_to(txn.txid).superuser
+        },
+    })
+}
+
+pub(crate) fn set_extension_schema(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &str,
+    schema: &str,
+) -> Result<(), SqlError> {
+    let extension = storage.extension_slot(name, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "extension \"{}\" does not exist",
+            name
+        )
+    })?;
+    storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Extension,
+            slot: extension as u16,
+        },
+        txn.txid,
+        "extension",
+    )?;
+    let (old_namespace, relocatable, version) =
+        storage.extension(extension).definition_to(txn.txid);
+    if !relocatable {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" does not support SET SCHEMA",
+            name
+        ));
+    }
+    if let Some(blocker) = storage.extension_relocation_blocker(name, txn.txid) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" does not support SET SCHEMA because extension \"{}\" depends on its schema",
+            name,
+            blocker.as_str()
+        ));
+    }
+    let namespace = storage
+        .find_schema_visible(schema, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                schema
+            )
+        })?;
+    storage.require_schema_create(schema, txn.txid)?;
+    if old_namespace as usize == namespace {
+        return Ok(());
+    }
+    let prior =
+        storage.alter_extension_definition(extension, namespace, true, version, txn.txid)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionAltered {
+        slot: extension as u32,
+        prior,
+    }) {
+        storage.rollback_extension_alter(extension, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn drop_extension_catalog(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &str,
+    if_exists: bool,
+    cascade: bool,
+) -> Result<Option<usize>, SqlError> {
+    let Some(extension) = storage.extension_slot(name, txn.txid) else {
+        if if_exists {
+            return Ok(None);
+        }
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "extension \"{}\" does not exist",
+            name
+        ));
+    };
+    storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Extension,
+            slot: extension as u16,
+        },
+        txn.txid,
+        "extension",
+    )?;
+    if !cascade
+        && storage
+            .extension_dependencies_visible_to(txn.txid)
+            .any(|(_, dependency)| {
+                dependency.extension as usize == extension
+                    && dependency.kind != crate::storage::ExtensionDependencyKind::Member
+            })
+    {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop extension \"{}\" because other objects depend on it",
+            name
+        ));
+    }
+    storage.drop_extension_in(extension, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDropped(extension as u32)) {
+        storage.rollback_extension_drop(extension, txn.txid);
+        return Err(error);
+    }
+    Ok(Some(extension))
+}
+
+fn extension_update_path(
+    storage: &Storage,
+    package: usize,
+    start: Option<crate::storage::ExtensionVersion>,
+    target: crate::storage::ExtensionVersion,
+) -> Result<([u16; MAX_EXTENSION_UPDATE_PATH], usize), SqlError> {
+    const MAX_SCRIPTS: usize = 256;
+    let mut versions = [None; MAX_SCRIPTS + 1];
+    let mut predecessor = [u16::MAX; MAX_SCRIPTS + 1];
+    let mut incoming = [u16::MAX; MAX_SCRIPTS + 1];
+    let mut queue = [0u16; MAX_SCRIPTS + 1];
+    versions[0] = start;
+    queue[0] = 0;
+    let mut count = 1usize;
+    let mut at = 0usize;
+    let mut found = None;
+    while at < count {
+        let node = queue[at] as usize;
+        at += 1;
+        if versions[node] == Some(target) {
+            found = Some(node);
+            break;
+        }
+        for (script_slot, script) in storage.extension_scripts_for(package) {
+            if script.from != versions[node] {
+                continue;
+            }
+            let destination = Some(script.to);
+            if versions[..count].contains(&destination) {
+                continue;
+            }
+            if count == versions.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "extension update graph exceeds {} versions",
+                    MAX_SCRIPTS
+                ));
+            }
+            versions[count] = destination;
+            predecessor[count] = node as u16;
+            incoming[count] = script_slot as u16;
+            queue[count] = count as u16;
+            count += 1;
+        }
+    }
+    let Some(mut node) = found else {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "extension has no update path to version \"{}\"",
+            target.as_str()
+        ));
+    };
+    let mut reversed = [u16::MAX; MAX_EXTENSION_UPDATE_PATH];
+    let mut length = 0usize;
+    while predecessor[node] != u16::MAX {
+        if length == reversed.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "extension update path exceeds {} scripts",
+                reversed.len()
+            ));
+        }
+        reversed[length] = incoming[node];
+        length += 1;
+        node = predecessor[node] as usize;
+    }
+    let mut path = [u16::MAX; MAX_EXTENSION_UPDATE_PATH];
+    for index in 0..length {
+        path[index] = reversed[length - index - 1];
+    }
+    Ok((path, length))
+}
+
+pub(crate) fn prepare_create_extension(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &str,
+    if_not_exists: bool,
+    schema: Option<&str>,
+    version: Option<&str>,
+) -> Result<Option<ExtensionExecutionPlan>, SqlError> {
+    if storage.extension_slot(name, txn.txid).is_some() {
+        if if_not_exists {
+            return Ok(None);
+        }
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "extension \"{}\" already exists",
+            name
+        ));
+    }
+    let (package_slot, target, package) = storage.extension_package_for_version(name, version)?;
+    if package.code == crate::storage::ExtensionPackageCode::NativeLibrary {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" requires a native library, which pos3ql does not load",
+            name
+        ));
+    }
+    let current = storage
+        .current_role_slot(txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+    let attributes = storage.role(current).attributes_to(txn.txid);
+    let has_database_create = storage.has_current_database_create_privilege(current, txn.txid);
+    if package.superuser && !attributes.superuser && !(package.trusted && has_database_create) {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to create extension \"{}\"",
+            name
+        ));
+    }
+    let (scripts, script_count) = extension_update_path(storage, package_slot, None, target)?;
+    let fixed_schema = package.schema;
+    if let (Some(written), Some(fixed)) = (schema, fixed_schema)
+        && written != fixed.as_str()
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "extension \"{}\" must be installed in schema \"{}\"",
+            name,
+            fixed.as_str()
+        ));
+    }
+    let fixed_schema_name = fixed_schema.as_ref().map(SqlName::as_str);
+    let target_schema = fixed_schema_name.or(schema).map_or_else(
+        || storage.creation_schema(None, name, txn.txid),
+        |schema| storage.creation_schema(Some(schema), name, txn.txid),
+    )?;
+    storage.require_schema_create(target_schema.as_str(), txn.txid)?;
+    let namespace = storage
+        .find_schema_visible(target_schema.as_str(), txn.txid)
+        .expect("creation schema was resolved");
+    let extension = storage.create_extension(
+        SqlName::parse(name)?,
+        namespace,
+        package.relocatable,
+        target,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionCreated(extension as u32)) {
+        storage.rollback_extension_create(extension);
+        return Err(error);
+    }
+    Ok(Some(ExtensionExecutionPlan {
+        extension,
+        package: package_slot,
+        scripts,
+        script_count,
+        run_as_bootstrap: package.superuser
+            && !attributes.superuser
+            && package.trusted
+            && has_database_create,
+    }))
+}
+
 pub enum DropRoutineTargets<'a> {
     Routines(&'a [super::ast::RoutineIdentity<'a>]),
     Aggregates(&'a [super::ast::AggregateIdentity<'a>]),
+}
+
+pub(crate) fn set_extension_dependency(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    extension_name: &str,
+    object: crate::storage::AccessObject,
+    kind: crate::storage::ExtensionDependencyKind,
+    enabled: bool,
+) -> Result<(), SqlError> {
+    let extension = storage
+        .extension_slot(extension_name, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension \"{}\" does not exist",
+                extension_name
+            )
+        })?;
+    let (slot, prior) =
+        storage.change_extension_dependency(extension, object, kind, enabled, txn.txid)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extension_dependency(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn set_extension_config(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    extension: usize,
+    relation: crate::storage::ExtensionConfigRelation,
+    condition: &str,
+) -> Result<(), SqlError> {
+    let condition = crate::storage::extension_config_condition(condition)?;
+    let (slot, prior) =
+        storage.change_extension_config(extension, relation, condition, true, txn.txid)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionConfigChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extension_config(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_extension_config(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    extension: usize,
+    relation: crate::storage::ExtensionConfigRelation,
+) -> Result<(), SqlError> {
+    let Some(config_slot) = storage.extension_config_slot(extension, relation, txn.txid) else {
+        return Ok(());
+    };
+    let condition = storage.extension_config(config_slot).condition_to(txn.txid);
+    let (slot, prior) =
+        storage.change_extension_config(extension, relation, condition, false, txn.txid)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionConfigChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extension_config(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_extension_member(
+    storage: &Storage,
+    txid: u32,
+    identity: crate::sql::ast::ExtensionMemberIdentity<'_>,
+) -> Result<crate::storage::AccessObject, SqlError> {
+    use crate::sql::ast::{ExtensionMemberIdentity, ExtensionRelationKind, RoutineTargetKind};
+    use crate::storage::{AccessClass, AccessObject, StoredRelKind};
+    let routine_object = |identity: &super::ast::RoutineIdentity<'_>,
+                          expected: RoutineTargetKind|
+     -> Result<AccessObject, SqlError> {
+        let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
+        let find_in = |schema: &str| {
+            if identity.signature_is_explicit {
+                storage.routine_slot_by_declared_signature(
+                    schema,
+                    identity.name.name,
+                    &arguments[..identity.argument_types.len()],
+                    txid,
+                )
+            } else {
+                storage
+                    .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
+                    .ok()
+                    .flatten()
+            }
+        };
+        let slot = if let Some(schema) = identity.name.schema {
+            find_in(schema)
+        } else {
+            storage
+                .path()
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    crate::storage::PathEntry::Schema(slot) => {
+                        find_in(storage.schema_def(*slot as usize).name.as_str())
+                    }
+                    crate::storage::PathEntry::Catalog => None,
+                })
+        }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "routine \"{}\" does not exist",
+                identity.name.name
+            )
+        })?;
+        let actual = match storage.routine_for(slot, txid).kind {
+            crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
+            crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
+            _ => RoutineTargetKind::Function,
+        };
+        if expected != RoutineTargetKind::Either && expected != actual {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} \"{}\" does not exist",
+                expected.noun(),
+                identity.name.name
+            ));
+        }
+        Ok(AccessObject {
+            class: AccessClass::Routine,
+            slot: slot as u16,
+        })
+    };
+    match identity {
+        ExtensionMemberIdentity::Routine { kind, identity } => routine_object(&identity, kind),
+        ExtensionMemberIdentity::Aggregate(aggregate) => {
+            let total =
+                aggregate.direct_argument_types.len() + aggregate.aggregated_argument_types.len();
+            if total > MAX_ROUTINE_ARGUMENTS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many aggregate arguments"
+                ));
+            }
+            let mut types = [""; MAX_ROUTINE_ARGUMENTS];
+            types[..aggregate.direct_argument_types.len()]
+                .copy_from_slice(aggregate.direct_argument_types);
+            types[aggregate.direct_argument_types.len()..total]
+                .copy_from_slice(aggregate.aggregated_argument_types);
+            routine_object(
+                &super::ast::RoutineIdentity {
+                    name: aggregate.name,
+                    argument_types: &types[..total],
+                    signature_is_explicit: true,
+                },
+                RoutineTargetKind::Aggregate,
+            )
+        }
+        ExtensionMemberIdentity::Relation { kind, name } => {
+            let Some((schema, actual)) = storage.classify_relation(name.schema, name.name, txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    name.name
+                ));
+            };
+            let class = match (kind, actual) {
+                (ExtensionRelationKind::Table, StoredRelKind::Table) => AccessClass::Table,
+                (ExtensionRelationKind::View, StoredRelKind::View) => AccessClass::View,
+                (ExtensionRelationKind::MaterializedView, StoredRelKind::Matview) => {
+                    AccessClass::MaterializedView
+                }
+                (ExtensionRelationKind::Sequence, StoredRelKind::Sequence) => AccessClass::Sequence,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not the requested extension member type",
+                        name.name
+                    ));
+                }
+            };
+            storage
+                .resolve_access_object(class, schema.as_str(), name.name, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "extension member does not exist"
+                    )
+                })
+        }
+        ExtensionMemberIdentity::Schema(name) => storage
+            .resolve_access_object(AccessClass::Schema, "", name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    name
+                )
+            }),
+        ExtensionMemberIdentity::Domain(name) => {
+            let schema = name.schema.unwrap_or("public");
+            storage
+                .resolve_access_object(AccessClass::Domain, schema, name.name, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "domain \"{}\" does not exist",
+                        name.name
+                    )
+                })
+        }
+        ExtensionMemberIdentity::Type(name) => {
+            let schema = name.schema.unwrap_or("public");
+            storage
+                .resolve_access_object(AccessClass::Domain, schema, name.name, txid)
+                .or_else(|| {
+                    storage.resolve_access_object(AccessClass::Enum, schema, name.name, txid)
+                })
+                .or_else(|| {
+                    storage.resolve_access_object(AccessClass::Composite, schema, name.name, txid)
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        name.name
+                    )
+                })
+        }
+    }
+}
+
+pub(crate) fn alter_extension_membership(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    extension_name: &str,
+    add: bool,
+    identity: crate::sql::ast::ExtensionMemberIdentity<'_>,
+) -> Result<(), SqlError> {
+    let extension = storage
+        .extension_slot(extension_name, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension \"{}\" does not exist",
+                extension_name
+            )
+        })?;
+    storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Extension,
+            slot: extension as u16,
+        },
+        txn.txid,
+        "extension",
+    )?;
+    let object = resolve_extension_member(storage, txn.txid, identity)?;
+    storage.require_owner(object, txn.txid, "extension member")?;
+    if !add
+        && let Some(relation) = crate::storage::ExtensionConfigRelation::from_access_object(object)
+    {
+        remove_extension_config(storage, txn, extension, relation)?;
+    }
+    let (slot, prior) = storage.change_extension_dependency(
+        extension,
+        object,
+        crate::storage::ExtensionDependencyKind::Member,
+        add,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extension_dependency(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn record_extension_member(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    extension: usize,
+    object: crate::storage::AccessObject,
+) -> Result<(), SqlError> {
+    if storage.extension_member_of(object, txn.txid) == Some(extension) {
+        return Ok(());
+    }
+    let (slot, prior) = storage.change_extension_dependency(
+        extension,
+        object,
+        crate::storage::ExtensionDependencyKind::Member,
+        true,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extension_dependency(slot, prior);
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn alter_aggregate(
@@ -15850,17 +16579,34 @@ pub fn alter_routine(
         Ok(arguments) => arguments,
         Err(error) => return sql_fail(error),
     };
-    let Some(slot) = storage.routine_slot_by_declared_signature(
-        schema,
-        identity.name.name,
-        &arguments[..identity.argument_types.len()],
-        txn.txid,
-    ) else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "routine \"{}\" does not exist",
-            identity.name.name
-        ));
+    let slot = if identity.signature_is_explicit {
+        Ok(storage.routine_slot_by_declared_signature(
+            schema,
+            identity.name.name,
+            &arguments[..identity.argument_types.len()],
+            txn.txid,
+        ))
+    } else {
+        storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
+    };
+    let slot = match slot {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{} \"{}\" does not exist",
+                kind.noun(),
+                identity.name.name
+            ));
+        }
+        Err(()) => {
+            return sql_fail(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "{} name \"{}\" is not unique",
+                kind.noun(),
+                identity.name.name
+            ));
+        }
     };
     let routine = *storage.routine(slot);
     let actual_kind = match routine.kind {
@@ -15878,6 +16624,26 @@ pub fn alter_routine(
     }
     if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
         return sql_fail(error);
+    }
+    if let crate::sql::ast::AlterRoutineAction::ExtensionDependency { extension, enabled } = action
+    {
+        if let Err(error) = set_extension_dependency(
+            storage,
+            txn,
+            extension,
+            Storage::routine_access_object(slot),
+            crate::storage::ExtensionDependencyKind::Automatic,
+            enabled,
+        ) {
+            return sql_fail(error);
+        }
+        responder.command_complete(match kind {
+            crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+            crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+            crate::sql::ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
+            crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+        })?;
+        return sql_ok();
     }
     if let crate::sql::ast::AlterRoutineAction::SetOwner(role) = action {
         let role = resolve_role_name(role);
@@ -15963,7 +16729,8 @@ pub fn alter_routine(
             };
             (schema, routine.name_for(txn.txid))
         }
-        crate::sql::ast::AlterRoutineAction::SetOwner(_) => unreachable!(),
+        crate::sql::ast::AlterRoutineAction::SetOwner(_)
+        | crate::sql::ast::AlterRoutineAction::ExtensionDependency { .. } => unreachable!(),
     };
     let old_schema = routine.schema_for(txn.txid);
     let old_name = routine.name_for(txn.txid);
@@ -16074,17 +16841,15 @@ pub fn drop_routine(
             Ok(arguments) => arguments,
             Err(error) => return sql_fail(error),
         };
-        let slot = match storage.routine_slot_by_declared_signature(
-            schema,
-            identity_name.name,
-            &arguments[..argument_types.len()],
-            txn.txid,
-        ) {
-            Some(slot) => Ok(Some(slot)),
-            None if !signature_is_explicit => {
-                storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
-            }
-            None => Ok(None),
+        let slot = if signature_is_explicit {
+            Ok(storage.routine_slot_by_declared_signature(
+                schema,
+                identity_name.name,
+                &arguments[..argument_types.len()],
+                txn.txid,
+            ))
+        } else {
+            storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
         };
         let slot = match slot {
             Ok(Some(slot)) => slot,
@@ -16138,6 +16903,13 @@ pub fn drop_routine(
                 kind.noun(),
                 identity_name.name
             ));
+        }
+        if let Err(error) = storage.require_not_extension_member(
+            Storage::routine_access_object(slot),
+            txn.txid,
+            actual_kind.noun(),
+        ) {
+            return sql_fail(error);
         }
         if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
             return sql_fail(error);
@@ -16696,6 +17468,27 @@ pub fn comment(
                 Err(error) => return sql_fail(error),
             };
             (CommentClass::Tablespace, SqlName::EMPTY, stored, 0u32)
+        }
+        CommentTarget::Extension(extension_name) => {
+            let Some(slot) = storage.extension_slot(extension_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "extension \"{}\" does not exist",
+                    extension_name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Extension,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "extension") {
+                return sql_fail(error);
+            }
+            let stored = match SqlName::parse(extension_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (CommentClass::Extension, SqlName::EMPTY, stored, 0u32)
         }
         CommentTarget::Type {
             name: type_name,
@@ -17391,6 +18184,16 @@ pub fn drop_materialized_view(
         let matview_slot = storage
             .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
             .expect("resolved materialized view has a catalog entry");
+        if let Err(error) = storage.require_not_extension_member(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::MaterializedView,
+                slot: matview_slot as u16,
+            },
+            txn.txid,
+            "materialized view",
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.require_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::MaterializedView,
@@ -17746,15 +18549,26 @@ pub fn create_sequence(
 }
 
 /// ALTER SEQUENCE [IF EXISTS] — redefine parameters (and optionally RESTART).
+pub struct AlterSequenceCommand<'a> {
+    pub name: &'a QualName<'a>,
+    pub if_exists: bool,
+    pub options: &'a crate::sql::ast::SeqOptions<'a>,
+    pub set_schema: Option<&'a str>,
+}
+
 pub fn alter_sequence(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &QualName,
-    if_exists: bool,
-    options: &crate::sql::ast::SeqOptions,
+    command: AlterSequenceCommand<'_>,
     responder: &mut Responder,
 ) -> Outcome {
+    let AlterSequenceCommand {
+        name,
+        if_exists,
+        options,
+        set_schema,
+    } = command;
     let slot = match resolve_sequence(storage, name, txn.txid) {
         Ok(Some(slot)) => slot,
         Ok(None) if if_exists => {
@@ -17779,6 +18593,35 @@ pub fn alter_sequence(
         return sql_fail(error);
     }
     let prior = storage.sequence_for(slot, txn.txid);
+    let target_schema = match set_schema {
+        Some(schema) => {
+            if storage.find_schema_visible(schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            if schema != prior.schema.as_str()
+                && storage.relation_name_taken(schema, prior.name.as_str(), txn.txid)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists in schema \"{}\"",
+                    prior.name.as_str(),
+                    schema
+                ));
+            }
+            match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            }
+        }
+        None => prior.schema,
+    };
     let base = SeqSpec {
         data_type: prior.data_type,
         increment: prior.increment,
@@ -17821,21 +18664,35 @@ pub fn alter_sequence(
         }
     };
     let generator_for = prior.generator_for;
-    let prior_definition =
-        match storage.stage_sequence_alter(slot, spec, owner, generator_for, restart, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => return sql_fail(error),
-        };
+    let prior_definition = match storage.stage_sequence_alter(
+        slot,
+        crate::storage::SequenceAlteration {
+            schema: target_schema,
+            spec,
+            owner,
+            generator_for,
+            restart,
+        },
+        txn.txid,
+    ) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
     let (schema, sname) = {
         let s = storage.sequence_for(slot, txn.txid);
         (s.schema, s.name)
     };
-    // The redefinition journals as a CreateSequence (absolute parameters).
+    // Parameter changes are absolute definitions; namespace changes preserve
+    // the sequence identity through their dedicated operation.
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(
-        txn.txid,
-        lsn,
-        &WalOp::CreateSequence {
+    let operation = if set_schema.is_some() {
+        WalOp::SetSequenceSchema {
+            schema: prior.schema.as_str(),
+            name: prior.name.as_str(),
+            new_schema: schema.as_str(),
+        }
+    } else {
+        WalOp::CreateSequence {
             schema: schema.as_str(),
             name: sname.as_str(),
             data_type: spec.data_type.to_u8(),
@@ -17847,8 +18704,9 @@ pub fn alter_sequence(
             cycle: spec.cycle,
             owner,
             generator_for,
-        },
-    ) {
+        }
+    };
+    if let Err(e) = wal.stage(txn.txid, lsn, &operation) {
         storage.rollback_sequence_alter(slot, prior_definition);
         return sql_fail(e);
     }
@@ -17887,6 +18745,16 @@ pub fn drop_sequence(
             Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
             Err(e) => return sql_fail(e),
         };
+        if let Err(error) = storage.require_not_extension_member(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "sequence",
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.require_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Sequence,
@@ -18573,6 +19441,16 @@ pub fn drop_domain(
                 name.name
             ));
         };
+        if let Err(error) = storage.require_not_extension_member(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Domain,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "type",
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.require_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Domain,
@@ -19535,6 +20413,16 @@ pub fn drop_type(
                 None => storage.resolve_composite_slot(name.name, txn.txid),
             };
             if let Some(slot) = composite {
+                if let Err(error) = storage.require_not_extension_member(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Composite,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                    "type",
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) = drop_composite_type(
                     storage,
                     wal,
@@ -19563,6 +20451,16 @@ pub fn drop_type(
                 name.name
             ));
         };
+        if let Err(error) = storage.require_not_extension_member(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Enum,
+                slot: slot as u16,
+            },
+            txn.txid,
+            "type",
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.require_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Enum,
@@ -23249,6 +24147,16 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
+            if let Err(error) = storage.require_not_extension_member(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "view",
+            ) {
+                return sql_fail(error);
+            }
             if let Err(error) = storage.require_owner(
                 crate::storage::AccessObject {
                     class: crate::storage::AccessClass::View,
@@ -23719,6 +24627,11 @@ pub fn drop_statistics(
             class: crate::storage::AccessClass::Statistics,
             slot: slot as u16,
         };
+        if let Err(error) =
+            storage.require_not_extension_member(object, txn.txid, "statistics object")
+        {
+            return sql_fail(error);
+        }
         if let Err(error) = storage.require_owner(object, txn.txid, "statistics object") {
             return sql_fail(error);
         }
@@ -24648,7 +25561,7 @@ fn create_partition_index_children(
             } else {
                 (0..storage.index_count())
                     .find(|slot| {
-                        storage.index_table_slot(*slot) == Some(parent_table)
+                        storage.index_table_slot_to(*slot, txn.txid) == Some(parent_table)
                             && storage
                                 .index_visible_to(*slot, txn.txid)
                                 .is_some_and(|index| {
@@ -24785,7 +25698,7 @@ fn refresh_partitioned_index_validity(
         .index_visible_to(index_slot, txn.txid)
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     let parent_table = storage
-        .index_table_slot(index_slot)
+        .index_table_slot_to(index_slot, txn.txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index has no table"))?;
     let mut valid = true;
     for child in 0..storage.table_count() {
@@ -24879,7 +25792,7 @@ pub fn alter_index(
     if let Err(error) = storage.require_owner(object, txn.txid, "index") {
         return sql_fail(error);
     }
-    let Some(table) = storage.index_table_slot(slot) else {
+    let Some(table) = storage.index_table_slot_to(slot, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "index \"{}\" has no table",
@@ -25047,10 +25960,10 @@ pub fn alter_index(
                     parent_index.name_for(txn.txid).as_str()
                 ));
             }
-            let Some(parent_table) = storage.index_table_slot(slot) else {
+            let Some(parent_table) = storage.index_table_slot_to(slot, txn.txid) else {
                 return sql_fail(sql_err!(sqlstate::INTERNAL_ERROR, "index has no table"));
             };
-            let Some(child_table) = storage.index_table_slot(child_slot) else {
+            let Some(child_table) = storage.index_table_slot_to(child_slot, txn.txid) else {
                 return sql_fail(sql_err!(sqlstate::INTERNAL_ERROR, "index has no table"));
             };
             if !storage
@@ -25082,6 +25995,18 @@ pub fn alter_index(
                     .index_visible_to(index_slot, txn.txid)
                     .and_then(|index| index.mutable_for(txn.txid).parent)
                     .map(usize::from);
+            }
+        }
+        crate::sql::ast::AlterIndexAction::ExtensionDependency { extension, enabled } => {
+            if let Err(error) = set_extension_dependency(
+                storage,
+                txn,
+                extension,
+                object,
+                crate::storage::ExtensionDependencyKind::Automatic,
+                enabled,
+            ) {
+                return sql_fail(error);
             }
         }
     }
@@ -25594,6 +26519,9 @@ pub fn drop_index(
                     txn.txid,
                 )
                 .expect("resolved index exists");
+            if let Err(error) = storage.require_not_extension_member(object, txn.txid, "index") {
+                return sql_fail(error);
+            }
             if let Err(error) = storage.require_owner(object, txn.txid, "index") {
                 return sql_fail(error);
             }
@@ -25617,7 +26545,7 @@ pub fn drop_index(
                     name.name
                 ));
             }
-            if let Some(table) = storage.index_table_slot(slot)
+            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
                 && let Err(error) = storage.lock_table(
                     txn.txid,
                     table,
@@ -25838,7 +26766,7 @@ pub fn reindex(
             if selected_index.is_some_and(|selected| selected != index_slot) {
                 continue;
             }
-            let Some(table) = storage.index_table_slot(index_slot) else {
+            let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {
                 continue;
             };
             if selected_index.is_none() && !tables[..table_count].contains(&table) {
@@ -28274,7 +29202,7 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
                 "int2vector exceeds the statement arena"
             )
         })?;
-    for slot in raw.chunks_exact_mut(2) {
+    for slot in raw.as_chunks_mut::<2>().0 {
         let len = reader.i32().map_err(|_| bad())?;
         if len != 2 {
             return Err(bad());
@@ -28326,7 +29254,7 @@ fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datu
                 "oidvector exceeds the statement arena"
             )
         })?;
-    for slot in raw.chunks_exact_mut(4) {
+    for slot in raw.as_chunks_mut::<4>().0 {
         let len = reader.i32().map_err(|_| bad())?;
         if len != 4 {
             return Err(bad());

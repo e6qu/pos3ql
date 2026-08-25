@@ -2667,6 +2667,7 @@ pub fn infer_type_res(
                 (crate::sql::types::ArrElem::Text.array_oid(), -1)
             }
             "pg_typeof" => (oid::REGTYPE, 4),
+            "pg_extension_config_dump" => (oid::VOID, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
             "pg_table_is_visible"
             | "pg_type_is_visible"

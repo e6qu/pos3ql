@@ -7,6 +7,537 @@
 use super::*;
 
 #[test]
+fn extension_packages_execute_transactionally_and_recover_catalog_state() {
+    let mut config = test_config("extension-lifecycle");
+    let package_root = std::path::Path::new(&config.data_dir).join("extensions");
+    let package_dir = package_root.join("extension");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("base_ext.control"),
+        "default_version = '1.0'\nrelocatable = true\nsuperuser = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("base_ext--1.0.sql"),
+        "CREATE TABLE base_values (value integer);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext.control"),
+        "default_version = '1.0'\nrelocatable = true\nsuperuser = false\nrequires = 'base_ext'\ncomment = 'typed extension fixture'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext--1.0.sql"),
+        "CREATE TABLE typed_values (id integer PRIMARY KEY, value text);\n\
+         CREATE FUNCTION typed_identity(value text) RETURNS text LANGUAGE SQL AS $$ SELECT value $$;\n\
+         CREATE SEQUENCE typed_sequence;\n\
+         CREATE TABLE typed_config (key text, built_in boolean);\n\
+         CREATE SEQUENCE typed_config_sequence;\n\
+         SELECT pg_catalog.pg_extension_config_dump('typed_config', 'WHERE NOT built_in');\n\
+         SELECT pg_catalog.pg_extension_config_dump('typed_config_sequence', '');\n\
+         CREATE VIEW typed_view AS SELECT id, value FROM typed_values;\n\
+         CREATE MATERIALIZED VIEW typed_snapshot AS SELECT 42 AS value;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext--1.0--2.0.sql"),
+        "ALTER TABLE typed_values ADD COLUMN enabled boolean DEFAULT true;\n\
+         SELECT pg_catalog.pg_extension_config_dump('typed_config', 'WHERE built_in IS FALSE');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext--2.0.control"),
+        "comment = 'typed extension v2'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext--2.0--3.0.sql"),
+        "ALTER TABLE typed_values ADD COLUMN generation integer DEFAULT 3;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("typed_ext--3.0.control"),
+        "comment = 'typed extension v3'\n",
+    )
+    .unwrap();
+    config.extension_control_path = package_root.to_str().unwrap().to_string();
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("extension-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT name, default_version, installed_version \
+               FROM pg_available_extensions ORDER BY name; \
+             SELECT name, version, installed, relocatable, requires::text, comment \
+               FROM pg_available_extension_versions ORDER BY name, version",
+        )),
+        [
+            "base_ext|1.0|NULL",
+            "typed_ext|1.0|NULL",
+            "base_ext|1.0|f|t|{}|NULL",
+            "typed_ext|1.0|f|t|{base_ext}|typed extension fixture",
+            "typed_ext|2.0|f|t|{base_ext}|typed extension v2",
+            "typed_ext|3.0|f|t|{base_ext}|typed extension v3",
+        ]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA extensions; \
+         CREATE EXTENSION typed_ext SCHEMA extensions CASCADE; \
+         SELECT extname, extversion, nspname, extrelocatable \
+           FROM pg_extension extension_catalog JOIN pg_namespace \
+             ON pg_namespace.oid=extension_catalog.extnamespace \
+           ORDER BY extname; \
+         SELECT count(*) FROM pg_depend d JOIN pg_extension e \
+           ON e.oid=d.refobjid WHERE d.deptype IN ('e','n'); \
+         SELECT extconfig IS NOT NULL, extcondition::text FROM pg_extension \
+           WHERE extname='typed_ext'; \
+         CREATE SCHEMA moved_extensions; \
+         ALTER EXTENSION typed_ext SET SCHEMA moved_extensions; \
+         ALTER EXTENSION typed_ext UPDATE TO '2.0'; \
+         INSERT INTO moved_extensions.typed_values(id,value) VALUES (1,'kept'); \
+         SELECT value, enabled FROM moved_extensions.typed_values; \
+         SELECT nextval('moved_extensions.typed_sequence'); \
+         SELECT value FROM moved_extensions.typed_snapshot; \
+         SELECT count(*) FROM moved_extensions.typed_view;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "base_ext|1.0|extensions|t",
+            "typed_ext|1.0|extensions|t",
+            "10",
+            "t|{\"WHERE NOT built_in\",\"\"}",
+            "kept|t",
+            "1",
+            "42",
+            "1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT value, enabled FROM moved_extensions.typed_values; \
+             SELECT nextval('moved_extensions.typed_sequence'); \
+             SELECT value FROM moved_extensions.typed_snapshot; \
+             SELECT count(*) FROM moved_extensions.typed_view; \
+             SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'; \
+             SELECT description FROM pg_description d JOIN pg_extension e \
+               ON e.oid=d.objoid WHERE e.extname='typed_ext'",
+        )),
+        [
+            "base_ext|1.0",
+            "typed_ext|2.0",
+            "kept|t",
+            "2",
+            "42",
+            "1",
+            "{\"WHERE built_in IS FALSE\",\"\"}",
+            "typed extension v2"
+        ]
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    config.extension_control_path.clear();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut recovered_budget = cold_budget;
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT value, enabled FROM moved_extensions.typed_values; \
+             SELECT value FROM moved_extensions.typed_snapshot; \
+             SELECT count(*) FROM moved_extensions.typed_view; \
+             SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'; \
+             SELECT version FROM pg_available_extension_versions \
+               WHERE name='typed_ext' ORDER BY version; \
+             ALTER EXTENSION typed_ext UPDATE TO '3.0'; \
+             SELECT generation FROM moved_extensions.typed_values; \
+             SELECT description FROM pg_description d JOIN pg_extension e \
+               ON e.oid=d.objoid WHERE e.extname='typed_ext'",
+        )),
+        [
+            "base_ext|1.0",
+            "typed_ext|2.0",
+            "kept|t",
+            "42",
+            "1",
+            "{\"WHERE built_in IS FALSE\",\"\"}",
+            "1.0",
+            "2.0",
+            "3.0",
+            "3",
+            "typed extension v3"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "BEGIN; ALTER EXTENSION typed_ext DROP TABLE moved_extensions.typed_config; \
+             SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'; \
+             ROLLBACK; \
+             SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'",
+        )),
+        ["{\"\"}", "{\"WHERE built_in IS FALSE\",\"\"}"]
+    );
+    let rejected = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "DROP TABLE moved_extensions.typed_values CASCADE",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("extension \"typed_ext\" requires it"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let restricted = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "DROP EXTENSION base_ext",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("other extensions depend on it"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let dropped = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "DROP EXTENSION base_ext CASCADE; \
+         SELECT count(*) FROM pg_extension; \
+         SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
+         SELECT count(*) FROM pg_proc WHERE proname='typed_identity'",
+    );
+    assert_eq!(
+        data_rows(&dropped),
+        ["0", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    drop(recovered);
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_extension; \
+             SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
+             SELECT count(*) FROM pg_depend WHERE deptype IN ('e','x','n')",
+        )),
+        ["0", "0", "0"]
+    );
+    drop(replayed);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
+    let mut config = test_config("extension-errors");
+    let package_root = std::path::Path::new(&config.data_dir).join("extensions");
+    let package_dir = package_root.join("extension");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    let package = |name: &str, control: &str, script: &str| {
+        std::fs::write(package_dir.join(format!("{name}.control")), control).unwrap();
+        std::fs::write(package_dir.join(format!("{name}--1.0.sql")), script).unwrap();
+    };
+    package(
+        "empty_ext",
+        "default_version='1.0'\nrelocatable=true\nsuperuser=false\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "native_ext",
+        "default_version='1.0'\nmodule_pathname='$libdir/native_ext'\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "cycle_a",
+        "default_version='1.0'\nrequires='cycle_b'\nsuperuser=false\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "cycle_b",
+        "default_version='1.0'\nrequires='cycle_a'\nsuperuser=false\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "required_ext",
+        "default_version='1.0'\nrelocatable=true\nsuperuser=false\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "guard_ext",
+        "default_version='1.0'\nrelocatable=true\nsuperuser=false\nrequires='required_ext'\nno_relocate='required_ext'\n",
+        "SELECT 1;\n",
+    );
+    package(
+        "bad_config_ext",
+        "default_version='1.0'\nrelocatable=true\nsuperuser=false\n",
+        "SELECT pg_catalog.pg_extension_config_dump('public.unowned_config', '');\n",
+    );
+    package(
+        "trusted_ext",
+        "default_version='1.0'\ntrusted=true\n",
+        "SELECT 1;\n",
+    );
+    config.extension_control_path = package_root.to_str().unwrap().to_string();
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unowned_config(key text)",
+    );
+    let direct_config_dump = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_catalog.pg_extension_config_dump('unowned_config', '')",
+    );
+    assert!(
+        String::from_utf8_lossy(&direct_config_dump)
+            .contains("can only be called from an SQL script executed by CREATE EXTENSION"),
+        "{}",
+        String::from_utf8_lossy(&direct_config_dump)
+    );
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_catalog.pg_extension_config_dump($1, $2)",
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [crate::sql::types::oid::VOID]
+    );
+    let bad_config = run_with(&mut engine, &mut budget, "CREATE EXTENSION bad_config_ext");
+    assert!(
+        String::from_utf8_lossy(&bad_config)
+            .contains("is not a member of the extension being created"),
+        "{}",
+        String::from_utf8_lossy(&bad_config)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_extension WHERE extname='bad_config_ext'",
+        )),
+        ["0"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE database_creator CREATEDB LOGIN",
+    );
+    let createdb_is_not_database_create = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE database_creator; CREATE EXTENSION trusted_ext",
+    );
+    assert!(
+        String::from_utf8_lossy(&createdb_is_not_database_create)
+            .contains("permission denied to create extension"),
+        "{}",
+        String::from_utf8_lossy(&createdb_is_not_database_create)
+    );
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+
+    let native = run_with(&mut engine, &mut budget, "CREATE EXTENSION native_ext");
+    assert!(
+        String::from_utf8_lossy(&native).contains("native library"),
+        "{}",
+        String::from_utf8_lossy(&native)
+    );
+    let cycle = run_with(&mut engine, &mut budget, "CREATE EXTENSION cycle_a CASCADE");
+    assert!(
+        String::from_utf8_lossy(&cycle).contains("cyclic extension requirement"),
+        "{}",
+        String::from_utf8_lossy(&cycle)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_extension",
+        )),
+        ["0"]
+    );
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; CREATE EXTENSION empty_ext; ROLLBACK; \
+             SELECT count(*) FROM pg_extension",
+        )),
+        ["0"]
+    );
+    let setup_membership = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EXTENSION empty_ext; CREATE EXTENSION IF NOT EXISTS empty_ext; \
+         CREATE TABLE member_table(id integer); \
+         ALTER EXTENSION empty_ext ADD TABLE member_table",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup_membership).contains("SERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup_membership)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT deptype FROM pg_depend \
+             WHERE classid='pg_class'::regclass AND objid='member_table'::regclass \
+               AND refclassid='pg_extension'::regclass \
+               AND refobjid=(SELECT oid FROM pg_extension WHERE extname='empty_ext')",
+        )),
+        ["e"]
+    );
+    let member_drop = run_with(&mut engine, &mut budget, "DROP TABLE member_table");
+    assert!(
+        String::from_utf8_lossy(&member_drop).contains("extension \"empty_ext\" requires it"),
+        "{}",
+        String::from_utf8_lossy(&member_drop)
+    );
+    let setup_automatic = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER EXTENSION empty_ext DROP TABLE member_table; DROP TABLE member_table; \
+         CREATE TABLE indexed_table(id integer); \
+         CREATE INDEX extension_index ON indexed_table(id); \
+         ALTER INDEX extension_index DEPENDS ON EXTENSION empty_ext; \
+         CREATE MATERIALIZED VIEW extension_snapshot AS SELECT 1 AS value; \
+         ALTER MATERIALIZED VIEW extension_snapshot DEPENDS ON EXTENSION empty_ext; \
+         CREATE MATERIALIZED VIEW extension_kept_snapshot AS SELECT 2 AS value; \
+         ALTER MATERIALIZED VIEW extension_kept_snapshot DEPENDS ON EXTENSION empty_ext; \
+         ALTER MATERIALIZED VIEW extension_kept_snapshot NO DEPENDS ON EXTENSION empty_ext; \
+         CREATE FUNCTION extension_function() RETURNS integer LANGUAGE SQL AS $$ SELECT 1 $$; \
+         ALTER FUNCTION extension_function DEPENDS ON EXTENSION empty_ext; \
+         CREATE FUNCTION extension_sum_state(state bigint, value integer) RETURNS bigint \
+           LANGUAGE SQL AS $$ SELECT coalesce(state, 0) + value $$; \
+         CREATE AGGREGATE extension_sum(integer) \
+           (SFUNC = extension_sum_state, STYPE = bigint, INITCOND = '0'); \
+         ALTER ROUTINE extension_sum(integer) DEPENDS ON EXTENSION empty_ext; \
+         DROP EXTENSION empty_ext",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup_automatic).contains("SERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup_automatic)
+    );
+    let automatic = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_class WHERE relname='extension_index'; \
+         SELECT count(*) FROM pg_class WHERE relname='extension_snapshot'; \
+         SELECT count(*) FROM pg_class WHERE relname='extension_kept_snapshot'; \
+         SELECT count(*) FROM pg_proc WHERE proname IN ('extension_function','extension_sum'); \
+         SELECT count(*) FROM indexed_table; \
+         DROP MATERIALIZED VIEW extension_kept_snapshot",
+    );
+    assert_eq!(
+        data_rows(&automatic),
+        ["0", "0", "1", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&automatic)
+    );
+
+    let aggregate_dependency = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER AGGREGATE extension_sum(integer) DEPENDS ON EXTENSION required_ext",
+    );
+    assert!(
+        String::from_utf8_lossy(&aggregate_dependency).contains("C42601"),
+        "{}",
+        String::from_utf8_lossy(&aggregate_dependency)
+    );
+    let index_if_exists_dependency = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX IF EXISTS absent_index DEPENDS ON EXTENSION required_ext",
+    );
+    assert!(
+        String::from_utf8_lossy(&index_if_exists_dependency).contains("C42601"),
+        "{}",
+        String::from_utf8_lossy(&index_if_exists_dependency)
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA required_schema; CREATE SCHEMA guard_schema; \
+         CREATE SCHEMA another_schema; \
+         CREATE EXTENSION guard_ext SCHEMA guard_schema CASCADE",
+    );
+    let relocation = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER EXTENSION required_ext SET SCHEMA another_schema",
+    );
+    assert!(
+        String::from_utf8_lossy(&relocation).contains("depends on its schema"),
+        "{}",
+        String::from_utf8_lossy(&relocation)
+    );
+    let independent_drop = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EXTENSION empty_ext; \
+         CREATE TABLE automatic_source(id integer); \
+         CREATE INDEX automatic_index ON automatic_source(id); \
+         ALTER INDEX automatic_index DEPENDS ON EXTENSION empty_ext; \
+         DROP INDEX automatic_index; \
+         SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+           WHERE e.extname='empty_ext' AND d.deptype='x'",
+    );
+    assert_eq!(data_rows(&independent_drop), ["0"]);
+    drop(engine);
+
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_extension WHERE extname='empty_ext'; \
+             SELECT count(*) FROM pg_class WHERE relname='automatic_index'; \
+             SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+               WHERE e.extname='empty_ext' AND d.deptype='x'",
+        )),
+        ["1", "0", "0"]
+    );
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn extended_statistics_are_typed_transactional_catalog_objects() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

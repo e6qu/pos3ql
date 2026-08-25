@@ -90,6 +90,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install SQL extension oracle fixtures
+        if: matrix.run_fast == '1'
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
+
       - name: Expose PostgreSQL 18 dump tools from the service image
         run: |
           mkdir -p .ci-bin
@@ -147,4 +155,6 @@ jobs:
           # PostgreSQL-implementation-specific (unspecified within-row operand
           # order, plan-dependent projection placement). Ratchet toward zero.
           FUZZ_BUDGET: "0"
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
         run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh

@@ -181,6 +181,10 @@ pub(crate) enum DdlUndo {
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
     /// undo by reviving it.
     ViewDropped(u32),
+    ViewSchemaChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingObjectSchema>,
+    },
     /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
     RoutineCreated(u32),
     RoutineDropped(u32),
@@ -331,6 +335,20 @@ pub(crate) enum DdlUndo {
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
     SchemaDropped(u32),
+    ExtensionCreated(u32),
+    ExtensionDropped(u32),
+    ExtensionAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingExtensionDefinition>,
+    },
+    ExtensionDependencyChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingExtensionDependency>,
+    },
+    ExtensionConfigChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingExtensionConfig>,
+    },
     /// CREATE/ALTER/DROP ROLE changed one transaction-private role overlay.
     /// Restoring the prior overlay makes repeated changes and savepoints exact.
     RoleChanged {

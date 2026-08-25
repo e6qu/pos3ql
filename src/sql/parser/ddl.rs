@@ -12,10 +12,11 @@ use super::{
 use crate::sql::ast::{
     AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
     AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
-    AlterIndexAction, AlterPublicationAction, AlterRoutineAction, AlterStatisticsAction,
-    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming,
-    ConstraintValidation, CreateDomain, CreateRoutine, CreateSchemaElement, CreateStatistics,
-    CreateTrigger, DomainCheck, ExclusionOperator, Expr, IndexBuildMode, IndexStorageOptionNames,
+    AlterExtensionAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
+    AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction, AlterTypeAction,
+    ConstraintMode, ConstraintTiming, ConstraintValidation, CreateDomain, CreateRoutine,
+    CreateSchemaElement, CreateStatistics, CreateTrigger, DomainCheck, ExclusionOperator, Expr,
+    ExtensionMemberIdentity, ExtensionRelationKind, IndexBuildMode, IndexStorageOptionNames,
     IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
     PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
     PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
@@ -605,12 +606,18 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("attach")? {
             self.expect_ident("partition")?;
             AlterIndexAction::AttachPartition(self.qual_name("partition index name")?)
-        } else if self.eat_ident("depends")? || self.eat_ident("no")? {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "extensions are not supported"),
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-            });
+        } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+            if if_exists {
+                return Err(self.err_here("IF EXISTS is not allowed with DEPENDS ON EXTENSION"));
+            }
+            let enabled = !self.eat_ident("no")?;
+            self.expect_ident("depends")?;
+            self.expect_ident("on")?;
+            self.expect_ident("extension")?;
+            AlterIndexAction::ExtensionDependency {
+                extension: self.col_ident("extension name")?,
+                enabled,
+            }
         } else {
             return Err(self.err_here("expected an ALTER INDEX action"));
         };
@@ -664,6 +671,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("aggregate")? {
             return self.create_aggregate(false);
         }
+        if self.eat_ident("extension")? {
+            return self.create_extension();
+        }
         if self.eat_ident("publication")? {
             return self.create_publication();
         }
@@ -711,6 +721,207 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn extension_version(&mut self) -> Result<&'a str, ParseError> {
+        let version = match self.peeked {
+            Tok::Ident(value) | Tok::Str(value) | Tok::Num(value) => value,
+            _ => return Err(self.err_here("extension version is required")),
+        };
+        if version.is_empty()
+            || version.starts_with('-')
+            || version.ends_with('-')
+            || version.contains("--")
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "invalid extension version name: {}", version),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        self.advance()?;
+        Ok(version)
+    }
+
+    fn create_extension(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.col_ident("extension name")?;
+        let _ = self.eat_ident("with")?;
+        let mut schema = None;
+        let mut version = None;
+        let mut cascade = false;
+        while self.peeked != Tok::Eof && self.peeked != Tok::Op(";") {
+            if self.eat_ident("schema")? {
+                if schema.replace(self.col_ident("schema name")?).is_some() {
+                    return Err(self.err_here("SCHEMA specified more than once"));
+                }
+            } else if self.eat_ident("version")? {
+                let parsed = self.extension_version()?;
+                if version.replace(parsed).is_some() {
+                    return Err(self.err_here("VERSION specified more than once"));
+                }
+            } else if self.eat_ident("cascade")? {
+                if cascade {
+                    return Err(self.err_here("CASCADE specified more than once"));
+                }
+                cascade = true;
+            } else {
+                return Err(self.unexpected("expected SCHEMA, VERSION, or CASCADE"));
+            }
+        }
+        Ok(Stmt::CreateExtension {
+            name,
+            if_not_exists,
+            schema,
+            version,
+            cascade,
+        })
+    }
+
+    fn extension_routine_identity(
+        &mut self,
+        kind: RoutineTargetKind,
+    ) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
+        let name = self.qual_name("routine name")?;
+        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0usize;
+        let signature_is_explicit = self.eat_op("(")?;
+        if signature_is_explicit && !self.eat_op(")")? {
+            loop {
+                let (argument_type, input) = self.routine_identity_argument()?;
+                if input {
+                    if count == argument_types.len() {
+                        return Err(self.limit("routine arguments", argument_types.len()));
+                    }
+                    argument_types[count] = argument_type;
+                    count += 1;
+                }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        Ok(ExtensionMemberIdentity::Routine {
+            kind,
+            identity: RoutineIdentity {
+                name,
+                argument_types: self.arena_slice(&argument_types[..count])?,
+                signature_is_explicit,
+            },
+        })
+    }
+
+    /// Parses the identity-bearing portion of one routine argument. OUT-only
+    /// arguments are consumed but excluded from the declared signature; the
+    /// returned type has already crossed the ordinary typed-name boundary.
+    fn routine_identity_argument(&mut self) -> Result<(&'a str, bool), ParseError> {
+        let input = match self.peeked {
+            Tok::Ident("out") | Tok::Ident("table") => {
+                self.advance()?;
+                false
+            }
+            Tok::Ident("in") | Tok::Ident("inout") | Tok::Ident("variadic") => {
+                self.advance()?;
+                true
+            }
+            _ => true,
+        };
+        let first = self.type_name()?;
+        let argument_type = if !matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            // The first identifier was the optional argument name. It cannot
+            // be retained in a routine identity, so parse and return the type.
+            self.type_name()?
+        } else {
+            first
+        };
+        Ok((argument_type, input))
+    }
+
+    fn extension_member(&mut self) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
+        if self.eat_ident("aggregate")? {
+            return Ok(ExtensionMemberIdentity::Aggregate(
+                self.aggregate_identity()?,
+            ));
+        }
+        if self.eat_ident("function")? {
+            return self.extension_routine_identity(RoutineTargetKind::Function);
+        }
+        if self.eat_ident("procedure")? {
+            return self.extension_routine_identity(RoutineTargetKind::Procedure);
+        }
+        if self.eat_ident("routine")? {
+            return self.extension_routine_identity(RoutineTargetKind::Either);
+        }
+        let relation = if self.eat_ident("table")? {
+            Some(ExtensionRelationKind::Table)
+        } else if self.eat_ident("view")? {
+            Some(ExtensionRelationKind::View)
+        } else if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            Some(ExtensionRelationKind::MaterializedView)
+        } else if self.eat_ident("sequence")? {
+            Some(ExtensionRelationKind::Sequence)
+        } else {
+            None
+        };
+        if let Some(kind) = relation {
+            return Ok(ExtensionMemberIdentity::Relation {
+                kind,
+                name: self.qual_name("extension member name")?,
+            });
+        }
+        if self.eat_ident("schema")? {
+            return Ok(ExtensionMemberIdentity::Schema(
+                self.col_ident("schema name")?,
+            ));
+        }
+        if self.eat_ident("domain")? {
+            return Ok(ExtensionMemberIdentity::Domain(
+                self.qual_name("domain name")?,
+            ));
+        }
+        if self.eat_ident("type")? {
+            return Ok(ExtensionMemberIdentity::Type(self.qual_name("type name")?));
+        }
+        Err(ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "unsupported extension member object kind"),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        })
+    }
+
+    pub(super) fn alter_extension(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("extension name")?;
+        let action = if self.eat_ident("update")? {
+            let version = if self.eat_ident("to")? {
+                Some(self.extension_version()?)
+            } else {
+                None
+            };
+            AlterExtensionAction::Update { version }
+        } else if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterExtensionAction::SetSchema(self.col_ident("schema name")?)
+        } else {
+            let add = if self.eat_ident("add")? {
+                true
+            } else {
+                self.expect_ident("drop")?;
+                false
+            };
+            AlterExtensionAction::Member {
+                add,
+                object: self.extension_member()?,
+            }
+        };
+        Ok(Stmt::AlterExtension { name, action })
     }
 
     fn create_statistics(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -1418,7 +1629,16 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("plpgsql")? {
                     crate::sql::ast::RoutineLanguage::PlPgSql
                 } else {
-                    return Err(self.unexpected("supported routine language"));
+                    let unsupported = self.any_ident("routine language")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "routine language \"{}\" is not supported",
+                            unsupported
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
                 });
             } else if self.eat_ident("as")? {
                 if body.is_some() {
@@ -2044,11 +2264,21 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(crate::sql::ast::AlterOwnerKind::Sequence, name, if_exists);
         }
+        if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            return Ok(Stmt::AlterSequence {
+                name,
+                if_exists,
+                options: crate::sql::ast::SeqOptions::EMPTY,
+                set_schema: Some(self.col_ident("schema name")?),
+            });
+        }
         let options = self.seq_options(true)?;
         Ok(Stmt::AlterSequence {
             name,
             if_exists,
             options,
+            set_schema: None,
         })
     }
 
@@ -3244,6 +3474,37 @@ impl<'a> Parser<'a> {
             let name = self.any_ident("tablespace name")?;
             return Ok(Stmt::DropTablespace { name, if_exists });
         }
+        if self.eat_ident("extension")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("extensions", names.len()));
+                }
+                names[count] = self.col_ident("extension name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropExtension {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("view")? {
             let (names, if_exists) = self.drop_targets("view name")?;
             let cascade = if self.eat_ident("cascade")? {
@@ -3457,11 +3718,14 @@ impl<'a> Parser<'a> {
             let signature_is_explicit = self.eat_op("(")?;
             if signature_is_explicit && !self.eat_op(")")? {
                 loop {
-                    if argument_count == argument_types.len() {
-                        return Err(self.limit("function arguments", argument_types.len()));
+                    let (argument_type, input) = self.routine_identity_argument()?;
+                    if input {
+                        if argument_count == argument_types.len() {
+                            return Err(self.limit("function arguments", argument_types.len()));
+                        }
+                        argument_types[argument_count] = argument_type;
+                        argument_count += 1;
                     }
-                    argument_types[argument_count] = self.any_ident("function argument type")?;
-                    argument_count += 1;
                     if self.eat_op(")")? {
                         break;
                     }
@@ -3694,16 +3958,19 @@ impl<'a> Parser<'a> {
         kind: RoutineTargetKind,
     ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        self.expect_op("(")?;
         let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
-        if !self.eat_op(")")? {
+        let signature_is_explicit = self.eat_op("(")?;
+        if signature_is_explicit && !self.eat_op(")")? {
             loop {
-                if count == argument_types.len() {
-                    return Err(self.limit("routine arguments", argument_types.len()));
+                let (argument_type, input) = self.routine_identity_argument()?;
+                if input {
+                    if count == argument_types.len() {
+                        return Err(self.limit("routine arguments", argument_types.len()));
+                    }
+                    argument_types[count] = argument_type;
+                    count += 1;
                 }
-                argument_types[count] = self.any_ident("routine argument type")?;
-                count += 1;
                 if self.eat_op(")")? {
                     break;
                 }
@@ -3719,15 +3986,26 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
+        } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+            let enabled = !self.eat_ident("no")?;
+            self.expect_ident("depends")?;
+            self.expect_ident("on")?;
+            self.expect_ident("extension")?;
+            AlterRoutineAction::ExtensionDependency {
+                extension: self.col_ident("extension name")?,
+                enabled,
+            }
         } else {
-            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
+            return Err(
+                self.unexpected("expected OWNER, RENAME, SET SCHEMA, or [NO] DEPENDS ON EXTENSION")
+            );
         };
         Ok(Stmt::AlterRoutine {
             kind,
             routine: RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..count])?,
-                signature_is_explicit: true,
+                signature_is_explicit,
             },
             action,
         })

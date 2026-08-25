@@ -240,8 +240,7 @@ fn f2d(ieee_mantissa: u32, ieee_exponent: u32) -> (u32, i32) {
     }
 
     let mut removed: i32 = 0;
-    let output;
-    if vm_is_trailing_zeros || vr_is_trailing_zeros {
+    let output = if vm_is_trailing_zeros || vr_is_trailing_zeros {
         while vp / 10 > vm / 10 {
             vm_is_trailing_zeros &= vm % 10 == 0;
             vr_is_trailing_zeros &= last_removed_digit == 0;
@@ -265,10 +264,9 @@ fn f2d(ieee_mantissa: u32, ieee_exponent: u32) -> (u32, i32) {
         if vr_is_trailing_zeros && last_removed_digit == 5 && vr % 2 == 0 {
             last_removed_digit = 4;
         }
-        output = vr
-            + u32::from(
-                (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5,
-            );
+        vr + u32::from(
+            (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5,
+        )
     } else {
         while vp / 10 > vm / 10 {
             last_removed_digit = (vr % 10) as u8;
@@ -277,8 +275,8 @@ fn f2d(ieee_mantissa: u32, ieee_exponent: u32) -> (u32, i32) {
             vm /= 10;
             removed += 1;
         }
-        output = vr + u32::from(vr == vm || last_removed_digit >= 5);
-    }
+        vr + u32::from(vr == vm || last_removed_digit >= 5)
+    };
 
     (output, e10 + removed)
 }
@@ -399,8 +397,7 @@ fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> (u64, i32) {
 
     let mut removed: i32 = 0;
     let mut last_removed_digit: u8 = 0;
-    let output;
-    if vm_is_trailing_zeros || vr_is_trailing_zeros {
+    let output = if vm_is_trailing_zeros || vr_is_trailing_zeros {
         loop {
             let vp_div10 = vp / 10;
             let vm_div10 = vm / 10;
@@ -438,10 +435,9 @@ fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> (u64, i32) {
         if vr_is_trailing_zeros && last_removed_digit == 5 && vr % 2 == 0 {
             last_removed_digit = 4;
         }
-        output = vr
-            + u64::from(
-                (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5,
-            );
+        vr + u64::from(
+            (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5,
+        )
     } else {
         let mut round_up = false;
         let vp_div100 = vp / 100;
@@ -469,8 +465,8 @@ fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> (u64, i32) {
             vm = vm_div10;
             removed += 1;
         }
-        output = vr + u64::from(vr == vm || round_up);
-    }
+        vr + u64::from(vr == vm || round_up)
+    };
 
     (output, e10 + removed)
 }

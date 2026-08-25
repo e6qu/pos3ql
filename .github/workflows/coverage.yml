@@ -161,6 +161,12 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
+      - name: Install SQL extension oracle fixtures
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
       - name: Python venv for differential oracles
         run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
       - name: Run forced-spill differential
@@ -170,6 +176,8 @@ jobs:
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_REFERENCE_PSQL: psql
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 
@@ -196,6 +204,12 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
+      - name: Install SQL extension oracle fixtures
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -209,6 +223,8 @@ jobs:
           POS3QL_REFERENCE_PSQL: psql
           POS3QL_REFERENCE_PG_HOST: 127.0.0.1
           POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           COVERAGE_SHARDS: "run:diff"
         run: |
           COVERAGE_SHARD="$COVERAGE_SHARDS" \

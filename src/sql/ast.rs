@@ -338,6 +338,11 @@ pub enum Stmt<'a> {
         name: &'a str,
         action: AlterExtensionAction<'a>,
     },
+    AlterMaterializedViewExtensionDependency {
+        name: QualName<'a>,
+        extension: &'a str,
+        enabled: bool,
+    },
     DropExtension {
         names: &'a [&'a str],
         if_exists: bool,

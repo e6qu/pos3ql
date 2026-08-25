@@ -370,6 +370,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropAggregate { .. }
         | Stmt::CreateExtension { .. }
         | Stmt::AlterExtension { .. }
+        | Stmt::AlterMaterializedViewExtensionDependency { .. }
         | Stmt::DropExtension { .. }
         | Stmt::DropView { .. }
         | Stmt::CreatePublication { .. }
@@ -456,6 +457,7 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
 struct ExtensionScriptText<'a> {
     source: &'a str,
     schema: &'a str,
+    substitute_schema: bool,
     owner: &'a str,
     required_names: &'a [crate::storage::SqlName],
     required_schemas: &'a [&'a str],
@@ -467,7 +469,9 @@ impl core::fmt::Display for ExtensionScriptText<'_> {
         while let Some(at) = rest.find('@') {
             formatter.write_str(&rest[..at])?;
             rest = &rest[at..];
-            if let Some(after) = rest.strip_prefix("@extschema@") {
+            if self.substitute_schema
+                && let Some(after) = rest.strip_prefix("@extschema@")
+            {
                 formatter.write_str(self.schema)?;
                 rest = after;
             } else if let Some(after) = rest.strip_prefix("@extowner@") {
@@ -3146,6 +3150,20 @@ impl Engine {
                 continue;
             }
             let dependency = *self.storage.extension_dependency(slot as usize);
+            let exists = dependency.visible_to(txn.txid);
+            if dependency.live == exists {
+                continue;
+            }
+            if !self
+                .storage
+                .extension(dependency.extension as usize)
+                .visible_to(txn.txid)
+                || !self
+                    .storage
+                    .access_object_visible_to(dependency.object, txn.txid)
+            {
+                continue;
+            }
             let extension = self.storage.extension(dependency.extension as usize).name;
             let (schema, name) = self
                 .storage
@@ -3169,7 +3187,7 @@ impl Engine {
                     schema: schema.as_str(),
                     name: name.as_str(),
                     kind: dependency.kind,
-                    exists: dependency.visible_to(txn.txid),
+                    exists,
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -7405,6 +7423,18 @@ impl Engine {
             } => self.drop_extension(
                 names, *if_exists, *cascade, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
+            Stmt::AlterMaterializedViewExtensionDependency {
+                name,
+                extension,
+                enabled,
+            } => exec::alter_materialized_view_extension_dependency(
+                &mut self.storage,
+                txn,
+                name,
+                extension,
+                *enabled,
+                responder,
+            ),
             Stmt::Call { name, arguments } => self.execute_call(
                 *name, arguments, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
@@ -9230,6 +9260,7 @@ impl Engine {
         let rendered = match arena.alloc_str_display(ExtensionScriptText {
             source,
             schema,
+            substitute_schema: !package_definition.relocatable,
             owner,
             required_names: &required_names[..required_count],
             required_schemas: &required_schemas[..required_count],
@@ -10055,6 +10086,19 @@ impl Engine {
             Ok((_, _, package)) => package,
             Err(error) => return Ok(Err(error)),
         };
+        let cascade_schema = match package.schema {
+            Some(schema) => schema,
+            None => match schema {
+                Some(schema) => match crate::storage::SqlName::parse(schema) {
+                    Ok(schema) => schema,
+                    Err(error) => return Ok(Err(error)),
+                },
+                None => match self.storage.creation_schema(None, name, txn.txid) {
+                    Ok(schema) => schema,
+                    Err(error) => return Ok(Err(error)),
+                },
+            },
+        };
         for required in package.requires() {
             if self
                 .storage
@@ -10068,11 +10112,19 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                let required_package = match self
+                    .storage
+                    .extension_package_for_version(required.as_str(), None)
+                {
+                    Ok((_, _, package)) => package,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let required_schema = required_package.schema.unwrap_or(cascade_schema);
                 let result = responder.without_command_complete(|responder| {
                     self.create_extension_inner(
                         required.as_str(),
                         false,
-                        None,
+                        Some(required_schema.as_str()),
                         None,
                         true,
                         installing,
@@ -10164,11 +10216,25 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                let namespace = self
+                    .storage
+                    .extension(plan.extension)
+                    .definition_to(txn.txid)
+                    .0 as usize;
+                let cascade_schema = self.storage.schema_def(namespace).name;
+                let required_package = match self
+                    .storage
+                    .extension_package_for_version(required.as_str(), None)
+                {
+                    Ok((_, _, package)) => package,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let required_schema = required_package.schema.unwrap_or(cascade_schema);
                 let result = responder.without_command_complete(|responder| {
                     self.create_extension_inner(
                         required.as_str(),
                         false,
-                        None,
+                        Some(required_schema.as_str()),
                         None,
                         true,
                         installing,

@@ -15,22 +15,22 @@
 # tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
-ALTER AGGREGATE	partial	110_user_defined_aggregates.sql plus typed extension dependency coverage
+ALTER AGGREGATE	partial	110_user_defined_aggregates.sql
 ALTER COLLATION	missing	-
 ALTER CONVERSION	missing	-
 ALTER DATABASE	missing	-
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
 ALTER EVENT TRIGGER	missing	-
-ALTER EXTENSION	partial	SQL-package lifecycle is covered end to end; native-library update execution is outside the architecture
+ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
-ALTER FUNCTION	partial	90_routine_lifecycle.sql
+ALTER FUNCTION	partial	90_routine_lifecycle.sql and 111_extension_lifecycle.sql
 ALTER GROUP	partial	83_roles_acl.sql
-ALTER INDEX	partial	107_index_lifecycle.sql plus typed extension dependency coverage
+ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
 ALTER LANGUAGE	missing	-
 ALTER LARGE OBJECT	missing	-
-ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql
+ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql and typed extension dependencies in 111_extension_lifecycle.sql
 ALTER OPERATOR	missing	-
 ALTER OPERATOR CLASS	missing	-
 ALTER OPERATOR FAMILY	missing	-
@@ -38,7 +38,7 @@ ALTER POLICY	complete	106_row_level_security.sql
 ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
-ALTER ROUTINE	partial	90_routine_lifecycle.sql
+ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	missing	-
 ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
@@ -75,7 +75,7 @@ CREATE CONVERSION	missing	-
 CREATE DATABASE	missing	-
 CREATE DOMAIN	complete	62_domains.sql
 CREATE EVENT TRIGGER	missing	-
-CREATE EXTENSION	partial	SQL control/script packages are complete; native libraries are rejected
+CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
 CREATE FUNCTION	partial	87_sql_routines.sql
@@ -122,7 +122,7 @@ DROP CONVERSION	missing	-
 DROP DATABASE	missing	-
 DROP DOMAIN	complete	62_domains.sql
 DROP EVENT TRIGGER	missing	-
-DROP EXTENSION	partial	SQL-package RESTRICT/CASCADE and dependency classes are complete; native packages are not loaded
+DROP EXTENSION	partial	111_extension_lifecycle.sql covers SQL-package dependency classes; native packages are not loaded
 DROP FOREIGN DATA WRAPPER	missing	-
 DROP FOREIGN TABLE	missing	-
 DROP FUNCTION	partial	87_sql_routines.sql

@@ -12,6 +12,8 @@ set -u
 cd "$(dirname "$0")/../.."
 EXT=tests/external
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
+EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$EXTENSION_CONTROL_ROOT}
 WORK=$(mktemp -d /tmp/pos3ql-diff.XXXXXX)
 KEEP=${1:-}
 
@@ -134,7 +136,7 @@ if [[ "$REFERENCE_MODE" == local ]]; then
     exit 1
   fi
   SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC" \
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
     -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
 
@@ -151,6 +153,7 @@ max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
+extension_control_path = ${EXTENSION_CONTROL_ROOT}
 ${POS3QL_EXTRA_CONF:-}
 EOF
 if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
@@ -208,13 +211,29 @@ normalize() {
 }
 
 run_corpus() { # port name file
-  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
-    -v VERBOSITY=verbose -f "$3" 2>&1 | normalize > "$WORK/$2"
+  if [[ "$1" == "$PG_PORT" ]]; then
+    PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+      "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+        -v VERBOSITY=verbose -f "$3" 2>&1
+  else
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+      -v VERBOSITY=verbose -f "$3" 2>&1
+  fi | normalize > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
     tail -80 "$WORK/p3.log"
     exit 1
   fi
+}
+reset_user_extensions() { # port
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -A -t -q \
+    -c "SELECT extname FROM pg_extension WHERE extname LIKE 'pos3ql_%' ORDER BY extname DESC" |
+  while IFS= read -r extension; do
+    [[ -z "$extension" ]] && continue
+    extension=${extension//\"/\"\"}
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
+      -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
+  done
 }
 
 # Independent external suites share one bounded catalog. Drop their user
@@ -234,6 +253,8 @@ reset_user_relations() { # port
 }
 
 reset_pair() {
+  reset_user_extensions "$PG_PORT"
+  reset_user_extensions "$P3_PORT"
   reset_user_relations "$PG_PORT"
   reset_user_relations "$P3_PORT"
 }

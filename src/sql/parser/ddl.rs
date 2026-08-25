@@ -607,6 +607,9 @@ impl<'a> Parser<'a> {
             self.expect_ident("partition")?;
             AlterIndexAction::AttachPartition(self.qual_name("partition index name")?)
         } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+            if if_exists {
+                return Err(self.err_here("IF EXISTS is not allowed with DEPENDS ON EXTENSION"));
+            }
             let enabled = !self.eat_ident("no")?;
             self.expect_ident("depends")?;
             self.expect_ident("on")?;
@@ -3884,19 +3887,8 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
-        } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
-            let enabled = !self.eat_ident("no")?;
-            self.expect_ident("depends")?;
-            self.expect_ident("on")?;
-            self.expect_ident("extension")?;
-            AlterRoutineAction::ExtensionDependency {
-                extension: self.col_ident("extension name")?,
-                enabled,
-            }
         } else {
-            return Err(
-                self.unexpected("expected OWNER, RENAME, SET SCHEMA, or [NO] DEPENDS ON EXTENSION")
-            );
+            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
         };
         Ok(Stmt::AlterAggregate { aggregate, action })
     }
@@ -3966,10 +3958,10 @@ impl<'a> Parser<'a> {
         kind: RoutineTargetKind,
     ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        self.expect_op("(")?;
         let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
-        if !self.eat_op(")")? {
+        let signature_is_explicit = self.eat_op("(")?;
+        if signature_is_explicit && !self.eat_op(")")? {
             loop {
                 let (argument_type, input) = self.routine_identity_argument()?;
                 if input {
@@ -4013,7 +4005,7 @@ impl<'a> Parser<'a> {
             routine: RoutineIdentity {
                 name,
                 argument_types: self.arena_slice(&argument_types[..count])?,
-                signature_is_explicit: true,
+                signature_is_explicit,
             },
             action,
         })

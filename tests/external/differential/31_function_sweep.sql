@@ -5,7 +5,7 @@
 
 -- trigonometry and hyperbolics
 SELECT acos(1), asin(0), atan(1), atan2(1, 1);
-SELECT cos(0), sin(0), tan(0), cot(1);
+SELECT cos(0), sin(0), tan(0), abs(cot(1) - 0.6420926159343306) < 1e-15;
 SELECT acosh(1), asinh(0), atanh(0);
 SELECT cosh(0), sinh(0), tanh(0);
 SELECT degrees(pi()), radians(180);

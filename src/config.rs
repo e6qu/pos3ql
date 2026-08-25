@@ -60,8 +60,8 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
-    /// Colon-separated PostgreSQL extension-control directories. Empty means
-    /// no installable packages; installed extension catalogs still recover.
+    /// Colon-separated PostgreSQL extension roots; controls live below each
+    /// root's `extension` directory. Empty selects only durable packages.
     pub extension_control_path: String,
     /// Number of installation and update scripts retained at startup.
     pub max_extension_scripts: usize,

@@ -3448,6 +3448,20 @@ impl<'a> Parser<'a> {
                 false
             };
             let name = self.qual_name("materialized view name")?;
+            if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+                if if_exists {
+                    return Err(self.err_here("IF EXISTS is not allowed with DEPENDS ON EXTENSION"));
+                }
+                let enabled = !self.eat_ident("no")?;
+                self.expect_ident("depends")?;
+                self.expect_ident("on")?;
+                self.expect_ident("extension")?;
+                return Ok(Stmt::AlterMaterializedViewExtensionDependency {
+                    name,
+                    extension: self.col_ident("extension name")?,
+                    enabled,
+                });
+            }
             return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
         }
         if self.eat_ident("view")? {

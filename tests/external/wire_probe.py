@@ -1231,6 +1231,75 @@ def test_extended_copy():
     s.close()
 
 
+def test_extension_lifecycle_over_raw_wire():
+    if os.environ.get("POS3QL_EXTENSION_WIRE") != "1":
+        return
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE SCHEMA wire_extension; "
+        "CREATE EXTENSION pos3ql_ext VERSION '1.0' SCHEMA wire_extension CASCADE; "
+        "ALTER EXTENSION pos3ql_ext UPDATE TO '2.0'",
+    )
+    tags = [payload.rstrip(b"\x00") for kind, payload in setup if kind == b"C"]
+    check(
+        "raw wire: extension create and transactional update complete",
+        tags == [b"CREATE SCHEMA", b"CREATE EXTENSION", b"ALTER EXTENSION"]
+        and not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    query = (
+        "SELECT extname, extversion, extrelocatable FROM pg_extension "
+        "WHERE extname::text = $1"
+    )
+    parse = frontend_message(
+        b"P", b"wire_extension_statement\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, 25)
+    )
+    value = b"pos3ql_ext"
+    bind = frontend_message(
+        b"B",
+        b"wire_extension_portal\x00wire_extension_statement\x00"
+        + struct.pack("!hhh", 1, 0, 1)
+        + struct.pack("!i", len(value))
+        + value
+        + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_extension_portal\x00")
+    execute = frontend_message(b"E", b"wire_extension_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    check(
+        "raw wire: extension catalogs retain PostgreSQL types through a named portal",
+        description is not None
+        and row_description_type_oids(description) == [19, 25, 16]
+        and row is not None
+        and text_row_fields(row) == ["pos3ql_ext", "2.0", "t"],
+        out,
+    )
+
+    cleanup = simple_query(
+        s,
+        "DROP EXTENSION pos3ql_ext; DROP EXTENSION pos3ql_base; "
+        "DROP SCHEMA wire_extension",
+    )
+    check(
+        "raw wire: extension drop removes durable members without CASCADE",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
+    )
+    s.close()
+
+
 def binary_array(element_oid, values):
     return binary_array_shaped(element_oid, [len(values)], [1], values)
 

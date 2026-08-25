@@ -49,6 +49,8 @@ SLT_QUERY_SHARDS=${SLT_QUERY_SHARDS:-1}
 RUN_FAST=${RUN_FAST:-1}
 RUN_SLT=${RUN_SLT:-1}
 RUN_FUZZ=${RUN_FUZZ:-1}
+EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$EXTENSION_CONTROL_ROOT}
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -170,6 +172,7 @@ max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
 memtable_bytes = 256MiB
+extension_control_path = ${EXTENSION_CONTROL_ROOT}
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
@@ -222,7 +225,8 @@ restart_p3_fresh() {
 if [[ "$RUN_FAST" == 1 ]]; then
 # --- raw wire-protocol probes ----------------------------------------------
 echo "=== wire protocol probes ==="
-if POS3QL_PORT=$P3_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
+if POS3QL_PORT=$P3_PORT POS3QL_EXTENSION_WIRE=1 \
+  python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else bad "wire probes"; cat "$WORK/wire.out"; fi
 
@@ -270,6 +274,65 @@ else
     printf 'expected:\n%s\nobserved:\n%s\n' "$expected_dump_observed" "$dump_observed"
   fi
 fi
+
+# --- extension-aware pg_dump, restored by vanilla PostgreSQL 18 ------------
+restart_p3_fresh || exit 1
+echo "=== SQL extension pg_dump round trip ==="
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 > "$WORK/extension_setup.out" 2>&1 <<'SQL'
+CREATE SCHEMA extension_dump;
+CREATE EXTENSION pos3ql_ext VERSION '1.0' SCHEMA extension_dump CASCADE;
+ALTER EXTENSION pos3ql_ext UPDATE TO '2.0';
+INSERT INTO extension_dump.extension_rows VALUES (1, 'extension member', true);
+INSERT INTO extension_dump.extension_config VALUES
+  ('user row', false),
+  ('built in row', true);
+SQL
+extension_setup_status=$?
+pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  --no-owner -f "$WORK/extension.sql" > "$WORK/extension_dump.out" 2>&1
+extension_dump_status=$?
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 \
+  -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
+  > "$WORK/extension_reference_clean.out" 2>&1
+PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+    -v ON_ERROR_STOP=1 -f "$WORK/extension.sql" \
+    > "$WORK/extension_restore.out" 2>&1
+extension_restore_status=$?
+if [[ $extension_setup_status -ne 0 || $extension_dump_status -ne 0 || $extension_restore_status -ne 0 ]]; then
+  bad "SQL extension pg_dump restores into PostgreSQL 18"
+  tail -40 "$WORK/extension_setup.out"
+  tail -40 "$WORK/extension_dump.out"
+  tail -40 "$WORK/extension_restore.out"
+else
+  extension_observed=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+      SELECT e.extname,e.extversion,n.nspname
+        FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
+       WHERE e.extname IN ('pos3ql_base','pos3ql_ext') ORDER BY e.extname;
+      SELECT count(*) FROM extension_dump.extension_rows;
+      SELECT key,built_in FROM extension_dump.extension_config ORDER BY key;
+      SELECT extension_dump.extension_identity('restored');
+      SELECT value FROM extension_dump.extension_snapshot;
+    " 2>/dev/null)
+  expected_extension_observed=$'pos3ql_base|1.0|extension_dump\npos3ql_ext|2.0|extension_dump\n0\nuser row|f\nrestored\n42'
+  if [[ "$extension_observed" == "$expected_extension_observed" ]]; then
+    ok "SQL extension definitions and configuration rows survive pg_dump into PostgreSQL 18"
+  else
+    bad "SQL extension pg_dump round-trip result"
+    printf 'expected:\n%s\nobserved:\n%s\n' \
+      "$expected_extension_observed" "$extension_observed"
+  fi
+fi
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 \
+  -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
+  > "$WORK/extension_reference_cleanup.out" 2>&1 || {
+    bad "clean SQL extension pg_dump fixture from PostgreSQL"
+    tail -40 "$WORK/extension_reference_cleanup.out"
+  }
 
 # --- outbound pg_dump, restored by vanilla PostgreSQL 18 -------------------
 # The inbound and outbound fixtures are independent durability boundaries.
@@ -640,12 +703,29 @@ normalize() {
     -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
 }
 run_corpus() { # host port outfile file
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off -v VERBOSITY=verbose -f "$4" 2>&1 | normalize > "$3"
+  if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
+    PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+      psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
+        -v VERBOSITY=verbose -f "$4" 2>&1
+  else
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
+      -v VERBOSITY=verbose -f "$4" 2>&1
+  fi | normalize > "$3"
   if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"
     tail -80 "$WORK/p3.log"
     exit 1
   fi
+}
+reset_user_extensions() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -c "SELECT extname FROM pg_extension WHERE extname LIKE 'pos3ql_%' ORDER BY extname DESC" |
+  while IFS= read -r extension; do
+    [[ -z "$extension" ]] && continue
+    extension=${extension//\"/\"\"}
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+      -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
+  done
 }
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
@@ -660,6 +740,8 @@ reset_user_relations() { # host port
   done
 }
 reset_corpus_pair() {
+  reset_user_extensions "$PGHOST" "$PGPORT"
+  reset_user_extensions 127.0.0.1 "$P3_PORT"
   reset_user_relations "$PGHOST" "$PGPORT"
   reset_user_relations 127.0.0.1 "$P3_PORT"
 }

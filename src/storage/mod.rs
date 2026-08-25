@@ -8196,13 +8196,14 @@ impl Storage {
             .filter(|root| !root.is_empty())
         {
             let root = std::path::Path::new(root);
-            let entries = match std::fs::read_dir(root) {
+            let control_directory = root.join("extension");
+            let entries = match std::fs::read_dir(&control_directory) {
                 Ok(entries) => entries,
                 Err(error) => {
                     return Err(sql_err!(
                         sqlstate::IO_ERROR,
                         "cannot read extension control directory \"{}\": {}",
-                        root.display(),
+                        control_directory.display(),
                         error
                     ));
                 }
@@ -8247,7 +8248,7 @@ impl Storage {
                 let parsed = parse_extension_control(name, &control_text)?;
                 let primary_package = parsed.package;
                 let script_directory = parsed.directory.as_ref().map_or_else(
-                    || root.to_path_buf(),
+                    || control_directory.clone(),
                     |directory| {
                         let path = std::path::Path::new(directory);
                         if path.is_absolute() {
@@ -8337,8 +8338,11 @@ impl Storage {
                             error
                         )
                     })?;
-                    let secondary_path =
-                        root.join(format!("{}--{}.control", written_name, to.as_str()));
+                    let secondary_path = control_directory.join(format!(
+                        "{}--{}.control",
+                        written_name,
+                        to.as_str()
+                    ));
                     let effective = if secondary_path.exists() {
                         let text = std::fs::read_to_string(&secondary_path).map_err(|error| {
                             sql_err!(
@@ -10810,8 +10814,12 @@ impl Storage {
         self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.commit_drop();
         self.extensions[slot].pending = None;
         self.drop_object_comments(CommentClass::Extension, "", name.as_str());
+        let object = AccessObject {
+            class: AccessClass::Extension,
+            slot: slot as u16,
+        };
         for dependency in self.extension_dependencies.iter_mut() {
-            if dependency.extension as usize == slot {
+            if dependency.extension as usize == slot || dependency.object == object {
                 *dependency = ExtensionDependency::EMPTY;
             }
         }
@@ -10834,6 +10842,14 @@ impl Storage {
 
     pub(crate) fn extension_dependency(&self, slot: usize) -> &ExtensionDependency {
         &self.extension_dependencies[slot]
+    }
+
+    fn clear_extension_dependencies_for_object(&mut self, object: AccessObject) {
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency.object == object {
+                *dependency = ExtensionDependency::EMPTY;
+            }
+        }
     }
 
     pub(crate) fn extension_member_of(&self, object: AccessObject, txid: u32) -> Option<usize> {
@@ -16649,6 +16665,10 @@ impl Storage {
         let (schema, name) = (self.matviews[slot].schema, self.matviews[slot].name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_drop();
+        self.clear_extension_dependencies_for_object(AccessObject {
+            class: AccessClass::MaterializedView,
+            slot: slot as u16,
+        });
     }
 
     pub fn rollback_matview_create(&mut self, slot: usize) {
@@ -20281,7 +20301,9 @@ impl Storage {
 
     pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
-        self.clear_object_acl_entries(Self::routine_access_object(slot));
+        let object = Self::routine_access_object(slot);
+        self.clear_object_acl_entries(object);
+        self.clear_extension_dependencies_for_object(object);
     }
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
@@ -21593,6 +21615,10 @@ impl Storage {
         let (schema, name) = (self.indexes[slot].schema, self.indexes[slot].name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
+        self.clear_extension_dependencies_for_object(AccessObject {
+            class: AccessClass::Index,
+            slot: slot as u16,
+        });
         if let Some(table) = self.index_table_slot(slot) {
             self.tables[table].mark_dirty();
         }

@@ -2780,6 +2780,68 @@ fn preserve_object_acl(
     Ok(())
 }
 
+fn materialized_view_access_object(
+    storage: &Storage,
+    name: &QualName,
+    txid: u32,
+) -> Result<Option<crate::storage::AccessObject>, SqlError> {
+    use crate::storage::{AccessClass, AccessObject, ResolvedRelation};
+    match storage.resolve_relation(name.schema, name.name, txid) {
+        Some(ResolvedRelation::Table(table)) => {
+            let definition = storage.table_def(table, txid);
+            let Some(slot) =
+                storage.matview_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a materialized view",
+                    name.name
+                ));
+            };
+            Ok(Some(AccessObject {
+                class: AccessClass::MaterializedView,
+                slot: slot as u16,
+            }))
+        }
+        Some(_) => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a materialized view",
+            name.name
+        )),
+        None => Ok(None),
+    }
+}
+
+pub fn alter_materialized_view_extension_dependency(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: &QualName,
+    extension: &str,
+    enabled: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let object = match materialized_view_access_object(storage, name, txn.txid) {
+        Ok(Some(object)) => object,
+        Ok(None) => return sql_fail(undefined_qual(name)),
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "materialized view") {
+        return sql_fail(error);
+    }
+    if let Err(error) = set_extension_dependency(
+        storage,
+        txn,
+        extension,
+        object,
+        crate::storage::ExtensionDependencyKind::Automatic,
+        enabled,
+    ) {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER MATERIALIZED VIEW")?;
+    sql_ok()
+}
+
 pub fn alter_owner(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -2881,32 +2943,12 @@ pub fn alter_owner(
             }
             None => None,
         },
-        AlterOwnerKind::MaterializedView => match relation() {
-            Some(crate::storage::ResolvedRelation::Table(table)) => {
-                let def = *storage.table_def(table, txn.txid);
-                let Some(slot) =
-                    storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
-                else {
-                    return sql_fail(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "\"{}\" is not a materialized view",
-                        name.name
-                    ));
-                };
-                Some(AccessObject {
-                    class: AccessClass::MaterializedView,
-                    slot: slot as u16,
-                })
+        AlterOwnerKind::MaterializedView => {
+            match materialized_view_access_object(storage, name, txn.txid) {
+                Ok(object) => object,
+                Err(error) => return sql_fail(error),
             }
-            Some(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a materialized view",
-                    name.name
-                ));
-            }
-            None => None,
-        },
+        }
         AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txn.txid) {
             Ok(Some(slot)) => Some(AccessObject {
                 class: AccessClass::Sequence,
@@ -16537,17 +16579,34 @@ pub fn alter_routine(
         Ok(arguments) => arguments,
         Err(error) => return sql_fail(error),
     };
-    let Some(slot) = storage.routine_slot_by_declared_signature(
-        schema,
-        identity.name.name,
-        &arguments[..identity.argument_types.len()],
-        txn.txid,
-    ) else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "routine \"{}\" does not exist",
-            identity.name.name
-        ));
+    let slot = if identity.signature_is_explicit {
+        Ok(storage.routine_slot_by_declared_signature(
+            schema,
+            identity.name.name,
+            &arguments[..identity.argument_types.len()],
+            txn.txid,
+        ))
+    } else {
+        storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
+    };
+    let slot = match slot {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{} \"{}\" does not exist",
+                kind.noun(),
+                identity.name.name
+            ));
+        }
+        Err(()) => {
+            return sql_fail(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "{} name \"{}\" is not unique",
+                kind.noun(),
+                identity.name.name
+            ));
+        }
     };
     let routine = *storage.routine(slot);
     let actual_kind = match routine.kind {
@@ -16782,17 +16841,15 @@ pub fn drop_routine(
             Ok(arguments) => arguments,
             Err(error) => return sql_fail(error),
         };
-        let slot = match storage.routine_slot_by_declared_signature(
-            schema,
-            identity_name.name,
-            &arguments[..argument_types.len()],
-            txn.txid,
-        ) {
-            Some(slot) => Ok(Some(slot)),
-            None if !signature_is_explicit => {
-                storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
-            }
-            None => Ok(None),
+        let slot = if signature_is_explicit {
+            Ok(storage.routine_slot_by_declared_signature(
+                schema,
+                identity_name.name,
+                &arguments[..argument_types.len()],
+                txn.txid,
+            ))
+        } else {
+            storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
         };
         let slot = match slot {
             Ok(Some(slot)) => slot,

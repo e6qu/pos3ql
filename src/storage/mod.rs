@@ -2668,6 +2668,7 @@ pub struct ViewDef {
     pub creation_path: StackStr<128>,
     pub security: ViewSecurity,
     pub ownership: Ownership,
+    pending_schema: Option<PendingObjectSchema>,
     ddl_state: CatalogDdlState,
 }
 
@@ -2675,6 +2676,18 @@ impl ViewDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
+
+    pub(crate) fn schema_for(&self, txid: u32) -> SqlName {
+        self.pending_schema
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.schema, |pending| pending.schema)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingObjectSchema {
+    pub txid: u32,
+    pub schema: SqlName,
 }
 
 /// A logical publication.  Publications are database-scoped catalog objects;
@@ -5322,6 +5335,7 @@ pub struct SequenceDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingSequenceDefinition {
     pub txid: u32,
+    pub schema: SqlName,
     pub spec: SeqSpec,
     pub owner: Option<SequenceOwner>,
     pub generator_for: Option<SequenceOwner>,
@@ -5386,6 +5400,15 @@ pub struct SeqSpec {
     pub cycle: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SequenceAlteration {
+    pub schema: SqlName,
+    pub spec: SeqSpec,
+    pub owner: Option<SequenceOwner>,
+    pub generator_for: Option<SequenceOwner>,
+    pub restart: Option<i64>,
+}
+
 impl SequenceDef {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -5397,6 +5420,7 @@ impl SequenceDef {
             .map_or_else(
                 || self.clone(),
                 |pending| Self {
+                    schema: pending.schema,
                     data_type: pending.spec.data_type,
                     increment: pending.spec.increment,
                     min_value: pending.spec.min_value,
@@ -5747,6 +5771,599 @@ pub(crate) struct PendingIndexName {
 /// How many schemas may exist at once, including the built-in "public".
 pub(crate) const MAX_SCHEMAS: usize = 32;
 
+pub(crate) const MAX_EXTENSIONS: usize = 64;
+pub(crate) const MAX_EXTENSION_DEPENDENCIES: usize = 512;
+pub(crate) const MAX_EXTENSION_REQUIRES: usize = 8;
+pub(crate) const MAX_EXTENSION_CONFIG_RELATIONS: usize = 36;
+pub(crate) const EXTENSION_CONFIG_CONDITION_BYTES: usize = 1024;
+
+/// A version name accepted by PostgreSQL's extension file grammar. It is
+/// distinct from an SQL identifier: dots and internal hyphens are ordinary
+/// version characters, while path separators and update delimiters are not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionVersion(SqlName);
+
+impl ExtensionVersion {
+    pub(crate) fn parse(value: &str) -> Result<Self, SqlError> {
+        if value.is_empty()
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || value.contains("--")
+            || value.contains(['/', '\\'])
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid extension version name: {}",
+                value
+            ));
+        }
+        Ok(Self(SqlName::parse(value)?))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtensionDefinition {
+    pub txid: u32,
+    pub namespace: u16,
+    pub relocatable: bool,
+    pub version: ExtensionVersion,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtensionDef {
+    pub created_at: u64,
+    pub name: SqlName,
+    pub namespace: u16,
+    pub relocatable: bool,
+    pub version: ExtensionVersion,
+    pub ownership: Ownership,
+    pub pending: Option<PendingExtensionDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl ExtensionDef {
+    const EMPTY: Self = Self {
+        created_at: 0,
+        name: SqlName::EMPTY,
+        namespace: 0,
+        relocatable: false,
+        version: ExtensionVersion(SqlName::EMPTY),
+        ownership: Ownership::BOOTSTRAP,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_to(&self, txid: u32) -> (u16, bool, ExtensionVersion) {
+        self.pending.filter(|pending| pending.txid == txid).map_or(
+            (self.namespace, self.relocatable, self.version),
+            |pending| (pending.namespace, pending.relocatable, pending.version),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionDependencyKind {
+    Member,
+    Automatic,
+    Required,
+}
+
+impl ExtensionDependencyKind {
+    pub(crate) const fn to_u8(self) -> u8 {
+        match self {
+            Self::Member => 0,
+            Self::Automatic => 1,
+            Self::Required => 2,
+        }
+    }
+
+    pub(crate) const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Member),
+            1 => Some(Self::Automatic),
+            2 => Some(Self::Required),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtensionDependency {
+    pub txid: u32,
+    pub exists: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtensionDependency {
+    pub extension: u16,
+    pub object: AccessObject,
+    pub kind: ExtensionDependencyKind,
+    pub live: bool,
+    pub pending: Option<PendingExtensionDependency>,
+}
+
+impl ExtensionDependency {
+    const EMPTY: Self = Self {
+        extension: u16::MAX,
+        object: AccessObject {
+            class: AccessClass::Table,
+            slot: 0,
+        },
+        kind: ExtensionDependencyKind::Member,
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.live, |pending| pending.exists)
+    }
+}
+
+/// A configuration relation has exactly one of the two relation kinds
+/// PostgreSQL accepts at `pg_extension_config_dump`'s boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionConfigRelation {
+    Table(u16),
+    Sequence(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionConfigRelationKind {
+    Table,
+    Sequence,
+}
+
+impl ExtensionConfigRelationKind {
+    pub(crate) const fn to_u8(self) -> u8 {
+        match self {
+            Self::Table => 0,
+            Self::Sequence => 1,
+        }
+    }
+
+    pub(crate) const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Table),
+            1 => Some(Self::Sequence),
+            _ => None,
+        }
+    }
+}
+
+impl ExtensionConfigRelation {
+    pub(crate) const fn kind(self) -> ExtensionConfigRelationKind {
+        match self {
+            Self::Table(_) => ExtensionConfigRelationKind::Table,
+            Self::Sequence(_) => ExtensionConfigRelationKind::Sequence,
+        }
+    }
+    pub(crate) const fn access_object(self) -> AccessObject {
+        match self {
+            Self::Table(slot) => AccessObject {
+                class: AccessClass::Table,
+                slot,
+            },
+            Self::Sequence(slot) => AccessObject {
+                class: AccessClass::Sequence,
+                slot,
+            },
+        }
+    }
+
+    pub(crate) const fn from_access_object(object: AccessObject) -> Option<Self> {
+        match object.class {
+            AccessClass::Table => Some(Self::Table(object.slot)),
+            AccessClass::Sequence => Some(Self::Sequence(object.slot)),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) type ExtensionConfigCondition = StackStr<EXTENSION_CONFIG_CONDITION_BYTES>;
+
+pub(crate) fn extension_config_condition(
+    value: &str,
+) -> Result<ExtensionConfigCondition, SqlError> {
+    let condition = StackStr::from_str(value);
+    if condition.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "extension configuration condition exceeds {} bytes",
+            EXTENSION_CONFIG_CONDITION_BYTES
+        ));
+    }
+    Ok(condition)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtensionConfig {
+    pub txid: u32,
+    pub exists: bool,
+    pub condition: ExtensionConfigCondition,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtensionConfig {
+    pub extension: u16,
+    pub ordinal: u16,
+    pub relation: ExtensionConfigRelation,
+    pub condition: ExtensionConfigCondition,
+    pub live: bool,
+    pub pending: Option<PendingExtensionConfig>,
+}
+
+impl ExtensionConfig {
+    const EMPTY: Self = Self {
+        extension: u16::MAX,
+        ordinal: 0,
+        relation: ExtensionConfigRelation::Table(0),
+        condition: ExtensionConfigCondition::new(),
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.live, |pending| pending.exists)
+    }
+
+    pub(crate) fn condition_to(&self, txid: u32) -> ExtensionConfigCondition {
+        self.pending
+            .filter(|pending| pending.txid == txid && pending.exists)
+            .map_or(self.condition, |pending| pending.condition)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionPackageCode {
+    Sql,
+    NativeLibrary,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtensionPackage {
+    pub name: SqlName,
+    pub default_version: Option<ExtensionVersion>,
+    pub schema: Option<SqlName>,
+    pub relocatable: bool,
+    pub superuser: bool,
+    pub trusted: bool,
+    pub code: ExtensionPackageCode,
+    pub comment: StackStr<COMMENT_MAX>,
+    pub requires: [SqlName; MAX_EXTENSION_REQUIRES],
+    pub require_count: u8,
+    pub no_relocate: [SqlName; MAX_EXTENSION_REQUIRES],
+    pub no_relocate_count: u8,
+}
+
+impl ExtensionPackage {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        default_version: None,
+        schema: None,
+        relocatable: false,
+        superuser: true,
+        trusted: false,
+        code: ExtensionPackageCode::Sql,
+        comment: StackStr::new(),
+        requires: [SqlName::EMPTY; MAX_EXTENSION_REQUIRES],
+        require_count: 0,
+        no_relocate: [SqlName::EMPTY; MAX_EXTENSION_REQUIRES],
+        no_relocate_count: 0,
+    };
+
+    pub(crate) fn requires(&self) -> &[SqlName] {
+        &self.requires[..self.require_count as usize]
+    }
+
+    pub(crate) fn no_relocate(&self) -> &[SqlName] {
+        &self.no_relocate[..self.no_relocate_count as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionPackageSource {
+    Configured,
+    Durable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtensionScript {
+    pub package: u16,
+    pub from: Option<ExtensionVersion>,
+    pub to: ExtensionVersion,
+    pub offset: u32,
+    pub length: u32,
+    pub effective: ExtensionPackage,
+}
+
+struct ParsedExtensionControl {
+    package: ExtensionPackage,
+    directory: Option<String>,
+    specified: u16,
+}
+
+fn extension_control_value(value: &str) -> Result<&str, SqlError> {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+        {
+            return Ok(&value[1..value.len() - 1]);
+        }
+    }
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid extension control value"
+        ));
+    }
+    Ok(value)
+}
+
+fn extension_control_bool(value: &str, parameter: &str) -> Result<bool, SqlError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for extension control parameter \"{}\": {}",
+            parameter,
+            value
+        )),
+    }
+}
+
+fn extension_control_names(
+    value: &str,
+    output: &mut [SqlName; MAX_EXTENSION_REQUIRES],
+    parameter: &str,
+) -> Result<u8, SqlError> {
+    let mut count = 0usize;
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "extension control parameter \"{}\" exceeds {} entries",
+                parameter,
+                output.len()
+            ));
+        }
+        let parsed = SqlName::parse(name)?;
+        if output[..count].contains(&parsed) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "extension control parameter \"{}\" repeats \"{}\"",
+                parameter,
+                name
+            ));
+        }
+        output[count] = parsed;
+        count += 1;
+    }
+    Ok(count as u8)
+}
+
+fn strip_extension_control_comment(line: &str) -> &str {
+    let mut quote = None;
+    for (index, byte) in line.bytes().enumerate() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(open), close) if open == close => quote = None,
+            (None, b'#') => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_extension_control(name: SqlName, text: &str) -> Result<ParsedExtensionControl, SqlError> {
+    let mut package = ExtensionPackage {
+        name,
+        ..ExtensionPackage::EMPTY
+    };
+    let mut directory = None;
+    let mut seen = [SqlName::EMPTY; 12];
+    let mut seen_count = 0usize;
+    let mut specified = 0u16;
+    for (line_index, raw) in text.lines().enumerate() {
+        let line = strip_extension_control_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((parameter, raw_value)) = line.split_once('=') else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid extension control line {} for \"{}\"",
+                line_index + 1,
+                name.as_str()
+            ));
+        };
+        let parameter = parameter.trim().to_ascii_lowercase();
+        let parameter_name = SqlName::parse(&parameter)?;
+        if seen[..seen_count].contains(&parameter_name) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "extension control parameter \"{}\" specified more than once",
+                parameter
+            ));
+        }
+        if seen_count == seen.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many extension control parameters"
+            ));
+        }
+        seen[seen_count] = parameter_name;
+        seen_count += 1;
+        let value = extension_control_value(raw_value)?;
+        match parameter.as_str() {
+            "directory" => {
+                specified |= 1 << 0;
+                directory = Some(value.to_string());
+            }
+            "default_version" => {
+                specified |= 1 << 1;
+                package.default_version = Some(ExtensionVersion::parse(value)?)
+            }
+            "comment" => {
+                specified |= 1 << 2;
+                package.comment = StackStr::from_str(value);
+                if package.comment.is_truncated() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "extension comment exceeds {} bytes",
+                        COMMENT_MAX
+                    ));
+                }
+            }
+            "encoding" => {
+                specified |= 1 << 3;
+                if !value.eq_ignore_ascii_case("UTF8") && !value.eq_ignore_ascii_case("UTF-8") {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "extension \"{}\" uses unsupported script encoding \"{}\"",
+                        name.as_str(),
+                        value
+                    ));
+                }
+            }
+            "module_pathname" => {
+                specified |= 1 << 4;
+                package.code = ExtensionPackageCode::NativeLibrary;
+            }
+            "requires" => {
+                specified |= 1 << 5;
+                package.require_count =
+                    extension_control_names(value, &mut package.requires, "requires")?
+            }
+            "no_relocate" => {
+                specified |= 1 << 6;
+                package.no_relocate_count =
+                    extension_control_names(value, &mut package.no_relocate, "no_relocate")?
+            }
+            "superuser" => {
+                specified |= 1 << 7;
+                package.superuser = extension_control_bool(value, &parameter)?;
+            }
+            "trusted" => {
+                specified |= 1 << 8;
+                package.trusted = extension_control_bool(value, &parameter)?;
+            }
+            "relocatable" => {
+                specified |= 1 << 9;
+                package.relocatable = extension_control_bool(value, &parameter)?;
+            }
+            "schema" => {
+                specified |= 1 << 10;
+                package.schema = Some(SqlName::parse(value)?);
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized extension control parameter \"{}\"",
+                    parameter
+                ));
+            }
+        }
+    }
+    if package.relocatable && package.schema.is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "extension \"{}\" cannot be both relocatable and schema-bound",
+            name.as_str()
+        ));
+    }
+    for dependency in package.no_relocate() {
+        if !package.requires().contains(dependency) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "extension \"{}\" names \"{}\" in no_relocate but not requires",
+                name.as_str(),
+                dependency.as_str()
+            ));
+        }
+    }
+    Ok(ParsedExtensionControl {
+        package,
+        directory,
+        specified,
+    })
+}
+
+fn merge_extension_control(
+    primary: ExtensionPackage,
+    secondary: ParsedExtensionControl,
+) -> Result<ExtensionPackage, SqlError> {
+    if secondary.specified & ((1 << 0) | (1 << 1)) != 0 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "secondary extension control files cannot set directory or default_version"
+        ));
+    }
+    let mut effective = primary;
+    let written = secondary.package;
+    if secondary.specified & (1 << 2) != 0 {
+        effective.comment = written.comment;
+    }
+    if secondary.specified & (1 << 4) != 0 {
+        effective.code = written.code;
+    }
+    if secondary.specified & (1 << 5) != 0 {
+        effective.requires = written.requires;
+        effective.require_count = written.require_count;
+    }
+    if secondary.specified & (1 << 6) != 0 {
+        effective.no_relocate = written.no_relocate;
+        effective.no_relocate_count = written.no_relocate_count;
+    }
+    if secondary.specified & (1 << 7) != 0 {
+        effective.superuser = written.superuser;
+    }
+    if secondary.specified & (1 << 8) != 0 {
+        effective.trusted = written.trusted;
+    }
+    if secondary.specified & (1 << 9) != 0 {
+        effective.relocatable = written.relocatable;
+    }
+    if secondary.specified & (1 << 10) != 0 {
+        effective.schema = written.schema;
+    }
+    if effective.relocatable && effective.schema.is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "extension \"{}\" cannot be both relocatable and schema-bound",
+            effective.name.as_str()
+        ));
+    }
+    for dependency in effective.no_relocate() {
+        if !effective.requires().contains(dependency) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "extension \"{}\" has an invalid no_relocate dependency",
+                effective.name.as_str()
+            ));
+        }
+    }
+    Ok(effective)
+}
+
 /// A named schema (namespace for tables, views and indexes).
 #[derive(Clone, Copy)]
 pub struct SchemaDef {
@@ -5821,6 +6438,7 @@ pub(crate) enum AccessClass {
     Composite = 9,
     Tablespace = 10,
     Statistics = 11,
+    Extension = 12,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -5880,6 +6498,7 @@ impl AccessClass {
             9 => Self::Composite,
             10 => Self::Tablespace,
             11 => Self::Statistics,
+            12 => Self::Extension,
             _ => return None,
         })
     }
@@ -6187,6 +6806,7 @@ pub enum CommentClass {
     Schema,
     Type,
     Tablespace,
+    Extension,
 }
 
 impl CommentClass {
@@ -6196,6 +6816,7 @@ impl CommentClass {
             CommentClass::Schema => 1,
             CommentClass::Type => 2,
             CommentClass::Tablespace => 3,
+            CommentClass::Extension => 4,
         }
     }
 
@@ -6205,6 +6826,7 @@ impl CommentClass {
             1 => CommentClass::Schema,
             2 => CommentClass::Type,
             3 => CommentClass::Tablespace,
+            4 => CommentClass::Extension,
             _ => return None,
         })
     }
@@ -6394,6 +7016,13 @@ pub struct Storage {
     indexes: FixedVec<IndexDef>,
     tablespaces: FixedVec<TablespaceDef>,
     schemas: FixedVec<SchemaDef>,
+    extensions: FixedVec<ExtensionDef>,
+    extension_dependencies: FixedVec<ExtensionDependency>,
+    extension_configs: FixedVec<ExtensionConfig>,
+    extension_packages: FixedVec<ExtensionPackage>,
+    extension_scripts: FixedVec<ExtensionScript>,
+    extension_script_source: FixedBuf,
+    extension_package_source: ExtensionPackageSource,
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
     acl_entries: FixedVec<AclEntry>,
@@ -7026,6 +7655,12 @@ impl Storage {
             + pending_extended_statistics_capacity(config)
                 * size_of::<PendingExtendedStatisticsDataSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
+            + MAX_EXTENSIONS * size_of::<ExtensionDef>()
+            + MAX_EXTENSION_DEPENDENCIES * size_of::<ExtensionDependency>()
+            + MAX_EXTENSION_CONFIG_RELATIONS * size_of::<ExtensionConfig>()
+            + MAX_EXTENSIONS * size_of::<ExtensionPackage>()
+            + config.max_extension_scripts * size_of::<ExtensionScript>()
+            + config.extension_script_bytes
             + MAX_ROLES * size_of::<RoleDef>()
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
@@ -7123,6 +7758,7 @@ impl Storage {
                     creation_path: StackStr::new(),
                     security: ViewSecurity::Definer,
                     ownership: Ownership::BOOTSTRAP,
+                    pending_schema: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
@@ -7326,6 +7962,34 @@ impl Storage {
                 })
                 .expect("sized to MAX_SCHEMAS");
         }
+        let mut extensions = FixedVec::new(budget, "extensions", MAX_EXTENSIONS)?;
+        for _ in 0..MAX_EXTENSIONS {
+            extensions
+                .push(ExtensionDef::EMPTY)
+                .expect("sized to MAX_EXTENSIONS");
+        }
+        let mut extension_dependencies =
+            FixedVec::new(budget, "extension_dependencies", MAX_EXTENSION_DEPENDENCIES)?;
+        for _ in 0..MAX_EXTENSION_DEPENDENCIES {
+            extension_dependencies
+                .push(ExtensionDependency::EMPTY)
+                .expect("sized to MAX_EXTENSION_DEPENDENCIES");
+        }
+        let mut extension_configs =
+            FixedVec::new(budget, "extension_configs", MAX_EXTENSION_CONFIG_RELATIONS)?;
+        for _ in 0..MAX_EXTENSION_CONFIG_RELATIONS {
+            extension_configs
+                .push(ExtensionConfig::EMPTY)
+                .expect("sized to MAX_EXTENSION_CONFIG_RELATIONS");
+        }
+        let extension_packages = FixedVec::new(budget, "extension_packages", MAX_EXTENSIONS)?;
+        let extension_scripts =
+            FixedVec::new(budget, "extension_scripts", config.max_extension_scripts)?;
+        let extension_script_source = FixedBuf::new(
+            budget,
+            "extension_script_source",
+            config.extension_script_bytes,
+        )?;
         let mut comments = FixedVec::new(budget, "comments", MAX_COMMENTS)?;
         for _ in 0..MAX_COMMENTS {
             comments
@@ -7468,6 +8132,13 @@ impl Storage {
             indexes,
             tablespaces,
             schemas,
+            extensions,
+            extension_dependencies,
+            extension_configs,
+            extension_packages,
+            extension_scripts,
+            extension_script_source,
+            extension_package_source: ExtensionPackageSource::Durable,
             roles,
             role_memberships,
             acl_entries,
@@ -7501,6 +8172,395 @@ impl Storage {
         debug_assert!(self.collation.is_none());
         self.collation = Some(CollationRuntime::new(config, budget)?);
         Ok(())
+    }
+
+    /// Loads PostgreSQL control and SQL files before the allocator freezes.
+    /// The retained package catalog and script bytes are startup-bounded; an
+    /// installed extension's durable definition is separate from this local
+    /// availability catalog, matching PostgreSQL's package/database split.
+    pub(crate) fn load_extension_packages(&mut self, config: &Config) -> Result<(), SqlError> {
+        self.extension_packages.clear();
+        self.extension_scripts.clear();
+        self.extension_script_source.clear();
+        self.extension_package_source = if config.extension_control_path.is_empty() {
+            ExtensionPackageSource::Durable
+        } else {
+            ExtensionPackageSource::Configured
+        };
+        if self.extension_package_source == ExtensionPackageSource::Durable {
+            return Ok(());
+        }
+        for root in config
+            .extension_control_path
+            .split(':')
+            .filter(|root| !root.is_empty())
+        {
+            let root = std::path::Path::new(root);
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return Err(sql_err!(
+                        sqlstate::IO_ERROR,
+                        "cannot read extension control directory \"{}\": {}",
+                        root.display(),
+                        error
+                    ));
+                }
+            };
+            let mut controls = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    sql_err!(
+                        sqlstate::IO_ERROR,
+                        "cannot enumerate extension control directory: {}",
+                        error
+                    )
+                })?;
+                let path = entry.path();
+                let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if let Some(name) = file.strip_suffix(".control")
+                    && !name.contains("--")
+                {
+                    controls.push((name.to_string(), path));
+                }
+            }
+            controls.sort_by(|left, right| left.0.cmp(&right.0));
+            for (written_name, control_path) in controls {
+                if self
+                    .extension_packages
+                    .iter()
+                    .any(|package| package.name.as_str() == written_name)
+                {
+                    continue;
+                }
+                let name = SqlName::parse(&written_name)?;
+                let control_text = std::fs::read_to_string(&control_path).map_err(|error| {
+                    sql_err!(
+                        sqlstate::IO_ERROR,
+                        "cannot read extension control file \"{}\": {}",
+                        control_path.display(),
+                        error
+                    )
+                })?;
+                let parsed = parse_extension_control(name, &control_text)?;
+                let primary_package = parsed.package;
+                let script_directory = parsed.directory.as_ref().map_or_else(
+                    || root.to_path_buf(),
+                    |directory| {
+                        let path = std::path::Path::new(directory);
+                        if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            root.join(path)
+                        }
+                    },
+                );
+                let package_slot = self.extension_packages.len();
+                self.extension_packages.push(parsed.package).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many available extension packages (limit {})",
+                        self.extension_packages.capacity()
+                    )
+                })?;
+                let prefix = format!("{}--", written_name);
+                let entries = std::fs::read_dir(&script_directory).map_err(|error| {
+                    sql_err!(
+                        sqlstate::IO_ERROR,
+                        "cannot read extension script directory \"{}\": {}",
+                        script_directory.display(),
+                        error
+                    )
+                })?;
+                let mut scripts = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        sql_err!(
+                            sqlstate::IO_ERROR,
+                            "cannot enumerate extension script directory: {}",
+                            error
+                        )
+                    })?;
+                    let path = entry.path();
+                    let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    let Some(rest) = file
+                        .strip_prefix(&prefix)
+                        .and_then(|name| name.strip_suffix(".sql"))
+                    else {
+                        continue;
+                    };
+                    let parts: Vec<&str> = rest.split("--").collect();
+                    let (from, to) = match parts.as_slice() {
+                        [to] => (None, ExtensionVersion::parse(to)?),
+                        [from, to] => (
+                            Some(ExtensionVersion::parse(from)?),
+                            ExtensionVersion::parse(to)?,
+                        ),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "invalid extension script file name \"{}\"",
+                                file
+                            ));
+                        }
+                    };
+                    scripts.push((from, to, path));
+                }
+                scripts.sort_by(|left, right| {
+                    left.0
+                        .as_ref()
+                        .map(ExtensionVersion::as_str)
+                        .cmp(&right.0.as_ref().map(ExtensionVersion::as_str))
+                        .then(left.1.as_str().cmp(right.1.as_str()))
+                });
+                for (from, to, path) in scripts {
+                    if self.extension_scripts.iter().any(|script| {
+                        script.package as usize == package_slot
+                            && script.from == from
+                            && script.to == to
+                    }) {
+                        return Err(sql_err!(
+                            sqlstate::DUPLICATE_OBJECT,
+                            "duplicate extension update edge for \"{}\"",
+                            written_name
+                        ));
+                    }
+                    let source = std::fs::read_to_string(&path).map_err(|error| {
+                        sql_err!(
+                            sqlstate::IO_ERROR,
+                            "cannot read extension script \"{}\": {}",
+                            path.display(),
+                            error
+                        )
+                    })?;
+                    let secondary_path =
+                        root.join(format!("{}--{}.control", written_name, to.as_str()));
+                    let effective = if secondary_path.exists() {
+                        let text = std::fs::read_to_string(&secondary_path).map_err(|error| {
+                            sql_err!(
+                                sqlstate::IO_ERROR,
+                                "cannot read secondary extension control file \"{}\": {}",
+                                secondary_path.display(),
+                                error
+                            )
+                        })?;
+                        merge_extension_control(
+                            primary_package,
+                            parse_extension_control(name, &text)?,
+                        )?
+                    } else {
+                        primary_package
+                    };
+                    let mut normalized = String::with_capacity(source.len());
+                    for line in source.lines() {
+                        if line.trim_start().starts_with("\\echo") {
+                            normalized.push_str("-- ");
+                        }
+                        normalized.push_str(line);
+                        normalized.push('\n');
+                    }
+                    let offset = self.extension_script_source.len();
+                    if !self.extension_script_source.append(normalized.as_bytes()) {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "extension scripts exceed extension_script_bytes ({})",
+                            self.extension_script_source.capacity()
+                        ));
+                    }
+                    self.extension_scripts
+                        .push(ExtensionScript {
+                            package: package_slot as u16,
+                            from,
+                            to,
+                            offset: offset as u32,
+                            length: normalized.len() as u32,
+                            effective,
+                        })
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "too many extension scripts (limit {})",
+                                self.extension_scripts.capacity()
+                            )
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extension_package_source(&self) -> ExtensionPackageSource {
+        self.extension_package_source
+    }
+
+    pub(crate) fn install_durable_extension_package(
+        &mut self,
+        package: ExtensionPackage,
+    ) -> Result<usize, SqlError> {
+        if self.extension_package_source != ExtensionPackageSource::Durable {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "durable extension package loaded while configured packages are authoritative"
+            ));
+        }
+        if self
+            .extension_packages
+            .iter()
+            .any(|known| known.name == package.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "duplicate durable extension package \"{}\"",
+                package.name.as_str()
+            ));
+        }
+        let slot = self.extension_packages.len();
+        self.extension_packages.push(package).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many durable extension packages (limit {})",
+                self.extension_packages.capacity()
+            )
+        })?;
+        Ok(slot)
+    }
+
+    pub(crate) fn install_durable_extension_script(
+        &mut self,
+        package: usize,
+        from: Option<ExtensionVersion>,
+        to: ExtensionVersion,
+        effective: ExtensionPackage,
+        source: &[u8],
+    ) -> Result<(), SqlError> {
+        if self.extension_package_source != ExtensionPackageSource::Durable {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid durable package source"
+            ));
+        }
+        if package >= self.extension_packages.len()
+            || effective.name != self.extension_packages[package].name
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid durable extension script package"
+            ));
+        }
+        if self.extension_scripts.iter().any(|script| {
+            script.package as usize == package && script.from == from && script.to == to
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "duplicate durable extension script"
+            ));
+        }
+        let offset = self.extension_script_source.len();
+        if !self.extension_script_source.append(source) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "durable extension scripts exceed extension_script_bytes ({})",
+                self.extension_script_source.capacity()
+            ));
+        }
+        self.extension_scripts
+            .push(ExtensionScript {
+                package: package as u16,
+                from,
+                to,
+                offset: offset as u32,
+                length: source.len() as u32,
+                effective,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many durable extension scripts (limit {})",
+                    self.extension_scripts.capacity()
+                )
+            })
+    }
+
+    pub(crate) fn extension_package(&self, name: &str) -> Option<(usize, &ExtensionPackage)> {
+        self.extension_packages
+            .iter()
+            .enumerate()
+            .find(|(_, package)| package.name.as_str() == name)
+    }
+
+    pub(crate) fn extension_packages(&self) -> impl Iterator<Item = (usize, &ExtensionPackage)> {
+        self.extension_packages.iter().enumerate()
+    }
+
+    pub(crate) fn extension_relocation_blocker(&self, name: &str, txid: u32) -> Option<SqlName> {
+        self.extensions_visible_to(txid).find_map(|(_, installed)| {
+            let (_, package) = self.extension_package(installed.name.as_str())?;
+            package
+                .no_relocate()
+                .iter()
+                .any(|required| required.as_str() == name)
+                .then_some(installed.name)
+        })
+    }
+
+    pub(crate) fn extension_scripts_for(
+        &self,
+        package: usize,
+    ) -> impl Iterator<Item = (usize, &ExtensionScript)> {
+        self.extension_scripts
+            .iter()
+            .enumerate()
+            .filter(move |(_, script)| script.package as usize == package)
+    }
+
+    pub(crate) fn extension_package_for_version(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<(usize, ExtensionVersion, ExtensionPackage), SqlError> {
+        let (package_slot, package) = self.extension_package(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "extension \"{}\" is not available",
+                name
+            )
+        })?;
+        let target = match version {
+            Some(version) => ExtensionVersion::parse(version)?,
+            None => package.default_version.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "version to install must be specified"
+                )
+            })?,
+        };
+        let effective = self
+            .extension_scripts_for(package_slot)
+            .find(|(_, script)| script.to == target)
+            .map(|(_, script)| script.effective)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "extension has no script for version \"{}\"",
+                    target.as_str()
+                )
+            })?;
+        Ok((package_slot, target, effective))
+    }
+
+    pub(crate) fn extension_script(&self, slot: usize) -> ExtensionScript {
+        self.extension_scripts[slot]
+    }
+
+    pub(crate) fn extension_script_source(&self, script: ExtensionScript) -> &str {
+        let start = script.offset as usize;
+        let end = start + script.length as usize;
+        core::str::from_utf8(&self.extension_script_source.readable()[start..end])
+            .expect("extension scripts were loaded as UTF-8")
     }
 
     /// Compares textual values under a resolved SQL collation identity.
@@ -7586,6 +8646,12 @@ impl Storage {
         self.roles[slot].name_to(txid)
     }
 
+    /// The current database is owned by the bootstrap role. `CREATEDB` is a
+    /// cluster role attribute and must never stand in for database `CREATE`.
+    pub(crate) fn has_current_database_create_privilege(&self, role: usize, txid: u32) -> bool {
+        role == 0 || self.role(role).attributes_to(txid).superuser
+    }
+
     pub fn live_roles(&self) -> impl Iterator<Item = (usize, &RoleDef)> {
         self.roles.iter().enumerate().filter(|(_, role)| role.live)
     }
@@ -7630,6 +8696,7 @@ impl Storage {
             AccessClass::Composite => &self.composites[slot].ownership,
             AccessClass::Tablespace => &self.tablespaces[slot].ownership,
             AccessClass::Statistics => &self.extended_statistics[slot].ownership,
+            AccessClass::Extension => &self.extensions[slot].ownership,
         }
     }
 
@@ -7648,6 +8715,7 @@ impl Storage {
             AccessClass::Composite => &mut self.composites[slot].ownership,
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
             AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
+            AccessClass::Extension => &mut self.extensions[slot].ownership,
         }
     }
 
@@ -7700,7 +8768,7 @@ impl Storage {
             AccessClass::Table => self.find_visible(schema, name, txid),
             AccessClass::View => self.views.iter().position(|view| {
                 view.visible_to(txid)
-                    && view.schema.as_str() == schema
+                    && view.schema_for(txid).as_str() == schema
                     && view.name.as_str() == name
             }),
             AccessClass::MaterializedView => self.matview_slot(schema, name, txid),
@@ -7721,6 +8789,7 @@ impl Storage {
             AccessClass::Composite => self.composite_slot(schema, name, txid),
             AccessClass::Tablespace => self.tablespace_slot(name, txid),
             AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
+            AccessClass::Extension => self.extension_slot(name, txid),
         }?;
         u16::try_from(slot)
             .ok()
@@ -7744,14 +8813,20 @@ impl Storage {
             }
             AccessClass::View => {
                 let definition = &self.views[slot];
-                (definition.schema, definition.name)
+                (definition.schema_for(txid), definition.name)
             }
             AccessClass::MaterializedView => {
                 let definition = &self.matviews[slot];
-                (definition.schema, definition.name)
+                let backing = self.tables.iter().position(|table| {
+                    table.def.schema == definition.schema && table.def.name == definition.name
+                });
+                backing.map_or((definition.schema, definition.name), |table| {
+                    let table = self.table_def(table, txid);
+                    (table.schema, table.name)
+                })
             }
             AccessClass::Sequence => {
-                let definition = &self.sequences[slot];
+                let definition = self.sequence_for(slot, txid);
                 (definition.schema, definition.name)
             }
             AccessClass::Schema => (SqlName::EMPTY, self.schemas[slot].name),
@@ -7780,6 +8855,7 @@ impl Storage {
                 let definition = self.extended_statistics[slot].definition_for(txid);
                 (definition.schema, definition.name)
             }
+            AccessClass::Extension => (SqlName::EMPTY, self.extensions[slot].name),
         }
     }
 
@@ -7802,6 +8878,7 @@ impl Storage {
             AccessClass::Statistics => {
                 self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
             }
+            AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -7820,6 +8897,7 @@ impl Storage {
             AccessClass::Composite => self.composites[slot].visible_to(txid),
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
+            AccessClass::Extension => self.extensions[slot].visible_to(txid),
         }
     }
 
@@ -7837,6 +8915,7 @@ impl Storage {
             AccessClass::Composite => self.composites.len(),
             AccessClass::Tablespace => self.tablespaces.len(),
             AccessClass::Statistics => self.extended_statistics.len(),
+            AccessClass::Extension => self.extensions.len(),
         }
     }
 
@@ -7869,6 +8948,8 @@ impl Storage {
             (AccessClass::Routine, self.routines.len()),
             (AccessClass::Composite, self.composites.len()),
             (AccessClass::Tablespace, self.tablespaces.len()),
+            (AccessClass::Statistics, self.extended_statistics.len()),
+            (AccessClass::Extension, self.extensions.len()),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -9417,8 +10498,7 @@ impl Storage {
                 "current role is not present in the role catalog"
             )
         })?;
-        let attributes = self.role(role).attributes_to(txid);
-        if !attributes.superuser && !attributes.create_database {
+        if !self.has_current_database_create_privilege(role, txid) {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied for database pos3ql"
@@ -9510,6 +10590,596 @@ impl Storage {
     /// image unchanged.
     pub fn rollback_schema_drop(&mut self, slot: usize, txid: u32) {
         self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn extension(&self, slot: usize) -> &ExtensionDef {
+        &self.extensions[slot]
+    }
+
+    pub(crate) fn extensions_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ExtensionDef)> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter(move |(_, extension)| extension.visible_to(txid))
+    }
+
+    pub(crate) fn live_extensions(&self) -> impl Iterator<Item = (usize, &ExtensionDef)> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter(|(_, extension)| extension.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn extension_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.extensions
+            .iter()
+            .position(|extension| extension.visible_to(txid) && extension.name.as_str() == name)
+    }
+
+    pub(crate) fn create_extension(
+        &mut self,
+        name: SqlName,
+        namespace: usize,
+        relocatable: bool,
+        version: ExtensionVersion,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if namespace >= self.schemas.len() || !self.schemas[namespace].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema for extension \"{}\" does not exist",
+                name.as_str()
+            ));
+        }
+        if self.extension_slot(name.as_str(), txid).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "extension \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if let Some(owner) = self.extensions.iter().find_map(|extension| {
+            (extension.name == name)
+                .then_some(extension.ddl_state.pending_txid()?)
+                .filter(|owner| *owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
+        let slot = self
+            .extensions
+            .iter()
+            .position(|extension| extension.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many extensions (limit {})",
+                    self.extensions.len()
+                )
+            })?;
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Extension,
+            slot: slot as u16,
+        });
+        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_seq;
+        self.extensions[slot] = ExtensionDef {
+            created_at,
+            name,
+            namespace: namespace as u16,
+            relocatable,
+            version,
+            ownership: self.initial_ownership(txid),
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn install_extension(
+        &mut self,
+        name: SqlName,
+        namespace: usize,
+        relocatable: bool,
+        version: ExtensionVersion,
+        owner: usize,
+        created_at: u64,
+    ) -> Result<usize, SqlError> {
+        if let Some(slot) = self.extension_slot(name.as_str(), 0) {
+            self.extensions[slot] = ExtensionDef {
+                created_at,
+                name,
+                namespace: namespace as u16,
+                relocatable,
+                version,
+                ownership: Ownership {
+                    owner: owner as u16,
+                    pending: None,
+                },
+                pending: None,
+                ddl_state: CatalogDdlState::Present,
+            };
+            return Ok(slot);
+        }
+        let slot = self
+            .extensions
+            .iter()
+            .position(|extension| extension.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many extensions (limit {})",
+                    self.extensions.len()
+                )
+            })?;
+        self.extensions[slot] = ExtensionDef {
+            created_at,
+            name,
+            namespace: namespace as u16,
+            relocatable,
+            version,
+            ownership: Ownership {
+                owner: owner as u16,
+                pending: None,
+            },
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_extension_definition(
+        &mut self,
+        slot: usize,
+        namespace: usize,
+        relocatable: bool,
+        version: ExtensionVersion,
+        txid: u32,
+    ) -> Result<Option<PendingExtensionDefinition>, SqlError> {
+        if namespace >= self.schemas.len() || !self.schemas[namespace].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema does not exist"
+            ));
+        }
+        if let Some(pending) = self.extensions[slot].pending
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.extensions[slot].name.as_str(),
+            ));
+        }
+        let prior = self.extensions[slot].pending;
+        self.extensions[slot].pending = Some(PendingExtensionDefinition {
+            txid,
+            namespace: namespace as u16,
+            relocatable,
+            version,
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_extension_create(&mut self, slot: usize, txid: u32) {
+        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.commit_create();
+        self.commit_object_owner(
+            AccessObject {
+                class: AccessClass::Extension,
+                slot: slot as u16,
+            },
+            txid,
+        );
+    }
+
+    pub(crate) fn rollback_extension_create(&mut self, slot: usize) {
+        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.rollback_create();
+        self.extensions[slot].pending = None;
+        self.rollback_extension_dependencies_for(slot, 0);
+        self.clear_extension_configs_for(slot);
+    }
+
+    pub(crate) fn commit_extension_alter(&mut self, slot: usize, txid: u32) {
+        if let Some(pending) = self.extensions[slot].pending
+            && pending.txid == txid
+        {
+            self.extensions[slot].namespace = pending.namespace;
+            self.extensions[slot].relocatable = pending.relocatable;
+            self.extensions[slot].version = pending.version;
+            self.extensions[slot].pending = None;
+        }
+    }
+
+    pub(crate) fn rollback_extension_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingExtensionDefinition>,
+    ) {
+        self.extensions[slot].pending = prior;
+    }
+
+    pub(crate) fn drop_extension_in(&mut self, slot: usize, txid: u32) {
+        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_extension_drop(&mut self, slot: usize) {
+        let name = self.extensions[slot].name;
+        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.commit_drop();
+        self.extensions[slot].pending = None;
+        self.drop_object_comments(CommentClass::Extension, "", name.as_str());
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency.extension as usize == slot {
+                *dependency = ExtensionDependency::EMPTY;
+            }
+        }
+        self.clear_extension_configs_for(slot);
+    }
+
+    pub(crate) fn rollback_extension_drop(&mut self, slot: usize, txid: u32) {
+        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn extension_dependencies_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ExtensionDependency)> {
+        self.extension_dependencies
+            .iter()
+            .enumerate()
+            .filter(move |(_, dependency)| dependency.visible_to(txid))
+    }
+
+    pub(crate) fn extension_dependency(&self, slot: usize) -> &ExtensionDependency {
+        &self.extension_dependencies[slot]
+    }
+
+    pub(crate) fn extension_member_of(&self, object: AccessObject, txid: u32) -> Option<usize> {
+        self.extension_dependencies
+            .iter()
+            .find(|dependency| {
+                dependency.visible_to(txid)
+                    && dependency.kind == ExtensionDependencyKind::Member
+                    && dependency.object == object
+            })
+            .map(|dependency| dependency.extension as usize)
+    }
+
+    pub(crate) fn require_not_extension_member(
+        &self,
+        object: AccessObject,
+        txid: u32,
+        kind: &str,
+    ) -> Result<(), SqlError> {
+        let Some(extension) = self.extension_member_of(object, txid) else {
+            return Ok(());
+        };
+        let (_, name) = self.access_object_name_to(object, txid);
+        Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop {} \"{}\" because extension \"{}\" requires it",
+            kind,
+            name.as_str(),
+            self.extensions[extension].name.as_str()
+        ))
+    }
+
+    pub(crate) fn change_extension_dependency(
+        &mut self,
+        extension: usize,
+        object: AccessObject,
+        kind: ExtensionDependencyKind,
+        exists: bool,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingExtensionDependency>), SqlError> {
+        if !self.extensions[extension].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension does not exist"
+            ));
+        }
+        if !self.access_object_visible_to(object, txid)
+            || (object.class == AccessClass::Extension && kind != ExtensionDependencyKind::Required)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension dependency target does not exist"
+            ));
+        }
+        if exists
+            && kind == ExtensionDependencyKind::Member
+            && let Some(other) = self.extension_member_of(object, txid)
+            && other != extension
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "object is already a member of extension \"{}\"",
+                self.extensions[other].name.as_str()
+            ));
+        }
+        let existing = self.extension_dependencies.iter().position(|dependency| {
+            dependency.extension as usize == extension
+                && dependency.object == object
+                && dependency.kind == kind
+                && (dependency.live || dependency.pending.is_some())
+        });
+        let slot = if let Some(slot) = existing {
+            slot
+        } else {
+            if !exists {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "object is not a member of extension \"{}\"",
+                    self.extensions[extension].name.as_str()
+                ));
+            }
+            self.extension_dependencies
+                .iter()
+                .position(|dependency| !dependency.live && dependency.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many extension dependencies (limit {})",
+                        self.extension_dependencies.len()
+                    )
+                })?
+        };
+        if let Some(pending) = self.extension_dependencies[slot].pending
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.extensions[extension].name.as_str(),
+            ));
+        }
+        let prior = self.extension_dependencies[slot].pending;
+        if existing.is_none() {
+            self.extension_dependencies[slot].extension = extension as u16;
+            self.extension_dependencies[slot].object = object;
+            self.extension_dependencies[slot].kind = kind;
+        }
+        self.extension_dependencies[slot].pending =
+            Some(PendingExtensionDependency { txid, exists });
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn commit_extension_dependency(&mut self, slot: usize, txid: u32) {
+        let dependency = &mut self.extension_dependencies[slot];
+        if let Some(pending) = dependency.pending
+            && pending.txid == txid
+        {
+            dependency.live = pending.exists;
+            dependency.pending = None;
+            if !dependency.live {
+                *dependency = ExtensionDependency::EMPTY;
+            }
+        }
+    }
+
+    pub(crate) fn rollback_extension_dependency(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingExtensionDependency>,
+    ) {
+        self.extension_dependencies[slot].pending = prior;
+        if !self.extension_dependencies[slot].live && prior.is_none() {
+            self.extension_dependencies[slot] = ExtensionDependency::EMPTY;
+        }
+    }
+
+    fn rollback_extension_dependencies_for(&mut self, extension: usize, txid: u32) {
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency.extension as usize == extension
+                && (txid == 0
+                    || dependency
+                        .pending
+                        .is_some_and(|pending| pending.txid == txid))
+            {
+                *dependency = ExtensionDependency::EMPTY;
+            }
+        }
+    }
+
+    pub(crate) fn extension_configs_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ExtensionConfig)> {
+        self.extension_configs
+            .iter()
+            .enumerate()
+            .filter(move |(_, config)| config.visible_to(txid))
+    }
+
+    pub(crate) fn extension_config(&self, slot: usize) -> &ExtensionConfig {
+        &self.extension_configs[slot]
+    }
+
+    pub(crate) fn extension_config_slot(
+        &self,
+        extension: usize,
+        relation: ExtensionConfigRelation,
+        txid: u32,
+    ) -> Option<usize> {
+        self.extension_configs.iter().position(|config| {
+            config.extension as usize == extension
+                && config.relation == relation
+                && config.visible_to(txid)
+        })
+    }
+
+    pub(crate) fn change_extension_config(
+        &mut self,
+        extension: usize,
+        relation: ExtensionConfigRelation,
+        condition: ExtensionConfigCondition,
+        exists: bool,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingExtensionConfig>), SqlError> {
+        self.change_extension_config_with_ordinal(
+            extension, relation, condition, exists, None, txid,
+        )
+    }
+
+    pub(crate) fn replay_extension_config(
+        &mut self,
+        extension: usize,
+        relation: ExtensionConfigRelation,
+        condition: ExtensionConfigCondition,
+        exists: bool,
+        ordinal: u16,
+    ) -> Result<(usize, Option<PendingExtensionConfig>), SqlError> {
+        self.change_extension_config_with_ordinal(
+            extension,
+            relation,
+            condition,
+            exists,
+            Some(ordinal),
+            0,
+        )
+    }
+
+    fn change_extension_config_with_ordinal(
+        &mut self,
+        extension: usize,
+        relation: ExtensionConfigRelation,
+        condition: ExtensionConfigCondition,
+        exists: bool,
+        recovered_ordinal: Option<u16>,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingExtensionConfig>), SqlError> {
+        if !self.extensions[extension].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension does not exist"
+            ));
+        }
+        let object = relation.access_object();
+        if !self.access_object_visible_to(object, txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "extension configuration relation does not exist"
+            ));
+        }
+        if exists && self.extension_member_of(object, txid) != Some(extension) {
+            let (_, name) = self.access_object_name_to(object, txid);
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "table \"{}\" is not a member of the extension being created",
+                name.as_str()
+            ));
+        }
+        let existing = self.extension_configs.iter().position(|config| {
+            config.extension as usize == extension
+                && config.relation == relation
+                && (config.live || config.pending.is_some())
+        });
+        let slot = if let Some(slot) = existing {
+            slot
+        } else {
+            if !exists {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "relation is not an extension configuration relation"
+                ));
+            }
+            self.extension_configs
+                .iter()
+                .position(|config| !config.live && config.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many extension configuration relations (limit {})",
+                        self.extension_configs.len()
+                    )
+                })?
+        };
+        if let Some(pending) = self.extension_configs[slot].pending
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.extensions[extension].name.as_str(),
+            ));
+        }
+        let prior = self.extension_configs[slot].pending;
+        if existing.is_none() {
+            self.extension_configs[slot].extension = extension as u16;
+            let ordinal = if let Some(ordinal) = recovered_ordinal {
+                if self.extension_configs.iter().any(|config| {
+                    config.extension as usize == extension
+                        && (config.live || config.pending.is_some())
+                        && config.ordinal == ordinal
+                }) {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "duplicate extension configuration ordinal"
+                    ));
+                }
+                ordinal
+            } else {
+                self.extension_configs
+                    .iter()
+                    .filter(|config| {
+                        config.extension as usize == extension
+                            && (config.live || config.pending.is_some())
+                    })
+                    .map(|config| config.ordinal)
+                    .max()
+                    .map_or(0, |ordinal| ordinal.saturating_add(1))
+            };
+            self.extension_configs[slot].ordinal = ordinal;
+            self.extension_configs[slot].relation = relation;
+        } else if let Some(ordinal) = recovered_ordinal
+            && self.extension_configs[slot].ordinal != ordinal
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "extension configuration ordinal changed during recovery"
+            ));
+        }
+        self.extension_configs[slot].pending = Some(PendingExtensionConfig {
+            txid,
+            exists,
+            condition,
+        });
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn commit_extension_config(&mut self, slot: usize, txid: u32) {
+        let config = &mut self.extension_configs[slot];
+        if let Some(pending) = config.pending
+            && pending.txid == txid
+        {
+            config.live = pending.exists;
+            config.condition = pending.condition;
+            config.pending = None;
+            if !config.live {
+                *config = ExtensionConfig::EMPTY;
+            }
+        }
+    }
+
+    pub(crate) fn rollback_extension_config(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingExtensionConfig>,
+    ) {
+        self.extension_configs[slot].pending = prior;
+        if !self.extension_configs[slot].live && prior.is_none() {
+            self.extension_configs[slot] = ExtensionConfig::EMPTY;
+        }
+    }
+
+    fn clear_extension_configs_for(&mut self, extension: usize) {
+        for config in self.extension_configs.iter_mut() {
+            if config.extension as usize == extension {
+                *config = ExtensionConfig::EMPTY;
+            }
+        }
     }
 
     /// Computes the effective path a raw `search_path` value denotes for this
@@ -9666,7 +11336,9 @@ impl Storage {
         self.views
             .iter()
             .position(|v| {
-                v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
+                v.visible_to(txid)
+                    && v.schema_for(txid).as_str() == schema
+                    && v.name.as_str() == name
             })
             .map(ResolvedRelation::View)
     }
@@ -14829,9 +16501,9 @@ impl Storage {
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
-        self.views
-            .iter()
-            .find(|v| v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name)
+        self.views.iter().find(|v| {
+            v.visible_to(txid) && v.schema_for(txid).as_str() == schema && v.name.as_str() == name
+        })
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -15012,14 +16684,20 @@ impl Storage {
     }
 
     pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
-        self.sequences
-            .iter()
-            .find(|s| s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name)
+        self.sequences.iter().find(|s| {
+            let definition = s.definition_for(txid);
+            s.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        })
     }
 
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.sequences.iter().position(|s| {
-            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
+            let definition = s.definition_for(txid);
+            s.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
         })
     }
 
@@ -15140,10 +16818,7 @@ impl Storage {
     pub(crate) fn stage_sequence_alter(
         &mut self,
         slot: usize,
-        spec: SeqSpec,
-        owner: Option<SequenceOwner>,
-        generator_for: Option<SequenceOwner>,
-        restart: Option<i64>,
+        alteration: SequenceAlteration,
         txid: u32,
     ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
         let sequence = &mut self.sequences[slot];
@@ -15182,19 +16857,21 @@ impl Storage {
         } else {
             (sequence.last_value.get(), sequence.is_called.get())
         };
-        let (last_value, is_called) =
-            restart.map_or((last_value, is_called), |value| (value, false));
+        let (last_value, is_called) = alteration
+            .restart
+            .map_or((last_value, is_called), |value| (value, false));
         sequence.pending_definition = Some(PendingSequenceDefinition {
             txid,
-            spec,
-            owner,
-            generator_for,
+            schema: alteration.schema,
+            spec: alteration.spec,
+            owner: alteration.owner,
+            generator_for: alteration.generator_for,
             last_value,
             is_called,
         });
         sequence.pending_last_value.set(last_value);
         sequence.pending_is_called.set(is_called);
-        sequence.pending_dirty.set(restart.is_some());
+        sequence.pending_dirty.set(alteration.restart.is_some());
         Ok(prior)
     }
 
@@ -15204,6 +16881,8 @@ impl Storage {
             .filter(|pending| pending.txid == txid)
             .is_some()
         {
+            let old_schema = self.sequences[slot].schema;
+            let name = self.sequences[slot].name;
             let last_value = self.sequences[slot].pending_last_value.get();
             let is_called = self.sequences[slot].pending_is_called.get();
             let definition = self.sequences[slot].definition_for(txid);
@@ -15212,6 +16891,18 @@ impl Storage {
             self.sequences[slot].is_called.set(is_called);
             self.sequences[slot].dirty.set(false);
             self.sequences[slot].pending_dirty.set(false);
+            if old_schema != self.sequences[slot].schema {
+                let new_schema = self.sequences[slot].schema;
+                for comment in self.comments.iter_mut() {
+                    if comment.used
+                        && comment.class == CommentClass::Relation
+                        && comment.schema == old_schema
+                        && comment.name == name
+                    {
+                        comment.schema = new_schema;
+                    }
+                }
+            }
         }
     }
 
@@ -17536,7 +19227,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.schema.as_str() == schema.as_str() && v.name.as_str() == name.as_str())
+            (v.schema_for(txid).as_str() == schema.as_str() && v.name.as_str() == name.as_str())
                 .then_some(v.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
@@ -17544,7 +19235,7 @@ impl Storage {
         }
         let existing = self.views.iter().position(|v| {
             v.visible_to(txid)
-                && v.schema.as_str() == schema.as_str()
+                && v.schema_for(txid).as_str() == schema.as_str()
                 && v.name.as_str() == name.as_str()
         });
         if existing.is_some() && !or_replace {
@@ -17582,6 +19273,7 @@ impl Storage {
             creation_path: query.creation_path,
             security,
             ownership,
+            pending_schema: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         self.view_dependencies[new] = query.dependencies;
@@ -17598,14 +19290,14 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.schema.as_str() == schema && v.name.as_str() == name)
+            (v.schema_for(txid).as_str() == schema && v.name.as_str() == name)
                 .then_some(v.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.views.iter().position(|v| {
-            v.visible_to(txid) && v.schema.as_str() == schema && v.name.as_str() == name
+            v.visible_to(txid) && v.schema_for(txid).as_str() == schema && v.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -17640,6 +19332,50 @@ impl Storage {
             );
         }
         self.views[slot].ddl_state = self.views[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn stage_view_schema(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingObjectSchema>, SqlError> {
+        let prior = self.views[slot].pending_schema;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                self.views[slot].name.as_str(),
+            ));
+        }
+        self.views[slot].pending_schema = Some(PendingObjectSchema { txid, schema });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_view_schema(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.views[slot]
+            .pending_schema
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
+        let old_schema = self.views[slot].schema;
+        let name = self.views[slot].name;
+        self.views[slot].schema = pending.schema;
+        self.views[slot].pending_schema = None;
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
+                && comment.schema == old_schema
+                && comment.name == name
+            {
+                comment.schema = pending.schema;
+            }
+        }
+    }
+
+    pub(crate) fn rollback_view_schema(&mut self, slot: usize, prior: Option<PendingObjectSchema>) {
+        self.views[slot].pending_schema = prior;
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
@@ -19866,8 +21602,14 @@ impl Storage {
     /// the reusable catalog slot after DROP, so this also resolves the table
     /// while finalizing a drop.
     pub fn index_table_slot(&self, slot: usize) -> Option<usize> {
+        self.index_table_slot_to(slot, 0)
+    }
+
+    /// The transaction-visible table named by an index. DDL execution must
+    /// use this form so a just-created table is not mistaken for corruption.
+    pub(crate) fn index_table_slot_to(&self, slot: usize, txid: u32) -> Option<usize> {
         let index = self.indexes.get(slot)?;
-        self.find_table(index.schema.as_str(), index.table.as_str())
+        self.find_visible(index.schema.as_str(), index.table.as_str(), txid)
     }
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
@@ -20228,6 +21970,14 @@ impl Storage {
         let name = self.tables[index].def.name;
         self.tables[index].def.schema = new_schema;
         self.tables[index].mark_dirty();
+        for matview in self.matviews.iter_mut() {
+            if matview.ddl_state == CatalogDdlState::Present
+                && matview.schema == old_schema
+                && matview.name == name
+            {
+                matview.schema = new_schema;
+            }
+        }
         for x in self.indexes.iter_mut() {
             if x.ddl_state == CatalogDdlState::Present
                 && x.schema.as_str() == old_schema.as_str()
@@ -20289,6 +22039,7 @@ impl Storage {
                 comment.schema = new_schema;
             }
         }
+        self.rename_stored_query_dependency(DependencyClass::Table, index, new_schema, name);
     }
 
     /// Removes one foreign key from a table's definition by constraint name
@@ -20825,10 +22576,11 @@ mod tests {
             CommentClass::Schema,
             CommentClass::Type,
             CommentClass::Tablespace,
+            CommentClass::Extension,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(4), None);
+        assert_eq!(CommentClass::from_u8(5), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 
@@ -20846,6 +22598,8 @@ mod tests {
             AccessClass::Routine,
             AccessClass::Composite,
             AccessClass::Statistics,
+            AccessClass::Tablespace,
+            AccessClass::Extension,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));
         }
@@ -20861,6 +22615,8 @@ mod tests {
         c.txn_rows = 128;
         c.value_index_rows = 512;
         c.max_value_indexes = 8;
+        c.max_extension_scripts = 8;
+        c.extension_script_bytes = 1 << 16;
         c
     }
 

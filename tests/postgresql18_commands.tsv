@@ -15,19 +15,19 @@
 # tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
-ALTER AGGREGATE	partial	110_user_defined_aggregates.sql (rename, owner, and schema forms; extension dependency remains in the extension gap)
+ALTER AGGREGATE	partial	110_user_defined_aggregates.sql plus typed extension dependency coverage
 ALTER COLLATION	missing	-
 ALTER CONVERSION	missing	-
 ALTER DATABASE	missing	-
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
 ALTER EVENT TRIGGER	missing	-
-ALTER EXTENSION	missing	-
+ALTER EXTENSION	partial	SQL-package lifecycle is covered end to end; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
 ALTER FUNCTION	partial	90_routine_lifecycle.sql
 ALTER GROUP	partial	83_roles_acl.sql
-ALTER INDEX	partial	107_index_lifecycle.sql (all modeled forms; extension dependency remains outside the extension gap)
+ALTER INDEX	partial	107_index_lifecycle.sql plus typed extension dependency coverage
 ALTER LANGUAGE	missing	-
 ALTER LARGE OBJECT	missing	-
 ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql
@@ -75,7 +75,7 @@ CREATE CONVERSION	missing	-
 CREATE DATABASE	missing	-
 CREATE DOMAIN	complete	62_domains.sql
 CREATE EVENT TRIGGER	missing	-
-CREATE EXTENSION	missing	-
+CREATE EXTENSION	partial	SQL control/script packages are complete; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
 CREATE FUNCTION	partial	87_sql_routines.sql
@@ -122,7 +122,7 @@ DROP CONVERSION	missing	-
 DROP DATABASE	missing	-
 DROP DOMAIN	complete	62_domains.sql
 DROP EVENT TRIGGER	missing	-
-DROP EXTENSION	missing	-
+DROP EXTENSION	partial	SQL-package RESTRICT/CASCADE and dependency classes are complete; native packages are not loaded
 DROP FOREIGN DATA WRAPPER	missing	-
 DROP FOREIGN TABLE	missing	-
 DROP FUNCTION	partial	87_sql_routines.sql

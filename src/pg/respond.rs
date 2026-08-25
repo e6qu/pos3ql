@@ -1336,6 +1336,20 @@ impl<'b> Responder<'b> {
         result
     }
 
+    /// Runs an internal statement without exposing its row description, rows,
+    /// or command tag. Diagnostic messages and errors still use the ordinary
+    /// wire path.
+    pub(crate) fn without_query_output<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+        let prior_discard = self.discard_query_output;
+        let prior_command = self.suppress_command_complete;
+        self.discard_query_output = true;
+        self.suppress_command_complete = true;
+        let result = operation(self);
+        self.discard_query_output = prior_discard;
+        self.suppress_command_complete = prior_command;
+        result
+    }
+
     pub fn empty_query_response(&mut self) -> Result<(), WireFull> {
         MsgOut::begin(self.buffer, wire::MSG_EMPTY_QUERY_RESPONSE).finish()
     }

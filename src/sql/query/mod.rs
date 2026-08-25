@@ -1462,7 +1462,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let attributes = self.storage.role(role).attributes_to(self.txid);
         let mut result = true;
         for written in privileges.split(',') {
             let privilege = written.trim();
@@ -1472,7 +1471,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             {
                 true
             } else if privilege.eq_ignore_ascii_case("create") {
-                attributes.superuser || attributes.create_database
+                self.storage
+                    .has_current_database_create_privilege(role, self.txid)
             } else {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,

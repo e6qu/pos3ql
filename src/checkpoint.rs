@@ -28,6 +28,7 @@ pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
 const MANIFEST_HEADER: &str = "pos3ql-manifest-v2";
+const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 
@@ -1680,11 +1681,14 @@ impl Checkpointer {
                     } else {
                         0
                     };
-                    let schema = decode_hex_name(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("own schema missing"))?,
-                    )?;
+                    let schema_word = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("own schema missing"))?;
+                    let schema = if schema_word == "-" {
+                        String::new()
+                    } else {
+                        decode_hex_name(schema_word)?
+                    };
                     let name = decode_hex_name(
                         words
                             .next()
@@ -2295,7 +2299,13 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
-                            .and_then(decode_hex_name)
+                            .and_then(|value| {
+                                if value == "-" {
+                                    Ok(String::new())
+                                } else {
+                                    decode_hex_name(value)
+                                }
+                            })
                     };
                     let schema = read_hex(words.next(), "sq2 schema missing")?;
                     let name = read_hex(words.next(), "sq2 name missing")?;
@@ -2607,6 +2617,309 @@ impl Checkpointer {
                                 e.message.as_str()
                             ))
                         })?;
+                }
+                Some("ext") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at: u64 = parse_field(words.next(), "ext sequence")?;
+                    let owner: usize = parse_field(words.next(), "ext owner")?;
+                    let relocatable = match parse_field::<u8>(words.next(), "ext relocatable")? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CheckpointSetupError::Corrupt("ext relocatable")),
+                    };
+                    let name = sql_name(&decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("ext name"))?,
+                    )?)?;
+                    let schema = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("ext schema"))?,
+                    )?;
+                    let version = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("ext version"))?,
+                    )?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing ext fields"));
+                    }
+                    let namespace = storage
+                        .find_schema(&schema)
+                        .ok_or(CheckpointSetupError::Corrupt("ext schema does not exist"))?;
+                    if owner >= storage.role_count() || !storage.role(owner).visible_to(0) {
+                        return Err(CheckpointSetupError::Corrupt("ext owner does not exist"));
+                    }
+                    storage
+                        .install_extension(
+                            name,
+                            namespace,
+                            relocatable,
+                            crate::storage::ExtensionVersion::parse(&version).map_err(|_| {
+                                CheckpointSetupError::Corrupt("ext version invalid")
+                            })?,
+                            owner,
+                            created_at,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest extension rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("xpk") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let package_slot: usize = parse_field(words.next(), "extension package slot")?;
+                    let key = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("extension package key"))?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing extension package fields",
+                        ));
+                    }
+                    if storage.extension_package_source()
+                        == crate::storage::ExtensionPackageSource::Configured
+                    {
+                        continue;
+                    }
+                    if package_slot != storage.extension_packages().count() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "extension package slots are not ordered",
+                        ));
+                    }
+                    self.client.get(key, None).map_err(|error| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "load durable extension package: {error}"
+                        ))
+                    })?;
+                    verify_extension_object_key(
+                        key,
+                        "extensions/meta/",
+                        ".pkg",
+                        self.client.body_bytes(),
+                    )?;
+                    let package = decode_extension_package(self.client.body_bytes())?;
+                    storage
+                        .install_durable_extension_package(package)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "durable extension package rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("xsc") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let package_slot: usize =
+                        parse_field(words.next(), "extension script package")?;
+                    let from = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("extension script from"))?,
+                    )?;
+                    let to = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("extension script to"))?,
+                    )?;
+                    let metadata_key = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "extension script metadata key",
+                    ))?;
+                    let source_key = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("extension script source key"))?;
+                    let expected_length: usize =
+                        parse_field(words.next(), "extension script length")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing extension script fields",
+                        ));
+                    }
+                    if storage.extension_package_source()
+                        == crate::storage::ExtensionPackageSource::Configured
+                    {
+                        continue;
+                    }
+                    self.client.get(metadata_key, None).map_err(|error| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "load durable extension version metadata: {error}"
+                        ))
+                    })?;
+                    verify_extension_object_key(
+                        metadata_key,
+                        "extensions/meta/",
+                        ".pkg",
+                        self.client.body_bytes(),
+                    )?;
+                    let effective = decode_extension_package(self.client.body_bytes())?;
+                    self.client.get(source_key, None).map_err(|error| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "load durable extension script: {error}"
+                        ))
+                    })?;
+                    verify_extension_object_key(
+                        source_key,
+                        "extensions/sql/",
+                        ".sql",
+                        self.client.body_bytes(),
+                    )?;
+                    if self.client.body_bytes().len() != expected_length
+                        || core::str::from_utf8(self.client.body_bytes()).is_err()
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid durable extension script",
+                        ));
+                    }
+                    let from = if from.is_empty() {
+                        None
+                    } else {
+                        Some(crate::storage::ExtensionVersion::parse(&from).map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid extension script source version")
+                        })?)
+                    };
+                    let to = crate::storage::ExtensionVersion::parse(&to).map_err(|_| {
+                        CheckpointSetupError::Corrupt("invalid extension script target version")
+                    })?;
+                    storage
+                        .install_durable_extension_script(
+                            package_slot,
+                            from,
+                            to,
+                            effective,
+                            self.client.body_bytes(),
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "durable extension script rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("exd") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let extension_name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("exd extension"))?,
+                    )?;
+                    let class = crate::storage::AccessClass::from_u8(parse_field(
+                        words.next(),
+                        "exd class",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("exd class invalid"))?;
+                    let object_oid: i32 = parse_field(words.next(), "exd object oid")?;
+                    let decode_identity = |value: Option<&str>, missing| {
+                        let value = value.ok_or(CheckpointSetupError::Corrupt(missing))?;
+                        if value == "-" {
+                            Ok(String::new())
+                        } else {
+                            decode_hex_name(value)
+                        }
+                    };
+                    let schema = decode_identity(words.next(), "exd schema")?;
+                    let name = decode_identity(words.next(), "exd name")?;
+                    let kind = match parse_field::<u8>(words.next(), "exd kind")? {
+                        0 => crate::storage::ExtensionDependencyKind::Member,
+                        1 => crate::storage::ExtensionDependencyKind::Automatic,
+                        2 => crate::storage::ExtensionDependencyKind::Required,
+                        _ => return Err(CheckpointSetupError::Corrupt("exd kind invalid")),
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing exd fields"));
+                    }
+                    let extension = storage.extension_slot(&extension_name, 0).ok_or(
+                        CheckpointSetupError::Corrupt("exd extension does not exist"),
+                    )?;
+                    let object = if class == crate::storage::AccessClass::Routine {
+                        storage.routine_slot_by_oid(object_oid, 0).map(|slot| {
+                            crate::storage::AccessObject {
+                                class,
+                                slot: slot as u16,
+                            }
+                        })
+                    } else {
+                        storage.resolve_access_object(class, &schema, &name, 0)
+                    }
+                    .ok_or(CheckpointSetupError::Corrupt("exd object does not exist"))?;
+                    let (slot, _) = storage
+                        .change_extension_dependency(extension, object, kind, true, 0)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest extension dependency rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_extension_dependency(slot, 0);
+                }
+                Some("exc") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let extension_name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("exc extension"))?,
+                    )?;
+                    let ordinal = parse_field(words.next(), "exc ordinal")?;
+                    let relation_kind = crate::storage::ExtensionConfigRelationKind::from_u8(
+                        parse_field(words.next(), "exc relation kind")?,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt("exc relation kind invalid"))?;
+                    let schema = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("exc schema"))?,
+                    )?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("exc name"))?,
+                    )?;
+                    let condition = match words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("exc condition"))?
+                    {
+                        "-" => String::new(),
+                        encoded => decode_hex_name(encoded)?,
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing exc fields"));
+                    }
+                    let extension = storage.extension_slot(&extension_name, 0).ok_or(
+                        CheckpointSetupError::Corrupt("exc extension does not exist"),
+                    )?;
+                    let object = match relation_kind {
+                        crate::storage::ExtensionConfigRelationKind::Table => storage
+                            .resolve_access_object(
+                                crate::storage::AccessClass::Table,
+                                &schema,
+                                &name,
+                                0,
+                            ),
+                        crate::storage::ExtensionConfigRelationKind::Sequence => storage
+                            .resolve_access_object(
+                                crate::storage::AccessClass::Sequence,
+                                &schema,
+                                &name,
+                                0,
+                            ),
+                    }
+                    .ok_or(CheckpointSetupError::Corrupt("exc relation does not exist"))?;
+                    let relation =
+                        crate::storage::ExtensionConfigRelation::from_access_object(object)
+                            .ok_or(CheckpointSetupError::Corrupt("exc relation class invalid"))?;
+                    let condition = crate::storage::extension_config_condition(&condition)
+                        .map_err(|_| CheckpointSetupError::Corrupt("exc condition too long"))?;
+                    let (slot, _) = storage
+                        .replay_extension_config(extension, relation, condition, true, ordinal)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest extension configuration rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_extension_config(slot, 0);
                 }
                 Some("cmt") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -4740,6 +5053,98 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (_, extension) in storage.live_extensions() {
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            let mut schema = StackStr::<130>::new();
+            let mut version = StackStr::<130>::new();
+            for byte in extension.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            for byte in storage
+                .schema_def(extension.namespace as usize)
+                .name
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(schema, "{byte:02x}");
+            }
+            for byte in extension.version.as_str().as_bytes() {
+                let _ = write!(version, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "ext {} {} {} {} {} {}",
+                    extension.created_at,
+                    extension.ownership.owner,
+                    u8::from(extension.relocatable),
+                    name.as_str(),
+                    schema.as_str(),
+                    version.as_str(),
+                ),
+            )?;
+        }
+        // The availability catalog is durable independently of installed
+        // extensions. SQL and control metadata are immutable objects; the CAS
+        // manifest publishes their ordered, bounded catalog in one step.
+        for (package_slot, package) in storage.extension_packages() {
+            let metadata = encode_extension_package(*package)?;
+            let metadata_key = stack_format!(
+                80,
+                "extensions/meta/{:08x}-{}.pkg",
+                crate::wal::crc32c::crc32c(metadata.as_str().as_bytes()),
+                metadata.as_str().len()
+            );
+            self.put_immutable(metadata_key.as_str(), metadata.as_str().as_bytes())?;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!("xpk {} {}", package_slot, metadata_key.as_str()),
+            )?;
+            for (_, script) in storage.extension_scripts_for(package_slot) {
+                let effective = encode_extension_package(script.effective)?;
+                let effective_key = stack_format!(
+                    80,
+                    "extensions/meta/{:08x}-{}.pkg",
+                    crate::wal::crc32c::crc32c(effective.as_str().as_bytes()),
+                    effective.as_str().len()
+                );
+                self.put_immutable(effective_key.as_str(), effective.as_str().as_bytes())?;
+                let source = storage.extension_script_source(*script).as_bytes();
+                let source_key = stack_format!(
+                    80,
+                    "extensions/sql/{:08x}-{}.sql",
+                    crate::wal::crc32c::crc32c(source),
+                    source.len()
+                );
+                self.put_immutable(source_key.as_str(), source)?;
+                let mut from = StackStr::<130>::new();
+                let mut to = StackStr::<130>::new();
+                use core::fmt::Write as _;
+                if let Some(version) = script.from {
+                    for byte in version.as_str().as_bytes() {
+                        let _ = write!(from, "{byte:02x}");
+                    }
+                } else {
+                    let _ = from.write_str("-");
+                }
+                for byte in script.to.as_str().as_bytes() {
+                    let _ = write!(to, "{byte:02x}");
+                }
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "xsc {} {} {} {} {} {}",
+                        package_slot,
+                        from.as_str(),
+                        to.as_str(),
+                        effective_key.as_str(),
+                        source_key.as_str(),
+                        source.len()
+                    ),
+                )?;
+            }
+        }
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
         for comment in storage.live_comments() {
@@ -4748,6 +5153,9 @@ impl Checkpointer {
             let mut hschema = StackStr::<130>::new();
             for b in comment.schema.as_str().as_bytes() {
                 let _ = write!(hschema, "{b:02x}");
+            }
+            if hschema.as_str().is_empty() {
+                let _ = write!(hschema, "-");
             }
             let mut hname = StackStr::<130>::new();
             for b in comment.name.as_str().as_bytes() {
@@ -4914,6 +5322,85 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (_, dependency) in storage.extension_dependencies_visible_to(0) {
+            use core::fmt::Write;
+            let extension = storage.extension(dependency.extension as usize).name;
+            let (schema, name) = storage.access_object_name(dependency.object);
+            let mut extension_hex = StackStr::<130>::new();
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            for byte in extension.as_str().as_bytes() {
+                let _ = write!(extension_hex, "{byte:02x}");
+            }
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            if schema_hex.as_str().is_empty() {
+                let _ = write!(schema_hex, "-");
+            }
+            for byte in name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "exd {} {} {} {} {} {}",
+                    extension_hex.as_str(),
+                    dependency.object.class as u8,
+                    if dependency.object.class == crate::storage::AccessClass::Routine {
+                        crate::storage::routine_oid(
+                            &storage.routine_for(dependency.object.slot as usize, 0),
+                        )
+                    } else {
+                        0
+                    },
+                    schema_hex.as_str(),
+                    name_hex.as_str(),
+                    match dependency.kind {
+                        crate::storage::ExtensionDependencyKind::Member => 0,
+                        crate::storage::ExtensionDependencyKind::Automatic => 1,
+                        crate::storage::ExtensionDependencyKind::Required => 2,
+                    },
+                ),
+            )?;
+        }
+        for (_, config) in storage.extension_configs_visible_to(0) {
+            use core::fmt::Write;
+            let extension = storage.extension(config.extension as usize).name;
+            let (schema, name) = storage.access_object_name(config.relation.access_object());
+            let mut extension_hex = StackStr::<130>::new();
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            let mut condition_hex =
+                StackStr::<{ crate::storage::EXTENSION_CONFIG_CONDITION_BYTES * 2 }>::new();
+            for byte in extension.as_str().as_bytes() {
+                let _ = write!(extension_hex, "{byte:02x}");
+            }
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            for byte in config.condition.as_str().as_bytes() {
+                let _ = write!(condition_hex, "{byte:02x}");
+            }
+            if condition_hex.as_str().is_empty() {
+                let _ = write!(condition_hex, "-");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "exc {} {} {} {} {} {}",
+                    extension_hex.as_str(),
+                    config.ordinal,
+                    config.relation.kind().to_u8(),
+                    schema_hex.as_str(),
+                    name_hex.as_str(),
+                    condition_hex.as_str(),
+                ),
+            )?;
+        }
         // Ownership and ACL authority follows every object definition so a
         // cold manifest load can resolve stable runtime slots from names.
         let mut write_owner = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
@@ -4925,6 +5412,9 @@ impl Checkpointer {
             let mut owner_hex = StackStr::<130>::new();
             for byte in schema.as_str().as_bytes() {
                 let _ = write!(schema_hex, "{byte:02x}");
+            }
+            if schema_hex.as_str().is_empty() {
+                let _ = write!(schema_hex, "-");
             }
             for byte in name.as_str().as_bytes() {
                 let _ = write!(name_hex, "{byte:02x}");
@@ -4986,6 +5476,12 @@ impl Checkpointer {
         for (slot, _) in storage.live_schemas() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.live_extensions() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Extension,
                 slot: slot as u16,
             })?;
         }
@@ -5919,6 +6415,9 @@ fn rest_of(line: &str, skip: usize) -> Result<&str, CheckpointSetupError> {
 /// Decodes a hex-encoded identifier from the manifest (startup only, so the
 /// allocation is fine).
 fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
+    if hex == "-" {
+        return Ok(String::new());
+    }
     if !hex.len().is_multiple_of(2) {
         return Err(CheckpointSetupError::Corrupt("odd-length hex name"));
     }
@@ -5930,6 +6429,220 @@ fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
         );
     }
     String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+}
+
+fn encode_extension_package(
+    package: crate::storage::ExtensionPackage,
+) -> Result<StackStr<2048>, SqlError> {
+    use core::fmt::Write as _;
+    fn hex<const N: usize>(value: &str) -> StackStr<N> {
+        use core::fmt::Write as _;
+        let mut encoded = StackStr::new();
+        for byte in value.as_bytes() {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        if value.is_empty() {
+            let _ = encoded.write_str("-");
+        }
+        encoded
+    }
+    let name = hex::<130>(package.name.as_str());
+    let default = package.default_version.map_or_else(
+        || StackStr::from_str("-"),
+        |value| hex::<130>(value.as_str()),
+    );
+    let schema = package.schema.map_or_else(
+        || StackStr::from_str("-"),
+        |value| hex::<130>(value.as_str()),
+    );
+    let comment = hex::<{ crate::storage::COMMENT_MAX * 2 + 2 }>(package.comment.as_str());
+    let mut encoded = StackStr::<2048>::new();
+    let code = match package.code {
+        crate::storage::ExtensionPackageCode::Sql => 0,
+        crate::storage::ExtensionPackageCode::NativeLibrary => 1,
+    };
+    write!(
+        encoded,
+        "{} {} {} {} {} {} {} {} {} {}",
+        EXTENSION_PACKAGE_HEADER,
+        name.as_str(),
+        default.as_str(),
+        schema.as_str(),
+        u8::from(package.relocatable),
+        u8::from(package.superuser),
+        u8::from(package.trusted),
+        code,
+        comment.as_str(),
+        package.requires().len(),
+    )
+    .map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "extension package metadata is too long"
+        )
+    })?;
+    for required in package.requires() {
+        let required = hex::<130>(required.as_str());
+        write!(encoded, " {}", required.as_str()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "extension package metadata is too long"
+            )
+        })?;
+    }
+    write!(encoded, " {}", package.no_relocate().len()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "extension package metadata is too long"
+        )
+    })?;
+    for required in package.no_relocate() {
+        let required = hex::<130>(required.as_str());
+        write!(encoded, " {}", required.as_str()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "extension package metadata is too long"
+            )
+        })?;
+    }
+    if encoded.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "extension package metadata is too long"
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_extension_package(
+    bytes: &[u8],
+) -> Result<crate::storage::ExtensionPackage, CheckpointSetupError> {
+    let text = core::str::from_utf8(bytes)
+        .map_err(|_| CheckpointSetupError::Corrupt("extension package metadata is not UTF-8"))?;
+    let mut words = text.split(' ');
+    if words.next() != Some(EXTENSION_PACKAGE_HEADER) {
+        return Err(CheckpointSetupError::Corrupt(
+            "bad extension package header",
+        ));
+    }
+    let name = sql_name(&decode_hex_name(next_manifest_word(
+        &mut words,
+        "extension package name",
+    )?)?)?;
+    let default = decode_hex_name(next_manifest_word(&mut words, "extension default version")?)?;
+    let schema = decode_hex_name(next_manifest_word(&mut words, "extension package schema")?)?;
+    let relocatable = parse_bool_field(words.next(), "extension relocatable")?;
+    let superuser = parse_bool_field(words.next(), "extension superuser")?;
+    let trusted = parse_bool_field(words.next(), "extension trusted")?;
+    let code = match parse_field::<u8>(words.next(), "extension package code")? {
+        0 => crate::storage::ExtensionPackageCode::Sql,
+        1 => crate::storage::ExtensionPackageCode::NativeLibrary,
+        _ => {
+            return Err(CheckpointSetupError::Corrupt(
+                "invalid extension package code",
+            ));
+        }
+    };
+    let comment = decode_hex_name(next_manifest_word(&mut words, "extension package comment")?)?;
+    let comment = crate::storage::comment_stackstr(&comment)
+        .map_err(|_| CheckpointSetupError::Corrupt("extension package comment is too long"))?;
+    let require_count: usize = parse_field(words.next(), "extension requirement count")?;
+    if require_count > crate::storage::MAX_EXTENSION_REQUIRES {
+        return Err(CheckpointSetupError::Corrupt(
+            "too many extension requirements",
+        ));
+    }
+    let mut requires = [SqlName::EMPTY; crate::storage::MAX_EXTENSION_REQUIRES];
+    for required in &mut requires[..require_count] {
+        *required = sql_name(&decode_hex_name(next_manifest_word(
+            &mut words,
+            "extension requirement",
+        )?)?)?;
+    }
+    let no_relocate_count: usize = parse_field(words.next(), "extension no_relocate count")?;
+    if no_relocate_count > crate::storage::MAX_EXTENSION_REQUIRES {
+        return Err(CheckpointSetupError::Corrupt(
+            "too many extension no_relocate entries",
+        ));
+    }
+    let mut no_relocate = [SqlName::EMPTY; crate::storage::MAX_EXTENSION_REQUIRES];
+    for required in &mut no_relocate[..no_relocate_count] {
+        *required = sql_name(&decode_hex_name(next_manifest_word(
+            &mut words,
+            "extension no_relocate entry",
+        )?)?)?;
+    }
+    if words.next().is_some()
+        || relocatable && !schema.is_empty()
+        || no_relocate[..no_relocate_count]
+            .iter()
+            .any(|required| !requires[..require_count].contains(required))
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "invalid extension package metadata",
+        ));
+    }
+    Ok(crate::storage::ExtensionPackage {
+        name,
+        default_version: if default.is_empty() {
+            None
+        } else {
+            Some(
+                crate::storage::ExtensionVersion::parse(&default).map_err(|_| {
+                    CheckpointSetupError::Corrupt("invalid extension default version")
+                })?,
+            )
+        },
+        schema: (!schema.is_empty())
+            .then(|| sql_name(&schema))
+            .transpose()?,
+        relocatable,
+        superuser,
+        trusted,
+        code,
+        comment,
+        requires,
+        require_count: require_count as u8,
+        no_relocate,
+        no_relocate_count: no_relocate_count as u8,
+    })
+}
+
+fn parse_bool_field(field: Option<&str>, what: &'static str) -> Result<bool, CheckpointSetupError> {
+    match parse_field::<u8>(field, what)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CheckpointSetupError::Corrupt("invalid boolean field")),
+    }
+}
+
+fn next_manifest_word<'a>(
+    words: &mut core::str::Split<'a, char>,
+    what: &'static str,
+) -> Result<&'a str, CheckpointSetupError> {
+    words.next().ok_or(CheckpointSetupError::Corrupt(what))
+}
+
+fn verify_extension_object_key(
+    key: &str,
+    prefix: &str,
+    suffix: &str,
+    bytes: &[u8],
+) -> Result<(), CheckpointSetupError> {
+    let expected = stack_format!(
+        80,
+        "{}{:08x}-{}{}",
+        prefix,
+        crate::wal::crc32c::crc32c(bytes),
+        bytes.len(),
+        suffix
+    );
+    if expected.is_truncated() || key != expected.as_str() {
+        return Err(CheckpointSetupError::Corrupt(
+            "extension object key does not match its content",
+        ));
+    }
+    Ok(())
 }
 
 #[inline(never)]

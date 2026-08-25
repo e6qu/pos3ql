@@ -259,6 +259,14 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "v",
     },
     IntrinsicRoutine {
+        oid: 3086,
+        name: "pg_extension_config_dump",
+        result_oid: 2278,
+        argument_types: "2205 25",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
         oid: 3778,
         name: "pg_tablespace_location",
         result_oid: 25,
@@ -514,6 +522,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_parameter_acl"
                 | "pg_default_acl"
                 | "pg_extension"
+                | "pg_available_extensions"
+                | "pg_available_extension_versions"
                 | "pg_depend"
                 | "pg_init_privs"
                 | "pg_cast"
@@ -977,23 +987,11 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_default_acl") => pg_default_acl(storage, txid, arena),
-        (false, "pg_extension") => finish(
-            def_of(
-                "pg_extension",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("extname", ColType::Name),
-                    ("extnamespace", ColType::Int4),
-                    ("extrelocatable", ColType::Bool),
-                    ("extversion", ColType::Text),
-                    ("extconfig", ColType::Array(super::types::ArrElem::Int4)),
-                    ("extcondition", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_extension") => pg_extension(storage, txid, arena),
+        (false, "pg_available_extensions") => pg_available_extensions(storage, txid, arena),
+        (false, "pg_available_extension_versions") => {
+            pg_available_extension_versions(storage, txid, arena)
+        }
         (false, "pg_depend") => pg_depend(storage, txid, arena),
         (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
         (false, "pg_roles") => pg_roles(storage, txid, arena),
@@ -1287,7 +1285,9 @@ fn acl<'a>(
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
-        crate::storage::AccessClass::Statistics => crate::storage::PrivilegeSet::NONE,
+        crate::storage::AccessClass::Statistics | crate::storage::AccessClass::Extension => {
+            crate::storage::PrivilegeSet::NONE
+        }
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -1588,6 +1588,37 @@ fn sequence_oid(slot: usize) -> i32 {
     FIRST_SEQUENCE_OID + slot as i32
 }
 
+pub(crate) fn extension_config_relation_oid(
+    relation: crate::storage::ExtensionConfigRelation,
+) -> i32 {
+    match relation {
+        crate::storage::ExtensionConfigRelation::Table(slot) => user_table_oid(slot as usize),
+        crate::storage::ExtensionConfigRelation::Sequence(slot) => sequence_oid(slot as usize),
+    }
+}
+
+pub(crate) fn extension_config_relation_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<crate::storage::ExtensionConfigRelation> {
+    for slot in 0..storage.table_count() {
+        if storage.table(slot).visible_to(txid) && user_table_oid(slot) == oid {
+            return u16::try_from(slot)
+                .ok()
+                .map(crate::storage::ExtensionConfigRelation::Table);
+        }
+    }
+    for slot in 0..storage.sequence_count() {
+        if storage.sequence_for(slot, txid).visible_to(txid) && sequence_oid(slot) == oid {
+            return u16::try_from(slot)
+                .ok()
+                .map(crate::storage::ExtensionConfigRelation::Sequence);
+        }
+    }
+    None
+}
+
 pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32) -> Option<(i64, bool)> {
     storage
         .sequences_with_slots()
@@ -1622,6 +1653,11 @@ const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
 /// OID links `pg_type.typrelid` and its `pg_attribute` rows.
 const FIRST_NAMED_COMPOSITE_RELATION_OID: i32 = 180_000;
 const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
+const FIRST_EXTENSION_OID: i32 = 500_000;
+
+fn extension_oid(slot: usize) -> i32 {
+    FIRST_EXTENSION_OID + slot as i32
+}
 
 pub(crate) fn extended_statistics_oid(slot: usize) -> i32 {
     FIRST_EXTENDED_STATISTICS_OID + slot as i32
@@ -3024,6 +3060,12 @@ fn pg_description<'a>(
                 None => continue,
             },
             crate::storage::CommentClass::Tablespace => continue,
+            crate::storage::CommentClass::Extension => {
+                let Some(slot) = storage.extension_slot(name, txid) else {
+                    continue;
+                };
+                (extension_oid(slot), 3079)
+            }
         };
         out[n] = row(
             &[
@@ -6353,6 +6395,269 @@ fn pg_rewrite<'a>(
     finish(def, out, arena)
 }
 
+fn available_extension_requires<'a>(
+    package: &crate::storage::ExtensionPackage,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_EXTENSION_REQUIRES];
+    for (index, required) in package.requires().iter().enumerate() {
+        values[index] = text(required.as_str(), arena)?;
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Name,
+        raw: super::array::build(&values[..package.requires().len()], arena)?,
+    })
+}
+
+fn pg_available_extensions<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_available_extensions",
+        &[
+            ("name", ColType::Name),
+            ("default_version", ColType::Text),
+            ("installed_version", ColType::Text),
+            ("comment", ColType::Text),
+        ],
+    );
+    let count = storage.extension_packages().count();
+    let out = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (_, package)) in storage.extension_packages().enumerate() {
+        let installed = storage
+            .extension_slot(package.name.as_str(), txid)
+            .map(|slot| storage.extension(slot).definition_to(txid).2);
+        out[index] = row(
+            &[
+                text(package.name.as_str(), arena)?,
+                match package.default_version {
+                    Some(version) => text(version.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                match installed {
+                    Some(version) => text(version.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                if package.comment.as_str().is_empty() {
+                    Datum::Null
+                } else {
+                    text(package.comment.as_str(), arena)?
+                },
+            ],
+            arena,
+        )?;
+    }
+    finish(def, out, arena)
+}
+
+fn pg_available_extension_versions<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_available_extension_versions",
+        &[
+            ("name", ColType::Name),
+            ("version", ColType::Text),
+            ("installed", ColType::Bool),
+            ("superuser", ColType::Bool),
+            ("trusted", ColType::Bool),
+            ("relocatable", ColType::Bool),
+            ("schema", ColType::Name),
+            ("requires", ColType::Array(super::types::ArrElem::Name)),
+            ("comment", ColType::Text),
+        ],
+    );
+    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let mut emitted: [Option<(usize, crate::storage::ExtensionVersion)>; 256] = [None; 256];
+    let mut count = 0usize;
+    for (package_slot, package) in storage.extension_packages() {
+        for (_, script) in storage.extension_scripts_for(package_slot) {
+            if emitted[..count].contains(&Some((package_slot, script.to))) {
+                continue;
+            }
+            if count == out.len() {
+                return Err(catalog_capacity_exceeded("pg_available_extension_versions"));
+            }
+            emitted[count] = Some((package_slot, script.to));
+            let effective = script.effective;
+            let installed = storage
+                .extension_slot(package.name.as_str(), txid)
+                .is_some_and(|slot| storage.extension(slot).definition_to(txid).2 == script.to);
+            out[count] = row(
+                &[
+                    text(package.name.as_str(), arena)?,
+                    text(script.to.as_str(), arena)?,
+                    Datum::Bool(installed),
+                    Datum::Bool(effective.superuser),
+                    Datum::Bool(effective.trusted),
+                    Datum::Bool(effective.relocatable),
+                    match effective.schema {
+                        Some(schema) => text(schema.as_str(), arena)?,
+                        None => Datum::Null,
+                    },
+                    available_extension_requires(&effective, arena)?,
+                    if effective.comment.as_str().is_empty() {
+                        Datum::Null
+                    } else {
+                        text(effective.comment.as_str(), arena)?
+                    },
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(def, &out[..count], arena)
+}
+
+fn pg_extension<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_extension",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("extname", ColType::Name),
+            ("extowner", ColType::Int4),
+            ("extnamespace", ColType::Int4),
+            ("extrelocatable", ColType::Bool),
+            ("extversion", ColType::Text),
+            ("extconfig", ColType::Array(super::types::ArrElem::Oid)),
+            ("extcondition", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.extensions_visible_to(txid).count();
+    let out = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, extension)) in storage.extensions_visible_to(txid).enumerate() {
+        let (namespace, relocatable, version) = extension.definition_to(txid);
+        let mut config_oids = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
+        let mut config_conditions = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
+        let mut configs = [None; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
+        let mut config_count = 0usize;
+        for (_, config) in storage.extension_configs_visible_to(txid) {
+            if config.extension as usize != slot {
+                continue;
+            }
+            configs[config_count] = Some(*config);
+            config_count += 1;
+        }
+        for index in 1..config_count {
+            let config = configs[index].expect("filled extension configuration slot");
+            let mut insertion = index;
+            while insertion > 0
+                && configs[insertion - 1]
+                    .expect("filled extension configuration slot")
+                    .ordinal
+                    > config.ordinal
+            {
+                configs[insertion] = configs[insertion - 1];
+                insertion -= 1;
+            }
+            configs[insertion] = Some(config);
+        }
+        for (index, config) in configs[..config_count].iter().enumerate() {
+            let config = config.expect("sorted extension configuration slot");
+            let oid = extension_config_relation_oid(config.relation);
+            config_oids[index] = Datum::Oid(oid as u32);
+            config_conditions[index] = text(config.condition_to(txid).as_str(), arena)?;
+        }
+        let extconfig = if config_count == 0 {
+            Datum::Null
+        } else {
+            Datum::Array {
+                element: super::types::ArrElem::Oid,
+                raw: super::array::build(&config_oids[..config_count], arena)?,
+            }
+        };
+        let extcondition = if config_count == 0 {
+            Datum::Null
+        } else {
+            Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&config_conditions[..config_count], arena)?,
+            }
+        };
+        out[index] = row(
+            &[
+                Datum::Int4(3079),
+                Datum::Int4(extension_oid(slot)),
+                text(extension.name.as_str(), arena)?,
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Extension,
+                    slot,
+                    txid,
+                )),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    storage.schema_def(namespace as usize).name.as_str(),
+                )),
+                Datum::Bool(relocatable),
+                text(version.as_str(), arena)?,
+                extconfig,
+                extcondition,
+            ],
+            arena,
+        )?;
+    }
+    finish(def, out, arena)
+}
+
+fn extension_dependency_catalog_identity(
+    storage: &Storage,
+    txid: u32,
+    object: crate::storage::AccessObject,
+) -> Option<(i32, i32)> {
+    use crate::storage::AccessClass;
+    let slot = object.slot as usize;
+    Some(match object.class {
+        AccessClass::Table => (PG_CLASS_OID, table_oid(storage, slot)),
+        AccessClass::View => (PG_CLASS_OID, view_oid(slot)),
+        AccessClass::MaterializedView => {
+            let materialized = storage.matview(slot);
+            let table = storage.find_visible(
+                materialized.schema.as_str(),
+                materialized.name.as_str(),
+                txid,
+            )?;
+            (PG_CLASS_OID, table_oid(storage, table))
+        }
+        AccessClass::Sequence => (PG_CLASS_OID, sequence_oid(slot)),
+        AccessClass::Domain => (PG_TYPE_OID, domain_oid(slot)),
+        AccessClass::Enum => (PG_TYPE_OID, crate::sql::types::oid::enum_oid(object.slot)),
+        AccessClass::Composite => (
+            PG_TYPE_OID,
+            crate::sql::types::oid::composite_oid(object.slot),
+        ),
+        AccessClass::Routine => (
+            PG_PROC_OID,
+            crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+        ),
+        AccessClass::Index => {
+            let index = storage.index_visible_to(slot, txid)?;
+            (PG_CLASS_OID, explicit_index_oid(&index))
+        }
+        AccessClass::Schema => (
+            PG_NAMESPACE_OID,
+            namespace_oid(storage, storage.schema_def(slot).name.as_str()),
+        ),
+        AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
+        AccessClass::Tablespace => return None,
+        AccessClass::Extension => (3079, extension_oid(slot)),
+    })
+}
+
 fn pg_depend<'a>(
     storage: &Storage,
     txid: u32,
@@ -6570,6 +6875,25 @@ fn pg_depend<'a>(
                 "n",
             )?;
         }
+    }
+    for (_, dependency) in storage.extension_dependencies_visible_to(txid) {
+        let Some((class, object)) =
+            extension_dependency_catalog_identity(storage, txid, dependency.object)
+        else {
+            continue;
+        };
+        push(
+            class,
+            object,
+            3079,
+            extension_oid(dependency.extension as usize),
+            0,
+            match dependency.kind {
+                crate::storage::ExtensionDependencyKind::Member => "e",
+                crate::storage::ExtensionDependencyKind::Automatic => "x",
+                crate::storage::ExtensionDependencyKind::Required => "n",
+            },
+        )?;
     }
     finish(def, &out[..count], arena)
 }

@@ -3417,6 +3417,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("tablespace")? {
             return self.alter_tablespace();
         }
+        if self.eat_ident("extension")? {
+            return self.alter_extension();
+        }
         if self.eat_ident("aggregate")? {
             return self.alter_aggregate();
         }
@@ -4456,6 +4459,8 @@ impl<'a> Parser<'a> {
             CommentTarget::Schema(self.col_ident("schema name")?)
         } else if self.eat_ident("tablespace")? {
             CommentTarget::Tablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("extension")? {
+            CommentTarget::Extension(self.col_ident("extension name")?)
         } else if self.eat_ident("type")? {
             CommentTarget::Type {
                 name: self.comment_type_name()?,
@@ -4487,9 +4492,7 @@ impl<'a> Parser<'a> {
                 }
             }
         } else {
-            return Err(self.err_here(
-                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TABLESPACE, TYPE, DOMAIN, or COLUMN",
-            ));
+            return Err(self.err_here("unsupported COMMENT ON object type"));
         };
         self.expect_ident("is")?;
         let text = match self.expression(0)? {

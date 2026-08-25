@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::sql::eval::SqlError;
-use crate::sql::types::ColType;
+use crate::sql::types::{BtreeOperatorClass, ColType};
 use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
@@ -117,6 +117,10 @@ const KIND_RENAME_SUBSCRIPTION: u8 = 67;
 const KIND_ALTER_REPLICATION_SLOT: u8 = 68;
 const KIND_SET_POLICY: u8 = 69;
 const KIND_DROP_POLICY: u8 = 70;
+const KIND_ALTER_INDEX_DEFINITION: u8 = 71;
+const KIND_CREATE_TABLESPACE: u8 = 72;
+const KIND_ALTER_TABLESPACE: u8 = 73;
+const KIND_DROP_TABLESPACE: u8 = 74;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -595,6 +599,7 @@ pub(crate) enum WalOp<'a> {
         confirmed_flush_lsn: u64,
     },
     CreateIndex {
+        created_at: u64,
         schema: &'a str,
         name: &'a str,
         table: &'a str,
@@ -603,6 +608,9 @@ pub(crate) enum WalOp<'a> {
         /// physical table column in `columns`.
         expressions: [Option<&'a str>; MAX_INDEX_COLS],
         include_columns: [u16; MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation; MAX_INDEX_COLS],
+        explicit_collations: [bool; MAX_INDEX_COLS],
+        operator_classes: [Option<BtreeOperatorClass>; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
@@ -612,6 +620,28 @@ pub(crate) enum WalOp<'a> {
         /// source persisted alongside the physical key columns.
         predicate: Option<&'a str>,
         unique: bool,
+        definition: crate::storage::IndexMutableDefinition,
+    },
+    AlterIndexDefinition {
+        schema: &'a str,
+        name: &'a str,
+        definition: crate::storage::IndexMutableDefinition,
+    },
+    CreateTablespace {
+        created_at: u64,
+        name: &'a str,
+        location: &'a str,
+        options: crate::storage::TablespaceOptions,
+        owner: u16,
+    },
+    AlterTablespace {
+        name: &'a str,
+        new_name: &'a str,
+        options: crate::storage::TablespaceOptions,
+        owner: u16,
+    },
+    DropTablespace {
+        name: &'a str,
     },
     DropIndex {
         schema: &'a str,
@@ -1485,6 +1515,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
+        WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION,
+        WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
+        WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
+        WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::RenameIndex { .. } => KIND_RENAME_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1832,6 +1866,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
         WalOp::AdvanceReplicationSlot { name, .. } => 1 + name.len() + 8,
         WalOp::CreateIndex {
+            created_at: _,
             schema,
             name,
             table,
@@ -1841,7 +1876,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             expressions,
             ..
         } => {
-            1 + name.len()
+            8 + 1
+                + name.len()
                 + 1
                 + table.len()
                 + 1
@@ -1864,7 +1900,26 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .filter(|(_, value)| value.is_some())
                     .map(|(_, value)| 2 + value.unwrap().len())
                     .sum::<usize>()
+                + n_cols
+                + n_cols
+                + 3
+                + 2
+                + 1
+                + 1
+                + MAX_INDEX_COLS * 2
+                + 2
+                + 1
         }
+        WalOp::AlterIndexDefinition { schema, name, .. } => {
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 1
+        }
+        WalOp::CreateTablespace { name, location, .. } => {
+            8 + 1 + name.len() + 2 + location.len() + 24 + 2
+        }
+        WalOp::AlterTablespace { name, new_name, .. } => {
+            1 + name.len() + 1 + new_name.len() + 24 + 2
+        }
+        WalOp::DropTablespace { name } => 1 + name.len(),
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameIndex {
             schema,
@@ -2270,6 +2325,57 @@ fn append_subscription_behavior(
         u8::from(behavior.failover),
         u8::from(behavior.skip_lsn.is_some()),
     ]) && buffer.append(&behavior.skip_lsn.unwrap_or(0).to_le_bytes())
+}
+
+fn append_index_definition(
+    buffer: &mut FixedBuf,
+    definition: crate::storage::IndexMutableDefinition,
+) -> bool {
+    let fillfactor = definition.options.fillfactor.unwrap_or(0);
+    let deduplicate = match definition.options.deduplicate_items {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    let kind = match definition.kind {
+        crate::storage::IndexKind::Ordinary => 0,
+        crate::storage::IndexKind::Partitioned { valid: false } => 1,
+        crate::storage::IndexKind::Partitioned { valid: true } => 2,
+    };
+    let mut ok = buffer.append(&definition.tablespace.to_le_bytes())
+        && buffer.append(&[fillfactor, deduplicate]);
+    for statistic in definition.statistics {
+        ok &= buffer.append(&statistic.to_le_bytes());
+    }
+    ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
+    ok && buffer.append(&[kind])
+}
+
+fn append_tablespace_options(
+    buffer: &mut FixedBuf,
+    options: crate::storage::TablespaceOptions,
+) -> bool {
+    buffer.append(
+        &options
+            .random_page_cost
+            .map_or(u64::MAX, crate::sql::ast::TablespaceCost::bits)
+            .to_le_bytes(),
+    ) && buffer.append(
+        &options
+            .seq_page_cost
+            .map_or(u64::MAX, crate::sql::ast::TablespaceCost::bits)
+            .to_le_bytes(),
+    ) && buffer.append(
+        &options
+            .effective_io_concurrency
+            .unwrap_or(i32::MIN)
+            .to_le_bytes(),
+    ) && buffer.append(
+        &options
+            .maintenance_io_concurrency
+            .unwrap_or(i32::MIN)
+            .to_le_bytes(),
+    )
 }
 
 fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
@@ -2704,12 +2810,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             confirmed_flush_lsn,
         } => name_bytes(buffer, name) && buffer.append(&confirmed_flush_lsn.to_le_bytes()),
         WalOp::CreateIndex {
+            created_at,
             schema,
             name,
             table,
             columns,
             expressions,
             include_columns,
+            collations,
+            explicit_collations,
+            operator_classes,
             descending,
             nulls_first,
             n_cols,
@@ -2717,8 +2827,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             nulls_not_distinct,
             predicate,
             unique,
+            definition,
         } => {
-            let mut ok = name_bytes(buffer, name)
+            let mut ok = buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
             for c in &columns[..*n_cols] {
@@ -2756,8 +2868,55 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&(expression.len() as u16).to_le_bytes())
                     && buffer.append(expression.as_bytes());
             }
-            ok
+            ok &= buffer.append(&[0xa6]);
+            for position in 0..*n_cols {
+                ok &= buffer
+                    .append(&[collations[position].code()
+                        | (u8::from(explicit_collations[position]) << 7)]);
+            }
+            ok &= buffer.append(&[0xa7]);
+            for operator_class in &operator_classes[..*n_cols] {
+                ok &= buffer.append(&[operator_class.map_or(0, BtreeOperatorClass::code)]);
+            }
+            ok &= buffer.append(&[0xa8]);
+            ok && append_index_definition(buffer, *definition)
         }
+        WalOp::AlterIndexDefinition {
+            schema,
+            name,
+            definition,
+        } => {
+            name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && append_index_definition(buffer, *definition)
+        }
+        WalOp::CreateTablespace {
+            created_at,
+            name,
+            location,
+            options,
+            owner,
+        } => {
+            buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
+                && location.len() <= u16::MAX as usize
+                && buffer.append(&(location.len() as u16).to_le_bytes())
+                && buffer.append(location.as_bytes())
+                && append_tablespace_options(buffer, *options)
+                && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::AlterTablespace {
+            name,
+            new_name,
+            options,
+            owner,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, new_name)
+                && append_tablespace_options(buffer, *options)
+                && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::DropTablespace { name } => name_bytes(buffer, name),
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::RenameIndex {
             schema,
@@ -3525,6 +3684,83 @@ fn decode_subscription_behavior(
     };
     *at += 18;
     Some(behavior)
+}
+
+fn decode_index_definition(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::IndexMutableDefinition> {
+    let tablespace = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    let fillfactor = match *payload.get(*at)? {
+        0 => None,
+        value @ 10..=100 => Some(value),
+        _ => return None,
+    };
+    *at += 1;
+    let deduplicate_items = match *payload.get(*at)? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        _ => return None,
+    };
+    *at += 1;
+    let mut statistics = [-1; MAX_INDEX_COLS];
+    for statistic in &mut statistics {
+        *statistic = i16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+        *at += 2;
+        if !(-1..=10_000).contains(statistic) {
+            return None;
+        }
+    }
+    let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    let kind = match *payload.get(*at)? {
+        0 => crate::storage::IndexKind::Ordinary,
+        1 => crate::storage::IndexKind::Partitioned { valid: false },
+        2 => crate::storage::IndexKind::Partitioned { valid: true },
+        _ => return None,
+    };
+    *at += 1;
+    Some(crate::storage::IndexMutableDefinition {
+        tablespace,
+        options: crate::storage::IndexStorageOptions {
+            fillfactor,
+            deduplicate_items,
+        },
+        statistics,
+        parent: (parent != u16::MAX).then_some(parent),
+        kind,
+    })
+}
+
+fn decode_tablespace_options(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::TablespaceOptions> {
+    let cost = |raw| {
+        if raw == u64::MAX {
+            Some(None)
+        } else {
+            crate::sql::ast::TablespaceCost::from_bits(raw).map(Some)
+        }
+    };
+    let concurrency = |raw| (raw != i32::MIN).then_some(raw);
+    let random_page_cost_bits = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+    *at += 8;
+    let seq_page_cost_bits = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+    *at += 8;
+    let effective_io_concurrency = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let maintenance_io_concurrency =
+        i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    Some(crate::storage::TablespaceOptions {
+        random_page_cost: cost(random_page_cost_bits)?,
+        seq_page_cost: cost(seq_page_cost_bits)?,
+        effective_io_concurrency: concurrency(effective_io_concurrency),
+        maintenance_io_concurrency: concurrency(maintenance_io_concurrency),
+    })
 }
 
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
@@ -4521,6 +4757,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             })
         }
         KIND_CREATE_INDEX => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
             let name = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let unique = *payload.get(at)? != 0;
@@ -4614,13 +4852,48 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += len;
                 *expression = Some(core::str::from_utf8(raw).ok()?);
             }
+            if *payload.get(at)? != 0xa6 {
+                return None;
+            }
+            at += 1;
+            let mut collations = [crate::sql::ast::Collation::Default; MAX_INDEX_COLS];
+            let mut explicit_collations = [false; MAX_INDEX_COLS];
+            for position in 0..n_cols {
+                let code = *payload.get(at)?;
+                explicit_collations[position] = code & 0x80 != 0;
+                collations[position] = crate::sql::ast::Collation::from_code(code & 0x7f)?;
+                at += 1;
+            }
+            if *payload.get(at)? != 0xa7 {
+                return None;
+            }
+            at += 1;
+            let mut operator_classes = [None; MAX_INDEX_COLS];
+            for operator_class in operator_classes.iter_mut().take(n_cols) {
+                let code = *payload.get(at)?;
+                at += 1;
+                *operator_class = if code == 0 {
+                    None
+                } else {
+                    Some(BtreeOperatorClass::from_code(code)?)
+                };
+            }
+            if *payload.get(at)? != 0xa8 {
+                return None;
+            }
+            at += 1;
+            let definition = decode_index_definition(payload, &mut at)?;
             (at == payload.len()).then_some(WalOp::CreateIndex {
+                created_at,
                 schema,
                 name,
                 table,
                 columns,
                 expressions,
                 include_columns,
+                collations,
+                explicit_collations,
+                operator_classes,
                 descending,
                 nulls_first,
                 n_cols,
@@ -4628,7 +4901,55 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 nulls_not_distinct,
                 predicate,
                 unique,
+                definition,
             })
+        }
+        KIND_ALTER_INDEX_DEFINITION => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let definition = decode_index_definition(payload, &mut at)?;
+            (at == payload.len()).then_some(WalOp::AlterIndexDefinition {
+                schema,
+                name,
+                definition,
+            })
+        }
+        KIND_CREATE_TABLESPACE => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let name = take_name(&mut at)?;
+            let location_len =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let location = core::str::from_utf8(payload.get(at..at + location_len)?).ok()?;
+            at += location_len;
+            let options = decode_tablespace_options(payload, &mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::CreateTablespace {
+                created_at,
+                name,
+                location,
+                options,
+                owner,
+            })
+        }
+        KIND_ALTER_TABLESPACE => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            let options = decode_tablespace_options(payload, &mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::AlterTablespace {
+                name,
+                new_name,
+                options,
+                owner,
+            })
+        }
+        KIND_DROP_TABLESPACE => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropTablespace { name })
         }
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
@@ -7109,6 +7430,7 @@ mod tests {
     #[test]
     fn partial_index_payload_round_trips_without_name_length_limits() {
         let operation = WalOp::CreateIndex {
+            created_at: 42,
             schema: "public",
             name: "active_values",
             table: "rows",
@@ -7124,6 +7446,9 @@ mod tests {
                 None,
             ],
             include_columns: [2; MAX_INDEX_COLS],
+            collations: [crate::sql::ast::Collation::Default; MAX_INDEX_COLS],
+            explicit_collations: [false; MAX_INDEX_COLS],
+            operator_classes: [None; MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
             n_cols: 1,
@@ -7131,6 +7456,7 @@ mod tests {
             nulls_not_distinct: true,
             predicate: Some("active AND value IS NOT NULL"),
             unique: true,
+            definition: crate::storage::IndexMutableDefinition::DEFAULT,
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(

@@ -17,7 +17,7 @@ use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::ValueIndexPool;
 use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
-use crate::sql::ast::Collation;
+use crate::sql::ast::{Collation, TablespaceCost};
 use crate::sql::eval::{SqlError, SqlState, hash_key, hash_key_collated, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
@@ -500,6 +500,12 @@ impl OwnedDatum {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store an int2vector value in a column"
+                ));
+            }
+            Datum::OidVector(_) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot store an oidvector value in a column"
                 ));
             }
             Datum::Regtype {
@@ -4657,9 +4663,131 @@ pub(crate) fn index_expression_stackstr(
     Ok(value)
 }
 
+pub(crate) const MAX_TABLESPACES: usize = 64;
+pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TablespaceOptions {
+    pub random_page_cost: Option<TablespaceCost>,
+    pub seq_page_cost: Option<TablespaceCost>,
+    pub effective_io_concurrency: Option<i32>,
+    pub maintenance_io_concurrency: Option<i32>,
+}
+
+impl TablespaceOptions {
+    pub(crate) const DEFAULT: Self = Self {
+        random_page_cost: None,
+        seq_page_cost: None,
+        effective_io_concurrency: None,
+        maintenance_io_concurrency: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingTablespaceDefinition {
+    pub txid: u32,
+    pub name: SqlName,
+    pub options: TablespaceOptions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TablespaceDef {
+    pub created_at: u64,
+    pub name: SqlName,
+    pub location: StackStr<TABLESPACE_LOCATION_MAX>,
+    pub options: TablespaceOptions,
+    pub ownership: Ownership,
+    pub(crate) pending: Option<PendingTablespaceDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+struct TablespaceImage {
+    created_at: u64,
+    name: SqlName,
+    location: StackStr<TABLESPACE_LOCATION_MAX>,
+    options: TablespaceOptions,
+    owner: u16,
+}
+
+impl TablespaceDef {
+    pub(crate) fn name_for(&self, txid: u32) -> SqlName {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
+
+    pub(crate) fn options_for(&self, txid: u32) -> TablespaceOptions {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.options, |pending| pending.options)
+    }
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexStorageOptions {
+    pub fillfactor: Option<u8>,
+    pub deduplicate_items: Option<bool>,
+}
+
+impl IndexStorageOptions {
+    pub const DEFAULT: Self = Self {
+        fillfactor: None,
+        deduplicate_items: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    Ordinary,
+    Partitioned { valid: bool },
+}
+
+impl IndexKind {
+    pub const fn valid(self) -> bool {
+        match self {
+            Self::Ordinary => true,
+            Self::Partitioned { valid } => valid,
+        }
+    }
+
+    pub const fn is_partitioned(self) -> bool {
+        matches!(self, Self::Partitioned { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexMutableDefinition {
+    pub tablespace: u16,
+    pub options: IndexStorageOptions,
+    pub statistics: [i16; MAX_INDEX_COLS],
+    pub parent: Option<u16>,
+    pub kind: IndexKind,
+}
+
+impl IndexMutableDefinition {
+    pub const DEFAULT: Self = Self {
+        tablespace: 0,
+        options: IndexStorageOptions::DEFAULT,
+        statistics: [-1; MAX_INDEX_COLS],
+        parent: None,
+        kind: IndexKind::Ordinary,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingIndexDefinition {
+    pub txid: u32,
+    pub definition: IndexMutableDefinition,
+}
+
 /// A named btree index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
+    pub created_at: u64,
     /// The schema of both the index and its table (an index always lives in
     /// its table's schema).
     pub schema: SqlName,
@@ -4674,6 +4802,9 @@ pub struct IndexDef {
     /// Covering columns are carried separately from key columns: they are
     /// readable from the index relation but cannot affect key semantics.
     pub include_columns: [u16; MAX_INDEX_COLS],
+    pub collations: [Collation; MAX_INDEX_COLS],
+    pub explicit_collations: [bool; MAX_INDEX_COLS],
+    pub operator_classes: [Option<crate::sql::types::BtreeOperatorClass>; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -4684,6 +4815,8 @@ pub struct IndexDef {
     /// of a partial index and is re-parsed before any membership decision.
     pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
     pub unique: bool,
+    pub mutable: IndexMutableDefinition,
+    pub(crate) pending_definition: Option<PendingIndexDefinition>,
     pub ddl_state: CatalogDdlState,
 }
 
@@ -4697,6 +4830,12 @@ impl IndexDef {
         self.pending_name
             .filter(|pending| pending.txid == txid)
             .map_or(self.name, |pending| pending.name)
+    }
+
+    pub fn mutable_for(&self, txid: u32) -> IndexMutableDefinition {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.mutable, |pending| pending.definition)
     }
 }
 
@@ -4781,6 +4920,7 @@ pub(crate) enum AccessClass {
     Index = 7,
     Routine = 8,
     Composite = 9,
+    Tablespace = 10,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -4838,6 +4978,7 @@ impl AccessClass {
             7 => Self::Index,
             8 => Self::Routine,
             9 => Self::Composite,
+            10 => Self::Tablespace,
             _ => return None,
         })
     }
@@ -5137,12 +5278,14 @@ pub(crate) const COMMENT_MAX: usize = 192;
 /// Which catalog a comment's object lives in. `Relation` covers every
 /// `pg_class` object (table, view, materialized view, index, sequence — and a
 /// column, via a non-zero `subid`); `Schema` covers `pg_namespace`; `Type`
-/// covers built-in and user-defined rows of `pg_type`.
+/// covers built-in and user-defined rows of `pg_type`; `Tablespace` covers
+/// shared `pg_tablespace` objects.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommentClass {
     Relation,
     Schema,
     Type,
+    Tablespace,
 }
 
 impl CommentClass {
@@ -5151,6 +5294,7 @@ impl CommentClass {
             CommentClass::Relation => 0,
             CommentClass::Schema => 1,
             CommentClass::Type => 2,
+            CommentClass::Tablespace => 3,
         }
     }
 
@@ -5159,6 +5303,7 @@ impl CommentClass {
             0 => CommentClass::Relation,
             1 => CommentClass::Schema,
             2 => CommentClass::Type,
+            3 => CommentClass::Tablespace,
             _ => return None,
         })
     }
@@ -5344,6 +5489,7 @@ pub struct Storage {
     enums: FixedVec<EnumDef>,
     composites: FixedVec<CompositeDef>,
     indexes: FixedVec<IndexDef>,
+    tablespaces: FixedVec<TablespaceDef>,
     schemas: FixedVec<SchemaDef>,
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
@@ -5984,6 +6130,7 @@ impl Storage {
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMPOSITES * size_of::<CompositeDef>()
+            + MAX_TABLESPACES * size_of::<TablespaceDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
             + config.max_connections as usize * config.max_tables * size_of::<TableLock>()
@@ -6321,6 +6468,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             indexes
                 .push(IndexDef {
+                    created_at: 0,
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
                     pending_name: None,
@@ -6329,6 +6477,9 @@ impl Storage {
                     columns: [0; MAX_INDEX_COLS],
                     expressions: [None; MAX_INDEX_COLS],
                     include_columns: [0; MAX_INDEX_COLS],
+                    collations: [Collation::Default; MAX_INDEX_COLS],
+                    explicit_collations: [false; MAX_INDEX_COLS],
+                    operator_classes: [None; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
@@ -6336,9 +6487,25 @@ impl Storage {
                     nulls_not_distinct: false,
                     predicate: None,
                     unique: false,
+                    mutable: IndexMutableDefinition::DEFAULT,
+                    pending_definition: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
+        }
+        let mut tablespaces = FixedVec::new(budget, "tablespaces", MAX_TABLESPACES)?;
+        for _ in 0..MAX_TABLESPACES {
+            tablespaces
+                .push(TablespaceDef {
+                    created_at: 0,
+                    name: SqlName::EMPTY,
+                    location: StackStr::new(),
+                    options: TablespaceOptions::DEFAULT,
+                    ownership: Ownership::BOOTSTRAP,
+                    pending: None,
+                    ddl_state: CatalogDdlState::Absent,
+                })
+                .expect("sized to MAX_TABLESPACES");
         }
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
@@ -6380,6 +6547,7 @@ impl Storage {
             enums,
             composites,
             indexes,
+            tablespaces,
             schemas,
             roles,
             role_memberships,
@@ -6541,6 +6709,7 @@ impl Storage {
             AccessClass::Index => &self.indexes[slot].ownership,
             AccessClass::Routine => &self.routines[slot].ownership,
             AccessClass::Composite => &self.composites[slot].ownership,
+            AccessClass::Tablespace => &self.tablespaces[slot].ownership,
         }
     }
 
@@ -6557,6 +6726,7 @@ impl Storage {
             AccessClass::Index => &mut self.indexes[slot].ownership,
             AccessClass::Routine => &mut self.routines[slot].ownership,
             AccessClass::Composite => &mut self.composites[slot].ownership,
+            AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
         }
     }
 
@@ -6628,6 +6798,7 @@ impl Storage {
                     && routine.name_for(txid).as_str() == name
             }),
             AccessClass::Composite => self.composite_slot(schema, name, txid),
+            AccessClass::Tablespace => self.tablespace_slot(name, txid),
         }?;
         u16::try_from(slot)
             .ok()
@@ -6682,6 +6853,7 @@ impl Storage {
                 let definition = self.composite_for(slot, txid);
                 (definition.schema, definition.name)
             }
+            AccessClass::Tablespace => (SqlName::EMPTY, self.tablespaces[slot].name_for(txid)),
         }
     }
 
@@ -6700,6 +6872,7 @@ impl Storage {
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Composite => self.composites[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -6716,6 +6889,7 @@ impl Storage {
             AccessClass::Index => self.indexes[slot].visible_to(txid),
             AccessClass::Routine => self.routines[slot].visible_to(txid),
             AccessClass::Composite => self.composites[slot].visible_to(txid),
+            AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
         }
     }
 
@@ -6731,6 +6905,7 @@ impl Storage {
             AccessClass::Index => self.indexes.len(),
             AccessClass::Routine => self.routines.len(),
             AccessClass::Composite => self.composites.len(),
+            AccessClass::Tablespace => self.tablespaces.len(),
         }
     }
 
@@ -6762,6 +6937,7 @@ impl Storage {
             (AccessClass::Index, self.indexes.len()),
             (AccessClass::Routine, self.routines.len()),
             (AccessClass::Composite, self.composites.len()),
+            (AccessClass::Tablespace, self.tablespaces.len()),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -14170,13 +14346,10 @@ impl Storage {
         None
     }
 
-    /// Whether a relation of this name is visible to `txid` in `schema` — a
-    /// table (including a matview's backing table), view, or sequence. Sequences
-    /// share PostgreSQL's relation namespace, so CREATE SEQUENCE collides with
-    /// any of them (42P07).
+    /// Whether PostgreSQL's shared relation namespace already contains this
+    /// name, including indexes and sequences.
     pub fn relation_name_taken(&self, schema: &str, name: &str, txid: u32) -> bool {
-        self.relation_in(schema, name, txid).is_some()
-            || self.find_sequence(schema, name, txid).is_some()
+        self.relation_kind_in(schema, name, txid).is_some()
     }
 
     /// Registers a sequence as an uncommitted CREATE owned by `txid`. The caller
@@ -18120,7 +18293,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
         }
-        if self.index_exists(def.schema.as_str(), def.name.as_str(), txid) {
+        if self.relation_name_taken(def.schema.as_str(), def.name.as_str(), txid) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -18143,12 +18316,61 @@ impl Storage {
             class: AccessClass::Index,
             slot: i as u16,
         });
+        let created_at = if def.created_at == 0 {
+            self.catalog_seq = self.catalog_seq.saturating_add(1);
+            self.catalog_seq
+        } else {
+            self.catalog_seq = self.catalog_seq.max(def.created_at);
+            def.created_at
+        };
         self.indexes[i] = IndexDef {
+            created_at,
             ownership,
+            pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
             ..def
         };
         Ok(i)
+    }
+
+    pub(crate) fn alter_index_definition(
+        &mut self,
+        slot: usize,
+        definition: IndexMutableDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        let pending = self.indexes[slot].pending_definition;
+        if let Some(pending) = pending
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.indexes[slot].name.as_str(),
+            ));
+        }
+        let index = &mut self.indexes[slot];
+        let prior = index.pending_definition;
+        index.pending_definition = Some(PendingIndexDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_index_definition(&mut self, slot: usize, txid: u32) {
+        let index = &mut self.indexes[slot];
+        if let Some(pending) = index.pending_definition
+            && pending.txid == txid
+        {
+            index.mutable = pending.definition;
+            index.pending_definition = None;
+        }
+    }
+
+    pub(crate) fn rollback_index_definition(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingIndexDefinition>,
+    ) {
+        self.indexes[slot].pending_definition = prior;
     }
 
     /// Marks every index visible to `txid` on a table pending-dropped
@@ -18314,6 +18536,288 @@ impl Storage {
             .get(slot)
             .copied()
             .filter(|index| index.visible_to(txid))
+    }
+
+    pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.tablespaces.iter().position(|tablespace| {
+            tablespace.visible_to(txid) && tablespace.name_for(txid).as_str() == name
+        })
+    }
+
+    pub(crate) fn tablespace_by_id(&self, id: u16, txid: u32) -> Option<TablespaceDef> {
+        let slot = usize::from(id.checked_sub(2)?);
+        self.tablespaces
+            .get(slot)
+            .copied()
+            .filter(|tablespace| tablespace.visible_to(txid))
+    }
+
+    pub(crate) fn tablespace_name(&self, id: u16, txid: u32) -> Option<SqlName> {
+        match id {
+            0 => SqlName::parse("pg_default").ok(),
+            1 => SqlName::parse("pg_global").ok(),
+            _ => self
+                .tablespace_by_id(id, txid)
+                .map(|tablespace| tablespace.name_for(txid)),
+        }
+    }
+
+    pub(crate) fn tablespace_id(&self, name: &str, txid: u32) -> Option<u16> {
+        if name.eq_ignore_ascii_case("pg_default") {
+            return Some(0);
+        }
+        if name.eq_ignore_ascii_case("pg_global") {
+            return Some(1);
+        }
+        self.tablespace_slot(name, txid)
+            .and_then(|slot| u16::try_from(slot + 2).ok())
+    }
+
+    pub(crate) fn tablespaces_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TablespaceDef)> {
+        self.tablespaces
+            .iter()
+            .enumerate()
+            .filter(move |(_, tablespace)| tablespace.visible_to(txid))
+    }
+
+    pub(crate) fn create_tablespace(
+        &mut self,
+        created_at: u64,
+        name: SqlName,
+        location: StackStr<TABLESPACE_LOCATION_MAX>,
+        options: TablespaceOptions,
+        owner: u16,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.validate_tablespace_identity(name, owner, txid)?;
+        let slot = self
+            .tablespaces
+            .iter()
+            .position(|tablespace| tablespace.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "tablespace catalog capacity exhausted"
+                )
+            })?;
+        self.install_tablespace(
+            slot,
+            TablespaceImage {
+                created_at,
+                name,
+                location,
+                options,
+                owner,
+            },
+            txid,
+        );
+        Ok(slot)
+    }
+
+    pub(crate) fn restore_tablespace(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        name: SqlName,
+        location: StackStr<TABLESPACE_LOCATION_MAX>,
+        options: TablespaceOptions,
+        owner: u16,
+    ) -> Result<(), SqlError> {
+        self.validate_tablespace_identity(name, owner, 0)?;
+        let Some(target) = self.tablespaces.get(slot) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "tablespace slot is out of range"
+            ));
+        };
+        if target.ddl_state != CatalogDdlState::Absent {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "tablespace slot {} is already occupied",
+                slot
+            ));
+        }
+        self.install_tablespace(
+            slot,
+            TablespaceImage {
+                created_at,
+                name,
+                location,
+                options,
+                owner,
+            },
+            0,
+        );
+        Ok(())
+    }
+
+    fn validate_tablespace_identity(
+        &self,
+        name: SqlName,
+        owner: u16,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if self.tablespace_id(name.as_str(), txid).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "tablespace \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self
+            .roles
+            .get(usize::from(owner))
+            .is_none_or(|role| !role.visible_to(txid))
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "tablespace owner does not exist"
+            ));
+        }
+        Ok(())
+    }
+
+    fn install_tablespace(&mut self, slot: usize, image: TablespaceImage, txid: u32) {
+        let created_at = if image.created_at == 0 {
+            self.catalog_seq = self.catalog_seq.saturating_add(1);
+            self.catalog_seq
+        } else {
+            self.catalog_seq = self.catalog_seq.max(image.created_at);
+            image.created_at
+        };
+        self.tablespaces[slot] = TablespaceDef {
+            created_at,
+            name: image.name,
+            location: image.location,
+            options: image.options,
+            ownership: Ownership {
+                owner: 0,
+                pending: Some(PendingOwnership {
+                    txid,
+                    owner: image.owner,
+                }),
+            },
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+    }
+
+    pub(crate) fn alter_tablespace_definition(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        options: TablespaceOptions,
+        txid: u32,
+    ) -> Result<Option<PendingTablespaceDefinition>, SqlError> {
+        if self
+            .tablespaces
+            .iter()
+            .enumerate()
+            .any(|(other, tablespace)| {
+                other != slot && tablespace.visible_to(txid) && tablespace.name_for(txid) == name
+            })
+            || ((name.as_str().eq_ignore_ascii_case("pg_default")
+                || name.as_str().eq_ignore_ascii_case("pg_global"))
+                && self.tablespaces[slot].name_for(txid) != name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "tablespace \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let prior = self.tablespaces[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.unwrap().txid,
+                self.tablespaces[slot].name.as_str(),
+            ));
+        }
+        self.tablespaces[slot].pending = Some(PendingTablespaceDefinition {
+            txid,
+            name,
+            options,
+        });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_tablespace(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let id = u16::try_from(slot + 2).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "tablespace slot is out of range"
+            )
+        })?;
+        if self
+            .indexes
+            .iter()
+            .any(|index| index.visible_to(txid) && index.mutable_for(txid).tablespace == id)
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "tablespace \"{}\" is not empty",
+                self.tablespaces[slot].name_for(txid).as_str()
+            ));
+        }
+        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.drop_by(txid);
+        Ok(())
+    }
+
+    pub(crate) fn commit_tablespace_create(&mut self, slot: usize) {
+        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.commit_create();
+        self.tablespaces[slot].ownership = self.tablespaces[slot].ownership.committed();
+    }
+
+    pub(crate) fn commit_tablespace_alter(&mut self, slot: usize, txid: u32) {
+        if let Some(pending) = self.tablespaces[slot].pending
+            && pending.txid == txid
+        {
+            let old_name = self.tablespaces[slot].name;
+            self.tablespaces[slot].name = pending.name;
+            self.tablespaces[slot].options = pending.options;
+            self.tablespaces[slot].pending = None;
+            for comment in self.comments.iter_mut() {
+                if comment.used
+                    && comment.class == CommentClass::Tablespace
+                    && comment.name == old_name
+                {
+                    comment.name = pending.name;
+                }
+            }
+        }
+        if self.tablespaces[slot]
+            .ownership
+            .pending
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            self.tablespaces[slot].ownership = self.tablespaces[slot].ownership.committed();
+        }
+    }
+
+    pub(crate) fn commit_tablespace_drop(&mut self, slot: usize) {
+        let name = self.tablespaces[slot].name;
+        self.drop_object_comments(CommentClass::Tablespace, "", name.as_str());
+        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_tablespace_create(&mut self, slot: usize) {
+        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn rollback_tablespace_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingTablespaceDefinition>,
+    ) {
+        self.tablespaces[slot].pending = prior;
+    }
+
+    pub(crate) fn rollback_tablespace_drop(&mut self, slot: usize, txid: u32) {
+        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.rollback_drop(txid);
     }
 
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
@@ -18920,10 +19424,11 @@ mod tests {
             CommentClass::Relation,
             CommentClass::Schema,
             CommentClass::Type,
+            CommentClass::Tablespace,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(3), None);
+        assert_eq!(CommentClass::from_u8(4), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

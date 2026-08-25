@@ -399,6 +399,8 @@ CREATE TABLE outbound_dump.partition_leaf PARTITION OF outbound_dump.partition_m
   FOR VALUES IN (1);
 CREATE TABLE outbound_dump.partition_other PARTITION OF outbound_dump.partition_mid DEFAULT;
 INSERT INTO outbound_dump.partition_root VALUES (10, 1), (20, 2);
+CREATE INDEX outbound_partition_region_idx ON outbound_dump.partition_root
+  (id, region DESC) WITH (fillfactor=75);
 GRANT USAGE ON SCHEMA outbound_dump TO outbound_reader;
 GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
 GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
@@ -483,6 +485,11 @@ else
       SELECT id,owner_name FROM outbound_dump.protected_view ORDER BY id;
       RESET ROLE;
       SELECT id,region FROM outbound_dump.partition_root ORDER BY id;
+      SELECT relation.relkind, count(inheritance.inhrelid)
+        FROM pg_class relation
+        LEFT JOIN pg_inherits inheritance ON inheritance.inhparent = relation.oid
+       WHERE relation.oid = 'outbound_dump.outbound_partition_region_idx'::regclass
+       GROUP BY relation.relkind;
       SELECT a.atttypmod,c.collname
         FROM pg_attribute AS a
         JOIN pg_collation AS c ON c.oid = a.attcollation
@@ -491,7 +498,7 @@ else
                               AND typname = 'metadata')
          AND a.attname = 'code';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\n7|C'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nI|1\n7|C'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

@@ -1382,7 +1382,9 @@ def test_catalog_definition_oid_over_raw_wire():
     setup = simple_query(
         s,
         "CREATE TABLE wire_catalog_definition (id integer PRIMARY KEY, value text); "
-        "CREATE INDEX wire_catalog_definition_value_idx ON wire_catalog_definition (value DESC)",
+        "CREATE INDEX wire_catalog_definition_value_idx ON wire_catalog_definition "
+        "(value COLLATE \"C\" DESC NULLS LAST) INCLUDE (id) "
+        "WITH (fillfactor=80, deduplicate_items=off) WHERE id > 0",
     )
     check("raw wire: catalog definition setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
     index_oid = int(
@@ -1414,7 +1416,9 @@ def test_catalog_definition_oid_over_raw_wire():
     check(
         "raw wire: binary oid reaches executable pg_get_indexdef",
         first_text_row(definition)
-        == "CREATE INDEX wire_catalog_definition_value_idx ON public.wire_catalog_definition USING btree (value DESC)",
+        == "CREATE INDEX wire_catalog_definition_value_idx ON public.wire_catalog_definition USING btree "
+        "(value COLLATE \"C\" DESC NULLS LAST) INCLUDE (id) "
+        "WITH (fillfactor='80', deduplicate_items=off) WHERE id > 0",
         definition,
     )
     overflow = query_oid(0xFFFFFFFF)

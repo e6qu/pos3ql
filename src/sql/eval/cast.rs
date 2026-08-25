@@ -48,6 +48,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Int2Vector(_) => v,
             _ => return Err(cast_unsupported(&v, "int2vector")),
         },
+        ColType::OidVector => match v {
+            Datum::OidVector(_) => v,
+            _ => return Err(cast_unsupported(&v, "oidvector")),
+        },
         ColType::PgNodeTree => match v {
             Datum::Text(_) => v,
             _ => return Err(cast_unsupported(&v, "pg_node_tree")),

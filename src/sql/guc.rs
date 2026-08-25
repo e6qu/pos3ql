@@ -244,6 +244,7 @@ struct GucValues {
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
     search_path: StackStr<128>,
+    default_tablespace: StackStr<64>,
     client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
@@ -270,6 +271,7 @@ impl GucValues {
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
             search_path: StackStr::new(),
+            default_tablespace: StackStr::new(),
             client_min_messages: MessageLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
@@ -350,6 +352,10 @@ impl GucState {
 
     pub fn search_path(&self) -> StackStr<128> {
         self.store.borrow().current.search_path
+    }
+
+    pub fn default_tablespace(&self) -> StackStr<64> {
+        self.store.borrow().current.default_tablespace
     }
 
     pub fn seq_session(&self) -> &SeqSession {
@@ -562,6 +568,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.application_name = defaults.application_name;
     } else if name.eq_ignore_ascii_case("search_path") {
         values.search_path = defaults.search_path;
+    } else if name.eq_ignore_ascii_case("default_tablespace") {
+        values.default_tablespace = defaults.default_tablespace;
     } else if name.eq_ignore_ascii_case("client_min_messages") {
         values.client_min_messages = defaults.client_min_messages;
     } else if name.eq_ignore_ascii_case("extra_float_digits") {
@@ -582,7 +590,6 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
         || name.eq_ignore_ascii_case("xmloption")
-        || name.eq_ignore_ascii_case("default_tablespace")
         || name.eq_ignore_ascii_case("default_table_access_method")
         || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
         || name.eq_ignore_ascii_case("transaction_timeout")
@@ -683,14 +690,10 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("default_tablespace") {
-        if is_default || v.is_empty() {
-            return Ok(());
-        }
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "tablespace \"{}\" is not supported",
-            v
-        ));
+        return store(
+            &mut values.default_tablespace,
+            if is_default { "" } else { v },
+        );
     }
     if name.eq_ignore_ascii_case("default_table_access_method") {
         if is_default || v.eq_ignore_ascii_case("heap") {
@@ -903,7 +906,7 @@ impl GucState {
         } else if name.eq_ignore_ascii_case("xmloption") {
             Some(StackStr::from_str("content"))
         } else if name.eq_ignore_ascii_case("default_tablespace") {
-            Some(StackStr::new())
+            Some(StackStr::from_str(values.default_tablespace.as_str()))
         } else if name.eq_ignore_ascii_case("default_table_access_method") {
             Some(StackStr::from_str("heap"))
         } else if name.eq_ignore_ascii_case("intervalstyle") {

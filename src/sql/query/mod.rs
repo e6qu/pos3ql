@@ -828,6 +828,13 @@ pub(super) fn storage_catalog<'a>(
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn tablespace_location<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::tablespace_location_by_oid(self.storage, self.txid, oid, arena)
+    }
     fn materialize_composite<'a>(
         &self,
         slot: u16,

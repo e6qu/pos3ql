@@ -13,6 +13,7 @@ pub mod oid {
     pub const INT8: i32 = 20;
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
+    pub const OIDVECTOR: i32 = 30;
     pub const PG_NODE_TREE: i32 = 194;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
@@ -123,6 +124,9 @@ pub enum ColType {
     /// PostgreSQL's zero-based, space-delimited `int2vector` catalog type.
     /// It is transient catalog data and is never accepted as a stored column.
     Int2Vector,
+    /// PostgreSQL's zero-based, space-delimited `oidvector` catalog type.
+    /// It is transient catalog data and is never accepted as a stored column.
+    OidVector,
     /// PostgreSQL's internal parse-tree text used by catalog definition
     /// reconstructors. It is transient catalog data, never a stored column.
     PgNodeTree,
@@ -214,6 +218,232 @@ pub enum ColType {
     /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
     /// this is durable and carries a catalog identity.
     Composite(u16),
+}
+
+/// B-tree operator classes whose comparison semantics the executor implements.
+///
+/// Index definitions store this closed type instead of catalog names.  That
+/// keeps unsupported classes out of WAL and checkpoints while retaining the
+/// PostgreSQL spelling and OID at catalog boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BtreeOperatorClass {
+    Array = 1,
+    Enum,
+    Multirange,
+    Range,
+    Bit,
+    Bool,
+    Bpchar,
+    Bytea,
+    Date,
+    Float4,
+    Float8,
+    Inet,
+    Int2,
+    Int4,
+    Int8,
+    Interval,
+    Jsonb,
+    Macaddr,
+    Macaddr8,
+    Name,
+    Numeric,
+    Oid,
+    Record,
+    Text,
+    Time,
+    Timestamp,
+    Timestamptz,
+    Timetz,
+    Uuid,
+    Varbit,
+}
+
+impl BtreeOperatorClass {
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        use ColType::*;
+        Some(match ctype {
+            Array(_) => Self::Array,
+            Enum(_) => Self::Enum,
+            Multirange(_) => Self::Multirange,
+            Range(_) => Self::Range,
+            Bit { varying: false } => Self::Bit,
+            Bool => Self::Bool,
+            Bpchar => Self::Bpchar,
+            Bytea => Self::Bytea,
+            Date => Self::Date,
+            Float4 => Self::Float4,
+            Float8 => Self::Float8,
+            Inet | Cidr => Self::Inet,
+            Int2 => Self::Int2,
+            Int4 => Self::Int4,
+            Int8 => Self::Int8,
+            Interval => Self::Interval,
+            Jsonb => Self::Jsonb,
+            Macaddr => Self::Macaddr,
+            Macaddr8 => Self::Macaddr8,
+            Name => Self::Name,
+            Numeric => Self::Numeric,
+            Oid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
+            | Regnamespace | Regrole => Self::Oid,
+            Record | Composite(_) => Self::Record,
+            Text | Varchar => Self::Text,
+            Time => Self::Time,
+            Timestamp => Self::Timestamp,
+            Timestamptz => Self::Timestamptz,
+            Timetz => Self::Timetz,
+            Uuid => Self::Uuid,
+            Bit { varying: true } => Self::Varbit,
+            Void | Int2Vector | OidVector | PgNodeTree | Json => return None,
+        })
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "array_ops" => Self::Array,
+            "enum_ops" => Self::Enum,
+            "multirange_ops" => Self::Multirange,
+            "range_ops" => Self::Range,
+            "bit_ops" => Self::Bit,
+            "bool_ops" => Self::Bool,
+            "bpchar_ops" => Self::Bpchar,
+            "bytea_ops" => Self::Bytea,
+            "date_ops" => Self::Date,
+            "float4_ops" => Self::Float4,
+            "float8_ops" => Self::Float8,
+            "inet_ops" => Self::Inet,
+            "int2_ops" => Self::Int2,
+            "int4_ops" => Self::Int4,
+            "int8_ops" => Self::Int8,
+            "interval_ops" => Self::Interval,
+            "jsonb_ops" => Self::Jsonb,
+            "macaddr_ops" => Self::Macaddr,
+            "macaddr8_ops" => Self::Macaddr8,
+            "name_ops" => Self::Name,
+            "numeric_ops" => Self::Numeric,
+            "oid_ops" => Self::Oid,
+            "record_ops" => Self::Record,
+            "text_ops" => Self::Text,
+            "time_ops" => Self::Time,
+            "timestamp_ops" => Self::Timestamp,
+            "timestamptz_ops" => Self::Timestamptz,
+            "timetz_ops" => Self::Timetz,
+            "uuid_ops" => Self::Uuid,
+            "varbit_ops" => Self::Varbit,
+            _ => return None,
+        })
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Array,
+            2 => Self::Enum,
+            3 => Self::Multirange,
+            4 => Self::Range,
+            5 => Self::Bit,
+            6 => Self::Bool,
+            7 => Self::Bpchar,
+            8 => Self::Bytea,
+            9 => Self::Date,
+            10 => Self::Float4,
+            11 => Self::Float8,
+            12 => Self::Inet,
+            13 => Self::Int2,
+            14 => Self::Int4,
+            15 => Self::Int8,
+            16 => Self::Interval,
+            17 => Self::Jsonb,
+            18 => Self::Macaddr,
+            19 => Self::Macaddr8,
+            20 => Self::Name,
+            21 => Self::Numeric,
+            22 => Self::Oid,
+            23 => Self::Record,
+            24 => Self::Text,
+            25 => Self::Time,
+            26 => Self::Timestamp,
+            27 => Self::Timestamptz,
+            28 => Self::Timetz,
+            29 => Self::Uuid,
+            30 => Self::Varbit,
+            _ => return None,
+        })
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Array => "array_ops",
+            Self::Enum => "enum_ops",
+            Self::Multirange => "multirange_ops",
+            Self::Range => "range_ops",
+            Self::Bit => "bit_ops",
+            Self::Bool => "bool_ops",
+            Self::Bpchar => "bpchar_ops",
+            Self::Bytea => "bytea_ops",
+            Self::Date => "date_ops",
+            Self::Float4 => "float4_ops",
+            Self::Float8 => "float8_ops",
+            Self::Inet => "inet_ops",
+            Self::Int2 => "int2_ops",
+            Self::Int4 => "int4_ops",
+            Self::Int8 => "int8_ops",
+            Self::Interval => "interval_ops",
+            Self::Jsonb => "jsonb_ops",
+            Self::Macaddr => "macaddr_ops",
+            Self::Macaddr8 => "macaddr8_ops",
+            Self::Name => "name_ops",
+            Self::Numeric => "numeric_ops",
+            Self::Oid => "oid_ops",
+            Self::Record => "record_ops",
+            Self::Text => "text_ops",
+            Self::Time => "time_ops",
+            Self::Timestamp => "timestamp_ops",
+            Self::Timestamptz => "timestamptz_ops",
+            Self::Timetz => "timetz_ops",
+            Self::Uuid => "uuid_ops",
+            Self::Varbit => "varbit_ops",
+        }
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Array => 10000,
+            Self::Enum => 10069,
+            Self::Multirange => 10080,
+            Self::Range => 10076,
+            Self::Bit => 10002,
+            Self::Bool => 10003,
+            Self::Bpchar => 10004,
+            Self::Bytea => 10006,
+            Self::Date => 3122,
+            Self::Float4 => 10012,
+            Self::Float8 => 3123,
+            Self::Inet => 10015,
+            Self::Int2 => 1979,
+            Self::Int4 => 1978,
+            Self::Int8 => 3124,
+            Self::Interval => 10022,
+            Self::Jsonb => 10088,
+            Self::Macaddr => 10024,
+            Self::Macaddr8 => 10026,
+            Self::Name => 10028,
+            Self::Numeric => 3125,
+            Self::Oid => 1981,
+            Self::Record => 10034,
+            Self::Text => 3126,
+            Self::Time => 10038,
+            Self::Timestamp => 3128,
+            Self::Timestamptz => 3127,
+            Self::Timetz => 10041,
+            Self::Uuid => 10065,
+            Self::Varbit => 10043,
+        }
+    }
 }
 
 /// Base storage codes for the parameterized type families. They must stay far
@@ -320,6 +550,7 @@ impl ColType {
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
+            Self::OidVector => oid::OIDVECTOR,
             Self::PgNodeTree => oid::PG_NODE_TREE,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
@@ -373,6 +604,7 @@ impl ColType {
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
+            oid::OIDVECTOR => Some(Self::OidVector),
             oid::PG_NODE_TREE => Some(Self::PgNodeTree),
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
@@ -472,7 +704,7 @@ impl ColType {
             Self::Void => 4,
             Self::Bool => 1,
             Self::Int2 => 2,
-            Self::Int2Vector | Self::PgNodeTree => -1,
+            Self::Int2Vector | Self::OidVector | Self::PgNodeTree => -1,
             Self::Int4
             | Self::Oid
             | Self::Regtype
@@ -534,6 +766,7 @@ impl ColType {
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
+            Self::OidVector => "oidvector",
             Self::PgNodeTree => "pg_node_tree",
             Self::Int4 => "int4",
             Self::Oid => "oid",
@@ -595,6 +828,7 @@ impl ColType {
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
+            Self::OidVector => "oidvector",
             Self::PgNodeTree => "pg_node_tree",
             Self::Int4 => "integer",
             Self::Oid => "oid",
@@ -669,6 +903,7 @@ impl ColType {
             Self::Numeric => 11,
             Self::Int2 => 12,
             Self::Int2Vector => 55,
+            Self::OidVector => 68,
             Self::PgNodeTree => 67,
             Self::Float4 => 13,
             Self::Varchar => 14,
@@ -731,6 +966,7 @@ impl ColType {
             11 => Self::Numeric,
             12 => Self::Int2,
             55 => Self::Int2Vector,
+            68 => Self::OidVector,
             13 => Self::Float4,
             14 => Self::Varchar,
             15 => Self::Bpchar,
@@ -1715,6 +1951,8 @@ pub enum Datum<'a> {
     },
     /// The fixed-width integer vector used by PostgreSQL system catalogs.
     Int2Vector(&'a [u8]),
+    /// The fixed-width OID vector used by PostgreSQL system catalogs.
+    OidVector(&'a [u8]),
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
@@ -1820,6 +2058,7 @@ impl<'a> Datum<'a> {
             Datum::Json { jsonb: true, .. } => oid::JSONB,
             Datum::Array { element, .. } => element.array_oid(),
             Datum::Int2Vector(_) => oid::INT2VECTOR,
+            Datum::OidVector(_) => oid::OIDVECTOR,
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
@@ -1864,6 +2103,14 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
     let exp = exp10 + (digits.len() as i32 - 1);
     let sign = if v.is_sign_negative() { "-" } else { "" };
     write_pg_float_notation(f, sign, head, tail, exp, 15)
+}
+
+pub(crate) struct PgFloat8(pub f64);
+
+impl fmt::Display for PgFloat8 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_pg_float8(f, self.0)
+    }
 }
 
 /// `real`/float4 output, byte-for-byte with PostgreSQL. Its shortest digits
@@ -1993,6 +2240,16 @@ impl fmt::Display for Datum<'_> {
                         f.write_str(" ")?;
                     }
                     let value = i16::from_le_bytes([bytes[0], bytes[1]]);
+                    write!(f, "{value}")?;
+                }
+                Ok(())
+            }
+            Datum::OidVector(raw) => {
+                for (index, bytes) in raw.chunks_exact(4).enumerate() {
+                    if index > 0 {
+                        f.write_str(" ")?;
+                    }
+                    let value = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
                     write!(f, "{value}")?;
                 }
                 Ok(())
@@ -2381,6 +2638,60 @@ mod tests {
     }
 
     #[test]
+    fn btree_operator_classes_are_closed_and_match_postgres_catalogs() {
+        let cases = [
+            (ColType::Array(ArrElem::Int4), BtreeOperatorClass::Array),
+            (ColType::Enum(0), BtreeOperatorClass::Enum),
+            (
+                ColType::Multirange(RangeKind::Int4),
+                BtreeOperatorClass::Multirange,
+            ),
+            (ColType::Range(RangeKind::Int4), BtreeOperatorClass::Range),
+            (ColType::Bit { varying: false }, BtreeOperatorClass::Bit),
+            (ColType::Bool, BtreeOperatorClass::Bool),
+            (ColType::Bpchar, BtreeOperatorClass::Bpchar),
+            (ColType::Bytea, BtreeOperatorClass::Bytea),
+            (ColType::Date, BtreeOperatorClass::Date),
+            (ColType::Float4, BtreeOperatorClass::Float4),
+            (ColType::Float8, BtreeOperatorClass::Float8),
+            (ColType::Cidr, BtreeOperatorClass::Inet),
+            (ColType::Int2, BtreeOperatorClass::Int2),
+            (ColType::Int4, BtreeOperatorClass::Int4),
+            (ColType::Int8, BtreeOperatorClass::Int8),
+            (ColType::Interval, BtreeOperatorClass::Interval),
+            (ColType::Jsonb, BtreeOperatorClass::Jsonb),
+            (ColType::Macaddr, BtreeOperatorClass::Macaddr),
+            (ColType::Macaddr8, BtreeOperatorClass::Macaddr8),
+            (ColType::Name, BtreeOperatorClass::Name),
+            (ColType::Numeric, BtreeOperatorClass::Numeric),
+            (ColType::Regclass, BtreeOperatorClass::Oid),
+            (ColType::Composite(0), BtreeOperatorClass::Record),
+            (ColType::Varchar, BtreeOperatorClass::Text),
+            (ColType::Time, BtreeOperatorClass::Time),
+            (ColType::Timestamp, BtreeOperatorClass::Timestamp),
+            (ColType::Timestamptz, BtreeOperatorClass::Timestamptz),
+            (ColType::Timetz, BtreeOperatorClass::Timetz),
+            (ColType::Uuid, BtreeOperatorClass::Uuid),
+            (ColType::Bit { varying: true }, BtreeOperatorClass::Varbit),
+        ];
+        for (ctype, operator_class) in cases {
+            assert_eq!(BtreeOperatorClass::for_type(ctype), Some(operator_class));
+            assert_eq!(
+                BtreeOperatorClass::parse(operator_class.name()),
+                Some(operator_class)
+            );
+            assert_eq!(
+                BtreeOperatorClass::from_code(operator_class.code()),
+                Some(operator_class)
+            );
+            assert_ne!(operator_class.oid(), 0);
+        }
+        assert_eq!(BtreeOperatorClass::for_type(ColType::Json), None);
+        assert_eq!(BtreeOperatorClass::parse("not_an_operator_class"), None);
+        assert_eq!(BtreeOperatorClass::from_code(0), None);
+    }
+
+    #[test]
     fn from_oid_inverts_oid() {
         // Every type the binary-parameter path can name by OID round-trips.
         let mut types = vec![
@@ -2388,6 +2699,7 @@ mod tests {
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,
+            ColType::OidVector,
             ColType::Int4,
             ColType::Oid,
             ColType::Regtype,
@@ -2465,6 +2777,7 @@ mod code_roundtrip_tests {
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,
+            ColType::OidVector,
             ColType::Int4,
             ColType::Oid,
             ColType::Regtype,

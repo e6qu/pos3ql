@@ -672,6 +672,10 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[32]);
             hasher.write(raw);
         }
+        Datum::OidVector(raw) => {
+            hasher.write(&[33]);
+            hasher.write(raw);
+        }
         Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
             hasher.write(&[26])
         }

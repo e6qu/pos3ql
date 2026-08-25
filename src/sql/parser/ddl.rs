@@ -11,15 +11,16 @@ use super::{
 };
 use crate::sql::ast::{
     AlterDomainAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming, ConstraintValidation,
-    CreateDomain, CreateRoutine, CreateSchemaElement, CreateTrigger, DomainCheck,
-    ExclusionOperator, Expr, PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand,
-    PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations,
-    PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind, RoutineIdentity,
-    RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TriggerEvent, TriggerIdentity, TriggerTiming,
-    TriggerTransitionTables, ViewSecurity,
+    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, ConstraintMode, ConstraintTiming,
+    ConstraintValidation, CreateDomain, CreateRoutine, CreateSchemaElement, CreateTrigger,
+    DomainCheck, ExclusionOperator, Expr, IndexBuildMode, IndexStorageOptionNames,
+    IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
+    PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
+    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
+    RoutineIdentity, RoutineTargetKind, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
+    TriggerEvent, TriggerIdentity, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -56,6 +57,27 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn alter_index(&mut self) -> Result<Stmt<'a>, ParseError> {
+        if self.eat_ident("all")? {
+            self.expect_ident("in")?;
+            self.expect_ident("tablespace")?;
+            let source = self.any_ident("tablespace name")?;
+            let owners = if self.eat_ident("owned")? {
+                self.expect_ident("by")?;
+                self.role_name_list("role name")?
+            } else {
+                &[]
+            };
+            self.expect_ident("set")?;
+            self.expect_ident("tablespace")?;
+            let target = self.any_ident("tablespace name")?;
+            let nowait = self.eat_ident("nowait")?;
+            return Ok(Stmt::AlterIndexesTablespace {
+                source,
+                owners,
+                target,
+                nowait,
+            });
+        }
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
@@ -71,10 +93,47 @@ impl<'a> Parser<'a> {
                 action: AlterIndexAction::Rename(self.col_ident("new index name")?),
             });
         }
-        Err(ParseError {
-            at: self.peek_at,
-            message: stack_format!(96, "ALTER INDEX form is not implemented"),
-            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+        let action = if self.eat_ident("set")? {
+            if self.eat_ident("tablespace")? {
+                AlterIndexAction::SetTablespace(self.any_ident("tablespace name")?)
+            } else {
+                self.expect_op("(")?;
+                let options = self.index_storage_options()?;
+                self.expect_op(")")?;
+                AlterIndexAction::SetOptions(options)
+            }
+        } else if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let options = self.index_storage_option_names()?;
+            self.expect_op(")")?;
+            AlterIndexAction::ResetOptions(options)
+        } else if self.eat_ident("alter")? {
+            let _ = self.eat_ident("column")?;
+            let column = self.seq_int()?;
+            let column = u16::try_from(column)
+                .map_err(|_| self.err_here("index column number is out of range"))?;
+            self.expect_ident("set")?;
+            self.expect_ident("statistics")?;
+            let target = self.seq_int()?;
+            let target = i16::try_from(target)
+                .map_err(|_| self.err_here("statistics target is out of range"))?;
+            AlterIndexAction::SetStatistics { column, target }
+        } else if self.eat_ident("attach")? {
+            self.expect_ident("partition")?;
+            AlterIndexAction::AttachPartition(self.qual_name("partition index name")?)
+        } else if self.eat_ident("depends")? || self.eat_ident("no")? {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "extensions are not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        } else {
+            return Err(self.err_here("expected an ALTER INDEX action"));
+        };
+        Ok(Stmt::AlterIndex {
+            name,
+            if_exists,
+            action,
         })
     }
 
@@ -134,6 +193,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("index")? {
             return self.create_index(false);
         }
+        if self.eat_ident("tablespace")? {
+            return self.create_tablespace();
+        }
         if self.eat_ident("schema")? {
             return self.create_schema();
         }
@@ -156,6 +218,143 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn tablespace_cost(&mut self) -> Result<crate::sql::ast::TablespaceCost, ParseError> {
+        let raw = match self.peeked {
+            Tok::Num(raw) | Tok::Str(raw) => raw,
+            _ => return Err(self.err_here("tablespace cost must be numeric")),
+        };
+        let value = raw
+            .parse::<f64>()
+            .ok()
+            .and_then(crate::sql::ast::TablespaceCost::new)
+            .ok_or_else(|| self.err_here("tablespace cost is out of range"))?;
+        self.advance()?;
+        Ok(value)
+    }
+
+    fn tablespace_options(&mut self) -> Result<TablespaceOptions, ParseError> {
+        let mut options = TablespaceOptions::DEFAULT;
+        loop {
+            let option = self.any_ident("tablespace parameter")?;
+            let _ = self.eat_op("=")?;
+            if option.eq_ignore_ascii_case("random_page_cost") {
+                if options.random_page_cost.is_some() {
+                    return Err(self.err_here("tablespace parameter specified more than once"));
+                }
+                options.random_page_cost = Some(self.tablespace_cost()?);
+            } else if option.eq_ignore_ascii_case("seq_page_cost") {
+                if options.seq_page_cost.is_some() {
+                    return Err(self.err_here("tablespace parameter specified more than once"));
+                }
+                options.seq_page_cost = Some(self.tablespace_cost()?);
+            } else if option.eq_ignore_ascii_case("effective_io_concurrency")
+                || option.eq_ignore_ascii_case("maintenance_io_concurrency")
+            {
+                let value = self.seq_int()?;
+                let value = i32::try_from(value)
+                    .ok()
+                    .filter(|value| (0..=1000).contains(value))
+                    .ok_or_else(|| self.err_here("tablespace concurrency is out of range"))?;
+                let target = if option.eq_ignore_ascii_case("effective_io_concurrency") {
+                    &mut options.effective_io_concurrency
+                } else {
+                    &mut options.maintenance_io_concurrency
+                };
+                if target.replace(value).is_some() {
+                    return Err(self.err_here("tablespace parameter specified more than once"));
+                }
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(options)
+    }
+
+    fn tablespace_option_names(&mut self) -> Result<TablespaceOptionNames, ParseError> {
+        let mut names = TablespaceOptionNames::EMPTY;
+        loop {
+            let option = self.any_ident("tablespace parameter")?;
+            let target = if option.eq_ignore_ascii_case("random_page_cost") {
+                &mut names.random_page_cost
+            } else if option.eq_ignore_ascii_case("seq_page_cost") {
+                &mut names.seq_page_cost
+            } else if option.eq_ignore_ascii_case("effective_io_concurrency") {
+                &mut names.effective_io_concurrency
+            } else if option.eq_ignore_ascii_case("maintenance_io_concurrency") {
+                &mut names.maintenance_io_concurrency
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            };
+            if core::mem::replace(target, true) {
+                return Err(self.err_here("tablespace parameter specified more than once"));
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(names)
+    }
+
+    fn create_tablespace(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("tablespace name")?;
+        let owner = if self.eat_ident("owner")? {
+            Some(self.any_ident("tablespace owner")?)
+        } else {
+            None
+        };
+        self.expect_ident("location")?;
+        let location = self.str_literal("tablespace location")?;
+        let options = if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            let options = self.tablespace_options()?;
+            self.expect_op(")")?;
+            options
+        } else {
+            TablespaceOptions::DEFAULT
+        };
+        Ok(Stmt::CreateTablespace {
+            name,
+            owner,
+            location,
+            options,
+        })
+    }
+
+    pub(super) fn alter_tablespace(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.any_ident("tablespace name")?;
+        let action = if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterTablespaceAction::Rename(self.any_ident("new tablespace name")?)
+        } else if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterTablespaceAction::SetOwner(self.any_ident("tablespace owner")?)
+        } else if self.eat_ident("set")? {
+            self.expect_op("(")?;
+            let options = self.tablespace_options()?;
+            self.expect_op(")")?;
+            AlterTablespaceAction::SetOptions(options)
+        } else if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let options = self.tablespace_option_names()?;
+            self.expect_op(")")?;
+            AlterTablespaceAction::ResetOptions(options)
+        } else {
+            return Err(self.err_here("expected a tablespace alteration"));
+        };
+        Ok(Stmt::AlterTablespace { name, action })
     }
 
     fn policy_expression(&mut self) -> Result<PolicyExpression<'a>, ParseError> {
@@ -1408,20 +1607,30 @@ impl<'a> Parser<'a> {
                 Stmt::CreateIndex {
                     name,
                     table,
+                    build,
+                    scope,
+                    if_not_exists,
                     columns,
                     include_columns,
                     nulls_not_distinct,
                     predicate,
                     predicate_text,
+                    options,
+                    tablespace,
                     unique,
                 } => CreateSchemaElement::Index {
                     name,
                     table,
+                    build,
+                    scope,
+                    if_not_exists,
                     columns,
                     include_columns,
                     nulls_not_distinct,
                     predicate,
                     predicate_text,
+                    options,
+                    tablespace,
                     unique,
                 },
                 Stmt::CreateSequence {
@@ -1458,11 +1667,35 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// CREATE [UNIQUE] INDEX name ON table (col, ...) ("create [unique] index"
-    /// consumed).
+    /// CREATE INDEX after the INDEX keyword. Syntax defaults become explicit
+    /// typed fields before execution sees the statement.
     fn create_index(&mut self, unique: bool) -> Result<Stmt<'a>, ParseError> {
-        let name = self.col_ident("index name")?;
+        let build = if self.eat_ident("concurrently")? {
+            IndexBuildMode::Concurrent
+        } else {
+            IndexBuildMode::Blocking
+        };
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = if self.peeked == Tok::Ident("on") {
+            if if_not_exists {
+                return Err(self.err_here("IF NOT EXISTS requires an index name"));
+            }
+            None
+        } else {
+            Some(self.col_ident("index name")?)
+        };
         self.expect_ident("on")?;
+        let scope = if self.eat_ident("only")? {
+            IndexTargetScope::Only
+        } else {
+            IndexTargetScope::Recurse
+        };
         let table = self.qual_name("table name")?;
         if self.eat_ident("using")? {
             let method = self.any_ident("index access method")?;
@@ -1484,6 +1717,8 @@ impl<'a> Parser<'a> {
             column: None,
             expression: null_expression,
             expression_text: "",
+            collation: None,
+            operator_class: None,
             descending: false,
             nulls_first: false,
         }; MAX_LIST];
@@ -1503,6 +1738,28 @@ impl<'a> Parser<'a> {
                 } => Some(*name),
                 _ => None,
             };
+            let collation = if self.eat_ident("collate")? {
+                Some(self.collation_name()?)
+            } else {
+                None
+            };
+            let operator_class = match self.peeked {
+                Tok::Ident(word)
+                    if !word.eq_ignore_ascii_case("asc")
+                        && !word.eq_ignore_ascii_case("desc")
+                        && !word.eq_ignore_ascii_case("nulls") =>
+                {
+                    Some(self.qual_name("operator class")?)
+                }
+                _ => None,
+            };
+            if operator_class.is_some() && self.peeked == Tok::Op("(") {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "operator class parameters are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            }
             let descending = if self.eat_ident("asc")? {
                 false
             } else {
@@ -1522,6 +1779,8 @@ impl<'a> Parser<'a> {
                 column,
                 expression,
                 expression_text,
+                collation,
+                operator_class,
                 descending,
                 nulls_first,
             };
@@ -1552,11 +1811,24 @@ impl<'a> Parser<'a> {
             &[]
         };
         let nulls_not_distinct = if self.eat_ident("nulls")? {
-            self.expect_ident("not")?;
+            let not = self.eat_ident("not")?;
             self.expect_ident("distinct")?;
-            true
+            not
         } else {
             false
+        };
+        let options = if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            let options = self.index_storage_options()?;
+            self.expect_op(")")?;
+            options
+        } else {
+            IndexStorageOptions::DEFAULT
+        };
+        let tablespace = if self.eat_ident("tablespace")? {
+            Some(self.any_ident("tablespace name")?)
+        } else {
+            None
         };
         let (predicate, predicate_text) = if self.eat_ident("where")? {
             let start = self.peek_at;
@@ -1571,13 +1843,97 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateIndex {
             name,
             table,
+            build,
+            scope,
+            if_not_exists,
             columns,
             include_columns,
             nulls_not_distinct,
             predicate,
             predicate_text,
+            options,
+            tablespace,
             unique,
         })
+    }
+
+    fn index_storage_options(&mut self) -> Result<IndexStorageOptions, ParseError> {
+        let mut options = IndexStorageOptions::DEFAULT;
+        if self.peeked == Tok::Op(")") {
+            return Ok(options);
+        }
+        loop {
+            let option = self.any_ident("index storage parameter")?;
+            let _ = self.eat_op("=")?;
+            if option.eq_ignore_ascii_case("fillfactor") {
+                if options.fillfactor.is_some() {
+                    return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
+                }
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.unexpected("fillfactor must be an integer"));
+                };
+                let value = raw
+                    .parse::<u8>()
+                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
+                self.advance()?;
+                if !(10..=100).contains(&value) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                options.fillfactor = Some(value);
+            } else if option.eq_ignore_ascii_case("deduplicate_items") {
+                if options.deduplicate_items.is_some() {
+                    return Err(
+                        self.err_here("parameter \"deduplicate_items\" specified more than once")
+                    );
+                }
+                let value = match self.peeked {
+                    Tok::Ident("true" | "on") | Tok::Str("true" | "on" | "1") => true,
+                    Tok::Ident("false" | "off") | Tok::Str("false" | "off" | "0") => false,
+                    _ => return Err(self.err_here("parameter requires a boolean value")),
+                };
+                self.advance()?;
+                options.deduplicate_items = Some(value);
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(options)
+    }
+
+    fn index_storage_option_names(&mut self) -> Result<IndexStorageOptionNames, ParseError> {
+        let mut names = IndexStorageOptionNames::EMPTY;
+        loop {
+            let option = self.any_ident("index storage parameter")?;
+            let flag = if option.eq_ignore_ascii_case("fillfactor") {
+                &mut names.fillfactor
+            } else if option.eq_ignore_ascii_case("deduplicate_items") {
+                &mut names.deduplicate_items
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            };
+            if core::mem::replace(flag, true) {
+                return Err(self.err_here("index storage parameter specified more than once"));
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(names)
     }
 
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
@@ -2170,6 +2526,16 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropOwned { roles, cascade });
         }
+        if self.eat_ident("tablespace")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.any_ident("tablespace name")?;
+            return Ok(Stmt::DropTablespace { name, if_exists });
+        }
         if self.eat_ident("view")? {
             let (names, if_exists) = self.drop_targets("view name")?;
             let cascade = if self.eat_ident("cascade")? {
@@ -2231,8 +2597,24 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_ident("index")? {
+            let build = if self.eat_ident("concurrently")? {
+                IndexBuildMode::Concurrent
+            } else {
+                IndexBuildMode::Blocking
+            };
             let (names, if_exists) = self.drop_targets("index name")?;
-            return Ok(Stmt::DropIndex { names, if_exists });
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropIndex {
+                names,
+                if_exists,
+                build,
+                cascade,
+            });
         }
         if self.eat_ident("schema")? {
             return self.drop_schema();

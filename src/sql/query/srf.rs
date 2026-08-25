@@ -766,6 +766,7 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
             Datum::Int2Vector(raw) => Ok(raw.len() / 2),
+            Datum::OidVector(raw) => Ok(raw.len() / 4),
             Datum::Null => Ok(0),
             _ => Err(srf_signature_error(name)),
         }
